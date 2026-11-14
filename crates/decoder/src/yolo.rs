@@ -1276,6 +1276,36 @@ pub(crate) fn impl_yolo_segdet_get_boxes<
 where
     f32: AsPrimitive<SCORE>,
 {
+    impl_yolo_segdet_get_boxes_on::<B, _, _>(
+        Isa::current()?,
+        boxes_tensor,
+        scores_tensor,
+        score_threshold.as_(),
+        iou_threshold,
+        nms,
+        pre_nms_top_k,
+        max_det,
+        multi_label,
+    )
+}
+
+/// [`impl_yolo_segdet_get_boxes`] on `isa`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn impl_yolo_segdet_get_boxes_on<
+    B: BBoxTypeTrait,
+    BOX: Float + AsPrimitive<f32> + Send + Sync,
+    SCORE: Float + AsPrimitive<f32> + Send + Sync,
+>(
+    isa: Isa,
+    boxes_tensor: ArrayView2<BOX>,
+    scores_tensor: ArrayView2<SCORE>,
+    score_threshold: SCORE,
+    iou_threshold: f32,
+    nms: Option<Nms>,
+    pre_nms_top_k: usize,
+    max_det: usize,
+    multi_label: bool,
+) -> crate::DecoderResult<Vec<(DetectBox, usize)>> {
     crate::byte::check_candidate_shapes(boxes_tensor.dim(), scores_tensor.dim())?;
     let span = tracing::trace_span!(
         "decoder.nms_get_boxes",
@@ -1286,13 +1316,12 @@ where
 
     // Multi-label emits one candidate per (anchor, class) above threshold;
     // argmax emits one per anchor.
-    let isa = Isa::current()?;
     let boxes = {
         let _s = tracing::trace_span!("decoder.nms_get_boxes.score_filter").entered();
         decode_candidates::<B, _, _>(
             isa,
             multi_label,
-            score_threshold.as_(),
+            score_threshold,
             boxes_tensor,
             scores_tensor,
         )?

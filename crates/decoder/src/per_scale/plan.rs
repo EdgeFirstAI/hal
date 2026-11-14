@@ -341,9 +341,10 @@ impl PerScalePlan {
                     )
                 })?;
             let mc_dtype = schema_dtype_to_tensor_dtype(mc_dtype)?;
+            // The mask kernels take f32, whatever the box and score dtype.
             Some(super::kernels::dispatch::MaskCoefDispatch::select(
                 mc_dtype,
-                out_dtype,
+                DecodeDtype::F32,
                 &cpu_features,
             )?)
         } else {
@@ -367,7 +368,7 @@ impl PerScalePlan {
             let proto_dtype = schema_dtype_to_tensor_dtype(proto_dtype)?;
             Some(super::kernels::dispatch::ProtoDispatch::select(
                 proto_dtype,
-                out_dtype,
+                DecodeDtype::F32,
                 &cpu_features,
             )?)
         } else {

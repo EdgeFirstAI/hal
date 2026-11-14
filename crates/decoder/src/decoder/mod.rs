@@ -587,6 +587,16 @@ impl Decoder {
         self.input_dims
     }
 
+    /// The dtype the per-scale pipeline decodes boxes and scores in: the one
+    /// given to [`DecoderBuilder::with_decode_dtype`], else
+    /// [`DecodeDtype::native`](crate::DecodeDtype::native). `None` for a
+    /// model that does not take the per-scale path.
+    pub fn decode_dtype(&self) -> Option<crate::DecodeDtype> {
+        let per_scale = self.per_scale.as_ref()?;
+        let per_scale = per_scale.lock().unwrap_or_else(|e| e.into_inner());
+        Some(per_scale.plan.out_dtype)
+    }
+
     /// Decode quantized model outputs into detection boxes and segmentation
     /// masks. The quantized outputs can be of u8, i8, u16, i16, u32, or i32
     /// types. Clears the provided output vectors before populating them.
@@ -1390,10 +1400,9 @@ impl Decoder {
             let mut ps = per_scale_mutex
                 .lock()
                 .map_err(|e| DecoderError::Internal(format!("per_scale mutex poisoned: {e}")))?;
-            let (decoded, widen) = ps.run_with_widen(outputs, Some(self.score_threshold))?;
+            let decoded = ps.run(outputs, Some(self.score_threshold))?;
             return per_scale_bridge::per_scale_to_masks(
                 &decoded,
-                widen,
                 output_boxes,
                 output_masks,
                 self.iou_threshold,
@@ -1489,10 +1498,9 @@ impl Decoder {
             let mut ps = per_scale_mutex
                 .lock()
                 .map_err(|e| DecoderError::Internal(format!("per_scale mutex poisoned: {e}")))?;
-            let (decoded, widen) = ps.run_with_widen(outputs, Some(self.score_threshold))?;
+            let decoded = ps.run(outputs, Some(self.score_threshold))?;
             return per_scale_bridge::per_scale_to_proto_data(
                 &decoded,
-                widen,
                 output_boxes,
                 self.iou_threshold,
                 self.score_threshold,

@@ -152,7 +152,7 @@ pub struct DecoderBuilder {
     /// Output dtype for the per-scale fast path. Has no effect on
     /// schemas without per-scale children (which use the legacy decode
     /// path).
-    decode_dtype: DecodeDtype,
+    decode_dtype: Option<DecodeDtype>,
     /// Explicit pre-NMS cap; `None` takes [`DEFAULT_PRE_NMS_TOP_K`], or
     /// [`MULTI_LABEL_PRE_NMS_TOP_K`] when multi-label decode is on.
     pre_nms_top_k: Option<usize>,
@@ -205,7 +205,7 @@ impl Default for DecoderBuilder {
             iou_threshold: 0.5,
             score_threshold: 0.5,
             nms: Some(configs::Nms::Auto),
-            decode_dtype: DecodeDtype::F32,
+            decode_dtype: None,
             pre_nms_top_k: None,
             max_det: 300,
             input_dims: None,
@@ -331,12 +331,14 @@ impl DecoderBuilder {
         self
     }
 
-    /// Choose the output dtype for the per-scale decoder pipeline.
+    /// Choose the dtype the per-scale pipeline decodes boxes and scores in.
     ///
-    /// Defaults to [`DecodeDtype::F32`]. Has no effect on schemas
-    /// without per-scale children (which use the legacy decode path).
-    /// `F16` saves ~2× memory bandwidth at the cost of 10-bit mantissa
-    /// precision; empirically safe for YOLO-family models.
+    /// Without this call the decoder uses [`DecodeDtype::native`]: `F16` on
+    /// a CPU with FP16 arithmetic, `F32` on any other. Has no effect on
+    /// schemas without per-scale children (which use the legacy decode
+    /// path). `F16` rounds boxes and scores to 11 significant bits, which
+    /// keeps YOLO detections within about a quarter pixel and 1e-4 in score
+    /// of `F32`; [`Decoder::decode_dtype`] reports the dtype in use.
     ///
     /// # Examples
     ///
@@ -354,7 +356,7 @@ impl DecoderBuilder {
     /// # }
     /// ```
     pub fn with_decode_dtype(mut self, dtype: DecodeDtype) -> Self {
-        self.decode_dtype = dtype;
+        self.decode_dtype = Some(dtype);
         self
     }
 
@@ -1127,7 +1129,7 @@ impl DecoderBuilder {
     /// # }
     /// ```
     pub fn build(self) -> Result<Decoder, DecoderError> {
-        let decode_dtype = self.decode_dtype;
+        let decode_dtype = self.decode_dtype.unwrap_or_else(DecodeDtype::native);
         let explicit_input_dims = self.input_dims;
         let Lowered {
             config,

@@ -114,6 +114,16 @@ binary!(
     "fmax"
 );
 binary!(
+    /// `FMAXNM`: the lane maximum; a lane with one NaN gives the other operand.
+    fmaxnm_f16x8,
+    "fmaxnm"
+);
+binary!(
+    /// `FMINNM`: the lane minimum; a lane with one NaN gives the other operand.
+    fminnm_f16x8,
+    "fminnm"
+);
+binary!(
     /// `FCMGT`: all ones where `a > b`.
     fcmgt_f16x8,
     "fcmgt"

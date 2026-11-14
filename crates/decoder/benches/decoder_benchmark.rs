@@ -1953,29 +1953,6 @@ fn bench_per_scale_box_cells(suite: &mut BenchSuite) {
     }
 }
 
-/// The per-scale bridge's f16 -> f32 widen of the 160x160x32 protos and of
-/// 8400x80 scores, per tier.
-fn bench_per_scale_widen(suite: &mut BenchSuite) {
-    use edgefirst_decoder::per_scale::bench::{widen_f16, Tier};
-    for (label, n) in [("protos_819200", 819_200usize), ("scores_672000", 672_000)] {
-        let src: Vec<half::f16> = (0..n)
-            .map(|i| half::f16::from_f32((i % 977) as f32 * 0.01 - 4.0))
-            .collect();
-        let mut dst = vec![0f32; n];
-        for name in ["scalar", "neon"] {
-            let Ok(tier) = Tier::new(name) else {
-                continue;
-            };
-            let name = format!("decoder/per_scale/widen_f16/{label}/{name}");
-            let result = run_bench(&name, WARMUP, ITERATIONS, || {
-                widen_f16(&tier, &src, &mut dst);
-            });
-            result.print_summary();
-            suite.record(&result);
-        }
-    }
-}
-
 /// The prefilter's anchor selection on realistic raw scores: the 640x640
 /// COCO level-0 layout (6400 anchors x 80 classes) and the 960x544 one
 /// (8160 x 4), at the floor of a 0.25 threshold.
@@ -2248,6 +2225,253 @@ fn bench_semantic(suite: &mut BenchSuite) {
     }
 }
 
+#[allow(dead_code)]
+#[path = "../tests/common/per_scale_fixture.rs"]
+mod per_scale_fixture;
+
+/// Accumulates the time spent inside each tracing span, by span name.
+mod stage_timer {
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+    use tracing::field::{Field, Visit};
+    use tracing::span::{Attributes, Id, Record};
+    use tracing_subscriber::layer::Context;
+    use tracing_subscriber::registry::LookupSpan;
+    use tracing_subscriber::Layer;
+
+    #[derive(Default)]
+    pub struct Stages {
+        /// Total time and entry count per span name.
+        pub time: BTreeMap<&'static str, (Duration, u64)>,
+        /// Last value of each counting field, as `span.field`.
+        pub counts: BTreeMap<String, u64>,
+    }
+
+    pub struct StageLayer(pub Arc<Mutex<Stages>>);
+
+    struct Entered(Instant);
+
+    struct Counts<'a> {
+        span: &'static str,
+        stages: &'a mut Stages,
+    }
+
+    impl Visit for Counts<'_> {
+        fn record_u64(&mut self, field: &Field, value: u64) {
+            if matches!(field.name(), "n" | "n_candidates" | "n_detections") {
+                self.stages
+                    .counts
+                    .insert(format!("{}.{}", self.span, field.name()), value);
+            }
+        }
+
+        fn record_debug(&mut self, _: &Field, _: &dyn std::fmt::Debug) {}
+    }
+
+    impl<S: tracing::Subscriber + for<'a> LookupSpan<'a>> Layer<S> for StageLayer {
+        fn on_new_span(&self, attrs: &Attributes<'_>, _: &Id, _: Context<'_, S>) {
+            if let Ok(mut stages) = self.0.lock() {
+                attrs.record(&mut Counts {
+                    span: attrs.metadata().name(),
+                    stages: &mut stages,
+                });
+            }
+        }
+
+        fn on_record(&self, id: &Id, values: &Record<'_>, ctx: Context<'_, S>) {
+            let (Some(span), Ok(mut stages)) = (ctx.span(id), self.0.lock()) else {
+                return;
+            };
+            values.record(&mut Counts {
+                span: span.name(),
+                stages: &mut stages,
+            });
+        }
+
+        fn on_enter(&self, id: &Id, ctx: Context<'_, S>) {
+            if let Some(span) = ctx.span(id) {
+                span.extensions_mut().replace(Entered(Instant::now()));
+            }
+        }
+
+        fn on_exit(&self, id: &Id, ctx: Context<'_, S>) {
+            let now = Instant::now();
+            let Some(span) = ctx.span(id) else { return };
+            let Some(Entered(start)) = span.extensions_mut().remove::<Entered>() else {
+                return;
+            };
+            if let Ok(mut stages) = self.0.lock() {
+                let slot = stages.time.entry(span.name()).or_default();
+                slot.0 += now - start;
+                slot.1 += 1;
+            }
+        }
+    }
+}
+
+/// A decode regime of the dtype comparison: the deployment threshold with
+/// argmax candidates, or COCO validation (multi-label at 0.001).
+struct Regime {
+    label: &'static str,
+    score_threshold: f32,
+    multi_label: bool,
+    pre_nms_top_k: Option<usize>,
+}
+
+const REGIMES: [Regime; 2] = [
+    Regime {
+        label: "deploy",
+        score_threshold: 0.25,
+        multi_label: false,
+        pre_nms_top_k: None,
+    },
+    Regime {
+        label: "val",
+        score_threshold: 0.001,
+        multi_label: true,
+        pre_nms_top_k: Some(30_000),
+    },
+];
+
+/// The detection half of a captured per-scale seg fixture: its schema
+/// without mask coefficients, protos or a pinned NMS mode, and the tensors
+/// that schema binds.
+fn detection_fixture(model: &str) -> Option<(SchemaV2, Vec<TensorDyn>)> {
+    let path = edgefirst_bench::testdata::path(format!("decoder/{model}.safetensors"));
+    let fixture = match per_scale_fixture::PerScaleFixture::load(&path) {
+        Ok(f) => f,
+        Err(e) => {
+            println!("  WARNING: SKIPPED: {model}: {e}");
+            return None;
+        }
+    };
+    let mut schema: serde_json::Value =
+        serde_json::from_str(fixture.schema_json()).expect("fixture schema");
+    schema.as_object_mut().expect("schema object").remove("nms");
+    let outputs = schema["outputs"].as_array_mut().expect("outputs");
+    outputs.retain(|o| matches!(o["type"].as_str(), Some("boxes" | "scores")));
+    let shapes: Vec<Vec<usize>> = outputs
+        .iter()
+        .flat_map(|o| o["outputs"].as_array().cloned().unwrap_or_default())
+        .map(|c| serde_json::from_value(c["shape"].clone()).expect("child shape"))
+        .collect();
+    let schema: SchemaV2 = serde_json::from_value(schema).expect("detection schema");
+    let mut tensors = fixture.build_tensors_with_quant().expect("fixture tensors");
+    tensors.retain(|t| shapes.iter().any(|s| s.as_slice() == t.shape()));
+    Some((schema, tensors))
+}
+
+/// FP32 against FP16 decode on captured int8 frames of the yolov8n, yolo11n
+/// (DFL) and yolo26n (LTRB) smart exports, in both [`REGIMES`]: `prefilter`
+/// is the per-scale decode alone, `decode` adds the candidate filter and
+/// NMS. A second pass prints the mean time inside each tracing span.
+fn bench_per_scale_dtype(suite: &mut BenchSuite) {
+    use tracing_subscriber::layer::SubscriberExt;
+
+    // `--filter <text>` keeps the cases whose name contains it.
+    let filter = std::env::args()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .find(|w| w[0] == "--filter")
+        .map(|w| w[1].clone());
+    let mut cases = Vec::new();
+    for model in ["yolov8n-seg", "yolo11n-seg", "yolo26n-seg"] {
+        let Some((schema, tensors)) = detection_fixture(model) else {
+            continue;
+        };
+        let tensors = std::rc::Rc::new(tensors);
+        for regime in &REGIMES {
+            for (dtype_label, dtype) in [("f32", DecodeDtype::F32), ("f16", DecodeDtype::F16)] {
+                let mut builder = DecoderBuilder::default()
+                    .with_schema(schema.clone())
+                    .with_decode_dtype(dtype)
+                    .with_iou_threshold(0.7)
+                    .with_score_threshold(regime.score_threshold)
+                    .with_nms(Some(Nms::ClassAware))
+                    .with_multi_label(regime.multi_label)
+                    .with_max_det(300);
+                if let Some(k) = regime.pre_nms_top_k {
+                    builder = builder.with_pre_nms_top_k(k);
+                }
+                let decoder = builder.build().expect("decoder build");
+                let name = format!(
+                    "decoder/per_scale/dtype/{model}/{}/{dtype_label}",
+                    regime.label
+                );
+                if filter.as_ref().is_none_or(|f| name.contains(f.as_str())) {
+                    cases.push((name, regime, decoder, tensors.clone()));
+                }
+            }
+        }
+    }
+
+    for (name, regime, decoder, tensors) in &cases {
+        let inputs: Vec<&TensorDyn> = tensors.iter().collect();
+        let threshold = Some(regime.score_threshold);
+        let kept = decoder._bench_run_per_scale(&inputs, threshold).unwrap();
+        let mut boxes = Vec::with_capacity(300);
+        decoder
+            .decode(&inputs, &mut boxes, &mut Vec::new())
+            .unwrap();
+        println!(
+            "  {name}: {kept} anchors decoded, {} detections",
+            boxes.len()
+        );
+        run_bench_cpu(
+            suite,
+            &format!("{name}/prefilter"),
+            WARMUP,
+            ITERATIONS * 3,
+            || {
+                decoder._bench_run_per_scale(&inputs, threshold).unwrap();
+            },
+        );
+        run_bench_cpu(
+            suite,
+            &format!("{name}/decode"),
+            WARMUP,
+            ITERATIONS * 3,
+            || {
+                decoder
+                    .decode(&inputs, &mut boxes, &mut Vec::new())
+                    .unwrap();
+            },
+        );
+    }
+
+    const STAGE_ITERATIONS: u32 = 200;
+    for (name, _, decoder, tensors) in &cases {
+        let inputs: Vec<&TensorDyn> = tensors.iter().collect();
+        let stages = std::sync::Arc::new(std::sync::Mutex::new(stage_timer::Stages::default()));
+        let subscriber =
+            tracing_subscriber::registry().with(stage_timer::StageLayer(stages.clone()));
+        let mut boxes = Vec::with_capacity(300);
+        tracing::subscriber::with_default(subscriber, || {
+            for i in 0..WARMUP as u32 + STAGE_ITERATIONS {
+                if i == WARMUP as u32 {
+                    *stages.lock().unwrap() = stage_timer::Stages::default();
+                }
+                decoder
+                    .decode(&inputs, &mut boxes, &mut Vec::new())
+                    .unwrap();
+            }
+        });
+        let stages = stages.lock().unwrap();
+        println!("  stages {name} (mean per decode, spans traced):");
+        for (span, (total, entries)) in &stages.time {
+            println!(
+                "    {span:58} {:>10.1}µs  x{:.1}",
+                total.as_secs_f64() * 1e6 / STAGE_ITERATIONS as f64,
+                *entries as f64 / STAGE_ITERATIONS as f64
+            );
+        }
+        for (field, value) in &stages.counts {
+            println!("    {field:58} {value:>10}");
+        }
+    }
+}
+
 /// One benchmark function.
 type Bench = fn(&mut BenchSuite);
 
@@ -2264,7 +2488,7 @@ fn main() {
         .windows(2)
         .find(|w| w[0] == "--section")
         .map(|w| w[1].to_ascii_lowercase());
-    let sections: [(&str, &[Bench]); 13] = [
+    let sections: [(&str, &[Bench]); 14] = [
         ("YOLO", &[bench_yolo_quant, bench_yolo_f32]),
         (
             "Quant",
@@ -2323,13 +2547,10 @@ fn main() {
         ("Per-Scale-Seg", &[bench_per_scale_seg]),
         (
             "Per-Scale-Cells",
-            &[
-                bench_per_scale_cells,
-                bench_per_scale_widen,
-                bench_per_scale_select,
-            ],
+            &[bench_per_scale_cells, bench_per_scale_select],
         ),
         ("Per-Scale-Boxes", &[bench_per_scale_box_cells]),
+        ("Per-Scale-Dtype", &[bench_per_scale_dtype]),
     ];
     for (name, benches) in sections {
         if only

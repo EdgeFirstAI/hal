@@ -186,12 +186,13 @@ use crate::per_scale::kernels::dispatch::TransposeDispatch;
 use crate::per_scale::kernels::dispatch::{DstSliceMut, InputView};
 use crate::per_scale::outputs::{
     boxes_level_slice_of, mask_coefs_level_slice_of, scores_level_slice_of, Buffer, BufferRef,
-    DecodedOutputBuffers, DecodedOutputsRef, ProtoStorage, ProtosView,
+    DecodedOutputBuffers, DecodedOutputsRef,
 };
 use crate::per_scale::plan::Layout;
 use crate::per_scale::prefilter::{
     gather_rows, raw_score_floor, select_anchors, LevelScratch, PACK_ANCHORS,
 };
+use crate::per_scale::score_lut::ScoreTable;
 use edgefirst_kernels::prim::dfl_lut::DflExpTable;
 use edgefirst_tensor::{CpuAccess, TensorMapTrait, TensorTrait};
 
@@ -229,26 +230,34 @@ pub(crate) fn run<'a>(
     // case) splits the levels into pieces for the rayon pool. NCHW levels
     // share `layout_scratch`, which would need per-level scratch buffers
     // to parallelize safely, so they decode sequentially.
-    let mut tables = std::mem::take(&mut buffers.dfl_tables);
-    let levels = update_dfl_tables(plan, &bind, &mut tables).and_then(|()| {
-        let kept = match score_threshold {
-            Some(t) => run_levels_prefiltered(plan, &bind, buffers, &tables, t)?,
-            None => None,
-        };
-        Ok(match kept {
-            Some(n) => n,
-            None => {
-                let all_nhwc = plan.levels.iter().all(|l| l.layout == Layout::Nhwc);
-                if all_nhwc {
-                    run_levels_parallel(plan, &bind, buffers, &tables)?;
-                } else {
-                    run_levels_sequential(plan, &bind, buffers, &tables)?;
+    let mut dfl = std::mem::take(&mut buffers.dfl_tables);
+    let mut score = std::mem::take(&mut buffers.score_tables);
+    let levels = update_dfl_tables(plan, &bind, &mut dfl)
+        .and_then(|()| update_score_tables(plan, &bind, &mut score))
+        .and_then(|()| {
+            let tables = LevelTables {
+                dfl: &dfl,
+                score: &score,
+            };
+            let kept = match score_threshold {
+                Some(t) => run_levels_prefiltered(plan, &bind, buffers, tables, t)?,
+                None => None,
+            };
+            Ok(match kept {
+                Some(n) => n,
+                None => {
+                    let all_nhwc = plan.levels.iter().all(|l| l.layout == Layout::Nhwc);
+                    if all_nhwc {
+                        run_levels_parallel(plan, &bind, buffers, tables)?;
+                    } else {
+                        run_levels_sequential(plan, &bind, buffers, tables)?;
+                    }
+                    plan.total_anchors
                 }
-                plan.total_anchors
-            }
-        })
-    });
-    buffers.dfl_tables = tables;
+            })
+        });
+    buffers.dfl_tables = dfl;
+    buffers.score_tables = score;
     let total_anchors = levels?;
 
     // Protos — single tensor, no per-level structure. Always sequential.
@@ -265,14 +274,15 @@ pub(crate) fn run<'a>(
             layout_scratch,
             ..
         } = buffers;
-        let dst = match proto_buf.as_mut() {
-            Some(ProtoStorage::F32(a)) => a.as_slice_mut().map(DstSliceMut::F32),
-            Some(ProtoStorage::F16(a)) => a.as_slice_mut().map(DstSliceMut::F16),
-            None => None,
-        }
-        .ok_or_else(|| {
-            DecoderError::Internal("protos buffer absent but plan declared proto_dispatch".into())
-        })?;
+        let dst = proto_buf
+            .as_mut()
+            .and_then(|a| a.as_slice_mut())
+            .map(DstSliceMut::F32)
+            .ok_or_else(|| {
+                DecoderError::Internal(
+                    "protos buffer absent but plan declared proto_dispatch".into(),
+                )
+            })?;
         if proto_layout == Layout::Nchw {
             let nhwc = plan.proto_nhwc_shape.as_ref().ok_or_else(|| {
                 DecoderError::Internal("NCHW protos but proto_nhwc_shape is None".into())
@@ -325,6 +335,60 @@ fn update_dfl_tables(
     Ok(())
 }
 
+/// The per-level lookup tables of a frame.
+#[derive(Clone, Copy)]
+struct LevelTables<'a> {
+    dfl: &'a [DflExpTable],
+    score: &'a [ScoreTable],
+}
+
+/// Point each level's score table at its score tensor's dtype and quantization.
+fn update_score_tables(
+    plan: &PerScalePlan,
+    bind: &FrameBindings<'_>,
+    tables: &mut Vec<ScoreTable>,
+) -> DecoderResult<()> {
+    tables.resize_with(bind.levels.len(), ScoreTable::default);
+    for (li, (lvl_bind, table)) in bind.levels.iter().zip(tables.iter_mut()).enumerate() {
+        let dtype = lvl_bind.scores.dtype();
+        let q = match dtype {
+            DType::I8 | DType::U8 => quant_from_tensor(lvl_bind.scores, "scores", li)?,
+            _ => Quantization::identity(),
+        };
+        let Some(level) = plan.levels.get(li) else {
+            continue;
+        };
+        table.update(plan, level, dtype, q)?;
+    }
+    Ok(())
+}
+
+/// Decode one level's scores: from its table when it has one, else with the score kernel.
+fn run_score_kernel(
+    plan: &PerScalePlan,
+    table: Option<&ScoreTable>,
+    input: InputView<'_>,
+    q: Quantization,
+    level: &crate::per_scale::plan::LevelPlan,
+    dst: DstSliceMut<'_>,
+) -> DecoderResult<()> {
+    let dst = match table {
+        Some(table) => match table.decode(&input, dst) {
+            Some(dst) => dst,
+            None => return Ok(()),
+        },
+        None => dst,
+    };
+    plan.score_dispatch.run(
+        input,
+        q,
+        plan.num_classes,
+        level,
+        plan.score_activation,
+        dst,
+    )
+}
+
 /// Run the box kernel for one level, choosing the per-channel DFL kernel
 /// when the box tensor carries per-channel quantization.
 fn run_box_kernel(
@@ -360,7 +424,7 @@ fn run_levels_prefiltered(
     plan: &PerScalePlan,
     bind: &FrameBindings<'_>,
     buffers: &mut DecodedOutputBuffers,
-    tables: &[DflExpTable],
+    tables: LevelTables<'_>,
     threshold: f32,
 ) -> DecoderResult<Option<usize>> {
     if buffers.prefilter.len() != plan.levels.len() {
@@ -450,25 +514,14 @@ fn run_levels_prefiltered(
                 if kept > 0 {
                     let packed = gather_rows(&input, nc, &scratch.anchors, &mut scratch.scores);
                     let dst = scores_level_slice_of(scores, offset, scratch.anchors.len(), nc);
-                    plan.score_dispatch.run(
-                        packed,
-                        score_q,
-                        nc,
-                        &scratch.plan,
-                        plan.score_activation,
-                        dst,
-                    )?;
+                    let table = tables.score.get(li);
+                    run_score_kernel(plan, table, packed, score_q, &scratch.plan, dst)?;
                 }
                 if tail > 0 {
                     let dst = scores_level_slice_of(scores, offset + kept, tail, nc);
-                    plan.score_dispatch.run(
-                        input.slice(body * nc..(body + tail) * nc),
-                        score_q,
-                        nc,
-                        &scratch.tail,
-                        plan.score_activation,
-                        dst,
-                    )?;
+                    let rows = input.slice(body * nc..(body + tail) * nc);
+                    let table = tables.score.get(li);
+                    run_score_kernel(plan, table, rows, score_q, &scratch.tail, dst)?;
                 }
                 Ok(())
             },
@@ -497,13 +550,13 @@ fn run_levels_prefiltered(
                     let packed =
                         gather_rows(&input, box_channels, &scratch.anchors, &mut scratch.boxes);
                     let dst = boxes_level_slice_of(boxes, offset, packed_len);
-                    let table = tables.get(li);
+                    let table = tables.dfl.get(li);
                     run_box_kernel(plan, &scratch.plan, lvl_bind.boxes, li, table, packed, dst)?;
                 }
                 if tail > 0 {
                     let rows = input.slice(body * box_channels..(body + tail) * box_channels);
                     let dst = boxes_level_slice_of(boxes, offset + kept, tail);
-                    let table = tables.get(li);
+                    let table = tables.dfl.get(li);
                     run_box_kernel(plan, &scratch.tail, lvl_bind.boxes, li, table, rows, dst)?;
                 }
                 Ok(())
@@ -553,7 +606,7 @@ fn run_levels_sequential(
     plan: &PerScalePlan,
     bind: &FrameBindings<'_>,
     buffers: &mut DecodedOutputBuffers,
-    tables: &[DflExpTable],
+    tables: LevelTables<'_>,
 ) -> DecoderResult<()> {
     // Iterate levels by index so we can carve disjoint mutable slices
     // out of the buffers per level. Each iteration maps the bound
@@ -627,7 +680,10 @@ fn run_levels_sequential(
                             box_channels,
                             layout_scratch,
                             plan.transpose,
-                            |input| plan.box_dispatch.run(input, q, lvl, tables.get(li), dst),
+                            |input| {
+                                plan.box_dispatch
+                                    .run(input, q, lvl, tables.dfl.get(li), dst)
+                            },
                         )?;
                     }
                 }
@@ -643,7 +699,10 @@ fn run_levels_sequential(
                     box_channels,
                     layout_scratch,
                     plan.transpose,
-                    |input| plan.box_dispatch.run(input, q, lvl, tables.get(li), dst),
+                    |input| {
+                        plan.box_dispatch
+                            .run(input, q, lvl, tables.dfl.get(li), dst)
+                    },
                 )?;
             }
         }
@@ -666,16 +725,7 @@ fn run_levels_sequential(
                 plan.num_classes,
                 layout_scratch,
                 plan.transpose,
-                |input| {
-                    plan.score_dispatch.run(
-                        input,
-                        q,
-                        plan.num_classes,
-                        lvl,
-                        plan.score_activation,
-                        dst,
-                    )
-                },
+                |input| run_score_kernel(plan, tables.score.get(li), input, q, lvl, dst),
             )?;
         }
 
@@ -794,7 +844,7 @@ fn run_levels_parallel(
     plan: &PerScalePlan,
     bind: &FrameBindings<'_>,
     buffers: &mut DecodedOutputBuffers,
-    tables: &[DflExpTable],
+    tables: LevelTables<'_>,
 ) -> DecoderResult<()> {
     let threads = if plan.total_anchors < PARALLEL_MIN_ANCHORS {
         1
@@ -860,7 +910,8 @@ fn run_levels_parallel(
 
     let run = |w: PieceWork<'_, '_>| {
         let li = w.piece.level;
-        decode_piece(plan, &bind.levels[li], &maps[li], tables.get(li), w)
+        let tables = (tables.dfl.get(li), tables.score.get(li));
+        decode_piece(plan, &bind.levels[li], &maps[li], tables, w)
     };
     if threads == 1 {
         work.into_iter().try_for_each(run)
@@ -875,7 +926,7 @@ fn decode_piece(
     plan: &PerScalePlan,
     lvl_bind: &LevelBindings<'_>,
     maps: &LevelMaps<'_>,
-    table: Option<&DflExpTable>,
+    (table, score_table): (Option<&DflExpTable>, Option<&ScoreTable>),
     work: PieceWork<'_, '_>,
 ) -> DecoderResult<()> {
     let PieceWork {
@@ -906,10 +957,8 @@ fn decode_piece(
         let _s = tracing::trace_span!("decoder.per_scale_run.level.scores", activation = ?plan.score_activation)
             .entered();
         let q = quant_from_tensor(lvl_bind.scores, "scores", li)?;
-        let nc = plan.num_classes;
-        let input = rows(maps.scores.view(), piece, nc);
-        plan.score_dispatch
-            .run(input, q, nc, lvl, plan.score_activation, scores)?;
+        let input = rows(maps.scores.view(), piece, plan.num_classes);
+        run_score_kernel(plan, score_table, input, q, lvl, scores)?;
     }
     if let (Some(mc_input), Some(mc_map), Some(mc_dispatch), Some(dst)) = (
         lvl_bind.mask_coefs,
@@ -1140,14 +1189,11 @@ fn make_outputs_ref<'a>(
     };
     let boxes = prefix(&buffers.boxes, 4);
     let scores = prefix(&buffers.scores, plan.num_classes);
-    let mask_coefs = buffers
-        .mask_coefs
-        .as_ref()
-        .map(|b| prefix(b, plan.num_mask_coefs));
-    let protos = buffers.protos.as_ref().map(|p| match p {
-        ProtoStorage::F32(a) => ProtosView::F32(a.view()),
-        ProtoStorage::F16(a) => ProtosView::F16(a.view()),
+    let mask_coefs = buffers.mask_coefs.as_ref().and_then(|b| match b {
+        Buffer::F32(v) => v.get(..total_anchors * plan.num_mask_coefs),
+        Buffer::F16(_) => None,
     });
+    let protos = buffers.protos.as_ref().map(|p| p.view());
     DecodedOutputsRef {
         boxes,
         scores,

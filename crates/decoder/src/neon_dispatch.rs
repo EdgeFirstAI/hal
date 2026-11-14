@@ -19,6 +19,7 @@
 
 use edgefirst_kernels::CpuFeatures;
 use ndarray::{Array, ArrayView, ArrayView1, ArrayView2, Dimension, ShapeBuilder};
+use num_traits::AsPrimitive;
 use rayon::iter::{
     IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
 };
@@ -33,12 +34,16 @@ mod nms;
 pub(crate) mod semantic;
 
 pub(crate) use modelpack::{channel_argmax, seg_normalize_array, seg_to_u8_array, SplitDecode};
-pub(crate) use nms::{jaccard4_kernel, keep_unflagged, nms_dead, nms_isa};
+pub(crate) use nms::{jaccard4_kernel, keep_unflagged, nms_dead, nms_isa, sort_by_score_desc};
 
 /// Candidate filters over fewer score elements than this run on the calling thread: handing a
 /// few hundred rows to rayon costs more CPU, in waking and then spinning workers, than filtering
 /// them.
 pub(crate) const PAR_MIN_SCORES: usize = 1 << 16;
+
+/// [`PAR_MIN_SCORES`] of the row-major float candidate filters on a NEON tier, where a row
+/// costs tens of nanoseconds and only a dense frame repays the pool.
+pub(crate) const PAR_MIN_ROW_SCORES: usize = 1 << 19;
 
 /// Score rows per rayon task in the row-major candidate scans: one row's argmax is too little
 /// work to split further.
@@ -54,6 +59,7 @@ pub(crate) struct Isa {
     neon: bool,
     fp16: bool,
     dotprod: bool,
+    f16_nms: bool,
 }
 
 impl Isa {
@@ -62,6 +68,7 @@ impl Isa {
         neon: false,
         fp16: false,
         dotprod: false,
+        f16_nms: false,
     };
 
     /// The best instruction set `f` allows on this CPU.
@@ -72,6 +79,7 @@ impl Isa {
                 neon: f.neon_baseline,
                 fp16: f.fp16_usable(),
                 dotprod: f.dotprod_usable(),
+                f16_nms: false,
             }
         }
         #[cfg(not(target_arch = "aarch64"))]
@@ -104,11 +112,47 @@ impl Isa {
         self.fp16
     }
 
+    /// `self` with the NMS overlap tests in FP16 when the FP16 kernels may run.
+    pub(crate) fn with_f16_nms(self) -> Self {
+        Self {
+            f16_nms: self.fp16,
+            ..self
+        }
+    }
+
+    /// Whether NMS runs its overlap tests in FP16.
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    pub(crate) fn f16_nms(self) -> bool {
+        self.f16_nms
+    }
+
     /// Whether the `sdot` kernels may run.
     #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
     pub(crate) fn dotprod(self) -> bool {
         self.dotprod
     }
+}
+
+/// `x` as f32, exactly. An f16 takes one `FCVT` (half to single is part of the aarch64 baseline,
+/// unlike FP16 arithmetic) in place of a call into `half`.
+#[inline(always)]
+pub(crate) fn widen<T: AsPrimitive<f32>>(x: T) -> f32 {
+    #[cfg(target_arch = "aarch64")]
+    if let Some(h) = cast_one::<T, half::f16>(x) {
+        let out: f32;
+        // SAFETY: a register-only conversion every aarch64 CPU has.
+        unsafe {
+            core::arch::asm!(
+                "fmov {t:s}, {bits:w}",
+                "fcvt {t:s}, {t:h}",
+                bits = in(reg) u32::from(h.to_bits()),
+                t = out(vreg) out,
+                options(pure, nomem, nostack, preserves_flags)
+            );
+        }
+        return out;
+    }
+    x.as_()
 }
 
 /// The kernel family a dispatch ran.
@@ -144,7 +188,7 @@ pub(crate) fn cast<T: 'static, U: 'static>(s: &[T]) -> Option<&[U]> {
 
 /// `v` as a `U` when `T` is `U`.
 #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
-fn cast_one<T: Copy + 'static, U: Copy + 'static>(v: T) -> Option<U> {
+pub(crate) fn cast_one<T: Copy + 'static, U: Copy + 'static>(v: T) -> Option<U> {
     cast::<T, U>(std::slice::from_ref(&v)).and_then(|s| s.first().copied())
 }
 

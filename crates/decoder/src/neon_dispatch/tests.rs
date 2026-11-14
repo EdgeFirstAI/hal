@@ -570,3 +570,27 @@ fn column_argmax_is_independent_of_the_thread_count() {
         assert_eq!(runs[0], reference, "{name}");
     }
 }
+
+/// `widen` equals `AsPrimitive::as_` for every f16 bit pattern (NaN payloads aside) and for f32.
+#[test]
+fn widen_is_the_exact_conversion() {
+    for bits in 0..=u16::MAX {
+        let h = half::f16::from_bits(bits);
+        let (got, want) = (widen(h), h.to_f32());
+        if want.is_nan() {
+            assert!(got.is_nan(), "{bits:#x}");
+        } else {
+            assert_eq!(got.to_bits(), want.to_bits(), "{bits:#x}");
+        }
+    }
+    for x in [
+        0.0f32,
+        -0.0,
+        1.5,
+        f32::MAX,
+        f32::MIN_POSITIVE,
+        f32::INFINITY,
+    ] {
+        assert_eq!(widen(x).to_bits(), x.to_bits());
+    }
+}

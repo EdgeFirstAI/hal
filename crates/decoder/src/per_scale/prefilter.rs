@@ -434,6 +434,41 @@ pub(crate) fn select_anchors(
     Ok(())
 }
 
+/// Kept rows the gather prefetches ahead of the one it copies: the rows are scattered through
+/// the level, where the hardware prefetcher does not follow.
+const GATHER_AHEAD: usize = 8;
+
+/// Hint that the cache line at `p` is read soon.
+#[inline(always)]
+fn prefetch<T>(p: *const T) {
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: a prefetch hint accesses no memory and cannot fault, whatever `p` is.
+    unsafe {
+        core::arch::asm!(
+            "prfm pldl1keep, [{p}]",
+            p = in(reg) p,
+            options(nostack, preserves_flags, readonly)
+        );
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    let _ = p;
+}
+
+/// `dst.copy_from_slice(src)` for a row of a few dozen elements: fixed-size pieces compile to
+/// register moves, where a call into `memcpy` per row costs more than the copy.
+#[inline(always)]
+fn copy_row<T: Copy>(dst: &mut [T], src: &[T]) {
+    const PIECE: usize = 16;
+    let mut d = dst.chunks_exact_mut(PIECE);
+    let mut s = src.chunks_exact(PIECE);
+    for (d, s) in (&mut d).zip(&mut s) {
+        d.copy_from_slice(s);
+    }
+    for (d, s) in d.into_remainder().iter_mut().zip(s.remainder()) {
+        *d = *s;
+    }
+}
+
 /// Copy the `row`-element rows of the kept `anchors` out of `input` into
 /// `scratch`, returning an `InputView` over the packed rows.
 pub(crate) fn gather_rows<'s>(
@@ -445,9 +480,14 @@ pub(crate) fn gather_rows<'s>(
     macro_rules! gather {
         ($src:expr, $ensure:ident, $variant:ident) => {{
             let dst = scratch.$ensure(anchors.len() * row);
-            for (out, &a) in dst.chunks_exact_mut(row).zip(anchors) {
+            for (k, (out, &a)) in dst.chunks_exact_mut(row).zip(anchors).enumerate() {
+                if let Some(&ahead) = anchors.get(k + GATHER_AHEAD) {
+                    let next = $src.as_ptr().wrapping_add(ahead as usize * row);
+                    prefetch(next);
+                    prefetch(next.wrapping_add(row.saturating_sub(1)));
+                }
                 let a = a as usize * row;
-                out.copy_from_slice(&$src[a..a + row]);
+                copy_row(out, &$src[a..a + row]);
             }
             InputView::$variant(dst)
         }};

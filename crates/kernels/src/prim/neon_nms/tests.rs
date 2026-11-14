@@ -228,3 +228,157 @@ fn jaccard4_matches_the_scalar_test() {
         }
     }
 }
+
+/// One FP16 operation: every `+`, `−` and `×` of two f16 values is exact in f32 arithmetic up to
+/// one rounding, so rounding the f32 result to f16 rounds the exact result once.
+fn h(x: f32) -> f16 {
+    f16::from_f32(x)
+}
+
+/// The FP16 kernel's test, one rounded operation at a time.
+fn jaccard_f16(a: [f16; 4], b: [f16; 4], iou: f16) -> bool {
+    let [a, b] = [a, b].map(|v| v.map(f16::to_f32));
+    let area = |v: [f32; 4]| h(h(v[2] - v[0]).to_f32() * h(v[3] - v[1]).to_f32()).to_f32();
+    let w = h(a[2].min(b[2]) - a[0].max(b[0])).to_f32().max(0.0);
+    let ht = h(a[3].min(b[3]) - a[1].max(b[1])).to_f32().max(0.0);
+    let inter = h(w * ht).to_f32();
+    let union = h(h(area(b) + area(a)).to_f32() - inter).to_f32();
+    inter > h(iou.to_f32() * union).to_f32()
+}
+
+/// Runs the FP16 kernel on `boxes` padded to a multiple of eight, `pre_dead` boxes flagged.
+fn kernel_fp16(boxes: &[[f16; 4]], iou: f16, cap: usize, pre_dead: &[bool]) -> Vec<bool> {
+    let n = boxes.len();
+    let np = n.next_multiple_of(LANES_FP16);
+    let mut coords = vec![vec![f16::ZERO; np]; 4];
+    for (k, b) in boxes.iter().enumerate() {
+        for c in 0..4 {
+            coords[c][k] = b[c];
+        }
+    }
+    let mut area = vec![f16::ZERO; np];
+    let mut dead: Vec<u16> = (0..np)
+        .map(|k| if k >= n || pre_dead[k] { !0 } else { 0 })
+        .collect();
+    let c = [
+        &coords[0][..],
+        &coords[1][..],
+        &coords[2][..],
+        &coords[3][..],
+    ];
+    // SAFETY: the callers checked FEAT_FP16.
+    assert!(unsafe { nms_greedy_neon_fp16(c, &mut area, iou, cap, &mut dead) });
+    dead[..n].iter().map(|&d| d != 0).collect()
+}
+
+/// The FP16 kernel's flags equal a scalar greedy loop over the same rounded operations, for
+/// every tail up to 333 boxes, clustered, identical, zero-area, inverted, infinite and quiet-NaN
+/// boxes at scales from 1 to 64, six thresholds, four caps and pre-flagged boxes.
+#[test]
+fn fp16_greedy_matches_the_rounded_scalar_loop() {
+    if !std::arch::is_aarch64_feature_detected!("fp16") {
+        crate::test_support::report_skip(
+            "fp16_greedy_matches_the_rounded_scalar_loop needs FEAT_FP16",
+        );
+        return;
+    }
+    let mut rng = Rng(0x0123_4567_89ab_cdef);
+    let counts = [
+        0, 1, 2, 7, 8, 9, 15, 16, 17, 31, 32, 33, 39, 40, 41, 64, 100, 257, 300, 333,
+    ];
+    let ious = [0.0, 0.3, 0.45, 0.5, 0.7, 0.999].map(h);
+    let mut cases = 0;
+    for &n in &counts {
+        for (specials, scale) in [(false, 1.0), (false, 64.0), (true, 40.0)] {
+            let b: Vec<[f16; 4]> = boxes(&mut rng, n, specials)
+                .into_iter()
+                .map(|b| {
+                    b.map(|x| {
+                        // Signalling NaNs are quieted: the model's f32 detour would quiet them.
+                        if x.is_nan() {
+                            f16::NAN
+                        } else {
+                            h(x * scale)
+                        }
+                    })
+                })
+                .collect();
+            let pre_dead: Vec<bool> = (0..n).map(|_| rng.next().is_multiple_of(9)).collect();
+            for &iou in &ious {
+                for cap in [usize::MAX, 0, 1, 10] {
+                    let mut want = pre_dead.clone();
+                    let mut survivors = 0;
+                    for i in 0..n {
+                        if want[i] {
+                            continue;
+                        }
+                        for j in (i + 1)..n {
+                            want[j] |= jaccard_f16(b[j], b[i], iou);
+                        }
+                        survivors += 1;
+                        if survivors >= cap {
+                            break;
+                        }
+                    }
+                    let got = kernel_fp16(&b, iou, cap, &pre_dead);
+                    assert_eq!(got, want, "n {n} specials {specials} iou {iou} cap {cap}");
+                    cases += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(cases, counts.len() * 3 * ious.len() * 4);
+}
+
+/// On boxes whose overlaps are far from the threshold, the FP16 kernel flags the boxes the f32
+/// kernel flags.
+#[test]
+fn fp16_agrees_with_f32_away_from_the_threshold() {
+    if !std::arch::is_aarch64_feature_detected!("fp16") {
+        crate::test_support::report_skip(
+            "fp16_agrees_with_f32_away_from_the_threshold needs FEAT_FP16",
+        );
+        return;
+    }
+    // A 6 x 6 grid of disjoint cells, each holding a box and two near copies of it.
+    let mut b = Vec::new();
+    for cell in 0..36 {
+        let (x, y) = ((cell % 6) as f32 * 10.0, (cell / 6) as f32 * 10.0);
+        for shift in [0.0, 0.25, 0.5] {
+            b.push([x + shift, y + shift, x + 8.0 + shift, y + 8.0 + shift]);
+        }
+    }
+    let f32_dead = kernel(&b, None, 0.5, usize::MAX, &vec![false; b.len()]);
+    let b16: Vec<[f16; 4]> = b.iter().map(|b| b.map(h)).collect();
+    let fp16_dead = kernel_fp16(&b16, h(0.5), usize::MAX, &vec![false; b.len()]);
+    assert_eq!(fp16_dead, f32_dead);
+    assert_eq!(fp16_dead.iter().filter(|&&d| !d).count(), 36);
+}
+
+/// Mismatched lengths or a length not a multiple of eight: `false`, and `dead` untouched.
+#[test]
+fn fp16_invalid_arguments_write_nothing() {
+    if !std::arch::is_aarch64_feature_detected!("fp16") {
+        crate::test_support::report_skip("fp16_invalid_arguments_write_nothing needs FEAT_FP16");
+        return;
+    }
+    let x = [f16::ZERO; 16];
+    for (lens, area_len, dead_len, valid) in [
+        ([16, 16, 16, 16], 16, 16, true),
+        ([12, 12, 12, 12], 12, 12, false),
+        ([16, 8, 16, 16], 16, 16, false),
+        ([16, 16, 16, 16], 8, 16, false),
+        ([8, 8, 8, 8], 8, 16, false),
+    ] {
+        let mut area = vec![f16::ONE; area_len];
+        let mut dead = vec![7u16; dead_len];
+        let c = lens.map(|l| &x[..l]);
+        // SAFETY: FEAT_FP16 was checked above.
+        let ok = unsafe { nms_greedy_neon_fp16(c, &mut area, h(0.5), usize::MAX, &mut dead) };
+        assert_eq!(ok, valid, "{lens:?} {area_len} {dead_len}");
+        if !valid {
+            assert!(dead.iter().all(|&d| d == 7));
+            assert!(area.iter().all(|&a| a == f16::ONE));
+        }
+    }
+}

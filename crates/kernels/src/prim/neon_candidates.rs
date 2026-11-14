@@ -56,6 +56,8 @@ trait Lanes {
     fn ge(a: Self::V, b: Self::V) -> Self::M;
     /// Lanes where `a == b`.
     fn eq(a: Self::V, b: Self::V) -> Self::M;
+    /// Lanes that are non-zero where `a` or `b` is flagged; not itself a lane flag.
+    fn merge(a: Self::M, b: Self::M) -> Self::M;
     /// `m ? a : b` per lane.
     fn select(m: Self::M, a: Self::V, b: Self::V) -> Self::V;
     /// `m ? a : b` per lane.
@@ -158,6 +160,11 @@ macro_rules! int_lanes {
             fn eq(a: $v, b: $v) -> $c {
                 // SAFETY: as above.
                 unsafe { $eq(a, b) }
+            }
+            #[inline(always)]
+            fn merge(a: $c, b: $c) -> $c {
+                // SAFETY: as above; `BSL` with `a` as its own mask is `a | b`.
+                unsafe { $cbsl(a, a, b) }
             }
             #[inline(always)]
             fn select(m: $c, a: $v, b: $v) -> $v {
@@ -289,6 +296,13 @@ impl Lanes for F32 {
         unsafe { vceqq_f32(a, b) }
     }
     #[inline(always)]
+    fn merge(a: uint32x4_t, b: uint32x4_t) -> uint32x4_t {
+        // An add, not an OR: LLVM folds the OR of two float compares into one compare of
+        // `FMAXNM`, which is NaN for a signalling NaN and loses the other lane's flag.
+        // SAFETY: as above.
+        unsafe { vaddq_u32(a, b) }
+    }
+    #[inline(always)]
     fn select(m: uint32x4_t, a: float32x4_t, b: float32x4_t) -> float32x4_t {
         // SAFETY: as above.
         unsafe { vbslq_f32(m, a, b) }
@@ -359,6 +373,10 @@ impl Lanes for F16Widened {
     #[inline(always)]
     fn eq(a: Self::V, b: Self::V) -> Self::M {
         [F32::eq(a[0], b[0]), F32::eq(a[1], b[1])]
+    }
+    #[inline(always)]
+    fn merge(a: Self::M, b: Self::M) -> Self::M {
+        [F32::merge(a[0], b[0]), F32::merge(a[1], b[1])]
     }
     #[inline(always)]
     fn select(m: Self::M, a: Self::V, b: Self::V) -> Self::V {
@@ -434,6 +452,11 @@ impl Lanes for F16Native {
     fn eq(a: uint16x8_t, b: uint16x8_t) -> uint16x8_t {
         // SAFETY: as `gt`.
         unsafe { fcmeq_f16x8(a, b) }
+    }
+    #[inline(always)]
+    fn merge(a: uint16x8_t, b: uint16x8_t) -> uint16x8_t {
+        // SAFETY: NEON is part of the aarch64 baseline.
+        unsafe { vorrq_u16(a, b) }
     }
     #[inline(always)]
     fn select(m: uint16x8_t, a: uint16x8_t, b: uint16x8_t) -> uint16x8_t {
@@ -617,12 +640,32 @@ fn row_argmax<L: Lanes>(row: &[L::T]) -> Option<(L::T, usize)> {
 fn ge_indices<L: Lanes>(src: &[L::T], threshold: L::T, mut hit: impl FnMut(usize)) {
     let thr = L::splat(threshold);
     let width = (64 / L::N) as u32;
-    let mut chunks = src.chunks_exact(L::N);
+    // Four vectors share one test: moving flags to a general register costs more than the
+    // compare, and most blocks hold no hit.
+    let mut blocks = src.chunks_exact(4 * L::N);
+    for (k, block) in (&mut blocks).enumerate() {
+        let p = block.as_ptr();
+        // SAFETY: the block holds `4 * N` scores.
+        let m = [0, 1, 2, 3].map(|v| L::ge(unsafe { L::load(p.add(v * L::N)) }, thr));
+        if L::bits(L::merge(L::merge(m[0], m[1]), L::merge(m[2], m[3]))) == 0 {
+            continue;
+        }
+        for (v, m) in m.into_iter().enumerate() {
+            for lane in (SetLanes {
+                bits: L::bits(m),
+                width,
+            }) {
+                hit((4 * k + v) * L::N + lane);
+            }
+        }
+    }
+    let blocks_done = src.len() - blocks.remainder().len();
+    let mut chunks = blocks.remainder().chunks_exact(L::N);
     for (k, chunk) in (&mut chunks).enumerate() {
         // SAFETY: the chunk holds `N` scores.
         let bits = L::bits(L::ge(unsafe { L::load(chunk.as_ptr()) }, thr));
         for lane in (SetLanes { bits, width }) {
-            hit(k * L::N + lane);
+            hit(blocks_done + k * L::N + lane);
         }
     }
     let done = src.len() - chunks.remainder().len();

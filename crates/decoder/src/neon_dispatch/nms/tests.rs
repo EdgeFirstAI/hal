@@ -178,41 +178,145 @@ fn nms_matches_the_scalar_tier_on_every_tier() {
     }
 }
 
-/// Every NEON tier runs the NMS kernel for class-agnostic and class-aware boxes; the scalar
-/// tier and labels above `u32::MAX` leave it to the scalar loop.
+/// Every NEON tier runs the NMS kernel for class-agnostic and class-aware boxes and the scalar
+/// tier leaves it to the scalar loop. Among at most `SMALL_NMS_BOXES` a label above `u32::MAX`
+/// runs scalar; above it, labels too sparse for the counting sort flag the boxes dense labels do.
 #[test]
 fn every_neon_tier_runs_the_nms_kernel() {
     let mut rng = Rng(42);
-    let boxes = float_boxes(&mut rng, 37, false);
+    let small = float_boxes(&mut rng, 37, false);
+    let large = float_boxes(&mut rng, 2 * SMALL_NMS_BOXES + 9, false);
+    let sparse = |b: &DetectBox| b.label * (u32::MAX as usize) + 7;
     for (name, isa) in tiers() {
-        for class_aware in [false, true] {
-            let r = nms_dead(
+        let run = |boxes: &[DetectBox], class_aware: bool, label: &dyn Fn(&DetectBox) -> usize| {
+            nms_dead(
                 isa,
-                &boxes,
+                boxes,
                 |b| &b.bbox,
                 class_aware,
-                |b| b.label,
+                label,
                 |b| b.score < 0.0,
+                |b| b.score >= 0.0,
                 0.5,
                 usize::MAX,
-            );
-            assert_eq!(
-                r.is_some(),
-                !isa.is_scalar(),
-                "{name} class_aware {class_aware}"
-            );
+            )
+        };
+        for boxes in [&small, &large] {
+            for class_aware in [false, true] {
+                let r = run(boxes, class_aware, &|b| b.label);
+                assert_eq!(
+                    r.is_some(),
+                    !isa.is_scalar(),
+                    "{name} n {} class_aware {class_aware}",
+                    boxes.len()
+                );
+            }
         }
-        let r = nms_dead(
-            isa,
-            &boxes,
-            |b| &b.bbox,
-            true,
-            |b| b.label + u32::MAX as usize,
-            |b| b.score < 0.0,
-            0.5,
-            usize::MAX,
+        assert!(
+            run(&small, true, &sparse).is_none(),
+            "{name}: small, sparse"
         );
-        assert!(r.is_none(), "{name}: a label above u32::MAX runs scalar");
+        assert_eq!(
+            run(&large, true, &sparse),
+            run(&large, true, &|b| b.label),
+            "{name}: large, sparse"
+        );
+    }
+}
+
+/// `sort_by_score_desc` is the stable descending sort in IEEE total order: NaN of either sign,
+/// infinities, signed zeros and ties included, for sizes on both sides of the parallel cut.
+#[test]
+fn score_sort_is_the_stable_total_order_sort() {
+    let mut rng = Rng(0xfeed_beef);
+    for n in [
+        0,
+        1,
+        2,
+        3,
+        17,
+        300,
+        PAR_SORT_MIN_BOXES,
+        PAR_SORT_MIN_BOXES + 13,
+    ] {
+        let mut boxes: Vec<(f32, usize)> = (0..n)
+            .map(|k| {
+                let score = match rng.next() % 12 {
+                    0 => f32::NAN,
+                    1 => -f32::NAN,
+                    2 => f32::INFINITY,
+                    3 => f32::NEG_INFINITY,
+                    4 => 0.0,
+                    5 => -0.0,
+                    6 => 0.5,
+                    7 => -0.5,
+                    _ => rng.unit() - 0.5,
+                };
+                (score, k)
+            })
+            .collect();
+        let mut want = boxes.clone();
+        want.sort_by(|a, b| b.0.total_cmp(&a.0));
+        sort_by_score_desc(&mut boxes, |b| b.0);
+        let bits = |v: &[(f32, usize)]| v.iter().map(|b| (b.0.to_bits(), b.1)).collect::<Vec<_>>();
+        assert_eq!(bits(&boxes), bits(&want), "n {n}");
+    }
+}
+
+/// FP16 overlap tests flag the boxes the f32 tests flag when no overlap is near the threshold,
+/// at pixel and normalized scales, and non-finite coordinates take the f32 tests.
+#[test]
+fn f16_nms_agrees_with_f32_away_from_the_threshold() {
+    for (name, isa) in tiers() {
+        if !isa.fp16() {
+            continue;
+        }
+        assert!(isa.with_f16_nms().f16_nms() && !isa.f16_nms(), "{name}");
+        for scale in [1.0 / 640.0, 1.0, 3.0] {
+            // Disjoint cells, each holding a box and two near copies of it; two labels, so a
+            // class-aware pass is long enough for the FP16 tests.
+            let mut boxes = Vec::new();
+            for cell in 0..144 {
+                let (x, y) = ((cell % 12) as f32 * 100.0, (cell / 12) as f32 * 100.0);
+                for (k, shift) in [0.0, 2.0, 4.0].into_iter().enumerate() {
+                    let c = |v: f32| (v + shift) * scale;
+                    boxes.push(DetectBox {
+                        bbox: BoundingBox::new(c(x), c(y), c(x + 64.0), c(y + 64.0)),
+                        score: 1.0 - (3 * cell + k) as f32 / 2000.0,
+                        label: cell % 2,
+                    });
+                }
+            }
+            sort_by_score_desc(&mut boxes, |b| b.score);
+            for class_aware in [false, true] {
+                let run = |isa: Isa, boxes: &[DetectBox]| {
+                    nms_dead(
+                        isa,
+                        boxes,
+                        |b| &b.bbox,
+                        class_aware,
+                        |b| b.label,
+                        |_| false,
+                        |_| true,
+                        0.5,
+                        usize::MAX,
+                    )
+                };
+                let f32_dead = run(isa, &boxes);
+                assert_eq!(run(isa.with_f16_nms(), &boxes), f32_dead, "{name} {scale}");
+                let kept = f32_dead.map(|d| d.iter().filter(|&&d| !d).count());
+                assert_eq!(kept, Some(144), "{name} {scale}");
+
+                let mut special = boxes.clone();
+                special[5].bbox.xmax = f32::NAN;
+                special[40].bbox.ymin = f32::INFINITY;
+                assert_eq!(
+                    run(isa.with_f16_nms(), &special),
+                    run(isa, &special),
+                    "{name} {scale}: non-finite coordinates"
+                );
+            }
+        }
     }
 }
 
@@ -235,6 +339,7 @@ fn small_nms_runs_the_scalar_loop() {
                 false,
                 |b| b.label,
                 |_| false,
+                |_| true,
                 0.5,
                 usize::MAX,
             )
