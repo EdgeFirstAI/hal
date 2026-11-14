@@ -117,39 +117,54 @@ def test_texture_import_and_module_device():
             )
 
 
+DXGI_FORMAT_R8_UNORM = 61
+DXGI_FORMAT_NV12 = 103
+
+
 @windows_only
 @pytest.mark.gpu
-def test_semi_planar_accepts_either_shape_spelling():
-    """NV12 640x480 allocates 720 combined rows but addresses a 480-row grid.
+@pytest.mark.parametrize(
+    ("width", "dxgi_format", "texture_height"),
+    [
+        # Even sizes are native two-plane NV12 textures of the image's size.
+        (640, DXGI_FORMAT_NV12, 480),
+        # An odd width keeps the combined R8 plane, 1.5 times as tall.
+        (639, DXGI_FORMAT_R8_UNORM, 720),
+    ],
+)
+def test_semi_planar_accepts_either_shape_spelling(width, dxgi_format, texture_height):
+    """NV12 at 480 rows has 720 combined rows but addresses a 480-row grid.
 
     Nothing in a rank-2 shape distinguishes the two, so the constructors read
-    the dimensions off the texture and accept either spelling of them. A
-    third rank-2 shape that is neither is an argument error.
+    the dimensions off the texture and accept either spelling of them, for a
+    native NV12 texture and a combined R8 one alike. A third rank-2 shape
+    that is neither is an argument error.
     """
     if not is_gpu_buffer_available():
         pytest.skip("no D3D11 device")
-    t = Tensor.image(640, 480, PixelFormat.Nv12, TensorMemory.DMABUF, "readwrite")
+    t = Tensor.image(width, 480, PixelFormat.Nv12, TensorMemory.DMABUF, "readwrite")
     assert t.d3d11_texture()
-    assert t.d3d11_layout().texture_height == 720
+    layout = t.d3d11_layout()
+    assert (layout.dxgi_format, layout.texture_height) == (dxgi_format, texture_height)
     with t.map() as m:
         np.asarray(memoryview(m))[0, :4] = [11, 22, 33, 44]
 
     h = t.d3d11_shared_handle()
     try:
-        for shape in ([720, 640], [480, 640]):
+        for shape in ([720, width], [480, width]):
             again = Tensor.from_d3d11_shared_handle(
                 h, shape, "uint8", PixelFormat.Nv12, "read"
             )
             # Both spellings recover the image the texture holds, not the
-            # 320-row one a shape-derived reading of [480, 640] would infer.
-            assert (again.width, again.height) == (640, 480), f"shape {shape}"
+            # 320-row one a shape-derived reading of [480, w] would infer.
+            assert (again.width, again.height) == (width, 480), f"shape {shape}"
             with again.map("read") as m:
                 first = list(np.asarray(memoryview(m))[0, :4])
             assert first == [11, 22, 33, 44], f"shape {shape}"
         # 479 rows is neither the combined plane height nor the luma height.
         with pytest.raises(ValueError):
             Tensor.from_d3d11_shared_handle(
-                h, [479, 640], "uint8", PixelFormat.Nv12, "read"
+                h, [479, width], "uint8", PixelFormat.Nv12, "read"
             )
     finally:
         _close(h)
