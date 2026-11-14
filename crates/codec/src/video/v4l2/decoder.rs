@@ -507,6 +507,7 @@ impl V4l2Decoder {
             }
             Err(e) => return Err(e),
         };
+        self.check_grant(capture.slots.len(), want, min)?;
         // An allocated pool is new memory and never leased.
         let free: Vec<u32> = (0..capture.slots.len() as u32)
             .filter(|&i| !self.leased(i))
@@ -529,6 +530,7 @@ impl V4l2Decoder {
             );
             stream.m2m.capture_mut().free().map_err(device_error)?;
             capture.slots = self.export(&layout, colorimetry, want)?;
+            self.check_grant(capture.slots.len(), want, min)?;
             let stream = self.stream.as_mut().expect("streaming");
             enqueue_capture(&stream.m2m, &capture, free[0])?;
         }
@@ -567,6 +569,30 @@ impl V4l2Decoder {
         self.info = Some(info.clone());
         self.pending.push_back(DecodeEvent::Reconfigured(info));
         Ok(())
+    }
+
+    /// Refuses a capture queue of fewer buffers than the pool needs.
+    ///
+    /// A device may grant fewer than requested: it caps the count, or, as
+    /// Wave6 does above its maximum of 31, falls back to its minimum. Going
+    /// on would let the caller hold fewer frames than it asked for, found
+    /// out only as `PoolExhausted` partway through the stream.
+    fn check_grant(&self, granted: usize, want: usize, min: usize) -> Result<()> {
+        if granted >= want {
+            return Ok(());
+        }
+        Err(CodecError::InvalidConfig(match &self.pool {
+            OutputPool::Allocate { count } => format!(
+                "{} granted {granted} capture buffers where a pool of {count} needs {want} \
+                 ({min} the device keeps, one to decode into); ask for fewer frames",
+                self.path
+            ),
+            OutputPool::Provided(pool) => format!(
+                "{} takes only {granted} of the {} provided buffers; provide at most {granted}",
+                self.path,
+                pool.len()
+            ),
+        }))
     }
 
     /// Allocates DMA-BUFs for the pool and has the device import them.

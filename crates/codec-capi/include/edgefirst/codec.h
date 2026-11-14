@@ -995,6 +995,10 @@ const struct ef_video_encoder_info *ef_video_encoder_get_info(struct ef_video_en
  * `pool_count` is the frames the caller may hold at once, 4 if 0; the
  * device's own reference pictures and one buffer to decode into are added
  * to it.
+ * A V4L2 device takes a bounded number of buffers (31 on the i.MX 95's
+ * Wave6, its own included); a count beyond that makes
+ * [`ef_video_decoder_decode`] fail with `EINVAL` once the stream's format is
+ * known.
  *
  * Platforms: Linux (V4L2 memory-to-memory decoders), Windows (Media
  * Foundation: Microsoft's H.264 decoder with DXVA, and MJPEG decoders).

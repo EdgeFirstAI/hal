@@ -406,6 +406,44 @@ fn rejects_a_provided_pool_too_small_for_the_stream() {
     assert!(matches!(err, CodecError::InvalidConfig(_)), "{err}");
 }
 
+/// A pool larger than the device takes is refused, not quietly shrunk. 40
+/// held frames is more than the i.MX 95's Wave6 takes (31 buffers in all),
+/// and Wave6 answers such a request with its minimum, which left a caller
+/// able to hold one frame.
+#[test]
+fn a_pool_the_device_cannot_cover_is_refused() {
+    let count = 40;
+    let Some(mut decoder) = open(
+        "a_pool_the_device_cannot_cover_is_refused",
+        DecoderConfig::h264().with_output(OutputPool::Allocate { count }),
+    ) else {
+        return;
+    };
+    let stream = testdata(MAIN_BFRAMES_FILE);
+    for (i, au) in access_units(&stream).enumerate() {
+        match decoder.decode(au, i as u64) {
+            Ok(events) => {
+                for event in events {
+                    if let DecodeEvent::Reconfigured(info) = event {
+                        assert!(
+                            info.buffers > count,
+                            "{} buffers cannot let the caller hold {count} frames",
+                            info.buffers
+                        );
+                        return;
+                    }
+                }
+            }
+            Err(CodecError::InvalidConfig(why)) => {
+                assert!(why.contains("granted"), "{why}");
+                return;
+            }
+            Err(e) => panic!("{e}"),
+        }
+    }
+    panic!("the stream never reported its format");
+}
+
 #[test]
 fn a_small_pool_recycles_dropped_frames() {
     let Some(mut decoder) = open(

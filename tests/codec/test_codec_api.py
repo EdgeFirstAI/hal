@@ -137,16 +137,28 @@ def decode_all(decoder, units):
 
 def test_a_stream_decodes_into_tensor_frames():
     units = codec.access_units((TESTDATA / "h264_1080p_main_bframes.h264").read_bytes())
-    decoder = open_or_skip(lambda: VideoDecoder(Codec.H264, pool=len(units) + 2))
-    events = decode_all(decoder, units)
-    assert isinstance(events[0], StreamInfo), events[:2]
-    info = events[0]
+    decoder = open_or_skip(lambda: VideoDecoder(Codec.H264))
+    # Only the first frame is kept, so the default pool recycles the rest.
+    infos, pts, f = [], [], None
+
+    def take(events):
+        nonlocal f
+        for event in events:
+            if isinstance(event, StreamInfo):
+                infos.append(event)
+            else:
+                pts.append(event.pts)
+                f = f or event
+
+    for i, unit in enumerate(units):
+        take(decoder.decode(unit, i))
+    take(decoder.flush())
+    assert len(infos) == 1, infos
+    info = infos[0]
     assert (info.width, info.height) == (1920, 1080)
     assert info.format == PixelFormat.Nv12
     assert decoder.stream_info.width == 1920
-    frames = [e for e in events if isinstance(e, Frame)]
-    assert sorted(f.pts for f in frames) == list(range(len(units)))
-    f = frames[0]
+    assert sorted(pts) == list(range(len(units)))
     assert isinstance(f, Tensor)
     assert (f.width, f.height, f.format) == (1920, 1080, PixelFormat.Nv12)
     with f.map("read") as m:

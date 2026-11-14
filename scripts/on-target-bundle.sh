@@ -17,9 +17,11 @@
 #
 # tests bundle:
 #   bin/                  the Rust test binaries of CRATES
-#   target/debug/         the C-API libraries, their .so.0 names, and
-#                         the G3 two-library-user binary
+#   target/debug/         the C-API libraries, their .so.0 names, the G3
+#                         two-library-user binary and test_codec_api
 #   crates/*-capi/        src/ and include/, which check-single-home.sh reads
+#   python/, tests/codec  with PYTHON_WHEELS: the unpacked wheels and the
+#                         Python codec tests
 #   scripts/              on-target-run.sh, check-single-home.sh,
 #                         dma-heap-setup.sh
 #   testdata/             testdata/ merged with every crates/*/testdata
@@ -39,6 +41,10 @@
 #                 project floor; see README "Toolchain and Platform Floors")
 #   TESTDATA      1 to include testdata/ (default: 1). scripts/on-target-test.sh
 #                 passes its SYNC_TESTDATA here.
+#   PYTHON_WHEELS tests: a directory of aarch64 wheels (edgefirst-tensor,
+#                 edgefirst-codec, pytest and its dependencies) to bundle with
+#                 the Python codec tests (default: none, and the board skips
+#                 them)
 
 set -euo pipefail
 
@@ -60,6 +66,7 @@ CAPI_CRATES="${CAPI_CRATES:-tensor-capi image-capi codec-capi decoder-capi track
 GLIBC="${GLIBC:-2.35}"
 FEATURES="${FEATURES:-}"
 TESTDATA="${TESTDATA:-1}"
+PYTHON_WHEELS="${PYTHON_WHEELS:-}"
 TRIPLE="${ARCH}-unknown-linux-gnu.${GLIBC}"
 LOGS="${ROOT}/target/on-target-bundle-logs"
 mkdir -p "${LOGS}"
@@ -211,6 +218,41 @@ build_libs() {
     tail -30 "${g3log}" >&2
     return 1
   fi
+
+  # The codec C API end to end -- capabilities, JPEG, and an H.264 stream
+  # encoded and decoded on the board's own engines -- with the flags the
+  # codec-capi test harness uses on a build host.
+  local codeclog="${LOGS}/libbuild-codec-api-${ARCH}.log"
+  if ! zig cc -std=c11 -Wall -Wextra -Werror -target "${ARCH}-linux-gnu.${GLIBC}" \
+        -o "${outdir}/test_codec_api" \
+        crates/codec-capi/tests/c/test_codec_api.c \
+        -Icrates/codec-capi/include -Icrates/tensor-capi/include \
+        -L"${outdir}" -ledgefirst_codec -ledgefirst_tensor \
+        -Wl,-rpath,'$ORIGIN' \
+        > "${codeclog}" 2>&1; then
+    echo "BUILD FAILED for test_codec_api (${TRIPLE}); last lines of ${codeclog}:" >&2
+    tail -30 "${codeclog}" >&2
+    return 1
+  fi
+  return 0
+}
+
+# The Python codec tests, from wheels built for the board (the hardware-test
+# workflow builds them natively on an aarch64 runner). The wheels -- the
+# edgefirst packages and pytest with its pure-Python dependencies -- are
+# unpacked into python/, which the board puts on PYTHONPATH, so nothing is
+# installed on the board.
+bundle_python() {
+  local wheels="$1" w
+  echo "==> unpacking the Python wheels from ${wheels}"
+  mkdir -p "${OUT}/python" "${OUT}/tests"
+  for w in "${wheels}"/*.whl; do
+    [[ -e "${w}" ]] || { echo "no wheels in ${wheels}" >&2; return 1; }
+    python3 -m zipfile -e "${w}" "${OUT}/python"
+    echo "    $(basename "${w}")"
+  done
+  cp tests/__init__.py tests/conftest.py "${OUT}/tests/"
+  cp -a tests/codec "${OUT}/tests/"
   return 0
 }
 
@@ -249,13 +291,16 @@ if [[ "${MODE}" == tests ]]; then
   libdir="target/${ARCH}-unknown-linux-gnu/debug"
   mkdir -p "${OUT}/target/debug"
   cp -a "${libdir}"/libedgefirst_*.so "${libdir}"/libedgefirst_*.so.0 \
-        "${libdir}/test_two_library_user" "${OUT}/target/debug/"
+        "${libdir}/test_two_library_user" "${libdir}/test_codec_api" "${OUT}/target/debug/"
   for c in ${CAPI_CRATES}; do
     mkdir -p "${OUT}/crates/${c}"
     cp -a "crates/${c}/src" "crates/${c}/include" "${OUT}/crates/${c}/"
   done
   cp scripts/on-target-run.sh scripts/check-single-home.sh \
      .github/scripts/dma-heap-setup.sh "${OUT}/scripts/"
+  if [[ -n "${PYTHON_WHEELS}" ]]; then
+    bundle_python "${PYTHON_WHEELS}"
+  fi
 else
   build_benches
   while IFS= read -r bin; do
