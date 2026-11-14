@@ -5,6 +5,7 @@ mirrors the pymodule registrations in crates/python-codec/src/lib.rs.
 """
 
 import enum
+from collections.abc import Sequence
 
 # Re-exported from `edgefirst.tensor` (a hard dependency of this package), so
 # `edgefirst.codec.PixelFormat` names the same enum a caller already has. The
@@ -199,7 +200,10 @@ class Tensor(_BaseTensor):
             EXIF rotation_degrees / flip_horizontal.
 
         Raises:
-            RuntimeError: If the tensor is too small or the dtype is unsupported.
+            InvalidDataError: The data is not a decodable image.
+            UnsupportedError: An image feature or destination type the
+                decoder does not support.
+            CodecError: The tensor is too small for the image.
             PermissionError: If the tensor's declared CPU access does not
                 cover the CPU decode's write.
         """
@@ -219,7 +223,10 @@ class Tensor(_BaseTensor):
             EXIF rotation_degrees / flip_horizontal.
 
         Raises:
-            RuntimeError: If the tensor is too small or the dtype is unsupported.
+            InvalidDataError: The data is not a decodable image.
+            UnsupportedError: An image feature or destination type the
+                decoder does not support.
+            CodecError: The tensor is too small for the image.
             PermissionError: If the tensor's declared CPU access does not
                 cover the CPU decode's write.
         """
@@ -255,7 +262,10 @@ def decode_into(tensor: EdgeFirstTensorExportable, data: bytes) -> ImageInfo:
         EXIF rotation_degrees / flip_horizontal.
 
     Raises:
-        RuntimeError: If the tensor is too small or the dtype is unsupported.
+        InvalidDataError: The data is not a decodable image.
+        UnsupportedError: An image feature or destination type the decoder
+            does not support.
+        CodecError: The tensor is too small for the image.
         PermissionError: If the tensor's declared CPU access does not cover
             the CPU decode's write.
         TypeError: If ``tensor`` does not implement the
@@ -276,9 +286,468 @@ def decode_file_into(tensor: EdgeFirstTensorExportable, filename: str) -> ImageI
         EXIF rotation_degrees / flip_horizontal.
 
     Raises:
-        RuntimeError: If the tensor is too small or the dtype is unsupported.
+        InvalidDataError: The data is not a decodable image.
+        UnsupportedError: An image feature or destination type the decoder
+            does not support.
+        CodecError: The tensor is too small for the image.
         PermissionError: If the tensor's declared CPU access does not cover
             the CPU decode's write.
         TypeError: If ``tensor`` does not implement the
             ``__edgefirst_tensor__`` protocol.
     """
+
+# --- Engines and capabilities ----------------------------------------------
+
+class CodecError(RuntimeError):
+    """A codec failure. Each kind below is a subclass.
+
+    A refused CPU access is raised as ``PermissionError`` and a missing file
+    as ``FileNotFoundError`` instead.
+    """
+
+class NoDeviceError(CodecError):
+    """No engine or device here for the request."""
+
+class UnsupportedError(CodecError):
+    """The engine exists, but not for this codec, format or feature."""
+
+class PoolExhaustedError(CodecError):
+    """Every frame of the decoder's pool is held: release frames and decode
+    the same access unit again."""
+
+class CodecTimeoutError(CodecError):
+    """The device did not finish in time."""
+
+class InvalidConfigError(CodecError):
+    """A configuration the engine cannot open, or a provided pool it cannot
+    use."""
+
+class InvalidInputError(CodecError):
+    """A bad argument or source picture."""
+
+class InvalidDataError(CodecError):
+    """Compressed data the decoder cannot parse."""
+
+class Codec(enum.Enum):
+    """A compressed image or video format. ``str()`` gives its name, for
+    example ``"H.264"``."""
+
+    Jpeg: Codec
+    """JPEG still images."""
+    Png: Codec
+    """PNG still images."""
+    H264: Codec
+    """H.264, as an Annex B byte stream."""
+    Hevc: Codec
+    """HEVC. No engine runs it yet."""
+    Mjpeg: Codec
+    """Motion JPEG: a stream of JPEG pictures."""
+    Vp8: Codec
+    """VP8. No engine runs it yet."""
+    Vp9: Codec
+    """VP9. No engine runs it yet."""
+    Av1: Codec
+    """AV1. No engine runs it yet."""
+
+class Engine(enum.Enum):
+    """What runs a codec. ``str()`` gives the name ``EDGEFIRST_CODEC_ENGINE``
+    uses, for example ``"media-foundation"``.
+
+    ``Engine.Auto`` takes the first engine that can do the request; the
+    environment variable ``EDGEFIRST_CODEC_ENGINE`` (engine names,
+    comma-separated) narrows and orders that choice. An engine named
+    explicitly is used alone.
+    """
+
+    Auto: Engine
+    """The first engine that can do the request, in the platform's order."""
+    V4l2: Engine
+    """Linux V4L2 memory-to-memory devices."""
+    MediaFoundation: Engine
+    """Windows Media Foundation transforms."""
+    VideoToolbox: Engine
+    """Apple VideoToolbox. No backend runs it yet."""
+    NvJpeg: Engine
+    """NVIDIA nvJPEG (JPEG decoding on Linux)."""
+    Cpu: Engine
+    """The CPU, for still images only."""
+
+    @staticmethod
+    def from_name(name: str) -> Engine:
+        """The engine a name stands for, as ``EDGEFIRST_CODEC_ENGINE`` spells
+        it (``"v4l2"``, ``"mf"``, ``"cpu"``, ...).
+
+        Raises:
+            ValueError: An unknown name.
+        """
+
+class Direction(enum.Enum):
+    """Encoding or decoding."""
+
+    Encode: Direction
+    """Images to compressed data."""
+    Decode: Direction
+    """Compressed data to images."""
+
+class Transfer(enum.Enum):
+    """How pictures move between tensors and the engine."""
+
+    ZeroCopy: Transfer
+    """The engine reads or writes the tensors' own memory."""
+    GpuCopy: Transfer
+    """One copy on the GPU, with no CPU access to the pixels."""
+    CpuCopy: Transfer
+    """The pixels pass through the CPU."""
+
+class Capability:
+    """What one engine does with one codec in one direction."""
+
+    engine: Engine
+    """The engine."""
+    device: str
+    """The device within the engine: a device node, a transform's name, or
+    ``"cpu"``."""
+    codec: Codec
+    """The compressed format."""
+    direction: Direction
+    """Encoding or decoding."""
+    hardware: bool
+    """Whether the work runs on dedicated hardware rather than the CPU."""
+    formats: list[PixelFormat]
+    """The pixel formats an encoder takes or a decoder produces."""
+    transfer: Transfer
+    """How pictures move in the best case."""
+
+def capabilities() -> list[Capability]:
+    """What the codec engines on this machine can do, engine by engine, in
+    the order ``Engine.Auto`` tries them.
+
+    Probing opens no stream, but it opens device nodes and enumerates (on
+    Windows, activates) transforms, so it is not free: call it once.
+    """
+
+# --- Still-image encoding --------------------------------------------------
+
+class ImageEncoder:
+    """Encodes tensors as still images: JPEG.
+
+    Under ``Engine.Auto`` a V4L2 JPEG encoder takes DMA-BUF sources it can
+    read and the CPU takes the rest. The CPU encodes ``uint8`` NV12, NV16,
+    YUYV, GREY, RGB and RGBA images at any row stride.
+    """
+
+    quality: int
+    """JPEG quality, 1 (smallest) to 100 (best). Setting a value outside that
+    range raises ``InvalidConfigError``."""
+    engine: Engine
+    """The engine selected: ``Engine.Auto`` or one engine used alone."""
+
+    def __init__(
+        self,
+        codec: Codec = ...,
+        *,
+        quality: int | None = None,
+        engine: Engine = ...,
+    ) -> None:
+        """
+        Args:
+            codec: The format to write. Only ``Codec.Jpeg`` is encoded.
+            quality: JPEG quality, 1 (smallest) to 100 (best); 85 when
+                omitted.
+            engine: ``Engine.Auto``, ``Engine.Cpu`` or ``Engine.V4l2``.
+
+        Raises:
+            UnsupportedError: A codec with no encoder.
+            InvalidConfigError: A quality outside 1 to 100.
+        """
+
+    def encode(self, src: EdgeFirstTensorExportable) -> bytes:
+        """Encodes ``src``, an image tensor from any ``edgefirst`` package,
+        and returns the file's bytes.
+
+        Raises:
+            PermissionError: The CPU must read a tensor not declared readable.
+            UnsupportedError: No engine takes the source's format or type.
+            InvalidInputError: A bad source, for example an odd-width YUYV
+                image.
+            NoDeviceError: The engine selected by name is not present.
+        """
+
+# --- Video -------------------------------------------------------------------
+
+class H264Profile(enum.Enum):
+    """H.264 profile (ITU-T H.264 Annex A)."""
+
+    Baseline: H264Profile
+    ConstrainedBaseline: H264Profile
+    Main: H264Profile
+    High: H264Profile
+
+class H264Level(enum.Enum):
+    """H.264 level (ITU-T H.264 Table A-1): ``L4_1`` is level 4.1."""
+
+    L1_0: H264Level
+    L1b: H264Level
+    L1_1: H264Level
+    L1_2: H264Level
+    L1_3: H264Level
+    L2_0: H264Level
+    L2_1: H264Level
+    L2_2: H264Level
+    L3_0: H264Level
+    L3_1: H264Level
+    L3_2: H264Level
+    L4_0: H264Level
+    L4_1: H264Level
+    L4_2: H264Level
+    L5_0: H264Level
+    L5_1: H264Level
+    L5_2: H264Level
+    L6_0: H264Level
+    L6_1: H264Level
+    L6_2: H264Level
+
+class EncodedFrame:
+    """One encoded access unit. ``len()`` gives its size in bytes."""
+
+    data: bytes
+    """The access unit: Annex B NAL units for H.264, a JPEG file for MJPEG."""
+    keyframe: bool
+    """Whether it is a key frame (an IDR picture for H.264)."""
+    pts: int
+    """The ``pts`` of the source picture it encodes."""
+
+    def __len__(self) -> int: ...
+
+class EncoderInfo:
+    """What an open encoder runs on and how sources reach it."""
+
+    engine: Engine
+    """The engine."""
+    device: str
+    """The device: a device node or a transform's name."""
+    hardware: bool
+    """Whether it encodes on dedicated hardware."""
+    transfer: Transfer
+    """How sources reach it, for a source in the memory it prefers."""
+
+class VideoEncoder:
+    """Encodes image tensors into an H.264 or MJPEG stream on hardware.
+
+    There is no software video encoder: where no engine runs the codec,
+    opening fails.
+
+    Platforms:
+        Linux: V4L2 memory-to-memory encoders; DMA-BUF sources are read in
+        place.
+        Windows: Media Foundation; D3D11 sources are read in place.
+        Elsewhere opening fails with ``NoDeviceError``.
+    """
+
+    def __init__(
+        self,
+        codec: Codec,
+        width: int,
+        height: int,
+        format: PixelFormat,
+        frame_rate: float,
+        *,
+        engine: Engine = ...,
+        bitrate: int | None = None,
+        gop: int | None = None,
+        repeat_headers: bool = True,
+        profile: H264Profile | None = None,
+        level: H264Level | None = None,
+        quality: int | None = None,
+    ) -> None:
+        """Opens an encoder.
+
+        Args:
+            codec: ``Codec.H264`` or ``Codec.Mjpeg``.
+            width: Picture width in pixels.
+            height: Picture height in pixels.
+            format: The sources' pixel format, for example
+                ``PixelFormat.Nv12``.
+            frame_rate: Frames per second, for rate control.
+            engine: ``Engine.Auto`` or one engine used alone.
+            bitrate: Target bits per second; chosen from size and rate when
+                omitted.
+            gop: Frames from one key frame to the next; the device's default
+                when omitted.
+            repeat_headers: Repeat SPS and PPS before every key frame.
+            profile: H.264 profile; High when omitted.
+            level: H.264 level; the lowest that covers the stream when
+                omitted.
+            quality: MJPEG quality, 1 to 100; 85 when omitted.
+
+        Raises:
+            NoDeviceError: There is no encoder.
+            UnsupportedError: No engine here encodes the codec or format.
+            InvalidConfigError: The device refuses the configuration.
+        """
+
+    def encode(
+        self,
+        src: EdgeFirstTensorExportable,
+        pts: int,
+        *,
+        keyframe: bool = False,
+        crop: Region | None = None,
+    ) -> EncodedFrame | None:
+        """Encodes one picture.
+
+        Returns the next access unit, or ``None`` while the encoder holds
+        pictures back; :meth:`flush` returns the rest at the end.
+
+        Args:
+            src: An image tensor from any ``edgefirst`` package, of the
+                configured format and size (or larger, with ``crop``).
+            pts: A timestamp returned unchanged on the matching access unit.
+            keyframe: Encode this picture as a key frame.
+            crop: The part of ``src`` to encode, exactly the configured size.
+
+        Raises:
+            InvalidInputError: A source of the wrong format or size.
+            PermissionError: The engine must read the source on the CPU and
+                it is not declared readable.
+        """
+
+    def flush(self) -> list[EncodedFrame]:
+        """Ends the stream and returns the access units still held."""
+
+    @property
+    def info(self) -> EncoderInfo:
+        """The engine, device and transfer of this encoder."""
+
+class OutputMemory(enum.Enum):
+    """Whose memory a decoder writes its pictures to."""
+
+    Imported: OutputMemory
+    """The pool's buffers (allocated by the decoder or provided by the
+    caller), which the device imports or the decoder copies into."""
+    Exported: OutputMemory
+    """The device's own buffers, exported because it would not import the
+    pool's. CPU reads of these may be uncached and slow."""
+
+class StreamInfo:
+    """The stream a decoder produces. :meth:`VideoDecoder.decode` returns one
+    when the stream's format becomes known or changes."""
+
+    width: int
+    """Visible width in pixels."""
+    height: int
+    """Visible height in pixels."""
+    crop: Region
+    """The visible rectangle within the coded picture."""
+    coded_width: int
+    """Coded (macroblock-aligned) width."""
+    coded_height: int
+    """Coded height."""
+    format: PixelFormat
+    """The frames' pixel format."""
+    colorimetry: Colorimetry | None
+    """The stream's colorimetry, where it says."""
+    buffers: int
+    """Buffers in the pool."""
+    memory: OutputMemory
+    """Whose memory the frames are."""
+    engine: Engine
+    """The engine decoding."""
+    transfer: Transfer
+    """How pictures reach the frames."""
+
+class Frame(Tensor):
+    """A decoded picture: a :class:`Tensor` whose buffer belongs to its
+    decoder's pool.
+
+    The buffer goes back to the decoder once the frame is no longer
+    referenced. Hold frames only as long as their pictures are needed: the
+    pool is bounded, and a decoder whose every buffer is held raises
+    ``PoolExhaustedError``. A ``view()`` or ``batch()`` taken from a frame
+    does not keep the buffer. A writable CPU map of a frame raises
+    ``RuntimeError``: the decoder still shares its buffer.
+    """
+
+    @property
+    def pts(self) -> int:
+        """The ``pts`` passed with the access unit of this picture."""
+
+    @property
+    def corrupted(self) -> bool:
+        """Whether the decoder reported the picture damaged (missing
+        references, for example after a lost access unit)."""
+
+class VideoDecoder:
+    """Decodes an H.264 or MJPEG stream on hardware into frames whose
+    pictures are tensors.
+
+    There is no software video decoder: where no engine runs the codec,
+    opening fails.
+
+    Platforms:
+        Linux: V4L2 memory-to-memory decoders, into DMA-BUF frames.
+        Windows: Media Foundation (Microsoft's H.264 decoder with DXVA, and
+        MJPEG decoders), into D3D11 frames.
+        Elsewhere opening fails with ``NoDeviceError``.
+    """
+
+    def __init__(
+        self,
+        codec: Codec,
+        *,
+        engine: Engine = ...,
+        pool: int | Sequence[EdgeFirstTensorExportable] | None = None,
+    ) -> None:
+        """Opens a decoder.
+
+        Args:
+            codec: ``Codec.H264`` or ``Codec.Mjpeg``.
+            engine: ``Engine.Auto`` or one engine used alone.
+            pool: The frames the caller may hold at once (4 when omitted), or
+                a sequence of tensors to decode into, each a different
+                DMA-BUF buffer (an NV12 D3D11 image of the stream's visible
+                size on Windows). The decoder writes those tensors: do not
+                use them while it is open.
+
+        Raises:
+            NoDeviceError: There is no decoder.
+            UnsupportedError: No engine here decodes the codec.
+            InvalidConfigError: A provided pool that is empty, holds one
+                buffer twice or is not in DMA-BUF memory.
+        """
+
+    def decode(self, data: bytes, pts: int) -> list[Frame | StreamInfo]:
+        """Decodes one access unit (H.264 in Annex B, or one JPEG picture for
+        MJPEG) whose picture is tagged with ``pts``.
+
+        Returns, in order, the events ready so far: :class:`StreamInfo` when
+        the stream's format becomes known or changes, and :class:`Frame` for
+        each picture, in presentation order. The list may be empty, and
+        frames may belong to earlier access units.
+
+        Raises:
+            PoolExhaustedError: Every buffer is held; release frames and
+                decode the same access unit again.
+            InvalidDataError: Data the decoder cannot parse.
+        """
+
+    def flush(self) -> list[Frame | StreamInfo]:
+        """Ends the stream and returns the remaining events."""
+
+    @property
+    def stream_info(self) -> StreamInfo | None:
+        """The stream as of the last :class:`StreamInfo` event, or ``None``
+        before the first."""
+
+    @property
+    def engine(self) -> Engine:
+        """The engine decoding."""
+
+    @property
+    def device(self) -> str:
+        """The device decoding: a device node or a transform's name."""
+
+def access_units(stream: bytes) -> list[bytes]:
+    """Splits an H.264 Annex B byte stream into access units, each ready for
+    :meth:`VideoDecoder.decode`. Bytes before the first start code are
+    skipped."""

@@ -12,6 +12,8 @@
 
 #![cfg_attr(nightly, feature(f16))]
 
+#[cfg(feature = "codec")]
+pub mod codec;
 #[cfg(feature = "tensor")]
 pub mod colorimetry;
 #[cfg(any(feature = "image", feature = "decoder"))]

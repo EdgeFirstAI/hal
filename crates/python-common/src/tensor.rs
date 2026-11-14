@@ -30,6 +30,9 @@ pub enum Error {
     /// A CPU access refusal the image crate reported, kept typed.
     #[cfg(feature = "image")]
     Image(edgefirst_image::Error),
+    /// A codec failure, raised as its `edgefirst.codec` exception.
+    #[cfg(feature = "codec")]
+    Codec(edgefirst_codec::CodecError),
     /// A Python exception raised underneath, passed through unchanged.
     Py(PyErr),
 }
@@ -49,6 +52,8 @@ impl fmt::Display for Error {
             Error::Io(e) => write!(f, "IO error: {e:?}"),
             #[cfg(feature = "image")]
             Error::Image(e) => write!(f, "{e}"),
+            #[cfg(feature = "codec")]
+            Error::Codec(e) => write!(f, "{e}"),
             Error::Py(e) => write!(f, "{e}"),
         }
     }
@@ -104,6 +109,8 @@ impl Error {
             Error::Tensor(e) => e.cpu_access_denied().is_some(),
             #[cfg(feature = "image")]
             Error::Image(e) => e.cpu_access_denied().is_some(),
+            #[cfg(feature = "codec")]
+            Error::Codec(e) => e.cpu_access_denied().is_some(),
             _ => false,
         }
     }
@@ -113,6 +120,8 @@ impl From<Error> for PyErr {
     fn from(err: Error) -> PyErr {
         match err {
             Error::Py(e) => e,
+            #[cfg(feature = "codec")]
+            Error::Codec(e) => crate::codec::to_pyerr(e),
             other => runtime_or_permission_error(other.is_cpu_access_denied(), other.to_string()),
         }
     }
@@ -121,12 +130,7 @@ impl From<Error> for PyErr {
 #[cfg(feature = "codec")]
 impl From<edgefirst_codec::CodecError> for Error {
     fn from(err: edgefirst_codec::CodecError) -> Self {
-        match err {
-            edgefirst_codec::CodecError::Tensor(e) if e.cpu_access_denied().is_some() => {
-                Error::Tensor(e)
-            }
-            err => Error::Format(format!("{err}")),
-        }
+        Error::Codec(err)
     }
 }
 
@@ -1493,7 +1497,9 @@ fn copy_numpy_via_contiguous_array<T: numpy::Element + Copy + Send + Sync>(
 
 // ─── PyTensor ───────────────────────────────────────────────────────────────
 
-#[pyclass(name = "Tensor", str, module = "edgefirst.tensor")]
+/// `subclass`: `edgefirst.codec.Frame` is a `Tensor` that also holds its
+/// decoder's buffer.
+#[pyclass(name = "Tensor", str, subclass, module = "edgefirst.tensor")]
 pub struct PyTensor(pub(crate) TensorDyn);
 
 impl Display for PyTensor {

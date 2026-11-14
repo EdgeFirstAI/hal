@@ -904,6 +904,34 @@ pub(crate) fn reconstructible(tensor: &TensorDyn) -> bool {
     !matches!(tensor.memory(), edgefirst_tensor::TensorMemory::Cuda)
 }
 
+/// What keeps a tensor taken out of a [`RawTensorAccess`] valid: the host
+/// pin and the Python object it was resolved from. Drop it after the tensor.
+#[cfg(feature = "codec")]
+pub struct RawKeepalive {
+    _pin: Option<HostPin<'static>>,
+    _keepalive: Option<Py<PyAny>>,
+}
+
+#[cfg(feature = "codec")]
+impl RawTensorAccess {
+    /// Takes the resolved tensor out, for a consumer that owns its tensors
+    /// (a decoder's provided pool), with what must outlive it.
+    pub fn into_owned(self) -> (TensorDyn, RawKeepalive) {
+        match self.repr {
+            RawTensorRepr::Ref {
+                tensor,
+                _pin,
+                _keepalive,
+            }
+            | RawTensorRepr::Mut {
+                tensor,
+                _pin,
+                _keepalive,
+            } => (tensor, RawKeepalive { _pin, _keepalive }),
+        }
+    }
+}
+
 impl AsRef<TensorDyn> for RawTensorAccess {
     /// Borrow the resolved tensor. Same shape as [`TensorArg`]'s own
     /// `AsRef` impl.
