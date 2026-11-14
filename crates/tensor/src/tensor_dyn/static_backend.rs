@@ -638,6 +638,19 @@ impl TensorDyn {
         dyn_fanout!(self, batch, n)
     }
 
+    /// A second owner of the same tensor. Only the dynamic backend, whose
+    /// tensors are reference-counted handles, can make one.
+    ///
+    /// # Errors
+    /// Always `NotImplemented` in this backend; a caller that needs the
+    /// tensor's memory reconstructs it from
+    /// [`descriptor_pinned`](Self::descriptor_pinned) instead.
+    pub fn share(&self) -> crate::Result<TensorDyn> {
+        Err(crate::Error::NotImplemented(
+            "sharing a tensor needs the dynamic tensor backend".into(),
+        ))
+    }
+
     /// Borrow a rectangular spatial sub-region (the destination/source crop) as
     /// a zero-copy view sharing this tensor's allocation. See [`Tensor::view`].
     pub fn view(&self, region: crate::Region) -> crate::Result<TensorDyn> {

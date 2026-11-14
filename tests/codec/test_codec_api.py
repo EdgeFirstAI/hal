@@ -12,7 +12,6 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-
 from edgefirst import codec
 from edgefirst.codec import (
     Codec,
@@ -31,7 +30,9 @@ TESTDATA = Path(__file__).resolve().parents[2] / "testdata"
 
 
 def grey(width, height, access="readwrite", value=None):
-    t = Tensor.image(width, height, PixelFormat.Grey, mem=codec.TensorMemory.MEM, access=access)
+    t = Tensor.image(
+        width, height, PixelFormat.Grey, mem=codec.TensorMemory.MEM, access=access
+    )
     if value is not None:
         with t.map("write") as m:
             np.asarray(m)[...] = value
@@ -68,7 +69,9 @@ def test_capabilities_list_the_cpu_jpeg_encoder():
     cpu = [
         c
         for c in caps
-        if c.engine == Engine.Cpu and c.codec == Codec.Jpeg and c.direction == codec.Direction.Encode
+        if c.engine == Engine.Cpu
+        and c.codec == Codec.Jpeg
+        and c.direction == codec.Direction.Encode
     ]
     assert len(cpu) == 1, caps
     assert not cpu[0].hardware
@@ -180,7 +183,9 @@ def nv12(width, height, luma):
 
 def test_an_h264_stream_round_trips_through_the_hardware():
     w, h, count = 320, 240, 8
-    encoder = open_or_skip(lambda: VideoEncoder(Codec.H264, w, h, PixelFormat.Nv12, 30.0, gop=count))
+    encoder = open_or_skip(
+        lambda: VideoEncoder(Codec.H264, w, h, PixelFormat.Nv12, 30.0, gop=count)
+    )
     assert encoder.info.hardware
     packets = []
     for pts in range(count):

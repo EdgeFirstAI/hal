@@ -98,9 +98,18 @@ The CPU encodes `uint8` NV12, NV16, YUYV, GREY, RGB and RGBA images at any row s
 H.264 and MJPEG streams are encoded and decoded on the platform's hardware: V4L2 memory-to-memory devices on Linux, Media Foundation on Windows. There is no software video codec, so where no engine runs a codec, opening it raises `NoDeviceError` or `UnsupportedError`.
 
 ```python
-from edgefirst.codec import Codec, PixelFormat, StreamInfo, VideoDecoder, VideoEncoder, access_units
+from edgefirst.codec import (
+    Codec,
+    PixelFormat,
+    StreamInfo,
+    VideoDecoder,
+    VideoEncoder,
+    access_units,
+)
 
-encoder = VideoEncoder(Codec.H264, 1920, 1080, PixelFormat.Nv12, 30.0, bitrate=8_000_000)
+encoder = VideoEncoder(
+    Codec.H264, 1920, 1080, PixelFormat.Nv12, 30.0, bitrate=8_000_000
+)
 for pts, picture in enumerate(pictures):
     packet = encoder.encode(picture, pts, keyframe=pts == 0)
     if packet is not None:

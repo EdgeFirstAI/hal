@@ -893,7 +893,6 @@ pub struct PyFrame {
     frame: Option<DecodedFrame>,
     returned: Weak<Returned>,
     /// Keeps a reconstructed base tensor's host mapping alive.
-    #[cfg(not(edgefirst_tensor_dynamic))]
     _pin: Option<edgefirst_tensor::HostPin<'static>>,
 }
 
@@ -915,18 +914,18 @@ impl PyFrame {
         frame: DecodedFrame,
         returned: &Arc<Returned>,
     ) -> PyResult<Py<PyAny>> {
-        #[cfg(edgefirst_tensor_dynamic)]
-        let base = frame
-            .tensor()
-            .share()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        #[cfg(not(edgefirst_tensor_dynamic))]
-        let (base, pin) =
-            crate::interop::reconstruct(frame.tensor(), edgefirst_tensor::CpuAccess::Read)?;
+        // Sharing the handle keeps everything the decoder set on the
+        // tensor, a separate chroma plane included. Where tensors are not
+        // shared handles, the memory is reconstructed from its descriptor.
+        let (base, pin) = match frame.tensor().share() {
+            Ok(shared) => (shared, None),
+            Err(_) => {
+                crate::interop::reconstruct(frame.tensor(), edgefirst_tensor::CpuAccess::Read)?
+            }
+        };
         let init = PyClassInitializer::from(PyTensor(base)).add_subclass(PyFrame {
             frame: Some(frame),
             returned: Arc::downgrade(returned),
-            #[cfg(not(edgefirst_tensor_dynamic))]
             _pin: pin,
         });
         Ok(Py::new(py, init)?.into_any())
