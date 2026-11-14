@@ -38,6 +38,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A video decoder pool the V4L2 device cannot cover is refused (`edgefirst-codec`, `libedgefirst_codec`, `edgefirst.codec`).** A device may grant fewer capture buffers than a pool needs; the i.MX 95's Wave6 decoder, asked for more than its 31, grants only its minimum. The decoder went on with the shorter pool, so a caller that asked to hold 33 frames could hold one and met `PoolExhausted` partway through the stream. `VideoDecoder::decode` now returns `CodecError::InvalidConfig` naming the buffers granted and needed (`EINVAL` in C, `InvalidConfigError` in Python) once the stream's format is known, for allocated and provided pools alike.
+
 - **`create_image` documentation on padded planar DMA-BUF images (`edgefirst-image`).** The docs said only packed images are padded to the 64-byte GPU pitch. Planar and semi-planar DMA-BUF images are padded too, and report the pitch through `row_stride()`: a 672-wide `PlanarRgb` image has 704-byte rows. A consumer that needs tight planes reads at the stride or uses `copy_to_flat`.
 
 - **Outputs that share a shape are bound by name or configured position (`edgefirst-decoder`).** When two configured outputs have the same shape, each role takes the tensor named like its output, else the only tensor of that shape, else the tensor at its configured position when every configured output was passed. Callers that passed same-shape tensors in role order (boxes before scores, scores before classes) against a configuration listing them otherwise must now pass them in configured order or name them. Models whose outputs all differ in shape are unaffected.

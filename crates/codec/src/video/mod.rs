@@ -601,7 +601,11 @@ pub enum OutputPool {
     Allocate {
         /// Frames the caller may hold at once. The device's own minimum
         /// (the reference pictures it keeps) and one buffer for it to
-        /// decode into are added to this.
+        /// decode into are added to this. A V4L2 device grants a bounded
+        /// number of buffers in all (31 on the i.MX 95's Wave6); a count
+        /// it cannot cover makes [`VideoDecoder::decode`] fail with
+        /// [`CodecError::InvalidConfig`] when the stream's size becomes
+        /// known.
         count: usize,
     },
     /// Pictures are decoded into these DMA-BUF tensors, one buffer each.
@@ -613,8 +617,9 @@ pub enum OutputPool {
     /// devices that decode in place.
     ///
     /// There must be at least one more than the device keeps for reference
-    /// pictures, and each must be large enough for the stream's coded
-    /// picture at the row stride the device asks for; otherwise
+    /// pictures and no more than it takes in all, and each must be large
+    /// enough for the stream's coded picture at the row stride the device
+    /// asks for; otherwise
     /// [`VideoDecoder::decode`] fails with [`CodecError::InvalidConfig`] when
     /// the stream's size becomes known. A tensor's own shape and format are
     /// not used: the decoded frames describe the device's layout over the
