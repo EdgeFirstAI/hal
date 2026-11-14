@@ -110,6 +110,14 @@ reconfigures the destination to `Rgb` itself.
 
 V4L2 access goes through the [`edgefirst-v4l2`](https://github.com/EdgeFirstAI/v4l2-rs) crate, shared with the EdgeFirst camera SDK: `device` for discovery and formats, `m2m` for the OUTPUT and CAPTURE queues (allocation, the mapped OUTPUT buffer, DMABUF import, waits), `events` for the source-change wait and drain, and `uapi` for the format structs. The crate's queues track which buffers the driver holds, so the decoder refuses to stage a JPEG into an OUTPUT buffer that is still queued.
 
+### Engines (`engine.rs`)
+
+`Codec`, `Engine`, `Direction`, `Transfer`, `Capability` and `capabilities()`. Every family resolves its engine through `engines_to_try`: an explicit engine is used alone (`NoDevice` when this build lacks it), and `Engine::Auto` takes the family's own list of present engines, in the platform's order, narrowed and reordered by `EDGEFIRST_CODEC_ENGINE`. `capabilities()` asks each backend: `video::v4l2::capabilities` (encoder and decoder nodes, by the same checks `open` makes), `video::mf::capabilities` (transforms by input subtype; each candidate that opening would give a device manager over HAL's D3D11 device is activated and given one, so a GPU transfer is reported only where the transform takes it), and `jpeg::capabilities`.
+
+### Still-Image Encoder (`encoder.rs`)
+
+`ImageEncoder` encodes JPEG. The CPU path feeds `jpeg-encoder` through its `ImageBuffer` trait straight from the mapped tensor: each row is handed over as full-resolution Y, Cb and Cr, chroma repeated across its subsampled block, and the encoder's sampling factor (2x2 for NV12, 2x1 for NV16 and YUYV) averages it back, so the file keeps the source's chroma without an intermediate image. Limited-range sources go through two 256-entry tables to full range. On Linux the V4L2 path opens an MJPEG `VideoEncoder` on the V4L2 engine for the source's geometry and quality and keeps it until they change; under `Auto` any failure there (a host-memory source, a format the device does not take) passes the image to the CPU.
+
 ### Video Module Map (`video/`)
 
 | Module          | Purpose                                              |
@@ -204,6 +212,14 @@ the source's native, unrotated pixels and dimensions. The caller applies the
 reported transform downstream (typically via the same `convert()` call that
 does colour conversion and resize). This avoids a redundant in-place rotation
 pass in the decode hot loop.
+
+### One Engine Vocabulary, No CPU Video
+
+The image and video families share `Codec` and `Engine`, so a caller can ask any codec object for an engine and get the same answer shape: success, `Unsupported(UnsupportedFeature::Codec)` when the engine cannot run the codec, or `NoDevice` when the engine is absent. Video runs only on platform engines (V4L2, Media Foundation, VideoToolbox): HAL carries no CPU video codec, so a codec the platform cannot run is an error rather than a slow fallback. A platform engine may use software of its own (Microsoft's H.264 encoder where the GPU has none), which `EncoderInfo::hardware` reports. Still images keep HAL's CPU decoder as an engine of their own (`Engine::Cpu`), last in `Auto`'s order.
+
+Under `Auto` a hardware JPEG decoder passes an image it cannot take (a fused output format, a destination it cannot write) to the next engine; named explicitly, the same case is `Unsupported`. `EDGEFIRST_CODEC_ENGINE` is a list rather than a single engine so that one setting can steer video (`media-foundation`) without leaving JPEG with no engine (`media-foundation,cpu`).
+
+Transfer is reported twice: `Capability::transfer` is the best case for an engine and device, known without a stream; `EncoderInfo::transfer` and `StreamInfo::transfer` are what the open stream does, which can depend on the source or pool (a host-memory pool, an encoder that holds frames).
 
 ### Hardware Decode Tried Before CPU (Linux)
 
@@ -683,6 +699,10 @@ with a V4L2 backend on Linux and a Media Foundation backend on Windows (see
   backend tears the queues down and the next frame starts a new stream, which
   also opens it with an IDR.
 
+## MJPEG
+
+MJPEG reuses the H.264 backends where the platform's model fits. On V4L2 the stateful encoder takes a JPEG CAPTURE format (`V4L2_PIX_FMT_JPEG`, else `MJPEG`): the H.264 controls and access-unit parsing are skipped, `V4L2_CID_JPEG_COMPRESSION_QUALITY` is set, and every CAPTURE buffer is one key-frame picture. Decoding goes through `video::v4l2::mjpeg`, a thin `DecoderBackend` over the image path's V4L2 JPEG decoder (`ImageDecoder` on `Engine::V4l2`) that decodes each picture into a pool tensor and returns it at once; a size or format change rebuilds an allocated pool. On Media Foundation the decoder takes `MFVideoFormat_MJPG`, hardware transforms first (NVIDIA's MJPEG decoder is D3D11-aware, so its pictures take the same GPU copy as DXVA H.264). MJPEG decoders need a frame size on the input type, so the decoder opens with a placeholder size and, when a picture of another size arrives, drains and sets the picture's size (`Transform::change_input_type`). Windows has no MJPEG encoder transform, so MJPEG encoding is `Unsupported` there.
+
 ## Media Foundation backend (Windows)
 
 `video/mf/` implements `EncoderBackend` and `DecoderBackend` with the Media
@@ -856,7 +876,8 @@ Span names follow `<crate>.<function>[.<operation>]`:
 
 - **`<crate>.<function>`** — top-level span: the public function the user
   invoked. The codec exposes format-specific entry points (`codec.decode_jpeg`,
-  `codec.decode_png`) selected automatically from the magic bytes.
+  `codec.decode_png`) selected automatically from the magic bytes, and
+  `codec.encode_jpeg` for `ImageEncoder`.
 - **`<crate>.<function>.<operation>`** — meaningful internal work
   (`codec.decode_jpeg.parse_markers`, `codec.decode_jpeg.mcu_loop`).
 
@@ -891,6 +912,8 @@ codec.decode_png                                        [user-facing fn]
 │
 └── codec.decode_png.zune_decode                        ← delegate to zune-png
     field: path = "u8" | "native_u16"
+
+codec.encode_jpeg                                       [user-facing fn: ImageEncoder::encode_into]
 ```
 
 The `nvjpeg*`, `v4l2_*`, and `mcu_loop` spans are mutually exclusive — exactly

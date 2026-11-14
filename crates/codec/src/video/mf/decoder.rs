@@ -40,13 +40,13 @@ use windows::core::{Interface, GUID};
 use windows::Win32::Media::MediaFoundation::{
     CODECAPI_AVLowLatencyMode, ICodecAPI, IMF2DBuffer2, IMFAttributes, IMFMediaType, IMFSample,
     MF2DBuffer_LockFlags_Read, MFMediaType_Video, MFNominalRange_0_255, MFNominalRange_16_235,
-    MFVideoArea, MFVideoFormat_H264, MFVideoFormat_NV12, MFVideoPrimaries_BT2020,
-    MFVideoPrimaries_BT709, MFVideoPrimaries_SMPTE170M, MFVideoTransFunc_10, MFVideoTransFunc_2084,
-    MFVideoTransFunc_709, MFVideoTransFunc_HLG, MFVideoTransFunc_sRGB,
-    MFVideoTransferMatrix_BT2020_10, MFVideoTransferMatrix_BT601, MFVideoTransferMatrix_BT709,
-    MFT_CATEGORY_VIDEO_DECODER, MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE,
-    MF_MT_MINIMUM_DISPLAY_APERTURE, MF_MT_SUBTYPE, MF_MT_TRANSFER_FUNCTION,
-    MF_MT_VIDEO_NOMINAL_RANGE, MF_MT_VIDEO_PRIMARIES, MF_MT_YUV_MATRIX,
+    MFVideoArea, MFVideoFormat_H264, MFVideoFormat_MJPG, MFVideoFormat_NV12,
+    MFVideoPrimaries_BT2020, MFVideoPrimaries_BT709, MFVideoPrimaries_SMPTE170M,
+    MFVideoTransFunc_10, MFVideoTransFunc_2084, MFVideoTransFunc_709, MFVideoTransFunc_HLG,
+    MFVideoTransFunc_sRGB, MFVideoTransferMatrix_BT2020_10, MFVideoTransferMatrix_BT601,
+    MFVideoTransferMatrix_BT709, MFT_CATEGORY_VIDEO_DECODER, MF_MT_DEFAULT_STRIDE,
+    MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE, MF_MT_MINIMUM_DISPLAY_APERTURE, MF_MT_SUBTYPE,
+    MF_MT_TRANSFER_FUNCTION, MF_MT_VIDEO_NOMINAL_RANGE, MF_MT_VIDEO_PRIMARIES, MF_MT_YUV_MATRIX,
 };
 
 use windows::Win32::System::Variant::VARIANT;
@@ -56,18 +56,19 @@ use windows::Win32::Media::MediaFoundation::IMFDXGIDeviceManager;
 
 use super::copy::{self, Plane};
 use super::{
-    com, error, hal_device, is_native_nv12, pair, sample_texture, tensor_texture, Output, Platform,
-    Transform,
+    com, error, hal_device, is_native_nv12, pair, sample_texture, set_pair, tensor_texture, Output,
+    Platform, Transform,
 };
+use crate::engine::unsupported;
 use crate::video::{
     DecodeEvent, DecodedFrame, DecoderBackend, DecoderConfig, OutputMemory, OutputPool, Returns,
     StreamInfo,
 };
-use crate::{CodecError, Result};
+use crate::{Codec, CodecError, Direction, Engine, Result, Transfer};
 
 /// Environment variable keeping only the decoders whose friendly name
 /// contains its value (or `hardware`, or `software`).
-const ENV_DECODER: &str = "EDGEFIRST_CODEC_MF_DECODER";
+pub(crate) const ENV_DECODER: &str = "EDGEFIRST_CODEC_MF_DECODER";
 /// How long the decoder may take to accept one access unit.
 const INPUT_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long an asynchronous decoder may take, once an access unit is
@@ -204,6 +205,10 @@ enum Picture {
 
 pub(crate) struct MfDecoder {
     transform: Transform,
+    codec: Codec,
+    /// The frame size of the input type, for codecs whose decoders need one
+    /// (MJPEG): changed when a picture of another size arrives.
+    input_size: Option<(u32, u32)>,
     /// The immediate context of HAL's device, when the decoder writes D3D11
     /// textures.
     context: Option<ID3D11DeviceContext>,
@@ -241,27 +246,34 @@ pub(crate) struct MfDecoder {
 unsafe impl Send for MfDecoder {}
 
 impl MfDecoder {
-    /// Opens the first decoder transform that decodes H.264 to NV12.
+    /// Opens the first decoder transform that decodes `config.codec` (H.264
+    /// or MJPEG) to NV12.
     pub fn open(config: DecoderConfig) -> Result<Self> {
+        let codec = config.codec;
+        let subtype = input_subtype(codec)
+            .ok_or_else(|| unsupported(codec, Direction::Decode, Engine::MediaFoundation))?;
         let platform = Platform::start()?;
         let candidates = platform.transforms(
             MFT_CATEGORY_VIDEO_DECODER,
-            Some(MFVideoFormat_H264),
+            Some(subtype),
             MFVideoFormat_NV12,
-            false,
+            hardware_first(codec),
             ENV_DECODER,
         )?;
         if candidates.is_empty() {
-            return Err(CodecError::NoDevice(
-                "no Media Foundation H.264 decoder".into(),
-            ));
+            return Err(CodecError::NoDevice(format!(
+                "no Media Foundation {codec} decoder"
+            )));
         }
         let manager = platform.device_manager();
+        // MJPEG decoders need a frame size before the first picture says
+        // which; the first picture of another size replaces it.
+        let input_size = (codec == Codec::Mjpeg).then_some(PLACEHOLDER_SIZE);
         let mut last = None;
         for candidate in candidates {
             let name = candidate.name.clone();
             match Transform::activate(candidate)
-                .and_then(|t| Self::configure(&platform, t, manager.as_ref()))
+                .and_then(|t| Self::configure(&platform, t, subtype, input_size, manager.as_ref()))
             {
                 Ok((transform, dxva)) => {
                     let context = if dxva {
@@ -284,9 +296,11 @@ impl MfDecoder {
                             "software"
                         }
                     );
-                    log::info!("h264 decoder {device}");
+                    log::info!("{codec} decoder {device}");
                     return Ok(Self {
                         transform,
+                        codec,
+                        input_size,
                         context,
                         parking: Vec::new(),
                         _manager: manager,
@@ -316,11 +330,13 @@ impl MfDecoder {
         Err(last.expect("at least one candidate was tried"))
     }
 
-    /// Sets the decoder up for H.264 in and NV12 out, on the GPU when it
+    /// Sets the decoder up for `subtype` in and NV12 out, on the GPU when it
     /// takes `manager`. Returns whether it does.
     fn configure(
         platform: &Platform,
         mut transform: Transform,
+        subtype: GUID,
+        size: Option<(u32, u32)>,
         manager: Option<&IMFDXGIDeviceManager>,
     ) -> Result<(Transform, bool)> {
         // Before the media types: the decoder chooses its output
@@ -334,17 +350,10 @@ impl MfDecoder {
                 log::debug!("{}: low latency not set: {}", transform.name(), e.message());
             }
         }
-        let input = platform.media_type()?;
-        let attrs: IMFAttributes = input.cast().map_err(|e| error(e, "IMFAttributes"))?;
-        // SAFETY: a live media type.
-        unsafe { attrs.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video) }
-            .map_err(|e| error(e, "IMFAttributes::SetGUID"))?;
-        // SAFETY: as above.
-        unsafe { attrs.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264) }
-            .map_err(|e| error(e, "IMFAttributes::SetGUID"))?;
+        let input = input_type(platform, subtype, size)?;
         transform
             .set_input_type(&input)
-            .map_err(|e| error(e, "set the H.264 input type"))?;
+            .map_err(|e| error(e, "set the input type"))?;
         let nv12 = transform
             .output_types()
             .into_iter()
@@ -356,6 +365,32 @@ impl MfDecoder {
             .map_err(|e| error(e, "set the NV12 output type"))?;
         transform.begin()?;
         Ok((transform, dxva))
+    }
+
+    /// Makes the input type's frame size that of the MJPEG picture in
+    /// `access_unit`, draining the pictures of the old size first.
+    fn follow_picture_size(&mut self, access_unit: &[u8]) -> Result<()> {
+        let info = crate::peek_info(access_unit)?;
+        let size = (
+            u32::try_from(info.width).unwrap_or(u32::MAX),
+            u32::try_from(info.height).unwrap_or(u32::MAX),
+        );
+        if self.input_size == Some(size) {
+            return Ok(());
+        }
+        let subtype = input_subtype(self.codec).expect("an open decoder's codec has a subtype");
+        let t = input_type(&self.platform, subtype, Some(size))?;
+        let mut out = Vec::new();
+        let changed = self
+            .transform
+            .change_input_type(&self.platform, &t, DRAIN_TIMEOUT, &mut out);
+        self.queue(out)?;
+        if let Err(e) = changed {
+            self.reset();
+            return Err(e);
+        }
+        self.input_size = Some(size);
+        Ok(())
     }
 
     /// Gives back the buffers of frames the caller has dropped. A frame
@@ -528,6 +563,12 @@ impl MfDecoder {
             colorimetry: layout.colorimetry,
             buffers: self.pool.len(),
             memory: OutputMemory::Imported,
+            engine: Engine::MediaFoundation,
+            transfer: if self.context.is_some() && self.pool.iter().all(|t| is_native_nv12(t)) {
+                Transfer::GpuCopy
+            } else {
+                Transfer::CpuCopy
+            },
         };
         log::debug!("{}: {info:?}", self.device);
         self.layout = Some(layout);
@@ -648,6 +689,10 @@ impl DecoderBackend for MfDecoder {
         // Pictures still waiting for a buffer go first; until they have one,
         // the access unit is not taken.
         self.deliver(true)?;
+        if self.input_size.is_some() {
+            self.follow_picture_size(access_unit)?;
+            self.deliver(true)?;
+        }
 
         let (sample, buffer) = self.platform.sample(access_unit.len())?;
         let mut ptr = std::ptr::null_mut();
@@ -718,6 +763,51 @@ impl DecoderBackend for MfDecoder {
     fn device(&self) -> String {
         self.device.clone()
     }
+
+    fn engine(&self) -> Engine {
+        Engine::MediaFoundation
+    }
+}
+
+/// The frame size an MJPEG decoder is opened with, before the first picture
+/// gives the stream's own.
+const PLACEHOLDER_SIZE: (u32, u32) = (640, 480);
+
+/// A video input type of `subtype`, with a frame size when one is given.
+fn input_type(
+    platform: &Platform,
+    subtype: GUID,
+    size: Option<(u32, u32)>,
+) -> Result<IMFMediaType> {
+    let t = platform.media_type()?;
+    let attrs: IMFAttributes = t.cast().map_err(|e| error(e, "IMFAttributes"))?;
+    // SAFETY: a live media type.
+    unsafe { attrs.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video) }
+        .map_err(|e| error(e, "IMFAttributes::SetGUID"))?;
+    // SAFETY: as above.
+    unsafe { attrs.SetGUID(&MF_MT_SUBTYPE, &subtype) }
+        .map_err(|e| error(e, "IMFAttributes::SetGUID"))?;
+    if let Some(size) = size {
+        set_pair(&attrs, &MF_MT_FRAME_SIZE, size)?;
+    }
+    Ok(t)
+}
+
+/// The Media Foundation subtype of a stream of `codec`, for the codecs the
+/// decoder takes.
+pub(crate) fn input_subtype(codec: Codec) -> Option<GUID> {
+    match codec {
+        Codec::H264 => Some(MFVideoFormat_H264),
+        Codec::Mjpeg => Some(MFVideoFormat_MJPG),
+        _ => None,
+    }
+}
+
+/// Whether hardware decoders of `codec` are tried before software ones.
+/// H.264 goes to Microsoft's decoder, which decodes on the GPU itself
+/// (DXVA); MJPEG to a GPU vendor's decoder where there is one.
+pub(crate) fn hardware_first(codec: Codec) -> bool {
+    codec == Codec::Mjpeg
 }
 
 /// `count` NV12 images of `w`x`h` for the pool: D3D11 textures, or host

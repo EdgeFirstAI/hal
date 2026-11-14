@@ -142,6 +142,55 @@ Apply the rotation by passing it to `ImageProcessor::convert()` (mapping
 `rotation_degrees` to `Rotation` and `flip_horizontal` to `Flip`). When the
 image has no EXIF orientation both fields are `0` / `false`.
 
+## Engines and Capabilities
+
+Every codec runs on an `Engine`: `V4l2` (Linux), `MediaFoundation` (Windows), `VideoToolbox` (Apple), `NvJpeg` (Linux with CUDA) or `Cpu` (still images only). `Codec` names the formats: `Jpeg`, `Png`, `H264`, `Mjpeg`, and `Hevc`, `Vp8`, `Vp9`, `Av1`, which no engine runs yet.
+
+| Codec | Linux (V4L2) | Windows (Media Foundation) | CPU |
+|---|---|---|---|
+| H.264 encode / decode | yes / yes | yes / yes | no |
+| MJPEG encode / decode | JPEG encoder / JPEG decoder (i.MX 95 and others with `mxc-jpeg`) | no / yes (GPU vendor's decoder, else Microsoft's) | no |
+| JPEG still encode (`ImageEncoder`) | JPEG encoder | no | yes |
+| JPEG / PNG still decode (`ImageDecoder`) | JPEG decoder | no | yes / yes |
+
+`Engine::Auto`, the default everywhere, picks the first engine that can do the request: the platform's own for video, and nvJPEG (when enabled), V4L2, then the CPU for JPEG. Naming an engine (`EncoderConfig::with_engine`, `DecoderConfig::with_engine`, `ImageDecoder::set_engine`) uses that engine alone, with no fallback. There is no CPU video codec in HAL: a video codec the platform cannot run fails with `CodecError::Unsupported(UnsupportedFeature::Codec { .. })`, and an engine this platform or build does not have with `CodecError::NoDevice`. A platform engine may itself use software, such as Microsoft's H.264 encoder on a GPU without one; `EncoderInfo::hardware` and `Capability::hardware` say which.
+
+`capabilities()` lists what the engines on this machine can do, without opening a stream: engine, device, codec, direction, whether it is hardware, the pixel formats, and how frames move at best (`Transfer::ZeroCopy`, `GpuCopy` or `CpuCopy`). An open stream reports what it actually does: `VideoEncoder::info()` returns an `EncoderInfo`, and `StreamInfo` carries the decoder's `engine` and `transfer`.
+
+```rust,no_run
+use edgefirst_codec::{capabilities, Codec, Direction};
+
+for c in capabilities() {
+    println!("{} {} {} on {} ({}, {:?}, {})", c.engine, c.direction, c.codec, c.device,
+             if c.hardware { "hardware" } else { "software" }, c.formats, c.transfer);
+}
+let h264 = capabilities()
+    .into_iter()
+    .any(|c| c.codec == Codec::H264 && c.direction == Direction::Encode);
+```
+
+| Environment variable     | Effect                                     |
+|--------------------------|--------------------------------------------|
+| `EDGEFIRST_CODEC_ENGINE` | The engines `Engine::Auto` may use, in order, separated by commas: for example `cpu` decodes JPEG on the CPU only, and `media-foundation` keeps video on Media Foundation. Codec objects that name an engine ignore it |
+
+## Encoding Still Images (JPEG)
+
+`ImageEncoder` writes a tensor as a JPEG file. It holds no per-image state, so create one and reuse it; `encode_into` reuses the output buffer.
+
+```rust,no_run
+use edgefirst_codec::{Codec, ImageEncoder};
+# let image: edgefirst_tensor::TensorDyn = unimplemented!();
+let mut encoder = ImageEncoder::new(Codec::Jpeg)?;
+encoder.set_quality(90)?;
+let mut jpeg = Vec::new();
+encoder.encode_into(&image, &mut jpeg)?;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+- **Engines:** under `Engine::Auto` a V4L2 JPEG encoder takes DMA-BUF sources it can read, kept open for the last geometry, and the CPU takes the rest. `set_engine(Engine::Cpu)` or `Engine::V4l2` uses one alone.
+- **CPU sources:** `u8` NV12 (written 4:2:0), NV16 and YUYV (4:2:2), Grey, RGB and RGBA, at any row stride. Limited-range YUV is stretched to the full range JPEG readers expect; the matrix is kept, so BT.709 sources decode with BT.601 colours.
+- **Quality** is 1 to 100, 85 by default.
+
 ## Hardware Acceleration (V4L2)
 
 On Linux, the `v4l2` feature (enabled by default) adds a hardware JPEG-decode
@@ -172,7 +221,7 @@ hardware decodes straight into the tensor's dmabuf — a true zero-copy path.
 Otherwise the driver buffers are mapped and the decoded planes are copied
 (cropped to the logical image) into the destination.
 
-## Video Encoding (H.264)
+## Video Encoding (H.264, MJPEG)
 
 `edgefirst_codec::video::VideoEncoder` encodes image tensors to an H.264 Annex B
 stream with the platform's hardware encoder. On Linux that is any V4L2 stateful
@@ -201,6 +250,8 @@ let rest = encoder.flush()?; // every access unit still in the encoder
 - **PTS:** `FrameOptions::pts` comes back unchanged on the matching `EncodedFrame`, in any unit.
 - **Input formats** are whatever the device lists for HAL's V4L2 code of the format (`PixelFormat::to_fourcc`); NV12 and YUYV on both i.MX encoders.
 - **Windows:** sources are NV12 or YUYV tensors in any memory. On a hardware encoder a native NV12 texture of the configured size is read in place, without a copy; crops, host tensors, and sources for an encoder that holds frames are copied into a texture of the encoder's own, on the GPU where the source is a texture. Either way the caller can reuse the source as soon as `encode()` returns. B-frames are off and the transform runs in low-latency mode, so `encode()` normally returns the access unit of the frame it was given. Microsoft's software encoder, used where there is no hardware encoder, reads system memory.
+- **MJPEG:** `EncoderConfig::new(Codec::Mjpeg, ..)` encodes each frame as a JPEG picture, every one a key frame, at `EncoderConfig::quality` (85 by default). Only V4L2 JPEG encoders run it; elsewhere it is `CodecError::Unsupported`.
+- **`info()`** names the engine and device and says how sources reach the encoder (`EncoderInfo::transfer`): zero-copy on V4L2; on Media Foundation zero-copy for an encoder that reads textures in place, a GPU copy for one that holds frames (decided on the first frame), and a CPU copy for the software encoder.
 
 | Environment variable           | Effect                                     |
 |--------------------------------|--------------------------------------------|
@@ -209,7 +260,7 @@ let rest = encoder.flush()?; // every access unit still in the encoder
 
 Run `cargo run --release -p edgefirst-codec --example video-encode -- out.h264 --frames 300` to encode a test pattern (or `--input frames.nv12`) and print the per-frame encode time.
 
-## Video Decoding (H.264)
+## Video Decoding (H.264, MJPEG)
 
 `edgefirst_codec::video::VideoDecoder` decodes an H.264 Annex B stream into NV12 image tensors with the platform's hardware decoder: on Linux any V4L2 stateful memory-to-memory decoder, found by capability (i.MX 8M Plus `vsi_v4l2`, i.MX 95 Wave6). It needs the `v4l2` feature (on by default). On Windows it is Microsoft's Media Foundation H.264 decoder, with the `media-foundation` feature (on by default).
 
@@ -233,7 +284,8 @@ let rest = decoder.flush()?; // every event still in the decoder
 
 - **Input** is one access unit per call, in decode order; `access_units()` splits a byte stream. `decode()` returns everything that is ready, which may be nothing, and frames come back in presentation order with the `pts` passed for their access unit.
 - **Frames are lent, not copied.** Each `DecodedFrame` is an NV12 DMA-BUF tensor of the visible picture over the device's buffer (whose coded height may be larger: 1088 rows for 1080p). The buffer goes back to the device when the frame is dropped, so the tensor is only reachable through the frame; share a picture by sharing the frame (`Arc<DecodedFrame>`). Frames import into the image crate's GPU paths without a copy.
-- **The pool:** `OutputPool::Allocate { count }` lets the caller hold `count` frames at once; the decoder adds the device's minimum and one buffer for it to decode into. `OutputPool::Provided(tensors)` decodes into the caller's DMA-BUFs. When the caller holds every buffer, `decode()` fails with `CodecError::PoolExhausted` without taking the access unit: drop frames and pass it again. `StreamInfo::memory` says whether the device imports the pool or, where it will not, writes its own buffers exported as DMA-BUFs.
+- **The pool:** `OutputPool::Allocate { count }` lets the caller hold `count` frames at once; the decoder adds the device's minimum and one buffer for it to decode into. `OutputPool::Provided(tensors)` decodes into the caller's DMA-BUFs. When the caller holds every buffer, `decode()` fails with `CodecError::PoolExhausted` without taking the access unit: drop frames and pass it again. `StreamInfo::memory` says whether the device imports the pool or, where it will not, writes its own buffers exported as DMA-BUFs, and `StreamInfo::transfer` how each picture reaches the pool (zero-copy on V4L2, a GPU copy on Media Foundation with DXVA, a CPU copy without).
+- **MJPEG:** `DecoderConfig::new(Codec::Mjpeg)` takes one JPEG picture per `decode()` call and returns its frame at once. Pictures may change size from one to the next; each change is a `DecodeEvent::Reconfigured`. On Windows the decoder is the GPU vendor's MJPEG transform where there is one (NVIDIA's decodes on the GPU), otherwise Microsoft's software one; 4:2:2 pictures, as cameras send, come back as NV12. On Linux it is the V4L2 JPEG decoder, which writes NV12 or Grey; a picture it cannot decode is an error, since HAL has no CPU video decoder.
 - **Size changes** mid-stream (a new SPS) drain the old pictures and rebuild the pool; `DecodeEvent::Reconfigured` carries the new `StreamInfo`. Frames already returned keep their memory.
 - **`flush()`** returns the remaining pictures. The decoder then starts a new sequence, so the next access unit must be an IDR with its SPS and PPS, as after a seek.
 - **Windows:** the decoder runs on the GPU (DXVA), and each picture is copied on the GPU into a pool tensor of the visible size, a native NV12 D3D11 texture whose recorded fence value orders consumers behind the copy; without DXVA (no D3D11 device, or an adapter without video decoding) it decodes into system memory, copied into the pool on the CPU. A provided pool must hold NV12 images of exactly the stream's visible size, so it cannot follow a size change. The decoder runs in low-latency mode: a picture comes back as soon as the stream's reordering allows.
@@ -395,7 +447,8 @@ Every decode entry point returns `Result<ImageInfo, CodecError>`:
 | `CodecError::InsufficientCapacity` | The decoded image does not fit the tensor's allocation. Allocate for the largest expected frame |
 | `CodecError::UnsupportedDtype` | Non-`u8` destination for a JPEG (`Nv12`/`Nv16`/`Nv24`/`Grey` are byte layouts) |
 | `CodecError::UnsupportedFormat` | The destination's pixel format cannot hold this decode |
-| `CodecError::Unsupported(UnsupportedFeature)` | Input outside the supported JPEG/PNG subset — match on the inner variant rather than parsing a string. See [Decoder Limitations](#decoder-limitations) |
+| `CodecError::Unsupported(UnsupportedFeature)` | Input outside the supported JPEG/PNG subset — match on the inner variant rather than parsing a string. See [Decoder Limitations](#decoder-limitations). `UnsupportedFeature::Codec` when the engine set with `set_engine` cannot decode the image |
+| `CodecError::NoDevice` | The engine set with `set_engine` is not on this platform or in this build, or has no device |
 | `CodecError::InvalidData` | Magic bytes match neither JPEG nor PNG, or the bitstream is malformed |
 | `CodecError::Io` | The `load_image_file` / `load_image_read` source failed |
 | `CodecError::Tensor` | The destination tensor rejected the reconfigure or map |

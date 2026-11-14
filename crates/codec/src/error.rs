@@ -41,6 +41,17 @@ pub enum UnsupportedFeature {
     /// sampled at a higher rate than luma along some axis (rejected so the
     /// downstream upsampler does not divide by zero).
     JpegChromaSubsampling,
+    /// An engine that cannot encode or decode a codec, or, for
+    /// [`Engine::Auto`](crate::Engine::Auto), no engine on this machine that
+    /// can.
+    Codec {
+        /// The compressed format asked for.
+        codec: crate::Codec,
+        /// Encoding or decoding.
+        direction: crate::Direction,
+        /// The engine asked for.
+        engine: crate::Engine,
+    },
 }
 
 impl fmt::Display for UnsupportedFeature {
@@ -72,6 +83,16 @@ impl fmt::Display for UnsupportedFeature {
             Self::JpegChromaSubsampling => {
                 write!(f, "JPEG chroma subsampling that exceeds luma sampling rate")
             }
+            Self::Codec {
+                codec,
+                direction,
+                engine: crate::Engine::Auto,
+            } => write!(f, "{direction} {codec}: no codec engine here can"),
+            Self::Codec {
+                codec,
+                direction,
+                engine,
+            } => write!(f, "{direction} {codec} on the {engine} engine"),
         }
     }
 }
@@ -90,10 +111,12 @@ pub enum CodecError {
     UnsupportedDtype(edgefirst_tensor::DType),
     /// The requested pixel format is not supported for this image type.
     UnsupportedFormat(edgefirst_tensor::PixelFormat),
-    /// The image data is well-formed but uses a feature this decoder does
-    /// not implement. Callers can pattern-match on the carried
-    /// [`UnsupportedFeature`] to react programmatically (e.g. transcode
-    /// before retry, surface a precise message, or skip gracefully).
+    /// The request is well-formed but not supported: image data using a
+    /// feature this decoder does not implement, or a codec the chosen engine
+    /// cannot run ([`UnsupportedFeature::Codec`]). Callers can pattern-match
+    /// on the carried [`UnsupportedFeature`] to react programmatically (e.g.
+    /// transcode before retry, surface a precise message, or skip
+    /// gracefully).
     Unsupported(UnsupportedFeature),
     /// The image data is corrupted, truncated, or not a recognized format.
     InvalidData(String),
@@ -142,7 +165,7 @@ impl fmt::Display for CodecError {
             Self::UnsupportedFormat(pf) => {
                 write!(f, "unsupported pixel format {pf:?} for image decode")
             }
-            Self::Unsupported(feat) => write!(f, "unsupported image feature: {feat}"),
+            Self::Unsupported(feat) => write!(f, "unsupported: {feat}"),
             Self::InvalidData(msg) => write!(f, "invalid image data: {msg}"),
             Self::Io(e) => write!(f, "I/O error: {e}"),
             Self::Tensor(e) => write!(f, "tensor error: {e}"),

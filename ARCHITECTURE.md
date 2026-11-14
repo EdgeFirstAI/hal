@@ -864,7 +864,7 @@ macOS, and Android.
 
 | Segment | Meaning | Examples |
 |---------|---------|----------|
-| `codec.` | Image decode | `codec.decode_jpeg`, `codec.decode_jpeg.mcu_loop`, `codec.decode_png.zune_decode`; the fused output stage is `codec.decode_jpeg.write_rgb`, `codec.decode_jpeg.write_rgb_420`, `codec.decode_jpeg.write_grey`, `codec.decode_jpeg.write_nv16`, `codec.decode_jpeg.write_nv24` |
+| `codec.` | Image decode and encode | `codec.decode_jpeg`, `codec.encode_jpeg`, `codec.decode_jpeg.mcu_loop`, `codec.decode_png.zune_decode`; the fused output stage is `codec.decode_jpeg.write_rgb`, `codec.decode_jpeg.write_rgb_420`, `codec.decode_jpeg.write_grey`, `codec.decode_jpeg.write_nv16`, `codec.decode_jpeg.write_nv24` |
 | `tensor.` | Tensor lifecycle | `tensor.alloc`, `tensor.map` |
 | `image.` | Image processing entry points | `image.convert`, `image.flush`, `image.gl_init`, `image.materialize_masks`, `image.draw_decoded_masks` |
 | `image.convert.<backend>` | Backend that serviced the convert | `image.convert.gl`, `image.convert.g2d`. The CPU backend opens no span at this level — a CPU-serviced convert is identified by its `image.convert.cpu.*` sub-steps under `image.convert` |

@@ -16,7 +16,7 @@ use edgefirst_codec::video::{
     access_units, DecodeEvent, DecodedFrame, DecoderConfig, EncoderConfig, FrameOptions,
     OutputMemory, OutputPool, StreamInfo, VideoDecoder, VideoEncoder,
 };
-use edgefirst_codec::CodecError;
+use edgefirst_codec::{CodecError, Engine, Transfer};
 use edgefirst_tensor::{CpuAccess, DType, PixelFormat, TensorDyn, TensorMemory};
 
 /// 30 frames of 1920x1080 Main profile with two B-frames between
@@ -312,6 +312,16 @@ fn decodes_into_a_provided_pool() {
     assert_eq!(run.hashes, MAIN_BFRAMES);
     assert_eq!(run.infos[0].buffers, 12);
     assert_eq!(run.infos[0].memory, OutputMemory::Imported);
+    let engine = decoder.engine();
+    assert_eq!(run.infos[0].engine, engine);
+    // V4L2 decodes into the pool; Media Foundation copies each picture out
+    // of its decoder, on the GPU when it decodes there (DXVA).
+    let transfer = match engine {
+        Engine::MediaFoundation if decoder.device().contains("DXVA") => Transfer::GpuCopy,
+        Engine::MediaFoundation => Transfer::CpuCopy,
+        _ => Transfer::ZeroCopy,
+    };
+    assert_eq!(run.infos[0].transfer, transfer);
 }
 
 #[test]

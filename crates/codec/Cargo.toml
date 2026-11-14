@@ -30,6 +30,7 @@ turbojpeg = ["dep:turbojpeg"]
 
 [dependencies]
 edgefirst-tensor = { workspace = true, default-features = false }
+jpeg-encoder = { workspace = true }
 kamadak-exif = { workspace = true }
 libloading = { workspace = true, optional = true }
 log = { workspace = true }

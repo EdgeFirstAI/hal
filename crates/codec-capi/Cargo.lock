@@ -160,6 +160,7 @@ version = "0.40.0"
 dependencies = [
  "edgefirst-tensor",
  "edgefirst-v4l2",
+ "jpeg-encoder",
  "kamadak-exif",
  "libloading",
  "log",

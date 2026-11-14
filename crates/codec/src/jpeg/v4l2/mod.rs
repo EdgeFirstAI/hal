@@ -97,6 +97,14 @@ pub(crate) fn device_available() -> bool {
     device::probe().is_some()
 }
 
+/// The node of the V4L2 JPEG decoder, when there is one that this backend
+/// drives (the multi-planar API).
+pub(crate) fn probe_path() -> Option<std::path::PathBuf> {
+    device::probe()
+        .filter(|d| d.api == device::ApiVariant::MultiPlanar)
+        .map(|d| d.path().to_owned())
+}
+
 /// Lazily-probed V4L2 backend state, stored on the reusable decoder state so
 /// the device is probed at most once and the context is reused across decodes.
 //
@@ -113,6 +121,13 @@ pub(crate) enum V4l2Probe {
 }
 
 impl V4l2Probe {
+    /// Whether the last picture was decoded straight into its destination
+    /// rather than copied out of the codec's own buffer.
+    pub(crate) fn wrote_in_place(&self) -> bool {
+        matches!(self, V4l2Probe::Ready(ctx)
+            if matches!(&ctx.stream, Some(s) if matches!(s.cap.target, CaptureTarget::DstDma)))
+    }
+
     fn ensure_probed(&mut self) -> Option<&mut V4l2Context> {
         if matches!(self, V4l2Probe::Unprobed) {
             *self = match device::probe().and_then(V4l2Context::new) {

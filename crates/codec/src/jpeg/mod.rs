@@ -44,6 +44,12 @@ pub(crate) fn v4l2_available() -> bool {
     v4l2::device_available()
 }
 
+/// The node of the V4L2 JPEG decoder this backend drives, when there is one.
+#[cfg(all(target_os = "linux", feature = "v4l2"))]
+pub(crate) fn v4l2_device() -> Option<String> {
+    v4l2::probe_path().map(|p| p.display().to_string())
+}
+
 /// Parse a boolean backend-gate environment variable: `true` only for
 /// `1`/`true`/`yes` (case-insensitive, trimmed); absent or anything else is
 /// `false`. Shared by the V4L2 opt-out (`EDGEFIRST_DISABLE_V4L2`) and the nvJPEG
@@ -55,11 +61,71 @@ pub(crate) fn env_flag(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+use crate::engine::{engines_to_try, unsupported, Capability, Codec, Direction, Engine, Transfer};
 use crate::error::{CodecError, UnsupportedFeature};
 use crate::exif::read_exif_orientation;
 use crate::options::ImageInfo;
 use crate::pixel::ImagePixel;
 use edgefirst_tensor::{PixelFormat, Tensor};
+
+/// The engines this build has that decode JPEG, in the order
+/// [`Engine::Auto`] tries them. nvJPEG is listed only when it is enabled.
+fn decode_engines() -> Vec<Engine> {
+    [
+        (Engine::NvJpeg, crate::nvjpeg_available()),
+        (
+            Engine::V4l2,
+            cfg!(all(target_os = "linux", feature = "v4l2")),
+        ),
+        (Engine::Cpu, true),
+    ]
+    .into_iter()
+    .filter_map(|(engine, present)| present.then_some(engine))
+    .collect()
+}
+
+/// Adds the JPEG decoders present here to `out`.
+pub(crate) fn capabilities(out: &mut Vec<Capability>) {
+    let jpeg = |engine, device: String, hardware, formats: Vec<PixelFormat>| Capability {
+        engine,
+        device,
+        codec: Codec::Jpeg,
+        direction: Direction::Decode,
+        hardware,
+        formats,
+        transfer: Transfer::ZeroCopy,
+    };
+    #[cfg(all(target_os = "linux", feature = "nvjpeg"))]
+    if nvjpeg_available() {
+        out.push(jpeg(
+            Engine::NvJpeg,
+            "nvjpeg".into(),
+            true,
+            vec![PixelFormat::Rgb],
+        ));
+    }
+    #[cfg(all(target_os = "linux", feature = "v4l2"))]
+    if let Some(path) = v4l2::probe_path() {
+        out.push(jpeg(
+            Engine::V4l2,
+            path.display().to_string(),
+            true,
+            vec![PixelFormat::Nv12, PixelFormat::Grey],
+        ));
+    }
+    out.push(jpeg(
+        Engine::Cpu,
+        "cpu".into(),
+        false,
+        vec![
+            PixelFormat::Nv12,
+            PixelFormat::Nv16,
+            PixelFormat::Nv24,
+            PixelFormat::Grey,
+            PixelFormat::Rgb,
+        ],
+    ));
+}
 
 /// Reusable JPEG decoder state.
 ///
@@ -84,6 +150,8 @@ pub struct JpegDecoderState {
     /// Default false; `EDGEFIRST_CODEC_DCT=fast` flips the constructor
     /// default so benchmarks can A/B without code changes.
     pub(crate) fast_dct: bool,
+    /// The engine that decodes; see [`crate::ImageDecoder::set_engine`].
+    pub(crate) engine: Engine,
     /// V4L2 hardware decoder, lazily probed on first decode. Probed at most
     /// once; a ready context is reused (and amortises per-image setup) across
     /// decodes.
@@ -97,6 +165,13 @@ pub struct JpegDecoderState {
 }
 
 impl JpegDecoderState {
+    /// Whether the V4L2 decoder wrote the last picture straight into its
+    /// destination.
+    #[cfg(all(target_os = "linux", feature = "v4l2"))]
+    pub(crate) fn v4l2_wrote_in_place(&self) -> bool {
+        self.v4l2.wrote_in_place()
+    }
+
     pub fn new() -> Self {
         Self {
             mcu_scratch: None,
@@ -106,6 +181,7 @@ impl JpegDecoderState {
             fast_dct: std::env::var("EDGEFIRST_CODEC_DCT")
                 .map(|v| v.trim().eq_ignore_ascii_case("fast"))
                 .unwrap_or(false),
+            engine: Engine::Auto,
             #[cfg(all(target_os = "linux", feature = "v4l2"))]
             v4l2: v4l2::V4l2Probe::default(),
             #[cfg(all(target_os = "linux", feature = "nvjpeg"))]
@@ -275,6 +351,96 @@ pub fn decode_jpeg_into<T: ImagePixel>(
     result
 }
 
+/// The picture a decode writes: its format, size and the destination's row
+/// stride.
+#[cfg_attr(
+    not(all(target_os = "linux", any(feature = "v4l2", feature = "nvjpeg"))),
+    allow(dead_code)
+)]
+struct Target {
+    format: PixelFormat,
+    width: usize,
+    height: usize,
+    stride: usize,
+    /// The format is the JPEG's own. Fused (non-native) outputs are a
+    /// CPU-decoder feature: the hardware decoders produce fixed formats.
+    native: bool,
+}
+
+/// What a hardware decoder did with an image.
+#[cfg_attr(not(all(target_os = "linux", feature = "v4l2")), allow(dead_code))]
+enum Attempt {
+    /// Decoded; the orientation is still to be filled in.
+    Decoded(ImageInfo),
+    /// Not this image, for the reason given.
+    PassedOn(String),
+    /// The decoder is not present.
+    NoDevice(String),
+}
+
+/// Decodes on hardware `engine`.
+#[cfg_attr(
+    not(all(target_os = "linux", any(feature = "v4l2", feature = "nvjpeg"))),
+    allow(unused_variables)
+)]
+fn try_hardware<T: ImagePixel>(
+    engine: Engine,
+    data: &[u8],
+    headers: &markers::JpegHeaders,
+    dst: &mut Tensor<T>,
+    state: &mut JpegDecoderState,
+    target: &Target,
+) -> crate::Result<Attempt> {
+    match engine {
+        #[cfg(all(target_os = "linux", any(feature = "v4l2", feature = "nvjpeg")))]
+        Engine::NvJpeg | Engine::V4l2 if !target.native => {
+            Ok(Attempt::PassedOn("a fused output format".into()))
+        }
+        // nvJPEG decodes interleaved RGB straight into a CUDA-backed (PBO)
+        // destination for zero-copy `convert()`.
+        #[cfg(all(target_os = "linux", feature = "nvjpeg"))]
+        Engine::NvJpeg => match state.nvjpeg.try_decode::<T>(
+            data,
+            headers,
+            dst,
+            target.format,
+            target.width,
+            target.height,
+            target.stride,
+        ) {
+            Ok(Some(info)) => {
+                // RGB output carries no chroma colorimetry; clear any stale
+                // value left on a recycled pool tensor.
+                dst.set_colorimetry(None);
+                Ok(Attempt::Decoded(info))
+            }
+            Ok(None) => Ok(Attempt::PassedOn("no nvJPEG decoder".into())),
+            Err(nvjpeg::NvJpegDecode::Fallback(why)) => Ok(Attempt::PassedOn(why)),
+            Err(nvjpeg::NvJpegDecode::Fatal(e)) => Err(e),
+        },
+        // A probed-but-failing device resets itself.
+        #[cfg(all(target_os = "linux", feature = "v4l2"))]
+        Engine::V4l2 => match state.v4l2.try_decode::<T>(
+            data,
+            headers,
+            dst,
+            target.format,
+            target.width,
+            target.height,
+            target.stride,
+        ) {
+            Ok(Some(info)) => {
+                dst.set_colorimetry(Some(edgefirst_tensor::Colorimetry::jfif()));
+                Ok(Attempt::Decoded(info))
+            }
+            Ok(None) => Ok(Attempt::NoDevice("no V4L2 JPEG decoder".into())),
+            Err(v4l2::V4l2Decode::Fallback(why)) => Ok(Attempt::PassedOn(why)),
+            Err(v4l2::V4l2Decode::Fatal(e)) => Err(e),
+        },
+        other => Err(unsupported(Codec::Jpeg, Direction::Decode, other)),
+    }
+}
+
 /// Decode using already-parsed headers. Huffman tables live in `headers` for
 /// the duration of this call; the caller restores them to the cache after.
 fn decode_jpeg_into_parsed<T: ImagePixel>(
@@ -287,11 +453,6 @@ fn decode_jpeg_into_parsed<T: ImagePixel>(
     let img_h = headers.header.height as usize;
     let native_fmt = native_format(headers)?;
     let output_fmt = resolve_output_format(headers, native_fmt, state.preferred_format)?;
-    // Fused (non-native) outputs are a CPU-decoder feature: the hardware
-    // decoders produce fixed formats, so bypass them when the resolved output
-    // differs from native.
-    #[cfg(all(target_os = "linux", any(feature = "v4l2", feature = "nvjpeg")))]
-    let allow_hw = output_fmt == native_fmt;
 
     // NV12 supports odd dimensions. Odd *height* gives a `H + ceil(H/2)`
     // combined-plane height (`PixelFormat::allocation_shape`). Odd *width* rounds the
@@ -329,52 +490,46 @@ fn decode_jpeg_into_parsed<T: ImagePixel>(
         .effective_row_stride()
         .unwrap_or(native_row_stride(img_w));
 
-    // Try the nvJPEG GPU decoder first when available (CUDA + libnvjpeg). It
-    // decodes interleaved RGB straight into a CUDA-backed (PBO) destination for
-    // zero-copy `convert()`. A non-CUDA destination or any failure cascades to
-    // the V4L2/CPU decoders.
-    #[cfg(all(target_os = "linux", feature = "nvjpeg"))]
-    if allow_hw {
-        match state
-            .nvjpeg
-            .try_decode::<T>(data, headers, dst, output_fmt, img_w, img_h, dst_stride)
-        {
-            Ok(Some(mut info)) => {
+    // The engines in order. A hardware decoder that cannot take this image
+    // (a fused output format, a destination it cannot write) passes it on
+    // under `Auto`, and is an error when it was asked for by name. The CPU
+    // decoder takes every image, so engines after it are never tried;
+    // without it in the list, an image every hardware engine passes on is
+    // refused.
+    let target = Target {
+        format: output_fmt,
+        width: img_w,
+        height: img_h,
+        stride: dst_stride,
+        native: output_fmt == native_fmt,
+    };
+    let mut cpu = false;
+    for engine in engines_to_try(state.engine, &decode_engines())? {
+        if engine == Engine::Cpu {
+            cpu = true;
+            break;
+        }
+        match try_hardware(engine, data, headers, dst, state, &target)? {
+            Attempt::Decoded(mut info) => {
                 info.rotation_degrees = rotation_degrees;
                 info.flip_horizontal = flip_horizontal;
-                // RGB output carries no chroma colorimetry; clear any stale
-                // value left on a recycled pool tensor.
-                dst.set_colorimetry(None);
                 return Ok(info);
             }
-            Ok(None) => {}
-            Err(nvjpeg::NvJpegDecode::Fallback(why)) => {
-                log::debug!("nvjpeg jpeg decode fell back: {why}");
+            Attempt::PassedOn(why) if state.engine == Engine::Auto => {
+                log::debug!("{engine} jpeg decode passed on: {why}");
             }
-            Err(nvjpeg::NvJpegDecode::Fatal(e)) => return Err(e),
+            Attempt::PassedOn(why) => {
+                log::debug!("{engine} jpeg decode refused: {why}");
+                return Err(unsupported(Codec::Jpeg, Direction::Decode, engine));
+            }
+            Attempt::NoDevice(why) if state.engine == Engine::Auto => {
+                log::debug!("{engine} jpeg decode passed on: {why}");
+            }
+            Attempt::NoDevice(why) => return Err(CodecError::NoDevice(why)),
         }
     }
-
-    // Try the V4L2 hardware decoder next when available; a probed-but-failing
-    // device resets itself and falls through to the CPU decoder transparently.
-    #[cfg(all(target_os = "linux", feature = "v4l2"))]
-    if allow_hw {
-        match state
-            .v4l2
-            .try_decode::<T>(data, headers, dst, output_fmt, img_w, img_h, dst_stride)
-        {
-            Ok(Some(mut info)) => {
-                info.rotation_degrees = rotation_degrees;
-                info.flip_horizontal = flip_horizontal;
-                dst.set_colorimetry(Some(edgefirst_tensor::Colorimetry::jfif()));
-                return Ok(info);
-            }
-            Ok(None) => {}
-            Err(v4l2::V4l2Decode::Fallback(why)) => {
-                log::debug!("v4l2 jpeg decode fell back to cpu: {why}");
-            }
-            Err(v4l2::V4l2Decode::Fatal(e)) => return Err(e),
-        }
+    if !cpu {
+        return Err(unsupported(Codec::Jpeg, Direction::Decode, state.engine));
     }
 
     // CPU decode: MCU loop writes NV12/GREY u8 directly into the tensor.
