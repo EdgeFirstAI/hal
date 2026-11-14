@@ -1,12 +1,12 @@
 [project]
 name = "edgefirst-codec"
 dynamic = ["version"]
-description = "Image codec for decoding JPEG/PNG into pre-allocated EdgeFirst tensors"
+description = "Image and video codecs for EdgeFirst tensors: JPEG/PNG decoding, JPEG encoding, and hardware H.264 and MJPEG"
 readme = "README.md"
 requires-python = ">=3.8"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
-keywords = ["jpeg", "png", "image-decoding", "zero-copy", "edge-ai"]
+keywords = ["jpeg", "png", "h264", "mjpeg", "video", "image-decoding", "zero-copy", "edge-ai"]
 authors = [{name = "Au-Zone Technologies", email = "support@au-zone.com"}]
 classifiers = [
     "Development Status :: 4 - Beta",

@@ -3,7 +3,7 @@
 
 [package]
 name = "edgefirst-codec-capi"
-description = "C API for EdgeFirst image decode and encode"
+description = "C API for EdgeFirst image and video encode and decode"
 version = "0.40.0"
 edition = "2021"
 rust-version = "1.94.0"
@@ -31,11 +31,12 @@ tracing = ["edgefirst-tensor/tracing"]
 # Links libedgefirst_tensor.so (dynamic backend + tensor-ffi declarations)
 # rather than embedding a private tensor copy.
 [dependencies]
-# The decoders this library ships, spelled out rather than inherited from codec's defaults.
+# The engines this library ships, spelled out rather than inherited from codec's defaults.
 edgefirst-codec = { version = "0.40.0", path = "../codec", default-features = false, features = [
     "v4l2",
     "nvjpeg",
     "png",
+    "media-foundation",
 ] }
 # Built with `--cfg edgefirst_tensor_dynamic` (this crate's .cargo/config.toml): calls into libedgefirst_tensor.
 edgefirst-tensor = { version = "0.40.0", path = "../tensor", default-features = false }

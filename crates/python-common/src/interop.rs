@@ -447,6 +447,10 @@ impl<'py> TensorArg<'py> {
     /// [`Self::extract`], an explicit `access` request is never retried:
     /// the caller already asked for exactly what it needs.
     pub fn extract_mut(obj: &Bound<'py, PyAny>, access: Option<&str>) -> PyResult<Self> {
+        #[cfg(feature = "codec")]
+        if obj.cast::<crate::codec::PyFrame>().is_ok() {
+            return Err(crate::codec::read_only("writing into it"));
+        }
         if let Ok(native) = obj.cast::<crate::tensor::PyTensor>() {
             return Ok(Self::NativeMut(native.try_borrow_mut()?));
         }
@@ -902,6 +906,34 @@ pub(crate) fn publish_gpu_write(dst: &Bound<'_, PyAny>, value: Option<u64>) {
 /// fix (`TensorCapsulePayload::pbo_keepalive`) for exactly that window.
 pub(crate) fn reconstructible(tensor: &TensorDyn) -> bool {
     !matches!(tensor.memory(), edgefirst_tensor::TensorMemory::Cuda)
+}
+
+/// What keeps a tensor taken out of a [`RawTensorAccess`] valid: the host
+/// pin and the Python object it was resolved from. Drop it after the tensor.
+#[cfg(feature = "codec")]
+pub struct RawKeepalive {
+    _pin: Option<HostPin<'static>>,
+    _keepalive: Option<Py<PyAny>>,
+}
+
+#[cfg(feature = "codec")]
+impl RawTensorAccess {
+    /// Takes the resolved tensor out, for a consumer that owns its tensors
+    /// (a decoder's provided pool), with what must outlive it.
+    pub fn into_owned(self) -> (TensorDyn, RawKeepalive) {
+        match self.repr {
+            RawTensorRepr::Ref {
+                tensor,
+                _pin,
+                _keepalive,
+            }
+            | RawTensorRepr::Mut {
+                tensor,
+                _pin,
+                _keepalive,
+            } => (tensor, RawKeepalive { _pin, _keepalive }),
+        }
+    }
 }
 
 impl AsRef<TensorDyn> for RawTensorAccess {

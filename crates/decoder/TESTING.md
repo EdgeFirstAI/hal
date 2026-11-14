@@ -47,6 +47,12 @@ crates/decoder/
 │   ├── decoder_from_edgefirst_json.rs
 │   ├── decoder_modelpack_multitask.rs
 │   ├── decoder_normalized_flag.rs
+│   ├── decoder_output_binding.rs       # Same-shape outputs: bound by name,
+│                                       #   else configured position, else
+│                                       #   refused; merged outputs by role
+│   ├── decoder_yolo26_pre_nms.rs       # yolo26 tag with a pre-NMS head:
+│                                       #   model.end2end and the layout
+│                                       #   fallback
 │   ├── infer_builder.rs                # Inferred schemas round-trip through
 │                                       #   DecoderBuilder
 │   ├── modelpack_coffeecup_parity.rs

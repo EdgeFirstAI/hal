@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! `edgefirst.codec` — JPEG/PNG decoding.
+//! `edgefirst.codec`: image decoding and encoding, H.264 and MJPEG video,
+//! and the engines that run them.
 
 use edgefirst_python_common::{colorimetry, tensor};
 use pyo3::prelude::*;
@@ -39,6 +40,7 @@ fn _codec(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(tensor::decode_into, m)?)?;
     m.add_function(wrap_pyfunction!(tensor::decode_file_into, m)?)?;
     m.add_function(wrap_pyfunction!(version, m)?)?;
+    edgefirst_python_common::codec::register(m)?;
     Ok(())
 }
 

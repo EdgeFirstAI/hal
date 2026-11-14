@@ -581,6 +581,34 @@ fn rejects_an_empty_access_unit() {
 }
 
 #[test]
+fn rejects_a_pool_that_holds_one_buffer_twice() {
+    let image = TensorDyn::image(
+        64,
+        64,
+        PixelFormat::Grey,
+        DType::U8,
+        Some(TensorMemory::Mem),
+        CpuAccess::ReadWrite,
+    )
+    .unwrap();
+    let whole = edgefirst_tensor::Region {
+        x: 0,
+        y: 0,
+        width: 64,
+        height: 64,
+    };
+    let alias = image.view(whole).unwrap();
+    let err = VideoDecoder::new(
+        DecoderConfig::h264().with_output(OutputPool::Provided(vec![image, alias])),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&err, CodecError::InvalidConfig(m) if m.contains("same buffer")),
+        "{err}"
+    );
+}
+
+#[test]
 fn rejects_an_empty_or_host_memory_pool() {
     let err =
         VideoDecoder::new(DecoderConfig::h264().with_output(OutputPool::Provided(Vec::new())))

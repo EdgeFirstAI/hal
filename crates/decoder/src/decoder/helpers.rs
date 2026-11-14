@@ -8,28 +8,21 @@ use crate::DecoderError;
 use ndarray::{ArrayView, ArrayViewD, Dimension};
 
 impl Decoder {
+    /// The tensor of each detection head, found by shape in configured
+    /// order, and the tensors' indices in `outputs`. Heads of one shape take
+    /// successive tensors of that shape.
     pub(super) fn match_outputs_to_detect<'a, 'b, T>(
         configs: &[configs::Detection],
         outputs: &'a [ArrayViewD<'b, T>],
-    ) -> Result<Vec<&'a ArrayViewD<'b, T>>, DecoderError> {
-        let mut new_output_order = Vec::new();
+    ) -> Result<(Vec<&'a ArrayViewD<'b, T>>, Vec<usize>), DecoderError> {
+        let mut matched = Vec::with_capacity(configs.len());
+        let mut indices = Vec::with_capacity(configs.len());
         for c in configs {
-            let mut found = false;
-            for o in outputs {
-                if o.shape() == c.shape {
-                    new_output_order.push(o);
-                    found = true;
-                    break;
-                }
-            }
-            if !found {
-                return Err(DecoderError::InvalidShape(format!(
-                    "Did not find output with shape {:?}",
-                    c.shape
-                )));
-            }
+            let (output, index) = Self::find_outputs_with_shape(&c.shape, outputs, &indices)?;
+            matched.push(output);
+            indices.push(index);
         }
-        Ok(new_output_order)
+        Ok((matched, indices))
     }
 
     pub(super) fn find_outputs_with_shape<'a, 'b, T>(
@@ -250,28 +243,21 @@ impl Decoder {
         array
     }
 
+    /// [`match_outputs_to_detect`](Self::match_outputs_to_detect) for
+    /// quantized outputs.
     pub(super) fn match_outputs_to_detect_quantized<'a, 'b>(
         configs: &[configs::Detection],
         outputs: &'a [ArrayViewDQuantized<'b>],
-    ) -> Result<Vec<&'a ArrayViewDQuantized<'b>>, DecoderError> {
-        let mut new_output_order = Vec::new();
+    ) -> Result<(Vec<&'a ArrayViewDQuantized<'b>>, Vec<usize>), DecoderError> {
+        let mut matched = Vec::with_capacity(configs.len());
+        let mut indices = Vec::with_capacity(configs.len());
         for c in configs {
-            let mut found = false;
-            for o in outputs {
-                if o.shape() == c.shape {
-                    new_output_order.push(o);
-                    found = true;
-                    break;
-                }
-            }
-            if !found {
-                return Err(DecoderError::InvalidShape(format!(
-                    "Did not find output with shape {:?}",
-                    c.shape
-                )));
-            }
+            let (output, index) =
+                Self::find_outputs_with_shape_quantized(&c.shape, outputs, &indices)?;
+            matched.push(output);
+            indices.push(index);
         }
-        Ok(new_output_order)
+        Ok((matched, indices))
     }
 
     /// Validate that an output's `shape` and `dshape` satisfy the HAL

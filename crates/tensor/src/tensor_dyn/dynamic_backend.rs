@@ -319,6 +319,44 @@ impl TensorDyn {
         }
     }
 
+    /// The handle, still owned by this value and valid while it lives.
+    ///
+    /// For lending the tensor to C code that does not keep it. A borrower
+    /// that keeps it takes its own reference with `ef_tensor_retain`; that
+    /// reference makes the handle shared, so writable CPU maps of it are
+    /// refused until it is released. Changing the tensor's shape or format
+    /// through the handle leaves this value's cached copies stale.
+    pub fn as_raw(&self) -> Raw {
+        self.handle.as_ptr()
+    }
+
+    /// A second owner of the same tensor: one more reference to this handle.
+    ///
+    /// Both values read and write the same buffer and metadata, and the
+    /// tensor lives until both are dropped. While both are alive the handle
+    /// is shared, so writable CPU maps through either are refused.
+    ///
+    /// # Safety
+    /// The handle's metadata (shape, format, row stride, plane offset,
+    /// quantization) is not synchronized between owners. While both are
+    /// alive, no metadata change through one may overlap any use of the
+    /// other, and neither may rely on the other leaving the metadata alone:
+    /// each keeps its own cached copy.
+    ///
+    /// # Errors
+    /// `NotImplemented` when the library refuses the reference.
+    pub unsafe fn share(&self) -> Result<TensorDyn> {
+        // SAFETY: `self.handle` is live.
+        let rc = unsafe { edgefirst_tensor_ffi::ef_tensor_retain(self.handle.as_ptr()) };
+        if rc != 0 {
+            return Err(Error::NotImplemented(format!(
+                "ef_tensor_retain failed: errno {rc}"
+            )));
+        }
+        // SAFETY: the reference taken above is owned by the new value.
+        Ok(unsafe { Self::from_raw(self.handle.as_ptr()) })
+    }
+
     /// Give up ownership, yielding the handle itself. The caches are
     /// dropped: they are derived state that `from_raw` re-derives.
     pub fn into_raw(self) -> Raw {

@@ -2581,6 +2581,55 @@ nms: class_agnostic
         ));
     }
 
+    /// With two classes a pre-NMS head has `4 + 2` features, the width of an
+    /// end-to-end row, so its shape cannot say which it is. The tag then
+    /// decides, as it always has, and only `model.end2end: false` selects
+    /// the NMS path. The same holds with protos (`6 + protos` either way).
+    #[test]
+    fn test_yolo26_two_class_pre_nms_head_needs_the_end2end_flag() {
+        let schema = |model: &str, protos: bool| {
+            let features = if protos { 38 } else { 6 };
+            let protos = if protos {
+                r#", {"name": "protos", "type": "protos", "shape": [1, 32, 160, 160],
+                      "dshape": [{"batch": 1}, {"num_protos": 32}, {"height": 160}, {"width": 160}]}"#
+            } else {
+                ""
+            };
+            format!(
+                r#"{{"schema_version": 2, "decoder_version": "yolo26", {model}
+                    "outputs": [{{"name": "output0", "type": "detection",
+                        "shape": [1, {features}, 8400],
+                        "dshape": [{{"batch": 1}}, {{"num_features": {features}}}, {{"num_boxes": 8400}}],
+                        "decoder": "ultralytics", "encoding": "direct", "normalized": true}}{protos}]}}"#
+            )
+        };
+        let model_type = |model: &str, protos: bool| {
+            DecoderBuilder::new()
+                .with_config_json_str(schema(model, protos))
+                .build()
+                .unwrap()
+                .model_type
+        };
+        let pre_nms = r#""model": {"end2end": false},"#;
+
+        assert!(matches!(
+            model_type("", false),
+            ModelType::YoloEndToEndDet { .. }
+        ));
+        assert!(matches!(
+            model_type(pre_nms, false),
+            ModelType::YoloDet { .. }
+        ));
+        assert!(matches!(
+            model_type("", true),
+            ModelType::YoloEndToEndSegDet { .. }
+        ));
+        assert!(matches!(
+            model_type(pre_nms, true),
+            ModelType::YoloSegDet { .. }
+        ));
+    }
+
     #[test]
     fn test_decoder_version_yolov8_traditional() {
         // Test that decoder_version: yolov8 creates traditional model type
