@@ -76,9 +76,9 @@ typedef struct ef_image_decoder ef_image_decoder;
  * A compressed image or video format.
  */
 enum ef_codec
-#if __STDC_VERSION__ >= 202311L
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
   : uint32_t
-#endif // __STDC_VERSION__ >= 202311L
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
  {
   /**
    * JPEG still images.
@@ -113,19 +113,21 @@ enum ef_codec
    */
   EF_CODEC_AV1 = 7,
 };
+#ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L
 typedef enum ef_codec ef_codec;
 #else
 typedef uint32_t ef_codec;
 #endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
 
 /**
  * What runs a codec.
  */
 enum ef_codec_engine
-#if __STDC_VERSION__ >= 202311L
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
   : uint32_t
-#endif // __STDC_VERSION__ >= 202311L
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
  {
   /**
    * The first engine that can do the request, in the platform's order.
@@ -154,19 +156,21 @@ enum ef_codec_engine
    */
   EF_CODEC_ENGINE_CPU = 5,
 };
+#ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L
 typedef enum ef_codec_engine ef_codec_engine;
 #else
 typedef uint32_t ef_codec_engine;
 #endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
 
 /**
  * Encoding or decoding.
  */
 enum ef_codec_direction
-#if __STDC_VERSION__ >= 202311L
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
   : uint32_t
-#endif // __STDC_VERSION__ >= 202311L
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
  {
   /**
    * Pixels to a compressed format.
@@ -177,19 +181,21 @@ enum ef_codec_direction
    */
   EF_CODEC_DIRECTION_DECODE = 1,
 };
+#ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L
 typedef enum ef_codec_direction ef_codec_direction;
 #else
 typedef uint32_t ef_codec_direction;
 #endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
 
 /**
  * How pixels move between a tensor and an engine.
  */
 enum ef_codec_transfer
-#if __STDC_VERSION__ >= 202311L
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
   : uint32_t
-#endif // __STDC_VERSION__ >= 202311L
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
  {
   /**
    * The engine reads or writes the tensor's own memory.
@@ -204,19 +210,21 @@ enum ef_codec_transfer
    */
   EF_CODEC_TRANSFER_CPU_COPY = 2,
 };
+#ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L
 typedef enum ef_codec_transfer ef_codec_transfer;
 #else
 typedef uint32_t ef_codec_transfer;
 #endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
 
 /**
  * H.264 profile of an encoder.
  */
 enum ef_h264_profile
-#if __STDC_VERSION__ >= 202311L
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
   : uint32_t
-#endif // __STDC_VERSION__ >= 202311L
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
  {
   /**
    * High where the device offers it, else the device default.
@@ -239,19 +247,21 @@ enum ef_h264_profile
    */
   EF_H264_PROFILE_HIGH = 4,
 };
+#ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L
 typedef enum ef_h264_profile ef_h264_profile;
 #else
 typedef uint32_t ef_h264_profile;
 #endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
 
 /**
  * What [`ef_video_decoder_next_event`] returned.
  */
 enum ef_video_event
-#if __STDC_VERSION__ >= 202311L
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
   : uint32_t
-#endif // __STDC_VERSION__ >= 202311L
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
  {
   /**
    * Nothing is ready: decode more, or flush.
@@ -268,19 +278,21 @@ enum ef_video_event
    */
   EF_VIDEO_EVENT_RECONFIGURED = 2,
 };
+#ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L
 typedef enum ef_video_event ef_video_event;
 #else
 typedef uint32_t ef_video_event;
 #endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
 
 /**
  * Whose memory a decoder writes its pictures to.
  */
 enum ef_video_memory
-#if __STDC_VERSION__ >= 202311L
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
   : uint32_t
-#endif // __STDC_VERSION__ >= 202311L
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
  {
   /**
    * The pool's tensors, which the device imports, or which each picture
@@ -293,11 +305,13 @@ enum ef_video_memory
    */
   EF_VIDEO_MEMORY_EXPORTED = 1,
 };
+#ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L
 typedef enum ef_video_memory ef_video_memory;
 #else
 typedef uint32_t ef_video_memory;
 #endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
 
 /**
  * What the codec engines on this machine can do: a list of
@@ -497,6 +511,10 @@ typedef struct ef_video_stream_info {
    */
   uint32_t transfer;
 } ef_video_stream_info;
+
+#ifdef __cplusplus
+extern "C" {
+#endif // __cplusplus
 
 /**
  * ABI version of this library's C surface.
@@ -992,6 +1010,8 @@ struct ef_video_decoder *ef_video_decoder_new(uint32_t codec,
 
 /**
  * Opens a decoder that decodes into the caller's tensors, one buffer each.
+ * Each must be a different buffer: a pool that holds one buffer twice, as
+ * the same handle or two handles over it, is `EINVAL`.
  *
  * On success the decoder takes over the caller's reference to each tensor:
  * the caller must not free them. A caller that keeps using one takes its
@@ -1133,6 +1153,10 @@ bool ef_video_frame_corrupted(const struct ef_video_frame *f);
  * `f` must be `NULL` or have come from [`ef_video_decoder_next_event`].
  */
 void ef_video_frame_free(struct ef_video_frame *f);
+
+#ifdef __cplusplus
+}  // extern "C"
+#endif  // __cplusplus
 
 #ifdef __cplusplus
 } /* extern "C" */

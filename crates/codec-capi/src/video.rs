@@ -714,6 +714,8 @@ pub extern "C" fn ef_video_decoder_new(
 }
 
 /// Opens a decoder that decodes into the caller's tensors, one buffer each.
+/// Each must be a different buffer: a pool that holds one buffer twice, as
+/// the same handle or two handles over it, is `EINVAL`.
 ///
 /// On success the decoder takes over the caller's reference to each tensor:
 /// the caller must not free them. A caller that keeps using one takes its
@@ -1071,6 +1073,46 @@ mod tests {
             ef_video_encoder_free(std::ptr::null_mut());
             assert!(ef_video_decoder_new_with_pool(2, 0, std::ptr::null(), 0).is_null());
             assert_eq!(errno::errno().0, libc::EINVAL);
+        }
+    }
+
+    #[test]
+    fn a_pool_holding_one_tensor_twice_is_refused_and_keeps_its_references() {
+        use edgefirst_tensor::{CpuAccess, DType, PixelFormat, TensorMemory};
+        let t = TensorDyn::image(
+            64,
+            64,
+            PixelFormat::Nv12,
+            DType::U8,
+            Some(TensorMemory::Mem),
+            CpuAccess::ReadWrite,
+        )
+        .unwrap()
+        .into_raw();
+        unsafe {
+            assert_eq!(edgefirst_tensor_ffi::ef_tensor_retain(t), 0);
+            let pool = [t, t];
+            let d = ef_video_decoder_new_with_pool(
+                EfCodec::H264 as u32,
+                EfCodecEngine::Auto as u32,
+                pool.as_ptr(),
+                pool.len(),
+            );
+            assert!(d.is_null());
+            assert_eq!(errno::errno().0, libc::EINVAL);
+            let msg = std::ffi::CStr::from_ptr(crate::error::ef_codec_last_error());
+            assert!(msg.to_str().unwrap().contains("same buffer"), "{msg:?}");
+            // The caller still holds exactly its two references: a CPU write
+            // map is refused while the handle is shared, and succeeds once one
+            // is released.
+            assert!(!TensorDyn::with_raw(t, |t| t
+                .map_bytes(CpuAccess::Write)
+                .is_ok()));
+            edgefirst_tensor_ffi::ef_tensor_free(t);
+            assert!(TensorDyn::with_raw(t, |t| t
+                .map_bytes(CpuAccess::Write)
+                .is_ok()));
+            edgefirst_tensor_ffi::ef_tensor_free(t);
         }
     }
 }

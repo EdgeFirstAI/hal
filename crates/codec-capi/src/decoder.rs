@@ -66,8 +66,11 @@ pub unsafe extern "C" fn ef_image_decoder_decode_into(
 ) -> c_int {
     unsafe {
         crate::error::guard(|| {
-            if d.is_null() || data.is_null() || len == 0 || dst.is_null() {
-                return libc::EINVAL;
+            if d.is_null() || dst.is_null() {
+                return crate::error::invalid("the decoder or the destination tensor is NULL");
+            }
+            if data.is_null() || len == 0 {
+                return crate::error::invalid("the image data is empty");
             }
             let bytes = std::slice::from_raw_parts(data, len);
             match TensorDyn::with_raw(dst, |t| t.load_image(&mut (*d).inner, bytes)) {
@@ -93,13 +96,13 @@ pub unsafe extern "C" fn ef_image_decoder_decode_file_into(
     unsafe {
         crate::error::guard(|| {
             if d.is_null() || path.is_null() {
-                return libc::EINVAL;
+                return crate::error::invalid("the decoder or the path is NULL");
             }
             let Ok(p) = CStr::from_ptr(path).to_str() else {
-                return libc::EINVAL;
+                return crate::error::invalid("the path is not UTF-8");
             };
             if dst.is_null() {
-                return libc::EINVAL;
+                return crate::error::invalid("the destination tensor is NULL");
             }
             match TensorDyn::with_raw(dst, |t| t.load_image_file(&mut (*d).inner, p)) {
                 Ok(_) => 0,
@@ -168,12 +171,12 @@ pub unsafe extern "C" fn ef_image_decoder_set_dct_method(
     unsafe {
         crate::error::guard(|| {
             if d.is_null() {
-                return libc::EINVAL;
+                return crate::error::invalid("the decoder is NULL");
             }
             let m = match method {
                 0 => edgefirst_codec::DctMethod::Accurate,
                 1 => edgefirst_codec::DctMethod::Fast,
-                _ => return libc::EINVAL,
+                _ => return crate::error::invalid(&format!("DCT method {method} is not 0 or 1")),
             };
             (*d).inner.set_dct_method(m);
             0
@@ -193,17 +196,17 @@ pub unsafe extern "C" fn ef_image_decoder_set_output_format(
     unsafe {
         crate::error::guard(|| {
             if d.is_null() {
-                return libc::EINVAL;
+                return crate::error::invalid("the decoder is NULL");
             }
             if format.is_null() {
                 (*d).inner.set_output_format(None);
                 return 0;
             }
             let Ok(s) = CStr::from_ptr(format).to_str() else {
-                return libc::EINVAL;
+                return crate::error::invalid("the pixel format is not UTF-8");
             };
             let Some(fmt) = edgefirst_tensor::PixelFormat::from_str_code(s) else {
-                return libc::EINVAL;
+                return crate::error::invalid(&format!("{s:?} is not a pixel format"));
             };
             (*d).inner.set_output_format(Some(fmt));
             0
@@ -220,7 +223,7 @@ pub unsafe extern "C" fn ef_image_decoder_reset_output_format(d: *mut EfImageDec
     unsafe {
         crate::error::guard(|| {
             if d.is_null() {
-                return libc::EINVAL;
+                return crate::error::invalid("the decoder is NULL");
             }
             (*d).inner.set_output_format(None);
             0
@@ -252,7 +255,7 @@ pub unsafe extern "C" fn ef_codec_colorimetry_from_v4l2(
     unsafe {
         crate::error::guard(|| {
             if out.is_null() {
-                return libc::EINVAL;
+                return crate::error::invalid("out is NULL");
             }
             *out = edgefirst_tensor::Colorimetry::from_v4l2(
                 colorspace,
@@ -285,10 +288,10 @@ pub unsafe extern "C" fn ef_codec_save_jpeg(
     unsafe {
         crate::error::guard(|| {
             if t.is_null() || path.is_null() {
-                return libc::EINVAL;
+                return crate::error::invalid("the tensor or the path is NULL");
             }
             let Ok(p) = CStr::from_ptr(path).to_str() else {
-                return libc::EINVAL;
+                return crate::error::invalid("the path is not UTF-8");
             };
             let quality = if quality <= 0 || quality > 100 {
                 80
@@ -303,31 +306,48 @@ pub unsafe extern "C" fn ef_codec_save_jpeg(
     }
 }
 
+/// Writes `tensor` as a JPEG file; a failure records its reason.
 fn save_jpeg(tensor: &TensorDyn, path: &str, quality: u8) -> Result<(), c_int> {
-    use edgefirst_tensor::{CpuAccess, PixelFormat, PixelLayout};
+    use crate::error::refuse;
+    use edgefirst_tensor::{CpuAccess, PixelFormat};
 
     if tensor.dtype() != edgefirst_tensor::DType::U8 {
-        return Err(libc::EINVAL);
+        return Err(refuse(
+            libc::EINVAL,
+            &format!("JPEG is written from u8 tensors, not {:?}", tensor.dtype()),
+        ));
     }
-    let fmt = tensor.format().ok_or(libc::EINVAL)?;
-    if fmt.layout() != PixelLayout::Packed {
-        return Err(libc::ENOTSUP);
-    }
+    let Some(fmt) = tensor.format() else {
+        return Err(refuse(libc::EINVAL, "the tensor is not an image"));
+    };
     let colour = match fmt {
         PixelFormat::Rgb => jpeg_encoder::ColorType::Rgb,
         PixelFormat::Rgba => jpeg_encoder::ColorType::Rgba,
-        _ => return Err(libc::ENOTSUP),
+        _ => {
+            return Err(refuse(
+                libc::ENOTSUP,
+                &format!("JPEG is written from RGB or RGBA images, not {fmt:?}"),
+            ))
+        }
     };
-    let w = tensor.width().ok_or(libc::EINVAL)?;
-    let h = tensor.height().ok_or(libc::EINVAL)?;
+    let (Some(w), Some(h)) = (tensor.width(), tensor.height()) else {
+        return Err(refuse(libc::EINVAL, "the image has no width or height"));
+    };
+    let (Ok(w16), Ok(h16)) = (u16::try_from(w), u16::try_from(h)) else {
+        return Err(refuse(
+            libc::ENOTSUP,
+            &format!("a {w}x{h} image is larger than JPEG allows (65535x65535)"),
+        ));
+    };
     let pin = tensor
         .pin_host(CpuAccess::Read)
-        .map_err(|e| tensor_errno(&e))?;
+        .map_err(|e| refuse(tensor_errno(&e), &e.to_string()))?;
     let bytes = unsafe { pin.as_slice() };
-    let encoder = jpeg_encoder::Encoder::new_file(path, quality).map_err(|_| libc::EIO)?;
+    let encoder = jpeg_encoder::Encoder::new_file(path, quality)
+        .map_err(|e| refuse(libc::EIO, &format!("{path}: {e}")))?;
     encoder
-        .encode(bytes, w as u16, h as u16, colour)
-        .map_err(|_| libc::EIO)
+        .encode(bytes, w16, h16, colour)
+        .map_err(|e| refuse(libc::EIO, &format!("{path}: {e}")))
 }
 
 #[cfg(test)]
@@ -363,6 +383,53 @@ mod tests {
                 ),
                 libc::EINVAL
             );
+            ef_image_decoder_free(d);
+        }
+    }
+
+    fn last_error() -> String {
+        let p = crate::error::ef_codec_last_error();
+        assert!(!p.is_null(), "a failed call left no message");
+        unsafe { std::ffi::CStr::from_ptr(p) }
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    #[test]
+    fn every_refusal_says_why() {
+        use edgefirst_tensor::{CpuAccess, DType, PixelFormat, TensorMemory};
+        unsafe {
+            let d = ef_image_decoder_new();
+            let dst = TensorDyn::image(
+                8,
+                8,
+                PixelFormat::Grey,
+                DType::U8,
+                Some(TensorMemory::Mem),
+                CpuAccess::ReadWrite,
+            )
+            .unwrap()
+            .into_raw();
+            assert_eq!(
+                ef_image_decoder_decode_into(d, [0u8].as_ptr(), 0, dst),
+                libc::EINVAL
+            );
+            assert!(last_error().contains("empty"));
+            assert_eq!(ef_image_decoder_set_dct_method(d, 9), libc::EINVAL);
+            assert!(last_error().contains("DCT method 9"));
+            let bogus = c"not-a-format";
+            assert_eq!(
+                ef_image_decoder_set_output_format(d, bogus.as_ptr()),
+                libc::EINVAL
+            );
+            assert!(last_error().contains("not-a-format"));
+            let path = c"never-written.jpg";
+            assert_eq!(ef_codec_save_jpeg(dst, path.as_ptr(), 80), libc::ENOTSUP);
+            assert!(last_error().contains("RGB or RGBA"));
+            let mut out = 0;
+            assert_eq!(ef_codec_colorimetry_from_v4l2(0, 0, 0, 0, 0, &mut out), 0);
+            assert!(crate::error::ef_codec_last_error().is_null());
+            edgefirst_tensor_ffi::ef_tensor_free(dst);
             ef_image_decoder_free(d);
         }
     }

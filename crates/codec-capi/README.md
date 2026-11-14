@@ -100,7 +100,7 @@ for (;;) {
 }
 ```
 
-Frames come from a pool: the caller may hold up to the pool count at once, and a decode with every buffer held is `EAGAIN` (free some frames and decode the same access unit again). `ef_video_decoder_new_with_pool` decodes into the caller's own tensors instead. Feed H.264 as Annex B access units in decode order, and MJPEG as one JPEG picture per call.
+Frames come from a pool: the caller may hold up to the pool count at once, and a decode with every buffer held is `EAGAIN` (free some frames and decode the same access unit again). `ef_video_decoder_new_with_pool` decodes into the caller's own tensors instead, each a different buffer. Feed H.264 as Annex B access units in decode order, and MJPEG as one JPEG picture per call.
 
 ## Engines and capabilities
 

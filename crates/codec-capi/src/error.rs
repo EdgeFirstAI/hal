@@ -54,20 +54,36 @@ pub(crate) fn fail(e: &CodecError) -> c_int {
     errno_for(e)
 }
 
+/// Records why a call failed and returns `rc`.
+pub(crate) fn refuse(rc: c_int, why: &str) -> c_int {
+    set_last(why);
+    rc
+}
+
 /// Records a bad argument and returns `EINVAL`.
 pub(crate) fn invalid(what: &str) -> c_int {
-    set_last(what);
-    libc::EINVAL
+    refuse(libc::EINVAL, what)
+}
+
+/// Gives a failure that recorded no reason a generic one, so a nonzero
+/// result always comes with a message.
+fn ensure_message(rc: c_int) {
+    let missing = LAST.try_with(|l| l.borrow().is_none()).unwrap_or(false);
+    if rc != 0 && missing {
+        set_last(&format!("failed with errno {rc}"));
+    }
 }
 
 /// Runs an entry point that returns an errno: clears the last error first,
-/// and turns a panic into `EINVAL` with a message.
+/// turns a panic into `EINVAL`, and leaves a message for every failure.
 pub(crate) fn guard(body: impl FnOnce() -> c_int) -> c_int {
     clear_last();
-    catch_unwind(AssertUnwindSafe(body)).unwrap_or_else(|_| {
+    let rc = catch_unwind(AssertUnwindSafe(body)).unwrap_or_else(|_| {
         set_last("internal error");
         libc::EINVAL
-    })
+    });
+    ensure_message(rc);
+    rc
 }
 
 /// Runs an entry point that returns a new object: `NULL` on failure, with
@@ -82,6 +98,7 @@ pub(crate) fn guard_new<T>(body: impl FnOnce() -> Result<T, c_int>) -> *mut T {
             libc::EINVAL
         }
     };
+    ensure_message(rc);
     errno::set_errno(errno::Errno(rc));
     std::ptr::null_mut()
 }
@@ -143,6 +160,19 @@ mod tests {
         assert_eq!(msg.to_str().unwrap(), "the thing is NULL");
         assert_eq!(guard(|| 0), 0);
         assert!(ef_codec_last_error().is_null());
+    }
+
+    #[test]
+    fn a_failure_without_a_reason_still_leaves_a_message() {
+        assert_eq!(guard(|| libc::EIO), libc::EIO);
+        let msg = unsafe { std::ffi::CStr::from_ptr(ef_codec_last_error()) };
+        assert_eq!(
+            msg.to_str().unwrap(),
+            format!("failed with errno {}", libc::EIO)
+        );
+        let p: *mut u8 = guard_new(|| -> Result<u8, c_int> { Err(libc::ENOTSUP) });
+        assert!(p.is_null());
+        assert!(!ef_codec_last_error().is_null());
     }
 
     #[test]

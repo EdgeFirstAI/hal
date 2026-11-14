@@ -406,6 +406,71 @@ mod tests {
         run_program(&exe, run)
     }
 
+    /// Parses `src` as C++17 against the shipped headers, or `None` after
+    /// reporting that no C++ compiler works here.
+    #[cfg(not(windows))]
+    fn cxx_syntax_check(src: &str) -> Option<std::process::Output> {
+        let cxx = std::env::var("CXX").unwrap_or_else(|_| "c++".to_string());
+        let pid = std::process::id();
+        let probe = std::env::temp_dir().join(format!("ef_codec_cxx_probe-{pid}.cpp"));
+        let works = std::fs::write(&probe, b"int main() { return 0; }\n").is_ok()
+            && std::process::Command::new(&cxx)
+                .args(["-std=c++17", "-fsyntax-only"])
+                .arg(&probe)
+                .output()
+                .is_ok_and(|o| o.status.success());
+        if !works {
+            skip(&format!(
+                "{src} not compiled: no working C++17 toolchain ({cxx})"
+            ));
+            return None;
+        }
+        let out = std::process::Command::new(&cxx)
+            .args([
+                "-x",
+                "c++",
+                "-std=c++17",
+                "-Wall",
+                "-Wextra",
+                "-Wpedantic",
+                "-Werror",
+                "-fsyntax-only",
+                "-I",
+                concat!(env!("CARGO_MANIFEST_DIR"), "/include"),
+                "-I",
+                concat!(env!("CARGO_MANIFEST_DIR"), "/../tensor-capi/include"),
+                src,
+            ])
+            .output()
+            .expect("the C++ compiler ran a moment ago");
+        Some(out)
+    }
+
+    #[cfg(windows)]
+    fn cxx_syntax_check(src: &str) -> Option<std::process::Output> {
+        let includes = [
+            concat!(env!("CARGO_MANIFEST_DIR"), "/include"),
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../tensor-capi/include"),
+        ];
+        Some(crate::msvc::require(src)?.syntax_check(&includes, &["/TP", "/std:c++17"], src))
+    }
+
+    /// C++ callers include the same header: each enum's name must be one
+    /// type in C++, where the enum tag is already a type name.
+    #[test]
+    fn the_header_compiles_as_cpp17() {
+        let src = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/c/test_cpp_include.cpp");
+        let Some(out) = cxx_syntax_check(src) else {
+            return;
+        };
+        assert!(
+            out.status.success(),
+            "codec.h failed to compile as C++17:\n{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
     /// The whole C surface from a C program: capabilities, a JPEG encoded
     /// and decoded back, refusals, and an H.264 stream encoded from tensors
     /// and decoded into frames where this machine has hardware for it.

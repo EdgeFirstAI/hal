@@ -605,6 +605,7 @@ pub enum OutputPool {
         count: usize,
     },
     /// Pictures are decoded into these DMA-BUF tensors, one buffer each.
+    /// Each tensor must be a different buffer.
     ///
     /// On Windows pictures are copied into the pool (on the GPU), and each
     /// tensor must be an NV12 image of exactly the stream's visible size;
@@ -863,8 +864,8 @@ impl VideoDecoder {
     ///
     /// # Errors
     ///
-    /// [`CodecError::InvalidConfig`] when a provided pool is empty or not in
-    /// DMA-BUF memory, [`CodecError::Unsupported`] when the engine (or, for
+    /// [`CodecError::InvalidConfig`] when a provided pool is empty, holds one
+    /// buffer twice or is not in DMA-BUF memory, [`CodecError::Unsupported`] when the engine (or, for
     /// [`Engine::Auto`], every engine here) does not decode the codec, and
     /// [`CodecError::NoDevice`] when there is no decoder.
     pub fn new(config: DecoderConfig) -> Result<Self> {
@@ -873,6 +874,17 @@ impl VideoDecoder {
                 return Err(CodecError::InvalidConfig(
                     "the provided pool is empty".into(),
                 ));
+            }
+            // Each provided tensor starts at the beginning of its buffer, so
+            // two with one buffer identity are the same memory: one slot would
+            // decode over a picture still shown from the other.
+            let mut seen = std::collections::HashMap::with_capacity(pool.len());
+            for (i, t) in pool.iter().enumerate() {
+                if let Some(first) = seen.insert(t.buffer_identity().id(), i) {
+                    return Err(CodecError::InvalidConfig(format!(
+                        "provided tensors {first} and {i} are the same buffer; each pool buffer must be distinct"
+                    )));
+                }
             }
             if let Some(t) = pool
                 .iter()

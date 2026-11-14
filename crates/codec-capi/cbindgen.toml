@@ -15,6 +15,11 @@
 # hand-written `trailer` below, not in generated output.
 
 language = "C"
+# C++ callers include this header too. Without `cpp_compat`, each
+# `#[repr(u32)]` enum is followed by `typedef uint32_t <name>;` under C++
+# (where `__STDC_VERSION__` is undefined), which redefines the enum tag that
+# C++ already made a type. With it, C++ gets the fixed-type enum and no typedef.
+cpp_compat = true
 autogen_warning = "/* WARNING: The generated portion of this file is produced by cbindgen. Do not modify it directly. */"
 include_version = true
 documentation = true
