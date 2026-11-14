@@ -27,6 +27,7 @@
 # allocation succeeds.
 #
 # Writes one log per binary, check-single-home.log, test_two_library_user.log,
+# test_codec_api.log, python-codec.log,
 # capabilities.txt, summary.txt (`RESULT|detail`, one line) and summary.json
 # into <results-dir>. Exits 0 on PASS, 1 on FAIL, NO-TESTS or NO-GPU.
 
@@ -188,6 +189,50 @@ else
   fail=$((fail + 1)); failed_bins+=("test_two_library_user")
   echo "     FAILED"
   sed 's/^/     /' "${g3log}"
+fi
+
+# The codec C API end to end on this board's engines. A part the board
+# cannot run prints "SKIP: <reason>", rewritten into the WARNING form the
+# skip count and warnings.txt collect.
+echo "  -- test_codec_api"
+codeclog="${RESULTS}/test_codec_api.log"
+env ${extra_env[@]+"${extra_env[@]}"} ./target/debug/test_codec_api 2>&1 \
+  | sed 's/^SKIP: /WARNING: SKIPPED: test_codec_api - /' > "${codeclog}"
+if [[ "${PIPESTATUS[0]}" -eq 0 ]]; then
+  pass=$((pass + 1))
+  grep -q "SKIPPED" "${codeclog}" && echo "     ok, but $(grep -c "SKIPPED" "${codeclog}") skipped"
+else
+  fail=$((fail + 1)); failed_bins+=("test_codec_api")
+  echo "     FAILED"
+  sed 's/^/     /' "${codeclog}"
+fi
+
+# The Python codec tests, with the bundle's own wheels and pytest on
+# PYTHONPATH. They need a python3 of 3.11 or newer with numpy; a board
+# without one, or a bundle built without wheels, skips them with the reason.
+echo "  -- Python codec tests"
+pylog="${RESULTS}/python-codec.log"
+py_skip=""
+if [[ ! -d python ]]; then
+  py_skip="the bundle has no wheels (built without PYTHON_WHEELS)"
+elif ! python3 -c 'import sys, numpy; sys.exit(sys.version_info < (3, 11))' > /dev/null 2>&1; then
+  py_skip="no python3 3.11+ with numpy on this board"
+fi
+if [[ -n "${py_skip}" ]]; then
+  echo "WARNING: SKIPPED: Python codec tests - ${py_skip}" > "${pylog}"
+  echo "     skipped: ${py_skip}"
+else
+  env PYTHONPATH="${BUNDLE}/python" ${extra_env[@]+"${extra_env[@]}"} \
+    python3 -m pytest tests/codec -q -rs -p no:cacheprovider 2>&1 \
+    | sed 's/^SKIPPED \[[0-9]*\] /WARNING: SKIPPED: /' > "${pylog}"
+  if [[ "${PIPESTATUS[0]}" -eq 0 ]]; then
+    pass=$((pass + 1))
+    echo "     ok -- $(tail -n 1 "${pylog}")"
+  else
+    fail=$((fail + 1)); failed_bins+=("python-codec")
+    echo "     FAILED (see ${pylog})"
+    grep -E "^(FAILED|ERROR)|Error" "${pylog}" | head -8 | sed 's/^/     /'
+  fi
 fi
 
 skipped="$(cat "${RESULTS}"/*.log 2>/dev/null | grep -c "SKIPPED")"
