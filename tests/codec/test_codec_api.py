@@ -138,7 +138,7 @@ def decode_all(decoder, units):
 def test_a_stream_decodes_into_tensor_frames():
     units = codec.access_units((TESTDATA / "h264_1080p_main_bframes.h264").read_bytes())
     decoder = open_or_skip(lambda: VideoDecoder(Codec.H264))
-    # Only the first frame is kept, so the default pool recycles the rest.
+    # Keeps only the first frame.
     infos, pts, f = [], [], None
 
     def take(events):

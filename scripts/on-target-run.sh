@@ -11,29 +11,27 @@
 #
 # Env:
 #   FILTER                      test-name filter passed to every binary. It
-#                               matches the test FUNCTION name; a filter that
+#                               matches the test function name; a filter that
 #                               matches nothing makes every binary run zero
 #                               tests, reported as NO-TESTS.
 #   HAL_BOARD_ENTRY             the board entry this run is for, recorded in
 #                               summary.json for the fleet roll-up
 #   HAL_ONTARGET_REQUIRE_GPU    1 to fail, as NO-GPU, on a board without a
-#                               DRM render node, where every GPU test would
-#                               otherwise skip and the run would pass
+#                               DRM render node
 #
-# Gates are armed from what the board has, as the CI board lane arms them:
-# HAL_TEST_REQUIRE_GL with a render node, HAL_TEST_REQUIRE_G2D with libg2d.so.2
-# (HAL_TEST_SKIP_G2D instead on i.MX 95), EDGEFIRST_SKIP_VIVANTE_KNOWN_BUGS with
-# /dev/galcore, and HAL_TEST_REQUIRE_DMA when dma-heap-setup.sh's probe
-# allocation succeeds.
+# Sets the test gates from what the board has: HAL_TEST_REQUIRE_GL with a
+# render node, HAL_TEST_REQUIRE_G2D with libg2d.so.2 (HAL_TEST_SKIP_G2D
+# instead on i.MX 95), EDGEFIRST_SKIP_VIVANTE_KNOWN_BUGS with /dev/galcore,
+# and HAL_TEST_REQUIRE_DMA when dma-heap-setup.sh's probe allocation
+# succeeds.
 #
-# Writes one log per binary, check-single-home.log, test_two_library_user.log,
-# test_codec_api.log, python-codec.log,
+# Writes one log per binary, check-single-home.log,
+# test_two_library_user.log, test_codec_api.log, python-codec.log,
 # capabilities.txt, summary.txt (`RESULT|detail`, one line) and summary.json
 # into <results-dir>. Exits 0 on PASS, 1 on FAIL, NO-TESTS or NO-GPU.
 #
-# The board needs bash and the POSIX tools (awk, grep, sed, sort) only.
-# python3 runs the Python codec tests and nothing else, so a board without it
-# skips those and still reports its result.
+# Needs bash and the POSIX tools (awk, grep, sed, sort). python3 is used for
+# the Python codec tests only.
 
 set -uo pipefail
 
@@ -57,25 +55,16 @@ echo "${caps}" > "${RESULTS}/capabilities.txt"
 echo "    ${caps}"
 
 extra_env=()
-# The Vivante driver has an intermittent double-free that otherwise reads as a
-# regression in whatever you just changed.
 [[ "${galcore}" == yes ]] && extra_env+=(EDGEFIRST_SKIP_VIVANTE_KNOWN_BUGS=1)
-# A board with a DRM render node has a GPU, so "the GL backend did not come
-# up" is a defect there and not a fact of the machine. Without this every
-# require-gated test -- the `gl_backend_available_canary` most visibly --
-# skips on every board and the run stays green through a broken GL stack.
 [[ "${render}" -gt 0 ]] && extra_env+=(HAL_TEST_REQUIRE_GL=1)
-# A board that ships libg2d must be able to use it, except an i.MX 95: its
-# libg2d loads, but G2D is not supported there, so its tests skip.
 if [[ "$(cat /sys/devices/soc0/soc_id 2>/dev/null)" == "i.MX95" ]]; then
   extra_env+=(HAL_TEST_SKIP_G2D=1)
 elif compgen -G "/usr/lib/libg2d.so.2*" >/dev/null || compgen -G "/usr/lib/*/libg2d.so.2*" >/dev/null; then
   extra_env+=(HAL_TEST_REQUIRE_G2D=1)
 fi
 
-# dma-heap-setup.sh exports through $GITHUB_ENV when it is set, so point it at
-# a file of our own and read the gate back. It never changes permissions on a
-# self-hosted machine and never fails.
+# Runs dma-heap-setup.sh with GITHUB_ENV pointed at a temporary file and
+# reads the DMA gate back from it.
 dma_env="$(mktemp)"
 GITHUB_ENV="${dma_env}" GITHUB_STEP_SUMMARY="" bash scripts/dma-heap-setup.sh \
   > "${RESULTS}/dma-heap-setup.log" 2>&1
@@ -84,16 +73,13 @@ grep -q '^HAL_TEST_REQUIRE_DMA=1$' "${dma_env}" && extra_env+=(HAL_TEST_REQUIRE_
 rm -f "${dma_env}"
 echo "    gates: ${extra_env[*]:-none} (dma ${dma_state:-unknown})"
 
-# summary.json is written with awk, not an interpreter: the Python tests are
-# optional on a board, so the result the fleet roll-up reads must not depend
-# on python3.
+# Writes summary.txt and summary.json.
 write_summary() {
   local result="$1" detail="$2"
   echo "${result}|${detail}" > "${RESULTS}/summary.txt"
   local logs=("${RESULTS}"/*.log)
   [[ -e "${logs[0]}" ]] || logs=()
-  # The values reach awk through the environment; `-v` would interpret
-  # backslash escapes in them.
+  # Passes the values to awk through the environment.
   SUMMARY_RESULT="${result}" SUMMARY_DETAIL="${detail}" SUMMARY_ARCH="${arch}" \
     SUMMARY_CAPS="${caps}" SUMMARY_DMA="${dma_state:-unknown}" \
     SUMMARY_HOST="$(uname -n)" SUMMARY_MANIFEST="${BUNDLE}/MANIFEST" \
@@ -164,19 +150,15 @@ for bin in "${bins[@]}"; do
   name="$(basename "${bin}")"
   echo "  -- ${name}"
   log="${RESULTS}/${name}.log"
-  # --test-threads=1 is a hard invariant on target: GL driver concurrency
-  # bugs, per-process G2D state, and CMA pool exhaustion each require it.
-  # shellcheck disable=SC2086  # FILTER is deliberately word-split, as before
+  # shellcheck disable=SC2086  # FILTER is word-split
   if env EDGEFIRST_TESTDATA_DIR="${BUNDLE}/testdata" ${extra_env[@]+"${extra_env[@]}"} \
       "./${bin}" --test-threads=1 ${FILTER} > "${log}" 2>&1; then
     pass=$((pass + 1))
-    # A hardware-gated test that returns early still reports "ok", so the
-    # count alone cannot tell you whether the path ran.
+    # Reports the skips of a binary that passed.
     if grep -q "SKIPPED" "${log}"; then
       echo "     ok, but $(grep -c "SKIPPED" "${log}") skipped"
     fi
-    # A binary that ran no test also exits 0, and the skip check above cannot
-    # see it: there was no test to skip.
+    # Counts a binary that ran no test.
     if grep -q "^running 0 tests" "${log}"; then
       ran_nothing=$((ran_nothing + 1))
       echo "     ok, but ran 0 tests${FILTER:+ (FILTER=\"${FILTER}\" matched no test name)}"
@@ -188,10 +170,9 @@ for bin in "${bins[@]}"; do
   fi
 done
 
-# G1/G2/G2t/G4/G9/G11 via check-single-home.sh. G5 (footprint) and G7 (Miri) read
-# `cannot_measure` on a board: no target/release build and no scripts/miri.sh
-# are bundled, on purpose. That is an attributable gap for those two gates
-# only, so it is not a failure; a FAIL on any of G1/G1b/G2/G2t/G4/G9/G11 is.
+# Runs check-single-home.sh and counts the failures of the gates a board
+# can run. The footprint and Miri gates need the build host and are
+# reported as gaps.
 echo "  -- check-single-home.sh (G1/G2/G2t/G4/G9/G11)"
 ghlog="${RESULTS}/check-single-home.log"
 ./scripts/check-single-home.sh > "${ghlog}" 2>&1
@@ -206,8 +187,7 @@ else
   grep -E 'FAIL' "${ghlog}" | sed 's/^/     /'
 fi
 
-# G3: the minimal two-library user, the binary `make test-two-library-user`
-# runs locally.
+# Runs the two-library C program.
 echo "  -- test_two_library_user (G3)"
 g3log="${RESULTS}/test_two_library_user.log"
 if env ${extra_env[@]+"${extra_env[@]}"} ./target/debug/test_two_library_user \
@@ -219,9 +199,8 @@ else
   sed 's/^/     /' "${g3log}"
 fi
 
-# The codec C API end to end on this board's engines. A part the board
-# cannot run prints "SKIP: <reason>", rewritten into the WARNING form the
-# skip count and warnings.txt collect.
+# Runs test_codec_api and rewrites its `SKIP: <reason>` lines as
+# `WARNING: SKIPPED:` lines.
 echo "  -- test_codec_api"
 codeclog="${RESULTS}/test_codec_api.log"
 env ${extra_env[@]+"${extra_env[@]}"} ./target/debug/test_codec_api 2>&1 \
@@ -235,12 +214,10 @@ else
   sed 's/^/     /' "${codeclog}"
 fi
 
-# The Python codec tests, with the bundle's own wheels and pytest on
-# PYTHONPATH. They need a python3 of 3.11 or newer with numpy; a board
-# without one, or a bundle built without wheels, skips them with the reason.
-# pytest reports the skips that share a location and reason on one
-# `SKIPPED [N]` line. The skip count and warnings.txt count lines, so that
-# line is written N times.
+# Runs the Python codec tests with the bundle's wheels and pytest on
+# PYTHONPATH. Skips them, with the reason, on a board without a python3 of
+# 3.11 or newer with numpy and in a bundle built without wheels. Writes
+# each of pytest's `SKIPPED [N]` lines N times as `WARNING: SKIPPED:` lines.
 echo "  -- Python codec tests"
 pylog="${RESULTS}/python-codec.log"
 py_skip=""
@@ -273,7 +250,7 @@ else
 fi
 
 skipped="$(cat "${RESULTS}"/*.log 2>/dev/null | grep -c "SKIPPED")"
-# Every distinct test warning, most frequent first, so skips are audited rather than only counted.
+# Writes every distinct test warning to warnings.txt, most frequent first.
 grep -h "WARNING: " "${RESULTS}"/*.log 2>/dev/null | sed 's/.*WARNING: //' | sort | uniq -c | sort -rn > "${RESULTS}/warnings.txt" || true
 if [[ -s "${RESULTS}/warnings.txt" ]]; then
   echo "  -- test warnings"
@@ -283,7 +260,6 @@ if [[ ${fail} -gt 0 ]]; then
   write_summary FAIL "${pass} ok, ${fail} failed: ${failed_bins[*]}"
   exit 1
 elif [[ ${ran_nothing} -eq ${#bins[@]} ]]; then
-  # Every binary ran zero tests, so this board exercised nothing.
   write_summary NO-TESTS "all ${ran_nothing} binaries ran 0 tests${FILTER:+ -- FILTER=\"${FILTER}\" matched no test name}"
   exit 1
 fi

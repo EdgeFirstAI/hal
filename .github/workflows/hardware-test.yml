@@ -1,13 +1,8 @@
-# On-demand full on-hardware test suite across the self-hosted board fleet.
-#
-# Where the CI hardware lane runs a selection of GPU/DMA binaries on four
-# boards, this runs HAL's whole on-target suite -- every test binary of the
-# workspace crates plus the C-API gates (scripts/check-single-home.sh G1/G2/G2t/G4/G9/
-# G11 and the G3 two-library user), the codec C API program and the
-# Python codec tests -- on every board named, one job per board
-# entry. It is the same bundle and board-side script scripts/on-target-test.sh
-# runs over ssh, so a result here and a result from a desk reproduce each
-# other.
+# Runs HAL's on-target test suite on the self-hosted boards, on demand, one
+# job per board entry: every test binary of the workspace crates,
+# scripts/check-single-home.sh, the two-library C program, the codec C API
+# program and the Python codec tests. Uses the bundle and the board-side
+# script that scripts/on-target-test.sh uses.
 #
 #   plan     resolve board entries; drop, and report, any no online runner serves
 #   wheels   build the aarch64 Python wheels the codec tests import
@@ -16,15 +11,10 @@
 #   summary  one table naming the runner each entry ran on; red if any failed
 #
 # Board entries are runner labels, `+` joining labels one runner must all
-# carry (`imx95-frdm+ara240`). The default is one board per SoC for general
-# HAL work: the EVK where a family has other carriers (FRDM boards are kept
-# for Ara240 work, vendor carriers for vendor tests). Board prerequisites and
-# how a board is validated: Confluence "Self-Hosted Runner Fleet Inventory".
+# carry (`imx95-frdm+ara240`). The default is one EVK per SoC.
 #
-# The runner check needs FLEET_RUNNERS_TOKEN, an organisation secret that can
-# read self-hosted runners (fine-grained token, organisation permission
-# "Self-hosted runners: read"). Without it every entry is scheduled, and one
-# that no online runner carries queues for 24 hours before failing.
+# The runner check reads FLEET_RUNNERS_TOKEN, an organisation secret with
+# "Self-hosted runners: read". Without it every entry is scheduled.
 #
 # Action versions (hash-pinned):
 # - actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 (v7.0.1)
@@ -75,11 +65,8 @@ jobs:
           boards: ${{ inputs.boards }}
           token: ${{ secrets.FLEET_RUNNERS_TOKEN }}
 
-  # The Python codec tests' wheels, built natively on aarch64 as the release
-  # builds them: tensor and codec's build.rs nested-builds edgefirst-tensor-capi
-  # for the host, so a cross build cannot produce them. abi3-py311 because the
-  # tests read pixels through the buffer protocol. pytest and its pure-Python
-  # dependencies ride along, so a board needs only python3 and numpy.
+  # Builds the edgefirst-tensor and edgefirst-codec wheels natively on aarch64
+  # with abi3-py311, and downloads pytest with its pure-Python dependencies.
   wheels:
     name: Build Python wheels (aarch64)
     needs: plan
@@ -90,8 +77,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Install build dependencies
-        # The ARM image ships neither lld nor a C compiler, which the build
-        # scripts and the nested tensor-capi build need for the host.
         run: |
           sudo apt-get update
           sudo apt-get install -y lld build-essential
@@ -134,8 +119,6 @@ jobs:
     name: Build tests bundle (aarch64)
     needs: [plan, wheels]
     if: needs.plan.outputs.has_boards == 'true'
-    # Free hosted runner: this runs on demand, not per push, so nothing is
-    # waiting on it; the cross-build is zig's, not the host's.
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -166,7 +149,6 @@ jobs:
           tar -xJf "$archive" -C "$RUNNER_TEMP/zig" --strip-components=1
           echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
 
-      # rust-toolchain.toml pins the compiler; rustup honours it on first use.
       - name: Add the aarch64 target
         run: rustup target add aarch64-unknown-linux-gnu
 
@@ -181,8 +163,6 @@ jobs:
           PYTHON_WHEELS: ${{ runner.temp }}/wheels
         run: ./scripts/on-target-bundle.sh tests aarch64 "$RUNNER_TEMP/bundle"
 
-      # A tarball, not the directory: an artifact loses file modes and
-      # symlinks, and the bundle needs both (executables, the .so.0 names).
       - name: Pack the bundle
         run: tar -C "$RUNNER_TEMP/bundle" -cf "$RUNNER_TEMP/on-target-tests.tar" .
 
@@ -206,17 +186,12 @@ jobs:
     name: Board ${{ matrix.runner }}
     needs: [plan, build]
     runs-on: ${{ matrix.labels }}
-    # A safety net, not a budget: this is the whole suite, not the CI lane's
-    # selection, and the slowest boards are Cortex-A53.
     timeout-minutes: 120
-    # No concurrency group: the runner application runs one job at a time per
-    # installed instance, and one instance per device is policy.
     strategy:
       fail-fast: false
       matrix:
         include: ${{ fromJSON(needs.plan.outputs.board_matrix) }}
     steps:
-      # Boards run on small storage; a job cut short leaves its bundle behind.
       - name: Reclaim disk from an earlier run
         run: rm -rf hal-bundle hal-results on-target-tests.tar
 
@@ -255,8 +230,6 @@ jobs:
           name: hardware-test-${{ matrix.runner }}
           path: hal-results/
           retention-days: 30
-          # A job that failed before writing results is reported by the
-          # summary as NO RESULT; failing this step too would add nothing.
           if-no-files-found: warn
 
       - name: Clean up
@@ -288,7 +261,6 @@ jobs:
           UNAVAILABLE: ${{ needs.plan.outputs.unavailable }}
           BUILD_RESULT: ${{ needs.build.result }}
         run: |
-          # Not -e: a failing roll-up must still write its report below.
           set +e -uo pipefail
           mkdir -p results
           python3 .github/scripts/fleet_summary.py tests --results results \

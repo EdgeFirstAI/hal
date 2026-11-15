@@ -572,11 +572,6 @@ impl V4l2Decoder {
     }
 
     /// Refuses a capture queue of fewer buffers than the pool needs.
-    ///
-    /// A device may grant fewer than requested: it caps the count, or, as
-    /// Wave6 does above its maximum of 31, falls back to its minimum. Going
-    /// on would let the caller hold fewer frames than it asked for, found
-    /// out only as `PoolExhausted` partway through the stream.
     fn check_grant(&self, granted: usize, want: usize, min: usize) -> Result<()> {
         if granted >= want {
             return Ok(());
