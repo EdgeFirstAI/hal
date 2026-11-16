@@ -478,18 +478,18 @@ checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
 name = "edgefirst-bench"
-version = "0.40.0"
+version = "0.41.0"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "edgefirst-build-support"
-version = "0.40.0"
+version = "0.41.0"
 
 [[package]]
 name = "edgefirst-codec"
-version = "0.40.0"
+version = "0.41.0"
 dependencies = [
  "edgefirst-bench",
  "edgefirst-tensor",
@@ -511,7 +511,7 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-decoder"
-version = "0.40.0"
+version = "0.41.0"
 dependencies = [
  "argminmax",
  "edgefirst-bench",
@@ -542,11 +542,11 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-decoder-abi"
-version = "0.40.0"
+version = "0.41.0"
 
 [[package]]
 name = "edgefirst-egl"
-version = "0.40.0"
+version = "0.41.0"
 dependencies = [
  "libc",
  "libloading",
@@ -577,14 +577,14 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-gl"
-version = "0.40.0"
+version = "0.41.0"
 dependencies = [
  "gl_generator",
 ]
 
 [[package]]
 name = "edgefirst-image"
-version = "0.40.0"
+version = "0.41.0"
 dependencies = [
  "crc32fast",
  "ctor",
@@ -628,7 +628,7 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-kernels"
-version = "0.40.0"
+version = "0.41.0"
 dependencies = [
  "edgefirst-bench",
  "half",
@@ -639,7 +639,7 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-python-codec"
-version = "0.40.0"
+version = "0.41.0"
 dependencies = [
  "edgefirst-build-support",
  "edgefirst-python-common",
@@ -651,7 +651,7 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-python-common"
-version = "0.40.0"
+version = "0.41.0"
 dependencies = [
  "edgefirst-build-support",
  "edgefirst-codec",
@@ -680,7 +680,7 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-python-decoder"
-version = "0.40.0"
+version = "0.41.0"
 dependencies = [
  "edgefirst-build-support",
  "edgefirst-python-common",
@@ -692,7 +692,7 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-python-image"
-version = "0.40.0"
+version = "0.41.0"
 dependencies = [
  "edgefirst-build-support",
  "edgefirst-python-common",
@@ -704,7 +704,7 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-python-kernels"
-version = "0.40.0"
+version = "0.41.0"
 dependencies = [
  "edgefirst-build-support",
  "edgefirst-python-common",
@@ -715,7 +715,7 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-python-tensor"
-version = "0.40.0"
+version = "0.41.0"
 dependencies = [
  "edgefirst-build-support",
  "edgefirst-python-common",
@@ -728,7 +728,7 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-python-tracker"
-version = "0.40.0"
+version = "0.41.0"
 dependencies = [
  "edgefirst-build-support",
  "edgefirst-python-common",
@@ -739,7 +739,7 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-tensor"
-version = "0.40.0"
+version = "0.41.0"
 dependencies = [
  "ctor",
  "dma-heap",
@@ -768,18 +768,18 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-tensor-abi"
-version = "0.40.0"
+version = "0.41.0"
 
 [[package]]
 name = "edgefirst-tensor-ffi"
-version = "0.40.0"
+version = "0.41.0"
 dependencies = [
  "edgefirst-tensor-abi",
 ]
 
 [[package]]
 name = "edgefirst-tracker"
-version = "0.40.0"
+version = "0.41.0"
 dependencies = [
  "edgefirst-bench",
  "edgefirst-tensor",
@@ -1077,7 +1077,7 @@ checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
 
 [[package]]
 name = "gpu-probe"
-version = "0.40.0"
+version = "0.41.0"
 dependencies = [
  "edgefirst-bench",
  "edgefirst-egl",
