@@ -3,16 +3,12 @@
 
 //! The CPU backend never reads a destination declared without CPU reads.
 //!
-//! `CpuAccess::None` and `CpuAccess::Write` DMA-BUF images come from the
-//! uncached CMA heap where the system has one, so a CPU pass that read such a
-//! destination would be slow. The declaration is enforced on every map, but
-//! a pass that maps `Write` and then reads what it mapped would get past
-//! that check. Each convert here runs twice into a `Write` destination whose
-//! bytes a `ReadWrite` alias of the same dma-buf pre-fills differently: a
-//! convert that succeeds must write identical bytes both times, so it read
-//! nothing back, and one that would read back must be refused.
+//! Each convert runs twice into a `Write` destination whose bytes a
+//! `ReadWrite` alias of the same dma-buf pre-fills differently: a convert
+//! that succeeds writes identical bytes both times, and one that would read
+//! back is refused.
 //!
-//! Needs a DMA heap; skips loudly without one, and fails without one under
+//! Needs a DMA heap; skips without one, and fails without one under
 //! `HAL_TEST_REQUIRE_DMA=1`.
 
 #![cfg(target_os = "linux")]
@@ -66,8 +62,8 @@ fn source(format: PixelFormat) -> TensorDyn {
 }
 
 /// A DMA-BUF destination declared `access` and a `ReadWrite` byte alias of
-/// its whole buffer. `None`, after a skip warning, only when the allocation
-/// fails on a host whose DMA heap the probe found unusable.
+/// its whole buffer. `None`, after a skip warning, when the allocation fails
+/// on a host whose DMA heap the probe found unusable.
 fn destination(
     format: PixelFormat,
     dtype: DType,
@@ -96,8 +92,7 @@ fn bytes(alias: &Tensor<u8>) -> Vec<u8> {
 }
 
 /// The pixel bytes of `dst`, read through `alias`: each row without the
-/// pitch padding and the page rounding past the last row, which no convert
-/// writes.
+/// pitch padding and the page rounding past the last row.
 fn pixels(dst: &TensorDyn, alias: &Tensor<u8>) -> Vec<u8> {
     let format = dst.format().unwrap();
     let elem = dst.dtype().size();
@@ -190,8 +185,7 @@ fn cpu_converts_never_read_a_write_only_destination() {
     assert!(ran > 0, "no convert ran into a write-only destination");
 }
 
-/// Drawing blends over the destination, so the CPU draw refuses `Write` and
-/// `None` destinations before touching them.
+/// The CPU draw refuses `Write` and `None` destinations.
 #[test]
 fn cpu_draw_refuses_destinations_it_cannot_read() {
     if !dma_or_skip("cpu_draw_refuses_destinations_it_cannot_read") {

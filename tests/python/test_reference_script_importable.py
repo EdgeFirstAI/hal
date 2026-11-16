@@ -1,7 +1,6 @@
 """Pin the public surface of scripts/per_scale_decode_reference.py.
 
-The decoder fixture generator imports these symbols. If any disappears,
-the generator breaks silently — this test fails loudly instead.
+The decoder fixture generator imports these symbols.
 """
 
 import importlib

@@ -13,9 +13,8 @@
 //! way each buffer is wrapped once as an NV12 tensor of the visible picture,
 //! and a frame lends that tensor to the caller until it is dropped.
 //!
-//! V4L2 keeps buffer timestamps at microsecond resolution, so each access
-//! unit is tagged with a sequence number and the caller's PTS is looked up
-//! again when its picture comes back.
+//! Each access unit is tagged with a sequence number, and the caller's PTS
+//! is looked up again when its picture comes back.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, VecDeque};
@@ -51,10 +50,9 @@ const INPUT_TIMEOUT: Duration = Duration::from_secs(2);
 const OUTPUT_GRACE: Duration = Duration::from_millis(20);
 /// How long a drain may take.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
-/// Events handled per wake-up, so a flood cannot stall decoding.
+/// Events handled per wake-up.
 const MAX_EVENTS: usize = 16;
-/// Timestamps kept for pictures the device has not returned. Older ones
-/// belong to access units the device dropped.
+/// Timestamps kept for pictures the device has not returned.
 const MAX_TIMESTAMPS: usize = 256;
 
 /// The NV12 formats a decoder can write, in order of preference, and
@@ -116,9 +114,8 @@ fn frame_tensor(
     };
     let luma_fd = fds.swap_remove(0);
     let luma = Tensor::<u8>::from_fd(luma_fd, &[h, w], None)?;
-    // A raw plane has no format to check a stride against, so the chroma
-    // plane takes its geometry unchecked; the luma plane's is checked once
-    // the planes are joined as NV12.
+    // The chroma plane takes its stride unchecked; the luma plane's is
+    // checked once the planes are joined as NV12.
     let mut chroma = Tensor::<u8>::from_fd(chroma_fd, &[h.div_ceil(2), w], None)?;
     chroma.set_row_stride_unchecked(layout.strides[1]);
     chroma.set_plane_offset(chroma_offset);
@@ -308,8 +305,7 @@ impl V4l2Decoder {
             let _ = stream.m2m.output_mut().free();
             let _ = events::unsubscribe(&self.device.dev, uapi::V4L2_EVENT_ALL, 0);
             drop(stream);
-            // A torn-down `vsi_v4l2` instance takes no input when streamed
-            // again; a new open is a new decoder instance on every driver.
+            // Open the device again: a new open is a new decoder instance.
             match M2mDevice::open(std::path::Path::new(&self.path)) {
                 Some(device) => self.device = device,
                 None => log::warn!("{}: could not reopen the decoder", self.path),
@@ -467,9 +463,7 @@ impl V4l2Decoder {
         let (layout, colorimetry) = self.layout(&mut fmt, two_buffers);
         let min = self.min_capture_buffers();
         let want = match &self.pool {
-            // The device minimum covers its reference pictures; Wave6 also
-            // needs a buffer to decode into before it releases one, and
-            // stalls at the end of a stream without it.
+            // The device minimum, the caller's count and one buffer to decode into.
             OutputPool::Allocate { count } => min + count + 1,
             OutputPool::Provided(pool) => {
                 if pool.len() < min + 1 {
@@ -508,7 +502,7 @@ impl V4l2Decoder {
             Err(e) => return Err(e),
         };
         self.check_grant(capture.slots.len(), want, min)?;
-        // An allocated pool is new memory and never leased.
+        // The buffers no frame of an earlier pool still shows.
         let free: Vec<u32> = (0..capture.slots.len() as u32)
             .filter(|&i| !self.leased(i))
             .collect();
@@ -520,7 +514,7 @@ impl V4l2Decoder {
             .first()
             .map(|&i| enqueue_capture(&stream.m2m, &capture, i));
         if let Some(Err(e)) = first {
-            // A device can list DMA-BUF import and still refuse the buffers.
+            // Export the device's buffers when it refuses to import an allocated pool.
             if !(allocate && matches!(capture.slots[0].backing, Backing::Import(_))) {
                 return Err(e);
             }
@@ -773,19 +767,15 @@ impl V4l2Decoder {
             if ready.event {
                 self.handle_events()?;
             }
-            // A queue can stay readable without yielding anything (one that
-            // has returned its last buffer reports EPIPE until restarted).
+            // Stop at the deadline.
             if left.is_zero() {
                 return Ok(done(self));
             }
         }
     }
 
-    /// Restarts both queues after a drain, as for a seek. Drivers differ in
-    /// what resumes a drained decoder: `vsi_v4l2` stays at end of stream
-    /// after `V4L2_DEC_CMD_START`, and Wave6 does not drain again after it,
-    /// while restarting the queues resumes both. The buffers no frame holds
-    /// are queued again.
+    /// Restarts both queues after a drain, as for a seek. The buffers no frame
+    /// holds are queued again.
     fn restart(&mut self) -> Result<()> {
         let stream = self.stream.as_mut().expect("streaming");
         stream.m2m.output().stream_off().map_err(device_error)?;
@@ -871,7 +861,7 @@ impl V4l2Decoder {
             let last = done.flags.is_last();
             let used = done.planes().first().map_or(0, |p| p.bytesused);
             if used == 0 {
-                // An empty buffer, usually the one carrying the last flag.
+                // An empty buffer: queue it again.
                 enqueue_capture(&stream.m2m, capture, done.index)?;
             } else {
                 let tensor = Arc::clone(&capture.slots[done.index as usize].tensor);
@@ -932,10 +922,7 @@ impl V4l2Decoder {
                 Cow::Borrowed(access_unit)
             };
 
-        // One access unit in the device at a time: each needs one buffer to
-        // decode into, so a call never waits on more buffers than the pool's
-        // spare. Deeper queues decode no faster on these devices, and frames
-        // finished while a call waits would hold the buffers it needs.
+        // One access unit is in the device at a time.
         let has_free = |s: &Self| {
             s.stream
                 .as_ref()
@@ -943,8 +930,7 @@ impl V4l2Decoder {
         };
         self.give_back()?;
         if !has_free(self) {
-            // With no output buffer queued the device cannot finish a
-            // picture, so no bitstream buffer will come back.
+            // The caller holds every output buffer.
             if let Some((held, pool)) = self.held().filter(|&(held, pool)| held == pool) {
                 return Err(CodecError::PoolExhausted { held, pool });
             }
@@ -986,7 +972,7 @@ impl V4l2Decoder {
             )
             .map_err(device_error)?;
         self.timestamps.insert(seq, pts);
-        // The oldest entries belong to pictures the device skipped.
+        // Drop the oldest entries past the limit.
         while self.timestamps.len() > MAX_TIMESTAMPS {
             self.timestamps.pop_first();
         }
@@ -1111,14 +1097,13 @@ impl DecoderBackend for V4l2Decoder {
         }
         let capturing = |s: &Self| s.stream.as_ref().is_some_and(|st| st.capture.is_some());
         if self.can_stop && !capturing(self) {
-            // `decode` can return before the device has parsed the first
-            // headers; the drain needs the CAPTURE side they set up.
+            // Wait for the CAPTURE side that the first headers set up.
             self.service(DRAIN_TIMEOUT, capturing)?;
         }
         if self.can_stop && capturing(self) {
             if let Err(e) = self.drain() {
-                // Frames the caller holds block the drain; it resumes on the
-                // next flush once they are dropped.
+                // A drain blocked by frames the caller holds resumes on the next
+                // flush; any other error resets the decoder.
                 if !matches!(e, CodecError::PoolExhausted { .. }) {
                     self.reset();
                 }
@@ -1182,8 +1167,7 @@ impl V4l2Decoder {
         let stream = self.stream.as_ref().expect("streaming");
         let ready = match stream.m2m.wait(Some(timeout)) {
             Ok(ready) => ready,
-            // Nothing is queued on either side: the caller holds every
-            // output buffer, and the device has nowhere to drain into.
+            // Nothing is queued on either side: the caller holds every output buffer.
             Err(e) if e.kind() == ErrorKind::InvalidState => {
                 return Err(self.stalled("finish draining", Duration::ZERO));
             }

@@ -1,13 +1,12 @@
 // SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! Hand-rolled FFI for the CUDA nvJPEG decode API.
+//! FFI for the CUDA nvJPEG decode API.
 //!
-//! These declarations mirror the on-target `nvjpeg.h` (CUDA 12.6 / nvJPEG
-//! 12.3.3, verified on the Orin Nano). The library is loaded via `dlopen` (see
-//! [`super::loader`]) — there is no link-time dependency, so only the subset of
-//! types and entry points the backend uses is declared here. The `CudaStream`
-//! is the `cudaStream_t` from `edgefirst_tensor::CudaStream`.
+//! These declarations mirror `nvjpeg.h`. The library is loaded via `dlopen`
+//! (see [`super::loader`]); only the subset of types and entry points the
+//! backend uses is declared. The `CudaStream` is the `cudaStream_t` from
+//! `edgefirst_tensor::CudaStream`.
 
 #![allow(non_camel_case_types)]
 
@@ -26,9 +25,7 @@ pub const NVJPEG_STATUS_SUCCESS: NvjpegStatus = 0;
 pub type NvjpegOutputFormat = c_int;
 pub const NVJPEG_OUTPUT_RGBI: NvjpegOutputFormat = 5;
 
-/// `nvjpegBackend_t` — `DEFAULT` resolves to GPU-hybrid on this build. The
-/// dedicated-hardware backend (`NVJPEG_BACKEND_HARDWARE = 3`) is unsupported on
-/// Orin (`nvjpegCreateEx` returns status 7), so it is never requested.
+/// `nvjpegBackend_t`; only `DEFAULT` is requested.
 pub type NvjpegBackend = c_int;
 pub const NVJPEG_BACKEND_DEFAULT: NvjpegBackend = 0;
 
@@ -41,7 +38,7 @@ pub type CudaStream = edgefirst_tensor::CudaStream;
 
 /// `nvjpegImage_t { unsigned char* channel[4]; size_t pitch[4]; }`.
 ///
-/// The `channel` pointers are caller-provided **device** pointers and `pitch`
+/// The `channel` pointers are caller-provided device pointers and `pitch`
 /// the per-plane row stride in bytes. For `NVJPEG_OUTPUT_RGBI` only
 /// `channel[0]`/`pitch[0]` are consulted.
 #[repr(C)]

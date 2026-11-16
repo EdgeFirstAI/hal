@@ -67,12 +67,7 @@ cargo test -p edgefirst-tensor --features ndarray -- --test-threads=1
   coverage; nothing fails outright. Set `EDGEFIRST_TENSOR_FORCE_MEM=1` to
   skip even the probe.
 
-  **A green run therefore says nothing about the DMA paths.** This is how the
-  `from_fd` minor-number misclassification reached a release: the only test
-  covering the import path skipped on every unprivileged host, and asserted
-  fd counts rather than the backend it got back. When touching DMA import or
-  allocation, confirm the tests actually ran — build unprivileged and run the
-  binary under `sudo` if the heap device is root-only:
+  **A green run therefore says nothing about the DMA paths.** When touching DMA import or allocation, confirm the tests ran — build unprivileged and run the binary under `sudo` if the heap device is root-only:
 
   ```bash
   cargo test -p edgefirst-tensor --lib --no-run     # build as your user
@@ -230,22 +225,11 @@ design), and then when `edgefirst_tensor::is_cuda_available()` is false. The
 order matters: the WARP skip is a property of the adapter that no runtime can
 satisfy, so checking it first keeps it a skip even under the gate below.
 
-`crates/tensor/tests/support/cuda_require.rs` is the guard, mirroring
-`crates/image/src/gl/cuda_policy.rs`: under `HAL_TEST_REQUIRE_CUDA=1` (set by
-`scripts/test-windows.ps1 -RequireCuda`, which also arms it from NVIDIA host
-detection unless WARP is the selected adapter) a "no CUDA runtime" skip fails
-instead of passing, naming the test and the reason. Its pure decision core,
-`decide`, is covered platform-generically — so on this box and every CI lane,
-not just Windows — by `crates/tensor/tests/cuda_require_policy.rs`, which is
-not Windows-gated and which `#[path]`-includes this same support module rather
-than copying it, so the tests pin the function `d3d11_tensor.rs` actually
-calls.
+`crates/tensor/tests/support/cuda_require.rs` is the guard, mirroring `crates/image/src/gl/cuda_policy.rs`: under `HAL_TEST_REQUIRE_CUDA=1` (set by `scripts/test-windows.ps1 -RequireCuda`, which also arms it from NVIDIA host detection unless WARP is the selected adapter) a "no CUDA runtime" skip fails instead of passing, naming the test and the reason. Its pure decision core, `decide`, is covered on every platform by `crates/tensor/tests/cuda_require_policy.rs`, which is not Windows-gated and which `#[path]`-includes this same support module rather than copying it, so the tests pin the function `d3d11_tensor.rs` calls.
 
 ### On-target validation
 
-On-target tests require a CUDA-capable device with `libcudart.so` present.
-Validated platforms: Jetson Orin-nano (O5/O6/O8) on L4T R36.4 / CUDA 12.6 /
-TRT 10.3; desktop RTX 3090 on CUDA 12.6.
+On-target tests require a CUDA-capable device with `libcudart.so` present. Validated platforms: Jetson Orin-nano on L4T R36.4 / CUDA 12.6 / TRT 10.3; desktop RTX 3090 on CUDA 12.6.
 
 Cross-compile and deploy:
 

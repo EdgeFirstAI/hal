@@ -3,18 +3,10 @@
 
 PURPOSE
 -------
-A safetensors fixture under ``testdata/decoder/`` records the
-``decoded.*`` output of the NumPy reference decoder running over the
-TFLite per-scale (int8) model. That fixture is trusted by the HAL
-parity tests as the oracle.
-
-This script independently validates that oracle: it runs an
-architecturally-equivalent FP32 ONNX export of the same model on the
-same image, applies a plain class-agnostic NMS, and compares its
-detections (boxes, classes, scores, masks) against the fixture's
-``decoded.*``. Quantization noise and small NMS-ordering differences
-are expected; the script reports IoU statistics so you can decide
-whether the agreement is good enough to trust the fixture.
+Runs an FP32 ONNX export of the fixture's model on the same image, applies
+a plain class-agnostic NMS, and compares its detections (boxes, classes,
+scores, masks) against the fixture's ``decoded.*`` tensors, reporting IoU
+statistics.
 
 USAGE
 -----

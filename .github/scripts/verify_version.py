@@ -24,8 +24,6 @@ import sys
 from pathlib import Path
 
 # Workspace crates that share the workspace version
-# The edgefirst-hal meta-crate was deleted in 0.29: it was re-exports plus
-# trace.rs, and depending on it made every consumer link the whole tree.
 WORKSPACE_CRATES = [
     "edgefirst-codec",
     "edgefirst-decoder",
@@ -39,12 +37,10 @@ WORKSPACE_CRATES = [
 ]
 
 # Workspace leaf crates (not referenced as dependencies by other crates).
-# The C monolith `edgefirst-hal-capi` is gone; modular C libraries live in
-# STANDALONE_LEAF_CRATES (workspace-excluded).
 WORKSPACE_LEAF_CRATES = []
 
-# Python extension crates, one self-contained module per distribution since
-# 0.29; their distributions take the version dynamically from Cargo.toml.
+# Python extension crates; their distributions take the version dynamically
+# from Cargo.toml.
 PYTHON_CRATES = [
     "edgefirst-python-common",
     "edgefirst-python-tensor",
@@ -58,9 +54,8 @@ PYTHON_CRATES = [
 # Crates with independent versions (not checked against workspace version)
 INDEPENDENT_CRATES = {}
 
-# The modular C-API leaves: standalone packages excluded from
-# the root workspace, so their versions never show up in the root Cargo.lock.
-# Each carries its own Cargo.lock next to its manifest.
+# The modular C-API leaves: standalone packages excluded from the root
+# workspace, each with its own Cargo.lock next to its manifest.
 STANDALONE_LEAF_CRATES = [
     "edgefirst-tensor-capi",
     "edgefirst-image-capi",
@@ -142,8 +137,7 @@ def check_cargo_lock(version: str) -> list[str]:
                         f"expected '{version}'"
                     )
 
-    # The standalone leaves are excluded from the root workspace, so check
-    # each one's own Cargo.lock for its own package instead.
+    # Check each standalone leaf's own Cargo.lock for its own package.
     for crate in STANDALONE_LEAF_CRATES:
         crate_dir = crate.removeprefix("edgefirst-")
         lock_path = f"crates/{crate_dir}/Cargo.lock"
@@ -166,11 +160,8 @@ def check_cargo_lock(version: str) -> list[str]:
 def check_standalone_leaves(version: str) -> list[str]:
     """Check the standalone C-API leaves' pins on the crates they build from.
 
-    The leaves sit outside the workspace, so nothing moves their
-    `version = "..."` requirements on internal path dependencies or the
-    path crates recorded in their own Cargo.lock. A 0.x requirement only
-    matches its own minor series: a `"0.32.0"` pin left behind by a 0.33.0
-    bump makes the leaf unresolvable, and a stale lock fails `--locked`.
+    Checks the `version = "..."` requirements on internal path dependencies
+    and the path crates recorded in each leaf's own Cargo.lock.
     """
     errors = []
     dep_pattern = re.compile(r'^([A-Za-z0-9_-]+)\s*=\s*\{([^\n]*)', re.MULTILINE)
@@ -231,9 +222,8 @@ def stale_path_crates(
 def check_benchmarks_lock(version: str) -> list[str]:
     """Check the excluded benchmarks workspace's lock on the HAL crates.
 
-    `make check-benchmarks` builds it with `--locked`, so a lock still
-    naming the previous version fails CI. The benchmarks' own crates keep
-    their own versions; only the root workspace's crates are checked.
+    The benchmarks' own crates keep their own versions; only the root
+    workspace's crates are checked.
     """
     hal_crates = {name for name, _ in lock_path_packages(read_file("Cargo.lock"))}
     return stale_path_crates("benchmarks", version, only=hal_crates)
@@ -242,10 +232,8 @@ def check_benchmarks_lock(version: str) -> list[str]:
 def check_pyproject_toml(version: str) -> list[str]:
     """Check the Python distributions.
 
-    Since 0.29 they take their version dynamically from Cargo.toml, so there is
-    no literal to drift. What CAN drift is each dependent's `~=` pin on
-    edgefirst-tensor -- and a stale pin means publishing something nobody can
-    install, which PyPI will not let you correct in place.
+    Each distribution must take its version dynamically from Cargo.toml, and
+    each dependent's `~=` pin on edgefirst-tensor must name the version.
     """
     errors = []
     packages = ["tensor", "codec", "image", "decoder", "tracker", "kernels"]
@@ -267,12 +255,7 @@ def check_pyproject_toml(version: str) -> list[str]:
         pin = re.search(r'edgefirst-tensor\s*~=\s*([0-9][0-9.]*)', content)
         if pin:
             pinned = pin.group(1)
-            # Exact match, not just major.minor: a PR review caught a stale
-            # `~= 0.29.0` pin surviving two patch releases (0.29.1, 0.29.2)
-            # because this used to only check the major.minor prefix, which
-            # a `~=` pin always satisfies for any patch in the same series --
-            # that's the whole point of the operator, so it can never catch
-            # the release procedure's real requirement (the exact version).
+            # Exact match, not only major.minor.
             if pinned != version:
                 errors.append(
                     f"{pyproject}: pins edgefirst-tensor ~= {pinned}, "
@@ -329,8 +312,7 @@ def check_notice(version: str) -> list[str]:
         # Look for entries like "  * edgefirst-decoder 0.5.0 (Apache-2.0)"
         crate_entries = [l for l in lines if f"* {crate} " in l]
         if not crate_entries:
-            # Not an error if the crate isn't a dependency of anything
-            # (it may not appear in NOTICE)
+            # A crate absent from NOTICE is not an error.
             continue
 
         for entry in crate_entries:

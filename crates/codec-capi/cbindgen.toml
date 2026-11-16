@@ -3,22 +3,10 @@
 #
 # cbindgen configuration for edgefirst/codec.h.
 #
-# NOTE: the include guard is written by hand in `header`/`trailer` rather than
-# via cbindgen's `include_guard`, which wraps only the *generated* body and
-# leaves `header` and `trailer` outside it. Everything below the trailer marker
-# -- the vtable struct and every `static inline` accessor -- would then be
-# re-emitted on a second #include and fail to compile with a redefinition.
-#
-# NOTE: cbindgen emits declarations for `extern "C"` functions only. It cannot
-# emit a `static inline` body, and `static inline` is the entire mechanism that
-# makes the vtable accessors non-interposable. Those therefore live in the
-# hand-written `trailer` below, not in generated output.
+# The include guard is written by hand in `header` and `trailer`.
 
 language = "C"
-# C++ callers include this header too. Without `cpp_compat`, each
-# `#[repr(u32)]` enum is followed by `typedef uint32_t <name>;` under C++
-# (where `__STDC_VERSION__` is undefined), which redefines the enum tag that
-# C++ already made a type. With it, C++ gets the fixed-type enum and no typedef.
+# Emits each `#[repr(u32)]` enum for C++ as a fixed-type enum without a typedef.
 cpp_compat = true
 autogen_warning = "/* WARNING: The generated portion of this file is produced by cbindgen. Do not modify it directly. */"
 include_version = true
@@ -42,10 +30,8 @@ header = """
  * or MJPEG access units (ef_video_encoder), and decode access units into
  * frames whose pictures are tensors (ef_video_decoder).
  *
- * Image decoding writes *into* a tensor you already have, rather than
- * allocating one: that is what lets a decode target be a DMA buffer the GPU
- * will read next, with no copy in between. The tensor may come from any
- * EdgeFirst library.
+ * Image decoding writes into a tensor the caller supplies. The tensor may
+ * come from any EdgeFirst library.
  *
  * Every codec runs on an engine (ef_codec_engine): V4L2 on Linux, Media
  * Foundation on Windows, nvJPEG on Linux with CUDA, or the CPU for still
@@ -79,9 +65,6 @@ extern "C" {
 
 /**
  * @brief An opaque image decoder.
- *
- * Forward-declared so callers write `ef_image_decoder *` without the `struct`
- * keyword. Its definition is private: decoder state is not part of the ABI.
  */
 typedef struct ef_image_decoder ef_image_decoder;
 """
@@ -96,12 +79,10 @@ trailer = """
 
 [export]
 prefix = ""
-# EfTensor/EfTensorImpl/EfTensorPlane are declared once, in edgefirst/tensor.h,
-# which this header includes; excluding them here avoids emitting a second,
-# conflicting definition.
+# EfTensor/EfTensorImpl/EfTensorPlane are declared in edgefirst/tensor.h,
+# which this header includes.
 exclude = ["EfTensor", "EfTensorImpl", "EfTensorPlane", "EfImageDecoder"]
-# Entry points take these enums as uint32_t, so nothing references them by
-# type; listed so their constants are emitted.
+# Enums no entry point references by type; listed to emit their constants.
 include = [
     "EfCodec",
     "EfCodecEngine",

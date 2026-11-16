@@ -33,6 +33,6 @@ The Rust encoder returns access units from `encode` and `flush`, and the decoder
 
 `ef_codec_capability`, `ef_video_packet`, `ef_video_encoder_info` and `ef_video_stream_info` are owned by the library and read through the pointers it returns, so fields may be appended without breaking callers. `ef_codec_region` is the one struct a caller fills (a crop passed by pointer); it is four `uint32_t` and does not change.
 
-**ABI versioning.** `ef_codec_abi_version()` returns `3`. It moved from `2` with the engine, capability, image encoder and video entry points, and the errno mapping image decoding now shares (`EBADMSG` and `ENOTSUP` where it answered `EIO`); from `1` to `2` when `ef_codec_colorimetry_from_v4l2` gained its `is_rgb_or_hsv` argument. The rules that govern when it moves, and what mixing versions across the five libraries is allowed to do, are in [§ C ABI Stability and Versioning](https://github.com/EdgeFirstAI/hal/blob/main/ARCHITECTURE.md#c-abi-stability-and-versioning).
+**ABI versioning.** `ef_codec_abi_version()` returns `3`. The rules that govern when it moves, and what mixing versions across the five libraries is allowed to do, are in [§ C ABI Stability and Versioning](https://github.com/EdgeFirstAI/hal/blob/main/ARCHITECTURE.md#c-abi-stability-and-versioning).
 
 See [README.md](README.md) for usage and [tests/c/](tests/c/) for the consumers; `tests/c/test_codec_api.c` runs the whole surface, including an H.264 round trip where the machine has hardware for it.

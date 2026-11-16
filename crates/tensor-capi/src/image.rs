@@ -5,25 +5,11 @@
 //! `ef_tensor_image_alloc`, `ef_tensor_image_with_stride_alloc`,
 //! `ef_tensor_view_region`, `ef_tensor_from_planes`.
 //!
-//! Every constructor here forwards to the real, already-implemented
-//! `TensorDyn`/`Tensor<T>` method (`edgefirst-tensor`'s `static` backend,
-//! the only backend this library ever ships): the ~250 lines of
-//! platform-specific image geometry (macOS IOSurface tiling, Android
-//! AHardwareBuffer, Linux DMA-BUF 64-byte pitch alignment, odd-dimension
-//! chroma handling) live there, not here. Adding these exports does not
-//! reimplement or approximate that geometry -- it makes the code that
-//! already computes it correctly reachable from the dynamic backend.
+//! Every constructor here forwards to the matching `TensorDyn`/`Tensor<T>`
+//! method, which computes the platform-specific image geometry.
 //!
 //! `ef_tensor_image_desc_alloc` (the `EfTensorImageDesc`-driven variant)
-//! lives in `desc.rs`, next to the request type it consumes.
-//!
-//! # Naming
-//!
-//! [`ef_tensor_view_region`] is named that, not `ef_tensor_view`, because
-//! `ef_tensor_view` already names a **struct** in `tensor.h`
-//! (`EfTensorView`, the mapped-window scalar block `ef_tensor_map` fills) --
-//! colliding with it would break every consumer including a C header at
-//! all.
+//! lives in `desc.rs`.
 
 use std::ffi::{c_char, c_int, CStr};
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -44,17 +30,13 @@ unsafe fn parse_format(f: *const c_char) -> Option<PixelFormat> {
     }
 }
 
-/// Decode a 0..=3 CPU access code, `None` included (unlike
-/// [`crate::codes::cpu_access_from_code`], which reserves 0 as "not a
-/// mappable direction" -- image allocation legitimately wants
-/// `CpuAccess::None`, e.g. a GPU-only render target).
+/// Decode a 0..=3 CPU access code, `CpuAccess::None` included.
 fn parse_access(access: u32) -> Option<CpuAccess> {
     CpuAccess::from_code(access)
 }
 
-/// Decode the `(has_memory, memory)` pair every `EfImageDescView`-adjacent
-/// entry point uses for "a specific backing, or auto-select" -- `Err(())`
-/// for an unrecognized `memory` code when `has_memory != 0`.
+/// Decode a `(has_memory, memory)` pair: `Ok(None)` for auto-select, and
+/// `Err(())` for an unrecognized `memory` code when `has_memory != 0`.
 fn parse_memory(has_memory: c_int, memory: u32) -> Result<Option<TensorMemory>, ()> {
     if has_memory == 0 {
         return Ok(None);
@@ -86,10 +68,6 @@ pub unsafe extern "C" fn ef_tensor_image_alloc(
     access: u32,
 ) -> *mut EfTensor {
     unsafe {
-        // The quiet hook, before the catch: a caught panic must WRITE the
-        // thread-local, or a consumer reading `ef_tensor_last_error_class`
-        // after this returns NULL gets a class left behind by an earlier
-        // failure and reports it as this call's. See `ensure_hook_installed`.
         crate::last_error::ensure_hook_installed();
         catch_unwind(AssertUnwindSafe(|| {
             let Some(fmt) = parse_format(format) else {
@@ -147,10 +125,6 @@ pub unsafe extern "C" fn ef_tensor_image_with_stride_alloc(
     access: u32,
 ) -> *mut EfTensor {
     unsafe {
-        // The quiet hook, before the catch: a caught panic must WRITE the
-        // thread-local, or a consumer reading `ef_tensor_last_error_class`
-        // after this returns NULL gets a class left behind by an earlier
-        // failure and reports it as this call's. See `ensure_hook_installed`.
         crate::last_error::ensure_hook_installed();
         catch_unwind(AssertUnwindSafe(|| {
             let Some(fmt) = parse_format(format) else {
@@ -188,8 +162,7 @@ pub unsafe extern "C" fn ef_tensor_image_with_stride_alloc(
 
 /// Borrow a rectangular `(x, y, width, height)` pixel sub-region of `t` as a
 /// new, independent handle that shares `t`'s underlying allocation and
-/// identity (zero-copy) -- never a new allocation. See
-/// [`edgefirst_tensor::TensorDyn::view`].
+/// identity (zero-copy). See [`edgefirst_tensor::TensorDyn::view`].
 ///
 /// @retval a new tensor the caller must free with `ef_tensor_free`
 ///         (independently of `t`; both stay valid, sharing the same
@@ -208,10 +181,6 @@ pub unsafe extern "C" fn ef_tensor_view_region(
     width: u64,
     height: u64,
 ) -> *mut EfTensor {
-    // The quiet hook, before the catch: a caught panic must WRITE the
-    // thread-local, or a consumer reading `ef_tensor_last_error_class`
-    // after this returns NULL gets a class left behind by an earlier
-    // failure and reports it as this call's. See `ensure_hook_installed`.
     crate::last_error::ensure_hook_installed();
     catch_unwind(AssertUnwindSafe(|| {
         if t.is_null() {
@@ -236,14 +205,10 @@ pub unsafe extern "C" fn ef_tensor_view_region(
 
 /// Borrow batch element `n` of a batched tensor (leading `N` dimension) as a
 /// new, independent handle that shares `t`'s underlying allocation and
-/// identity (zero-copy) -- never a new allocation. See
-/// [`edgefirst_tensor::TensorDyn::batch`].
+/// identity (zero-copy). See [`edgefirst_tensor::TensorDyn::batch`].
 ///
-/// Distinct from `ef_tensor_view_region`, which crops a *spatial*
-/// rectangle within one image: this indexes the leading dimension, and the
-/// result has `t`'s shape with that dimension dropped. A tensor whose
-/// leading dimension is not a batch axis has no meaningful element `n`, and
-/// the underlying call refuses.
+/// The result has `t`'s shape with the leading dimension dropped. A tensor
+/// whose leading dimension is not a batch axis is refused.
 ///
 /// @retval a new tensor the caller must free with `ef_tensor_free`
 ///         (independently of `t`; both stay valid, sharing the same
@@ -255,10 +220,6 @@ pub unsafe extern "C" fn ef_tensor_view_region(
 /// `t` must be `NULL` or a live handle.
 #[no_mangle]
 pub unsafe extern "C" fn ef_tensor_batch(t: *const EfTensor, n: u64) -> *mut EfTensor {
-    // The quiet hook, before the catch: a caught panic must WRITE the
-    // thread-local, or a consumer reading `ef_tensor_last_error_class`
-    // after this returns NULL gets a class left behind by an earlier
-    // failure and reports it as this call's. See `ensure_hook_installed`.
     crate::last_error::ensure_hook_installed();
     catch_unwind(AssertUnwindSafe(|| {
         if t.is_null() {
@@ -269,9 +230,6 @@ pub unsafe extern "C" fn ef_tensor_batch(t: *const EfTensor, n: u64) -> *mut EfT
             set_last_error("batch: could not resolve handle");
             return std::ptr::null_mut();
         };
-        // A 64-bit index on a 32-bit host cannot address an element that
-        // exists, and truncating would silently return a *different*
-        // element's view -- refuse instead.
         let Ok(n) = usize::try_from(n) else {
             set_last_error("batch: index is out of range for this host's usize");
             return std::ptr::null_mut();
@@ -290,32 +248,20 @@ pub unsafe extern "C" fn ef_tensor_batch(t: *const EfTensor, n: u64) -> *mut EfT
 /// Combine separate luma and chroma plane tensors into one semi-planar
 /// (NV12/NV16) tensor. See [`edgefirst_tensor::Tensor::from_planes`].
 ///
-/// **Ownership: consumes both `luma` and `chroma`, but only past this
-/// function's precondition checks.** A real Rust caller of
-/// `Tensor::<T>::from_planes` always passes both by value, with no "give
-/// them back on error" path -- but every precondition that call requires
-/// (matching element types chief among them, since the C boundary is
-/// type-erased and the compiler cannot enforce it the way it does for a
-/// real Rust caller) is checked here *first*, before either handle is
-/// reclaimed. Consuming happens once, right before the underlying
-/// `Tensor::from_planes` call; from that point on both outcomes (success or
-/// a validation failure *inside* `Tensor::from_planes`, e.g. an
-/// incompatible format/shape) leave `luma`/`chroma` invalidated, matching
-/// Rust's own by-value semantics. See the `@retval` list below for exactly
-/// which failures consume and which do not.
+/// Consumes both `luma` and `chroma` once the precondition checks pass:
+/// from that point both handles are invalid whether the call succeeds or
+/// fails. A failed precondition check leaves both handles valid.
 ///
 /// @retval a new tensor the caller must free with `ef_tensor_free`, on
 ///         success (`luma`/`chroma` consumed).
-/// @retval `NULL`, **`luma`/`chroma` left valid and unconsumed** -- a
+/// @retval `NULL`, `luma`/`chroma` left valid and unconsumed -- a
 ///         `NULL`/invalid `luma` or `chroma`, an unrecognized `format`, a
-///         `luma`/`chroma` element-type mismatch, or an
-///         outstanding `ef_tensor_retain`/`ef_tensor_map` on either handle
-///         (consuming a handle another reference still points at, or that
-///         has a live map guard, would dangle it).
-/// @retval `NULL`, **`luma`/`chroma` consumed regardless** -- every
-///         precondition above passed but `Tensor::from_planes` itself
-///         refused (see its constraints: only NV12/NV16, matching
-///         luma/chroma widths, and the format-specific height ratio).
+///         `luma`/`chroma` element-type mismatch, or an outstanding
+///         `ef_tensor_retain`/`ef_tensor_map` on either handle.
+/// @retval `NULL`, `luma`/`chroma` consumed -- every precondition above
+///         passed but `Tensor::from_planes` refused (it accepts only
+///         NV12/NV16, matching luma/chroma widths, and the format-specific
+///         height ratio).
 ///
 /// Every `NULL` case sets `ef_tensor_last_error_message` with the reason.
 ///
@@ -329,10 +275,6 @@ pub unsafe extern "C" fn ef_tensor_from_planes(
     format: *const c_char,
 ) -> *mut EfTensor {
     unsafe {
-        // The quiet hook, before the catch: a caught panic must WRITE the
-        // thread-local, or a consumer reading `ef_tensor_last_error_class`
-        // after this returns NULL gets a class left behind by an earlier
-        // failure and reports it as this call's. See `ensure_hook_installed`.
         crate::last_error::ensure_hook_installed();
         catch_unwind(AssertUnwindSafe(|| {
             if luma.is_null() || chroma.is_null() {
@@ -347,13 +289,7 @@ pub unsafe extern "C" fn ef_tensor_from_planes(
                 set_last_error("from_planes: could not resolve luma/chroma handle");
                 return std::ptr::null_mut();
             };
-            // Precondition, checked before consuming anything: neither handle
-            // may have an outstanding retain or map. This function reclaims
-            // both `Box<EfTensorImpl>`s outright; doing that while another
-            // reference (a retain, or a live map guard's keepalive) still
-            // points at the same allocation would dangle it, the same hazard
-            // `ef_tensor_map`'s own exclusive-write gate (`map.rs`) guards
-            // against for a narrower case.
+            // Preconditions, checked before either handle is consumed.
             if limp.refs.load(Ordering::Acquire) != 1 || cimp.refs.load(Ordering::Acquire) != 1 {
                 set_last_error(
                     "from_planes: luma and chroma must each have no outstanding ef_tensor_retain",
@@ -372,14 +308,6 @@ pub unsafe extern "C" fn ef_tensor_from_planes(
                 );
                 return std::ptr::null_mut();
             }
-            // Another precondition checked before consuming: a real Rust caller
-            // of `Tensor::<T>::from_planes` can never pass mismatched element
-            // types (the compiler enforces `T` is the same for both arguments);
-            // that guarantee does not exist at this type-erased C boundary, so
-            // it is checked explicitly here, before either handle is reclaimed
-            // -- not inside the match below, where by then both would already
-            // be gone and a caller "retrying" with the free'd pointers would be
-            // a use-after-free.
             if limp.inner.dtype() != cimp.inner.dtype() {
                 set_last_error(
                     "from_planes: luma and chroma tensors must have the same element type",
@@ -387,10 +315,8 @@ pub unsafe extern "C" fn ef_tensor_from_planes(
                 return std::ptr::null_mut();
             }
 
-            // Consume: from this point on `luma`/`chroma` are invalidated on
-            // every path, matching Rust's own `from_planes(luma, chroma, ..)`
-            // taking both by value regardless of outcome (see this function's
-            // Doxygen).
+            // Consume both handles: `luma` and `chroma` are invalid on every
+            // path from here.
             let luma_box = Box::from_raw(luma as *mut EfTensorImpl);
             let chroma_box = Box::from_raw(chroma as *mut EfTensorImpl);
             let result = match (luma_box.inner, chroma_box.inner) {
@@ -464,8 +390,8 @@ pub unsafe extern "C" fn ef_tensor_is_multiplane(t: *const EfTensor) -> c_int {
 /// The result is an independent handle the caller must free with
 /// `ef_tensor_free`. Geometry mutations (`ef_tensor_set_row_stride_unchecked`,
 /// `ef_tensor_set_plane_offset`) apply to this handle. Stride/offset that
-/// must live on the combined tensor should be set on the chroma input
-/// *before* `ef_tensor_from_planes`.
+/// must live on the combined tensor are set on the chroma input before
+/// `ef_tensor_from_planes`.
 ///
 /// @retval a new tensor on success.
 /// @retval `NULL` if `t` is `NULL`, not multiplane, or the chroma plane

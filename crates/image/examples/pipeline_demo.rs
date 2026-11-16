@@ -1,18 +1,15 @@
 // SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! End-to-end decode → letterbox pipeline demonstrating zero-allocation reuse.
+//! End-to-end decode → letterbox pipeline that reuses its buffers.
 //!
-//! This example shows the recommended pattern for real-time vision pipelines:
+//! 1. **Init**: allocates input tensors large enough for the maximum expected
+//!    image size, output tensors at model input resolution (640×640), and
+//!    decoder state.
+//! 2. **Hot loop**: decodes JPEG into the input tensor (strided), then
+//!    `convert()`s with letterbox resize into the output tensor.
 //!
-//! 1. **Init**: Allocate input tensors large enough for the maximum
-//!    expected image size, output tensors at model input resolution (640×640),
-//!    and decoder state.
-//! 2. **Hot loop**: Decode JPEG into the input tensor (strided), then
-//!    `convert()` with letterbox resize into the output tensor.
-//!
-//! After warmup, the hot loop performs **zero heap allocations** — all buffers
-//! (decoder scratch, tensor backing, GL resources) were sized during init.
+//! After warmup, the hot loop performs no heap allocations.
 //!
 //! ## Memory modes
 //!
@@ -41,7 +38,7 @@
 //!
 //! ## Verify zero allocations with strace
 //!
-//! With CPU backend (guaranteed zero `brk`/`mmap`):
+//! With the CPU backend:
 //! ```bash
 //! cargo build --release -p edgefirst-image --example pipeline_demo
 //! EDGEFIRST_FORCE_BACKEND=cpu strace -e brk,mmap -f \
@@ -49,16 +46,14 @@
 //!     | grep -A9999 'HOT LOOP START' | grep -B9999 'HOT LOOP END'
 //! ```
 //!
-//! With OpenGL backend you may see a single GPU driver `mmap` (MAP_SHARED
-//! on the DRM render device) the first time a new source dimension is
-//! presented. This is a GPU-internal resource import, not a heap allocation.
-//! On embedded targets with DMA-BUF tensors this does not occur.
+//! With the OpenGL backend the GPU driver may `mmap` (MAP_SHARED on the DRM
+//! render device) the first time a new source dimension is presented.
 //!
 //! ## Verify zero allocations with perf
 //! ```bash
 //! perf stat -e page-faults ./target/release/examples/pipeline_demo
 //! ```
-//! Page faults during the hot loop indicate unexpected allocations.
+//! Page faults during the hot loop indicate allocations.
 
 use edgefirst_codec::{ImageDecoder, ImageLoad};
 use edgefirst_image::{Crop, ImageProcessor, ImageProcessorTrait};
@@ -70,7 +65,6 @@ const MODEL_H: usize = 640;
 const ITERATIONS: usize = 100;
 
 /// Letterbox geometry: scale to fit, centre in destination.
-/// Retained for reference; placement is now computed by `Crop::letterbox`.
 #[allow(dead_code)]
 fn calculate_letterbox(
     src_w: usize,
@@ -134,9 +128,6 @@ fn load_test_images() -> Vec<ImageEntry> {
 }
 
 /// Run the pipeline for one image, returning (decode_us, convert_us) medians.
-///
-/// Uses pre-allocated timing buffers to avoid allocations during measurement.
-/// Assumes all warmup is done before calling this function.
 #[allow(clippy::too_many_arguments)]
 fn bench_pipeline(
     image: &ImageEntry,
@@ -180,7 +171,7 @@ fn bench_pipeline(
 }
 
 fn main() {
-    // Silence GL/image processor logs unless explicitly requested
+    // Silence GL/image processor logs unless `RUST_LOG` is set.
     if std::env::var("RUST_LOG").is_err() {
         std::env::set_var("RUST_LOG", "warn");
     }
@@ -202,8 +193,7 @@ fn main() {
     // Create ImageProcessor (probes GPU backends)
     let mut proc = ImageProcessor::new().expect("Failed to create ImageProcessor");
 
-    // Memory type: auto-select (DMA on embedded, Mem on desktop).
-    // Override with PIPELINE_MEM_TYPE=mem|dma|shm for testing.
+    // Memory type: auto-select, or `PIPELINE_MEM_TYPE=mem|dma|shm`.
     let mem_type = match std::env::var("PIPELINE_MEM_TYPE")
         .unwrap_or_default()
         .as_str()
@@ -223,13 +213,8 @@ fn main() {
     });
     eprintln!("  ImageProcessor created (memory: {mem_label})");
 
-    // Allocate input tensor — larger than all test images.
-    // With None (auto), DMA-BUF backed tensors are used on embedded Linux
-    // for zero-copy GPU pipeline (decode → EGL image → convert).
-    //
-    // Colour JPEGs decode to their native NV12 layout; the codec configures
-    // the tensor's dims+format during the decode and the convert step below
-    // handles the NV12 → RGB colour conversion.
+    // Allocate the input tensor, larger than all test images. The codec
+    // configures its dims and format during the decode.
     let mut input = proc
         .create_image(
             max_w,
@@ -237,8 +222,7 @@ fn main() {
             PixelFormat::Nv12,
             DType::U8,
             mem_type,
-            // The codec CPU-writes the decode; nothing reads it back on the
-            // CPU (convert consumes it on the GPU).
+            // The codec writes the decode on the CPU; the convert reads it on the GPU.
             edgefirst_tensor::CpuAccess::Write,
         )
         .expect("Failed to create input tensor");
@@ -262,9 +246,7 @@ fn main() {
             PixelFormat::Rgb,
             DType::U8,
             mem_type,
-            // Convert destinations feed hardware consumers; no CPU access —
-            // the None declaration keeps them eligible for vendor tile
-            // compression on platforms that support it.
+            // Convert destinations have no CPU access.
             edgefirst_tensor::CpuAccess::None,
         )
         .expect("Failed to create packed output tensor");
@@ -298,14 +280,9 @@ fn main() {
         output_planar.memory()
     );
 
-    // Create decoder
     let mut decoder = ImageDecoder::new();
 
-    // Comprehensive warmup: exercise every (image × output) combination
-    // multiple times so that all GL resources (PBOs, framebuffers),
-    // thread pools, and scratch buffers are fully sized.
-    // Warmup mirrors the hot loop pattern: N iterations per (image, output)
-    // to ensure GPU caches stabilize for same-input repeated calls.
+    // Warmup: exercise every (image × output) combination several times.
     eprintln!("\n  Warmup: exercising all code paths...");
     for image in &images {
         for _ in 0..10 {
@@ -335,7 +312,7 @@ fn main() {
     }
     eprintln!("  Warmup complete — all buffers sized\n");
 
-    // Pre-allocate timing vectors (reused across all benchmark runs)
+    // Pre-allocate timing vectors.
     let mut decode_times = Vec::with_capacity(ITERATIONS);
     let mut convert_times = Vec::with_capacity(ITERATIONS);
 

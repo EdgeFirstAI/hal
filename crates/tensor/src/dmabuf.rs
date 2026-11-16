@@ -8,8 +8,8 @@ use std::sync::OnceLock;
 const DMA_BUF_BASE: u8 = b'b';
 const DMA_BUF_IOCTL_SYNC: u8 = 0;
 
-// Values of `DMA_BUF_SYNC_*` from `<linux/dma-buf.h>`, written as literals:
-// READ = 1 << 0, WRITE = 1 << 1, START = 0 << 2, END = 1 << 2.
+// Values of `DMA_BUF_SYNC_*` from `<linux/dma-buf.h>`: READ = 1 << 0, WRITE = 1
+// << 1, START = 0 << 2, END = 1 << 2.
 const DMA_BUF_SYNC_READ: u64 = 1;
 const DMA_BUF_SYNC_WRITE: u64 = 2;
 const DMA_BUF_SYNC_RW: u64 = 3;
@@ -36,11 +36,7 @@ fn sync(fd: &OwnedFd, flags: u64) -> nix::Result<()> {
 }
 
 /// The `DMA_BUF_IOCTL_SYNC` flags for one direction and one half of the
-/// bracket.
-///
-/// `CpuAccess::None` maps to read-write: callers reject it before reaching
-/// here, but a zero direction would issue a no-op ioctl that silently
-/// maintains nothing.
+/// bracket. `CpuAccess::None` maps to read-write.
 fn sync_flags(start: bool, access: crate::CpuAccess) -> u64 {
     let mut flags = 0;
     if access.reads() {
@@ -63,9 +59,7 @@ fn sync_flags(start: bool, access: crate::CpuAccess) -> u64 {
 #[cfg(test)]
 mod sync_counter {
     thread_local! {
-        /// `(start, end)` sync calls issued on this thread, so a test can
-        /// assert that a map's bracket is balanced. Per-thread so concurrently
-        /// running tests do not see each other's calls.
+        /// `(start, end)` sync calls issued on this thread.
         pub(crate) static SYNC_CALLS: std::cell::Cell<(usize, usize)> =
             const { std::cell::Cell::new((0, 0)) };
     }
@@ -74,11 +68,7 @@ mod sync_counter {
 pub(crate) use sync_counter::SYNC_CALLS;
 
 /// Issue `DMA_BUF_IOCTL_SYNC` for one direction and one half of the bracket.
-///
-/// The direction matters: a read-only bracket lets the kernel skip the
-/// writeback at END, a write-only one skips the invalidate at START — so
-/// `start` and `end` MUST be called with the same `access`, or the
-/// maintenance one half performed is undone by the other half's omission.
+/// `start` and `end` must be called with the same `access`.
 pub(crate) fn sync_access(fd: &OwnedFd, start: bool, access: crate::CpuAccess) -> nix::Result<()> {
     #[cfg(test)]
     SYNC_CALLS.with(|c| {
@@ -89,16 +79,8 @@ pub(crate) fn sync_access(fd: &OwnedFd, start: bool, access: crate::CpuAccess) -
 }
 
 // =============================================================================
-// DRM PRIME import — creates persistent dma_buf_attach for cache maintenance
+// DRM PRIME import: creates a persistent dma_buf_attach for cache maintenance
 // =============================================================================
-//
-// The CMA heap's begin_cpu_access iterates over buffer->attachments to perform
-// cache maintenance via dma_sync_sgtable_for_cpu(). Without any active
-// attachments, DMA_BUF_IOCTL_SYNC is a no-op on cached CMA heaps.
-//
-// By importing the DMA-buf fd through the DRM/GPU driver
-// (DRM_IOCTL_PRIME_FD_TO_HANDLE), a persistent dma_buf_attach() is created.
-// This makes DMA_BUF_IOCTL_SYNC actually perform cache invalidation/flush.
 
 const DRM_IOCTL_BASE: u8 = b'd';
 
@@ -123,11 +105,7 @@ struct DrmGemClose {
 const DRM_IOCTL_GEM_CLOSE: nix::sys::ioctl::ioctl_num_type =
     nix::request_code_write!(DRM_IOCTL_BASE, 0x09, std::mem::size_of::<DrmGemClose>());
 
-/// Shared DRM render node fd — opened once, reused for all PRIME imports.
-///
-/// Opening `/dev/dri/renderD128` per tensor can deadlock on Vivante DRM drivers
-/// when v4l2 decoders (VPU) are concurrently using DMA-BUFs. A single shared fd
-/// avoids the contention by routing all PRIME imports through one DRM file instance.
+/// Shared DRM render node fd: opened once, reused for all PRIME imports.
 static SHARED_DRM_FD: OnceLock<Option<OwnedFd>> = OnceLock::new();
 
 fn shared_drm_fd() -> Option<BorrowedFd<'static>> {
@@ -155,17 +133,10 @@ fn shared_drm_fd() -> Option<BorrowedFd<'static>> {
         .map(|fd| unsafe { BorrowedFd::borrow_raw(fd.as_raw_fd()) })
 }
 
-/// Holds a DRM GEM handle that keeps a persistent `dma_buf_attach` alive.
-///
-/// When the DMA-buf fd is imported through the GPU DRM driver via
-/// `DRM_IOCTL_PRIME_FD_TO_HANDLE`, the driver creates a persistent
-/// `dma_buf_attach()`. This attachment is required for `DMA_BUF_IOCTL_SYNC`
-/// to perform actual cache maintenance on cached CMA heaps.
-///
-/// Uses a shared DRM render node fd to avoid deadlocks with concurrent
-/// V4L2/VPU DMA-BUF usage on Vivante-based SoCs.
-///
-/// The attachment is released when the GEM handle is closed on drop.
+/// Holds a DRM GEM handle that keeps a persistent `dma_buf_attach` alive. The
+/// attachment is created by importing the DMA-buf fd through the GPU DRM driver
+/// (`DRM_IOCTL_PRIME_FD_TO_HANDLE`) on the shared render node fd, and released
+/// when the GEM handle is closed on drop.
 #[derive(Debug)]
 pub(crate) struct DrmAttachment {
     gem_handle: u32,
@@ -174,11 +145,9 @@ pub(crate) struct DrmAttachment {
 impl DrmAttachment {
     /// Import a DMA-buf fd through the GPU DRM driver to create a persistent
     /// `dma_buf_attach`. Returns `None` if `/dev/dri/renderD128` is not
-    /// available (e.g. on non-GPU systems or in containers).
-    /// If `imported` is true the fd came from an external source (e.g. a
-    /// Neutron NPU kernel driver) and a PRIME import failure is expected —
-    /// logged at DEBUG.  For self-allocated dma_heap buffers, failure is
-    /// unexpected and logged at WARN.
+    /// available or the import fails. An import failure is logged at DEBUG when
+    /// `imported` is true (the fd came from an external source) and at WARN
+    /// otherwise.
     pub(crate) fn new(dma_buf_fd: &OwnedFd, imported: bool) -> Option<Self> {
         let drm_fd = shared_drm_fd()?;
 

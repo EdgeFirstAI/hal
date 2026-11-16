@@ -35,13 +35,8 @@ mod decoder_builder_tests {
 
     #[test]
     fn builder_with_decode_dtype_constructs_per_scale_decoder() {
-        // Minimal LTRB detection-only per-scale schema: 3 FPN strides for
-        // boxes (4 channels each, LTRB encoding) + scores. Detection-only
-        // avoids the legacy `mask_coefs` dshape verification (which still
-        // expects a flat `num_protos` axis the per-scale fixture
-        // lowering does not provide); per-scale planning is independent
-        // of mask_coefs presence and triggers from the boxes/scores
-        // children alone.
+        // LTRB detection-only per-scale schema: 3 FPN strides of boxes (4
+        // channels each) and scores.
         let schema_json = r#"{
           "schema_version": 2,
           "decoder_version": "yolov8",
@@ -116,8 +111,7 @@ mod decoder_builder_tests {
         );
     }
 
-    /// The default decode dtype follows the decoder's tier: F16 only where FP16 arithmetic
-    /// may run, F32 for a forced baseline, scalar or unknown tier.
+    /// The default decode dtype is F16 only on a tier where FP16 arithmetic may run.
     #[test]
     fn native_decode_dtype_follows_the_fp16_tier() {
         use crate::per_scale::kernels::{decoder_cpu_features_from, forced_for_test};
@@ -138,12 +132,6 @@ mod decoder_builder_tests {
 
     #[test]
     fn decoder_with_per_scale_routes_through_new_path() {
-        // Smoke test: build a per-scale decoder via the inline LTRB
-        // detection-only schema (the same fixture that survives the
-        // legacy validator in `builder_with_decode_dtype_constructs_per_scale_decoder`),
-        // feed zero-i8 tensors with attached per-tensor quant, and
-        // verify `decode` / `decode_proto` route through the per-scale
-        // path without erroring.
         use crate::DecodeDtype;
         use edgefirst_tensor::{Quantization as TQ, Tensor, TensorDyn, TensorMemory};
 
@@ -220,8 +208,7 @@ mod decoder_builder_tests {
             "per-scale fast path must be attached"
         );
 
-        // Build the 6 zero-i8 inputs (3 levels × {boxes, scores}). LTRB
-        // detection-only: 4 channels per box; no mask_coefs, no protos.
+        // The 6 zero-i8 inputs: 3 levels × {boxes, scores}.
         let shapes: &[(&[usize], &[usize])] = &[
             (&[1, 80, 80, 4], &[1, 80, 80, 80]),
             (&[1, 40, 40, 4], &[1, 40, 40, 80]),
@@ -247,9 +234,7 @@ mod decoder_builder_tests {
             "detection-only schema must produce no ProtoData"
         );
 
-        // Now exercise the materialised-mask path. Detection-only ⇒ masks
-        // are unused but the entry point should still succeed and report
-        // zero masks.
+        // `decode` with masks: a detection-only model reports zero masks.
         let mut masks: Vec<crate::Segmentation> = Vec::new();
         decoder
             .decode(&inputs, &mut output_boxes, &mut masks)
@@ -279,7 +264,7 @@ mod decoder_builder_tests {
         );
     }
 
-    /// A builder holds no dtype until one is set, so the default is resolved at `build`.
+    /// A builder holds no dtype until one is set.
     #[test]
     fn builder_decode_dtype_is_unset_until_chosen() {
         let unset = DecoderBuilder::default();
@@ -301,13 +286,7 @@ mod decoder_builder_tests {
         let result = DecoderBuilder::new()
             .with_config_yaml_str(malformed_yaml)
             .build();
-        // build() now routes YAML through SchemaV2::parse_yaml which
-        // bridges to a serde_json::Value before deserialising as v1
-        // ConfigOutputs, so structurally-valid YAML that fails the v1
-        // schema check surfaces as a Json variant. Either Yaml (from
-        // the initial serde_yaml::from_str step) or Json (from the v1
-        // fallback) is acceptable here — the contract is "malformed
-        // config errors out".
+        // Either a Yaml or a Json error is accepted.
         assert!(
             matches!(
                 result,
@@ -1209,12 +1188,6 @@ mod decoder_builder_tests {
 
     #[test]
     fn test_modelpack_seg_infers_classes_without_numclasses_dshape() {
-        // Regression for DE-2651 / DE-2628: a ModelPack segmentation output
-        // whose canonical NHWC channel axis is not tagged `NumClasses` (the
-        // validator's shape-inference fallback tags it `NumProtos`) must still
-        // build. HAL infers the class count from the NHWC shape and relies on
-        // `swap_axes_if_needed` to keep the physical layout intact at decode.
-
         // Segmentation-only: channel axis mis-tagged as NumProtos.
         let result = DecoderBuilder::new()
             .with_config(ConfigOutputs {
@@ -1237,10 +1210,8 @@ mod decoder_builder_tests {
             "seg-only ModelPack with mis-tagged channel should build, got {result:?}"
         );
 
-        // Multitask (boxes + scores + segmentation): the seg/detection
-        // `classes + 1` cross-check must use the NHWC channel count (shape[3])
-        // when the dshape lacks NumClasses. Detection declares 3 classes, so
-        // the seg channel axis must be 4.
+        // Multitask (boxes + scores + segmentation): detection declares 3
+        // classes and the seg channel axis is 4.
         let result = DecoderBuilder::new()
             .with_config(ConfigOutputs {
                 outputs: vec![
@@ -1289,11 +1260,7 @@ mod decoder_builder_tests {
 
     #[test]
     fn test_modelpack_seg_inferred_count_mismatch_is_rejected() {
-        // DE-2651 follow-up: when the seg channel axis is mis-tagged (NumProtos)
-        // the `classes + 1` cross-check must still fire using the *inferred*
-        // NHWC channel count (shape[3]). Detection declares 3 classes, so a seg
-        // channel count of 6 (≠ 3 + 1) must be rejected — exercising the
-        // inference failure branch, not just the happy path.
+        // Detection declares 3 classes; a seg channel count of 6 is rejected.
         let result = DecoderBuilder::new()
             .with_config(ConfigOutputs {
                 outputs: vec![
@@ -1346,10 +1313,8 @@ mod decoder_builder_tests {
 
     #[test]
     fn test_modelpack_seg_explicit_numclasses_tag_drives_cross_check() {
-        // Regression guard for the refactor: an explicitly-tagged `NumClasses`
-        // seg axis must still drive the detection `classes + 1` check —
-        // `modelpack_seg_num_classes` prefers the tag. Detection declares 3
-        // classes, so a tagged seg channel of 4 builds and 5 is rejected.
+        // Detection declares 3 classes: a tagged seg channel of 4 builds and 5
+        // is rejected.
         let build = |seg_channels: usize| {
             DecoderBuilder::new()
                 .with_config(ConfigOutputs {
@@ -1410,10 +1375,7 @@ mod decoder_builder_tests {
 
     #[test]
     fn test_modelpack_seg_missing_spatial_axis_is_rejected() {
-        // The relaxation made only the *channel* axis optional; the spatial
-        // axes (Batch/Height/Width) must still be named. A seg dshape that omits
-        // Height (an Unknown axis fills the slot) must still be rejected — the
-        // relaxation must not have over-loosened.
+        // The seg dshape has an `Unknown` axis in place of Height.
         let result = DecoderBuilder::new()
             .with_config(ConfigOutputs {
                 outputs: vec![ConfigOutput::Segmentation(configs::Segmentation {
@@ -1442,10 +1404,6 @@ mod decoder_builder_tests {
 
     #[test]
     fn test_unknown_dshape_axis_name_deserializes_to_unknown() {
-        // DE-2651: an unrecognised dshape axis name must deserialize to
-        // `DimName::Unknown` (via `#[serde(other)]`) instead of failing the
-        // parse, while recognised names still map to their variant. Locks the
-        // serde contract independently of the seg/decoder pipeline.
         let mut de = serde_json::Deserializer::from_str(r#"[{"channels": 3}, {"batch": 1}]"#);
         let dshape = configs::deserialize_dshape(&mut de).expect("unknown axis name must parse");
         assert_eq!(dshape, vec![(DimName::Unknown, 3), (DimName::Batch, 1)]);
@@ -2140,7 +2098,6 @@ mod decoder_builder_tests {
 
     #[test]
     fn test_nms_from_config_yaml() {
-        // Test parsing NMS from YAML config
         let yaml_class_agnostic = r#"
 outputs:
   - decoder: ultralytics
@@ -2178,16 +2135,15 @@ nms: class_aware
         // Test that explicit with_nms() overrides config NMS
         let decoder = DecoderBuilder::new()
             .with_config_yaml_str(yaml_class_aware.to_string())
-            .with_nms(Some(configs::Nms::ClassAgnostic)) // User explicitly overrides
+            .with_nms(Some(configs::Nms::ClassAgnostic))
             .build()
             .unwrap();
-        // Explicit user override takes precedence over config
         assert_eq!(decoder.nms, Some(configs::Nms::ClassAgnostic));
 
         // Test that explicit with_nms(None) disables NMS even when config declares one
         let decoder = DecoderBuilder::new()
             .with_config_yaml_str(yaml_class_aware.to_string())
-            .with_nms(None) // User explicitly disables NMS
+            .with_nms(None)
             .build()
             .unwrap();
         assert_eq!(decoder.nms, None);
@@ -2195,7 +2151,6 @@ nms: class_aware
 
     #[test]
     fn test_nms_from_config_json() {
-        // Test parsing NMS from JSON config
         let json_class_aware = r#"{
             "outputs": [{
                 "decoder": "ultralytics",
@@ -2214,7 +2169,6 @@ nms: class_aware
 
     #[test]
     fn test_nms_missing_from_config_uses_builder_default() {
-        // Test that missing NMS in config uses builder default
         let yaml_no_nms = r#"
 outputs:
   - decoder: ultralytics
@@ -2229,13 +2183,12 @@ outputs:
             .with_config_yaml_str(yaml_no_nms.to_string())
             .build()
             .unwrap();
-        // Default fallback NMS is ClassAware
         assert_eq!(decoder.nms, Some(configs::Nms::ClassAware));
 
         // Test with explicit builder NMS
         let decoder = DecoderBuilder::new()
             .with_config_yaml_str(yaml_no_nms.to_string())
-            .with_nms(None) // Explicitly set to None (bypass NMS)
+            .with_nms(None)
             .build()
             .unwrap();
         assert_eq!(decoder.nms, None);
@@ -2243,7 +2196,6 @@ outputs:
 
     #[test]
     fn test_nms_auto_never_persists_in_built_decoder() {
-        // Nms::Auto must always be resolved to a concrete mode during build.
         let yaml_no_nms = r#"
 outputs:
   - decoder: ultralytics
@@ -2262,7 +2214,7 @@ outputs:
         assert_eq!(decoder.nms, Some(configs::Nms::ClassAware));
         assert_ne!(decoder.nms, Some(configs::Nms::Auto));
 
-        // Explicit Auto → resolves from config (class_aware) rather than default
+        // Explicit Auto resolves from the config (class_aware)
         let yaml_class_aware = r#"
 outputs:
   - decoder: ultralytics
@@ -2276,7 +2228,7 @@ nms: class_aware
 "#;
         let decoder = DecoderBuilder::new()
             .with_config_yaml_str(yaml_class_aware.to_string())
-            .with_nms(Some(configs::Nms::Auto)) // Explicitly request Auto
+            .with_nms(Some(configs::Nms::Auto))
             .build()
             .unwrap();
         assert_eq!(
@@ -2537,7 +2489,6 @@ outputs:
 
     #[test]
     fn test_decoder_version_yolo26_end_to_end() {
-        // Test that decoder_version: yolo26 creates end-to-end model type
         let yaml = r#"
 outputs:
   - decoder: ultralytics
@@ -2558,7 +2509,7 @@ decoder_version: yolo26
             ModelType::YoloEndToEndDet { .. }
         ));
 
-        // Even with NMS set, yolo26 should use end-to-end
+        // With NMS set, yolo26 is end-to-end
         let yaml_with_nms = r#"
 outputs:
   - decoder: ultralytics
@@ -2581,10 +2532,7 @@ nms: class_agnostic
         ));
     }
 
-    /// With two classes a pre-NMS head has `4 + 2` features, the width of an
-    /// end-to-end row, so its shape cannot say which it is. The tag then
-    /// decides, as it always has, and only `model.end2end: false` selects
-    /// the NMS path. The same holds with protos (`6 + protos` either way).
+    /// A two-class Yolo26-tagged head is end-to-end unless `model.end2end` is `false`.
     #[test]
     fn test_yolo26_two_class_pre_nms_head_needs_the_end2end_flag() {
         let schema = |model: &str, protos: bool| {
@@ -2632,7 +2580,6 @@ nms: class_agnostic
 
     #[test]
     fn test_decoder_version_yolov8_traditional() {
-        // Test that decoder_version: yolov8 creates traditional model type
         let yaml = r#"
 outputs:
   - decoder: ultralytics
@@ -2653,7 +2600,6 @@ decoder_version: yolov8
 
     #[test]
     fn test_decoder_version_all_versions() {
-        // Test all supported decoder versions parse correctly
         for version in ["yolov5", "yolov8", "yolo11"] {
             let yaml = format!(
                 r#"
@@ -2707,7 +2653,6 @@ decoder_version: yolo26
 
     #[test]
     fn test_decoder_version_json() {
-        // Test parsing decoder_version from JSON config
         let json = r#"{
             "outputs": [{
                 "decoder": "ultralytics",
@@ -2729,7 +2674,6 @@ decoder_version: yolo26
 
     #[test]
     fn test_decoder_version_none_uses_traditional() {
-        // Without decoder_version, traditional model type is used
         let yaml = r#"
 outputs:
   - decoder: ultralytics
@@ -2749,8 +2693,6 @@ outputs:
 
     #[test]
     fn test_decoder_version_none_with_nms_none_still_traditional() {
-        // Without decoder_version, nms: None now means user handles NMS, not end-to-end
-        // This is a behavior change from the previous implementation
         let yaml = r#"
 outputs:
   - decoder: ultralytics
@@ -2763,18 +2705,14 @@ outputs:
 "#;
         let decoder = DecoderBuilder::new()
             .with_config_yaml_str(yaml.to_string())
-            .with_nms(None) // User wants to handle NMS themselves
+            .with_nms(None)
             .build()
             .unwrap();
-        // nms=None with 84 features (80 classes) -> traditional YoloDet (user handles
-        // NMS)
         assert!(matches!(decoder.model_type, ModelType::YoloDet { .. }));
     }
 
     #[test]
     fn test_decoder_heuristic_end_to_end_detection() {
-        // models with (batch, num_boxes, num_features) output shape are treated
-        // as end-to-end detection
         let yaml = r#"
 outputs:
   - decoder: ultralytics
@@ -2838,8 +2776,7 @@ outputs:
             .with_config_yaml_str(yaml.to_string())
             .build()
             .unwrap();
-        // 6 features -> traditional YOLO detection (needs num_classes > 0 for
-        // end-to-end)
+        // 6 features -> traditional YOLO detection
         assert!(matches!(decoder.model_type, ModelType::YoloDet { .. }));
 
         let yaml = r#"
@@ -2877,15 +2814,7 @@ outputs:
         assert!(configs::DecoderVersion::Yolo26.is_end_to_end());
     }
 
-    /// Larger-scale variant of the full-stack mask-alignment repro
-    /// that exercises the non-contiguous `protos.to_shape(...)` path
-    /// inside `make_segmentation`. Uses 256-anchor input, 32 protos,
-    /// 160×160 proto grid with each anchor writing a unique integer
-    /// into proto channel K, where K = anchor index modulo 32. Builds
-    /// mask_coefs as a one-hot vector at channel K so the rendered
-    /// mask value uniquely identifies which anchor it came from.
-    /// A mis-indexed mask would lookup the wrong channel → wrong
-    /// rendered value → test failure.
+    /// Each mask matches its anchor on the non-contiguous protos path of `make_segmentation`.
     #[test]
     fn yolo_segdet_combined_tensor_large_scale_non_contiguous_crop() {
         use edgefirst_tensor::{Tensor, TensorDyn, TensorMapTrait, TensorMemory, TensorTrait};
@@ -2901,8 +2830,6 @@ outputs:
             decoder: DecoderType::Ultralytics,
             quantization: Some(QuantTuple(1.0, 0)),
             shape: vec![1, FEAT, N],
-            // Shape is already canonical [batch, num_features, num_boxes];
-            // dshape omitted.
             dshape: vec![],
             anchors: None,
             normalized: Some(true),
@@ -2911,9 +2838,7 @@ outputs:
             decoder: DecoderType::Ultralytics,
             quantization: Some(QuantTuple(1.0, 0)),
             shape: vec![1, NM, PH, PW],
-            // Physical CHW layout (producer writes channels-outer); HAL
-            // permutes to canonical HWC via swap_axes driven by this
-            // dshape.
+            // Physical CHW layout.
             dshape: vec![
                 (DimName::Batch, 1),
                 (DimName::NumProtos, NM),
@@ -2924,29 +2849,23 @@ outputs:
 
         let decoder = DecoderBuilder::default()
             .with_score_threshold(0.5)
-            .with_iou_threshold(0.99) // disable NMS suppression to keep all survivors identifiable
+            .with_iou_threshold(0.99)
             .with_nms(Some(configs::Nms::ClassAgnostic))
             .add_output(ConfigOutput::Detection(detection_cfg))
             .add_output(ConfigOutput::Protos(protos_cfg))
             .build()
             .expect("YoloSegDet large-scale decoder must build");
 
-        // Detection tensor (1, FEAT, N): 10 anchors pass threshold.
-        // anchor idx 10..20: xywh non-overlapping boxes at different
-        // positions; class 0 score 0.9; mask_coefs = one-hot at index
-        // `k = idx % NM` with value +10 (strong signal). Protos all
-        // zero EXCEPT channel k set to marker value `5.0 + 0.1 * k`
-        // so dot(coefs, protos) = 10 * (5.0 + 0.1*k) for the correct
-        // anchor, and 0 for any mis-indexed lookup. After sigmoid,
-        // correct → ~1 (→ 255 u8); mis-indexed → 0.5 (→ 128 u8).
+        // Detection tensor (1, FEAT, N): anchors 10..20 pass the threshold with
+        // class 0 score 0.9 and a one-hot mask coefficient of 10 at
+        // `k = idx % NM`.
         let mut det_data = vec![0.0f32; FEAT * N];
         let set = |d: &mut [f32], r: usize, c: usize, v: f32| d[r * N + c] = v;
         let n_targets = 10usize;
         let target_start = 10usize;
         for t in 0..n_targets {
             let anchor = target_start + t;
-            // Non-overlapping bboxes along x-axis: each covers
-            // a narrow vertical strip so they never NMS-suppress.
+            // Non-overlapping boxes along the x-axis.
             let xc = 0.05 + 0.08 * t as f32;
             let yc = 0.5;
             set(&mut det_data, 0, anchor, xc);
@@ -2967,9 +2886,7 @@ outputs:
             t.into()
         };
 
-        // Protos (1, NM, PH, PW) NCHW. Channel k filled with value
-        // (5.0 + 0.1*k). Channels that appear in `target_start..`
-        // anchor k = anchor % NM mappings are 10..20 → k = 10..20.
+        // Protos (1, NM, PH, PW) NCHW: channel k is filled with `5.0 + 0.1 * k`.
         let mut proto_data = vec![0.0f32; NM * PH * PW];
         for k in 0..NM {
             let val = 5.0 + 0.1 * k as f32;
@@ -2999,13 +2916,8 @@ outputs:
             out_boxes.len()
         );
 
-        // For each output, compute the expected mask mean from the
-        // anchor-k mapping (inferred from bbox centre xc = 0.05+0.08*t
-        // → t = round((xc-0.05)/0.08) → anchor = 10+t → k = anchor%NM).
-        // Sigmoid(10 * (5.0 + 0.1*k)) ≈ 1.0 for k ≥ 0 → mask mean ≈ 255.
-        // If mask coef looks up the wrong channel (not anchor%NM), the
-        // rendered value would be 0 · protos = 0 → sigmoid = 0.5 →
-        // mean ≈ 128, far from 255.
+        // The mask mean is ~255 when a coefficient reads its own channel and
+        // ~128 otherwise.
         for (b, m) in out_boxes.iter().zip(out_masks.iter()) {
             let cx = (b.bbox.xmin + b.bbox.xmax) * 0.5;
             let mean: f32 = {
@@ -3025,19 +2937,7 @@ outputs:
         }
     }
 
-    /// Full-stack reproducer for HAILORT_BUG.md's mask-vs-detection
-    /// misalignment claim. Exercises the same config the validator
-    /// passes to HAL when running HailoRT → HAL-postproc:
-    ///
-    ///   { type: detection, shape: [1, 116, 8400] }
-    ///   { type: protos,    shape: [1, 32, 160, 160] }   // NCHW
-    ///
-    /// Input tensors encode anchor-identity in both the mask
-    /// coefficients and the proto channel ordering so a mis-indexed
-    /// mask would produce rendered values wildly different from the
-    /// expected pattern. The test builds `Decoder::decode()` through
-    /// the public `TensorDyn` API — same entry point the Python
-    /// bindings call.
+    /// Masks align with their detections through `Decoder::decode` for a combined detection tensor and NCHW protos.
     #[test]
     fn yolo_segdet_combined_detection_protos_full_stack_mask_alignment() {
         use edgefirst_tensor::{Tensor, TensorDyn, TensorMapTrait, TensorMemory, TensorTrait};
@@ -3053,8 +2953,6 @@ outputs:
             decoder: DecoderType::Ultralytics,
             quantization: Some(QuantTuple(1.0, 0)),
             shape: vec![1, FEAT, N],
-            // Shape is already canonical [batch, num_features, num_boxes];
-            // dshape omitted.
             dshape: vec![],
             anchors: None,
             normalized: Some(true),
@@ -3063,9 +2961,7 @@ outputs:
             decoder: DecoderType::Ultralytics,
             quantization: Some(QuantTuple(1.0, 0)),
             shape: vec![1, NM, PH, PW],
-            // Physical CHW layout (producer writes channels-outer); HAL
-            // permutes to canonical HWC via swap_axes driven by this
-            // dshape.
+            // Physical CHW layout.
             dshape: vec![
                 (DimName::Batch, 1),
                 (DimName::NumProtos, NM),
@@ -3094,9 +2990,7 @@ outputs:
         //   anchor 2: xywh (0.8, 0.8, 0.1, 0.1)  class 0 score 0.85  mask_coefs (-3, -3)
         //   anchor 3: below threshold (filler)
         //   anchor 4: below threshold (filler)
-        // Two survivors; mask for a0 should sigmoid to ~0.9975 (→ 254
-        // u8), mask for a2 to ~0.0025 (→ 1 u8). ≈250-point gap makes
-        // any misalignment trivially detectable.
+        // The mask of anchor 0 is ~254 and the mask of anchor 2 is ~1.
         let mut det_data = vec![0.0f32; FEAT * N];
         let set = |d: &mut [f32], r: usize, c: usize, v: f32| d[r * N + c] = v;
         set(&mut det_data, 0, 0, 0.2);
@@ -3122,9 +3016,7 @@ outputs:
             }
             t.into()
         };
-        // Protos in NCHW (1, 2, 8, 8) all-ones — any proto channel
-        // contributes identically, so the sign of mask_coefs dominates
-        // the rendered mask pixel value.
+        // Protos in NCHW (1, 2, 8, 8), all ones.
         let proto_data = vec![1.0f32; NM * PH * PW];
         let protos_tensor: TensorDyn = {
             let t = Tensor::<f32>::new(&[1, NM, PH, PW], Some(TensorMemory::Mem), None).unwrap();
@@ -3176,12 +3068,6 @@ outputs:
     }
 
     /// f16 twin of `yolo_segdet_combined_detection_protos_full_stack_mask_alignment`.
-    /// Proves the Orin TensorRT fp16 engine path: decoder accepts native `F16`
-    /// tensors, the `decode_float::<f16>` instantiation handles NMS and
-    /// coefficient extraction, and segmentation masks are rendered correctly.
-    /// The same 0.95/0.85 scores and +3/−3 mask coefficients as the f32 test
-    /// produce the same near-saturating sigmoid outputs (the 10-bit f16
-    /// mantissa is lossless for these small magnitudes).
     #[test]
     fn yolo_segdet_combined_detection_protos_f16_full_stack() {
         use edgefirst_tensor::{Tensor, TensorDyn, TensorMapTrait, TensorMemory, TensorTrait};
@@ -3205,9 +3091,7 @@ outputs:
             decoder: DecoderType::Ultralytics,
             quantization: None,
             shape: vec![1, NM, PH, PW],
-            // Physical CHW (producer channels-outer); HAL permutes to canonical
-            // HWC via the dshape-driven stride permutation introduced in
-            // EDGEAI-1288.
+            // Physical CHW layout.
             dshape: vec![
                 (DimName::Batch, 1),
                 (DimName::NumProtos, NM),
@@ -3225,7 +3109,7 @@ outputs:
             .build()
             .expect("YoloSegDet f16 decoder must build");
 
-        // Build identical detection payload, but as half-precision floats.
+        // The same detection payload as half-precision floats.
         let mut det_data = vec![half::f16::ZERO; FEAT * N];
         let set = |d: &mut [half::f16], r: usize, c: usize, v: f32| {
             d[r * N + c] = half::f16::from_f32(v);
@@ -3295,8 +3179,7 @@ outputs:
             }
         }
 
-        // Path 2: decode_proto() produces TensorDyn::F16 protos (native f16,
-        // no widening on the decoder side) with matching F16 mask coefficients.
+        // Path 2: decode_proto() produces F16 protos and F16 mask coefficients.
         let mut out_boxes2: Vec<DetectBox> = Vec::with_capacity(10);
         let proto = decoder
             .decode_proto(&inputs, &mut out_boxes2)
@@ -3320,7 +3203,7 @@ outputs:
 
     #[test]
     fn test_dshape_dict_format() {
-        // Spec produces array-of-single-key-dicts: [{"batch": 1}, {"num_features": 84}]
+        // Array of single-key dicts: [{"batch": 1}, {"num_features": 84}]
         let json = r#"{
             "decoder": "ultralytics",
             "shape": [1, 84, 8400],
@@ -3350,7 +3233,6 @@ outputs:
 
     #[test]
     fn test_dshape_empty_default() {
-        // When dshape is omitted entirely, default to empty vec
         let json = r#"{
             "decoder": "ultralytics",
             "shape": [1, 84, 8400]
@@ -3414,7 +3296,6 @@ outputs:
 
     #[test]
     fn test_decode_quantized_proto_returns_none_no_model() {
-        // Detection-only decoder has no segmentation model → returns Ok(None)
         let decoder = build_det_only_decoder();
         let data = vec![0i8; 84 * 8400];
         let arr = ndarray::Array3::from_shape_vec((1, 84, 8400), data).unwrap();
@@ -3429,7 +3310,6 @@ outputs:
 
     #[test]
     fn test_decode_float_proto_returns_none_no_model() {
-        // Detection-only decoder has no segmentation model → returns Ok(None)
         let decoder = build_det_only_decoder();
         let data = vec![0.0f32; 84 * 8400];
         let arr = ndarray::Array3::from_shape_vec((1, 84, 8400), data).unwrap();
@@ -3465,14 +3345,9 @@ outputs:
         assert_eq!(output_boxes.len(), 5);
 
         let result = decoder.decode_quantized_proto(&[arr.view().into()], &mut output_boxes);
-        // For det-only models, decode_proto should return Ok(None) for proto
-        // data but still decode detections (clearing stale data first).
-        // With all-zero input, no detections pass the score threshold.
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
-        // Stale data (5 items) must be cleared. The all-zero quantized input
-        // may produce a small number of detections due to dequantization
-        // (zero_point=-123 → dequant(0) ≈ 0.49 which can pass threshold).
+        // The stale entries are cleared.
         assert!(
             output_boxes.len() < 5,
             "decode_quantized_proto should clear stale data: got {} items (was 5)",
@@ -3583,9 +3458,7 @@ outputs:
         let coeffs = ndarray::Array2::from_shape_vec((1, 2), vec![40_000_u16, 41_000]).unwrap();
         let coeff_quant = Quantization::new(1e-4, 40_568);
 
-        // u16 protos stored NCHW [K=2, H=2, W=3] and viewed as [H, W, K],
-        // as a QNN `[1, 32, 160, 160]` output is. Values above 255 lose
-        // their high byte if narrowed to i8.
+        // u16 protos stored NCHW [K=2, H=2, W=3] and viewed as [H, W, K].
         let nchw: Vec<u16> = vec![
             2_383, 2_400, 3_000, 10_000, 65_535, 0, // channel 0
             100, 2_383, 60_000, 512, 256, 1_024, // channel 1
@@ -3624,7 +3497,7 @@ outputs:
             }
         }
 
-        // u8 protos with a non-zero zero point: 200 must not wrap to -56.
+        // u8 protos with a non-zero zero point.
         let protos_u8 = ndarray::Array3::from_shape_vec((1, 1, 2), vec![200_u8, 10]).unwrap();
         let proto_data = extract_proto_data_quant(
             crate::instance_mask::Isa::current_or_scalar(),
@@ -3662,7 +3535,6 @@ outputs:
         use crate::yolo::impl_yolo_segdet_quant_proto;
         use crate::{Nms, ProtoData, Quantization, XYWH};
 
-        // Load cached YOLOv8 segmentation model outputs
         let boxes_raw = edgefirst_bench::testdata::read("yolov8_boxes_116x8400.bin");
         let boxes_i8 =
             unsafe { std::slice::from_raw_parts(boxes_raw.as_ptr() as *const i8, boxes_raw.len()) };
@@ -3693,21 +3565,17 @@ outputs:
         )
         .unwrap();
 
-        // Verify detections are produced
         assert!(
             !output_boxes.is_empty(),
             "Expected detections from cached model outputs"
         );
 
-        // Verify proto data shape
         assert_eq!(
             proto_data.protos.shape(),
             &[160, 160, 32],
             "Proto shape mismatch"
         );
 
-        // Verify mask coefficients: shape [num_detections, num_protos],
-        // dtype I8 (kept raw with quantization metadata).
         assert_eq!(
             proto_data.mask_coefficients.shape(),
             &[output_boxes.len(), 32],
@@ -3718,7 +3586,6 @@ outputs:
             edgefirst_tensor::DType::I8,
             "quantized extraction keeps coefficients as raw I8"
         );
-        // Verify coefficients carry quantization metadata.
         let coeff_quant = proto_data
             .mask_coefficients
             .quantization()
@@ -3728,7 +3595,6 @@ outputs:
             "coeff quantization should be per-tensor"
         );
 
-        // Verify proto tensor is I8 (input was i8) with per-tensor quantization.
         assert_eq!(
             proto_data.protos.dtype(),
             edgefirst_tensor::DType::I8,
@@ -3741,20 +3607,7 @@ outputs:
         assert!(quant.is_per_tensor(), "quantization should be per-tensor");
     }
 
-    /// f32 sibling of `test_extract_proto_data_quant_with_cached_model`.
-    ///
-    /// Dequantizes the same cached i8 fixture to f32 using the model's
-    /// per-tensor quantization parameters, feeds it through the float
-    /// proto-extraction path, and asserts detection count + shape match the
-    /// quantized reference exactly. The dequantization is
-    /// `(v - zp) * scale` per-element; because both paths run NMS with the
-    /// same thresholds on numerically equivalent data, the surviving
-    /// detection set is identical.
-    ///
-    /// Regression anchor: any refactor that silently alters the f32 decode
-    /// path (e.g. the planned `ProtoData` → `TensorDyn` migration) fails
-    /// the count / shape / coefficient-length assertions before any
-    /// downstream mask materialization is touched.
+    /// f32 sibling of `test_extract_proto_data_quant_with_cached_model`: matches the quantized reference.
     #[test]
     fn test_extract_proto_data_float_with_cached_model() {
         use crate::yolo::{impl_yolo_segdet_float_proto, impl_yolo_segdet_quant_proto};
@@ -3774,7 +3627,7 @@ outputs:
         let quant_boxes = Quantization::new(0.019_484_945, 20);
         let quant_protos = Quantization::new(0.020_889_873, -115);
 
-        // First: run the quantized reference to establish ground truth.
+        // The quantized reference.
         let mut ref_boxes = Vec::with_capacity(50);
         let _ref_proto: ProtoData = impl_yolo_segdet_quant_proto::<XYWH, _, _>(
             (boxes.view(), quant_boxes),
@@ -3795,7 +3648,7 @@ outputs:
             "reference (quant) decode produced no detections — fixture broken"
         );
 
-        // Now dequantize to f32 and run the float path.
+        // Dequantize to f32 and run the float path.
         let boxes_f32 =
             boxes.mapv(|v| (v as f32 - quant_boxes.zero_point as f32) * quant_boxes.scale);
         let protos_f32 =
@@ -3812,12 +3665,11 @@ outputs:
             300,
             None,
             None,
-            false, // multi_label: argmax for this parity test
+            false, // multi_label
             &mut output_boxes,
         )
         .unwrap();
 
-        // Same detection count as the quantized reference.
         assert_eq!(
             output_boxes.len(),
             ref_boxes.len(),
@@ -3826,23 +3678,19 @@ outputs:
             ref_boxes.len()
         );
 
-        // Shape + coefficient-count invariants.
         assert_eq!(proto_data.protos.shape(), &[160, 160, 32]);
         assert_eq!(
             proto_data.mask_coefficients.shape(),
             &[output_boxes.len(), 32]
         );
 
-        // f32 input → TensorDyn::F32 protos + coefficients (dtype matches).
         assert_eq!(proto_data.protos.dtype(), edgefirst_tensor::DType::F32);
         assert_eq!(
             proto_data.mask_coefficients.dtype(),
             edgefirst_tensor::DType::F32
         );
 
-        // Per-detection box-centre correspondence vs. quantized reference.
-        // Order is preserved by NMS (both sorted by score desc), so we can
-        // zip directly.
+        // Box centres match the quantized reference, detection by detection.
         for (i, (q, f)) in ref_boxes.iter().zip(output_boxes.iter()).enumerate() {
             let dcx = ((q.bbox.xmin + q.bbox.xmax) - (f.bbox.xmin + f.bbox.xmax)).abs() * 0.5;
             let dcy = ((q.bbox.ymin + q.bbox.ymax) - (f.bbox.ymin + f.bbox.ymax)).abs() * 0.5;
@@ -3854,16 +3702,7 @@ outputs:
         }
     }
 
-    /// f16 sibling — same fixture as the f32 test, but coefficients and
-    /// protos are narrowed from f32 to f16 before feeding the float decode
-    /// path. f16 has a 10-bit mantissa so scores near the NMS threshold can
-    /// flip, and post-NMS detection count may differ by ±2 from the
-    /// reference. The invariants we assert are:
-    ///
-    ///   - detection count within ±20% of the quantized reference,
-    ///   - per-detection bbox centre drift < 5e-3 for the intersection set,
-    ///   - coefficient tensor length equals `num_protos`,
-    ///   - `ProtoTensor::Float16` variant is returned.
+    /// f16 sibling: detection count, box centres and dtypes stay close to the quantized reference.
     #[test]
     fn test_extract_proto_data_f16_with_cached_model() {
         use crate::yolo::{impl_yolo_segdet_float_proto, impl_yolo_segdet_quant_proto};
@@ -3920,14 +3759,12 @@ outputs:
             300,
             None,
             None,
-            false, // multi_label: argmax for this parity test
+            false, // multi_label
             &mut output_boxes,
         )
         .unwrap();
 
-        // Detection count within ±20% of quantized reference. Tolerance set
-        // generously because scores near the 0.45 threshold can flip with
-        // f16's 10-bit mantissa.
+        // Detection count within ±20% of the quantized reference.
         let ref_n = ref_boxes.len();
         let got_n = output_boxes.len();
         assert!(got_n > 0, "f16 path produced zero detections");
@@ -3937,23 +3774,19 @@ outputs:
             "f16 detection count {got_n} diverged from quant reference {ref_n} by > {tol} (20%)"
         );
 
-        // Proto shape + coefficient shape intact.
         assert_eq!(proto_data.protos.shape(), &[160, 160, 32]);
         assert_eq!(
             proto_data.mask_coefficients.shape(),
             &[output_boxes.len(), 32]
         );
 
-        // f16 input → TensorDyn::F16 for BOTH protos and coefficients
-        // (native f16 preserved end-to-end — no widening on the decoder side).
         assert_eq!(proto_data.protos.dtype(), edgefirst_tensor::DType::F16);
         assert_eq!(
             proto_data.mask_coefficients.dtype(),
             edgefirst_tensor::DType::F16
         );
 
-        // Centre-drift on the first min(ref_n, got_n) detections. Order is
-        // preserved by NMS when scores don't cross the threshold.
+        // Centre drift on the first min(ref_n, got_n) detections.
         let n = ref_boxes.len().min(output_boxes.len());
         for (i, (q, f)) in ref_boxes
             .iter()
@@ -4206,8 +4039,7 @@ outputs:
             .build()
             .unwrap();
 
-        // Use the reference yolov8s detection output, but strip mask_coefs
-        // (pretend they come from a separate tensor). Detection = [1,84,8400].
+        // The reference yolov8s detection output, [1,84,8400].
         let out = edgefirst_bench::testdata::read("yolov8s_80_classes.bin");
         let out = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const i8, out.len()) };
 
@@ -4217,8 +4049,7 @@ outputs:
         crate::dequantize_cpu(out, quant, &mut out_f64);
         let det_arr = ndarray::Array3::from_shape_vec((1, 84, 8400), out_f64).unwrap();
 
-        // Create synthetic mask_coefs [1,32,8400] and protos [1,160,160,32]
-        // (all zeros — no real masks, but the decode path should not crash)
+        // Synthetic all-zero mask_coefs [1,32,8400] and protos [1,160,160,32].
         let mask_coefs = ndarray::Array3::<f64>::zeros((1, 32, 8400));
         let protos = ndarray::Array4::<f64>::zeros((1, 160, 160, 32));
 
@@ -4233,7 +4064,6 @@ outputs:
         let mut output_masks = Vec::with_capacity(100);
         let result = decoder.decode_float(&outputs, &mut output_boxes, &mut output_masks);
         assert!(result.is_ok(), "decode_float failed: {result:?}");
-        // Should detect boxes (same as reference yolov8s test)
         assert!(!output_boxes.is_empty(), "Expected detections");
     }
 
@@ -4247,8 +4077,6 @@ outputs:
 
         #[test]
         fn with_schema_flat_v2_builds() {
-            // A flat v2 schema (no children) should build a decoder
-            // identical to the v1 path.
             let j = r#"{
               "schema_version": 2,
               "decoder_version": "yolov8",
@@ -4282,8 +4110,6 @@ outputs:
 
         #[test]
         fn with_schema_v1_yaml_via_shim_builds() {
-            // Legacy v1 testdata parsed through the v2 shim and fed to
-            // the new builder should produce a working decoder.
             let yaml = edgefirst_bench::testdata::read_to_string("yolov8_seg.yaml");
             let schema = SchemaV2::parse_yaml(&yaml).unwrap();
             let decoder = DecoderBuilder::new().with_schema(schema).build().unwrap();
@@ -4359,8 +4185,7 @@ outputs:
             assert!(matches!(err, DecoderError::NotSupported(_)));
         }
 
-        /// Construct a TensorDyn with the given values. Helper for the
-        /// end-to-end decode test below.
+        /// Construct a TensorDyn with the given values.
         fn make_i16(shape: &[usize], values: &[i16]) -> edgefirst_tensor::TensorDyn {
             use edgefirst_tensor::{Tensor, TensorMapTrait, TensorMemory, TensorTrait};
             let t = Tensor::<i16>::new(shape, Some(TensorMemory::Mem), None).unwrap();
@@ -4381,11 +4206,6 @@ outputs:
 
         #[test]
         fn with_schema_split_decode_end_to_end() {
-            // End-to-end: build a decoder from a v2 schema with a
-            // channel-sub-split boxes output, run `decode` on synthetic
-            // tensors, and verify at least one detection survives NMS
-            // given a single-anchor high score.
-            //
             // Boxes: xy [1,2,3] i16 + wh [1,2,3] i16 → logical [1,4,3]
             // Scores: [1,2,3] i8
             let j = r#"{
@@ -4458,8 +4278,7 @@ outputs:
 
             let inputs: Vec<&edgefirst_tensor::TensorDyn> = vec![&xy, &wh, &scores];
 
-            // Verify merged tensors first (split from decode so we can
-            // isolate merge correctness from kernel correctness).
+            // The merged tensors.
             let prog = decoder.decode_program.as_ref().unwrap();
             let merged = prog.execute(&inputs).unwrap();
             assert_eq!(merged.len(), 2);
@@ -4479,8 +4298,6 @@ outputs:
                 merged_scores[[0, 0, 0]]
             );
 
-            // NOTE: impl_yolo_split_float caps output to the caller's
-            // vector capacity; a zero-capacity vec drops all boxes.
             let mut boxes = Vec::with_capacity(16);
             let mut masks = Vec::with_capacity(0);
             decoder
@@ -4488,7 +4305,6 @@ outputs:
                 .expect("decode failed");
             assert_eq!(boxes.len(), 1, "expected exactly one surviving anchor");
             let b = &boxes[0];
-            // label 0, score ~1.0
             assert_eq!(b.label, 0);
             assert!(b.score > 0.9, "score {:?} should be near 1.0", b.score);
             // xywh(0.4, 0.4, 0.2, 0.2) → xyxy(0.3, 0.3, 0.5, 0.5)
@@ -4509,8 +4325,6 @@ outputs:
                 .with_score_threshold(0.25)
                 .build()
                 .expect("ARA-2 int8 DVM should build");
-            // ARA-2 has a split boxes logical, so a merge program must be
-            // attached.
             assert!(
                 decoder.decode_program.is_some(),
                 "ARA-2 int8 DVM should produce a DecodeProgram (split boxes)"
@@ -4519,12 +4333,7 @@ outputs:
             assert_eq!(decoder.nms, Some(crate::configs::Nms::ClassAgnostic));
         }
 
-        /// Smoke test: build an ARA-2 decoder from the real DVM metadata
-        /// and run `decode` against zero-filled synthetic tensors. The
-        /// test verifies the whole pipeline (parse → validate → plan →
-        /// dequant → merge → dispatch → NMS) executes without panicking,
-        /// which shakes out shape/layout/merge bugs that would otherwise
-        /// only surface on real hardware.
+        /// An ARA-2 decoder built from the DVM metadata decodes zero-filled tensors without error.
         #[test]
         fn with_schema_real_ara2_int8_dvm_decode_smoke() {
             use edgefirst_tensor::{Tensor, TensorDyn, TensorMemory, TensorTrait};
@@ -4548,8 +4357,7 @@ outputs:
                 t.into()
             }
 
-            // Shapes copied from the real edgefirst.json so binding by
-            // shape succeeds.
+            // The shapes of the fixture's outputs.
             let xy = zero_tensor_i8(&[1, 2, 8400, 1]);
             let wh = zero_tensor_i8(&[1, 2, 8400, 1]);
             let scores = zero_tensor_u8(&[1, 80, 8400, 1]);
@@ -4559,10 +4367,6 @@ outputs:
 
             let mut boxes = Vec::with_capacity(16);
             let mut masks = Vec::with_capacity(16);
-            // All-zero quantized inputs produce near-zero dequantized
-            // scores (well under the 0.25 threshold), so the decoder
-            // should complete with no detections — but the pipeline
-            // itself must not panic.
             decoder
                 .decode(&inputs, &mut boxes, &mut masks)
                 .expect("ARA-2 int8 decode on zero tensors");
@@ -4591,10 +4395,8 @@ outputs:
 
         #[test]
         fn with_schema_split_creates_decode_program() {
-            // Channel sub-split boxes (ARA-2 style): logical boxes with
-            // two children of shapes [1,3,3] + [1,1,3] → logical [1,4,3].
-            // Scores remain flat with shape matching split detection
-            // convention.
+            // Channel sub-split boxes: two children of shapes [1,3,3] + [1,1,3] →
+            // logical [1,4,3]. Scores are flat.
             let j = r#"{
               "schema_version": 2,
               "decoder_version": "yolov8",
@@ -4632,17 +4434,11 @@ outputs:
         }
 
         // =====================================================================
-        // `with_config_json_str` v2 auto-detect tests (the path used by the
-        // Python `Decoder.new_from_json_str` static constructor).
+        // `with_config_json_str` v2 auto-detect tests
         // =====================================================================
 
         #[test]
         fn json_str_v2_ara2_int16_builds() {
-            // Real ARA-2 int16 metadata fed through the JSON-string path
-            // must produce the same merge program the schema path
-            // produces. This is the validator's target API: pass the raw
-            // edgefirst.json string, get a decoder that handles the
-            // xy/wh sub-split natively.
             let json = edgefirst_bench::testdata::read_to_string("ara2_int16_edgefirst.json");
             let decoder = DecoderBuilder::new()
                 .with_config_json_str(json.to_string())
@@ -4669,8 +4465,6 @@ outputs:
 
         #[test]
         fn json_str_v1_legacy_still_builds() {
-            // Legacy v1 JSON must continue to build via the same path
-            // (the auto-detect must not regress v1 callers).
             let json = edgefirst_bench::testdata::read_to_string("modelpack_split.json");
             let decoder = DecoderBuilder::new()
                 .with_config_json_str(json.to_string())
@@ -4684,9 +4478,6 @@ outputs:
 
         #[test]
         fn json_str_v2_future_version_rejected() {
-            // schema_version above MAX_SUPPORTED_SCHEMA_VERSION must
-            // surface as DecoderError::NotSupported rather than a serde
-            // error, so callers get a useful upgrade message.
             let json = r#"{"schema_version": 99, "outputs": []}"#;
             let err = DecoderBuilder::new()
                 .with_config_json_str(json.to_string())
@@ -4700,17 +4491,8 @@ outputs:
 
         #[test]
         fn with_schema_real_hailo_yolov8seg_builds_and_reports_dfl_reg_max() {
-            // Schema-level e2e: parse the canonical Hailo YOLOv8-seg
-            // fixture (strides 8/16/32, DFL boxes, sigmoid-applied
-            // scores, mask coefficients per-scale, NHWC protos), build
-            // a decoder, and confirm:
-            //   * the per-scale fast path is attached (split schema)
-            //   * `normalized_boxes() == Some(true)`: HAILORT emits
-            //     pixel-space coords, but the per-scale path normalizes
-            //     internally using the schema's input_dims — the public
-            //     accessor reports the post-decode state
-            //   * the DFL reg_max extracted from the per-scale plan == 16
-            //     (= 64 feature channels ÷ 4)
+            // The Hailo YOLOv8-seg fixture: strides 8/16/32, DFL boxes, per-scale
+            // mask coefficients, NHWC protos.
             let json = edgefirst_bench::testdata::read_to_string("hailo_yolov8seg_edgefirst.json");
             let schema = SchemaV2::parse_json(&json).unwrap();
             schema.validate().unwrap();
@@ -4738,15 +4520,6 @@ outputs:
                 "reg_max must be 16 (64 feature channels ÷ 4)"
             );
         }
-
-        // NOTE: the former `hailo_yolov8seg_uniform_uint8_128_dfl_decode_parity`
-        // test exercised DFL decode through the legacy schema-v2 merge path
-        // (`decode_program.execute`). That path has been removed; the
-        // equivalent (and broader) numerical parity for the live per-scale
-        // path is covered by `tests/per_scale_parity.rs`
-        // (`parity_yolov8n_seg_per_scale_int8`, the analytic `xc=4` anchor
-        // assertions, and the yolov8n/yolo11n/yolo26n end-to-end + pre-NMS
-        // parity cases).
     }
 
     // =========================================================================
@@ -4758,10 +4531,6 @@ outputs:
 
         #[test]
         fn mask_coefs_is_primary_spelling() {
-            // v2 spec vocabulary uses `mask_coefs`. The legacy ConfigOutput
-            // enum must accept it so that any consumer re-serialising through
-            // the legacy path (or feeding a v2-vocabulary dict into the
-            // legacy deserialiser) stays compatible.
             let j = r#"{"type": "mask_coefs", "shape": [1, 32, 8400]}"#;
             let parsed: ConfigOutput = serde_json::from_str(j).unwrap();
             assert!(matches!(parsed, ConfigOutput::MaskCoefficients(_)));
@@ -4769,18 +4538,13 @@ outputs:
 
         #[test]
         fn mask_coefficients_alias_still_accepted() {
-            // Legacy v1 spelling — required for backward compatibility with
-            // models already trained and stored before the v2 vocabulary
-            // landed.
             let j = r#"{"type": "mask_coefficients", "shape": [1, 32, 8400]}"#;
             let parsed: ConfigOutput = serde_json::from_str(j).unwrap();
             assert!(matches!(parsed, ConfigOutput::MaskCoefficients(_)));
         }
     }
 
-    /// Verify that a transposed `[K, H, W]` proto array (viewed as `[H, W, K]`
-    /// via `permuted_axes`) is detected as NCHW layout and copied correctly
-    /// without transposing.
+    /// A `[K, H, W]` proto array viewed as `[H, W, K]` is detected as NCHW and copied without transposing.
     #[test]
     fn test_extract_proto_nchw_layout_detection() {
         use crate::yolo::impl_yolo_segdet_quant_proto;
@@ -4797,13 +4561,10 @@ outputs:
         let protos_i8 = unsafe {
             std::slice::from_raw_parts(protos_raw.as_ptr() as *const i8, protos_raw.len())
         };
-        // Create as [K, H, W] physical layout, then permute axes to [H, W, K].
-        // This mimics what DMA-BUF model outputs look like when the model
-        // produces NCHW protos that are axis-swapped at the ndarray level.
         let protos_nchw = ndarray::Array3::from_shape_vec((k, h, w), protos_i8.to_vec()).unwrap();
         let protos_hwk = protos_nchw.view().permuted_axes([1, 2, 0]);
 
-        // Verify the strides match our NCHW detection pattern [w, 1, h*w].
+        // The strides are the NCHW pattern [w, 1, h*w].
         assert_eq!(
             protos_hwk.strides(),
             &[w as isize, 1, (h * w) as isize],
@@ -4829,27 +4590,23 @@ outputs:
         )
         .unwrap();
 
-        // NCHW layout should be detected.
         assert_eq!(
             proto_data.layout,
             ProtoLayout::Nchw,
             "Expected NCHW layout detection for transposed view"
         );
 
-        // Proto tensor shape should be [K, H, W] (NCHW).
         assert_eq!(
             proto_data.protos.shape(),
             &[k, h, w],
             "NCHW proto shape should be [K, H, W]"
         );
 
-        // Verify detections still produced (same model data).
         assert!(
             !output_boxes.is_empty(),
             "Expected detections from NCHW proto path"
         );
 
-        // Verify mask coefficients shape.
         assert_eq!(
             proto_data.mask_coefficients.shape(),
             &[output_boxes.len(), k],
@@ -4861,14 +4618,12 @@ outputs:
         use crate::yolo::impl_yolo_segdet_quant_proto;
         use crate::{Nms, ProtoLayout, Quantization, XYWH};
 
-        // Use a very high score threshold so no detections survive NMS.
-        // The proto layout should still be correctly detected as NCHW.
         let boxes_raw = edgefirst_bench::testdata::read("yolov8_boxes_116x8400.bin");
         let boxes_i8 =
             unsafe { std::slice::from_raw_parts(boxes_raw.as_ptr() as *const i8, boxes_raw.len()) };
         let boxes = ndarray::Array2::from_shape_vec((116, 8400), boxes_i8.to_vec()).unwrap();
 
-        // Create NCHW protos (same as the non-zero-det test).
+        // NCHW protos.
         let (k, h, w) = (32, 160, 160);
         let protos_raw = edgefirst_bench::testdata::read("yolov8_protos_160x160x32.bin");
         let protos_i8 = unsafe {
@@ -4881,8 +4636,7 @@ outputs:
         let quant_protos = Quantization::new(0.020_889_873, -115);
 
         let mut output_boxes = Vec::with_capacity(50);
-        // score_threshold = 10.0 guarantees no detections survive (max dequantized
-        // i8 score ≈ 2.0 with scale=0.019, zp=20).
+        // A score threshold of 10.0 leaves no detections.
         let proto_data = impl_yolo_segdet_quant_proto::<XYWH, _, _>(
             (boxes.view(), quant_boxes),
             (protos_hwk, quant_protos),
@@ -4898,27 +4652,23 @@ outputs:
         )
         .unwrap();
 
-        // Zero detections should result.
         assert!(
             output_boxes.is_empty(),
             "score_threshold=1.0 should yield zero detections"
         );
 
-        // NCHW layout should STILL be detected from the proto strides.
         assert_eq!(
             proto_data.layout,
             ProtoLayout::Nchw,
             "Zero-det path should detect NCHW layout from proto strides"
         );
 
-        // Proto tensor shape should be [K, H, W] (NCHW).
         assert_eq!(
             proto_data.protos.shape(),
             &[k, h, w],
             "Zero-det NCHW proto shape should be [K, H, W]"
         );
 
-        // Mask coefficients should have zero rows.
         assert_eq!(
             proto_data.mask_coefficients.shape(),
             &[0, k],
@@ -5038,10 +4788,7 @@ mod per_scale_prefilter_tests {
         )
     }
 
-    /// Prefiltered decode returns exactly the dense decode's detections and
-    /// mask coefficients, while decoding only a fraction of the anchors.
-    /// Ten classes leave most packed score slices off a NEON chunk
-    /// boundary, which is where an unpacked decode would round differently.
+    /// Prefiltered decode returns the dense decode's detections and mask coefficients.
     #[test]
     fn prefiltered_decode_matches_dense_decode() {
         for (schema_file, nc) in [
@@ -5084,8 +4831,7 @@ mod per_scale_prefilter_tests {
         }
     }
 
-    /// The decode dtype covers boxes and scores only: an f16 decoder's mask
-    /// coefficients and protos are the f32 decoder's, bit for bit.
+    /// f16 outputs widen into the decoder's scratch, which later frames reuse without reallocating.
     #[test]
     fn f16_decode_keeps_mask_data_in_f32() {
         let json =
@@ -5119,10 +4865,7 @@ mod per_scale_prefilter_tests {
         assert!(f16_protos == f32_protos, "protos differ");
     }
 
-    /// Levels whose anchor count is not a whole number of packs, such as
-    /// a 960x544 input's 60x34 and 30x17 grids and a 3x3 grid smaller than
-    /// one pack, still take the prefilter and decode exactly the dense
-    /// decode's detections and mask coefficients.
+    /// Levels whose anchor count is not a whole number of packs decode as the dense decode does.
     #[test]
     fn prefiltered_decode_matches_dense_decode_on_unaligned_levels() {
         use crate::per_scale::prefilter::PACK_ANCHORS;
@@ -5186,9 +4929,7 @@ mod per_scale_prefilter_tests {
         }
     }
 
-    /// The dense decode cuts levels into pieces by the rayon thread count;
-    /// every count decodes the same bits, including a single thread, which
-    /// takes no rayon pool at all.
+    /// The dense decode yields the same bits on every rayon thread count, including one.
     #[test]
     fn dense_decode_is_the_same_on_any_thread_count() {
         for schema_file in [
@@ -5257,8 +4998,7 @@ mod per_scale_prefilter_tests {
         assert!(boxes.is_empty());
     }
 
-    /// A box tensor not declared CPU-readable is refused even when no anchor
-    /// survives the prefilter to read it, matching the dense decode.
+    /// A box tensor not declared CPU-readable is refused even when no anchor survives the prefilter.
     #[test]
     fn prefilter_refuses_unreadable_boxes_without_survivors() {
         let json =
@@ -5376,9 +5116,7 @@ mod per_scale_prefilter_tests {
         serde_json::from_value(v).unwrap()
     }
 
-    /// Scores whose kernel output rounds up across the threshold, through
-    /// F16 output or near the ends of the sigmoid, pass in the dense decode
-    /// and so must survive the prefilter too.
+    /// Scores whose kernel output rounds up across the threshold survive the prefilter.
     #[test]
     fn prefilter_keeps_scores_rounded_up_to_the_threshold() {
         let json =

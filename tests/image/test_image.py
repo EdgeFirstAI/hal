@@ -45,9 +45,7 @@ def calculate_similarity_rms_u8(imageA, imageB) -> float:
     return 1.0 - rms
 
 
-# Maximum source tensor dimensions — oversized to exercise strided decode.
-# Used by decode-specific tests where pixel comparison goes through
-# normalize_to_numpy at the decoded sub-region size.
+# Maximum source tensor dimensions for the decode tests.
 MAX_SRC_W, MAX_SRC_H = 1920, 1080
 
 
@@ -58,14 +56,8 @@ def _image_size(path):
 
 
 def test_flip(monkeypatch):
-    # This test's oracle is PIL's exact JPEG decode, so it opts into
-    # colorimetry-exact conversion. The default ColorimetryMode is Fast
-    # (issue #106): on Vivante it routes every NV12 colorimetry through the
-    # external sampler's fixed conversion (~12x faster), which lands ~0.965
-    # against this oracle.
     monkeypatch.setenv("EDGEFIRST_COLORIMETRY", "exact")
     w, h = _image_size("testdata/zidane.jpg")
-    # JPEG decodes to its native NV12; convert downstream produces RGBA.
     src = Tensor.image(w, h, format=PixelFormat.Nv12, access="readwrite")
     decode_file_into(src, "testdata/zidane.jpg")
     converter = ImageProcessor()
@@ -78,9 +70,6 @@ def test_flip(monkeypatch):
     expected = load_image("testdata/zidane.jpg", "RGB")
     expected = expected[:, ::-1, :]
 
-    # Decode produces native NV12 tagged JFIF (BT.601 full-range); convert()
-    # honors it, matching PIL's direct JPEG RGB decode. Only 4:2:0 chroma
-    # downsampling differs, so 0.98 holds.
     assert calculate_similarity_rms_u8(n, expected) > 0.98
 
 
@@ -88,14 +77,12 @@ def test_grey_load():
     w, h = _image_size("testdata/grey.jpg")
     converter = ImageProcessor()
 
-    # A greyscale JPEG decodes to its native Grey format.
     grey_ = Tensor.image(w, h, format=PixelFormat.Grey, access="readwrite")
     info = decode_file_into(grey_, "testdata/grey.jpg")
     assert info.format == PixelFormat.Grey
     grey = np.zeros((h, w, 1), dtype=np.uint8)
     grey_.normalize_to_numpy(grey)
 
-    # RGBA / RGB variants are obtained by converting the native Grey image.
     rgba_ = converter.create_image(w, h, PixelFormat.Rgba, access="readwrite")
     converter.convert(grey_, rgba_)
     rgba = np.zeros((h, w, 4), dtype=np.uint8)
@@ -131,7 +118,6 @@ def test_normalize():
 def test_render():
     w, h = _image_size("testdata/giraffe.jpg")
     converter = ImageProcessor()
-    # Decode the JPEG to its native NV12, then convert to an RGBA background.
     bg_native = Tensor.image(w, h, format=PixelFormat.Nv12, access="readwrite")
     decode_file_into(bg_native, "testdata/giraffe.jpg")
     bg = Tensor.image(w, h, format=PixelFormat.Rgba, access="readwrite")
@@ -153,10 +139,6 @@ def test_render():
     expected_cpu = load_image("testdata/output_render_cpu.jpg", "RGBA")
     with dst.map() as m:
         img = np.asarray(m.numpy())
-        # Threshold 0.95: GPU smoothstep anti-aliasing at mask edges produces
-        # small differences across platforms (x86 Mesa vs Vivante GC7000UL),
-        # and the background now arrives via an NV12->RGBA conversion that
-        # differs slightly from the reference renders' direct-RGBA decode.
         assert (
             calculate_similarity_rms_u8(img, expected_gl) > 0.95
             or calculate_similarity_rms_u8(img, expected_cpu) > 0.95
@@ -209,7 +191,6 @@ def test_box_colour_alpha():
 
 
 def test_rgb_resize(monkeypatch):
-    # PIL-exact oracle → opt into colorimetry-exact (see test_flip).
     monkeypatch.setenv("EDGEFIRST_COLORIMETRY", "exact")
     w, h = _image_size("testdata/zidane.jpg")
     src = Tensor.image(w, h, format=PixelFormat.Nv12, access="readwrite")
@@ -220,7 +201,6 @@ def test_rgb_resize(monkeypatch):
     with dst.map() as m:
         n = np.asarray(m.numpy())
         expected = load_image("testdata/zidane.jpg", "RGBA", resize=(640, 640))
-        # JFIF (BT.601 full) NV12->RGB matches PIL's JPEG decode; 0.98 holds.
         assert calculate_similarity_rms_u8(n, expected) > 0.98
 
 
@@ -256,22 +236,17 @@ def test_interpolation(monkeypatch):
 
 
 def test_rgba_to_rgb(monkeypatch):
-    # PIL-exact oracle → opt into colorimetry-exact (see test_flip).
     monkeypatch.setenv("EDGEFIRST_COLORIMETRY", "exact")
     w, h = _image_size("testdata/zidane.jpg")
-    # Decode the JPEG to native NV12, then convert to RGB (3-channel) output.
     src = Tensor.image(w, h, format=PixelFormat.Nv12, access="readwrite")
     decode_file_into(src, "testdata/zidane.jpg")
     converter = ImageProcessor()
     dst = converter.create_image(w, h, PixelFormat.Rgb, access="readwrite")
-    # Whole-image convert (the former Rect(0,0,w,h) was a no-op crop; the
-    # destination shape is the placement and `source=None` samples the whole src).
     converter.convert(src, dst, Rotation.Rotate0, Flip.NoFlip)
 
     with dst.map() as m:
         n = np.asarray(m.numpy())
         expected = load_image("testdata/zidane.jpg", "RGB")
-        # JFIF (BT.601 full) NV12->RGB matches PIL's JPEG decode; 0.98 holds.
         assert calculate_similarity_rms_u8(n, expected) > 0.98
 
 
@@ -284,16 +259,13 @@ def test_rgba_to_rgb(monkeypatch):
     ids=["nv16_422", "nv24_444"],
 )
 def test_decode_native_nv16_nv24(fixture, fmt):
-    """The Python surface exposes NV16 (4:2:2) and NV24 (4:4:4): the decoder
-    selects the matching native format from the JPEG subsampling, and the
-    semi-planar source converts to RGB through the same path as NV12."""
+    """The decoder selects NV16 or NV24 from the JPEG subsampling."""
     if not os.path.exists(fixture):
         pytest.skip(f"{fixture} fixture missing")
     w, h = _image_size(fixture)
     src = Tensor.image(w, h, format=fmt, access="readwrite")
     assert src.format == fmt
     info = decode_file_into(src, fixture)
-    # The decoder reports (and configures) the native semi-planar format.
     assert info.format == fmt
     assert (info.width, info.height) == (w, h)
 
@@ -303,7 +275,6 @@ def test_decode_native_nv16_nv24(fixture, fmt):
     n = np.zeros((h, w, 3), dtype=np.uint8)
     dst.normalize_to_numpy(n)
     expected = load_image(fixture, "RGB")
-    # 0.95: same BT.601-full-vs-PIL tolerance as the NV12 conversions.
     assert calculate_similarity_rms_u8(n, expected) > 0.95
 
 
@@ -318,20 +289,7 @@ def test_decode_native_nv16_nv24(fixture, fmt):
     ids=["nv12_420", "nv16_422", "nv24_444", "grey"],
 )
 def test_decode_native_odd_dimensions(fixture, fmt):
-    """Real-world COCO JPEGs with ODD dimensions, one per native decode output:
-    4:2:0->NV12, 4:2:2->NV16, 4:4:4->NV24, greyscale->Grey. Each is decoded to
-    its native format and converted to RGB on whichever backend the lane
-    provides — CPU on headless x86_64, G2D/GL on i.MX8MP, ANGLE GL on macOS — so
-    the odd-stride chroma layout is exercised end-to-end on both CPU and GPU.
-
-    Odd dimensions stress the stride math: an odd width rounds the buffer up to
-    even(width) then 64-byte alignment (so chroma columns stay byte-aligned and
-    the GPU DMA pitch is valid), while NV12/NV24 chroma row counts use ceil(H/2)
-    and 2*H of an odd height.
-
-    The 4:2:2 fixture is the only synthesized one: COCO has no native 4:2:2
-    JPEGs, so it is re-encoded from a real COCO photo at its native odd size.
-    """
+    """Odd-dimension JPEGs decode to their native format and convert to RGB."""
     if not os.path.exists(fixture):
         pytest.skip(f"{fixture} fixture missing")
     w, h = _image_size(fixture)
@@ -340,30 +298,21 @@ def test_decode_native_odd_dimensions(fixture, fmt):
     src = Tensor.image(w, h, format=fmt, access="readwrite")
     assert src.format == fmt
     info = decode_file_into(src, fixture)
-    # The decoder selects + configures the native format and keeps the true
-    # (odd) logical dimensions — no even-rounding leaks into the reported size.
     assert info.format == fmt
     assert (info.width, info.height) == (w, h)
 
     converter = ImageProcessor()
     dst = converter.create_image(w, h, PixelFormat.Rgb, access="readwrite")
     converter.convert(src, dst)
-    # normalize_to_numpy honours the destination's (possibly padded) row stride,
-    # which a flat reshape would not for odd widths.
     n = np.zeros((h, w, 3), dtype=np.uint8)
     dst.normalize_to_numpy(n)
     expected = load_image(fixture, "RGB")
-    # GREY has no YUV colorimetry ambiguity (Grey→RGB = replicate luma), so a
-    # tighter tolerance is appropriate. All other formats use 0.95 to cover
-    # BT.601-full-vs-PIL divergence across CPU / ANGLE GL / Vivante GL backends.
     threshold = 0.98 if fmt == PixelFormat.Grey else 0.95
     assert calculate_similarity_rms_u8(n, expected) > threshold
 
 
 def test_set_output_format_fused_rgb():
-    """set_output_format(PixelFormat.Rgb) fuses colour conversion into the
-    JPEG MCU write stage for a 4:4:4 source; the decoder reports Rgb
-    directly instead of the native Nv24, and pixels match PIL's decode."""
+    """set_output_format(PixelFormat.Rgb) makes a 4:4:4 JPEG decode report Rgb."""
     import edgefirst.codec as hal
 
     fixture = "testdata/zidane_444.jpg"
@@ -379,17 +328,13 @@ def test_set_output_format_fused_rgb():
         n = np.zeros((h, w, 3), dtype=np.uint8)
         src.normalize_to_numpy(n)
         expected = load_image(fixture, "RGB")
-        # Same BT.601-full-vs-PIL tolerance as the other native-decode oracles.
         assert calculate_similarity_rms_u8(n, expected) > 0.95
     finally:
         hal.set_output_format(None)
 
 
 def test_set_dct_method_fast_decodes():
-    """set_dct_method(DctMethod.Fast) selects the AAN ifast kernel; decode
-    still succeeds and reports the same native format and dimensions as the
-    default Accurate kernel (accuracy is measured on-target, see
-    CHANGELOG.md)."""
+    """set_dct_method(DctMethod.Fast) decodes to the same format and dimensions."""
     import edgefirst.codec as hal
 
     w, h = _image_size("testdata/zidane.jpg")
@@ -404,39 +349,19 @@ def test_set_dct_method_fast_decodes():
 
 
 def test_is_v4l2_available_returns_bool():
-    """is_v4l2_available() must be callable and return a bool (True or False)."""
+    """is_v4l2_available() returns a bool."""
     import edgefirst.codec as hal
 
     assert isinstance(hal.is_v4l2_available(), bool)
 
 
 # ---------------------------------------------------------------------------
-# Strided zero-copy + DMA buffer-protocol tests.
-#
-# A DMA / GPU image tensor is allocated with a 64-byte-aligned row pitch, so
-# whenever `width * channels` is not already 64-aligned the backing buffer is
-# ROW-PADDED: `row_stride > width * channels`. `map()` exposes the full padded
-# buffer, so any consumer that assumes a tight `width*channels`-per-row layout
-# reads every row after the first at the wrong offset (a progressive shear).
-# These cells prove both the read (buffer protocol + normalize_to_numpy) and
-# write (from_numpy) paths honour the physical pitch, zero-copy onto the DMA-BUF.
-#
-# On platforms without a DMA heap (headless x86 CI) the allocation falls back /
-# is unavailable and the cells skip — the padded pitch only arises on DMA.
+# Strided zero-copy and DMA buffer-protocol tests.
 # ---------------------------------------------------------------------------
 
 
 def _skip_unless_pitch_is_padded_and_aligned(t, tight_row_bytes):
-    """Skip unless this adapter gave the tensor a 64-byte-aligned padded row.
-
-    The padded-pitch tests exist to prove the strided buffer protocol, which
-    needs a pitch wider than the tight row to prove anything. Whether one is
-    produced is the adapter's choice, not the HAL's: at 595 columns the RTX
-    3070 pads rgba8 to 2432 and mono8 to 640, while WARP hands back 2380
-    (tight) and 596 (even-rounded, not 64-aligned). Neither is a defect, so
-    an adapter that does not pad to a 64-byte multiple skips rather than
-    fails; the padded path is exercised on adapters that pad.
-    """
+    """Skip unless this adapter gave the tensor a 64-byte-aligned padded row."""
     if t.row_stride == tight_row_bytes or t.row_stride % 64 != 0:
         pytest.skip(
             f"this adapter returns a {t.row_stride}-byte pitch for a "
@@ -466,15 +391,8 @@ def _dma_image_or_skip(w, h, fmt):
     ids=["rgb", "rgba", "grey"],
 )
 def test_dma_padded_buffer_protocol_zero_copy(fmt, channels):
-    """A padded-pitch DMA image tensor exposes a *strided* (not sheared
-    contiguous) buffer via the Python buffer protocol.
-
-    End-to-end: write a known gradient with `from_numpy` (stride-aware write),
-    read it back through `memoryview` / `np.asarray` (stride-aware read), then
-    mutate through the live mapping and confirm the change is visible on a fresh
-    map — i.e. the view is zero-copy onto the DMA-BUF, not a private copy.
-    """
-    w, h = 595, 438  # odd width → width*channels is not 64-aligned → padded
+    """A padded-pitch DMA image tensor exposes a strided, zero-copy buffer."""
+    w, h = 595, 438  # odd width
     t = _dma_image_or_skip(w, h, fmt)
     _skip_unless_pitch_is_padded_and_aligned(t, w * channels)
 
@@ -483,12 +401,10 @@ def test_dma_padded_buffer_protocol_zero_copy(fmt, channels):
 
     with t.map() as m:
         mv = memoryview(m)
-        # Logical shape, physical pitch as the outermost stride.
         assert mv.shape == (h, w, channels)
         assert mv.strides[0] == t.row_stride
         arr = np.asarray(mv)
         assert np.array_equal(arr, ref), "strided buffer-protocol read sheared the data"
-        # Poke the live mapping (zero-copy write-through onto the DMA-BUF).
         poked = (int(ref[0, 0, 0]) ^ 0xFF) & 0xFF
         memoryview(m)[0, 0, 0] = poked
 
@@ -496,7 +412,6 @@ def test_dma_padded_buffer_protocol_zero_copy(fmt, channels):
         arr2 = np.asarray(memoryview(m2))
         assert int(arr2[0, 0, 0]) == poked, "mutation did not reach the DMA-BUF"
 
-    # normalize_to_numpy reads the same padded backing and must agree.
     if channels == 3:
         t.from_numpy(ref)
         out = np.zeros((h, w, 3), dtype=np.uint8)
@@ -510,13 +425,9 @@ def test_dma_padded_buffer_protocol_zero_copy(fmt, channels):
     ids=["nv12", "nv16", "nv24"],
 )
 def test_dma_semiplanar_buffer_protocol_strided(fmt):
-    """Semi-planar DMA tensors expose the combined Y+UV plane as a 2-D
-    ``[rows, width]`` buffer at the physical pitch. Verify the pitch is the
-    outer stride and that per-row writes through the mapping round-trip
-    zero-copy (the chroma rows share the same padded pitch as luma)."""
+    """A semi-planar DMA tensor exposes its Y+UV plane at the physical pitch."""
     w, h = 595, 438
     t = _dma_image_or_skip(w, h, fmt)
-    # The combined Y+UV plane is one byte per column, so the tight row is `w`.
     _skip_unless_pitch_is_padded_and_aligned(t, w)
 
     with t.map() as m:
@@ -525,7 +436,7 @@ def test_dma_semiplanar_buffer_protocol_strided(fmt):
         assert mv.strides[0] == t.row_stride
         rows = mv.shape[0]
         for r in range(rows):
-            mv[r, 0] = r % 256  # per-row marker through the live mapping
+            mv[r, 0] = r % 256  # per-row marker
 
     with t.map() as m2:
         a2 = np.asarray(memoryview(m2))
@@ -540,9 +451,7 @@ def test_dma_semiplanar_buffer_protocol_strided(fmt):
     ids=["nv12", "nv16", "nv24"],
 )
 def test_dma_semiplanar_from_numpy_writes_every_combined_row(fmt):
-    """``from_numpy`` into a padded semi-planar tensor writes all of its
-    combined ``[H*k, W]`` rows at the physical pitch, luma and chroma alike,
-    and reads back unchanged through the buffer protocol."""
+    """``from_numpy`` writes every row of a padded semi-planar tensor at its pitch."""
     w, h = 595, 438
     t = _dma_image_or_skip(w, h, fmt)
     _skip_unless_pitch_is_padded_and_aligned(t, w)
@@ -558,10 +467,7 @@ def test_dma_semiplanar_from_numpy_writes_every_combined_row(fmt):
 
 
 def test_dma_planar_buffer_protocol_pads_rows_and_planes():
-    """A padded planar ``[C, H, W]`` DMA tensor puts its pitch on the row
-    dimension, and each plane spans ``pitch * H`` bytes -- the same strides
-    the descriptor, the blob and the C API report. Padding only the outermost
-    stride would start plane 1 inside plane 0's row padding."""
+    """A padded planar DMA tensor pads rows and spaces planes ``pitch * H`` apart."""
     w, h = 595, 438
     t = _dma_image_or_skip(w, h, PixelFormat.PlanarRgb)
     _skip_unless_pitch_is_padded_and_aligned(t, w)
@@ -579,8 +485,7 @@ def test_dma_planar_buffer_protocol_pads_rows_and_planes():
 
 
 def test_dma_one_row_planar_buffer_keeps_its_pitch():
-    """A one-row planar image's pitch exceeds its whole logical size, and the
-    planes still sit one padded row apart."""
+    """A one-row planar image keeps its planes one padded row apart."""
     t = _dma_image_or_skip(2, 1, PixelFormat.PlanarRgb)
     if t.row_stride == 2:
         pytest.skip("this heap returned a tight pitch; nothing to pad")
@@ -591,8 +496,7 @@ def test_dma_one_row_planar_buffer_keeps_its_pitch():
 
 
 def test_mem_tight_buffer_protocol_contiguous():
-    """A tight (non-padded) image tensor still exposes a plain C-contiguous
-    buffer — the strided exposure must only engage for padded backings."""
+    """A tight image tensor exposes a C-contiguous buffer."""
     w, h, c = 600, 400, 3
     t = Tensor.image(
         w, h, format=PixelFormat.Rgb, mem=TensorMemory.MEM, access="readwrite"
@@ -629,9 +533,6 @@ def test_from_fd_dma():
         np.asarray(m.numpy()).fill(233)
 
     fd = tensor.fd
-    # finally, not `except Exception` -- the old form caught the AssertionError
-    # below and closed the fd, so a wrong-data failure reported as a PASS. It
-    # also never closed the fd on success.
     try:
         img = Tensor.from_fd(fd, [720, 1280, 4], dtype="uint8")
         with img.map() as m:
@@ -652,9 +553,6 @@ def test_from_fd_shm():
         np.asarray(m.numpy()).fill(233)
 
     fd = tensor.fd
-    # finally, not `except Exception` -- the old form caught the AssertionError
-    # below and closed the fd, so a wrong-data failure reported as a PASS. It
-    # also never closed the fd on success.
     try:
         img = Tensor.from_fd(fd, [720, 1280, 4], dtype="uint8")
         with img.map() as m:
@@ -672,7 +570,6 @@ def test_create_image():
     assert img.height == 240
     assert img.format == PixelFormat.Rgba
 
-    # Image should be mappable
     with img.map() as m:
         data = np.asarray(m.numpy())
         assert data.size == 320 * 240 * 4
@@ -688,8 +585,7 @@ def _cpu_only_processor(monkeypatch):
 
 @pytest.mark.parametrize("access", ["read", "none", None])
 def test_cpu_convert_into_create_image(monkeypatch, access):
-    """The CPU backend fills a ``create_image`` destination whatever access
-    the caller requested: the processor adds the write it needs."""
+    """The CPU backend fills a ``create_image`` destination of any requested access."""
     converter = _cpu_only_processor(monkeypatch)
     w, h = _image_size("testdata/zidane.jpg")
     src = Tensor.image(w, h, format=PixelFormat.Nv12)
@@ -719,8 +615,7 @@ def _dma_or_skip(cls, *args, **kwargs):
 
 
 def test_gpu_declined_convert_raises_permission_error():
-    """A destination left without CPU access that the GPU declines (here for
-    its VYUY source) is refused as PermissionError, naming the decline."""
+    """A destination without CPU access that the GPU declines raises PermissionError."""
     converter = ImageProcessor()
     dst = converter.create_image(64, 48, PixelFormat.Rgba, access="none")
     skip_unless_gpu_backed(dst)
@@ -735,8 +630,7 @@ def test_gpu_declined_convert_raises_permission_error():
 
 
 def test_decode_image_method_on_read_dma_tensor_raises_permission_error():
-    """``Tensor.decode_image`` into a read-only tensor raises PermissionError,
-    on the DMA-BUF import path as on the host-pin path."""
+    """``Tensor.decode_image`` into a read-only DMA tensor raises PermissionError."""
     from edgefirst.codec import Tensor as CodecTensor
 
     with open("testdata/zidane.jpg", "rb") as fh:
@@ -754,8 +648,7 @@ def test_decode_image_method_on_read_dma_tensor_raises_permission_error():
 
 @pytest.mark.parametrize("mem", ["mem", "dma"])
 def test_imported_alias_keeps_declaration(monkeypatch, mem):
-    """A tensor from another EdgeFirst package keeps its declaration when this
-    package imports it, so its alias refuses what the producer refuses."""
+    """A tensor imported from another EdgeFirst package keeps its access declaration."""
     from edgefirst.tensor import PixelFormat as CorePixelFormat
     from edgefirst.tensor import Tensor as CoreTensor
     from edgefirst.tensor import TensorMemory as CoreMemory
@@ -781,9 +674,7 @@ def test_imported_alias_keeps_declaration(monkeypatch, mem):
 @pytest.mark.parametrize("mem", ["mem", "dma"])
 @pytest.mark.parametrize("package", ["image", "tensor"])
 def test_cpu_convert_refuses_a_write_only_view(monkeypatch, package, mem, origin):
-    """A view shares cache lines with pixels outside it, so the CPU convert
-    refuses one declared write-only, at any offset, whether the view is this
-    package's own or another package's."""
+    """The CPU convert refuses a write-only view from this package or another."""
     from edgefirst.tensor import PixelFormat as CorePixelFormat
     from edgefirst.tensor import Region
     from edgefirst.tensor import Tensor as CoreTensor
@@ -807,8 +698,7 @@ def test_cpu_convert_refuses_a_write_only_view(monkeypatch, package, mem, origin
 
 @pytest.mark.parametrize("dtype", [np.uint8, np.float32])
 def test_normalize_to_numpy_reads_a_read_only_tensor(dtype):
-    """normalize_to_numpy only reads its tensor, so a read-only declaration
-    covers it."""
+    """normalize_to_numpy reads a tensor declared read-only."""
     src = Tensor.image(8, 4, PixelFormat.Rgb, mem=TensorMemory.MEM, access="read")
     out = np.full((4, 8, 3), 7, dtype=dtype)
     src.normalize_to_numpy(out)
@@ -816,8 +706,7 @@ def test_normalize_to_numpy_reads_a_read_only_tensor(dtype):
 
 
 def test_writes_into_a_tensor_declared_without_write_raise(monkeypatch):
-    """A caller tensor declared without writes is refused by the CPU convert
-    and the codec, naming the access instead of an errno."""
+    """The CPU convert and the codec refuse a tensor declared without write access."""
     converter = _cpu_only_processor(monkeypatch)
     w, h = _image_size("testdata/zidane.jpg")
     src = Tensor.image(w, h, format=PixelFormat.Nv12)
@@ -865,7 +754,6 @@ def test_create_image_dtype_i8():
     assert img.format == PixelFormat.Rgb
     assert img.dtype == "int8"
 
-    # Convert into i8 destination should succeed
     w, h = _image_size("testdata/zidane.jpg")
     src = Tensor.image(w, h, format=PixelFormat.Nv12, access="readwrite")
     decode_file_into(src, "testdata/zidane.jpg")
@@ -879,23 +767,18 @@ def test_create_image_convert():
     """Test that images from create_image() work with convert()."""
     converter = ImageProcessor()
 
-    # Load a source image normally (native NV12 from the JPEG)
     w, h = _image_size("testdata/zidane.jpg")
     src = Tensor.image(w, h, format=PixelFormat.Nv12, access="readwrite")
     decode_file_into(src, "testdata/zidane.jpg")
 
-    # Create destination via create_image (may use PBO, DMA, or Mem)
     dst = converter.create_image(640, 640, PixelFormat.Rgba, access="readwrite")
 
-    # Convert should succeed regardless of backing type
     converter.convert(src, dst)
 
-    # Verify the result has actual pixel data (not all zeros)
     n = np.zeros((640, 640, 3), dtype=np.uint8)
     dst.normalize_to_numpy(n)
     assert n.any(), "Destination image is all zeros after convert"
 
-    # Compare with standard Tensor destination
     dst_mem = Tensor.image(640, 640, PixelFormat.Rgba, access="readwrite")
     converter.convert(src, dst_mem)
     n_mem = np.zeros((640, 640, 3), dtype=np.uint8)
@@ -908,7 +791,6 @@ def test_create_image_roundtrip():
     """Test create_image as both src and dst for convert()."""
     converter = ImageProcessor()
 
-    # Create source via create_image and fill it
     src = converter.create_image(640, 480, PixelFormat.Rgba, access="readwrite")
     with src.map() as m:
         arr = np.asarray(m.numpy())
@@ -917,13 +799,10 @@ def test_create_image_roundtrip():
         ]
         arr.flat[:] = pattern
 
-    # Create destination via create_image
     dst = converter.create_image(320, 240, PixelFormat.Rgba, access="readwrite")
 
-    # Convert using both create_image tensors
     converter.convert(src, dst)
 
-    # Verify destination has data (not zeros)
     with dst.map() as m:
         result = np.asarray(m.numpy())
         assert result.any(), "Destination is all zeros after roundtrip convert"
@@ -1002,9 +881,7 @@ def test_draw_decoded_masks_empty():
         classes=np.zeros((0,), dtype=np.uintp),
         background=bg,
     )
-    # Verify dst matches the background (no detections → bg only). Compare
-    # against the converted RGBA background itself (not PIL's RGBA decode),
-    # since the background now arrives via an NV12->RGBA conversion.
+    # Compare against the converted RGBA background.
     expected = np.zeros((h, w, 4), dtype=np.uint8)
     bg.normalize_to_numpy(expected)
     with dst.map() as m:
@@ -1033,12 +910,9 @@ def test_draw_decoded_masks_multiple_boxes():
         scores=np.array([0.9, 0.8, 0.7], dtype=np.float32),
         classes=np.array([0, 1, 2], dtype=np.uintp),
     )
-    # Should render 3 boxes. We can't pixel-match without a reference,
-    # but verify it didn't crash and image was modified.
     original = load_image("testdata/giraffe.jpg", "RGBA")
     with dst.map() as m:
         img = np.asarray(m.numpy())
-        # The image should be different from original (boxes drawn on it)
         assert calculate_similarity_rms_u8(img, original) < 0.999
 
 
@@ -1061,7 +935,6 @@ def test_draw_decoded_masks_instance_color_mode():
         classes=np.array([0, 0], dtype=np.uintp),
         color_mode=ColorMode.Instance,
     )
-    # Verify it didn't crash and image was modified
     original = load_image("testdata/giraffe.jpg", "RGBA")
     with dst.map() as m:
         img = np.asarray(m.numpy())
@@ -1093,7 +966,6 @@ def test_draw_decoded_masks_with_opacity():
     with dst_full.map() as m1, dst_half.map() as m2:
         img_full = np.array(m1.numpy()).reshape((dst_full.height, dst_full.width, 4))
         img_half = np.array(m2.numpy()).reshape((dst_half.height, dst_half.width, 4))
-        # Half-opacity result should be closer to the original than full-opacity
         sim_full = calculate_similarity_rms_u8(img_full, original)
         sim_half = calculate_similarity_rms_u8(img_half, original)
         assert sim_half >= sim_full
@@ -1115,7 +987,6 @@ outputs:
 """
     decoder = Decoder.new_from_yaml_str(config, score_threshold=0.1, iou_threshold=0.7)
 
-    # Create a synthetic float detection tensor: 1 detection with box + score + class
     data = np.zeros((1, 10, 6), dtype=np.float32)
     data[0, 0, :] = [0.1, 0.1, 0.3, 0.3, 0.9, 2.0]  # box + score + class
     model_output_tensor = Tensor([1, 10, 6], dtype="float32")
@@ -1131,7 +1002,6 @@ outputs:
     converter.convert(src, dst)
     result = decoder.draw_onto(converter, [model_output_tensor], dst)
 
-    # Should return (boxes, scores, classes)
     assert len(result) == 3
     boxes, scores, classes = result
     assert boxes.shape[1] == 4
@@ -1143,7 +1013,6 @@ def test_decode_image_from_bytes():
     """Test decode_image with raw bytes into oversized tensor (strided)."""
     with open("testdata/zidane.jpg", "rb") as fh:
         data = fh.read()
-    # Color JPEG decodes to its native NV12; the tensor is reconfigured to match.
     tensor = Tensor.image(
         MAX_SRC_W, MAX_SRC_H, format=PixelFormat.Nv12, access="readwrite"
     )
@@ -1151,40 +1020,24 @@ def test_decode_image_from_bytes():
     assert info.width == 1280
     assert info.height == 720
     assert info.format == PixelFormat.Nv12
-    # The decoder reconfigures the tensor's LOGICAL width/height to the decoded
-    # image (1280x720) but PRESERVES the oversized buffer's allocated row stride
-    # so a consumer can still index rows of the reused buffer correctly. The
-    # tensor was allocated MAX_SRC_W (1920) wide — already 64-aligned — so the
-    # reported stride stays 1920, wider than the 1280 logical width. (Reporting
-    # the logical width here would make the buffer unreadable: rows would be
-    # indexed at the wrong byte offset.)
     assert info.row_stride == MAX_SRC_W
     assert info.row_stride >= info.width
     assert info.row_stride % 64 == 0
 
 
 def test_decode_image_reuse():
-    """Test decoding multiple different images into the same oversized tensor.
-
-    The decoder configures the tensor's format per image, so the same buffer
-    is reused across a color JPEG (NV12) and a greyscale JPEG (Grey).
-    """
+    """Decoding different images into one oversized tensor reconfigures its format."""
     tensor = Tensor.image(
         MAX_SRC_W, MAX_SRC_H, format=PixelFormat.Nv12, access="readwrite"
     )
 
-    # First decode: zidane.jpg (1280x720) — native NV12, strided into 1920x1080
     info1 = decode_file_into(tensor, "testdata/zidane.jpg")
     assert info1.width == 1280
     assert info1.height == 720
     assert info1.format == PixelFormat.Nv12
-    # `tensor` crosses packages (edgefirst.image.Tensor into edgefirst.codec's
-    # decode_file_into): the foreign write-back must leave it in the same
-    # state a same-module decode would, not just report it via ImageInfo.
     assert tensor.format == PixelFormat.Nv12
     assert (tensor.width, tensor.height) == (1280, 720)
 
-    # Second decode: grey.jpg (1024x681) — native Grey, reconfigured in place
     info2 = decode_file_into(tensor, "testdata/grey.jpg")
     assert info2.width == 1024
     assert info2.height == 681
@@ -1219,8 +1072,6 @@ def test_decode_image_pipeline():
     """Test the full recommended pipeline: create_image -> decode -> convert."""
     converter = ImageProcessor()
 
-    # Allocate via ImageProcessor for the optimal memory backend, sized to the
-    # image. Decode emits native NV12; convert produces the RGBA result.
     w, h = _image_size("testdata/zidane.jpg")
     src = converter.create_image(w, h, PixelFormat.Nv12, access="readwrite")
     decode_file_into(src, "testdata/zidane.jpg")
@@ -1228,7 +1079,6 @@ def test_decode_image_pipeline():
     dst = converter.create_image(640, 640, PixelFormat.Rgba, access="readwrite")
     converter.convert(src, dst)
 
-    # Verify result has pixel data
     n = np.zeros((640, 640, 3), dtype=np.uint8)
     dst.normalize_to_numpy(n)
     assert n.any(), "Destination image is all zeros after pipeline"
@@ -1236,13 +1086,9 @@ def test_decode_image_pipeline():
 
 def test_decode_image_exact_size():
     """Allocate tensor at exact decoded image size by reading the JPEG header first."""
-    # Use PIL to read just the header (no pixel decode)
     with Image.open("testdata/zidane.jpg") as im:
         w, h = im.size
 
-    # Allocate tensor at exact dimensions. Color JPEG decodes to native NV12;
-    # the NV12 luma plane is one byte per pixel, so an exact-size tensor has
-    # row_stride == width (no padding).
     tensor = Tensor.image(w, h, format=PixelFormat.Nv12, access="readwrite")
     info = decode_file_into(tensor, "testdata/zidane.jpg")
     assert info.width == w
@@ -1256,7 +1102,6 @@ def test_decode_image_exact_size_png():
     with Image.open("testdata/zidane.png") as im:
         w, h = im.size
 
-    # zidane.png is a 3-channel RGB PNG; decode emits its native RGB format.
     tensor = Tensor.image(w, h, format=PixelFormat.Rgb, access="readwrite")
     info = decode_file_into(tensor, "testdata/zidane.png")
     assert info.width == w
@@ -1287,13 +1132,7 @@ def test_decode_image_tensor_too_small_both():
 
 
 def test_decode_image_strided_pixel_correctness():
-    """Verify strided decode produces identical pixels to exact-size decode.
-
-    Color JPEGs decode to native NV12; this compares the NV12 luma (Y) plane
-    of an exact-size decode against the strided sub-region of an oversized
-    decode, exercising the per-row stride handling.
-    """
-    # Exact-size decode (no stride padding) — luma stride == width.
+    """Strided decode produces the same luma pixels as an exact-size decode."""
     w, h = _image_size("testdata/zidane.jpg")
     exact = Tensor.image(w, h, format=PixelFormat.Nv12, access="readwrite")
     decode_file_into(exact, "testdata/zidane.jpg")
@@ -1301,19 +1140,17 @@ def test_decode_image_strided_pixel_correctness():
         arr = np.asarray(memoryview(m))
         exact_y = np.array(arr[:h, :w], copy=True)
 
-    # Oversized decode (strided — the common real-world path).
     big = Tensor.image(
         MAX_SRC_W, MAX_SRC_H, format=PixelFormat.Nv12, access="readwrite"
     )
     info = decode_file_into(big, "testdata/zidane.jpg")
 
-    # Extract the decoded luma sub-region via map() and the reported row stride.
+    # Extract the decoded luma sub-region using the reported row stride.
     with big.map() as m:
         arr = np.asarray(memoryview(m))
         assert arr.strides[0] == info.row_stride
         big_y = np.array(arr[:h, :w], copy=True)
 
-    # Pixels must match exactly — strided decode must not corrupt data.
     assert np.array_equal(exact_y, big_y), (
         "Strided decode pixels differ from exact-size decode"
     )
@@ -1322,35 +1159,14 @@ def test_decode_image_strided_pixel_correctness():
 @pytest.mark.parametrize(
     "width,height",
     [
-        (105, 124),  # the original STRIDES_BUG.md repro
+        (105, 124),
         (100, 124),
         (160, 80),
         (200, 64),
     ],
 )
-def test_from_numpy_grey_unaligned_width_stride_bug(width, height):
-    """Regression for STRIDES_BUG.md.
-
-    The original bug: `create_image(w, h, Grey)` on backends that
-    apply a GPU pitch alignment rounds the underlying buffer up
-    (e.g. 105 → 128-byte pitch on Mali Valhall), but `Image.size`
-    still reports the *logical* `w × h`. A numpy array sized from
-    `Image.size` was the natural caller choice, so `from_numpy`
-    panicked in `copy_from_slice` on the length mismatch with the
-    padded destination. The fix (`tensor.rs`) detects the padded
-    destination via `dst_len > tensor_len` and switches to a
-    row-by-row copy using `effective_row_stride()`.
-
-    This test locks in that `from_numpy` no longer panics for a
-    non-64-aligned width, and that `Image.size` / `Image.row_stride`
-    satisfy the documented contract (size is logical, row_stride is
-    reported and at least the logical row width). Byte-level
-    correctness of the mapped write is backend-sensitive — PBO
-    staging paths reinterpret the buffer with their own stride
-    between write and read — and is covered by higher-level
-    end-to-end tests rather than a regression test whose concern is
-    the panic.
-    """
+def test_from_numpy_grey_unaligned_width(width, height):
+    """`from_numpy` accepts a width not aligned to the GPU pitch."""
     converter = ImageProcessor()
     img = converter.create_image(width, height, PixelFormat.Grey, access="readwrite")
 
@@ -1361,16 +1177,9 @@ def test_from_numpy_grey_unaligned_width_stride_bug(width, height):
     rs = img.row_stride
     assert rs is not None and rs >= width, f"row_stride {rs} must be >= width {width}"
 
-    # The regression: this call used to panic in copy_from_slice for
-    # widths not aligned to the GPU pitch. Must now succeed.
     src = np.arange(width * height, dtype=np.uint8).reshape(height, width)
     img.from_numpy(src)
 
-    # The mapped buffer must be addressable at the logical size. All
-    # reads must stay inside the `with` block — `m.numpy()` returns a
-    # zero-copy numpy view that dangles once the TensorMap context
-    # exits; touching it afterwards (including via pytest saferepr on
-    # assertion failure) segfaults.
     with img.map() as m:
         raw = np.asarray(m.numpy())
         assert raw.size == width * height, (
@@ -1379,19 +1188,7 @@ def test_from_numpy_grey_unaligned_width_stride_bug(width, height):
 
 
 def test_convert_honors_tagged_colorimetry(monkeypatch):
-    """convert() must honor the source tensor's tagged colorimetry (QA F11).
-
-    The same NV12 bytes decoded as BT.601 full-range vs BT.709 limited-range
-    must produce visibly different RGB pixels — proving the HAL threads the
-    per-source colorimetry tag through the conversion instead of applying one
-    hardcoded YUV matrix/range.
-
-    Exact tag honoring is the ColorimetryMode::Exact contract, opted into
-    here via EDGEFIRST_COLORIMETRY. The Fast default (issue #106)
-    deliberately collapses colorimetries into the external sampler's fixed
-    conversion on Vivante (~12x faster); non-Vivante GPUs honor tags in both
-    modes.
-    """
+    """convert() honors the source tensor's tagged colorimetry."""
     monkeypatch.setenv("EDGEFIRST_COLORIMETRY", "exact")
     w, h = 1280, 720
     nv12 = np.fromfile("testdata/zidane.nv12", dtype=np.uint8).reshape(h * 3 // 2, w)
@@ -1414,25 +1211,13 @@ def test_convert_honors_tagged_colorimetry(monkeypatch):
         "BT.601-full and BT.709-limited decoded to identical pixels — "
         "convert() ignored the tagged colorimetry"
     )
-    # A whole-matrix/range change shifts pixels well beyond a stray rounding
-    # difference; require a clearly visible mean delta.
     mean_diff = np.abs(bt601_full.astype(int) - bt709_limited.astype(int)).mean()
     assert mean_diff > 1.0, f"mean pixel delta {mean_diff:.3f} too small to be real"
 
 
 @pytest.mark.gpu
 def test_convert_with_fence_returns_a_waitable_or_none():
-    """convert_with_fence() must hand back a completion handle the caller
-    can wait on and close, or None when the convert already completed
-    synchronously (no native fence on this platform/backend).
-
-    skip_unless_gpu_backed enforces the GPU test policy (tests/gpu_policy.py):
-    on Windows this requires HAL_TEST_REQUIRE_GL=1, at which point
-    create_image(access="read") (memory unspecified) prefers a D3D11 texture
-    destination and convert_with_fence hands back a set-on-completion event
-    for it -- so `fence is None` here is only reachable on a platform/backend
-    combination with no native fence at all.
-    """
+    """convert_with_fence() returns a waitable completion handle, or None."""
     p = ImageProcessor()
     src = Tensor.image(64, 48, PixelFormat.Rgba, None, "readwrite")
     dst = p.create_image(64, 48, PixelFormat.Rgb, "uint8", "read")
@@ -1440,13 +1225,11 @@ def test_convert_with_fence_returns_a_waitable_or_none():
 
     fence = p.convert_with_fence(src, dst, Rotation.Rotate0, Flip.NoFlip)
     if fence is None:
-        return  # platform without a native fence: the convert already completed
+        return  # no native fence on this platform
 
     if sys.platform == "win32":
         import ctypes
 
-        # Closed in a `finally`, as a plain call: a failing assert there
-        # would replace the real failure with its own.
         try:
             waited = ctypes.windll.kernel32.WaitForSingleObject(
                 ctypes.c_void_p(fence), 5000
@@ -1460,17 +1243,7 @@ def test_convert_with_fence_returns_a_waitable_or_none():
 
 @pytest.mark.gpu
 def test_convert_publishes_its_completion_on_the_destination():
-    """A convert records a fence value on the destination it rendered into,
-    and the caller's own tensor reports it afterwards.
-
-    The engine writes onto a `TensorDyn` the binding reconstructs from the
-    destination's descriptor (that is what lets the convert release the
-    GIL), never onto the caller's tensor, so without the publish step
-    `gpu_completion()` answers None for work that has in fact been queued
-    and a CUDA or D3D12 consumer has no fence value to wait on. This is the
-    same-package case: destination and processor both come from
-    `edgefirst.image`.
-    """
+    """A convert records a fence value that the caller's destination tensor reports."""
     if sys.platform != "win32":
         pytest.skip("only D3D11 textures record completions")
     import ctypes
@@ -1489,8 +1262,6 @@ def test_convert_publishes_its_completion_on_the_destination():
     try:
         assert value > 0
     finally:
-        # A plain call, not an assertion: a failing assert here would
-        # replace the real failure above with this one.
         ctypes.windll.kernel32.CloseHandle(ctypes.c_void_p(fence))
 
 

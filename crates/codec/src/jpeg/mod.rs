@@ -1,19 +1,15 @@
 // SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! Custom baseline JPEG decoder with a zero-allocation hot loop and strided
-//! native output.
+//! Baseline JPEG decoder with strided native output.
 //!
-//! The decoder emits the source's native format by default — `Grey` for
+//! The decoder emits the source's native format by default: `Grey` for
 //! greyscale (1-component) JPEGs, and the matching semi-planar format for
 //! colour (3-component) JPEGs by subsampling: `Nv12` for 4:2:0, `Nv16` for
-//! 4:2:2, `Nv24` for 4:4:4. Callers may opt into a **pure CPU** fused output
-//! via [`crate::ImageDecoder::set_output_format`]: `Rgb` (4:4:4 or native
-//! 4:2:0 sources — the latter via a fused 2×2 box chroma upsample) or
-//! `Nv12` (any colour source), converted at the MCU write stage in a single
-//! software-decode pass (not a GPU hybrid). The decoder never rotates:
-//! geometry and any remaining preprocessing are applied downstream by
-//! `ImageProcessor::convert()`. EXIF orientation is reported in
+//! 4:2:2, `Nv24` for 4:4:4. [`crate::ImageDecoder::set_output_format`]
+//! selects a fused output of the software decoder: `Rgb` (4:4:4 or native
+//! 4:2:0 sources) or `Nv12` (any colour source), converted at the MCU write
+//! stage. The decoder never rotates; EXIF orientation is reported in
 //! [`ImageInfo`].
 
 pub mod bitstream;
@@ -50,10 +46,8 @@ pub(crate) fn v4l2_device() -> Option<String> {
     v4l2::probe_path().map(|p| p.display().to_string())
 }
 
-/// Parse a boolean backend-gate environment variable: `true` only for
-/// `1`/`true`/`yes` (case-insensitive, trimmed); absent or anything else is
-/// `false`. Shared by the V4L2 opt-out (`EDGEFIRST_DISABLE_V4L2`) and the nvJPEG
-/// opt-in (`EDGEFIRST_ENABLE_NVJPEG`) gates.
+/// Parse a boolean environment variable: `true` only for `1`/`true`/`yes`
+/// (case-insensitive, trimmed); absent or anything else is `false`.
 #[cfg(all(target_os = "linux", any(feature = "v4l2", feature = "nvjpeg")))]
 pub(crate) fn env_flag(name: &str) -> bool {
     std::env::var(name)
@@ -130,36 +124,30 @@ pub(crate) fn capabilities(out: &mut Vec<Capability>) {
 /// Reusable JPEG decoder state.
 ///
 /// Holds scratch buffers that grow to the high-water mark and are reused across
-/// decode calls. After the first frame at a given resolution, subsequent
-/// decodes perform zero heap allocations.
+/// decode calls.
 pub struct JpegDecoderState {
     /// MCU scratch buffers (per-component IDCT output for one MCU row band).
     mcu_scratch: Option<mcu::McuScratch>,
     /// Huffman LUTs reused across frames when the DHT payload is unchanged.
     /// Tables are moved into [`markers::JpegHeaders`] for the decode and
-    /// restored afterwards so a cache hit allocates nothing.
+    /// restored afterwards.
     huffman_cache: huffman::HuffmanCache,
     /// Optional fused-output preference (see [`resolve_output_format`]).
     pub(crate) preferred_format: Option<PixelFormat>,
-    /// Chroma upsampling filter for a fused native-4:2:0 `Rgb` decode — see
-    /// [`crate::ChromaUpsample`]. Only `Box` is implemented; the field
-    /// exists so the type is threaded through end to end before a second
-    /// filter is added, rather than retrofitted later.
+    /// Chroma upsampling filter for a fused native-4:2:0 `Rgb` decode; see
+    /// [`crate::ChromaUpsample`].
     pub(crate) chroma_upsample: crate::decoder::ChromaUpsample,
-    /// Opt-in fast (AAN `ifast`-class) IDCT — see [`crate::DctMethod`].
-    /// Default false; `EDGEFIRST_CODEC_DCT=fast` flips the constructor
-    /// default so benchmarks can A/B without code changes.
+    /// Fast (AAN `ifast`-class) IDCT; see [`crate::DctMethod`]. False by
+    /// default; `EDGEFIRST_CODEC_DCT=fast` makes it the constructor default.
     pub(crate) fast_dct: bool,
     /// The engine that decodes; see [`crate::ImageDecoder::set_engine`].
     pub(crate) engine: Engine,
-    /// V4L2 hardware decoder, lazily probed on first decode. Probed at most
-    /// once; a ready context is reused (and amortises per-image setup) across
-    /// decodes.
+    /// V4L2 hardware decoder, probed on first decode, at most once; a ready
+    /// context is reused across decodes.
     #[cfg(all(target_os = "linux", feature = "v4l2"))]
     v4l2: v4l2::V4l2Probe,
-    /// nvJPEG GPU decoder, lazily probed on first decode. Preferred over V4L2
-    /// when a CUDA device + libnvjpeg are present and the destination is a
-    /// CUDA-backed tensor; reuses one nvJPEG handle/state/stream across decodes.
+    /// nvJPEG GPU decoder, probed on first decode; one nvJPEG
+    /// handle/state/stream is reused across decodes.
     #[cfg(all(target_os = "linux", feature = "nvjpeg"))]
     nvjpeg: nvjpeg::NvJpegProbe,
 }
@@ -205,19 +193,16 @@ fn native_format(headers: &markers::JpegHeaders) -> crate::Result<PixelFormat> {
     match comps.len() {
         1 => Ok(PixelFormat::Grey),
         3 => {
-            // Emit the JPEG's NATIVE chroma format so no resampling is needed:
+            // Native chroma format by subsampling:
             //   4:4:4 (full-res chroma)        → NV24
             //   4:2:2 (half-width chroma)      → NV16
             //   4:2:0 (quarter-res chroma)     → NV12
-            // The downsample path (avg_block in `write_nv12_rows`) then only
-            // runs for non-standard subsamplings (4:1:1, 4:1:0, mismatched
-            // Cb/Cr), which fall back to NV12.
+            // Non-standard subsamplings (4:1:1, 4:1:0, mismatched Cb/Cr) map to NV12.
             let max_h = headers.header.max_h_samp as usize;
             let max_v = headers.header.max_v_samp as usize;
             let cb = comps[1].sampling;
             let cr = comps[2].sampling;
-            // Both chroma components must share sampling for a clean native
-            // mapping; otherwise fall back to NV12.
+            // Chroma components with different sampling map to NV12.
             if cb.h == cr.h && cb.v == cr.v && cb.h as usize > 0 && cb.v as usize > 0 {
                 let h_ratio = max_h / cb.h as usize;
                 let v_ratio = max_v / cb.v as usize;
@@ -241,20 +226,11 @@ fn native_format(headers: &markers::JpegHeaders) -> crate::Result<PixelFormat> {
 /// Resolve the decode output format from the native format and an optional
 /// caller preference (fused decode outputs):
 ///
-/// - `Rgb`: honoured for 4:4:4 colour JPEGs (native `Nv24`, straight per-row
-///   YCbCr→RGB, no chroma resampling) and for native 4:2:0 colour JPEGs
-///   (`headers` sampling factors match [`mcu::is_native_420`] exactly — a 2×2
-///   nearest-neighbour chroma upsample fused into the write). `native ==
-///   Nv12` alone is not sufficient: non-standard subsamplings (4:1:1, mismatched
-///   Cb/Cr) also downsample to `Nv12` in [`native_format`] but aren't the
-///   shape the fused RGB write targets. An explicit `Rgb` request on any
-///   other source (4:2:2, greyscale, or a non-standard subsampling) returns
-///   [`CodecError::UnsupportedFormat`] rather than silently substituting the
-///   native format — a caller who asks for RGB and doesn't check
-///   [`ImageInfo::format`](crate::ImageInfo) must not be handed a
-///   differently-shaped buffer with no indication anything changed. See
-///   `docs/BENCHMARKS_JPEG_REVIEW_v3.13.md` item #3.
-/// - `Nv12`: honoured for any colour JPEG — the MCU writer downsamples
+/// - `Rgb`: honoured for 4:4:4 colour JPEGs (native `Nv24`) and for native
+///   4:2:0 colour JPEGs (sampling factors matching [`mcu::is_native_420`]).
+///   Any other source (4:2:2, greyscale, or a non-standard subsampling)
+///   returns [`CodecError::UnsupportedFormat`].
+/// - `Nv12`: honoured for any colour JPEG; the MCU writer downsamples
 ///   chroma (2×2 for 4:4:4, vertical for 4:2:2; native 4:2:0 passes through).
 /// - Anything else (or `None`): native format.
 fn resolve_output_format(
@@ -282,24 +258,15 @@ fn resolve_output_format(
     })
 }
 
-/// Native luma/primary-plane row stride in bytes for a freshly decoded image.
-/// GREY and all semi-planar luma/UV planes are 1 byte/pixel.  Semi-planar grids
-/// require at least `even(width)` bytes per row (chroma alignment); the stride
-/// is further rounded up to 64 bytes so `ImageInfo.row_stride` honours the
-/// same 64-byte-alignment invariant as `Tensor::image()`.
-///
-/// This MUST stay equal to the image crate's `align_width_for_gpu_pitch(width, 1)`
-/// and `PixelFormat::semi_planar_surface_dims(..)` pitch (both produce the same
-/// 64-aligned even width). The codec crate can't depend on `edgefirst-image`, so
-/// the value is recomputed here — keep the two in lockstep if either changes.
+/// Native luma/primary-plane row stride in bytes for a freshly decoded image:
+/// `even(width)` rounded up to 64 bytes.
 fn native_row_stride(width: usize) -> usize {
     width.next_multiple_of(2).next_multiple_of(64)
 }
 
 /// Parse JPEG headers and return native dimensions, format, and EXIF
-/// orientation without decoding pixels. The codec does not rotate, so `width`
-/// and `height` are the source's true dimensions and the orientation is
-/// reported for the caller to apply via `convert()`.
+/// orientation without decoding pixels. `width` and `height` are the source's
+/// dimensions before the orientation is applied.
 pub fn peek_jpeg_info(data: &[u8]) -> crate::Result<ImageInfo> {
     let headers = markers::parse_markers(data)?;
     let img_w = headers.header.width as usize;
@@ -362,8 +329,8 @@ struct Target {
     width: usize,
     height: usize,
     stride: usize,
-    /// The format is the JPEG's own. Fused (non-native) outputs are a
-    /// CPU-decoder feature: the hardware decoders produce fixed formats.
+    /// Whether the format is the JPEG's own; fused outputs are produced by
+    /// the CPU decoder only.
     native: bool,
 }
 
@@ -396,8 +363,7 @@ fn try_hardware<T: ImagePixel>(
         Engine::NvJpeg | Engine::V4l2 if !target.native => {
             Ok(Attempt::PassedOn("a fused output format".into()))
         }
-        // nvJPEG decodes interleaved RGB straight into a CUDA-backed (PBO)
-        // destination for zero-copy `convert()`.
+        // nvJPEG decodes interleaved RGB into a CUDA-backed (PBO) destination.
         #[cfg(all(target_os = "linux", feature = "nvjpeg"))]
         Engine::NvJpeg => match state.nvjpeg.try_decode::<T>(
             data,
@@ -409,8 +375,7 @@ fn try_hardware<T: ImagePixel>(
             target.stride,
         ) {
             Ok(Some(info)) => {
-                // RGB output carries no chroma colorimetry; clear any stale
-                // value left on a recycled pool tensor.
+                // RGB output carries no chroma colorimetry: clear it.
                 dst.set_colorimetry(None);
                 Ok(Attempt::Decoded(info))
             }
@@ -418,7 +383,6 @@ fn try_hardware<T: ImagePixel>(
             Err(nvjpeg::NvJpegDecode::Fallback(why)) => Ok(Attempt::PassedOn(why)),
             Err(nvjpeg::NvJpegDecode::Fatal(e)) => Err(e),
         },
-        // A probed-but-failing device resets itself.
         #[cfg(all(target_os = "linux", feature = "v4l2"))]
         Engine::V4l2 => match state.v4l2.try_decode::<T>(
             data,
@@ -454,13 +418,7 @@ fn decode_jpeg_into_parsed<T: ImagePixel>(
     let native_fmt = native_format(headers)?;
     let output_fmt = resolve_output_format(headers, native_fmt, state.preferred_format)?;
 
-    // NV12 supports odd dimensions. Odd *height* gives a `H + ceil(H/2)`
-    // combined-plane height (`PixelFormat::allocation_shape`). Odd *width* rounds the
-    // tensor's buffer width up to even (also via `allocation_shape`), so the MCU
-    // writer's `ceil(width/2)` chroma columns are byte-aligned; the reported
-    // `ImageInfo.width` below stays the true odd value for a downstream crop.
-
-    // Native NV12/GREY are u8 formats; reject non-u8 destinations.
+    // Reject non-u8 destinations.
     if T::dtype() != edgefirst_tensor::DType::U8 {
         return Err(CodecError::UnsupportedDtype(T::dtype()));
     }
@@ -490,12 +448,9 @@ fn decode_jpeg_into_parsed<T: ImagePixel>(
         .effective_row_stride()
         .unwrap_or(native_row_stride(img_w));
 
-    // The engines in order. A hardware decoder that cannot take this image
-    // (a fused output format, a destination it cannot write) passes it on
-    // under `Auto`, and is an error when it was asked for by name. The CPU
-    // decoder takes every image, so engines after it are never tried;
-    // without it in the list, an image every hardware engine passes on is
-    // refused.
+    // Try the engines in order. Under `Auto` a hardware decoder that cannot
+    // take this image passes it on; an engine asked for by name fails instead.
+    // An image every listed engine passes on is refused.
     let target = Target {
         format: output_fmt,
         width: img_w,
@@ -532,7 +487,7 @@ fn decode_jpeg_into_parsed<T: ImagePixel>(
         return Err(unsupported(Codec::Jpeg, Direction::Decode, state.engine));
     }
 
-    // CPU decode: MCU loop writes NV12/GREY u8 directly into the tensor.
+    // CPU decode: the MCU loop writes u8 pixels into the tensor.
     dst.cpu_access()
         .require(edgefirst_tensor::CpuAccess::Write)?;
     match &mut state.mcu_scratch {
@@ -560,8 +515,7 @@ fn decode_jpeg_into_parsed<T: ImagePixel>(
         )?;
     }
 
-    // RGB output carries no chroma colorimetry (matches the nvJPEG path);
-    // clear any stale value left on a recycled pool tensor.
+    // RGB output carries no chroma colorimetry: clear it.
     if output_fmt == PixelFormat::Rgb {
         dst.set_colorimetry(None);
     } else {

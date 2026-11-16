@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 # SPDX-License-Identifier: Apache-2.0
 #
-# Container entrypoint for per-processor JPEG **decode-only** A/B.
+# Container entrypoint for per-processor JPEG decode-only A/B.
 #
 # Matrix (default): for each of yuv + rgb, run HAL and TurboJPEG into memory.
 #   HAL  yuv → --decode-only --decode-fmt native   (NV12/16/24)
@@ -10,7 +10,7 @@
 #   Turbo yuv → --decode-only --format yuv         (tjDecompressToYUV2)
 #   Turbo rgb → --decode-only --format rgb         (tjDecompress2 TJPF_RGB)
 #
-# ImageProcessor::convert / letterbox is intentionally not timed.
+# ImageProcessor::convert / letterbox is not timed.
 #
 # Env contract (documented in benchmarks/README.md):
 #   EDGEFIRST_BENCH_COCO   JPEG directory (falls back to /opt/coco-smoke then
@@ -26,17 +26,14 @@
 #   LIMIT / WARMUP         smoke knobs (default 50 / 10; LIMIT=0 = full set)
 #   ROUNDS                 interleaved rounds (default 1). With ROUNDS>1 the
 #                          whole module matrix repeats per round in one
-#                          session (the board-sweep protocol: report the
-#                          median across rounds); CSVs gain a _rN suffix
+#                          session; CSVs gain a _rN suffix
 #   PIN                    optional core to pin every arm to via taskset
 #   TENSOR_MEM             mem|dma|auto (default mem)
 #   MODULES                comma list: hal_cpu,turbojpeg,turbojpeg_fastupsample,zune,image,stb,wuffs
-#                          (default all six; zune covers yuv+rgb, image/stb/
+#                          (default all; zune covers yuv+rgb, image/stb/
 #                          wuffs are rgb-only and skip the yuv pass)
 #   FORMATS                comma list: yuv,rgb (default both)
-#   DCT                    turbojpeg IDCT: accurate|fast (default accurate,
-#                          matching HAL's islow kernel and libjpeg-turbo's own
-#                          decompression default)
+#   DCT                    turbojpeg IDCT: accurate|fast (default accurate)
 #   EXTRA_ARGS             extra argv appended to hal_cpu
 set -euo pipefail
 
@@ -52,7 +49,7 @@ DCT="${DCT:-accurate}"
 ROUNDS="${ROUNDS:-1}"
 mkdir -p "${RESULTS_DIR}"
 
-# Optional single-core pinning (matches the board sweeps' taskset -c).
+# Optional single-core pinning.
 runner=()
 if [[ -n "${PIN:-}" ]]; then
   if command -v taskset >/dev/null 2>&1; then
@@ -81,9 +78,7 @@ extract_archive() { # file dest
   esac
 }
 
-# Optional corpus fetch (AWS Batch: the job role authenticates DATASET_S3, no
-# secrets in the job definition). Skipped when the directory already has
-# JPEGs, so a mounted volume wins over a re-download.
+# Optional corpus fetch. Skipped when the directory already has JPEGs.
 if [[ -n "${DATASET_S3:-}${DATASET_URL:-}" ]] && [[ "$(jpeg_count "${COCO}")" -eq 0 ]]; then
   mkdir -p "${COCO}"
   if [[ -n "${DATASET_S3:-}" ]]; then
@@ -107,8 +102,7 @@ if [[ -n "${DATASET_S3:-}${DATASET_URL:-}" ]] && [[ "$(jpeg_count "${COCO}")" -e
     extract_archive "${fname}" "${COCO}"
     rm -f "${fname}"
   fi
-  # macOS BSD tar can ship AppleDouble metadata (._*) unless the archive was
-  # created with COPYFILE_DISABLE=1; they match *.jpg globs and are not JPEGs.
+  # Remove AppleDouble metadata files (._*).
   find "${COCO}" -name '._*' -delete 2>/dev/null || true
   # Archives may nest a single top-level directory; flatten one level.
   if [[ "$(jpeg_count "${COCO}")" -eq 0 ]]; then
@@ -135,9 +129,8 @@ fi
 
 export EDGEFIRST_BENCH_COCO="${COCO}"
 
-# Container provenance (BENCHMARKS.md review v3.12 §2.2): everything a
-# reader needs to reproduce or falsify this job's numbers, written once per
-# job to RESULTS_DIR (not per-round — none of this changes within a job).
+# Container provenance: the build toolchain, base image and libturbojpeg
+# versions, written once per job to RESULTS_DIR.
 {
   echo "captured: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "board: ${BOARD}"
@@ -171,9 +164,7 @@ elif [[ -n "${EDGEFIRST_CODEC_FORCE_NEON:-}" ]]; then
   tier_tag="neon-${EDGEFIRST_CODEC_FORCE_NEON}"
 fi
 
-# Always pass --limit explicitly: every harness honours `--limit 0` as "full
-# set", whereas omitting the flag would fall back to per-arm defaults that
-# DISAGREE (50 for hal_cpu/turbojpeg/stb/wuffs, 200 for rust_jpeg).
+# Pass --limit explicitly; `--limit 0` is the full set.
 limit_args=(--limit "${LIMIT}")
 
 hal_decode_fmt() {
@@ -236,9 +227,7 @@ for fmt in "${fmts[@]}"; do
         cat "${csv}"
         ;;
       turbojpeg_fastupsample)
-        # Matched-accuracy-class comparator for EdgeFirst's fused native-4:2:0
-        # box chroma upsample (see BENCHMARKS.md § JPEG Decode). RGB-only:
-        # --upsample is a no-op on tjDecompressToYUV2, which never resamples.
+        # libjpeg-turbo with TJFLAG_FASTUPSAMPLE. RGB only.
         if [[ "${fmt}" != rgb ]]; then
           echo "(skip turbojpeg_fastupsample: rgb-only arm, format=${fmt})" >&2
           continue

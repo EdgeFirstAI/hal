@@ -130,9 +130,7 @@ fn kernel(
     dead[..n].iter().map(|&d| d != 0).collect()
 }
 
-/// The kernel's suppression flags equal the scalar loop's for 23 box counts up to 333 (every
-/// tail), clusters, identical, zero-area, inverted and NaN/infinite boxes, class-agnostic and
-/// class-aware, eight thresholds, four caps and pre-flagged boxes.
+/// The kernel's suppression flags equal the scalar loop's.
 #[test]
 fn greedy_matches_the_scalar_loop() {
     let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
@@ -178,8 +176,7 @@ fn identical_boxes_leave_one_per_class() {
     assert_eq!(got, (0..11).map(|k| k > 0).collect::<Vec<_>>());
 }
 
-/// Mismatched lengths, a length not a multiple of four, or a short label slice: `false`, and
-/// `dead` untouched.
+/// Invalid lengths return `false` and leave `dead` untouched.
 #[test]
 fn invalid_arguments_write_nothing() {
     let x = [0.0f32; 8];
@@ -209,8 +206,7 @@ fn invalid_arguments_write_nothing() {
     assert!(!ok);
 }
 
-/// `jaccard4_neon` equals the scalar test for both argument orders over random and special
-/// boxes.
+/// `jaccard4_neon` equals the scalar test for both argument orders.
 #[test]
 fn jaccard4_matches_the_scalar_test() {
     let mut rng = Rng(0x2545_f491_4f6c_dd1d);
@@ -241,15 +237,14 @@ fn centre_size(b: [f32; 4], scale: f32) -> [f16; 4] {
         b[2] - b[0],
         b[3] - b[1],
     ];
-    // Signalling NaNs are quieted: the model's f64 detour would quiet them.
+    // Signalling NaNs are quieted.
     v.map(|x| if x.is_nan() { f16::NAN } else { h(x * scale) })
 }
 
-/// The FP16 kernel's test, one rounded operation at a time: every `+`, `−` and `×` of two f16
-/// values is exact in f64, so rounding that result to f16 rounds the exact result once.
+/// The FP16 kernel's test, each operation computed in f64 and rounded to f16.
 fn jaccard_f16(a: [f16; 4], b: [f16; 4], iou: f16) -> bool {
     let r = |x: f64| f16::from_f64(x).to_f64();
-    // `FMIN` and `FMAX` give NaN for a NaN operand, unlike `f64::min` and `f64::max`.
+    // `FMIN` and `FMAX`, which give NaN for a NaN operand.
     let nan = |x: f64, y: f64| x.is_nan() || y.is_nan();
     let fmin = |x: f64, y: f64| if nan(x, y) { f64::NAN } else { x.min(y) };
     let fmax = |x: f64, y: f64| if nan(x, y) { f64::NAN } else { x.max(y) };
@@ -290,9 +285,7 @@ fn kernel_fp16(boxes: &[[f16; 4]], iou: f16, cap: usize, pre_dead: &[bool]) -> V
     dead[..n].iter().map(|&d| d != 0).collect()
 }
 
-/// The FP16 kernel's flags equal a scalar greedy loop over the same rounded operations, for
-/// every tail up to 333 boxes, clustered, identical, zero-area, inverted, infinite and quiet-NaN
-/// boxes at scales from 1 to 64, six thresholds, four caps and pre-flagged boxes.
+/// The FP16 kernel's flags equal a scalar greedy loop over the same rounded operations.
 #[test]
 fn fp16_greedy_matches_the_rounded_scalar_loop() {
     if !std::arch::is_aarch64_feature_detected!("fp16") {
@@ -340,8 +333,7 @@ fn fp16_greedy_matches_the_rounded_scalar_loop() {
     assert_eq!(cases, counts.len() * 3 * ious.len() * 4);
 }
 
-/// On boxes whose overlaps are far from the threshold, the FP16 kernel flags the boxes the f32
-/// kernel flags.
+/// The FP16 kernel flags the boxes the f32 kernel flags when no overlap is near the threshold.
 #[test]
 fn fp16_agrees_with_f32_away_from_the_threshold() {
     if !std::arch::is_aarch64_feature_detected!("fp16") {
@@ -365,8 +357,7 @@ fn fp16_agrees_with_f32_away_from_the_threshold() {
     assert_eq!(fp16_dead.iter().filter(|&&d| !d).count(), 36);
 }
 
-/// Boxes narrower than the f16 spacing at their centre keep their extent: copies of one
-/// suppress each other, and neighbours one centre spacing apart do not.
+/// Boxes narrower than the f16 spacing at their centre keep their extent.
 #[test]
 fn fp16_keeps_the_extent_of_small_boxes_far_from_the_origin() {
     if !std::arch::is_aarch64_feature_detected!("fp16") {

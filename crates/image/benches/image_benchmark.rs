@@ -3,10 +3,7 @@
 
 //! Image processing benchmarks using the edgefirst-bench in-process harness.
 //!
-//! Divan runs each benchmark in a forked subprocess. On i.MX8MP this causes
-//! `corrupted double-linked list` crashes after GPU driver state is poisoned
-//! across the fork boundary. This harness runs all benchmarks sequentially in
-//! a single process with no forking.
+//! Runs all benchmarks sequentially in a single process with no forking.
 //!
 //! ## Run benchmarks (host)
 //! ```bash
@@ -32,10 +29,9 @@ use edgefirst_tensor::{
 };
 use std::sync::LazyLock;
 
-/// One-shot helper: peek header, allocate sized to image, decode into the
-/// source's native format, then convert to `format` (if different) via a
-/// headless CPU-backed processor. The codec emits the native format (JPEG →
-/// NV12/GREY, PNG → RGB/RGBA/GREY) and configures the tensor during decode.
+/// Peek the header, allocate a tensor sized to the image, decode into the
+/// source's native format (JPEG → NV12/GREY, PNG → RGB/RGBA/GREY), then
+/// convert to `format` (if different) with a CPU-backed processor.
 fn load_image_bench(
     data: &[u8],
     format: Option<PixelFormat>,
@@ -67,10 +63,6 @@ fn load_image_bench(
                 memory,
                 edgefirst_tensor::CpuAccess::ReadWrite,
             )?;
-            // `..Default::default()` is a real update on Linux (extra GL/G2D
-            // fields) but covers no remaining fields on macOS where `backend`
-            // is the only field — allow needless_update for cross-platform
-            // parity (matches sanity_check.rs and load_image_test_helper).
             #[allow(clippy::needless_update)]
             let mut proc = ImageProcessor::with_config(ImageProcessorConfig {
                 backend: ComputeBackend::Cpu,
@@ -86,7 +78,7 @@ fn load_image_bench(
 const WARMUP: usize = 10;
 const ITERATIONS: usize = 100;
 
-// Test data loaded at first access from testdata/ (see edgefirst_bench::testdata)
+// Test data, loaded at first access from testdata/.
 static CAMERA_1080P_RGBA: LazyLock<Vec<u8>> =
     LazyLock::new(|| edgefirst_bench::testdata::read("camera1080p.rgba"));
 static CAMERA_4K_RGBA: LazyLock<Vec<u8>> =
@@ -99,9 +91,7 @@ static CAMERA_4K_RGBA: LazyLock<Vec<u8>> =
 fn bench_load(suite: &mut BenchSuite) {
     println!("\n== Load: JPEG to Memory Backends ==\n");
 
-    // Load baseline JPEG test images to Mem backend in PixelFormat::Rgba.
-    // (person.jpg is progressive JPEG and is intentionally not exercised by
-    // this benchmark — the codec supports baseline only.)
+    // Load baseline JPEG test images to the Mem backend in PixelFormat::Rgba.
     for name in &["jaguar.jpg", "giraffe.jpg", "zidane.jpg"] {
         let path = find_testdata_path(name);
         let bench_name = format!("load/mem/RGBA/{}", name.strip_suffix(".jpg").unwrap());
@@ -297,11 +287,8 @@ fn bench_convert(proc: &mut ImageProcessor, suite: &mut BenchSuite) {
             CAMERA_1080P_RGBA.as_slice(),
             4,
         ),
-        // RGBA→BGRA and RGBA→GREY are the issue #106 drift sentinels: the
-        // 2026-06 capture found them +79%/+91% over the v0.15.0 doc numbers
-        // on Vivante while other boards held, and the cells had meanwhile
-        // dropped out of this bench — keep them measurable so same-size
-        // swizzle/extraction drift can never go unnoticed again.
+        // RGBA→BGRA and RGBA→GREY measure the same-size swizzle and
+        // extraction converts.
         (
             PixelFormat::Rgba,
             PixelFormat::Bgra,
@@ -509,9 +496,7 @@ fn run_hires_configs(
     configs: &[BenchConfig],
     prefix: &str,
 ) {
-    // Pre-create source images for each input format used in these configs.
-    // We need PixelFormat::Yuyv, PixelFormat::Rgba, and PixelFormat::Rgb sources at the resolution of the first config
-    // (all configs in a batch share the same input resolution).
+    // Pre-create a source image for each input format, at the first config's input resolution.
     let (src_w, src_h) = (configs[0].in_w, configs[0].in_h);
 
     // PixelFormat::Yuyv source
@@ -649,7 +634,7 @@ fn bench_import(proc: &ImageProcessor, suite: &mut BenchSuite) {
         ];
 
         for &(w, h, fmt, name) in configs {
-            // Allocate a DMA-backed tensor to obtain a valid DMA-BUF fd.
+            // Allocate a DMA-backed tensor for its DMA-BUF fd.
             let Ok(src_tensor) = TensorDyn::image(
                 w,
                 h,

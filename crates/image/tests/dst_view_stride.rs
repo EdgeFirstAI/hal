@@ -1,35 +1,16 @@
 // SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! `convert()` into a `Tensor::view()` destination must render into that
-//! sub-rectangle of the parent — every output row at the **parent's** row
-//! pitch, and nothing written outside the view region.
+//! `convert()` into a `Tensor::view()` destination renders into that
+//! sub-rectangle of the parent: every output row at the parent's row pitch,
+//! and nothing written outside the view region.
 //!
-//! `Tensor::view`'s own contract says "`convert(src, &mut dst.view(rect), …)`
-//! renders into that sub-rectangle of `dst`". A view of a parent that is
-//! *taller* than the view has the same pitch as the view, so a tightly-packed
-//! writer happens to land correctly; a parent that is **wider** does not, and a
-//! tight writer packs the whole output into the head of the parent buffer as a
-//! short full-width band.
+//! Every case pre-fills the parent with a poison byte and asserts that the
+//! view region matches an identical convert into an exact-sized standalone
+//! tensor and that every parent byte outside the view region is still poison.
 //!
-//! Every case here pre-fills the parent with a poison byte and asserts three
-//! things: the view region matches an identical convert into an exact-sized
-//! standalone tensor, every parent byte outside the view region is still
-//! poison, and (implied by the first two) each output row landed at the parent
-//! pitch rather than the view's tight width.
-//!
-//! **Planar destinations are out of scope by construction**: `Tensor::view`
-//! rejects non-packed layouts (`PlanarRgb`/`PlanarRgba`/the NV family), so a
-//! planar dst view cannot be built at all. The planar writers take their pitch
-//! from `tensor_row_stride(dst)` already; `padded_planar_dst_honours_stride`
-//! guards that seam with an explicitly strided (not viewed) planar tensor.
-//!
-//! `gl_padded_dst_rows_land_at_the_declared_stride` makes the same claim of the
-//! GL engine, whose readback packs its rows tightly and so has to re-space them
-//! to the destination's pitch.
-//! `gl_padded_pbo_dst_rows_land_at_the_declared_stride` makes it of the PBO
-//! readback, which reaches its destination through `glReadPixels` into a PACK
-//! buffer and `glMapBufferRange` instead of the tensor's map.
+//! Planar destinations are reached with a padded-stride tensor, and the GL and
+//! PBO readbacks with a declared row stride.
 
 #[cfg(all(
     any(
@@ -51,9 +32,7 @@ use edgefirst_tensor::{
 #[allow(dead_code)]
 mod outcome;
 
-/// Byte the parent buffer is pre-filled with; any of these left inside the view
-/// region means the convert under-wrote, any byte outside that is *not* poison
-/// means it over-wrote.
+/// Byte the parent buffer is pre-filled with.
 const POISON: u8 = 0xAB;
 
 const SRC_W: usize = 16;
@@ -73,8 +52,7 @@ fn mem_image(w: usize, h: usize, fmt: PixelFormat) -> TensorDyn {
     .expect("allocate image")
 }
 
-/// A deterministic, non-uniform source image: every byte is a function of its
-/// offset, so a mis-strided write cannot coincidentally match.
+/// A deterministic, non-uniform source image: every byte is a function of its offset.
 fn make_src(w: usize, h: usize, fmt: PixelFormat) -> TensorDyn {
     let mut t = mem_image(w, h, fmt);
     {
@@ -124,7 +102,7 @@ fn assert_view_dst_matches_standalone(
         .effective_row_stride()
         .expect("reference has a stride");
 
-    // Subject: the same convert into a view of a WIDER parent.
+    // Subject: the same convert into a view of a wider parent.
     let mut parent = mem_image(PARENT_W, PARENT_H, dst_fmt);
     fill(&mut parent, POISON);
     let parent_stride = parent.effective_row_stride().expect("parent has a stride");
@@ -150,8 +128,7 @@ fn assert_view_dst_matches_standalone(
     let row_bytes = region.width * bpp;
     let x_off = region.x * bpp;
 
-    // (a) + (c): each output row sits at the parent pitch and matches the
-    // standalone convert's corresponding row.
+    // Each output row sits at the parent pitch and matches the standalone convert's row.
     for row in 0..region.height {
         let start = (region.y + row) * parent_stride + x_off;
         let got_row = &got[start..start + row_bytes];
@@ -163,7 +140,7 @@ fn assert_view_dst_matches_standalone(
         );
     }
 
-    // (b): nothing outside the view region was touched.
+    // Nothing outside the view region was touched.
     for y in 0..PARENT_H {
         for x in 0..PARENT_W * bpp {
             let inside = y >= region.y
@@ -187,8 +164,7 @@ fn full_view() -> Region {
     Region::new(0, 0, SRC_W, SRC_H)
 }
 
-/// The downstream-reported case: a packed RGB source, an RGBA view of a wider
-/// parent, identity scale.
+/// A packed RGB source into an RGBA view of a wider parent, at identity scale.
 #[test]
 fn rgb_to_rgba_view_of_wider_parent() {
     let src = make_src(SRC_W, SRC_H, PixelFormat::Rgb);
@@ -201,7 +177,7 @@ fn rgb_to_rgba_view_of_wider_parent() {
     );
 }
 
-/// Semi-planar source into a packed view — the JPEG-decode → tile shape.
+/// Semi-planar source into a packed view.
 #[test]
 fn nv12_to_rgba_view_of_wider_parent() {
     let src = make_src(SRC_W, SRC_H, PixelFormat::Nv12);
@@ -214,7 +190,7 @@ fn nv12_to_rgba_view_of_wider_parent() {
     );
 }
 
-/// 3-byte packed destination: a different bpp, and a different writer.
+/// 3-byte packed destination.
 #[test]
 fn nv12_to_rgb_view_of_wider_parent() {
     let src = make_src(SRC_W, SRC_H, PixelFormat::Nv12);
@@ -227,9 +203,7 @@ fn nv12_to_rgb_view_of_wider_parent() {
     );
 }
 
-/// `Rgba → Rgba` and `Rgb → Rgb` take the whole-buffer `copy_image` path, which
-/// compares total mapped lengths — a view maps `parent_stride × rows`, so this
-/// is the latent `InvalidShape` case rather than a mis-write.
+/// `Rgba → Rgba` and `Rgb → Rgb`, which take the whole-buffer `copy_image` path.
 #[test]
 fn rgba_to_rgba_view_of_wider_parent() {
     let src = make_src(SRC_W, SRC_H, PixelFormat::Rgba);
@@ -267,8 +241,7 @@ fn rgba_to_rgb_view_of_wider_parent() {
     );
 }
 
-/// BGRA destination: converts to RGBA and then swizzles R/B across the mapped
-/// buffer — the swizzle must not reach the parent pixels beside the view.
+/// BGRA destination: the R/B swizzle stays inside the view.
 #[test]
 fn rgb_to_bgra_view_of_wider_parent() {
     let src = make_src(SRC_W, SRC_H, PixelFormat::Rgb);
@@ -320,8 +293,7 @@ fn yuyv_to_rgb_view_of_wider_parent() {
     );
 }
 
-/// A view that is not at the parent origin — the tile shape a real SAHI grid
-/// produces. Exercises the `plane_offset` path as well as the pitch.
+/// A view that is not at the parent origin.
 #[test]
 fn rgb_to_rgba_offset_view_of_wider_parent() {
     let src = make_src(SRC_W, SRC_H, PixelFormat::Rgb);
@@ -334,8 +306,7 @@ fn rgb_to_rgba_offset_view_of_wider_parent() {
     );
 }
 
-/// A genuine resize into a view destination: the resize writes the scaled
-/// rect and (for a format change) a final convert copies it into `dst`.
+/// A resize into a view destination.
 #[test]
 fn scaled_rgb_to_rgba_view_of_wider_parent() {
     let src = make_src(SRC_W / 2, SRC_H / 2, PixelFormat::Rgb);
@@ -348,7 +319,7 @@ fn scaled_rgb_to_rgba_view_of_wider_parent() {
     );
 }
 
-/// Scaled NV12 source — the resize path with a semi-planar input.
+/// Scaled NV12 source into a view destination.
 #[test]
 fn scaled_nv12_to_rgba_view_of_wider_parent() {
     let src = make_src(SRC_W / 2, SRC_H / 2, PixelFormat::Nv12);
@@ -361,9 +332,7 @@ fn scaled_nv12_to_rgba_view_of_wider_parent() {
     );
 }
 
-/// A letterbox fit clears the destination to the pad colour and renders the
-/// aspect-preserved content into its inner region — for a view destination the
-/// clear must stay inside the view, not paint the parent.
+/// A letterbox fit into a view: the pad clear stays inside the view.
 #[test]
 fn letterbox_rgb_to_rgba_view_of_wider_parent() {
     // 16x4 source into a 16x8 view: a horizontal pad band above and below.
@@ -377,8 +346,7 @@ fn letterbox_rgb_to_rgba_view_of_wider_parent() {
     );
 }
 
-/// Fill a typed tensor with an out-of-band value, so any byte the convert
-/// leaves alone is distinguishable from a value it could legitimately write.
+/// Fill a typed tensor with an out-of-band value.
 fn poison(t: &mut TensorDyn) {
     match t {
         TensorDyn::I8(t) => t.map_mut().unwrap().as_mut_slice().fill(-91),
@@ -392,8 +360,7 @@ fn poison(t: &mut TensorDyn) {
     }
 }
 
-/// The mapped element bytes of a typed tensor, little-endian, so rows of any
-/// dtype can be compared at a byte pitch.
+/// The mapped element bytes of a typed tensor, little-endian.
 fn raw_bytes(t: &TensorDyn) -> Vec<u8> {
     match t {
         TensorDyn::I8(t) => t
@@ -421,9 +388,8 @@ fn raw_bytes(t: &TensorDyn) -> Vec<u8> {
     }
 }
 
-/// Non-`u8` destinations run the same convert into a scratch and then widen /
-/// bias into `dst`; that final write is the same seam and must also be
-/// row-confined. Compared against an exact-sized standalone convert.
+/// Convert into a non-`u8` view destination and compare against an exact-sized
+/// standalone convert.
 fn assert_typed_view_dst_matches_standalone(label: &str, dtype: DType, elem: usize) {
     let mut cpu = CPUProcessor::new();
     let src = make_src(SRC_W, SRC_H, PixelFormat::Rgb);
@@ -501,9 +467,7 @@ fn rgb_to_f16_rgba_view_of_wider_parent() {
     assert_typed_view_dst_matches_standalone("rgb→f16 rgba", DType::F16, 2);
 }
 
-/// `Tensor::view` cannot express a planar sub-rectangle, so the planar writers
-/// are reached with a padded (strided) standalone tensor instead. They take
-/// their pitch from the tensor's row stride already; this pins that.
+/// A planar convert into a padded-stride tensor lands each row at the declared stride.
 #[test]
 fn padded_planar_dst_honours_stride() {
     let src = make_src(SRC_W, SRC_H, PixelFormat::Nv12);
@@ -517,8 +481,8 @@ fn padded_planar_dst_honours_stride() {
          succeeding, planar dst views need their own coverage here"
     );
 
-    // `image_with_stride` is DMA/Linux-only, so build the padded planar tensor
-    // by allocating at the padded width and re-declaring the logical geometry.
+    // Builds the padded planar tensor by allocating at the padded width and
+    // re-declaring the logical geometry.
     let stride = PARENT_W * 4;
     let mut padded = mem_image(stride, SRC_H, PixelFormat::PlanarRgb);
     fill(&mut padded, POISON);
@@ -544,21 +508,7 @@ fn padded_planar_dst_honours_stride() {
     }
 }
 
-/// The GL engine's readback has to land each output row at the destination's
-/// own pitch, exactly as the CPU writers above do.
-///
-/// `glReadPixels` packs its rows at `width * channels` whatever pitch the
-/// destination has, and the Mem readback wrote that block straight into the
-/// map — so a destination carrying a `row_stride` (a D3D11 staging texture on
-/// Windows, an IOSurface, any padded allocation) got a tight frame in a padded
-/// window and every row after the first landed short. It reproduces on any
-/// platform through a declared stride; on a discrete NVIDIA adapter it is what
-/// `tests/pin_convert.rs` caught, because the D3D11 staging pitch there is
-/// 128-byte aligned while the software adapter's is tight.
-///
-/// `Rgba` covers the direct `glReadPixels` branch and `Rgb`/`Grey` the
-/// RGBA-scratch repack ANGLE forces, because the two write the destination by
-/// different routes.
+/// The GL readback lands each output row at the declared stride, for `Rgba`, `Rgb` and `Grey`.
 #[test]
 fn gl_padded_dst_rows_land_at_the_declared_stride() {
     let src = make_src(SRC_W, SRC_H, PixelFormat::Rgba);
@@ -566,8 +516,7 @@ fn gl_padded_dst_rows_land_at_the_declared_stride() {
 
     for dst_fmt in [PixelFormat::Rgba, PixelFormat::Rgb, PixelFormat::Grey] {
         let bpp = dst_fmt.channels();
-        // Same construction as `padded_planar_dst_honours_stride`: allocate at
-        // the padded width, then re-declare the logical geometry and the pitch.
+        // Allocates at the padded width, then re-declares the logical geometry and the pitch.
         let stride = PARENT_W * bpp;
         let mut padded = mem_image(PARENT_W, SRC_H, dst_fmt);
         fill(&mut padded, POISON);
@@ -600,13 +549,6 @@ fn gl_padded_dst_rows_land_at_the_declared_stride() {
             );
         }
 
-        // A CPU fallback would exercise the stride-aware CPU writers and pass
-        // without the GL readback ever running. `Rgba` is the first format, so
-        // the count here covers only its two converts. Asserted where the lane
-        // declares a GL backend must come up -- the same `HAL_TEST_REQUIRE_GL`
-        // flag `gl_backend_available_canary` gates on -- so a host with no GL
-        // stack still runs the assertions above rather than failing on their
-        // absence, with the count reported below.
         if dst_fmt == PixelFormat::Rgba
             && std::env::var("HAL_TEST_REQUIRE_GL").is_ok_and(|v| v == "1")
         {
@@ -619,9 +561,6 @@ fn gl_padded_dst_rows_land_at_the_declared_stride() {
         }
     }
 
-    // A vacuous pass is visible in the log rather than silent: a non-zero count
-    // means the convert fell back to the CPU backend, which has its own
-    // stride-aware writers and never exercises the GL readback.
     use std::io::Write;
     let _ = writeln!(
         &mut std::io::stderr(),
@@ -642,21 +581,7 @@ fn gl_padded_dst_rows_land_at_the_declared_stride() {
 ))]
 use outcome::report_skip as skip;
 
-/// The PBO readback has to land each output row at the destination's pitch
-/// too, and it reaches the destination by routes of its own: `glReadPixels`
-/// into the PBO's PACK binding for the RGBA pair, and the RGBA-scratch repack
-/// ANGLE forces for `Rgb`/`Grey`, each writing through `glMapBufferRange` on
-/// the GL thread rather than through the tensor's map.
-///
-/// `PARENT_W * bpp` is a whole number of pixels for every format, the kind of
-/// pitch `GL_PACK_ROW_LENGTH` can express; `PARENT_W * bpp + 1` is not for the
-/// RGBA pair, so those rows have to be read tight and moved afterwards, as the
-/// Mem readback moves them. `Bgra` adds the R/B swap on top of each route.
-///
-/// A `GLProcessorThreaded` is driven directly: `ImageProcessor::create_image`
-/// prefers a D3D11 texture on Windows, and only the GL processor can allocate
-/// a PBO, so this is the one way to put a PBO destination in front of the
-/// readback. There is no CPU fallback that could pass in its place.
+/// The PBO readback lands each output row at the declared stride, whole-pixel or not.
 #[cfg(all(
     any(
         target_os = "linux",
@@ -699,10 +624,7 @@ fn gl_padded_pbo_dst_rows_land_at_the_declared_stride() {
         let stride = PARENT_W * bpp + extra;
         let label = format!("{dst_fmt:?} at a {stride} B pitch");
 
-        // Allocate wide and one row tall of spare, then re-declare the logical
-        // geometry and the pitch, as the Mem test does. The spare row is for
-        // the tensor's own map, which spans `stride * rows` and the odd pitch
-        // pushes past a `PARENT_W x SRC_H` allocation.
+        // Allocates wide with one spare row, then re-declares the logical geometry and the pitch.
         let mut padded = gl
             .create_pbo_image(PARENT_W, SRC_H + 1, dst_fmt)
             .unwrap_or_else(|e| panic!("{label}: a PBO on a live GL context: {e}"));
@@ -715,9 +637,8 @@ fn gl_padded_pbo_dst_rows_land_at_the_declared_stride() {
         gl.convert(&src, &mut padded, None)
             .unwrap_or_else(|e| panic!("{label}: padded convert failed: {e}"));
 
-        // A tight PBO of the same render is the row oracle, and the Mem
-        // readback of the same render checks that the tight PBO route itself
-        // still lands the frame where it always did.
+        // A tight PBO of the same render is the row reference; it is also
+        // compared with the Mem readback.
         let mut reference = TensorDyn::from(
             gl.create_pbo_image(SRC_W, SRC_H, dst_fmt)
                 .unwrap_or_else(|e| panic!("{label}: tight PBO: {e}")),
@@ -749,35 +670,12 @@ fn gl_padded_pbo_dst_rows_land_at_the_declared_stride() {
                 &want[row * row_bytes..row * row_bytes + row_bytes],
                 "{label}: row {row} did not land at the {stride} B pitch"
             );
-            // The bytes between this row's pixels and the next row are the
-            // destination's padding, and no route promises them: a driver
-            // packing rows at `GL_PACK_ROW_LENGTH` may write them (Vivante
-            // does, issue #167), and the read-tight-and-spread route leaves
-            // the tight read's leftovers there. So this test asserts one
-            // thing, the pixel bytes of every row at the declared pitch,
-            // above. That nothing lands past `needed` is `plan_pbo_readback`'s
-            // invariant, unit-tested there, NOT something asserted here; the
-            // spare row this test allocates is what keeps a written last-row
-            // pad inside the buffer either way.
+            // The padding bytes between rows are not asserted.
         }
     }
 }
 
-/// A PBO destination that is a `view()` of a wider parent is refused, not
-/// filled from the top of the parent's buffer.
-///
-/// The PBO readback writes at buffer offset 0 and bounds itself on the whole
-/// allocation, so a sub-region destination would land as a full-width band at
-/// the head of the parent -- the same corruption the CPU cases in this file
-/// exist to prevent, with no error to show for it. `convert` declines view
-/// destinations in `convert_inner`; the overlay `render` paths decline them
-/// in `check_draw_dst_placement`, which covers the zero-copy arm as well as
-/// this one, and the readback keeps its own guard (`plan_pbo_readback`) at
-/// the place that actually holds the offset-0 assumption. This test comes in
-/// through an overlay.
-///
-/// `draw_decoded_masks` with no detections still writes the destination (the
-/// cleared frame), which is exactly the write that must not happen here.
+/// An overlay draw into a PBO `view()` destination is refused and leaves the parent untouched.
 #[cfg(all(
     any(
         target_os = "linux",

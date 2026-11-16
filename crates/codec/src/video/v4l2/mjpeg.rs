@@ -1,12 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! MJPEG decoding on the V4L2 JPEG decoder (i.MX `mxc-jpeg`).
+//! MJPEG decoding on the V4L2 JPEG decoder.
 //!
 //! Each picture is a JPEG of its own, decoded on the hardware by the image
 //! path's V4L2 backend into a tensor of the pool, so there is no reordering
-//! and nothing to drain. A picture the hardware cannot decode is an error:
-//! MJPEG is a video codec, which HAL does not decode on the CPU.
+//! and nothing to drain. A picture the hardware cannot decode is an error.
 
 use std::sync::Arc;
 
@@ -88,8 +87,8 @@ impl V4l2MjpegDecoder {
                     )
                 })
                 .collect::<std::result::Result<Vec<_>, _>>()?,
-            // Provided tensors are kept across sizes: each decode configures
-            // its tensor to the picture, within the tensor's capacity.
+            // Provided tensors are kept across sizes; each decode configures
+            // its tensor to the picture.
             OutputPool::Provided(pool) if !pool.is_empty() => std::mem::take(pool),
             OutputPool::Provided(_) => {
                 let held = self
@@ -124,8 +123,7 @@ impl V4l2MjpegDecoder {
             buffers: self.pool.len(),
             memory: OutputMemory::Imported,
             engine: Engine::V4l2,
-            // Set from the first picture, which shows where the hardware
-            // writes.
+            // Replaced once the first picture is decoded.
             transfer: Transfer::ZeroCopy,
         })
     }
@@ -143,8 +141,7 @@ impl DecoderBackend for V4l2MjpegDecoder {
             .info
             .as_ref()
             .is_some_and(|i| (i.width, i.height, i.format) == (w, h, format));
-        // A picture that then fails to decode leaves `info` as it was, so
-        // the next picture of this size reports the new pool.
+        // Reconfigure the pool when the picture's size or format differs.
         let reconfigured = if same {
             None
         } else {
@@ -162,8 +159,8 @@ impl DecoderBackend for V4l2MjpegDecoder {
             self.free.push(slot);
             return Err(e);
         }
-        // The hardware writes straight into a tensor it can take as its
-        // capture buffer; otherwise the picture is copied out of its own.
+        // Zero-copy when the hardware wrote into the tensor; otherwise the
+        // picture was copied out of the decoder's own buffer.
         let transfer = if self.decoder.v4l2_wrote_in_place() {
             Transfer::ZeroCopy
         } else {

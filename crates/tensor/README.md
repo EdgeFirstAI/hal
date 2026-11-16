@@ -109,11 +109,7 @@ For anything past the four common parameters â€” notably a compression request â
 
 ## DMA Images Carry a 64-Byte-Aligned Row Stride
 
-Every DMA-backed image tensor has a 64-byte-aligned row stride, in packed,
-planar, and semi-planar layouts alike. This is not a tuning choice: Mali
-rejects an `eglCreateImage` DMA-BUF import at an unaligned pitch with
-`EGL_BAD_ALLOC`, and Vivante with `EGL_BAD_ACCESS`. Neither error mentions the
-stride, which is what makes the bug expensive to find.
+Every DMA-backed image tensor has a 64-byte-aligned row stride, in packed, planar, and semi-planar layouts alike. Mali rejects an `eglCreateImage` DMA-BUF import at an unaligned pitch with `EGL_BAD_ALLOC`, and Vivante with `EGL_BAD_ACCESS`; neither error mentions the stride.
 
 The alignment holds in both `image()` (allocation) and `configure_image()`
 (reconfiguring a pooled tensor for a new geometry). If you touch either path,

@@ -3,9 +3,8 @@
 
 //! Instance masks, proto dequantize, conversions and threshold on every tier this CPU has.
 //!
-//! Masks on a NEON tier are within 1 of the scalar tier (the integer logits are exact, so only
-//! the sigmoid differs; float logits also differ in summation order). The scalar tier's quantized
-//! masks equal an ndarray `mapv` + `dot` reference bit for bit. Conversions and the threshold are
+//! Masks on a NEON tier are within 1 of the scalar tier. The scalar tier's quantized masks equal
+//! an ndarray `mapv` + `dot` reference bit for bit. Conversions and the threshold are
 //! bit-identical on every tier.
 
 use half::f16;

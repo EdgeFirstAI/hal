@@ -8,11 +8,10 @@
 //! platform, and [`capabilities`] lists what the engines here can do.
 //!
 //! This crate provides the [`ImageDecoder`] struct and [`ImageLoad`] extension
-//! trait for decoding image files directly into existing tensor buffers —
-//! including DMA-BUF tensors with GPU-aligned pitch padding. The core design
-//! goal is **allocate once, decode many**: users create a tensor at the maximum
-//! expected image size during program initialisation, then call
-//! [`ImageLoad::load_image`] in the hot loop with zero per-frame allocations.
+//! trait for decoding image files into existing tensor buffers, including
+//! DMA-BUF tensors with GPU-aligned pitch padding. A tensor allocated at the
+//! maximum expected image size is reused by [`ImageLoad::load_image`] for
+//! every image.
 //!
 //! # Quick Start
 //!
@@ -20,15 +19,13 @@
 //! use edgefirst_codec::{ImageDecoder, ImageLoad};
 //! use edgefirst_tensor::{CpuAccess, Tensor, TensorTrait, TensorMemory, PixelFormat};
 //!
-//! // Allocate once (at init), sized for the largest expected image. The
-//! // decoder CPU-writes the pixels: declare `CpuAccess::Write`.
+//! // Allocate once, sized for the largest expected image.
 //! let mut tensor = Tensor::<u8>::image(1920, 1080, PixelFormat::Nv12, Some(TensorMemory::Mem),
 //!                                       CpuAccess::Write)
 //!     .expect("allocation");
 //! let mut decoder = ImageDecoder::new();
 //!
-//! // Decode many (in hot loop). The decoder sets the tensor's dimensions and
-//! // native format (JPEG → Nv12/Grey); call `convert()` for RGB.
+//! // Decode. The decoder sets the tensor's dimensions and native format.
 //! let jpeg_bytes = std::fs::read("frame.jpg").unwrap();
 //! let info = tensor.load_image(&mut decoder, &jpeg_bytes).expect("decode");
 //! assert!(info.width <= 1920);
@@ -37,18 +34,16 @@
 //!
 //! # Performance
 //!
-//! For best performance, allocate tensors via
+//! Tensors allocated with
 //! [`ImageProcessor::create_image()`](https://docs.rs/edgefirst-image/latest/edgefirst_image/struct.ImageProcessor.html#method.create_image)
-//! which selects the optimal memory backend (DMA → PBO → Mem) with
-//! GPU-aligned pitch. Free-standing tensors work but cannot use PBO
-//! and may not have aligned pitch.
+//! use the platform's memory backend (DMA → PBO → Mem) with GPU-aligned
+//! pitch. Free-standing tensors cannot use PBO and may not have aligned
+//! pitch.
 //!
 //! # Strided Buffers
 //!
-//! The decoder respects `effective_row_stride()` on the destination tensor.
-//! When a DMA tensor has GPU-aligned pitch padding, decoded pixel rows are
-//! written at the correct stride offsets — no intermediate contiguous buffer
-//! is exposed to the caller.
+//! The decoder respects `effective_row_stride()` on the destination tensor:
+//! decoded pixel rows are written at the tensor's stride offsets.
 
 mod decoder;
 mod encoder;
@@ -73,13 +68,11 @@ pub use options::ImageInfo;
 pub use pixel::ImagePixel;
 pub use traits::ImageLoad;
 
-/// Returns `true` when the nvJPEG GPU JPEG decoder is available at runtime —
-/// Linux with CUDA + libnvjpeg loaded **and** opted in via
-/// `EDGEFIRST_ENABLE_NVJPEG` (off by default, so it never silently contends with
-/// CUDA inference). When `true` the codec prefers it over the V4L2/CPU backends
-/// for CUDA-backed destinations. Always `false` on other platforms or when the
-/// `nvjpeg` feature is disabled. Useful for benchmarks and consumers that branch
-/// on backend availability.
+/// Returns `true` when the nvJPEG GPU JPEG decoder is available at runtime:
+/// Linux with CUDA and libnvjpeg loaded, and opted in via
+/// `EDGEFIRST_ENABLE_NVJPEG` (off by default). When `true` the codec prefers
+/// it over the V4L2/CPU backends for CUDA-backed destinations. Always `false`
+/// on other platforms or when the `nvjpeg` feature is disabled.
 pub fn nvjpeg_available() -> bool {
     #[cfg(all(target_os = "linux", feature = "nvjpeg"))]
     {
@@ -91,12 +84,10 @@ pub fn nvjpeg_available() -> bool {
     }
 }
 
-/// Returns `true` when a V4L2 memory-to-memory JPEG decoder (e.g. the i.MX
-/// mxc-jpeg block) is present and not opted out via `EDGEFIRST_DISABLE_V4L2`.
-/// Opens and drops the device once; the decode path re-probes lazily and
-/// keeps its own context. Always `false` on other platforms or when the
-/// `v4l2` feature is disabled. Useful for benchmarks and consumers that must
-/// fail fast instead of silently falling back to the CPU decoder.
+/// Returns `true` when a V4L2 memory-to-memory JPEG decoder is present and
+/// not opted out via `EDGEFIRST_DISABLE_V4L2`. Opens and drops the device
+/// once. Always `false` on other platforms or when the `v4l2` feature is
+/// disabled.
 pub fn v4l2_available() -> bool {
     #[cfg(all(target_os = "linux", feature = "v4l2"))]
     {

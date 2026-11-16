@@ -125,8 +125,7 @@ fn each_mjpeg_picture_matches_the_cpu_decoder() {
     }
 }
 
-/// Cameras send 4:2:2 MJPEG; the decoders return NV12 for it where they
-/// decode it at all.
+/// A 4:2:2 MJPEG picture decodes to NV12 or is refused.
 #[test]
 fn a_4_2_2_mjpeg_picture_decodes_to_nv12_or_is_refused() {
     const TEST: &str = "a_4_2_2_mjpeg_picture_decodes_to_nv12_or_is_refused";

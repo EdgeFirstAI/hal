@@ -77,9 +77,7 @@ pub fn opengl_available() -> bool {
 /// Locate a test file in the testdata directory, handling different working
 /// directories.
 pub fn find_testdata_path(filename: &str) -> std::path::PathBuf {
-    // Honor EDGEFIRST_TESTDATA_DIR first (matches the test harness), so
-    // on-target bench runs can point at a deployed testdata dir without a
-    // CWD-relative symlink.
+    // Honor EDGEFIRST_TESTDATA_DIR first.
     if let Ok(dir) = std::env::var("EDGEFIRST_TESTDATA_DIR") {
         let path = Path::new(&dir).join(filename);
         if path.exists() {
@@ -255,13 +253,11 @@ pub static CAMERA_4K_RGB: LazyLock<Vec<u8>> =
     LazyLock::new(|| edgefirst_bench::testdata::read("camera4k.rgb"));
 
 // NV16 is 4:2:2 semi-planar: Y plane (W*H) + interleaved UV plane (W*H).
-// No real capture file available; synthetic mid-gray data is sufficient for
-// throughput benchmarks.
+// Synthetic mid-gray data.
 static CAMERA_1080P_NV16: LazyLock<Vec<u8>> = LazyLock::new(|| vec![128u8; 1920 * 1080 * 2]);
 
-// RGBA synthetic data for format conversion benchmarks (e.g. RGBA -> BGRA,
-// RGBA -> GREY). No real capture file needed; mid-gray is sufficient for
-// throughput measurement.
+// RGBA synthetic mid-gray data for format conversion benchmarks (e.g. RGBA ->
+// BGRA, RGBA -> GREY).
 static CAMERA_1080P_RGBA: LazyLock<Vec<u8>> = LazyLock::new(|| vec![128u8; 1920 * 1080 * 4]);
 
 /// Get embedded test data for a given resolution and format.

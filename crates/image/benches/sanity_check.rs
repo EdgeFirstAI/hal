@@ -3,9 +3,8 @@
 
 //! Adaptive sanity check for letterbox format combinations.
 //!
-//! Each test runs in a forked child process with a 30-second alarm timeout
-//! to detect GPU hangs without blocking the parent. Results are reported
-//! via exit code and a small result file.
+//! Each test runs in a forked child process with a 30-second alarm timeout.
+//! Results are reported through a pipe.
 //!
 //! - Run 1 iteration first
 //! - If >100ms, run 10 more iterations
@@ -19,9 +18,7 @@
 //! EDGEFIRST_FORCE_BACKEND=g2d ./sanity_check
 //! ```
 //!
-//! The fork / pipe / alarm machinery is POSIX-only, so the whole bench is
-//! Unix-only; on Windows the binary prints a message and exits (the crate's
-//! benches are compiled by `--all-targets` there).
+//! Unix-only; on Windows the binary prints a message and exits.
 
 #[cfg(unix)]
 mod common;
@@ -64,8 +61,6 @@ mod unix_impl {
         // Set alarm for GPU hang detection
         unsafe { libc::alarm(TIMEOUT_SECS) };
 
-        // `needless_update` fires on macOS where `ImageProcessorConfig` has only
-        // `backend`, but on Linux the struct also has the cfg-gated `egl_display`.
         #[allow(clippy::needless_update)]
         let ipc_config = ImageProcessorConfig {
             backend,
@@ -111,7 +106,6 @@ mod unix_impl {
             }
         };
 
-        // Letterbox placement is derived internally by `Crop::resolve`.
         let crop = Crop::letterbox([114, 114, 114, 255]);
 
         // Stage 1: single iteration
@@ -174,7 +168,7 @@ mod unix_impl {
         use std::os::unix::io::FromRawFd;
         let mut f = unsafe { std::fs::File::from_raw_fd(fd) };
         let _ = f.write_all(msg.as_bytes());
-        // Don't drop f — it'll close the fd, which is what we want
+        // Dropping `f` closes the fd.
     }
 
     /// Fork a child, run the test, collect results with timeout.
@@ -370,17 +364,16 @@ mod unix_impl {
             ]
         };
 
-        // Test safe combos first, known GPU-hang combos last (PixelFormat::Nv12→planar on Vivante).
-        // Each (input, output) pair — ordered so GPU-hang candidates are last.
+        // Each (input, output) pair, with the Nv12 → planar combination last.
         let test_combos: Vec<(PixelFormat, PixelFormat)> = vec![
-            // Yuyv sources — all safe on Vivante
+            // Yuyv sources
             (PixelFormat::Yuyv, PixelFormat::Rgba),
             (PixelFormat::Yuyv, PixelFormat::Rgb),
             (PixelFormat::Yuyv, PixelFormat::PlanarRgb),
-            // Nv12 sources — packed/Rgba are safe, planar may hang
+            // Nv12 sources
             (PixelFormat::Nv12, PixelFormat::Rgba),
             (PixelFormat::Nv12, PixelFormat::Rgb),
-            // Nv12 → planar: KNOWN GPU HANG RISK on Vivante GC7000UL
+            // Nv12 → planar
             (PixelFormat::Nv12, PixelFormat::PlanarRgb),
         ];
         let resolutions = [(1920, 1080, "1080p"), (1280, 720, "720p")];

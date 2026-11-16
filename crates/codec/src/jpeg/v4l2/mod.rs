@@ -3,36 +3,28 @@
 
 //! Optional V4L2 hardware JPEG-decoder backend (Linux only).
 //!
-//! When a Linux device exposes a JPEG decoder through the standard V4L2
-//! mem2mem API, this backend offloads the decode to hardware, emitting the
-//! codec's native `NV12`/`GREY` directly. It is probed lazily and entirely
-//! capability-based, so it is portable across SoCs; anything it cannot drive
-//! transparently falls back to the existing software decoder.
+//! Decodes JPEG through a V4L2 mem2mem device, emitting the codec's native
+//! `NV12`/`GREY`. The device is probed lazily by capability; anything it
+//! cannot drive falls back to the software decoder.
 //!
-//! Targets multi-planar M2M devices (the lead target, i.MX `mxc-jpeg`) with a
-//! persistent streaming session. The OUTPUT (coded) buffer is allocated once
-//! with headroom and survives geometry changes; the CAPTURE side is always
-//! `V4L2_MEMORY_DMABUF`, where `REQBUFS` is allocation-free bookkeeping, so a
-//! geometry change costs ~1 ms of ioctls instead of the ~110 ms CMA
-//! allocate-and-map that `V4L2_MEMORY_MMAP` pays (there is no cheap MMAP
-//! alternative: `S_FMT` returns `EBUSY` while MMAP buffers exist on a queue).
-//! A hardware failure resets the session and (after repeated failures)
-//! demotes the device to the CPU decoder.
+//! Drives multi-planar M2M devices with a persistent streaming session. The
+//! OUTPUT (coded) buffer is allocated once and survives geometry changes; the
+//! CAPTURE side is `V4L2_MEMORY_DMABUF`. A hardware failure resets the
+//! session and, after repeated failures, demotes the device to the CPU
+//! decoder.
 //!
 //! Two CAPTURE targets, tried in order:
 //! - **Zero-copy ([`CaptureTarget::DstDma`]):** when the destination is a DMA
 //!   tensor with MCU(16)-aligned dimensions and the driver accepts a
 //!   single-plane contiguous CAPTURE at the tensor pitch, the tensor's dmabuf
-//!   fd is imported as the CAPTURE buffer and the hardware decodes straight
-//!   into it — no copy.
+//!   fd is imported as the CAPTURE buffer and the hardware decodes into it.
 //! - **Scratch ([`CaptureTarget::Scratch`]):** the hardware decodes into a
-//!   persistent codec-owned DMA scratch buffer (grown monotonically, never
-//!   freed between frames) and the planes are copied — `NV12`/`GREY` cropped,
-//!   `YUV3` (packed 4:4:4) deinterleaved to `NV24` — into the destination.
+//!   persistent codec-owned DMA scratch buffer and the planes are copied into
+//!   the destination: `NV12`/`GREY` cropped, `YUV3` (packed 4:4:4)
+//!   deinterleaved to `NV24`.
 //!
-//! The HAL is DMABUF-centric by design: hardware decode requires DMA buffer
-//! allocation (dma_heap). Platforms without it use the CPU decoder, as do
-//! single-planar M2M devices for now.
+//! Hardware decode requires DMA buffer allocation (dma_heap). Platforms
+//! without it, and single-planar M2M devices, use the CPU decoder.
 
 mod device;
 mod format;
@@ -54,23 +46,19 @@ use format::CapKind;
 const SOURCE_CHANGE_TIMEOUT: Duration = Duration::from_millis(200);
 /// Timeout waiting for the hardware to finish a decode.
 const DECODE_TIMEOUT: Duration = Duration::from_secs(2);
-/// Hard cap on the `DQEVENT` drain loop (an unbounded loop hangs — the driver
-/// re-returns the same event repeatedly).
+/// Maximum number of events drained by one `DQEVENT` loop.
 const MAX_EVENTS: usize = 16;
 /// Consecutive hardware failures after which the device is demoted to the CPU
-/// decoder for the rest of the session (circuit breaker).
+/// decoder for the rest of the session.
 const MAX_CONSECUTIVE_FAILURES: u32 = 8;
-/// Minimum OUTPUT (coded) buffer allocation. Sized so virtually any JPEG fits
-/// without a full stream rebuild; the buffer is allocated once per session.
+/// Minimum OUTPUT (coded) buffer allocation.
 const OUT_SIZE_FLOOR: u32 = 2 * 1024 * 1024;
-/// Minimum CAPTURE scratch allocation (covers ~720p NV12 without regrowth).
+/// Minimum CAPTURE scratch allocation.
 const SCRATCH_SIZE_FLOOR: usize = 2 * 1024 * 1024;
-/// Scratch tensor row width — the scratch is a GREY image used purely as a
-/// linear byte buffer, so the row geometry only shapes the allocation size.
+/// Row width of the scratch tensor, a GREY image used as a linear byte buffer.
 const SCRATCH_ROW_BYTES: usize = 4096;
 
-/// Outcome of a hardware decode attempt, distinct from [`CodecError`] so the
-/// caller can react to a transient hardware failure by retrying on the CPU.
+/// Failure of a hardware decode attempt.
 pub(crate) enum V4l2Decode {
     /// The hardware could not decode this image; the device has been reset and
     /// the caller should decode it on the CPU. Carries a short reason.
@@ -83,16 +71,14 @@ pub(crate) enum V4l2Decode {
 enum DecodeErr {
     /// A hardware/ioctl failure: reset the device and fall back to CPU.
     Reset(String),
-    /// A configuration we don't drive (unsupported CAPTURE format, colorimetry
-    /// mismatch, single-planar device, …): fall back to CPU.
+    /// A configuration this backend does not drive (unsupported CAPTURE format,
+    /// colorimetry mismatch, single-planar device): fall back to CPU.
     Unsupported(String),
-    /// A real error to surface to the caller (e.g. tensor mapping failure).
+    /// An error to surface to the caller (e.g. tensor mapping failure).
     Fatal(CodecError),
 }
 
-/// One-shot availability probe: opens and drops the first working decoder
-/// device. Backs the crate-level `v4l2_available()`; the decode path keeps its
-/// own lazy [`V4l2Probe`] and is unaffected (V4L2 nodes are multi-open).
+/// Availability probe: opens and drops the first working decoder device.
 pub(crate) fn device_available() -> bool {
     device::probe().is_some()
 }
@@ -105,12 +91,8 @@ pub(crate) fn probe_path() -> Option<std::path::PathBuf> {
         .map(|d| d.path().to_owned())
 }
 
-/// Lazily-probed V4L2 backend state, stored on the reusable decoder state so
-/// the device is probed at most once and the context is reused across decodes.
-//
-// `Ready` is much larger than the unit variants, but there is exactly one
-// probe per decoder and it is `Ready` in the steady state, so boxing would add
-// indirection on the hot path for no real saving.
+/// Lazily-probed V4L2 backend state: the device is probed at most once and
+/// the context is reused across decodes.
 #[allow(clippy::large_enum_variant)]
 #[derive(Default)]
 pub(crate) enum V4l2Probe {
@@ -145,9 +127,9 @@ impl V4l2Probe {
     ///
     /// - `Ok(Some(info))` — decoded in hardware.
     /// - `Ok(None)` — no usable device; the caller uses the CPU decoder.
-    /// - `Err(V4l2Decode::Fallback)` — transient/unsupported; device reset,
-    ///   caller decodes this image on the CPU.
-    /// - `Err(V4l2Decode::Fatal)` — a real error to surface.
+    /// - `Err(V4l2Decode::Fallback)` — transient or unsupported; the device is
+    ///   reset and the caller decodes this image on the CPU.
+    /// - `Err(V4l2Decode::Fatal)` — an error to surface.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn try_decode<T: ImagePixel>(
         &mut self,
@@ -164,7 +146,7 @@ impl V4l2Probe {
         };
 
         if ctx.device.api != ApiVariant::MultiPlanar {
-            // Single-planar M2M decode is a later increment.
+            // Single-planar devices are not driven.
             return Ok(None);
         }
         require_copy_out_access(dst, output_fmt, final_w, final_h).map_err(V4l2Decode::Fatal)?;
@@ -176,19 +158,17 @@ impl V4l2Probe {
                 Ok(Some(info))
             }
             Err(DecodeErr::Reset(why)) => {
-                // Hardware failure: reset + count toward the circuit breaker.
+                // Hardware failure: reset and count it.
                 ctx.fail_reset();
                 Err(V4l2Decode::Fallback(why))
             }
             Err(DecodeErr::Unsupported(why)) => {
-                // A config we don't drive (e.g. 4:4:4 YUV3 → NV12, or non-601
-                // colorimetry). Reset the stream but do NOT count it as a
-                // hardware failure — the CPU handles it; the device is fine.
+                // Unsupported configuration: reset the stream without counting a failure.
                 ctx.drop_stream();
                 Err(V4l2Decode::Fallback(why))
             }
             Err(DecodeErr::Fatal(e)) => {
-                // A refusal after OUTPUT was queued leaves the stream unusable; reset it uncounted.
+                // Reset the stream, uncounted, when a buffer is left queued.
                 if ctx.m2m.output().queued_count() != 0 || ctx.m2m.capture().queued_count() != 0 {
                     ctx.drop_stream();
                 }
@@ -196,8 +176,7 @@ impl V4l2Probe {
             }
         };
 
-        // Circuit breaker: a device that keeps failing is demoted so it stops
-        // costing per-image latency; the CPU decoder takes over for good.
+        // Demote a device that reached the failure limit.
         if let V4l2Probe::Ready(ctx) = self {
             if ctx.failures >= MAX_CONSECUTIVE_FAILURES {
                 log::warn!(
@@ -213,9 +192,7 @@ impl V4l2Probe {
 
 /// The CPU access the decode needs on `dst`: `None` when the hardware can
 /// decode straight into its DMA-BUF (a DMA destination, NV12/GREY output and
-/// MCU(16)-aligned dimensions), else `Write` for the scratch copy-out. The
-/// driver may still refuse zero-copy, so `None` is necessary but not
-/// sufficient.
+/// MCU(16)-aligned dimensions), else `Write` for the scratch copy-out.
 fn dst_cpu_access(
     dma_capable: bool,
     output_fmt: PixelFormat,
@@ -257,9 +234,7 @@ fn require_scratch_copy_out<T: ImagePixel>(dst: &Tensor<T>) -> Result<(), Decode
 /// A persistent, capability-verified V4L2 decode context.
 ///
 /// After the first decode the OUTPUT buffer and the CAPTURE scratch stay
-/// allocated, so a same-geometry decode pays only queue/dequeue and a
-/// geometry change pays only a CAPTURE reconfigure (~1 ms) — never the
-/// ~110 ms MMAP buffer reallocation. A hardware failure drops the session.
+/// allocated. A hardware failure drops the session.
 pub(crate) struct V4l2Context {
     device: ProbedDevice,
     /// The OUTPUT (coded) and CAPTURE (raw) queues of the device.
@@ -268,15 +243,13 @@ pub(crate) struct V4l2Context {
     /// attached), or `None` before the first decode / after a reset.
     stream: Option<Stream>,
     /// Persistent CAPTURE scratch: a codec-owned DMA buffer the hardware
-    /// decodes into when zero-copy is not possible. Grows monotonically on a
-    /// new high-water mark and survives stream resets — only its capacity,
-    /// dmabuf fd, and CPU mapping are used; its image geometry is irrelevant.
+    /// decodes into when zero-copy is not possible. Grows on a new high-water
+    /// mark and survives stream resets.
     scratch: Option<Tensor<u8>>,
-    /// DMA scratch allocation failed once (no dma_heap): don't retry per
-    /// frame. Hardware decode requires DMA buffers, so non-zero-copy images
-    /// fall back to the CPU decoder for the rest of the session.
+    /// Set when DMA scratch allocation failed; non-zero-copy images then fall
+    /// back to the CPU decoder for the rest of the session.
     scratch_failed: bool,
-    /// Consecutive hardware-failure count for the circuit breaker.
+    /// Consecutive hardware-failure count.
     failures: u32,
 }
 
@@ -286,15 +259,10 @@ struct Stream {
     jpeg_w: u32,
     jpeg_h: u32,
     /// The native output format the JPEG decodes to (`Nv12`/`Nv24`/`Grey`).
-    /// Part of the reuse key: two same-sized JPEGs with different subsampling
-    /// must not share a CAPTURE configuration (the driver would stall waiting
-    /// for a format change).
+    /// Part of the reuse key.
     out_fmt: PixelFormat,
     /// Destination row pitch this session was configured for. Part of the
-    /// reuse key for zero-copy: `S_FMT` baked this pitch into the CAPTURE
-    /// format, so a same-geometry destination with a different stride must
-    /// reconfigure. The scratch target copies out at the caller's stride
-    /// every frame and ignores this.
+    /// reuse key for zero-copy; the scratch target ignores it.
     dst_stride: usize,
     /// Allocated OUTPUT plane size; a larger JPEG forces a full rebuild.
     out_sizeimage: u32,
@@ -305,7 +273,7 @@ struct Stream {
 }
 
 /// The CAPTURE side of a stream: driver-chosen format and decode target.
-/// The CAPTURE queue is always single-plane DMABUF — multi-plane formats
+/// The CAPTURE queue is always single-plane DMABUF; multi-plane formats
 /// (NV12M) are renegotiated to their contiguous single-plane equivalents.
 struct Capture {
     kind: CapKind,
@@ -338,10 +306,9 @@ impl V4l2Context {
         })
     }
 
-    /// Decode one image through a three-tier path:
-    /// - **reuse** — same geometry/format, OUTPUT fits: queue and go;
-    /// - **reconfigure** — geometry changed but the session can keep its
-    ///   buffers (DMABUF CAPTURE, persistent OUTPUT): ~1 ms of ioctls;
+    /// Decode one image through one of three paths:
+    /// - **reuse** — same geometry and format, OUTPUT fits: queue the JPEG;
+    /// - **reconfigure** — geometry changed, the session keeps its buffers;
     /// - **rebuild** — first frame, OUTPUT overflow, or recovery: full setup.
     fn decode<T: ImagePixel>(
         &mut self,
@@ -356,22 +323,16 @@ impl V4l2Context {
         let dma_capable = dst.memory() == TensorMemory::DmaBuf;
         let dst_capacity = dst.capacity_bytes();
 
-        // Hardware decode requires DMA buffers (the HAL is DMABUF-centric).
-        // With no scratch and a non-DMA destination there is no possible
-        // CAPTURE target — fail fast to the CPU decoder without touching the
-        // device.
+        // With no scratch and a non-DMA destination there is no CAPTURE target.
         if self.scratch_failed && !dma_capable {
             return Err(DecodeErr::Unsupported(
                 "hardware decode requires DMA buffers (dma_heap unavailable)".into(),
             ));
         }
 
-        // Reuse requires identical geometry AND native format (a same-sized
-        // JPEG with different subsampling changes the CAPTURE format and would
-        // stall the driver), plus a target the new destination supports:
-        // zero-copy needs a DMA destination at the exact pitch the CAPTURE
-        // format was configured with; Scratch copies out at the caller's
-        // stride each frame, so any destination fits.
+        // Reuse requires identical geometry and native format, and a target the
+        // destination supports: zero-copy needs a DMA destination at the configured
+        // pitch; scratch fits any destination.
         let reuse = matches!(
             &self.stream,
             Some(s) if s.jpeg_w == final_w as u32
@@ -383,8 +344,8 @@ impl V4l2Context {
                     CaptureTarget::Scratch => true,
                 }
         );
-        // Reconfigure keeps the OUTPUT buffer and re-imports the CAPTURE
-        // buffers; only the OUTPUT capacity gates it.
+        // Reconfigure keeps the OUTPUT buffer and re-imports the CAPTURE buffers;
+        // it requires the OUTPUT capacity to fit.
         let reconfigure = !reuse && matches!(&self.stream, Some(s) if s.out_sizeimage >= needed);
 
         if reuse {
@@ -403,9 +364,7 @@ impl V4l2Context {
                 dma_capable,
             ) {
                 match e {
-                    // A reconfigure that cannot proceed (stale driver state,
-                    // scratch exhausted) recovers with a full rebuild instead
-                    // of burning a frame on the CPU.
+                    // A failed reconfigure is retried as a full rebuild.
                     DecodeErr::Reset(why) => {
                         log::debug!("v4l2: reconfigure failed ({why}); rebuilding stream");
                         self.rebuild_stream(
@@ -437,15 +396,15 @@ impl V4l2Context {
         self.collect::<T>(dst, output_fmt, final_w, final_h, dst_stride)
     }
 
-    /// Fast path: copy the JPEG into the already-mapped OUTPUT buffer and queue
-    /// it. Both queues are already streaming from a prior decode.
+    /// Copy the JPEG into the mapped OUTPUT buffer and queue it. Both queues
+    /// are streaming.
     fn requeue_output(&mut self, data: &[u8]) -> Result<(), DecodeErr> {
         let staged = self.stage_output(data)?;
         self.queue_output(staged, "QBUF OUTPUT")
     }
 
     /// Copy the JPEG into the mapped OUTPUT buffer, refusing while the driver
-    /// still holds it (a previous decode that failed before dequeueing it).
+    /// holds it.
     fn stage_output(&mut self, data: &[u8]) -> Result<usize, DecodeErr> {
         if self.m2m.output().is_queued(0) {
             return Err(DecodeErr::Reset("OUTPUT buffer still queued".into()));
@@ -454,8 +413,8 @@ impl V4l2Context {
             .stream
             .as_mut()
             .ok_or_else(|| DecodeErr::Reset("no stream".into()))?;
-        // SAFETY: OUTPUT buffer 0 is not queued (checked above), so the driver
-        // does not access it, and `self` is borrowed mutably.
+        // SAFETY: OUTPUT buffer 0 is not queued, so the driver does not access
+        // it, and `self` is borrowed mutably.
         Ok(stage_jpeg(unsafe { stream.out_map.as_mut_slice() }, data))
     }
 
@@ -472,8 +431,8 @@ impl V4l2Context {
             .map_err(|e| DecodeErr::Reset(format!("{what}: {e}")))
     }
 
-    /// Wait (best-effort) for the driver to parse the queued JPEG header and
-    /// raise `SOURCE_CHANGE`, then drain the pending events.
+    /// Wait for the driver to raise `SOURCE_CHANGE` for the queued JPEG, then
+    /// drain the pending events. Errors are ignored.
     fn await_source_change(&self) {
         let _ = events::wait(&self.device.dev, Some(SOURCE_CHANGE_TIMEOUT));
         let _ = events::drain(&self.device.dev, MAX_EVENTS);
@@ -490,10 +449,9 @@ impl V4l2Context {
         Ok(*unsafe { fmt.pix_mp() })
     }
 
-    /// Tear down any existing stream, then set up the OUTPUT + CAPTURE queues
+    /// Tear down any existing stream, then set up the OUTPUT and CAPTURE queues
     /// for a new geometry, leaving the first JPEG queued and both queues
-    /// streaming. The OUTPUT buffer is allocated with headroom so subsequent
-    /// geometry changes take [`Self::reconfigure_capture`] instead.
+    /// streaming.
     #[allow(clippy::too_many_arguments)]
     fn rebuild_stream(
         &mut self,
@@ -511,13 +469,11 @@ impl V4l2Context {
                 .entered();
         self.drop_stream();
 
-        // Subscribe to source-change events (harmless if already subscribed).
+        // Subscribe to source-change events.
         events::subscribe(&self.device.dev, uapi::V4L2_EVENT_SOURCE_CHANGE, 0, 0)
             .map_err(|e| DecodeErr::Reset(format!("SUBSCRIBE_EVENT: {e}")))?;
 
-        // OUTPUT: JPEG format with headroom (so a later, larger image avoids a
-        // full rebuild), allocate, map, stream. The allocation is persistent —
-        // it survives every geometry change until OUTPUT overflow or reset.
+        // OUTPUT: set the JPEG format, allocate, map and stream.
         let out_request = needed.max(OUT_SIZE_FLOOR);
         let mut ofmt = uapi::v4l2_format {
             type_: uapi::V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE,
@@ -557,12 +513,12 @@ impl V4l2Context {
             .stream_on()
             .map_err(|e| DecodeErr::Reset(format!("STREAMON OUTPUT: {e}")))?;
 
-        // Queue the first JPEG so the driver can parse the header.
+        // Queue the first JPEG.
         // SAFETY: the buffer was just allocated and has never been queued.
         let staged = stage_jpeg(unsafe { out_map.as_mut_slice() }, data);
         self.queue_output(staged, "QBUF OUTPUT")?;
 
-        // Wait for the driver to determine the CAPTURE format (best-effort).
+        // Wait for the driver to determine the CAPTURE format.
         self.await_source_change();
 
         let cap = self.configure_capture(
@@ -586,13 +542,10 @@ impl V4l2Context {
         Ok(())
     }
 
-    /// Geometry-change hot path: keep the persistent OUTPUT buffer and the
-    /// DMABUF CAPTURE memory mode, paying only ioctls (~1 ms measured on
-    /// i.MX95 `mxc-jpeg`) instead of the ~110 ms MMAP buffer reallocation.
+    /// Handle a geometry change: keep the OUTPUT buffer and rebuild only the
+    /// CAPTURE queue.
     ///
-    /// Any `Reset` error here is recovered by the caller with a full rebuild —
-    /// the half-torn queue state this can leave behind is exactly what
-    /// [`Self::drop_stream`] (the first step of a rebuild) cleans up.
+    /// A `Reset` error is recovered by the caller with a full rebuild.
     #[allow(clippy::too_many_arguments)]
     fn reconfigure_capture(
         &mut self,
@@ -610,9 +563,7 @@ impl V4l2Context {
             h = final_h
         )
         .entered();
-        // Stop and free only the CAPTURE queue — DMABUF buffers are ours, so
-        // this releases no memory, just vb2 bookkeeping. The OUTPUT queue
-        // keeps streaming with its buffer allocated.
+        // Stop and free only the CAPTURE queue; the OUTPUT queue keeps streaming.
         if self.stream.is_none() {
             return Err(DecodeErr::Reset("no stream to reconfigure".into()));
         }
@@ -622,7 +573,7 @@ impl V4l2Context {
             .map_err(|e| DecodeErr::Reset(format!("free CAPTURE (reconf): {e}")))?;
 
         // Queue the new JPEG; the driver parses the header and retargets the
-        // CAPTURE format (raising SOURCE_CHANGE) while OUTPUT keeps streaming.
+        // CAPTURE format.
         let staged = self.stage_output(data)?;
         self.queue_output(staged, "QBUF OUTPUT (reconf)")?;
         self.await_source_change();
@@ -664,12 +615,11 @@ impl V4l2Context {
     ) -> Result<Capture, DecodeErr> {
         const CAP: u32 = uapi::V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
 
-        // CAPTURE: query the driver-chosen format for the queued JPEG.
+        // Query the driver-chosen CAPTURE format for the queued JPEG.
         let mut cap = self.capture_format("G_FMT CAPTURE")?;
 
-        // The driver reports MCU-padded dimensions, so they must cover the
-        // logical image. Smaller means the SOURCE_CHANGE never landed and the
-        // format is stale from a previous image — recover with a rebuild.
+        // The driver reports MCU-padded dimensions; dimensions smaller than the
+        // logical image mean a stale format.
         if (cap.width as usize) < final_w || (cap.height as usize) < final_h {
             return Err(DecodeErr::Reset(format!(
                 "stale CAPTURE geometry {}x{} for {}x{} image",
@@ -690,15 +640,8 @@ impl V4l2Context {
             )));
         }
 
-        // The mxc-jpeg driver (and equivalent SoC decoders) select their native
-        // CAPTURE format from the JPEG's chroma subsampling: a 4:4:4 JPEG
-        // yields YUV3 (packed 4:4:4). When the caller explicitly requested
-        // NV12 — and only then — negotiate it via S_FMT so the hardware
-        // downconverts 4:4:4→4:2:0. An Nv24 request must NOT attempt this:
-        // a driver that accepted NV12 would silently discard chroma
-        // resolution and break the native-format contract with the CPU
-        // decoder (4:4:4 → Nv24). S_FMT must happen before REQBUFS CAPTURE;
-        // this is the only safe window (after G_FMT, before REQBUFS).
+        // A 4:4:4 JPEG yields YUV3 (packed 4:4:4). When the caller requested NV12,
+        // negotiate it via S_FMT so the hardware downconverts 4:4:4 to 4:2:0.
         if matches!(kind, CapKind::Yuv444Packed) && matches!(output_fmt, PixelFormat::Nv12) {
             let mut nfmt = uapi::v4l2_format {
                 type_: CAP,
@@ -717,8 +660,8 @@ impl V4l2Context {
                 p.xfer_func = cap.xfer_func;
                 p.num_planes = 1;
             }
-            // Best-effort — if refused, cap/kind stay YUV3 and the scratch
-            // path deinterleaves to NV24 instead.
+            // If refused, `cap` and `kind` stay YUV3 and the scratch path
+            // deinterleaves to NV24.
             let _ = self.device.dev.set_format(&mut nfmt);
             if let Ok(got) = self.capture_format("G_FMT CAPTURE (nv12)") {
                 if let Some(new_kind) = format::classify(got.pixelformat) {
@@ -738,22 +681,18 @@ impl V4l2Context {
             }
         }
 
-        // Save the driver's natural CAPTURE format so a failed zero-copy probe
-        // can restore it for the copy paths.
+        // The driver's natural CAPTURE format, restored when zero-copy is refused.
         let cap0 = cap;
 
-        // Zero-copy eligibility: DMA destination, NV12/GREY output, and
-        // MCU(16)-aligned dims so the CAPTURE geometry equals the logical image
-        // (the decoded data lands exactly at the tensor's layout).
+        // Zero-copy eligibility: DMA destination, NV12/GREY output and
+        // MCU(16)-aligned dimensions.
         let want_zc = dst_cpu_access(dma_capable, output_fmt, final_w, final_h)
             == edgefirst_tensor::CpuAccess::None
             && matches!(kind, CapKind::Nv12 | CapKind::Grey);
 
         let mut dst_dma = false;
         if want_zc {
-            // MCU(16)-aligned logical dims mean the driver's MCU-padded
-            // CAPTURE geometry equals them — the invariant the zero-copy
-            // sizeimage math and the tensor layout both rely on.
+            // MCU(16)-aligned logical dimensions equal the driver's CAPTURE geometry.
             debug_assert_eq!(
                 cap0.height as usize, final_h,
                 "zero-copy requires the MCU-padded CAPTURE height to equal the image height"
@@ -762,10 +701,8 @@ impl V4l2Context {
                 cap0.width as usize, final_w,
                 "zero-copy requires the MCU-padded CAPTURE width to equal the image width"
             );
-            // Request a SINGLE-PLANE contiguous CAPTURE at the tensor pitch:
-            // the whole NV12 (Y+CbCr) / GREY image becomes one fd at offset 0.
-            // The driver's default NV12M is two *non-contiguous* planes, which
-            // do not compose into a single tensor buffer via data_offset.
+            // Request a single-plane contiguous CAPTURE at the tensor pitch: the
+            // whole NV12 (Y+CbCr) or GREY image is one fd at offset 0.
             let (target_fourcc, total_h) = match output_fmt {
                 PixelFormat::Nv12 => (uapi::V4L2_PIX_FMT_NV12, cap0.height as usize * 3 / 2),
                 _ => (uapi::V4L2_PIX_FMT_GREY, cap0.height as usize),
@@ -789,7 +726,7 @@ impl V4l2Context {
                 p.plane_fmt[0].bytesperline = dst_stride as u32;
                 p.plane_fmt[0].sizeimage = (dst_stride * total_h) as u32;
             }
-            // Best-effort; read back what the driver kept.
+            // Read back what the driver kept.
             let _ = self.device.dev.set_format(&mut sfmt);
             let cap_zc = self.capture_format("G_FMT CAPTURE (zc)")?;
             let ok = cap_zc.pixelformat == target_fourcc
@@ -802,8 +739,8 @@ impl V4l2Context {
                 cap = cap_zc;
                 dst_dma = true;
             } else {
-                // Driver refused single-plane contiguous output — restore its
-                // natural format for the copy paths.
+                // The driver refused single-plane contiguous output: restore its
+                // natural format.
                 let mut rfmt = uapi::v4l2_format {
                     type_: CAP,
                     ..Default::default()
@@ -813,15 +750,14 @@ impl V4l2Context {
                     let p = unsafe { rfmt.pix_mp() };
                     *p = cap0;
                 }
-                // Best-effort restore.
                 let _ = self.device.dev.set_format(&mut rfmt);
                 cap = cap0;
             }
         }
 
         if dst_dma {
-            // Zero-copy: no driver buffers; the tensor fd is imported per
-            // frame in `collect`. REQBUFS(DMABUF) is bookkeeping only.
+            // Zero-copy: no driver buffers; the tensor fd is imported per frame in
+            // `collect`.
             self.start_capture("dmabuf")?;
             return Ok(Capture {
                 kind,
@@ -831,10 +767,9 @@ impl V4l2Context {
             });
         }
 
-        // Scratch: the hardware decodes into the persistent codec-owned DMA
-        // buffer and the planes are copied out. Needs a single-plane CAPTURE
-        // so the import never depends on multi-plane data_offset semantics;
-        // YUV3/GREY are naturally single-plane, NV12M is renegotiated.
+        // Scratch: the hardware decodes into the codec-owned DMA buffer and the
+        // planes are copied out. Multi-plane formats are renegotiated to
+        // single-plane.
         let mut single = cap;
         if cap.num_planes != 1 {
             let mut sfmt = uapi::v4l2_format {
@@ -854,7 +789,7 @@ impl V4l2Context {
                 p.xfer_func = cap.xfer_func;
                 p.num_planes = 1;
             }
-            // Best-effort — read back the result.
+            // Read back the result.
             let _ = self.device.dev.set_format(&mut sfmt);
             single = self.capture_format("G_FMT CAPTURE (scratch)")?;
             if single.num_planes != 1 {
@@ -885,8 +820,7 @@ impl V4l2Context {
         })
     }
 
-    /// Request the single DMABUF CAPTURE buffer (bookkeeping only; the memory
-    /// is imported per frame) and start the CAPTURE queue.
+    /// Request the single DMABUF CAPTURE buffer and start the CAPTURE queue.
     fn start_capture(&mut self, target: &str) -> Result<(), DecodeErr> {
         self.m2m
             .capture_mut()
@@ -932,31 +866,25 @@ impl V4l2Context {
     }
 
     /// Ensure the persistent scratch dmabuf holds at least `sizeimage` bytes,
-    /// growing geometrically on a new high-water mark. Returns whether the
-    /// scratch is usable; a failed DMA allocation latches [`Self::scratch_failed`]
-    /// so the session fails fast to the CPU decoder instead of retrying the
-    /// allocation per frame.
+    /// growing on a new high-water mark. Returns whether the scratch is usable; a
+    /// failed DMA allocation sets [`Self::scratch_failed`].
     fn ensure_scratch(&mut self, sizeimage: usize) -> bool {
         if let Some(s) = &self.scratch {
             if s.capacity_bytes() >= sizeimage {
                 return true;
             }
         }
-        // Grow ×3/2 over the request (and never below the floor) so a slowly
-        // increasing image size doesn't reallocate every frame.
+        // Allocate 3/2 of the request, and at least the floor.
         let want = (sizeimage + sizeimage / 2).max(SCRATCH_SIZE_FLOOR);
         let rows = want.div_ceil(SCRATCH_ROW_BYTES);
-        // Free the outgrown scratch before allocating its replacement: CMA is
-        // a scarce contiguous pool and holding both peaks at 2.5× the need.
+        // Free the outgrown scratch before allocating its replacement.
         self.scratch = None;
         match Tensor::<u8>::image(
             SCRATCH_ROW_BYTES,
             rows,
             PixelFormat::Grey,
             Some(TensorMemory::DmaBuf),
-            // The decoder hardware writes the capture planes; the CPU only
-            // reads them during copy-out (`map_read` syncs the read
-            // direction).
+            // The CPU only reads the capture planes, during copy-out.
             edgefirst_tensor::CpuAccess::Read,
         ) {
             Ok(t) => {
@@ -977,7 +905,7 @@ impl V4l2Context {
 
     /// Queue the CAPTURE buffer for the session's target, wait for the decode,
     /// dequeue both buffers, and (for the scratch target) write the decoded
-    /// pixels into `dst`. Shared by all three decode paths.
+    /// pixels into `dst`.
     fn collect<T: ImagePixel>(
         &mut self,
         dst: &mut Tensor<T>,
@@ -1000,18 +928,11 @@ impl V4l2Context {
         .entered();
 
         if is_dst_dma {
-            // Zero-copy: import the tensor's dmabuf fd as the CAPTURE buffer
-            // so the hardware decodes straight into it — no copy. The whole
-            // image (Y, then CbCr for NV12) is one contiguous plane at offset
-            // 0; layout matches because dims are MCU-aligned and the CAPTURE
-            // stride was forced to the tensor pitch.
+            // Zero-copy: import the tensor's dmabuf fd as the CAPTURE buffer. The
+            // whole image (Y, then CbCr for NV12) is one contiguous plane at offset 0.
             let capacity = dst.capacity_bytes();
             let dmabuf = dst.dmabuf().map_err(|e| DecodeErr::Fatal(e.into()))?;
             self.decode_into(dmabuf, capacity, "dmabuf")?;
-            // Decoded pixels are in the tensor's DMA buffer; the consumer's
-            // `Tensor::map()` issues the cache sync on read.
-            // DstDma only fires when output_fmt is Nv12|Grey (want_zc check),
-            // so actual == requested and no dst reconfiguration is needed.
             return Ok(ImageInfo {
                 width: final_w,
                 height: final_h,
@@ -1022,12 +943,11 @@ impl V4l2Context {
             });
         }
 
-        // The driver refused zero-copy, and the copy-out writes on the CPU.
+        // The copy-out writes `dst` on the CPU.
         require_scratch_copy_out(dst)?;
 
-        // Persistent-scratch: the hardware decodes into the codec-owned DMA
-        // buffer (single plane; QBUF length may exceed the format's
-        // sizeimage — the import is by capacity), then planes copy out.
+        // Scratch: the hardware decodes into the codec-owned DMA buffer,
+        // imported by capacity, then the planes are copied out.
         {
             let t = self
                 .scratch
@@ -1041,7 +961,6 @@ impl V4l2Context {
             .stream
             .as_ref()
             .ok_or_else(|| DecodeErr::Reset("no stream".into()))?;
-        // `map()` issues the DMA_BUF_IOCTL_SYNC so CPU reads are coherent.
         let smap = self
             .scratch
             .as_mut()
@@ -1060,11 +979,8 @@ impl V4l2Context {
     }
 
     /// Stop both queues and release their buffer pools, dropping the stream.
-    /// The CAPTURE scratch is *kept* — it is plain memory, not driver state,
-    /// and survives resets so recovery never re-pays the DMA allocation.
-    /// Also cleans up queues a failed rebuild left active before it created
-    /// the stream. Best-effort: errors are ignored (this is also the
-    /// failure-recovery path).
+    /// The CAPTURE scratch is kept. Also cleans up queues left active by a failed
+    /// rebuild. Errors are ignored.
     fn drop_stream(&mut self) {
         let stream = self.stream.take();
         let active = |q: &Queue| q.is_streaming() || !q.is_empty();
@@ -1088,7 +1004,6 @@ impl V4l2Context {
 
 impl Drop for V4l2Context {
     fn drop(&mut self) {
-        // Release the streaming session and device buffers on decoder drop.
         self.drop_stream();
     }
 }
@@ -1116,11 +1031,9 @@ fn write_planes<T: ImagePixel>(
     .entered();
     let y_stride = cap.luma_stride;
 
-    // YUV3 → NV24: the mxc-jpeg driver outputs 4:4:4 JPEGs as packed
-    // [Y,Cb,Cr] triples (V4L2_PIX_FMT_YUV24). Deinterleave into the
-    // semi-planar NV24 layout expected by the tensor and downstream convert.
-    // NV24 UV addressing: Cb at [final_h*dst + y*2*dst + x*2],
-    // Cr at [... + x*2 + 1] — matches the MCU writer in mcu.rs exactly.
+    // YUV3 to NV24: deinterleave packed [Y,Cb,Cr] triples
+    // (V4L2_PIX_FMT_YUV24) into the semi-planar NV24 layout. Cb is at
+    // [final_h*dst + y*2*dst + x*2], Cr at the next byte.
     if matches!(cap.kind, CapKind::Yuv444Packed) {
         if !matches!(output_fmt, PixelFormat::Nv24) {
             return Err(DecodeErr::Unsupported(format!(
@@ -1157,20 +1070,14 @@ fn write_planes<T: ImagePixel>(
         CapKind::Yuv444Packed => unreachable!("handled above"),
     };
 
-    // Derive the format actually written from what hardware produced and
-    // reconfigure dst when it differs (e.g. an Nv24 request where the 4:4:4
-    // JPEG was hardware-downconverted is rejected above, but a caller may
-    // request Nv12 for a 4:4:4 JPEG, where negotiation yields kind=Nv12).
+    // Derive the format written from what the hardware produced and
+    // reconfigure `dst` when it differs.
     let actual_fmt = match &cap.kind {
         CapKind::Grey => PixelFormat::Grey,
         CapKind::Nv12 => PixelFormat::Nv12,
         CapKind::Yuv444Packed => unreachable!("handled above"),
     };
     if actual_fmt != output_fmt {
-        // The tensor was configured for output_fmt (e.g. Nv24) by the
-        // caller; reconfigure it to match what we're about to write.
-        // The underlying allocation is always large enough because Nv24 is
-        // the largest per-pixel format the caller pre-allocates for.
         dst.configure_image(final_w, final_h, actual_fmt)
             .map_err(|e| DecodeErr::Fatal(e.into()))?;
     }
@@ -1182,7 +1089,7 @@ fn write_planes<T: ImagePixel>(
         std::slice::from_raw_parts_mut(dst_bytes.as_mut_ptr() as *mut u8, dst_bytes.len())
     };
 
-    // Crop to the logical image (the CAPTURE buffer is MCU-rounded up).
+    // Crop to the logical image.
     match actual_fmt {
         PixelFormat::Grey => {
             for y in 0..final_h {
@@ -1203,13 +1110,7 @@ fn write_planes<T: ImagePixel>(
                 let o = y * dst_stride;
                 d[o..o + final_w].copy_from_slice(&y_plane[s..s + final_w]);
             }
-            // Interleaved CbCr plane. An NV12 chroma row holds
-            // `ceil(final_w/2)` (Cb,Cr) pairs == `even(final_w)` bytes;
-            // copying only `final_w` drops the final Cr on ODD widths.
-            // `ceil(final_h/2)` chroma rows (4:2:0 rounds the row count up).
-            // Both `c_stride` (MCU-rounded CAPTURE pitch) and `dst_stride`
-            // (64-aligned tensor pitch) are >= even(final_w), so the wider
-            // copy stays in-bounds.
+            // Interleaved CbCr plane: `ceil(final_h/2)` rows of `even(final_w)` bytes.
             let uv_base = final_h * dst_stride;
             copy_nv12_chroma(
                 cbcr,
@@ -1241,15 +1142,8 @@ fn write_planes<T: ImagePixel>(
 /// Copy `data` into the OUTPUT buffer with metadata segments stripped,
 /// returning the staged byte count.
 ///
-/// The i.MX `mxc-jpeg` bitstream parser does not skip APPn payloads by their
-/// length field: an APP13 (Photoshop IRB) carrying an embedded thumbnail JPEG
-/// (nested SOI/SOF/SOS markers) wedges the hardware until the decode timeout
-/// (observed deterministically on COCO val 000000122046.jpg, i.MX95). The
-/// metadata carries nothing the hardware needs, so it is dropped during the
-/// copy we already pay for. APP0 (JFIF) and APP14 (Adobe — its transform flag
-/// changes component-colour interpretation) are kept; both are tiny and never
-/// embed thumbnails. Falls back to a verbatim copy when the marker walk fails
-/// (corrupt or unusual stream — the hardware error path handles it).
+/// APP0 (JFIF) and APP14 (Adobe) are kept. Falls back to a verbatim copy when
+/// the marker walk fails.
 fn stage_jpeg(out: &mut [u8], data: &[u8]) -> usize {
     match copy_jpeg_stripped(out, data) {
         Some(n) => n,
@@ -1260,9 +1154,9 @@ fn stage_jpeg(out: &mut [u8], data: &[u8]) -> usize {
     }
 }
 
-/// The marker walk behind [`stage_jpeg`]: copy every pre-scan segment except
-/// APP1–APP13/APP15 and COM, then the scan (SOS onward) verbatim. `None` when
-/// the stream doesn't parse as a baseline marker sequence or doesn't fit.
+/// Copy every pre-scan segment except APP1–APP13/APP15 and COM, then the
+/// scan (SOS onward) verbatim. `None` when the stream doesn't parse as a
+/// baseline marker sequence or doesn't fit.
 fn copy_jpeg_stripped(out: &mut [u8], data: &[u8]) -> Option<usize> {
     if data.len() < 4 || data[0] != 0xFF || data[1] != 0xD8 {
         return None;
@@ -1276,13 +1170,12 @@ fn copy_jpeg_stripped(out: &mut [u8], data: &[u8]) -> Option<usize> {
         }
         let marker = data[i + 1];
         if marker == 0xDA {
-            // SOS: entropy-coded data follows — copy the remainder verbatim.
+            // SOS: copy the remainder verbatim.
             let rest = &data[i..];
             out.get_mut(o..o + rest.len())?.copy_from_slice(rest);
             return Some(o + rest.len());
         }
-        // Fill bytes or standalone markers before SOS aren't expected from a
-        // well-formed encoder; hand the stream over verbatim.
+        // Fill bytes or standalone markers before SOS: hand the stream over verbatim.
         if marker == 0xFF || marker == 0x01 || (0xD0..=0xD9).contains(&marker) {
             return None;
         }
@@ -1302,8 +1195,8 @@ fn copy_jpeg_stripped(out: &mut [u8], data: &[u8]) -> Option<usize> {
 
 /// Deinterleave packed `[Y,Cb,Cr]` rows (`V4L2_PIX_FMT_YUV24`) into NV24:
 /// a Y plane of `h` rows followed by an interleaved CbCr plane of `2h` rows
-/// (each luma row owns two `dst_stride` UV rows — `uv_rows_per_luma = 2`).
-/// NEON-accelerated on aarch64, scalar elsewhere.
+/// (each luma row owns two `dst_stride` UV rows). NEON-accelerated on
+/// aarch64, scalar elsewhere.
 fn deinterleave_yuv24_to_nv24(
     src: &[u8],
     src_stride: usize,
@@ -1326,8 +1219,8 @@ fn deinterleave_yuv24_to_nv24(
 fn deinterleave_row(src: &[u8], dy: &mut [u8], duv: &mut [u8], w: usize) {
     #[cfg(target_arch = "aarch64")]
     {
-        // SAFETY: the slice lengths are checked by the caller's sub-slicing;
-        // NEON is baseline on aarch64 (no runtime feature detection needed).
+        // SAFETY: the caller's sub-slicing fixes the slice lengths; NEON is
+        // baseline on aarch64.
         unsafe { deinterleave_row_neon(src, dy, duv, w) }
     }
     #[cfg(not(target_arch = "aarch64"))]
@@ -1355,8 +1248,8 @@ unsafe fn deinterleave_row_neon(src: &[u8], dy: &mut [u8], duv: &mut [u8], w: us
     use core::arch::aarch64::{uint8x16x2_t, vld3q_u8, vst1q_u8, vst2q_u8};
     let mut x = 0usize;
     while x + 16 <= w {
-        // SAFETY (caller contract): x+16 <= w ⇒ 48 bytes readable at src[3x],
-        // 16 writable at dy[x], 32 writable at duv[2x].
+        // SAFETY: x+16 <= w, so 48 bytes are readable at src[3x], 16 writable
+        // at dy[x] and 32 writable at duv[2x].
         let v = vld3q_u8(src.as_ptr().add(x * 3));
         vst1q_u8(dy.as_mut_ptr().add(x), v.0);
         vst2q_u8(duv.as_mut_ptr().add(x * 2), uint8x16x2_t(v.1, v.2));
@@ -1368,10 +1261,8 @@ unsafe fn deinterleave_row_neon(src: &[u8], dy: &mut [u8], duv: &mut [u8], w: us
 /// Copy the interleaved NV12 CbCr plane from a hardware CAPTURE buffer into the
 /// destination tensor, cropping to the logical image width.
 ///
-/// An NV12 chroma row carries `ceil(final_w / 2)` (Cb, Cr) pairs, which is
-/// `even(final_w)` bytes. Copying only `final_w` bytes would silently drop the
-/// final Cr sample on **odd** widths. This function always copies
-/// `final_w.next_multiple_of(2)` bytes per row, preserving the last Cr.
+/// An NV12 chroma row carries `ceil(final_w / 2)` (Cb, Cr) pairs, so each
+/// row copies `final_w.next_multiple_of(2)` bytes.
 ///
 /// # Arguments
 ///
@@ -1397,10 +1288,9 @@ fn copy_nv12_chroma(
     }
 }
 
-/// Accept only BT.601 full-range (JFIF) colorimetry — what the codec's colour
-/// kernels assume. `DEFAULT` (0) fields defer to the colorspace, so a JPEG
-/// colorspace is accepted; anything explicitly limited-range or non-601 is
-/// rejected so we never emit mis-scaled colour.
+/// Accept only BT.601 full-range (JFIF) colorimetry. `DEFAULT` (0) fields
+/// defer to the colorspace, so a JPEG colorspace is accepted; anything
+/// explicitly limited-range or non-601 is rejected.
 fn colorimetry_ok(colorspace: u32, ycbcr_enc: u8, quantization: u8) -> bool {
     if colorspace == uapi::V4L2_COLORSPACE_JPEG {
         return true;
@@ -1435,8 +1325,7 @@ mod tests {
         assert_eq!(dst_cpu_access(true, PixelFormat::Nv12, 640, 470), CopyOut);
     }
 
-    /// A destination the scratch copy-out would write on the CPU is refused
-    /// up front unless it is declared writable.
+    /// A destination the scratch copy-out writes is refused unless declared writable.
     #[test]
     fn copy_out_requires_a_declared_write() {
         use edgefirst_tensor::{CpuAccess, Error as TensorError};
@@ -1460,38 +1349,38 @@ mod tests {
         }
     }
 
-    /// `V4L2_YCBCR_ENC_709` — a non-601 encoding we must reject.
+    /// `V4L2_YCBCR_ENC_709`.
     const ENC_709: u8 = 2;
-    /// `V4L2_QUANTIZATION_LIM_RANGE` — limited range we must reject.
+    /// `V4L2_QUANTIZATION_LIM_RANGE`.
     const QUANT_LIMITED: u8 = 2;
 
     #[test]
     fn colorimetry_accepts_jpeg_and_full_range_601() {
-        // JPEG colorspace is the shorthand and is always accepted.
+        // JPEG colorspace.
         assert!(colorimetry_ok(
             uapi::V4L2_COLORSPACE_JPEG,
             ENC_709,
             QUANT_LIMITED
         ));
-        // Explicit 601 + full range.
+        // Explicit 601, full range.
         assert!(colorimetry_ok(
             uapi::V4L2_COLORSPACE_SRGB,
             uapi::V4L2_YCBCR_ENC_601,
             uapi::V4L2_QUANTIZATION_FULL_RANGE
         ));
-        // Driver "default" (0) fields defer to the colorspace and are accepted.
+        // Default (0) fields.
         assert!(colorimetry_ok(uapi::V4L2_COLORSPACE_SRGB, 0, 0));
     }
 
     #[test]
     fn colorimetry_rejects_non_601_or_limited_range() {
-        // 709 encoding → reject.
+        // 709 encoding.
         assert!(!colorimetry_ok(
             uapi::V4L2_COLORSPACE_SRGB,
             ENC_709,
             uapi::V4L2_QUANTIZATION_FULL_RANGE
         ));
-        // Limited-range quantization → reject.
+        // Limited-range quantization.
         assert!(!colorimetry_ok(
             uapi::V4L2_COLORSPACE_SRGB,
             uapi::V4L2_YCBCR_ENC_601,
@@ -1499,47 +1388,39 @@ mod tests {
         ));
     }
 
-    /// `copy_nv12_chroma` with an odd `final_w` must copy `even(final_w)` bytes
-    /// per chroma row, preserving the final Cr sample that a naïve `final_w`-byte
-    /// copy would have silently dropped.
+    /// `copy_nv12_chroma` with an odd `final_w` copies `even(final_w)` bytes per chroma
+    /// row.
     #[test]
     fn copy_nv12_chroma_odd_w_preserves_last_cr() {
-        // Odd width 5: even(5) = 6. One chroma row (final_h = 2 → 1 chroma row).
         let final_w = 5usize;
         let final_h = 2usize;
         let src_stride = 8usize; // MCU-rounded (>= even(final_w)=6)
         let dst_stride = 64usize; // 64-aligned tensor pitch
 
-        // Build a src chroma row: [Cb0, Cr0, Cb1, Cr1, Cb2, Cr2, PAD, PAD]
-        // Index 4 is Cb2 and index 5 is Cr2 — the bytes that a naïve
-        // `final_w=5` copy would have omitted (it would stop at index 4).
+        // Source chroma row: [Cb0, Cr0, Cb1, Cr1, Cb2, Cr2, PAD, PAD].
         let mut src = vec![0u8; src_stride];
         src[0] = 10; // Cb0
         src[1] = 11; // Cr0
         src[2] = 20; // Cb1
         src[3] = 21; // Cr1
         src[4] = 30; // Cb2
-        src[5] = 31; // Cr2  ← last valid Cr, must NOT be dropped
+        src[5] = 31; // Cr2
 
         let mut dst = vec![0u8; dst_stride];
         copy_nv12_chroma(&src, src_stride, &mut dst, dst_stride, final_w, final_h);
 
-        // Bytes 0..6 in dst must match src 0..6 exactly.
         assert_eq!(
             &dst[..6],
             &src[..6],
             "copy_nv12_chroma: first 6 bytes (even(5)) must be copied verbatim"
         );
-        // Specifically, the last Cr (index 5) must NOT be zero / dropped.
         assert_eq!(
             dst[5], 31,
             "copy_nv12_chroma: last Cr at byte 5 must be preserved for odd final_w=5"
         );
     }
 
-    /// Sanity-check the even-width case: `copy_nv12_chroma` with an even
-    /// `final_w` behaves identically to copying `final_w` bytes (no implicit
-    /// extra byte).
+    /// `copy_nv12_chroma` with an even `final_w` copies exactly `final_w` bytes per row.
     #[test]
     fn copy_nv12_chroma_even_w_no_extra_byte() {
         let final_w = 4usize; // even
@@ -1552,7 +1433,7 @@ mod tests {
         src[1] = 2;
         src[2] = 3;
         src[3] = 4; // last valid byte for even(4)=4
-        src[4] = 99; // must NOT be copied
+        src[4] = 99; // not copied
 
         let mut dst = vec![0u8; dst_stride];
         copy_nv12_chroma(&src, src_stride, &mut dst, dst_stride, final_w, final_h);
@@ -1573,16 +1454,15 @@ mod tests {
             v.extend_from_slice(&len.to_be_bytes());
             v.extend_from_slice(payload);
         }
-        // SOS with a 6-byte header + fake entropy data + EOI.
+        // SOS with a 6-byte header, fake entropy data and EOI.
         v.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x08, 1, 1, 0, 0, 63, 0]);
         v.extend_from_slice(&[0xAB; 32]);
         v.extend_from_slice(&[0xFF, 0xD9]);
         v
     }
 
-    /// APP13 (and other metadata) must be stripped while DQT/SOF/DHT, APP0,
-    /// APP14, and the scan survive byte-for-byte — including an APP13 payload
-    /// that embeds JPEG markers (the mxc-jpeg wedge trigger).
+    /// Metadata segments are stripped while DQT/SOF/DHT, APP0, APP14 and the
+    /// scan survive byte-for-byte.
     #[test]
     fn stage_jpeg_strips_metadata_segments() {
         let evil_app13 = [
@@ -1612,8 +1492,7 @@ mod tests {
         assert_eq!(&out[..n], &want[..]);
     }
 
-    /// A stream that doesn't parse as plain marker segments must be staged
-    /// verbatim, not rejected.
+    /// A stream that doesn't parse as plain marker segments is staged verbatim.
     #[test]
     fn stage_jpeg_falls_back_to_verbatim() {
         for bad in [
@@ -1627,9 +1506,8 @@ mod tests {
         }
     }
 
-    /// `deinterleave_yuv24_to_nv24` must match a naïve reference for odd
-    /// widths, padded strides, and partial NEON tails (w % 16 != 0). On
-    /// aarch64 this verifies the NEON path against scalar addressing.
+    /// `deinterleave_yuv24_to_nv24` matches a reference for odd widths, padded
+    /// strides and partial NEON tails.
     #[test]
     fn deinterleave_yuv24_matches_reference() {
         for &(w, h) in &[(37usize, 5usize), (16, 3), (1, 1), (64, 2), (53, 4)] {
@@ -1666,15 +1544,9 @@ mod tests {
         std::fs::read(root.join(name)).ok()
     }
 
-    /// On-target probe for the DMABUF-first reconfigure design: alternates two
-    /// JPEG geometries while keeping the OUTPUT queue allocated and streaming,
-    /// rebuilding only the CAPTURE queue in `V4L2_MEMORY_DMABUF` mode against a
-    /// persistent, deliberately oversized DMA scratch buffer.
-    ///
-    /// Answers three driver-behavior questions the design depends on:
-    /// 1. Is `REQBUFS(1, DMABUF)` allocation-free (sub-ms), unlike MMAP?
-    /// 2. Is `S_FMT(CAPTURE)` accepted while the OUTPUT queue keeps streaming?
-    /// 3. Is a QBUF `plane.length` larger than the format's `sizeimage` accepted?
+    /// On-target probe: alternates two JPEG geometries, rebuilding only the
+    /// DMABUF CAPTURE queue against an oversized DMA scratch buffer while the
+    /// OUTPUT queue keeps streaming.
     #[test]
     #[ignore = "on-target hardware probe; run with --ignored --nocapture on a JPEG M2M device"]
     fn probe_dmabuf_reconfigure() {
@@ -1702,8 +1574,7 @@ mod tests {
             return;
         };
 
-        // Persistent CAPTURE scratch: 4 MiB DMA buffer — larger than any
-        // sizeimage in this probe, to confirm question 3.
+        // CAPTURE scratch: a 4 MiB DMA buffer.
         let Some(scratch) = crate::test_support::dma_allocated(
             Tensor::<u8>::image(
                 4096,
@@ -1722,7 +1593,7 @@ mod tests {
         let mut m2m = M2m::new(&dev.dev, true).expect("queues");
         events::subscribe(&dev.dev, uapi::V4L2_EVENT_SOURCE_CHANGE, 0, 0).expect("SUBSCRIBE_EVENT");
 
-        // OUTPUT: one persistent 2 MiB coded buffer, set up once, streamed once.
+        // OUTPUT: one 2 MiB coded buffer, set up and streamed once.
         let mut ofmt = uapi::v4l2_format {
             type_: uapi::V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE,
             ..Default::default()
@@ -1752,8 +1623,7 @@ mod tests {
                         .free()
                         .expect("STREAMOFF + REQBUFS CAPTURE 0");
                 }
-                // SAFETY: the OUTPUT buffer was dequeued at the end of the
-                // previous round (or never queued), so the driver is not using it.
+                // SAFETY: the OUTPUT buffer is not queued, so the driver is not using it.
                 let coded = unsafe { out_map.as_mut_slice() };
                 coded[..jpeg.len()].copy_from_slice(jpeg);
                 m2m.output()
@@ -1776,7 +1646,7 @@ mod tests {
                 let got = *unsafe { gfmt.pix_mp() };
                 let t_gfmt = t0.elapsed();
 
-                // Question 2: S_FMT(CAP) single-plane NV12 while OUTPUT streams.
+                // S_FMT(CAP) single-plane NV12 while OUTPUT streams.
                 let mut sfmt = uapi::v4l2_format {
                     type_: CAP,
                     ..Default::default()
@@ -1808,7 +1678,7 @@ mod tests {
                     "scratch too small: {scratch_cap} < {sizeimage}"
                 );
 
-                // Question 1: REQBUFS(DMABUF) cost in isolation.
+                // REQBUFS(DMABUF) cost in isolation.
                 let t1 = Instant::now();
                 m2m.capture_mut()
                     .request(Memory::DmaBuf, 1)
@@ -1816,7 +1686,7 @@ mod tests {
                 let t_reqbufs = t1.elapsed();
                 m2m.capture().stream_on().expect("STREAMON CAPTURE");
 
-                // Question 3: plane.length = 4 MiB scratch capacity > sizeimage.
+                // Queue with plane.length set to the scratch capacity.
                 m2m.capture()
                     .enqueue(
                         0,
@@ -1859,9 +1729,7 @@ mod tests {
     }
 
     /// Drive one M2M context at the given queue depth on a fixed JPEG and
-    /// return steady-state decode FPS. OUTPUT buffers are prefilled once
-    /// (every frame decodes the same bitstream — no per-frame copy), so this
-    /// measures the pure driver + hardware pipeline rate.
+    /// return steady-state decode FPS. OUTPUT buffers are prefilled once.
     fn run_throughput(dev: &ProbedDevice, jpeg: &[u8], depth: u32, frames: usize) -> Option<f64> {
         use std::time::Instant;
         const CAP: u32 = uapi::V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
@@ -1869,7 +1737,7 @@ mod tests {
         let mut m2m = M2m::new(&dev.dev, true).ok()?;
         events::subscribe(&dev.dev, uapi::V4L2_EVENT_SOURCE_CHANGE, 0, 0).ok()?;
 
-        // OUTPUT: depth buffers, all prefilled with the same JPEG.
+        // OUTPUT: `depth` buffers, all prefilled with the same JPEG.
         let mut ofmt = uapi::v4l2_format {
             type_: uapi::V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE,
             ..Default::default()
@@ -1905,7 +1773,7 @@ mod tests {
         let _ = events::wait(&dev.dev, Some(SOURCE_CHANGE_TIMEOUT));
         let _ = events::drain(&dev.dev, MAX_EVENTS);
 
-        // CAPTURE: single-plane NV12, depth scratch dmabufs.
+        // CAPTURE: single-plane NV12, `depth` scratch dmabufs.
         let mut gfmt = dev.dev.format(BufType::VideoCaptureMplane).ok()?;
         // SAFETY: mplane variant.
         let got = *unsafe { gfmt.pix_mp() };
@@ -1976,8 +1844,7 @@ mod tests {
             m2m.output().enqueue(i, &coded, None).ok()?;
         }
 
-        // Warmup, then measure: each completion immediately requeues the same
-        // buffer pair, keeping `live` decodes in flight.
+        // Warm up, then measure: each completion requeues the same buffer pair.
         let warmup = 30usize;
         let mut t0 = Instant::now();
         for n in 0..(warmup + frames) {
@@ -2001,10 +1868,8 @@ mod tests {
         Some(fps)
     }
 
-    /// On-target probe: raw mxc-jpeg decode throughput (1280×720 4:2:0 →
-    /// NV12, no userspace copies) versus queue depth and context count.
-    /// Answers whether deeper buffer queues ("batch" decoding) or parallel
-    /// M2M contexts (one per decode worker) raise hardware throughput.
+    /// On-target probe: hardware decode throughput (1280×720 4:2:0 to NV12)
+    /// versus queue depth and context count.
     #[test]
     #[ignore = "on-target hardware probe; run with --ignored --nocapture on a JPEG M2M device"]
     fn probe_decode_throughput() {
@@ -2029,8 +1894,7 @@ mod tests {
             }
         }
 
-        // Parallel contexts: one fd per thread, depth 1 each — the shape the
-        // profiler's decode workers (one ImageDecoder each) already produce.
+        // Parallel contexts: one fd per thread, depth 1 each.
         for contexts in [2usize, 4] {
             let mut devs = Vec::new();
             for _ in 0..contexts {
@@ -2055,8 +1919,7 @@ mod tests {
                     });
                 }
             });
-            // Each thread also runs its 30-frame warmup; include it in the
-            // aggregate (small, and identical across configurations).
+            // The aggregate includes each thread's 30-frame warmup.
             let total = contexts * (frames + 30);
             let fps = total as f64 / t0.elapsed().as_secs_f64();
             eprintln!("{contexts} contexts, depth 1: {fps:7.1} FPS aggregate");
@@ -2100,11 +1963,8 @@ mod tests {
         assert!(ctx.stream.is_none());
     }
 
-    /// A rebuild that fails after starting the OUTPUT queue leaves the queues
-    /// active without a [`Stream`]. The reset must stop and free both, and
-    /// the next decode must succeed on the hardware. `V4l2Context::decode` is
-    /// called directly because the public path would hide a failure behind
-    /// the CPU fallback.
+    /// A reset stops and frees the queues a failed rebuild left active, and the
+    /// next decode succeeds on the hardware.
     #[test]
     fn v4l2_recovers_from_partial_setup() {
         let Some(jpeg) = testdata_file("zidane.jpg") else {

@@ -57,6 +57,4 @@ when any check failed.
 | S7 | Cross-process: named NT handles, fence by name, legacy KMT handle, CUDA in the child |
 | S8 | D3D12 open of the texture and fence, linear copy, DirectML operator, ANGLE D3D11on12, injected D3D11On12 device with `UnwrapUnderlyingResource` |
 
-Running the whole thing with `--warp` is the S9 coverage map. The
-results that fed the design are recorded with the planning documents
-for the Windows D3D11 texture tensor work.
+Running the whole thing with `--warp` is the S9 coverage map.

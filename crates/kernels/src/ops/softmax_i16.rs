@@ -64,8 +64,7 @@ impl RowConsts {
 
 /// A validated int16 softmax over the last axis; every other axis indexes independent rows.
 ///
-/// Reproduces TFLite's `reference_ops::SoftmaxInt16` bit for bit on every tier: it is all
-/// integer, so the order of the row sum does not matter.
+/// Reproduces TFLite's `reference_ops::SoftmaxInt16` bit for bit on every tier.
 ///
 /// ```
 /// use edgefirst_kernels::{Quant, SoftmaxI16Params, SoftmaxI16Plan, TensorMut, TensorRef, View, ViewMut};
@@ -103,8 +102,7 @@ impl SoftmaxI16Plan {
 
     /// Builds a plan that runs the best kernel `f` allows.
     ///
-    /// `input.scale * beta` must be below about 5 (`Unsupported` otherwise): beyond that TFLite's
-    /// int32 rescale of the input difference overflows.
+    /// `input.scale * beta` must be below about 5 (`Unsupported` otherwise).
     pub fn with_features(p: SoftmaxI16Params, f: CpuFeatures) -> Result<Self> {
         if !finite_positive(p.input.scale) {
             return Err(KernelError::InvalidArgument(
@@ -167,10 +165,9 @@ impl SoftmaxI16Plan {
 
     /// Softmax of `input` into `output`, both i16 with the same shape of rank ≥ 1.
     ///
-    /// Rows may hold at most 65538 elements (`Unsupported` otherwise), the most whose sum of
-    /// exps fits TFLite's int32 accumulator. Rows are split across `pool` when one is given.
-    /// Output axes sorted by stride must each step past the extent of the smaller ones.
-    /// Arguments are validated before anything is written.
+    /// Rows may hold at most 65538 elements (`Unsupported` otherwise). Rows are split across
+    /// `pool` when one is given. Output axes sorted by stride must each step past the extent of
+    /// the smaller ones. Arguments are validated before anything is written.
     pub fn run(
         &self,
         input: TensorRef<'_>,
@@ -215,7 +212,7 @@ impl SoftmaxI16Plan {
         }
     }
 
-    /// Long strided rows: the output cannot be read back, so the exps are computed twice.
+    /// Long strided rows: the exps are computed twice.
     fn row_strided(&self, src: StridedRow<'_, i16>, dst: &mut StridedRowMut<'_, i16>) {
         if src.len() != dst.len() {
             return;
@@ -264,7 +261,6 @@ pub(super) fn reciprocal(c: &RowConsts, sum: i32) -> (i16, u32) {
     let shifted = ((i64::from(sum) << headroom_plus_one.saturating_sub(1)) + (1 << 13)) >> 14;
     let sym = (shifted as i32).wrapping_sub((1 << 15) + (1 << 16));
     let recip = lut_lookup_i16(sym.clamp(-32768, 32767) as i16, &c.recip_lut);
-    // A non-empty row's sum is at least the max's exp, so the shift is in 14..=30.
     let right_shift = 31u32.saturating_sub(headroom_plus_one).max(1);
     (recip, right_shift)
 }

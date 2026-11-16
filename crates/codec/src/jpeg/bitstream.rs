@@ -1,31 +1,19 @@
 // SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! 64-bit big-endian bit buffer with a branch-light bulk refill and FF/00
-//! byte-stuffing handling, engineered for the priority cores: in-order
-//! Cortex-A53/A55 and out-of-order Cortex-A7x / Apple Silicon.
+//! 64-bit big-endian bit buffer with bulk refill and FF/00 byte-stuffing
+//! handling.
 //!
-//! Hot-path contract (libjpeg-turbo `BITREAD_*` in spirit):
+//! - [`BitStream::refill`] leaves ≥ 32 buffered bits whenever more entropy
+//!   data exists: one Huffman code (≤ 16 bits) plus its magnitude bits
+//!   (≤ 11).
+//! - [`BitStream::peek`] / [`BitStream::consume`] operate on the buffered
+//!   bits only and never refill.
+//! - The fast refill is one unaligned 8-byte load plus a SWAR scan for 0xFF.
+//!   Stuffing and markers take a byte-wise path.
 //!
-//! - [`BitStream::refill`] guarantees **≥ 32 buffered bits** whenever more
-//!   entropy data exists — enough for one Huffman code (≤ 16 bits) plus its
-//!   magnitude bits (≤ 11) — so the block decoder performs a single refill
-//!   check per coefficient instead of one per `peek`.
-//! - [`BitStream::peek`] / [`BitStream::consume`] are pure register ops:
-//!   no memory access, no fill branch. This only holds while nothing hands a
-//!   `&mut BitStream` to an out-of-line callee — see [`BitStream::refill_slow`]
-//!   for why both cold paths are inlined instead of marked `#[cold]`.
-//! - The fast refill is one unaligned 8-byte GPR load (cheap on every target
-//!   core, including Cortex-A53's 64-bit load path) plus a SWAR scan for
-//!   0xFF. Stuffing/markers divert to a cold byte-wise path.
-//!
-//! At end-of-data the buffer zero-pads (turbo inserts dummy zeroes the same
-//! way), so a truncated stream decodes to garbage rather than reading out of
-//! bounds. Block-level validation catches most of that garbage, but not all of
-//! it: zero is a valid DC code and a valid EOB, so a scan that simply stops
-//! decodes as well-formed zero blocks. [`BitStream::overran`] records that the
-//! decoder was handed bits the file never contained, which is what lets the
-//! scan loop tell "ran out of data" from "decoded to zeroes".
+//! At end-of-data the buffer zero-pads. [`BitStream::overran`] records that
+//! the decoder was handed bits past the end of the data.
 
 /// All-ones in every byte lane; used by the SWAR 0xFF detector.
 const LO: u64 = 0x0101_0101_0101_0101;
@@ -45,18 +33,12 @@ fn any_byte_ff(w: u64) -> bool {
 /// Bits are buffered top-aligned in a u64 accumulator. Handles JPEG's
 /// byte-stuffing convention (0xFF 0x00 → single 0xFF data byte).
 ///
-/// The hot block loop does not operate on this struct directly: it takes a
-/// [`BitCursor`] copy of the state ([`Self::cursor`]), runs on that, and
-/// [`Self::commit`]s at exit. `&mut BitStream` is caller-visible memory, so
-/// LLVM must keep its fields coherent across every potential exit — `perf
-/// annotate` on Cortex-A53 showed a store of `avail` back into the struct on
-/// every decoded coefficient. The cursor is a function-local the optimizer
-/// can prove non-escaping, which keeps the whole state in registers
-/// (libjpeg-turbo's `BITREAD_LOAD_STATE` / `BITREAD_SAVE_STATE` discipline).
+/// The block loop takes a [`BitCursor`] copy of the state
+/// ([`Self::cursor`]), runs on that, and [`Self::commit`]s at exit.
 pub struct BitStream<'a> {
     data: &'a [u8],
     pos: usize,
-    /// Bits buffered in the HIGH bits of the u64; low bits are zero.
+    /// Bits buffered in the high bits of the u64; low bits are zero.
     bits: u64,
     /// Number of valid top bits (may briefly go ≤ 0 on truncated streams,
     /// where the zero-padded low bits stand in for missing data).
@@ -64,15 +46,14 @@ pub struct BitStream<'a> {
     /// Entropy prefetch distance in bytes (0 disables).
     prefetch: usize,
     /// Set once the buffer has handed out bits past the end of the entropy
-    /// data. Only ever written on the exhausted branch of the cold refill.
+    /// data.
     overran: bool,
 }
 
-/// Register-resident working copy of a [`BitStream`]'s state.
+/// Working copy of a [`BitStream`]'s state.
 ///
 /// Created by [`BitStream::cursor`], written back by [`BitStream::commit`].
-/// All hot-path operations live here; `BitStream` methods delegate through a
-/// cursor so there is a single implementation of the refill logic.
+/// `BitStream` methods delegate through a cursor.
 pub struct BitCursor<'a> {
     data: &'a [u8],
     pos: usize,
@@ -109,7 +90,7 @@ impl<'a> BitStream<'a> {
         self.pos
     }
 
-    /// Copy the state into a register-resident working cursor.
+    /// Copy the state into a working cursor.
     #[inline(always)]
     pub fn cursor(&self) -> BitCursor<'a> {
         BitCursor {
@@ -142,8 +123,7 @@ impl<'a> BitCursor<'a> {
         let idx = self.pos + self.prefetch;
         if idx < self.data.len() {
             #[cfg(target_arch = "aarch64")]
-            // SAFETY: idx is in-bounds; prfm is a hint (dual-issues free on
-            // A53/A55).
+            // SAFETY: idx is in-bounds; prfm is a hint.
             unsafe {
                 core::arch::asm!(
                     "prfm pldl1keep, [{ptr}]",
@@ -162,10 +142,10 @@ impl<'a> BitCursor<'a> {
         }
     }
 
-    /// Top up the buffer to **≥ 32 bits** (when data remains).
+    /// Top up the buffer to ≥ 32 bits (when data remains).
     ///
     /// Fast path: one unaligned 8-byte load + SWAR 0xFF scan, then append as
-    /// many whole bytes as fit. Runs at most once per decoded coefficient.
+    /// many whole bytes as fit.
     #[inline(always)]
     pub fn refill(&mut self) {
         if self.avail >= 32 {
@@ -192,20 +172,10 @@ impl<'a> BitCursor<'a> {
     }
 
     /// Byte-wise refill handling 0xFF stuffing, markers, and end-of-data.
-    ///
-    /// Inlined despite being the rare path, and despite its size. Out of line
-    /// it takes `&mut BitStream`, which escapes the pointer and forces the
-    /// coefficient loop to keep `bits`/`avail` in memory: `perf annotate`
-    /// showed a load *and* a store against the stack slot on every `consume`.
-    /// Inlining it lets the whole buffer stay in registers, worth ~6% of
-    /// decode time on Rocket Lake for ~3% more retired instructions.
     #[inline(always)]
     fn refill_slow(&mut self) {
         if self.avail < 0 {
-            // Negative means a consumer was already handed more bits than the
-            // file held: the padding zeroes stood in for them. Reachable only
-            // at true end-of-data — while whole bytes remain, a refill tops up
-            // to 32 bits and no single symbol consumes that many.
+            // Negative: a consumer was handed more bits than the data held.
             self.overran = true;
             self.avail = 0;
         }
@@ -230,7 +200,7 @@ impl<'a> BitCursor<'a> {
 
     /// Peek at the top `n` bits without consuming them (n ≤ 56).
     ///
-    /// Does **not** refill — the caller must uphold the [`refill`] contract.
+    /// Does not refill; the caller must uphold the [`refill`] contract.
     ///
     /// [`refill`]: Self::refill
     #[inline(always)]
@@ -239,7 +209,7 @@ impl<'a> BitCursor<'a> {
         (self.bits >> (64 - n as u32)) as u32
     }
 
-    /// Consume (drop) `n` bits from the buffer. Pure register ops.
+    /// Consume (drop) `n` bits from the buffer.
     #[inline(always)]
     pub fn consume(&mut self, n: u8) {
         self.bits <<= n;
@@ -256,8 +226,7 @@ impl<'a> BitCursor<'a> {
 }
 
 impl<'a> BitStream<'a> {
-    /// Top up the buffer to ≥ 32 bits. Cold-path convenience that round-trips
-    /// through a [`BitCursor`]; hot loops hold their own cursor instead.
+    /// Top up the buffer to ≥ 32 bits through a [`BitCursor`].
     #[inline]
     fn refill(&mut self) {
         let mut cur = self.cursor();
@@ -265,9 +234,8 @@ impl<'a> BitStream<'a> {
         self.commit(cur);
     }
 
-    /// Whether the stream was ever asked for bits past the end of the entropy
-    /// data, i.e. the scan is truncated and part of the image is zero padding
-    /// rather than decoded content.
+    /// Whether the stream was asked for bits past the end of the entropy
+    /// data, i.e. the scan is truncated.
     #[inline]
     pub fn overran(&self) -> bool {
         self.overran
@@ -300,9 +268,6 @@ impl<'a> BitStream<'a> {
     }
 
     /// Skip past the next restart marker (0xFF 0xDn).
-    ///
-    /// Buffered bits never contain marker bytes (both refill paths stop at
-    /// 0xFF-non-stuffing), so scanning forward from `pos` is sound.
     pub fn skip_restart_marker(&mut self) -> bool {
         self.align_to_byte();
 
@@ -397,11 +362,10 @@ mod tests {
         }
     }
 
-    /// Randomized parity vs a trivial bit-at-a-time reference reader, with
-    /// partial-byte refills exercised (avail lands on non-multiples of 8).
+    /// Random-width reads match a bit-at-a-time reference reader.
     #[test]
     fn refill_parity_random_reads() {
-        // Deterministic LCG; bytes 0x00..=0xFE (no 0xFF → pure fast path).
+        // Deterministic LCG; bytes 0x00..=0xFE (no 0xFF).
         let mut state = 0x1234_5678u32;
         let mut next = move || {
             state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
@@ -427,8 +391,7 @@ mod tests {
         }
     }
 
-    /// Same parity check across a stream salted with FF00 stuffing (slow path
-    /// interleaves with the bulk path).
+    /// The same parity check on a stream with FF00 stuffing.
     #[test]
     fn refill_parity_with_stuffing() {
         let mut raw = Vec::new(); // logical (unstuffed) bytes

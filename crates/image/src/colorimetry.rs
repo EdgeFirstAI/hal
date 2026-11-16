@@ -4,26 +4,25 @@
 //! Resolve a tensor's colorimetry to concrete conversion parameters.
 //!
 //! `convert()` calls [`effective_colorimetry`] at use-time to fill only the
-//! axes it needs, per industry convention, WITHOUT mutating the tensor.
+//! axes it needs, without mutating the tensor.
 
 use edgefirst_tensor::{
     ColorEncoding, ColorRange, ColorSpace, ColorTransfer, Colorimetry, TensorDyn,
 };
 
 /// Height (in lines) at/above which HD conventions (BT.709) apply; below it,
-/// SD conventions (BT.601). Matches Rec.709(HD)/Rec.601(SD) + libcamera.
+/// SD conventions (BT.601).
 const HD_THRESHOLD: usize = 720;
 
 /// Return a fully-resolved `Colorimetry` (every axis `Some`): the tensor's
 /// specified axes, with only the missing ones filled by the height heuristic.
-/// Pure — does NOT mutate the tensor.
+/// Does not mutate the tensor.
 pub(crate) fn effective_colorimetry(t: &TensorDyn) -> Colorimetry {
     resolve_colorimetry(t.colorimetry(), t.height())
 }
 
-/// Core resolver shared by `effective_colorimetry` and any caller that already
-/// has the raw `(colorimetry, height)` pair (e.g. a `Tensor<u8>` fill target).
-/// Fills only the missing axes by the height heuristic; never mutates.
+/// Resolver for a raw `(colorimetry, height)` pair. Fills only the missing
+/// axes by the height heuristic.
 pub(crate) fn resolve_colorimetry(
     colorimetry: Option<Colorimetry>,
     height: Option<usize>,
@@ -52,7 +51,7 @@ pub(crate) fn yuv_matrix(e: ColorEncoding) -> yuv::YuvStandardMatrix {
         ColorEncoding::Bt601 => yuv::YuvStandardMatrix::Bt601,
         ColorEncoding::Bt709 => yuv::YuvStandardMatrix::Bt709,
         ColorEncoding::Bt2020 => yuv::YuvStandardMatrix::Bt2020,
-        // Future encodings added in a later HAL version default to BT.709.
+        // Any other encoding maps to BT.709.
         _ => yuv::YuvStandardMatrix::Bt709,
     }
 }
@@ -62,7 +61,7 @@ pub(crate) fn yuv_range(r: ColorRange) -> yuv::YuvRange {
     match r {
         ColorRange::Full => yuv::YuvRange::Full,
         ColorRange::Limited => yuv::YuvRange::Limited,
-        // Future range variants default to Limited (broadcast convention).
+        // Any other range maps to Limited.
         _ => yuv::YuvRange::Limited,
     }
 }
@@ -73,8 +72,7 @@ pub(crate) fn yuv_range(r: ColorRange) -> yuv::YuvRange {
 /// chroma cross-terms (`c_vr`, `c_ug`, `c_vg`, `c_ub`) encode the
 /// `ColorEncoding` matrix folded with the range's chroma scaling. These feed
 /// the shared GLSL YUV→RGB fragment shaders (see `gl::shaders_common`) as
-/// `float` uniforms — identical on every GL backend (macOS ANGLE + Linux
-/// GLES); only the texture import differs by platform.
+/// `float` uniforms.
 ///
 /// The coefficients derive from the BT matrix luma weights `(kr, kb)`:
 /// ```text
@@ -85,10 +83,6 @@ pub(crate) fn yuv_range(r: ColorRange) -> yuv::YuvRange {
 /// ```
 /// For limited range the luma gain is 255/219 and chroma scale 255/224; for
 /// full range both are 1.0.
-// Only the GL backend consumes these: they are *in-shader* coefficients.
-// Without `opengl` the struct and its constructor are genuinely dead, and
-// `--no-default-features` builds under `-D warnings` fail without this.
-// The unit tests below keep exercising it in every configuration.
 #[cfg_attr(not(feature = "opengl"), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct YuvToRgbCoeffs {
@@ -116,13 +110,12 @@ impl YuvToRgbCoeffs {
 }
 
 /// Compute the in-shader YUV→RGB coefficients for a resolved
-/// `(ColorEncoding, ColorRange)`. Pure; platform-neutral.
+/// `(ColorEncoding, ColorRange)`.
 #[cfg_attr(not(feature = "opengl"), allow(dead_code))]
 pub(crate) fn yuv_to_rgb_coeffs(encoding: ColorEncoding, range: ColorRange) -> YuvToRgbCoeffs {
-    // Luma weights (kr, kb) and range swings come from the canonical source in
-    // `edgefirst_tensor::colorimetry` so the GL coefficients stay in lockstep
-    // with the CPU encoders. The arithmetic below is kept in `f32` (the GL
-    // uniform type) for bit-stable shader output.
+    // Luma weights (kr, kb) and range swings come from
+    // `edgefirst_tensor::colorimetry`; the arithmetic is in `f32`, the GL
+    // uniform type.
     let w = encoding.luma_weights();
     let (kr, kb) = (w.kr as f32, w.kb as f32);
     let kg = 1.0 - kr - kb;
@@ -211,13 +204,12 @@ mod tests {
 
     #[test]
     fn yuv_to_rgb_coeffs_match_reference_values() {
-        // Reference YCbCr→RGB cross-terms (well-known broadcast constants). The
-        // shader applies `r = y' + c_vr*v'`, `b = y' + c_ub*u'`, etc.
+        // Reference YCbCr→RGB cross-terms.
         fn close(a: f32, b: f32, what: &str) {
             assert!((a - b).abs() < 2e-3, "{what}: {a} vs expected {b}");
         }
 
-        // BT.601 limited range — the canonical SD decode.
+        // BT.601 limited range.
         let c = yuv_to_rgb_coeffs(ColorEncoding::Bt601, ColorRange::Limited);
         close(c.y_offset, 16.0 / 255.0, "601L y_offset");
         close(c.y_scale, 255.0 / 219.0, "601L y_scale");
@@ -226,7 +218,7 @@ mod tests {
         close(c.c_ug, 0.391, "601L c_ug");
         close(c.c_vg, 0.813, "601L c_vg");
 
-        // BT.709 limited range — the canonical HD decode.
+        // BT.709 limited range.
         let c = yuv_to_rgb_coeffs(ColorEncoding::Bt709, ColorRange::Limited);
         close(c.c_vr, 1.793, "709L c_vr");
         close(c.c_ub, 2.113, "709L c_ub");

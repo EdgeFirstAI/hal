@@ -3,18 +3,15 @@
 
 //! Rust-ecosystem JPEG decode reference arms for the decoder A/B.
 //!
-//! Mirrors the `turbojpeg` bench protocol: sorted, **evenly spaced** COCO
-//! subset (the same `i * total / n` stride as `benchmarks/common` and
-//! `bench.c`, so every arm decodes the same images for a given `--limit`),
-//! warmup repeated on the first image, per-image wall time, p50 (with ~95%
-//! CI) / mean / p95 / p99. Two engines:
+//! Decodes a sorted, evenly spaced subset of the corpus (the `i * total / n`
+//! stride), repeats warmup on the first image and reports per-image wall
+//! time as p50 (with ~95% CI) / mean / p95 / p99. Two engines:
 //!
 //! - `--engine zune`: `zune-jpeg` directly, headers + `decode_into` a reused
-//!   buffer. `--format yuv` decodes to interleaved YCbCr (its closest
-//!   native-output analogue); `--format rgb` to RGB.
-//! - `--engine image`: the `image` crate exactly as the codec's historical
-//!   comparison uses it (`load_from_memory_with_format` + `to_rgb8`,
-//!   allocating per call; RGB only). Uses zune-jpeg internally.
+//!   buffer. `--format yuv` decodes to interleaved YCbCr; `--format rgb` to
+//!   RGB.
+//! - `--engine image`: the `image` crate (`load_from_memory_with_format` +
+//!   `to_rgb8`, allocating per call; RGB only). Uses zune-jpeg internally.
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -39,8 +36,7 @@ struct Args {
     csv: Option<std::path::PathBuf>,
 }
 
-/// Process CPU time, as the C harnesses measure it (CLOCK_PROCESS_CPUTIME_ID;
-/// the decode loop is single-threaded so this doubles as busiest-core).
+/// Process CPU time (CLOCK_PROCESS_CPUTIME_ID).
 fn process_cpu_seconds() -> f64 {
     let mut ts = libc::timespec {
         tv_sec: 0,
@@ -52,8 +48,7 @@ fn process_cpu_seconds() -> f64 {
     ts.tv_sec as f64 + ts.tv_nsec as f64 / 1e9
 }
 
-/// Peak RSS in MB, matching peak_rss_mb() in benchmarks/common and the C
-/// harnesses. Linux ru_maxrss is kilobytes; Darwin reports bytes.
+/// Peak RSS in MB. Linux ru_maxrss is kilobytes; Darwin reports bytes.
 fn peak_rss_mb() -> f64 {
     let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
     if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) } != 0 {
@@ -66,11 +61,7 @@ fn peak_rss_mb() -> f64 {
     }
 }
 
-/// Advisory scheduling hint for macOS, which has no `taskset`-equivalent
-/// core pinning; matches `benchmarks/common::cpu::pin_qos` (duplicated
-/// rather than depending on that crate, which pulls in edgefirst-codec/
-/// image — this binary deliberately stays independent of the HAL it's
-/// compared against). No-op on non-macOS.
+/// Advisory scheduling hint for macOS. No-op on non-macOS.
 #[cfg(target_os = "macos")]
 fn pin_qos() {
     #[allow(non_camel_case_types)]
@@ -79,8 +70,7 @@ fn pin_qos() {
     extern "C" {
         fn pthread_set_qos_class_self_np(qos_class: qos_class_t, relative_priority: i32) -> i32;
     }
-    // SAFETY: FFI call with no pointer arguments; a nonzero return is
-    // advisory-only and safe to ignore.
+    // SAFETY: FFI call with no pointer arguments.
     unsafe {
         pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
     }
@@ -101,9 +91,7 @@ fn main() -> Result<()> {
         })
         .collect();
     files.sort();
-    // Evenly spaced subset, exactly as benchmarks/common list_jpegs() and
-    // bench.c preload() select: COCO val2017's lexicographic prefix is biased
-    // (4:4:4-dominant), and every arm must see the same images.
+    // Evenly spaced subset.
     if args.limit > 0 && args.limit < files.len() {
         let len = files.len();
         files = (0..args.limit)
@@ -127,9 +115,7 @@ fn main() -> Result<()> {
         "--engine image supports --format rgb only"
     );
 
-    // High-water scratch, grown on demand by decode_one (the turbo/wuffs
-    // pattern): starting empty keeps the reported peak RSS an honest measure
-    // of the decoder's working set instead of a pre-allocated 64 MB floor.
+    // Scratch buffer, grown on demand by decode_one.
     let mut buf = Vec::new();
     let mut mp_total = 0f64;
     let mut decode_one = |jpeg: &[u8]| -> Result<(usize, usize)> {
@@ -157,10 +143,7 @@ fn main() -> Result<()> {
         }
     };
 
-    // Warmup on the first *decodable* image, repeated as the hal_cpu and
-    // turbojpeg harnesses do; if the corpus leads with an image this engine
-    // rejects (e.g. greyscale under forced YCbCr), fall through to the next
-    // so warmup is never a silent no-op.
+    // Warmup on the first decodable image.
     if let Some(first) = data.iter().find(|jpeg| decode_one(jpeg).is_ok()) {
         for _ in 1..args.warmup {
             let _ = decode_one(first);
@@ -169,8 +152,7 @@ fn main() -> Result<()> {
         eprintln!("  warn: no image in the corpus warms up under this engine/format");
     }
 
-    // Per-image failures are skipped and counted, not fatal: e.g. zune-jpeg
-    // rejects forced-YCbCr output for COCO's greyscale images.
+    // Per-image failures are skipped and counted.
     let mut skipped = 0usize;
     let mut times = Vec::with_capacity(data.len());
     let cpu0 = process_cpu_seconds();
@@ -191,11 +173,10 @@ fn main() -> Result<()> {
     }
     times.sort_by(|a, b| a.total_cmp(b));
     let n = times.len();
-    // `round(p * (n - 1))`, the same index as benchmarks/common and bench.c.
+    // Percentile index `round(p * (n - 1))`.
     let pct = |p: f64| times[((p * (n as f64 - 1.0)).round() as usize).min(n - 1)];
     let total_ms: f64 = times.iter().sum();
-    // ~95% CI for the median: 1-based ranks n/2 ∓ 1.96·√n/2, as in
-    // benchmarks/common median_ci_indices().
+    // ~95% CI for the median: 1-based ranks n/2 ∓ 1.96·√n/2.
     let half_width = 0.98 * (n as f64).sqrt();
     let ci_lo = times[((n as f64) / 2.0 - half_width).floor().max(1.0) as usize - 1];
     let ci_hi = times[((n as f64) / 2.0 + 1.0 + half_width).ceil().min(n as f64) as usize - 1];

@@ -4,13 +4,10 @@
 //! Scalar Loeffler 8×8 IDCT.
 //!
 //! Two-pass (columns then rows) Loeffler butterfly with 13-bit fixed-point
-//! arithmetic. Reference implementation validated against libjpeg-turbo.
-//!
-//! This is the reference every SIMD kernel is asserted against, so where the
-//! vector kernels have no choice — a 16-bit dequantised coefficient, a
-//! saturating narrow between the passes, `i32` lanes that wrap — this one does
-//! the same rather than the arithmetically nicer thing. See [`super::IdctFn`]
-//! for what that buys and what it does not.
+//! arithmetic. The reference every SIMD kernel is compared against: it uses a
+//! 16-bit dequantised coefficient, a saturating narrow between the passes and
+//! wrapping `i32` intermediates, as the vector kernels do. See
+//! [`super::IdctFn`].
 
 use std::num::Wrapping;
 
@@ -20,10 +17,7 @@ const CONST_BITS: i32 = 13;
 /// Round-to-nearest bias for the pass-1 descale shift (`CONST_BITS - PASS1_BITS`).
 const PASS1_ROUND: W = Wrapping(1 << (CONST_BITS - PASS1_BITS - 1));
 
-/// Butterfly intermediates. The vector kernels do this arithmetic in `i32`
-/// lanes, where overflow wraps silently; matching that here keeps the reference
-/// bit-identical to them on corrupt coefficient streams, and keeps a malformed
-/// JPEG from tripping the overflow checks in a debug build.
+/// Butterfly intermediates: wrapping `i32`, as in the vector kernels' lanes.
 type W = Wrapping<i32>;
 
 /// Loeffler butterfly constants (13-bit fixed-point).
@@ -39,27 +33,20 @@ const FIX_2_053: W = Wrapping(16819); // √2 * (cos(7π/16) + cos(3π/16))
 const FIX_2_562: W = Wrapping(20995); // √2 * (cos(π/16) + cos(5π/16))
 const FIX_3_072: W = Wrapping(25172); // √2 * (cos(π/16) + cos(3π/16))
 
-/// Dequantise one coefficient (quantised value × quant table entry).
-///
-/// Wrapping in `i16`, matching libjpeg-turbo and the SIMD kernels, which hold
-/// the dequantised block in 16-bit lanes and cannot do otherwise. Real streams
-/// never reach the wrap: an encoder that picks a large quantiser has already
-/// divided the coefficient down to match. Widening to `i32` here instead would
-/// only make the reference disagree with the kernels it is used to check.
+/// Dequantise one coefficient (quantised value × quant table entry),
+/// wrapping in `i16`.
 #[inline(always)]
 fn deq(c: i16, q: u16) -> W {
     Wrapping(c.wrapping_mul(q as i16) as i32)
 }
 
-/// Descale a pass-1 result and narrow to `i16`, **saturating**: the vector
-/// kernels have to pack the inter-pass workspace back into 16-bit lanes, so
-/// this is where they lose range and the reference must lose it identically.
+/// Descale a pass-1 result and narrow to `i16`, saturating.
 #[inline(always)]
 fn narrow_p1(x: W) -> W {
     Wrapping((x.0 >> (CONST_BITS - PASS1_BITS)).clamp(i16::MIN as i32, i16::MAX as i32))
 }
 
-/// Perform 8×8 IDCT on **quantised** coefficients in natural (row-major)
+/// Perform 8×8 IDCT on quantised coefficients in natural (row-major)
 /// order, dequantising with `quant` (also natural order) on load.
 ///
 /// Output is 64 clamped `[0, 255]` u8 values written at `stride` byte offsets.
@@ -87,8 +74,7 @@ pub fn idct_8x8_scalar(coeffs: &[i16; 64], quant: &[u16; 64], output: &mut [u8],
             && s6 == zero
             && s7 == zero
         {
-            // Saturated like the full path below, which the vector kernels take
-            // unconditionally: the shortcut must not widen the reference's range.
+            // Saturated like the full path below.
             let dc_val =
                 Wrapping((s0.0 << PASS1_BITS as usize).clamp(i16::MIN as i32, i16::MAX as i32));
             for row in 0..8 {
@@ -150,7 +136,7 @@ pub fn idct_8x8_scalar(coeffs: &[i16; 64], quant: &[u16; 64], output: &mut [u8],
     // Add DC offset of 128 and clamp to [0, 255].
     let range_shift = CONST_BITS + PASS1_BITS + 3; // +3 for the IDCT normalization
     let round = 1 << (range_shift - 1);
-    // Also add 128 * 2^range_shift to centre the output
+    // Add 128 * 2^range_shift to centre the output.
     let bias = Wrapping(round + (128 << range_shift));
 
     for row in 0..8 {
@@ -233,9 +219,7 @@ pub fn idct_8x8_scalar(coeffs: &[i16; 64], quant: &[u16; 64], output: &mut [u8],
 
 /// DC-only fast path: all 64 output values are the same.
 pub fn idct_dc_only_scalar(dc_value: i32, output: &mut [u8], stride: usize) {
-    // DC coefficient is already dequantised. Apply IDCT scaling:
-    // After two passes of the IDCT, the DC value gets divided by 8 (normalisation).
-    // With our fixed-point: (dc * 2^CONST_BITS + bias) >> range_shift as usize
+    // (dc * 2^(CONST_BITS + PASS1_BITS) + bias) >> range_shift.
     let range_shift = CONST_BITS + PASS1_BITS + 3;
     let round = 1 << (range_shift - 1);
     let bias = Wrapping(round + (128 << range_shift));
@@ -256,7 +240,7 @@ fn clamp_u8(x: W) -> u8 {
     x.0.clamp(0, 255) as u8
 }
 
-// Constants for the FIX_0_899 used in odd part
+// FIX_0_899, used in the odd part.
 const FIX_0_899: W = Wrapping(7373);
 
 #[cfg(test)]
@@ -265,7 +249,7 @@ mod tests {
 
     const UNIT_QUANT: [u16; 64] = [1u16; 64];
 
-    /// Test that a zero-coefficient block produces all 128s (the DC level shift).
+    /// A zero-coefficient block produces all 128s (the DC level shift).
     #[test]
     fn zero_block_gives_128() {
         let coeffs = [0i16; 64];
@@ -276,29 +260,24 @@ mod tests {
         }
     }
 
-    /// Test DC-only block.
+    /// A DC-only block is uniform and matches `idct_dc_only_scalar`.
     #[test]
     fn dc_only_block() {
         let mut coeffs = [0i16; 64];
-        // A DC coefficient of 8 (dequantised) should produce:
-        // (8 * 2^15 + bias) >> 18 with bias = 2^17 + 128*2^18
-        // = approximately 128 + 1 = 129
         coeffs[0] = 8;
         let mut output = [0u8; 64];
         idct_8x8_scalar(&coeffs, &UNIT_QUANT, &mut output, 8);
-        // All values should be the same (DC-only shortcut triggers)
         let expected = output[0];
         for &v in &output {
             assert_eq!(v, expected);
         }
 
-        // Compare with dc_only function
         let mut output2 = [0u8; 64];
         idct_dc_only_scalar(8, &mut output2, 8);
         assert_eq!(output, output2);
     }
 
-    /// Dequantisation must apply the quant table entry per position.
+    /// Dequantisation applies the quant table entry per position.
     #[test]
     fn quant_table_applied() {
         let mut coeffs = [0i16; 64];
@@ -314,7 +293,7 @@ mod tests {
         assert_eq!(with_quant, reference);
     }
 
-    /// Test that strided output works correctly.
+    /// Strided output writes 8 bytes per row and leaves the rest untouched.
     #[test]
     fn strided_output() {
         let coeffs = [0i16; 64];
@@ -323,11 +302,9 @@ mod tests {
         idct_8x8_scalar(&coeffs, &UNIT_QUANT, &mut output, stride);
 
         for row in 0..8 {
-            // First 8 bytes of each row should be 128
             for col in 0..8 {
                 assert_eq!(output[row * stride + col], 128);
             }
-            // Remaining bytes should be untouched (0xFF)
             for col in 8..stride {
                 assert_eq!(output[row * stride + col], 0xFF);
             }

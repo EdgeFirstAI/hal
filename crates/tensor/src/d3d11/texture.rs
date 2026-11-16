@@ -4,11 +4,9 @@
 //! the CPU reads and writes through a staging copy, or, for write-only
 //! tensors, through a host buffer uploaded with `UpdateSubresource`.
 //!
-//! The host buffer is also what [`D3d11TextureTensor::host_pin`] hands out an
-//! address into, for every access kind: a pin outlives any map, so it cannot
-//! be the staging mapping itself (that would hold the staging texture mapped
-//! forever and freeze the data). `sync_for_cpu` and `sync_for_device` move
-//! bytes between that buffer and the texture.
+//! [`D3d11TextureTensor::host_pin`] hands out an address into the host buffer,
+//! for every access kind. `sync_for_cpu` and `sync_for_device` move bytes
+//! between that buffer and the texture.
 
 use super::com::hr;
 use super::device::{
@@ -44,21 +42,14 @@ use windows::Win32::Graphics::Dxgi::{
     DXGI_SHARED_RESOURCE_WRITE,
 };
 
-/// Bind flags every allocated texture carries: a render target so the image
-/// crate can draw into it, a shader resource so it can be sampled from.
+/// Bind flags every allocated texture carries: render target and shader
+/// resource.
 const BIND: u32 = (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32;
-/// Shared with an NT handle, which is the form every cross-API consumer
-/// (D3D12, CUDA, ANGLE) opens.
+/// Misc flags every allocated texture carries: shared, with an NT handle.
 const MISC: u32 = (D3D11_RESOURCE_MISC_SHARED.0 | D3D11_RESOURCE_MISC_SHARED_NTHANDLE.0) as u32;
 
-/// Who holds a CPU window onto a backing right now.
-///
-/// `map_with` and `scoped_pin` take `&self`, and views share their parent's
-/// backing, so two maps of one staging texture or one host buffer are
-/// reachable from safe code. Without this they would produce a second `Map`
-/// on a mapped subresource, a `CopyResource` into a mapped staging texture,
-/// or two `&mut` aliases into one buffer. Same shape as `PboTensor`'s
-/// `map_state`: readers refcount behind one mapping, a writer is exclusive.
+/// Who holds a CPU window onto a backing. Readers share one mapping; a writer
+/// is exclusive.
 #[derive(Default)]
 struct MapState {
     /// Live read maps sharing one mapping.
@@ -66,10 +57,10 @@ struct MapState {
     /// A writable map is live. Never true while `readers > 0`.
     writer: bool,
     /// Base address of the live mapping, meaningful only while `readers > 0`
-    /// or `writer`. Stored as an integer so `MapState` stays `Send`.
+    /// or `writer`.
     base: usize,
     /// A `CopyResource` into the staging texture is queued and no `Map` has
-    /// consumed it yet, so a retry must not queue another one.
+    /// consumed it yet.
     refresh_pending: bool,
 }
 
@@ -97,8 +88,7 @@ impl MapState {
         Ok(None)
     }
 
-    /// Gives a claim back. Returns whether that was the last holder, so the
-    /// caller knows to tear the mapping down.
+    /// Gives a claim back. Returns whether that was the last holder.
     fn release(&mut self, writes: bool) -> bool {
         if writes {
             self.writer = false;
@@ -137,14 +127,10 @@ impl Staging {
 /// tensor's maps write through. `row_pitch` is the backing pitch it was
 /// allocated at, which is also the source pitch of its upload.
 struct HostBuffer {
-    /// The allocation, over-sized by `HOST_PIN_ALIGN - 1` so the rows can
-    /// start at an aligned address inside it. Never borrowed again after
-    /// construction; it is here to own the bytes [`Self::base`] points at.
+    /// The allocation, over-sized by `HOST_PIN_ALIGN - 1` bytes. Owns the
+    /// bytes [`Self::base`] points at.
     _bytes: UnsafeCell<Box<[u8]>>,
-    /// Aligned address of the first row, taken once in [`Self::new`]. Taking
-    /// it per call would mint a fresh `&mut` over the allocation while pins
-    /// and maps still hold pointers derived from an earlier one, which the
-    /// aliasing model does not allow.
+    /// Aligned address of the first row, taken once in [`Self::new`].
     base: *mut u8,
     /// Bytes of rows, excluding the alignment slack.
     len: usize,
@@ -153,22 +139,13 @@ struct HostBuffer {
 }
 
 /// Alignment of the address [`D3d11TextureTensor::host_pin`] hands out.
-///
-/// `crate::pin::HostPin::alignment` documents 64 bytes as what TFLite's
-/// `SetCustomAllocationForTensor` requires, and every other backing satisfies
-/// it by being page-backed. Rust's allocator promises only `align_of::<u8>()`,
-/// so this backing has to ask.
 const HOST_PIN_ALIGN: usize = 64;
 
-// SAFETY: the buffer is written by one mapper at a time -- `MapState` makes a
-// writer exclusive -- and read by an upload only under the same claim, which
-// `HostBufferGuard::drop` holds across it. `host_pin` is the one path that
-// takes no claim at all: it hands out the address for the tensor's lifetime,
-// so a pin holder carries the coherency obligation `crate::pin` documents for
-// every backend, and this type does not arbitrate it.
+// SAFETY: `MapState` gives the buffer one writer at a time, and an upload
+// reads it under the same claim. A `host_pin` holder carries the coherency
+// obligation `crate::pin` documents.
 unsafe impl Sync for HostBuffer {}
-// SAFETY: a `Box<[u8]>` has no thread affinity; see the `Sync` note above for
-// the access discipline.
+// SAFETY: a `Box<[u8]>` has no thread affinity.
 unsafe impl Send for HostBuffer {}
 
 impl HostBuffer {
@@ -176,8 +153,8 @@ impl HostBuffer {
         let len = row_pitch * rows;
         let mut bytes = vec![0u8; len + HOST_PIN_ALIGN - 1].into_boxed_slice();
         let start = bytes.as_mut_ptr();
-        // At most `HOST_PIN_ALIGN - 1`, which is exactly the slack allocated.
-        // SAFETY: the offset is inside the allocation by construction.
+        // SAFETY: the offset is at most `HOST_PIN_ALIGN - 1`, the slack
+        // allocated.
         let base = unsafe { start.add(start.align_offset(HOST_PIN_ALIGN)) };
         HostBuffer {
             _bytes: UnsafeCell::new(bytes),
@@ -198,15 +175,14 @@ impl HostBuffer {
     }
 }
 
-/// Where a CPU view of a native NV12 texture holding a shorter image keeps
-/// the image's chroma rows.
+/// Where a CPU view of a native NV12 texture holding a shorter image keeps the
+/// image's chroma rows.
 ///
 /// The texture's chroma plane starts at row `texture_row` of a mapped copy
-/// (its own height), while the image's combined plane -- what producers
-/// write and consumers read through `row_stride` -- has them right after
-/// its own luma rows, at `image_row`. A map moves them up after the texture
-/// is copied in, and a write moves them back down before it is copied out.
-/// Rows between the two belong to neither image and are not preserved.
+/// (its own height), while the image's combined plane has them right after its
+/// own luma rows, at `image_row`. A map moves them up after the texture is
+/// copied in, and a write moves them back down before it is copied out. Rows
+/// between the two are not preserved.
 #[derive(Debug, Clone, Copy)]
 struct ChromaRepack {
     texture_row: usize,
@@ -263,27 +239,24 @@ pub struct D3d11TextureTensor<T> {
     access: CpuAccess,
     staging: Option<Arc<Staging>>,
     /// Created on the first pin or the first map of a write-only tensor, and
-    /// shared with every view: the `Arc` is the cell, not the buffer, so a
-    /// view made before the first pin still lands on the same buffer.
+    /// shared with every view.
     host: Arc<OnceLock<HostBuffer>>,
     nt_handle: Arc<OwnedHandle>,
     identity: BufferIdentity,
     last_gpu_write: Arc<AtomicU64>,
     /// The producer's fence, opened at import and kept for the tensor's
-    /// lifetime because the immediate context holds a queued `Wait` on it.
-    /// `None` for an allocated or wrapped texture, and for an import that
-    /// carried no completion.
+    /// lifetime. `None` for an allocated or wrapped texture, and for an import
+    /// that carried no completion.
     imported_fence: Option<ID3D11Fence>,
-    /// Set when a caller took a writable window on the host buffer, so
-    /// `sync_for_device` knows which backing carries its writes.
+    /// Set when `host_pin` hands out a writable pin. `sync_for_device` then
+    /// publishes from the host buffer.
     wrote_host: Arc<AtomicBool>,
     view_offset: usize,
     _marker: PhantomData<T>,
 }
 
 /// How long an import blocks on a producer's fence when this device cannot
-/// queue a GPU-side wait. Bounded rather than infinite so a value the producer
-/// never signals costs a warning instead of a hung import.
+/// queue a GPU-side wait, in milliseconds.
 const IMPORT_WAIT_MS: u32 = 5_000;
 
 fn texture_desc(
@@ -348,13 +321,11 @@ fn create_staging_texture(d: &D3d11Device, layout: &D3d11ImageLayout) -> Result<
     create_texture(d, &texture_desc(layout, D3D11_USAGE_STAGING, 0, cpu, 0))
 }
 
-/// The driver's row pitch for a staging texture, learned from one throwaway
-/// map. The pitch is chosen when the texture is created, so reading it takes a
-/// texture; no query answers from a description alone.
+/// The driver's row pitch for a staging texture, read from one map of it.
 fn staging_row_pitch(d: &D3d11Device, tex: &ID3D11Texture2D) -> Result<usize> {
     let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
     // SAFETY: `tex` is a live staging texture and `mapped` is a valid
-    // out-parameter; a read map purely to learn the pitch.
+    // out-parameter.
     hr("ID3D11DeviceContext::Map (pitch query)", unsafe {
         d.ctx().Map(tex, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
     })?;
@@ -378,35 +349,19 @@ fn create_staging(d: &D3d11Device, layout: &D3d11ImageLayout) -> Result<Staging>
 }
 
 /// A semi-planar layout widened to the row pitch the driver gives its staging
-/// copy, so the texture's texel grid and the combined plane's row stride are
-/// one number.
+/// copy: the texture's texel width equals the combined plane's row stride.
 ///
-/// The HAL's semi-planar model is a linear combined plane whose row pitch is
-/// the sampled texture's texel width: CPU producers write luma and chroma
-/// lines at the row stride, and the Path B shader wraps chroma addressing at
-/// that same width. A texture only `even(width)` texels wide breaks that
-/// wherever the driver pads the pitch -- 128 bytes on this NVIDIA adapter --
-/// because one producer row then spans two texture rows and the shader samples
-/// past the row edge.
-///
-/// The pitch is fixed when a texture is created, so learning it costs an
-/// allocation: one staging texture at the floor width, and, when that came
-/// back padded, a second at the pitch to confirm the wider texture is not
-/// padded again. Every `CpuAccess` pays for the probe, the ones with no
-/// staging of their own included, so a GPU-only tensor's texture has the same
-/// geometry as a readable one's.
+/// Probes one staging texture at the layout's width and, when its pitch is
+/// padded, a second at that pitch. Fails when the second is padded again.
 fn widen_semi_planar_to_pitch(
     d: &D3d11Device,
     layout: D3d11ImageLayout,
 ) -> Result<D3d11ImageLayout> {
-    // R8, so a pitch in bytes is a pitch in texels.
+    // R8: a pitch in bytes is a pitch in texels.
     let pitch = staging_row_pitch(d, &create_staging_texture(d, &layout)?)?;
     if pitch <= layout.tight_row_bytes() {
         return Ok(layout);
     }
-    // Rounded up because a chroma pair cannot straddle a row edge. Every pitch
-    // either adapter has produced here is a multiple of four, so the rounding
-    // has never moved the number; it holds the invariant, it does not measure.
     let widened = layout.widened_to(pitch.next_multiple_of(2));
     let second = staging_row_pitch(d, &create_staging_texture(d, &widened)?)?;
     if second != widened.tight_row_bytes() {
@@ -426,8 +381,7 @@ fn tex_key(tex: &ID3D11Texture2D) -> u64 {
 
 /// Checks an externally created texture against the layout the HAL would have
 /// chosen, and returns that layout with the texture's own bind flags.
-/// `BIND_RENDER_TARGET` is not required here; the image crate checks it when
-/// the tensor is a destination.
+/// `BIND_RENDER_TARGET` is not required.
 fn validate_external(
     d: &D3d11Device,
     tex: &ID3D11Texture2D,
@@ -475,9 +429,7 @@ fn validate_external(
             desc.SampleDesc.Count
         )));
     }
-    // An even NV12 image is allocated as a native two-plane texture, but a
-    // producer may still hand over the combined-plane R8 texture the HAL used
-    // to allocate; that one keeps the combined layout and its rules.
+    // An R8 texture for an even NV12 image takes the combined-plane layout.
     let layout = if layout.is_native_nv12() && desc.Format.0 as u32 == DXGI_FORMAT_R8_UNORM {
         combined_semi_planar_layout(format, width, height).ok_or_else(|| {
             Error::InvalidArgument(format!(
@@ -500,11 +452,9 @@ fn validate_external(
             desc.Height, layout.texture_height
         )));
     }
-    // A combined-plane texture carries the image's row stride as its width,
-    // so a width above the image's even row is padding the host allocated, and
-    // it becomes the tensor's backing pitch. Every other texture's row --
-    // native NV12's luma row included -- is its image row exactly, so a
-    // different width is a different image.
+    // A combined-plane texture's width is the image's row stride: a width
+    // above the image's even row becomes the tensor's backing pitch. Every
+    // other texture's width is its image row.
     let layout = if format.layout() == PixelLayout::SemiPlanar && !layout.is_native_nv12() {
         let texture_width = desc.Width as usize;
         if texture_width < layout.texture_width {
@@ -514,18 +464,9 @@ fn validate_external(
                 layout.texture_width
             )));
         }
-        // The wrapped texture has to satisfy the same rule `new_image` enforces
-        // on its own allocations, and for the same reason: maps and pins of
-        // this tensor are laid out at the driver's staging pitch, so a texture
-        // narrower than that pitch would be reported at one width and
-        // addressed at another. A third-party 64-wide NV12 texture on this
-        // NVIDIA adapter is exactly that case -- its staging pitch is 128.
-        // The pitch is a property of a created texture, so it takes a probe;
-        // the probe is dropped here and `finish` creates the real staging.
+        // The texture's width has to be even and equal to its staging row
+        // pitch.
         let wrapped = layout.widened_to(texture_width);
-        // Two rules, two messages: a chroma pair cannot straddle a row edge,
-        // and the texel grid has to be the row stride a CPU map is laid out
-        // at. An odd width fails the first whatever its pitch turns out to be.
         if !texture_width.is_multiple_of(2) {
             return Err(Error::InvalidArgument(format!(
                 "external D3D11 texture: a {format:?} texture is {texture_width} texels wide, \
@@ -593,10 +534,7 @@ where
             ))
         })?;
         let d = device()?;
-        // A combined-plane texture has to be as wide as the row pitch a CPU
-        // map sees; every other texture's row already is its image row. A
-        // native NV12 texture is sampled per plane, so its luma row is the
-        // image row and the map's pitch is only the CPU's business.
+        // A combined-plane texture is widened to the row pitch a CPU map sees.
         let layout = if format.layout() == PixelLayout::SemiPlanar && !layout.is_native_nv12() {
             widen_semi_planar_to_pitch(d, layout)?
         } else {
@@ -620,7 +558,7 @@ where
     ///
     /// `texture` must be null or a live `ID3D11Texture2D*`. Ownership stays
     /// with the caller: this takes its own reference.
-    #[allow(clippy::too_many_arguments)] // one image description, spelled out
+    #[allow(clippy::too_many_arguments)]
     pub(crate) unsafe fn from_d3d11_texture(
         texture: *mut c_void,
         width: usize,
@@ -633,8 +571,7 @@ where
     ) -> Result<Self> {
         let d = device()?;
         // SAFETY: the caller guarantees `texture` is null or a live
-        // `ID3D11Texture2D`; borrowing takes no reference and `cloned` AddRefs
-        // the one this tensor keeps.
+        // `ID3D11Texture2D`; `cloned` takes the reference this tensor keeps.
         let tex = unsafe { ID3D11Texture2D::from_raw_borrowed(&texture) }
             .cloned()
             .ok_or_else(|| Error::InvalidArgument("from_d3d11_texture: null texture".into()))?;
@@ -652,15 +589,14 @@ where
     }
 
     /// Opens a shared texture on the HAL device and, when a completion is
-    /// given, waits for it on the immediate context so same-device readers
-    /// need no further ordering.
+    /// given, waits for it on the immediate context.
     ///
     /// # Safety
     ///
     /// `handle` must be a shared NT handle valid in this process, and the
     /// completion's handle, when given, a shared fence handle. Both stay owned
     /// by the caller: this duplicates what it keeps.
-    #[allow(clippy::too_many_arguments)] // one image description, spelled out
+    #[allow(clippy::too_many_arguments)]
     pub(crate) unsafe fn from_d3d11_shared_handle(
         handle: RawHandle,
         width: usize,
@@ -682,16 +618,7 @@ where
         })?;
         let (layout, bind) = validate_external(d, &tex, width, height, format, dtype)?;
         let own = duplicate_raw_handle(handle).map_err(Error::IoError)?;
-        // The texture this open produced, not the handle value the caller
-        // passed in. The caller may close its handle the moment this returns
-        // -- the blob importer does exactly that -- and Windows hands the
-        // freed value straight to the next `DuplicateHandle` in the process,
-        // so an identity keyed on any handle value can be reused by an
-        // unrelated later import and the image crate's EGLImage cache would
-        // then serve the wrong texture. A COM object's address cannot be
-        // reused that way: the cache's EGLImage holds its own reference to
-        // the texture, so the address stays taken for as long as any entry
-        // keyed on it can be found.
+        // Keyed on the opened texture, not on the caller's handle value.
         let key = tex_key(&tex);
         let mut t = Self::finish(
             d, tex, bind, layout, width, height, format, dtype, shape, name, access, own, key,
@@ -707,26 +634,10 @@ where
     /// Orders this process's device behind the producer's recorded write and
     /// re-records the completion on the local timeline.
     ///
-    /// `last_gpu_write` is a value on *this* device's fence everywhere else in
-    /// this module: [`gpu_completion`](Self::gpu_completion) pairs it with
-    /// `fence_shared_handle()`, and [`try_init_cuda`](Self::try_init_cuda)
-    /// imports that same fence as the CUDA external semaphore. Storing the
-    /// producer's value would break that pairing -- in-process it is harmless
-    /// because the rendezvous makes both copies share one fence, but across
-    /// processes the two timelines are unrelated, so a CUDA map would wait on
-    /// the local fence for a value it may never reach and the importing thread
-    /// would block indefinitely.
-    ///
-    /// So the producer's fence is opened and waited on, and a fresh local
-    /// signal taken *after* that wait becomes the recorded completion. Every
-    /// local consumer -- CPU maps through the immediate context, the CUDA
-    /// semaphore wait, a re-export through a descriptor or a blob -- then
-    /// works on one timeline. In-process the two fences are the same object,
-    /// so the wait is one the driver satisfies immediately.
-    ///
-    /// A device that cannot signal has no local value to record, so it blocks
-    /// on the producer's fence here instead: the same guarantee, paid for at
-    /// import rather than at first use.
+    /// Opens the producer's fence, queues a GPU-side wait on its value, and
+    /// records a local signal taken after that wait as `last_gpu_write`. A
+    /// device that cannot queue a wait or signal blocks on the producer's
+    /// fence for up to `IMPORT_WAIT_MS` milliseconds and records nothing.
     ///
     /// # Safety
     ///
@@ -766,13 +677,10 @@ where
             }
             return Ok(());
         };
-        // SAFETY: both interfaces are live; a GPU-side wait on the producer's
-        // value, which every command queued after it is ordered behind.
+        // SAFETY: both interfaces are live.
         hr("ID3D11DeviceContext4::Wait", unsafe {
             ctx4.Wait(&fence, value)
         })?;
-        // Kept for the tensor's lifetime: the queued wait names this fence
-        // until it retires, and the tensor outlives that by construction.
         self.imported_fence = Some(fence);
         self.last_gpu_write
             .store(d.signal().unwrap_or(0), Ordering::Release);
@@ -781,7 +689,7 @@ where
 
     /// Shared tail of the three constructors: builds the CPU-side backing
     /// `access` calls for and assembles the tensor.
-    #[allow(clippy::too_many_arguments)] // one image description, spelled out
+    #[allow(clippy::too_many_arguments)]
     fn finish(
         d: &'static D3d11Device,
         texture: ID3D11Texture2D,
@@ -797,9 +705,7 @@ where
         handle: OwnedHandle,
         key: u64,
     ) -> Result<Self> {
-        // Only a readable tensor needs the staging texture. A write-only one
-        // reaches the texture through the host buffer, and a hardware-only one
-        // never reaches it from the CPU at all.
+        // Only a readable tensor gets a staging texture.
         let staging = match access {
             CpuAccess::Read | CpuAccess::ReadWrite => Some(Arc::new(create_staging(d, &layout)?)),
             CpuAccess::None | CpuAccess::Write => None,
@@ -862,14 +768,11 @@ where
         Ok(())
     }
 
-    /// Bytes of one *image* row: what this tensor's shape counts per row.
+    /// Bytes of one image row: what this tensor's shape counts per row.
     ///
-    /// The texture row for every format except a semi-planar one, whose
-    /// texture is as wide as the row stride (see
-    /// [`widen_semi_planar_to_pitch`]) while its shape still counts `width`
-    /// samples per row. Row counts and image footprints come from here; the
-    /// spacing between rows in the backing comes from
-    /// [`backing_pitch`](Self::backing_pitch).
+    /// The texture row for every format except a semi-planar one, whose shape
+    /// counts `width` samples per row while its texture is as wide as the row
+    /// stride.
     fn image_row_bytes(&self) -> usize {
         if self.format.layout() == PixelLayout::SemiPlanar {
             self.width * self.dtype.size()
@@ -879,8 +782,7 @@ where
     }
 
     /// Row pitch of the CPU-side backing: the driver's staging pitch when
-    /// there is staging, the texture's own row otherwise. Those are the same
-    /// number for a semi-planar texture, which is allocated at the pitch.
+    /// there is staging, the texture's own row otherwise.
     fn backing_pitch(&self) -> usize {
         self.staging
             .as_ref()
@@ -888,9 +790,7 @@ where
     }
 
     /// Bytes addressable from a map or a pin of this backing, padding
-    /// included. Offsets, view bounds and `capacity_bytes` are all in this
-    /// space, because `Tensor::row_stride()` reports the same pitch and
-    /// callers compute offsets from it.
+    /// included. Offsets, view bounds and `capacity_bytes` are in this space.
     fn backing_bytes(&self) -> usize {
         self.backing_pitch() * self.layout.mapped_rows()
     }
@@ -903,41 +803,13 @@ where
     }
 
     /// Orders the reads queued after this call behind the GPU write
-    /// `set_gpu_write` recorded.
+    /// `set_gpu_write` recorded, with a GPU-side `Wait` on this device's
+    /// fence.
     ///
-    /// A staging refresh is a `CopyResource` on the immediate context, and
-    /// nothing else orders it behind the context that produced the texture's
-    /// contents: an unfenced convert followed by a map read whatever the
-    /// texture happened to hold, which is how a destination came back blank.
-    /// The recorded value is a point on this device's own fence, so a
-    /// GPU-side `Wait` on it is what makes the copy see the write.
-    ///
-    /// Cheap by construction: a value the fence has already passed is skipped
-    /// outright, and a `Wait` the driver can retire immediately is a no-op on
-    /// the queue. A device that cannot wait, or a tensor with nothing
-    /// recorded, does nothing -- the same degraded behaviour `order_behind`
-    /// accepts, since there is no local timeline to order against.
-    ///
-    /// # The value has to be reachable
-    ///
-    /// A `Wait` queued on a value the fence never reaches does not stall one
-    /// map: it stalls the immediate context for the rest of the process, and
-    /// every `Signal` and every other tensor's work queued after it with it.
-    /// One unreachable value would take the device down. Two rules bound it:
-    ///
-    /// * The value must be at or below [`D3d11Device::last_signalled`], the
-    ///   newest value the counter has allocated. Every legitimate value comes
-    ///   from `signal`, `signal_deferred`, or the re-signal `order_behind`
-    ///   takes on import, so it is always at or below that word. Anything
-    ///   above it was invented by a caller -- `ef_tensor_set_gpu_write` takes
-    ///   any `u64` -- and names a point nothing will ever signal.
-    /// * The device's fence must be the shared one
-    ///   ([`D3d11Device::fence_is_shared`]). A copy that adopted the
-    ///   published device but could not open its fence signals a private
-    ///   fence from a private counter, so a value another copy recorded names
-    ///   a point this fence does not have and the counter cannot tell the two
-    ///   apart. That copy keeps exactly the behaviour it had before this wait
-    ///   existed: a map that is unordered, but never one that hangs.
+    /// Does nothing when no write is recorded, when the device's fence is not
+    /// the shared one ([`D3d11Device::fence_is_shared`]), when the value is
+    /// above [`D3d11Device::last_signalled`], when the fence has passed the
+    /// value, or when the device cannot wait.
     fn wait_for_recorded_write(&self) {
         let value = self.last_gpu_write();
         if value == 0 {
@@ -966,8 +838,8 @@ where
         let (Some(fence), Some(ctx4)) = (self.device.fence(), self.device.ctx4()) else {
             return;
         };
-        // SAFETY: both interfaces are live for the process's lifetime, and
-        // the value names a point on that fence's own timeline.
+        // SAFETY: both interfaces are live for the process's lifetime, and the
+        // value names a point on that fence's timeline.
         if let Err(e) = unsafe { ctx4.Wait(fence, value) } {
             log::warn!(
                 "D3D11 map: queuing a wait on the recorded write {value} failed ({e}); \
@@ -977,9 +849,9 @@ where
     }
 
     /// Refreshes the pinned host buffer from the texture, through the staging
-    /// copy. A tensor nobody has pinned has no host bytes to make coherent,
-    /// and a tensor with no staging cannot read the texture back at all, so
-    /// both are no-ops rather than errors.
+    /// copy. A no-op for a tensor with no host buffer or no staging.
+    ///
+    /// Fails while a map of the staging copy is live.
     pub(crate) fn sync_for_cpu(&self, access: CpuAccess) -> Result<()> {
         if !access.reads() {
             return Ok(());
@@ -1029,28 +901,16 @@ where
         Ok(())
     }
 
-    /// Publishes CPU writes to the texture from the backing that carries
-    /// them: the host buffer once a writable pin or map has taken a window on
-    /// it, otherwise the staging copy. Nothing is submitted when the tensor
-    /// has neither, because nothing was queued.
+    /// Publishes CPU writes to the texture from the backing that carries them:
+    /// the host buffer once a writable pin has been taken on it, otherwise the
+    /// staging copy. A no-op when the tensor has neither.
     ///
-    /// Refuses while any map of either backing is live, as
-    /// [`sync_for_cpu`](Self::sync_for_cpu) does.
+    /// Fails while a map of either backing is live.
     pub(crate) fn sync_for_device(&self, access: CpuAccess) -> Result<()> {
         if !access.writes() {
             return Ok(());
         }
-        // The same refusal `sync_for_cpu` makes, for the same reason: a live
-        // map is a window onto the backing this reads from, and D3D11 rejects
-        // a `CopyResource` into a mapped staging texture outright.
-        //
-        // Both guards are bound for the rest of the function rather than
-        // dropped at the end of their check: a `map_write` on another thread
-        // could otherwise take the claim between the check and the copy below,
-        // and the copy would then run against a staging texture that is mapped
-        // by the time it executes. Same lock order as `establish_map` -- the
-        // map state first, the device's own section (inside `CopyResource` /
-        // `UpdateSubresource`) second -- so this cannot invert against it.
+        // Both claims are held until the function returns.
         let _staging_claim = match self.staging.as_ref() {
             Some(st) => {
                 let state = st.state();
@@ -1079,26 +939,13 @@ where
             }
             None => None,
         };
-        // Whichever backing the caller actually wrote through. The host buffer
-        // only wins once someone has taken a writable window on it: a tensor
-        // that was merely pinned for reading would otherwise publish the
-        // buffer's untouched (zero) rows over the texture.
-        //
-        // The flag is sticky -- one writable pin or map sets it for the
-        // tensor's life, and a later staging write does not clear it. That is
-        // the conservative direction and it is what a pin means: a pin outlives
-        // every guard, so the holder may write through it at any time, and
-        // there is no drop to observe the last write at. A caller that mixes
-        // both backings on one tensor owns the ordering between them, which is
-        // the coherency obligation `crate::pin` already states.
+        // Publishes from the backing the caller wrote through.
         match (self.wrote_host.load(Ordering::Acquire), self.host.get()) {
-            // `host_pin` hands out the whole backing, never a window, so this
-            // publishes every row -- unlike the windowed publish a scoped
-            // write map's `HostBufferGuard` does.
+            // Publishes every row of the host buffer.
             (true, Some(buffer)) => {
                 if let Some(repack) = self.chroma_repack(buffer.row_pitch) {
                     // SAFETY: the buffer holds every mapped row at its pitch,
-                    // and both claims are held, so nothing maps it meanwhile.
+                    // and both claims are held.
                     unsafe { repack.move_to_texture(buffer.span().0) };
                 }
                 upload_buffer_window(
@@ -1112,8 +959,7 @@ where
             }
             _ => match &self.staging {
                 // SAFETY: both textures are live and identically described,
-                // and `_staging_claim` is held across this call, so the
-                // staging texture cannot be mapped while the copy is issued.
+                // and `_staging_claim` keeps the staging texture unmapped.
                 Some(st) => unsafe { self.device.ctx().CopyResource(&self.texture, &st.tex) },
                 None => return Ok(()),
             },
@@ -1122,28 +968,20 @@ where
         Ok(())
     }
 
-    /// A stable host address for this tensor's rows, valid until the pin
-    /// drops and across any number of maps and frames.
-    ///
-    /// Deliberately not the staging mapping: a pin outlives every guard, so
-    /// mapping the staging texture here would keep it mapped forever, block
-    /// every later map and freeze the bytes at the moment of the pin. The
-    /// address is the storage's own host buffer instead; `sync_for_cpu` and
-    /// `sync_for_device` move bytes between it and the texture.
+    /// A stable host address for this tensor's rows, valid until the pin drops
+    /// and across any number of maps and frames. The address is into the
+    /// storage's host buffer; `sync_for_cpu` and `sync_for_device` move bytes
+    /// between it and the texture.
     pub(crate) fn host_pin<'a>(&self, access: CpuAccess) -> Result<crate::pin::HostPin<'a>> {
         self.require_access(self.access)?;
         self.check_view_offset()?;
         if access.writes() {
-            // A pin outlives every guard, so there is no drop to notice the
-            // write at: `sync_for_device` reads this to decide that the host
-            // buffer, not the staging copy, is what the caller wrote through.
             self.wrote_host.store(true, Ordering::Release);
         }
         let (base, len) = self.host_buffer().span();
         // SAFETY: `check_view_offset` above bounds `view_offset` by
         // `backing_bytes()`, which is the length this buffer was allocated at.
         let at = unsafe { base.add(self.view_offset) };
-        // The cell, not the buffer: holding it is what keeps the address live.
         let keepalive: Arc<dyn Send + Sync> = self.host.clone();
         Ok(crate::pin::HostPin::new(
             keepalive,
@@ -1169,14 +1007,8 @@ where
         }
     }
 
-    /// Bytes this tensor's image occupies from the start of its window.
-    ///
-    /// Every row but the last at the backing's pitch, plus the last row's own
-    /// bytes. The final row is followed by no padding, which is what lets a
-    /// view in the texture's last row fit its backing exactly --
-    /// [`pitched_extent`](Self::pitched_extent) counts a full pitch for that
-    /// row too, so bounding an offset by it would refuse
-    /// `one_row_d3d11_view_descriptor_maps_the_producers_texels`.
+    /// Bytes this tensor's image occupies from the start of its window: every
+    /// row but the last at the backing's pitch, plus the last row's own bytes.
     fn addressable_span(&self) -> usize {
         let tight_row = self.image_row_bytes();
         if tight_row == 0 {
@@ -1191,21 +1023,9 @@ where
         (rows - 1) * self.backing_pitch() + last_row
     }
 
-    /// Refuses a window that cannot hold this tensor's own image.
-    ///
-    /// `view` computes `view_offset` under a bounds check, but
-    /// `set_view_offset` takes whatever `Tensor::set_plane_offset` was handed
-    /// -- a descriptor's restored offset, untrusted cross-package input -- so
-    /// every pin re-checks before it offsets a base pointer by it.
-    ///
-    /// Bounding only the *start* is not enough. A pin's length is the backing
-    /// less the offset, so an offset near the end yields a map shorter than
-    /// the image while the tensor still reports its full width and height; a
-    /// consumer reading `width x height` through the pointer then runs past
-    /// the allocation, which the GL upload path did. An offset equal to the
-    /// backing is the extreme case: a legal one-past-the-end pointer and an
-    /// empty window for a non-empty tensor. Both are refused here, and
-    /// `checked_add` keeps a hostile offset from wrapping into range.
+    /// Refuses a window that cannot hold this tensor's own image: fails when
+    /// `view_offset` plus [`addressable_span`](Self::addressable_span)
+    /// overflows or runs past the backing.
     fn check_view_offset(&self) -> Result<()> {
         let capacity = self.backing_bytes();
         let end = self.view_offset.checked_add(self.addressable_span());
@@ -1218,28 +1038,15 @@ where
         }
     }
 
-    /// Moves this tensor's window to `offset` bytes from the backing's
-    /// origin, in the pitched space `view` measures in.
-    ///
-    /// The write-back half of `Tensor::set_plane_offset` (and the clear half
-    /// of `set_format`/`reshape`): a tensor rebuilt from a descriptor is
-    /// opened at the texture's origin, and this is how the sub-region it
-    /// described is put back. Unchecked here so the setter stays infallible;
-    /// `check_view_offset` refuses an offset past the backing when a pin is
-    /// taken.
+    /// Moves this tensor's window to `offset` bytes from the backing's origin,
+    /// in the pitched space `view` measures in. Unchecked; `check_view_offset`
+    /// refuses an offset past the backing when a pin is taken.
     pub(crate) fn set_view_offset(&mut self, offset: usize) {
         self.view_offset = offset;
     }
 
     /// This window as `(start_row, row_count)` in the backing's own texel
-    /// rows, when the window is a whole-row range a `D3D11_BOX` can name.
-    ///
-    /// `pitched_extent` is always a multiple of `backing_pitch` (it is built
-    /// as a row count times the pitch), so only `view_offset` needs the
-    /// alignment check. A non-row-aligned `view_offset` -- not something
-    /// `configure_image`'s row-window narrowing produces, but a generic
-    /// `set_plane_offset` byte offset can in principle be one -- has no
-    /// `D3D11_BOX` that names it, so callers fall back to refusing the map.
+    /// rows, or `None` when `view_offset` is not a whole number of rows.
     fn row_window(&self) -> Option<(usize, usize)> {
         let pitch = self.backing_pitch();
         if pitch == 0 || !self.view_offset.is_multiple_of(pitch) {
@@ -1248,29 +1055,9 @@ where
         Some((self.view_offset / pitch, self.pitched_extent() / pitch))
     }
 
-    /// Refuses a write-only window only the *staging* path cannot publish
-    /// safely -- the one case where retrying with `CpuAccess::ReadWrite` is
-    /// guaranteed to work, which is what makes
-    /// [`Error::PartialWriteRequiresReadWrite`] the right signal here.
-    ///
-    /// Unmapping a writable window through staging publishes the whole
-    /// backing -- a `CopyResource` of the staging texture -- and a
-    /// write-only window is not refreshed from the real texture first, so
-    /// rows outside the window would be undefined. For a whole-tensor map
-    /// that is the documented contract ("bytes the caller leaves untouched
-    /// are undefined"); for a sub-view it is not a contract the caller can
-    /// meet, so it is refused. `ReadWrite` is the same window with the
-    /// refresh (`establish_map`'s pre-copy runs whenever `access.reads()`),
-    /// so it says what it costs and always succeeds here.
-    ///
-    /// The host-buffer path (no staging -- a `CpuAccess::Write`-declared
-    /// tensor) has no such hazard and is not this function's concern:
-    /// [`HostBufferGuard`] publishes only the window's own rows via a
-    /// partial `UpdateSubresource`, so this returns `Ok` unconditionally and
-    /// leaves validating that window to `buffer_pin`'s own `row_window`
-    /// check -- which, unlike this one, a `ReadWrite` request cannot skip
-    /// past, since no staging means no backend for it to succeed through
-    /// either.
+    /// Refuses a write-only map of a window shorter than the backing on a
+    /// tensor with staging, with [`Error::PartialWriteRequiresReadWrite`].
+    /// Returns `Ok` for every other access and for a tensor without staging.
     fn refuse_partial_write(&self, access: CpuAccess) -> Result<()> {
         if access != CpuAccess::Write || self.staging.is_none() {
             return Ok(());
@@ -1296,14 +1083,11 @@ where
         non_blocking: bool,
     ) -> Result<crate::pin::HostPin<'a>> {
         let writes = access.writes();
-        // The whole claim-and-map runs under one lock so a second reader
-        // cannot observe a claimed-but-not-yet-mapped `base`. No guard exists
-        // inside this scope: dropping one here would re-enter the mutex.
+        // The claim and the map run under one lock.
         let base = {
             let mut state = st.state();
             match state.claim(writes)? {
-                // Joined a live read mapping: same snapshot, one more reader,
-                // no second `Map` and no second copy into the staging texture.
+                // Joined a live read mapping.
                 Some(base) => base,
                 None => self.establish_map(st, &mut state, access, non_blocking)?,
             }
@@ -1327,13 +1111,8 @@ where
         access: CpuAccess,
         non_blocking: bool,
     ) -> Result<usize> {
-        // `refresh_pending` is a non-blocking optimisation, not a cache: it
-        // exists so a caller polling `try_map` does not queue one
-        // `CopyResource` per attempt. A blocking map has to refresh whatever
-        // is pending, because the copy still queued was issued before whatever
-        // the GPU has written since -- a poll that gave up followed by a
-        // `map()` would otherwise hand back the previous frame. The blocking
-        // `Map` waits for what it queues, so the extra copy costs nothing.
+        // A non-blocking map skips the refresh while one is pending; a
+        // blocking map always refreshes.
         if access.reads() && !(non_blocking && state.refresh_pending) {
             self.wait_for_recorded_write();
             // SAFETY: both textures are live, identically described, and the
@@ -1341,9 +1120,7 @@ where
             unsafe { self.device.ctx().CopyResource(&st.tex, &self.texture) };
             state.refresh_pending = true;
             if non_blocking {
-                // A non-blocking map can only succeed once the copy has been
-                // submitted; without this a polling caller spins forever
-                // while the queue grows.
+                // Submits the copy.
                 publish(self.device);
             }
         }
@@ -1367,8 +1144,7 @@ where
         if let Err(e) = result {
             state.release(access.writes());
             if e.code() == DXGI_ERROR_WAS_STILL_DRAWING {
-                // `refresh_pending` stays set, so a retry re-attempts only the
-                // map rather than queueing a second copy.
+                // `refresh_pending` stays set for the retry.
                 return Err(Error::IoError(std::io::Error::from(
                     std::io::ErrorKind::WouldBlock,
                 )));
@@ -1389,17 +1165,10 @@ where
     }
 
     fn buffer_pin<'a>(&self, access: CpuAccess) -> Result<crate::pin::HostPin<'a>> {
-        // A read map of a write-only tensor must not push its host bytes into
-        // the texture; only a writable map publishes, and only the rows it
-        // actually owns -- `row_window` is what keeps that publish from
-        // touching rows outside this view that belong to a different frame
-        // in the same pooled allocation. `pin_impl`'s `refuse_partial_write`
-        // already refuses a `CpuAccess::Write` request this cannot express;
-        // this also covers a `ReadWrite` request, which that check does not.
+        // Only a writable map publishes, and only the rows of its own window.
         let write_region = if access.writes() {
-            // A native NV12 texture is published whole. A shorter image in
-            // one (`configure_image`) owns the whole texture, but a window at
-            // an offset is part of a frame it does not own.
+            // A native NV12 texture is published whole: a writable window
+            // starts at its origin.
             let window = if self.layout.is_native_nv12() {
                 if self.view_offset != 0 {
                     return Err(Error::InvalidArgument(format!(
@@ -1427,17 +1196,6 @@ where
         };
         let buffer = self.host_buffer();
         buffer.state().claim(access.writes())?;
-        // Deliberately does not set `wrote_host`: that flag tells a *later*
-        // `sync_for_device` to republish the whole backing, which is only
-        // correct for `host_pin`'s unwindowed write (no drop to publish at,
-        // so `sync_for_device` is the only place that can). A scoped map's
-        // `HostBufferGuard` already publishes exactly the rows it wrote when
-        // it drops; setting the sticky flag here would make a later
-        // `sync_for_device` call -- from an unrelated `host_pin` elsewhere on
-        // the same tensor, or from code that calls it defensively -- treat
-        // this write's *whole* backing as valid and republish rows outside
-        // this window that belong to a different frame in the same pool,
-        // exactly the corruption `upload_buffer_window` exists to prevent.
         let (base, len) = buffer.span();
         let guard = HostBufferGuard {
             device: self.device,
@@ -1477,25 +1235,9 @@ where
     }
 
     /// Bytes an ordinary map exposes: this tensor's own rows at the backing
-    /// pitch.
-    ///
-    /// Row padding is addressable -- `Tensor::row_stride()` reports the same
-    /// pitch and callers iterate rows by it -- so the extent is pitched, not
-    /// tight. What it is *not* is everything left in the parent allocation: a
-    /// sub-view covers its own rows, which is what a batched destination's
-    /// per-band map depends on to match the same convert done standalone.
-    ///
-    /// The granularity is a whole pitched row, because the pitch is the only
-    /// row spacing the backing has: a shape covering part of a row still maps
-    /// to the end of that row, since rounding down would hand back a window
-    /// the caller cannot index by stride.
-    ///
-    /// Rows come from the shape's own byte count over the image's tight row,
-    /// so one expression covers packed, planar and semi-planar shapes: each
-    /// one's product over `tight_row_bytes` is its row count in the texture.
-    /// The byte count uses `dtype`, not `size_of::<T>()`: the shape counts
-    /// samples of the image's element type, while `T` is only the type a map
-    /// hands back, and the two differ when a caller maps an F16 image as bytes.
+    /// pitch, row padding included. A shape covering part of a row maps to the
+    /// end of that row. The row count is the shape's byte count, taken with
+    /// `dtype`, over the image's tight row.
     fn pitched_extent(&self) -> usize {
         let tight_row = self.image_row_bytes();
         if tight_row == 0 {
@@ -1505,12 +1247,10 @@ where
         tight.div_ceil(tight_row) * self.backing_pitch()
     }
 
-    /// Wrap a pin as a view of this tensor's shape. `byte_size_override` is
+    /// Wraps a pin as a view of this tensor's shape. `byte_size_override` is
     /// `None` for an ordinary map, which exposes
-    /// [`pitched_extent`](Self::pitched_extent); the padded extent of a
-    /// differently-strided window comes through
-    /// [`map_with_byte_size`](Self::map_with_byte_size), which
-    /// `Tensor::map_with` calls when the tensor carries a row stride.
+    /// [`pitched_extent`](Self::pitched_extent), and the padded extent for
+    /// [`map_with_byte_size`](Self::map_with_byte_size).
     fn view_of<'a>(
         &self,
         pin: crate::pin::HostPin<'a>,
@@ -1536,9 +1276,7 @@ where
         Ok(())
     }
 
-    /// Map exposing `bytes` of the pitched backing rather than the shape's
-    /// tight extent -- the padded-row path, mirroring
-    /// `IoSurfaceTensor::map_with_byte_size`.
+    /// Maps `bytes` of the pitched backing: the padded-row path.
     pub(crate) fn map_with_byte_size<'a>(
         &self,
         bytes: usize,
@@ -1573,8 +1311,7 @@ where
         self.layout
     }
 
-    // The image crate reads this when the tensor is a render destination; no
-    // accessor exposes it yet.
+    /// Whether the texture carries `D3D11_BIND_RENDER_TARGET`.
     #[allow(dead_code)]
     pub(crate) fn is_render_target(&self) -> bool {
         self.desc_bind_flags & D3D11_BIND_RENDER_TARGET.0 as u32 != 0
@@ -1585,8 +1322,7 @@ where
         duplicate_handle(&self.nt_handle).map_err(Error::IoError)
     }
 
-    /// The tensor's own NT handle value, valid while the tensor lives. For
-    /// descriptors and the D1 blob, which carry a value rather than ownership.
+    /// The tensor's own NT handle value, valid while the tensor lives.
     pub(crate) fn shared_handle_value(&self) -> usize {
         self.nt_handle.as_raw_handle() as usize
     }
@@ -1605,15 +1341,8 @@ where
     }
 
     /// Records a fence value a producer signalled after writing this texture.
-    /// Monotonic: an older value never displaces a newer one.
-    ///
-    /// Any `u64` is accepted, because the C and Python surfaces take one from
-    /// a caller and a producer's value is not this crate's to validate. What
-    /// a value above the device's own counter does *not* do is reach the
-    /// immediate context: `wait_for_recorded_write` ignores it rather than
-    /// queue a `Wait` nothing will ever satisfy. It is still reported by
-    /// [`gpu_completion`](Self::gpu_completion), which is a statement about
-    /// the producer's timeline, not this device's.
+    /// Monotonic: an older value never displaces a newer one. Any `u64` is
+    /// accepted.
     pub(crate) fn set_gpu_write(&self, value: u64) {
         self.last_gpu_write.fetch_max(value, Ordering::AcqRel);
     }
@@ -1623,59 +1352,33 @@ where
     }
 
     /// The row pitch a CPU map or pin sees, or `None` when there is none to
-    /// report. One number for both, which is why the host buffer is allocated
-    /// at this pitch too.
-    ///
-    /// The staging pitch when there is staging: that is what a map is
-    /// literally laid out at, whatever the layout table says.
-    ///
-    /// A semi-planar tensor answers even without staging, because its texture
-    /// is as wide as the driver's row pitch by construction -- `new_image`
-    /// widens its own allocations to it (see [`widen_semi_planar_to_pitch`])
-    /// and [`validate_external`] refuses a wrapped texture that is not already
-    /// as wide as its own pitch -- so the two branches are the same number and
-    /// the write-only host buffer is laid out at it too. Reporting `None`
-    /// there would tell a producer to write chroma lines at the tight pitch
-    /// into a wider texture, which is the mismatch the widening exists to
-    /// remove.
-    ///
-    /// Every other format is `None` without staging: a write-only tensor's
-    /// host buffer and a hardware-only tensor both have tight rows or no rows
-    /// at all.
+    /// report: the staging pitch when there is staging, the texture's width
+    /// for a semi-planar tensor without staging, and `None` otherwise.
     pub(crate) fn image_backing_row_stride(&self) -> Option<usize> {
         if let Some(st) = self.staging.as_ref() {
             return Some(st.row_pitch);
         }
-        // R8, so the texture's row in bytes is its width in texels.
+        // R8: the texture's row in bytes is its width in texels.
         (self.format.layout() == PixelLayout::SemiPlanar).then(|| self.layout.tight_row_bytes())
     }
 
-    /// Bytes the image occupies with no row padding. The logical extent
-    /// `set_logical_shape` measures against, not the addressable one -- so the
-    /// image's rows, not the texture's, which differ when a semi-planar
-    /// texture was widened to the driver's pitch.
+    /// Bytes the image occupies with no row padding: the extent
+    /// `set_logical_shape` measures against.
     pub(crate) fn tight_bytes(&self) -> usize {
         self.image_row_bytes() * self.layout.mapped_rows()
     }
 
-    /// Imports this texture into CUDA, for `Tensor::try_init_d3d11_cuda` to
-    /// attach at allocation and at both wrap constructors.
+    /// Imports this texture into CUDA. Returns `None` when no CUDA runtime
+    /// loaded, when the adapter has no CUDA device, or when the driver refuses
+    /// the import.
     ///
-    /// Best-effort, like the DMA-BUF import on Linux: `None` when no CUDA
-    /// runtime loaded, when the adapter has no CUDA device (WARP), or when the
-    /// driver refuses the import. The tensor is then a perfectly ordinary
-    /// texture tensor whose `cuda_map()` is `None`.
-    ///
-    /// The texture's own NT handle is *borrowed* for the call -- CUDA
-    /// duplicates a Win32 handle it imports -- while the fence's is a fresh
-    /// duplicate the CUDA handle takes over, because it outlives the call.
+    /// The texture's NT handle is borrowed for the call; the fence's is a
+    /// duplicate the CUDA handle takes over.
     pub(crate) fn try_init_cuda(&self) -> Option<crate::cuda::CudaHandle> {
         if !crate::cuda::is_cuda_available() {
             return None;
         }
-        // No fence means no GPU-side ordering, which the import tolerates: it
-        // then copies without waiting, as it does for a tensor no producer has
-        // recorded a write on.
+        // Without a fence the import copies without waiting.
         let fence = self.device.fence_shared_handle().ok();
         crate::cuda::import_d3d11_texture(
             self.nt_handle.as_raw_handle(),
@@ -1699,42 +1402,18 @@ impl<T> fmt::Debug for D3d11TextureTensor<T> {
     }
 }
 
-/// Submits the immediate context, so a copy that has just published CPU
-/// writes reaches a device that opened this texture's shared handle. D3D11
-/// does not submit a shared resource's writes on its own, and these textures
-/// carry no keyed mutex, so without this another device reads stale bytes.
-///
-/// This submits the whole immediate context, not just the copy -- including
-/// commands the GL worker has in flight on the same device. That is sound
-/// rather than merely tolerable: the context is used under
-/// `ID3D11Multithread` protection, and an early submit changes when work
-/// runs, never what it computes.
+/// Submits the whole immediate context, which makes queued writes visible to
+/// other devices that opened a texture's shared handle.
 fn publish(device: &D3d11Device) {
     // SAFETY: the immediate context is live for the process's lifetime.
     unsafe { device.ctx().Flush() };
 }
 
 /// Uploads `row_count` of the host buffer's own rows into the texture at
-/// `row_offset`, at the pitch the buffer was allocated with.
+/// `row_offset`, at the pitch the buffer was allocated with, through a boxed
+/// `UpdateSubresource` spanning whole rows.
 ///
-/// A boxed `UpdateSubresource`, not the whole-resource form (a `None` box):
-/// publishing exactly the caller's own window is what lets a
-/// `CpuAccess::Write`-declared tensor's sub-view unmap without touching --
-/// and so without corrupting -- rows outside it that hold a different frame
-/// in the same pooled allocation. `left`/`right` still span the whole
-/// pitch-width row, matching `row_window`'s own row-granular contract (see
-/// `pitched_extent`): a row is wholly this tensor's, so nothing outside it is
-/// touched by covering it entirely.
-///
-/// `row_offset`/`row_count` name a sub-range for `buffer_pin`'s windowed
-/// write (derived from `row_window`, itself bounded by `check_view_offset`),
-/// or `(0, mapped_rows)` for `sync_for_device`'s unwindowed `host_pin`
-/// republish -- 0 is trivially in range regardless of `view_offset`.
-///
-/// A native NV12 texture is always uploaded whole, with no box: a box names
-/// luma rows only, and the chroma plane is read from the source after the
-/// luma rows at the same pitch. `buffer_pin` only lets a whole-tensor window
-/// write one.
+/// A native NV12 texture is uploaded whole, with no box.
 fn upload_buffer_window(
     device: &D3d11Device,
     texture: &ID3D11Texture2D,
@@ -1745,8 +1424,7 @@ fn upload_buffer_window(
 ) {
     let (base, _) = buffer.span();
     if layout.is_native_nv12() {
-        // SAFETY: the buffer holds every mapped row at `row_pitch`, which is
-        // what a whole-resource update of an NV12 texture reads, and both
+        // SAFETY: the buffer holds every mapped row at `row_pitch`, and both
         // objects are live for the call.
         unsafe {
             device.ctx().UpdateSubresource(
@@ -1761,9 +1439,7 @@ fn upload_buffer_window(
         return;
     }
     let texture_width = layout.texture_width;
-    // SAFETY: `row_offset` rows are within the buffer's own span for both
-    // callers -- `buffer_pin`'s window is bounded by `check_view_offset`,
-    // and `sync_for_device` always passes `row_offset = 0`.
+    // SAFETY: `row_offset` rows are within the buffer's span.
     let src = unsafe { base.add(row_offset * buffer.row_pitch) };
     let region = D3D11_BOX {
         left: 0,
@@ -1773,10 +1449,9 @@ fn upload_buffer_window(
         bottom: (row_offset + row_count) as u32,
         back: 1,
     };
-    // SAFETY: the buffer is live for the call, the destination texture is
-    // live, `region` is bounded by the texture's own extent for the same
-    // reason `src` is bounded by the buffer's, and `row_pitch` is the pitch
-    // `src`'s rows are laid out at.
+    // SAFETY: the buffer and the destination texture are live, `region` is
+    // within the texture's extent, and `src`'s rows are laid out at
+    // `row_pitch`.
     unsafe {
         device.ctx().UpdateSubresource(
             texture,
@@ -1828,10 +1503,9 @@ impl Drop for StagingGuard {
     }
 }
 
-/// Releases one claim on the host buffer and, for a writable map, uploads
-/// the rows it wrote. `writeback` is `Some((row_offset, row_count))` for a
-/// writable map -- `buffer_pin` computed it from `row_window` -- and `None`
-/// for a read map, which must not push its host bytes into the texture.
+/// Releases one claim on the host buffer and, for a writable map, uploads the
+/// rows it wrote. `writeback` is `Some((row_offset, row_count))` for a
+/// writable map and `None` for a read map.
 struct HostBufferGuard {
     device: &'static D3d11Device,
     texture: ID3D11Texture2D,
@@ -1849,10 +1523,7 @@ impl Drop for HostBufferGuard {
             .host
             .get()
             .expect("the guard was built from a live host buffer");
-        // The claim is held across the upload, as `StagingGuard::drop` holds
-        // its lock across the equivalent copy: releasing first would let
-        // another thread take a write map and mutate the rows in the middle of
-        // `UpdateSubresource`.
+        // The claim is held across the upload.
         let mut state = buffer.state();
         if let Some((row_offset, row_count)) = self.writeback {
             if let Some(repack) = self.repack {
@@ -1887,8 +1558,7 @@ where
     }
 
     fn memory(&self) -> TensorMemory {
-        // Unified variant: Windows reports DmaBuf, as macOS and Linux do. The
-        // variant name is shared; the inner storage type differs per platform.
+        // Texture storage reports the shared `DmaBuf` variant.
         TensorMemory::DmaBuf
     }
 
@@ -1920,13 +1590,7 @@ where
         Ok(self.view_of(self.scoped_pin(access)?, access, None))
     }
 
-    /// The one backing whose `try_map_with` is not `map_with`: mapping the
-    /// staging texture waits for the refresh copy, so a non-blocking caller is
-    /// told to come back rather than stalled.
-    ///
-    /// No span of its own: `Tensor::map_impl` already opens one `tensor.map`
-    /// span carrying `non_blocking`, and that is the single spelling of the
-    /// event.
+    /// Reports `WouldBlock` while the staging refresh copy is in flight.
     fn try_map_with<'a>(&self, access: CpuAccess) -> Result<crate::view::HostView<'a, T>>
     where
         T: 'a,
@@ -1948,8 +1612,7 @@ where
         if shape.is_empty() {
             return Err(Error::InvalidSize(0));
         }
-        // The image's own size, not the padded one: a logical shape describes
-        // pixels, and padding is not addressable as data.
+        // Measured against the image's unpadded size.
         let needed = shape.iter().product::<usize>() * std::mem::size_of::<T>();
         let capacity = self.tight_bytes();
         if needed > capacity {
@@ -1957,8 +1620,7 @@ where
         }
         // A native NV12 texture holds a smaller NV12 image as its top-left
         // corner, with the image's chroma at the top of the texture's chroma
-        // plane; CPU views move those rows to where the image's own combined
-        // plane has them (`ChromaRepack`). Only an NV12 shape describes that.
+        // plane. Only an NV12 shape is accepted.
         if self.layout.is_native_nv12() {
             let rows = match shape {
                 [rows, _] => PixelFormat::Nv12.image_height_from_combined(*rows),
@@ -1980,8 +1642,7 @@ where
     /// buffer, its NT handle and its [`BufferIdentity`], positioned at
     /// `offset_bytes` from this tensor's own window.
     ///
-    /// `offset_bytes` is in backing (pitched) space, matching what
-    /// `Tensor::row_stride()` reports, so a caller offsets by whole rows with
+    /// `offset_bytes` is in backing (pitched) space: whole rows are
     /// `n * row_stride`.
     fn view(&self, offset_bytes: usize, shape: &[usize]) -> Result<Self> {
         if !offset_bytes.is_multiple_of(std::mem::align_of::<T>()) {
@@ -2065,7 +1726,7 @@ mod tests_support {
         };
         let mut dev: Option<ID3D11Device> = None;
         let mut ctx: Option<ID3D11DeviceContext> = None;
-        // SAFETY: documented creation call; both out-parameters are valid locals.
+        // SAFETY: both out-parameters are valid locals.
         unsafe {
             D3D11CreateDevice(
                 None::<&IDXGIAdapter>,
@@ -2138,11 +1799,6 @@ mod tests_support {
 
     /// A shared fence created on `other`, with the NT handle a consumer in
     /// this process opens to wait on it.
-    ///
-    /// The producer side of the import path: a second device signalling a
-    /// fence of its own is what a real producer in another API or another
-    /// process does, and the only way in one process to put GPU work on a
-    /// queue this process's device does not already order itself against.
     pub(super) fn shared_fence(other: &SecondDevice) -> (ID3D11Fence, OwnedHandle) {
         let d5 = other.dev.cast::<ID3D11Device5>().expect("ID3D11Device5");
         let mut f: Option<ID3D11Fence> = None;
@@ -2156,19 +1812,9 @@ mod tests_support {
         (fence, unsafe { OwnedHandle::from_raw_handle(handle.0) })
     }
 
-    /// Fills the texture `handle` names with `byte` from `other`, then
-    /// signals `fence` at `value` behind that write and submits.
-    ///
-    /// The signal is queued after the write on the same context, so the
-    /// value covers it: a consumer that waits for the value is ordered
-    /// behind the bytes, and one that does not is racing them.
-    ///
-    /// `churn` zero-filled uploads go in front of the real one so that race
-    /// is one a test can lose. A single small upload retires long before a
-    /// consumer gets to its own copy, and a test that cannot fail without
-    /// the wait proves nothing about it; reading this texture early reads
-    /// one of the zero fills instead.
-    #[allow(clippy::too_many_arguments)] // one write, spelled out
+    /// Uploads `churn` zero fills and then `byte` to the texture `handle`
+    /// names, from `other`, then signals `fence` at `value` and submits.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn write_through(
         other: &SecondDevice,
         handle: HANDLE,
@@ -2205,8 +1851,7 @@ mod tests_support {
             .expect("ID3D11DeviceContext4");
         // SAFETY: both interfaces are live and `value` is fresh on this fence.
         unsafe { ctx4.Signal(fence, value) }.expect("ID3D11DeviceContext4::Signal");
-        // SAFETY: the second device's immediate context is live. Without the
-        // submit the consumer waits on a value that was never sent.
+        // SAFETY: the second device's immediate context is live.
         unsafe { other.ctx.Flush() };
     }
 }
@@ -2219,7 +1864,7 @@ mod tests {
     use windows::Win32::Foundation::WAIT_OBJECT_0;
     use windows::Win32::System::Threading::WaitForSingleObject;
 
-    /// A `ReadWrite` RGBA8 tensor of `w` x `h`, the shape most tests want.
+    /// An RGBA8 tensor of `w` x `h` with `access`.
     fn rgba(w: usize, h: usize, access: CpuAccess) -> D3d11TextureTensor<u8> {
         let shape = PixelFormat::Rgba.allocation_shape(w, h).unwrap();
         D3d11TextureTensor::<u8>::new_image(
@@ -2234,17 +1879,7 @@ mod tests {
         .unwrap()
     }
 
-    /// A `try_map` that gave up leaves one refresh copy queued and unconsumed.
-    /// The next *blocking* map must re-queue rather than ride that copy: it
-    /// was issued before whatever the GPU has written since, so honouring the
-    /// flag there hands the caller the previous frame.
-    ///
-    /// The later write is a real GPU texture-to-texture copy, not a CPU
-    /// staging write. A staging write publishes the whole staging texture on
-    /// unmap, which refreshes the pending copy as a side effect and lets the
-    /// pre-fix code pass; only a write that lands in the texture behind the
-    /// staging copy's back tells the two apart. Reverting the gate in
-    /// `establish_map` to `!state.refresh_pending` fails this test.
+    /// A blocking map after an abandoned `try_map` queues a fresh refresh copy.
     #[test]
     fn a_blocking_map_refreshes_past_an_abandoned_try_maps_copy() {
         let d = device().unwrap();
@@ -2255,30 +1890,23 @@ mod tests {
             m.as_mut_slice().fill(byte);
         }
 
-        // Exactly the state a `try_map` that answered `WouldBlock` leaves
-        // behind: one refresh copy queued into the staging texture, and the
-        // flag that says a retry must not queue a second. Built directly so
-        // the precondition is deterministic rather than a race with the GPU.
+        // Builds the state an abandoned `try_map` leaves: one refresh copy
+        // queued and `refresh_pending` set.
         {
             let st = old.staging.as_ref().unwrap();
             let mut state = st.state();
             // SAFETY: both textures are live and identically described, and
-            // this claim-free scope holds the state lock, so nothing else can
-            // map the staging texture while the copy is issued.
+            // the state lock is held, so the staging texture stays unmapped.
             unsafe { d.ctx().CopyResource(&st.tex, &old.texture) };
             state.refresh_pending = true;
         }
 
-        // The GPU write the abandoned copy predates.
+        // A GPU write issued after the queued refresh copy.
         // SAFETY: both textures are live and identically described.
         unsafe { d.ctx().CopyResource(&old.texture, &new.texture) };
         d.signal();
 
-        // Only the logical bytes of each row are compared. Both write maps
-        // above filled the whole pitched extent, so on an adapter that pads a
-        // 64-texel RGBA8 row the staging padding still holds the old byte:
-        // the GPU copy moved the texture, which has no padding, and a refresh
-        // of the staging texture is not obliged to overwrite its row tails.
+        // Compares only the logical bytes of each row.
         let mapped = old.map_with(CpuAccess::Read).unwrap();
         let pitch = old.image_backing_row_stride().unwrap();
         let row_bytes = old.layout().tight_row_bytes();
@@ -2300,16 +1928,7 @@ mod tests {
         }
     }
 
-    /// The bug `crates/codec`'s D3D11 Windows support hit: `CpuAccess::Write`
-    /// is the access the tensor crate documents for decode targets, and a
-    /// `configure_image`d decode into a pooled allocation maps a row-window
-    /// shorter than the backing. Before the windowed `UpdateSubresource` fix,
-    /// unmapping such a write published the *whole* host buffer -- including
-    /// whatever stale bytes sat outside the window -- onto the texture,
-    /// silently clobbering rows that hold a different frame in the same pool.
-    /// Also covers a `sync_for_device` call right after the scoped map, which
-    /// would reproduce the same clobber if the map wrongly left the tensor's
-    /// sticky `wrote_host` flag set for `sync_for_device` to act on later.
+    /// A write-only map of a row window publishes only that window's rows.
     #[test]
     fn write_only_partial_row_window_does_not_clobber_rows_outside_it() {
         let d = device().unwrap();
@@ -2320,9 +1939,7 @@ mod tests {
 
         let pool = rgba(W, H, CpuAccess::Write);
         {
-            // A whole-backing write: not windowed, so this alone cannot
-            // exercise the bug. It seeds every row of the real texture with
-            // a sentinel the windowed write below must not disturb.
+            // Seeds every row of the texture with a sentinel.
             let mut m = pool.map_with(CpuAccess::Write).unwrap();
             m.as_mut_slice().fill(0xAA);
         }
@@ -2338,19 +1955,10 @@ mod tests {
             m.as_mut_slice().fill(0x55);
         }
 
-        // A scoped map's `HostBufferGuard` already published this window's
-        // own rows on drop above; `sync_for_device` must not do it again for
-        // the *whole* backing. It only would if the scoped map had wrongly
-        // set the sticky `wrote_host` flag `host_pin` relies on -- that flag
-        // has no per-window memory, so `sync_for_device` would treat this
-        // write's rows as license to republish the whole (partly stale)
-        // host buffer, clobbering the very rows this test checks below.
         pool.sync_for_device(CpuAccess::Write).unwrap();
 
-        // Read back through a *second*, independently-allocated tensor so
-        // this inspects the real texture, not `pool`'s own host buffer (which
-        // the windowed write above never touched outside its own rows,
-        // whether or not the publish leaked into the texture).
+        // Reads the texture back through a second, independently allocated
+        // tensor.
         let readback = rgba(W, H, CpuAccess::ReadWrite);
         // SAFETY: both textures are live and identically described.
         unsafe { d.ctx().CopyResource(&readback.texture, &pool.texture) };
@@ -2434,10 +2042,8 @@ mod tests {
         }
     }
 
-    /// The sizes the combined-plane stride rule is proved at: NV16 and NV24
-    /// at an even size, and NV12 at the odd sizes that have no native NV12
-    /// texture, one of them needing the even rounding on top of whatever the
-    /// driver pads to.
+    /// Combined-plane sizes for the stride tests: NV16 and NV24 at an even
+    /// size, and NV12 at odd sizes.
     fn nv_sizes() -> [(PixelFormat, usize, usize); 4] {
         [
             (PixelFormat::Nv12, 64, 63),
@@ -2458,17 +2064,7 @@ mod tests {
             .unwrap_or_else(|e| panic!("{fmt:?} {w}x{h}: {e}"))
     }
 
-    /// A semi-planar texture is exactly as wide as the row pitch a CPU map
-    /// sees, so the combined plane's linear-byte model and the texture's texel
-    /// grid are one number.
-    ///
-    /// The HAL writes luma and chroma lines at `row_stride` and the Path B
-    /// shader wraps chroma addressing at the sampled texture's width. When the
-    /// driver pads the staging pitch past the image width -- 128-byte aligned
-    /// on this NVIDIA adapter -- a texture only `width` texels wide stores one
-    /// producer row as two texture rows, and the shader samples past the row
-    /// edge. An odd width breaks the same way on every adapter, because a
-    /// chroma pair needs an even row.
+    /// A semi-planar texture is exactly as wide as the row pitch a CPU map sees.
     #[test]
     fn nv_textures_are_as_wide_as_their_pitch() {
         for (fmt, w, h) in nv_sizes() {
@@ -2487,9 +2083,8 @@ mod tests {
                 "{fmt:?} {w}x{h}: texture width {tex_w} is narrower than the image"
             );
 
-            // The same size through the public constructor reports that width
-            // as its row stride, or no stride at all when the driver needed no
-            // padding and the texture is the natural row.
+            // The public constructor reports that width as its row stride, or
+            // no stride when the driver added no padding.
             let img = crate::Tensor::<u8>::image(
                 w,
                 h,
@@ -2513,12 +2108,7 @@ mod tests {
         }
     }
 
-    /// A semi-planar tensor with no staging still carries the stride rule: the
-    /// allocator probes for a pitch whatever the `CpuAccess`, and the tensor
-    /// reports that width as its backing pitch even with no staging texture to
-    /// read one from. A texture nobody maps still has to carry the geometry
-    /// every consumer of the combined plane assumes, and a write-only one has
-    /// to be *told* the pitch or it lays its chroma lines out too tightly.
+    /// A semi-planar tensor with no staging is as wide as, and reports, the driver's pitch.
     #[test]
     fn nv_textures_with_cpu_access_none_share_the_stride_rule() {
         for (fmt, w, h) in nv_sizes() {
@@ -2540,15 +2130,7 @@ mod tests {
         }
     }
 
-    /// A write-only NV tensor's chroma lines land where the texture keeps
-    /// them.
-    ///
-    /// The end of the rule above: a producer writes at the stride
-    /// `Tensor::image` recorded, the host buffer is uploaded at the texture's
-    /// own pitch, and a reader of the same texture finds the lines at the same
-    /// offsets. NV24 is the shape that separates a right pitch from a wrong
-    /// one, because its chroma line is `2W` bytes -- twice the image row -- and
-    /// the model places line `i` two rows below line `i - 1`.
+    /// A write-only NV tensor's chroma lines land at the texture's pitch.
     #[test]
     fn a_write_only_nv_tensor_uploads_its_chroma_lines_at_the_texture_pitch() {
         let (w, h) = (64usize, 64usize);
@@ -2571,9 +2153,7 @@ mod tests {
             "a padded texture records its width as the row stride"
         );
 
-        // Chroma line `i` is `2 * w` bytes at combined-plane row `h + 2 * i`,
-        // which is where `ChromaLayout::uv_rows_per_luma` puts it and where the
-        // Path B shader reads it.
+        // Chroma line `i` is `2 * w` bytes at combined-plane row `h + 2 * i`.
         let line = 2 * w;
         let chroma_at = |i: usize| (h + 2 * i) * stride;
         let byte = |i: usize, k: usize| ((i * 5 + k * 3) % 251) as u8;
@@ -2588,8 +2168,7 @@ mod tests {
             }
         }
 
-        // A second, readable wrapper of the same texture: the only way to see
-        // what the upload actually put there.
+        // A second, readable wrapper of the same texture.
         let shape = fmt.allocation_shape(w, h).unwrap();
         // SAFETY: `t` holds the texture alive across this call.
         let r = unsafe {
@@ -2624,13 +2203,9 @@ mod tests {
         }
     }
 
-    /// An external semi-planar texture is accepted when it is at least as wide
-    /// as an even image row, and its own width becomes the tensor's stride:
-    /// the host allocated the padding, so the host's width is the pitch.
+    /// An external semi-planar texture is wrapped at its own width, which becomes the stride.
     #[test]
     fn an_external_semi_planar_texture_is_wrapped_at_its_own_width() {
-        // 128 is a multiple of every staging alignment either adapter uses, so
-        // this texture is 128 texels wide on both.
         let backing = nv_tensor(PixelFormat::Nv16, 128, 64, CpuAccess::None);
         assert_eq!(backing.layout().texture_width, 128);
         let shape = PixelFormat::Nv16.allocation_shape(100, 64).unwrap();
@@ -2655,25 +2230,13 @@ mod tests {
         );
     }
 
-    /// An external semi-planar texture that is not already as wide as its own
-    /// staging pitch is refused: maps and pins of the wrapped tensor are laid
-    /// out at that pitch, so accepting one would report a width the tensor
-    /// does not address by.
-    ///
-    /// A raw 100-wide R8 texture is the shape a third party would hand over
-    /// for a 100x64 NV12 image in the combined layout, which is still accepted
-    /// for an even NV12 image although the HAL now allocates native NV12. Whether it is legal depends on the adapter,
-    /// not on the HAL: this NVIDIA adapter gives it a 128-byte staging pitch
-    /// and it is refused, while WARP's pitch is tight and it is accepted. The
-    /// test measures the pitch and asserts the matching outcome rather than
-    /// skipping on one of them.
+    /// An external semi-planar texture narrower than its own staging pitch is refused.
     #[test]
     fn an_external_semi_planar_texture_narrower_than_its_pitch_is_refused() {
         let (w, h) = (100usize, 64usize);
         let fmt = PixelFormat::Nv12;
         let d = device().unwrap();
-        // What a producer outside the HAL would create: the combined plane at
-        // exactly the image's own width.
+        // The combined plane at exactly the image's own width.
         let raw = D3d11ImageLayout {
             texture_width: w,
             ..combined_semi_planar_layout(fmt, w, h).unwrap()
@@ -2700,15 +2263,7 @@ mod tests {
         }
     }
 
-    /// A wrapped semi-planar tensor reports the texture's width as its row
-    /// stride, exactly as an HAL-allocated one does.
-    ///
-    /// Without it the tensor would report the natural `even(width)` stride
-    /// while its texture is the driver's pitch wide, and the Path B shader --
-    /// which takes its `tex_width` from the stride -- would sample a padded
-    /// texture at the image width. Both constructors record it, so a texture
-    /// that crosses a process boundary as a shared handle lands the same way
-    /// as one passed by pointer.
+    /// A wrapped semi-planar tensor reports the texture's width as its row stride.
     #[test]
     fn wrapped_nv_tensors_record_the_textures_width_as_their_row_stride() {
         for (w, h) in [(321usize, 241usize), (64, 63)] {
@@ -2756,11 +2311,7 @@ mod tests {
         }
     }
 
-    /// An even NV12 image is a native two-plane texture, and a CPU map lays it
-    /// out as the combined plane: luma rows, then chroma rows, at one pitch.
-    /// What a write map puts there, a second wrapper of the same texture
-    /// reads back at the same offsets -- through staging for a readable
-    /// tensor and through the whole-texture upload for a write-only one.
+    /// A native NV12 texture round-trips luma and chroma through combined-plane CPU maps.
     #[test]
     fn native_nv12_round_trips_luma_and_chroma_through_the_cpu() {
         let (w, h) = (640usize, 480usize);
@@ -2818,10 +2369,7 @@ mod tests {
         }
     }
 
-    /// A producer's own NV12 texture -- what a video decoder or capture
-    /// pipeline creates -- wraps without a copy, by pointer and by shared
-    /// handle, and the geometry helpers read its image size straight from the
-    /// texture.
+    /// An external native NV12 texture wraps by pointer and by shared handle.
     #[test]
     fn an_external_native_nv12_texture_wraps_by_pointer_and_by_handle() {
         let (w, h) = (1920usize, 1080usize);
@@ -2871,7 +2419,7 @@ mod tests {
         .unwrap();
         assert_eq!(geometry, (w, h), "an NV12 texture needs no shape");
 
-        // A native NV12 texture of another size is another image.
+        // Wrapping at another image size is refused.
         // SAFETY: `tex` is live for the call.
         let other = unsafe {
             crate::Tensor::<u8>::from_d3d11_texture(
@@ -2886,12 +2434,7 @@ mod tests {
         assert!(matches!(other, Err(Error::InvalidArgument(_))), "{other:?}");
     }
 
-    /// A native NV12 texture holding a shorter image (a pool tensor
-    /// reconfigured for a smaller frame) keeps the image's chroma at the top
-    /// of its chroma plane, while CPU views lay it out as the image's own
-    /// combined plane. Written through one view, read back through the same
-    /// one and through a full-size wrapper of the texture, for a readable and
-    /// a write-only tensor.
+    /// A shorter image in a native NV12 texture round-trips its chroma through CPU views.
     #[test]
     fn a_shorter_image_in_a_native_nv12_texture_keeps_its_chroma_in_the_plane() {
         let (w, h) = (640usize, 480usize);
@@ -2981,8 +2524,7 @@ mod tests {
         );
     }
 
-    /// A write-only native NV12 texture is uploaded whole, so a writable map
-    /// of part of it is refused rather than publishing rows it does not own.
+    /// A writable map of part of a write-only native NV12 texture is refused.
     #[test]
     fn a_partial_write_window_of_a_write_only_native_nv12_tensor_is_refused() {
         let (w, h) = (64usize, 64usize);
@@ -3012,9 +2554,7 @@ mod tests {
         );
     }
 
-    /// A texture narrower than an even image row cannot hold the image, so it
-    /// is refused rather than wrapped at a width whose last chroma pair falls
-    /// off the row.
+    /// An external semi-planar texture narrower than an even image row is refused.
     #[test]
     fn an_external_semi_planar_texture_narrower_than_the_image_is_refused() {
         let backing = nv_tensor(PixelFormat::Nv12, 128, 64, CpuAccess::None);
@@ -3048,7 +2588,8 @@ mod tests {
             let mut v = w.map_with(CpuAccess::Write).unwrap();
             v.as_mut_slice().fill(0xA5);
         }
-        // Read it back through a second, readable wrapper of the same texture.
+        // Reads it back through a second, readable wrapper of the same
+        // texture.
         // SAFETY: `w` holds the texture alive across this call.
         let r = unsafe {
             D3d11TextureTensor::<u8>::from_d3d11_texture(
@@ -3084,8 +2625,7 @@ mod tests {
             let mut v = t.map_with(CpuAccess::Write).unwrap();
             v.as_mut_slice().fill(0x5A);
         }
-        // The second device is not ordered against this one by anything but
-        // the shared fence, so wait for the write to land before reading.
+        // Waits on the shared fence for the write to land.
         let value = device().unwrap().signal().expect("fence signal");
         let event = device().unwrap().event_for(value).unwrap();
         // SAFETY: `event` is the live event handle `event_for` just returned.
@@ -3111,11 +2651,6 @@ mod tests {
 
     #[test]
     fn a_map_does_not_block_on_a_recorded_write_the_fence_has_passed() {
-        // The wait a map queues is GPU-side, and a value already complete
-        // retires at once, so recording an old value must not cost the
-        // caller anything. Without the bound this would be the failure mode
-        // of getting the ordering wrong: a wait on a value nothing will ever
-        // signal, paid for on every map.
         let t = rgba(16, 16, CpuAccess::ReadWrite);
         let v = device().unwrap().signal().unwrap();
         let ev = device().unwrap().event_for(v).unwrap();
@@ -3136,26 +2671,14 @@ mod tests {
 
     #[test]
     fn a_map_sees_a_second_device_write_the_recorded_completion_covers() {
-        // A producer this device does not order itself against: a second
-        // D3D11 device writes the texture through its shared handle and
-        // signals a fence of its own behind that write. The import opens
-        // that fence, queues a wait on it, and re-signals the local
-        // timeline behind the wait, so the value this tensor records is
-        // reached only once the second device's bytes are there -- and the
-        // map has to be behind it.
-        //
-        // The earlier shape of this test queued the write on the same
-        // immediate context the staging refresh uses, where context order
-        // alone already guaranteed the result; this one carries the
-        // ordering on a fence and nothing else.
+        // A second D3D11 device writes the texture through its shared handle
+        // and signals a fence of its own behind that write.
         assert!(
             device().unwrap().fence_is_shared(),
             "this host's copy signals the process's shared fence, so the map \
              path's wait is live rather than skipped"
         );
-        // Big enough, and preceded by enough zero fills, that the write is
-        // still in flight when the map below asks for the bytes: 16 MiB of
-        // uploads in front of the 1 MiB that matters.
+        // Sixteen zero-fill uploads precede the 1 MiB write.
         const W: usize = 512;
         const H: usize = 512;
         let shape = PixelFormat::Rgba.allocation_shape(W, H).unwrap();
@@ -3205,11 +2728,6 @@ mod tests {
 
     #[test]
     fn a_recorded_write_above_the_counter_does_not_block_the_next_map() {
-        // `ef_tensor_set_gpu_write` takes any u64, so a caller can record a
-        // value this device's fence will never reach. Queuing a wait on it
-        // would not stall one map: it stalls the immediate context for the
-        // rest of the process, and every later signal and every other
-        // tensor's work with it. The map path has to ignore it instead.
         let t = rgba(32, 32, CpuAccess::ReadWrite);
         {
             let mut v = t.map_with(CpuAccess::Write).unwrap();
@@ -3218,11 +2736,7 @@ mod tests {
         let unreachable = device().unwrap().last_signalled() + 1_000_000;
         t.set_gpu_write(unreachable);
 
-        // try_map rather than map: were the bound gone, a blocking map would
-        // hang this process instead of failing, and a hung test says less
-        // than a failed one. The loop is the same shape
-        // `try_map_eventually_succeeds_and_returns_the_written_bytes` uses --
-        // bounded by the clock, yielding between attempts.
+        // Polls `try_map_with` until a deadline, yielding between attempts.
         let deadline = Instant::now() + Duration::from_secs(5);
         let mapped = loop {
             match t.try_map_with(CpuAccess::Read) {
@@ -3244,9 +2758,7 @@ mod tests {
             "the map still reads the texture, it just does not wait on the value"
         );
         drop(mapped);
-        // Ignored by the map path, not discarded: `gpu_completion` describes
-        // the producer's timeline, and a consumer opening the producer's
-        // fence is entitled to the value the producer named.
+        // The recorded value is still reported.
         assert_eq!(t.last_gpu_write(), unreachable);
     }
 
@@ -3278,11 +2790,8 @@ mod tests {
             )
         }
         .unwrap();
-        // Not the producer's value: the import queues a wait on the producer's
-        // fence and then signals the *local* one behind it, so what it records
-        // is a value on the timeline `gpu_completion` and the CUDA semaphore
-        // wait both read. In-process the two fences are the same object, so the
-        // recorded value is simply a newer point on it.
+        // The import records a newer value on the local fence, not the
+        // producer's.
         assert!(
             dst.last_gpu_write() > v,
             "the import recorded {} on the local timeline, past the producer's {v}",
@@ -3419,21 +2928,6 @@ mod tests {
     }
 
     /// A map and a pin address the same rows at the same pitch.
-    ///
-    /// Every byte a map or a pin hands out is in backing (pitched) space, and
-    /// `image_backing_row_stride()` -- which `Tensor::image` records as the
-    /// tensor's `row_stride` -- is that pitch. A consumer writing row `y` at
-    /// `y * row_stride` through a map therefore reads it back at the same
-    /// offset through a pin, with no repacking anywhere between. That is the
-    /// rule the image engine's GL readback depends on: it packs its rows
-    /// tightly and re-spaces them to this pitch, and a backing that quietly
-    /// packed one of the two windows differently would put the two halves of
-    /// that contract out of step.
-    ///
-    /// An RGB image is the shape that separates them: its tight row is
-    /// `width * 3`, which no 128-byte-aligned driver pitch is a multiple of, so
-    /// on a discrete adapter the two numbers differ. On the software adapter
-    /// the pitch is tight and the test still holds, trivially.
     #[test]
     fn a_map_and_a_pin_agree_row_for_row_at_the_backing_pitch() {
         let w = 64;
@@ -3483,13 +2977,9 @@ mod tests {
         }
     }
 
-    /// `crate::pin::HostPin::alignment` documents 64 bytes as what an
-    /// inference runtime's custom allocation needs; the allocator alone does
-    /// not provide it, so `HostBuffer` carries the slack to reach it.
+    /// A host pin's address is 64-byte aligned.
     #[test]
     fn a_host_pin_is_64_byte_aligned() {
-        // A pitch that is not itself a multiple of 64 would still land on an
-        // aligned base, because the base is aligned, not the pitch.
         for (w, h) in [(64usize, 64usize), (37, 5), (1, 1)] {
             let t = rgba(w, h, CpuAccess::ReadWrite);
             let pin = t.host_pin(CpuAccess::ReadWrite).unwrap();
@@ -3501,10 +2991,7 @@ mod tests {
         }
     }
 
-    /// A map covers this tensor's own rows at the backing pitch -- for a
-    /// sub-view, its own window rather than everything left in the parent.
-    /// A batched destination's per-band map depends on this to match the same
-    /// convert done standalone.
+    /// A map covers this tensor's own rows at the backing pitch, not the rest of the parent.
     #[test]
     fn a_map_covers_this_tensors_rows_not_the_parents_tail() {
         let t = rgba(32, 8, CpuAccess::ReadWrite);
@@ -3514,14 +3001,13 @@ mod tests {
         assert_eq!(whole.as_slice().len(), pitch * 8);
         drop(whole);
 
-        // A window two rows in, two rows tall: its map covers those two rows,
-        // not the six that remain in the parent.
+        // A window two rows in, two rows tall.
         let v = t.view(pitch * 2, &[2, 32, 4]).unwrap();
         let mapped = v.map_with(CpuAccess::Read).unwrap();
         assert_eq!(mapped.as_slice().len(), pitch * 2);
         drop(mapped);
 
-        // An explicit request past the window is refused rather than clamped.
+        // An explicit request past the window is refused.
         assert!(matches!(
             v.map_with_byte_size(pitch * 7, CpuAccess::Read),
             Err(Error::InsufficientCapacity { .. })
@@ -3537,21 +3023,14 @@ mod tests {
             v.as_mut_slice().fill(0x6B);
         }
 
-        // The first attempt either maps or reports that the copy is still in
-        // flight. Any other error is a failure, not a retry.
+        // The first attempt either maps or reports `WouldBlock`.
         match t.try_map_with(CpuAccess::Read) {
             Ok(_) => {}
             Err(Error::IoError(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(e) => panic!("first try_map_with returned an unexpected error: {e}"),
         }
 
-        // Bounded by the clock alone, and yielding between attempts. An
-        // attempt cap is the wrong bound here: 10 000 spins elapse in tens of
-        // milliseconds, so the loop could exhaust it before the GPU had a
-        // chance to finish the copy the first attempt submitted -- and a tight
-        // spin makes that worse, not better, because the threads that finish
-        // the copy (the driver's, and on WARP the CPU workers that *are* the
-        // GPU) are competing with this loop for the same core.
+        // Retries until a deadline, yielding between attempts.
         let deadline = Instant::now() + Duration::from_secs(2);
         let mut attempts = 0usize;
         let mapped = loop {
@@ -3578,7 +3057,7 @@ mod tests {
             let mut v = w.map_with(CpuAccess::Write).unwrap();
             v.as_mut_slice().fill(0xA5);
         }
-        // A readable wrapper of the same texture, to observe and to overwrite.
+        // A readable wrapper of the same texture.
         // SAFETY: `w` holds the texture alive across this call.
         let r = unsafe {
             D3d11TextureTensor::<u8>::from_d3d11_texture(
@@ -3599,7 +3078,7 @@ mod tests {
             .iter()
             .all(|&b| b == 0xA5));
 
-        // A read map of the write-only tensor must publish nothing.
+        // A read map of the write-only tensor publishes nothing.
         drop(w.map_with(CpuAccess::Read).unwrap());
 
         {
@@ -3609,8 +3088,7 @@ mod tests {
                 dst[n * pitch..n * pitch + row].fill(0x11);
             }
         }
-        // Taken again after the overwrite: this is the ordering that catches
-        // an unconditional upload, which would put 0xA5 back.
+        // A second read map, after the overwrite.
         drop(w.map_with(CpuAccess::Read).unwrap());
 
         assert!(
@@ -3633,7 +3111,7 @@ mod tests {
                 dst[n * pitch..n * pitch + row].fill(0xB0 + n as u8);
             }
         }
-        // Offsets are in backing space, so three whole rows is `3 * pitch`.
+        // Three whole rows in backing space.
         let sub = t.view(3 * pitch, &[13, 16, 4]).unwrap();
         assert_eq!(sub.capacity_bytes(), 16 * pitch - 3 * pitch);
         let v = sub.map_with(CpuAccess::Read).unwrap();

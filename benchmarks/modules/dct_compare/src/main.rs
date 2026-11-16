@@ -6,8 +6,6 @@
 //! Decodes every image twice — `DctMethod::Accurate` (the default `islow`
 //! kernel) and `DctMethod::Fast` (opt-in AAN) — and reports per-corpus
 //! cosine similarity, PSNR, and worst pixel delta of the raw decoded planes.
-//! This is the interim accuracy evidence for the fast mode until the mAP
-//! comparison lands (measure the model, not just the pixels).
 //!
 //! ```bash
 //! dct_compare --dir /data/coco/val2017 --limit 500
@@ -83,12 +81,10 @@ fn main() -> Result<()> {
         };
         let _ = t_fast.load_image(&mut dec_fast, &data)?;
 
-        // Compare the decoded planes over the valid image region only: the
-        // luma rows carry `width` bytes; the chroma rows of the semi-planar
-        // formats carry interleaved CbCr — 2·width for Nv24 (full-res),
-        // even(width) for Nv12/Nv16 (2 bytes per 2-wide pair). Row count
-        // comes from the format's combined plane height, so Nv12's half-
-        // height chroma and Grey's absence of chroma are both respected.
+        // Compare the decoded planes over the valid image region: the luma
+        // rows carry `width` bytes; the chroma rows of the semi-planar formats
+        // carry interleaved CbCr, 2·width for Nv24 and even(width) for
+        // Nv12/Nv16. The row count is the format's combined plane height.
         let stride = t_acc.effective_row_stride().unwrap_or(ia.width);
         let plane_rows = ia
             .format

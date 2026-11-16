@@ -50,8 +50,7 @@ fn sweep(patterns: impl Iterator<Item = u32>) {
     check(&mut xs);
 }
 
-/// `fast_sigmoid4` equals `fast_sigmoid` on every 127th f32 bit pattern, every value within
-/// 2^16 ulps of ±80, ±88 and ±0, and the specials.
+/// `fast_sigmoid4` equals `fast_sigmoid` on a sweep of f32 bit patterns and the specials.
 #[test]
 fn fast_sigmoid4_matches_the_scalar_function() {
     sweep((0..=u32::MAX).step_by(127));
@@ -76,7 +75,7 @@ fn fast_sigmoid4_matches_the_scalar_function() {
     sweep(specials.iter().map(|x| x.to_bits()));
 }
 
-/// Every f32 bit pattern; slow, run by hand on the board.
+/// `fast_sigmoid4` equals `fast_sigmoid` on every f32 bit pattern.
 #[test]
 #[ignore]
 fn fast_sigmoid4_matches_the_scalar_function_exhaustively() {
@@ -278,8 +277,7 @@ fn split_rows_match_the_scalar_decode() {
     check_type::<f16>(6);
 }
 
-/// Bad lengths, rows past the grid, no anchors, no classes, an empty grid or a row longer than
-/// `MAX_ROW`: rejected with nothing written.
+/// Invalid lengths, rows, anchors, classes or grids are rejected with nothing written.
 #[test]
 fn invalid_arguments_write_nothing() {
     let anchors = [[1.0f32, 1.0]];

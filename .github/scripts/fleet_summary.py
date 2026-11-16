@@ -10,15 +10,13 @@ Each board job uploads one artifact holding scripts/on-target-run.sh's
 and one `<case>.json` per case. Each `summary.json` records the board entry it
 ran for (`entry`, as requested: `imx8mp-evk`, `imx95-frdm+ara240`) and the
 runner that ran it. Results are found by that entry wherever they sit under
-`--results`: download-artifact puts each of several artifacts in its own
-directory, but extracts a pattern's only match straight into the path. An
-older result without `entry` is matched by its `<prefix>-<entry>` directory.
+`--results`. A result without `entry` is matched by its `<prefix>-<entry>`
+directory.
 
 Every requested entry gets a row. An entry that produced no artifact (the job
 failed before uploading, was cancelled, or timed out) is a failure. An entry
 the plan found no online runner for is listed as unavailable and does not fail
-the run: it was reported rather than queued, which is the point. A run that
-scheduled no board at all tested nothing, and fails.
+the run. A run that scheduled no board at all fails.
 
 Usage:
   fleet_summary.py tests --results DIR --requested JSON --unavailable JSON
@@ -35,8 +33,7 @@ import json
 import sys
 from pathlib import Path
 
-# Rows worth reading across boards at a glance: (case, benchmark name, label).
-# Everything else is in the per-case sections.
+# Rows of the headline table: (case, benchmark name, label).
 HEADLINE = [
     (
         "pipeline-opengl",

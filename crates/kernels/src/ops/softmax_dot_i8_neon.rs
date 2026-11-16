@@ -34,8 +34,7 @@ pub(super) unsafe fn rows16(p: &SoftmaxDotI8Plan, g: &RowGroup<'_, i8>) {
     // Rows 0..8 and 8..16 of the sums; rows 4q..4q + 4 of the weighted sums.
     let mut sum = [vdupq_n_u16(0); 2];
     let mut ws = [vdupq_n_s32(0); 4];
-    // Four elements per step, each stage across all four, so the in-order core always has
-    // independent work.
+    // Four elements per step, each stage across all four.
     for (x, w) in v.as_chunks::<4>().0.iter().zip(weights.as_chunks::<4>().0) {
         let (a, b) = tables.entries(max, x);
         let s16 = vreinterpretq_s16_u16;
@@ -130,9 +129,7 @@ mod tests {
         );
     }
 
-    /// The widest weights (−128 and 127) and every projection gain the error bound still
-    /// admits for NEON, on rows with one maximum and the rest anywhere below it: within ±1
-    /// LSB throughout.
+    /// At the widest weights and every gain the error bound admits, results stay within ±1 LSB.
     #[test]
     fn plans_at_the_error_bound_stay_within_one_lsb() {
         use crate::cpu::Tier;

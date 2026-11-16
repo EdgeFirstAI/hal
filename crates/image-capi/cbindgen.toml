@@ -1,22 +1,11 @@
 # SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 # SPDX-License-Identifier: Apache-2.0
 #
-# cbindgen configuration for edgefirst/tensor.h.
+# cbindgen configuration for edgefirst/image.h.
 #
-# NOTE: the include guard is written by hand in `header`/`trailer` rather than
-# via cbindgen's `include_guard`, which wraps only the *generated* body and
-# leaves `header` and `trailer` outside it. Everything below the trailer marker
-# -- the vtable struct and every `static inline` accessor -- would then be
-# re-emitted on a second #include and fail to compile with a redefinition.
-#
-# NOTE: cbindgen emits declarations for `extern "C"` functions only. It cannot
-# emit a `static inline` body, and `static inline` is the entire mechanism that
-# makes the vtable accessors non-interposable. Those therefore live in the
-# hand-written `trailer` below, not in generated output.
+# The include guard is written by hand in `header` and `trailer`.
 
 language = "C"
-# The option vocabularies are `#[repr(u32)]` enums; see tensor-capi's
-# cbindgen.toml for why that needs `cpp_compat` to compile as C++.
 cpp_compat = true
 autogen_warning = "/* WARNING: The generated portion of this file is produced by cbindgen. Do not modify it directly. */"
 include_version = true
@@ -38,17 +27,16 @@ header = """
  * Hardware-accelerated image processing: conversion, scaling and colour
  * handling across GL, G2D and CPU backends.
  *
- * This library MINTS tensors. `ef_image_processor_create_image` returns an
- * `ef_tensor`, and allocating a PBO is the one operation that genuinely
- * requires a processor, because only the GL context owner can create one.
+ * `ef_image_processor_create_image` returns an `ef_tensor`. A PBO-backed
+ * tensor is allocated only through a processor.
  *
  * A tensor from here is an ordinary `ef_tensor`. There is one tensor
  * header, `edgefirst/tensor.h`. Detection primitives used when drawing
  * masks live in header-only `edgefirst/detect.h`.
  *
  * Platform-specific entry points. Both are declared on every platform and
- * refuse at run time off their platform, so linking never depends on the
- * host. The tie is stated per function with a "Platforms:" line:
+ * refuse at run time off their platform. Each function states its
+ * platforms on a "Platforms:" line:
  *   - Linux, macOS, iOS, Android: ef_image_processor_convert_fence
  *     (sync-fence fd)
  *   - Windows: ef_image_processor_convert_fence_handle (event handle)
@@ -69,9 +57,6 @@ extern "C" {
 
 /**
  * @brief An opaque image processor.
- *
- * Forward-declared so callers write `ef_image_processor *` without the `struct`
- * keyword. Its definition is private: processor state is not part of the ABI.
  */
 typedef struct ef_image_processor ef_image_processor;
 
@@ -104,9 +89,8 @@ trailer = """
 
 [export]
 prefix = ""
-# EfTensor/EfTensorImpl/EfTensorPlane/EfTensorImageDesc are declared once, in
-# edgefirst/tensor.h, which this header includes; excluding them here avoids
-# emitting a second, conflicting definition.
+# EfTensor, EfTensorImpl, EfTensorPlane and EfTensorImageDesc are declared in
+# edgefirst/tensor.h, which this header includes.
 exclude = [
   "EfTensor",
   "EfTensorImpl",
@@ -120,15 +104,14 @@ exclude = [
   "EfTilePlacement",
   "EfDetectBox",
   "EfSegmentation",
-  # Declared in detect.h, shared with decoder.h.
+  # Declared in detect.h.
   "EfPreprocessSpec",
   "EfFit",
   "EfLetterboxPlacement",
   "EfPadSpace",
   "EfInterpolation",
 ]
-# The option vocabularies are not reachable from any signature (the
-# functions take `uint32_t`), so they are named here.
+# The option vocabularies, which no function signature references.
 include = [
   "EfRotation",
   "EfFlip",

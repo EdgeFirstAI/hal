@@ -4,8 +4,8 @@
 //! Score-level kernel: dequant + optional sigmoid.
 //!
 //! The input layout is NHWC `[1, h, w, num_classes]`. Dequantization
-//! is element-wise so the layout is preserved → output is anchor-major
-//! `[a0c0, a0c1, …, a0cNC-1, a1c0, …]`, exactly what NMS consumes.
+//! is element-wise, so the output is anchor-major
+//! `[a0c0, a0c1, …, a0cNC-1, a1c0, …]`.
 
 use crate::per_scale::plan::LevelPlan;
 use crate::per_scale::Activation;
@@ -95,11 +95,8 @@ macro_rules! impl_score_level_f32_neon {
             let n = level.h * level.w * num_classes;
             debug_assert_eq!(input.len(), n);
             debug_assert_eq!(dst.len(), n);
-            // SAFETY: NEON is mandatory on aarch64 and the dispatch
-            // contract guarantees this function is only reached when
-            // CpuFeatures::neon_baseline was probed true. Variants that
-            // use the FP16 sigmoid additionally require f.neon_fp16
-            // (gated upstream in dispatch::select).
+            // SAFETY: NEON is part of the aarch64 baseline; `dispatch::select`
+            // picks the FP16 sigmoid variants only when FEAT_FP16 is present.
             unsafe {
                 edgefirst_kernels::prim::neon_convert::$dequant_neon(input, q.into(), dst);
                 if activation == Activation::Sigmoid {
@@ -142,10 +139,9 @@ impl_score_level_f32_neon!(
 // ────────────────────────────────────────────────────────────────────────
 // Fused dequant+sigmoid NEON score-level kernels
 //
-// For quantized integer inputs (i8, u8, i16, u16) with Sigmoid activation,
-// these use a single-pass kernel that dequants and applies sigmoid without
-// writing then re-reading the intermediate f32 buffer. When activation is
-// not Sigmoid, falls back to the two-pass NEON dequant path (no sigmoid).
+// For integer inputs (i8, u8, i16, u16) with Sigmoid activation, a
+// single-pass kernel dequantizes and applies the sigmoid. Without the
+// sigmoid, the NEON dequant runs alone.
 // ────────────────────────────────────────────────────────────────────────
 
 #[cfg(target_arch = "aarch64")]
@@ -163,7 +159,7 @@ macro_rules! impl_score_level_f32_neon_fused {
             let n = level.h * level.w * num_classes;
             debug_assert_eq!(input.len(), n);
             debug_assert_eq!(dst.len(), n);
-            // SAFETY: NEON is mandatory on aarch64; dispatch contract.
+            // SAFETY: NEON is part of the aarch64 baseline.
             unsafe {
                 if activation == Activation::Sigmoid {
                     edgefirst_kernels::prim::neon_baseline::$fused(input, q.into(), dst);

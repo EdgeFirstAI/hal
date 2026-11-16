@@ -3,12 +3,10 @@
 
 //! The decoder option vocabularies, as named C enumerators.
 //!
-//! Each enumerator's value is asserted against the `code()` of the
-//! `edgefirst_decoder` vocabulary it names, at compile time, so the header
-//! cannot drift from the Rust declaration. The functions and struct fields
-//! that take one keep a plain `uint32_t`: an out-of-range value is rejected
-//! rather than transmuted into a Rust enum, which would be undefined
-//! behaviour for a value no variant names.
+//! Each enumerator's value is asserted at compile time against the `code()`
+//! of the `edgefirst_decoder` vocabulary it names. The functions and struct
+//! fields that take one are plain `uint32_t` and reject an out-of-range
+//! value.
 
 use edgefirst_decoder::configs::{
     DecoderType, DecoderVersion, DimName, Nms, OutputType, NMS_OFF_CODE,
@@ -126,7 +124,7 @@ pub enum EfMergeMode {
 pub enum EfModelSource {
     Onnx = 0,
     TfLite = 1,
-    /// Accepted, but inference refuses it: the box convention is unknown.
+    /// Accepted, but inference refuses it.
     Other = 2,
     CoreMl = 3,
 }
@@ -309,9 +307,8 @@ mod tests {
     }
 
     /// The C enumerator for a variant, spelled the way cbindgen's
-    /// `ScreamingSnakeCase` spells the matching `Ef*` variant (which shares
-    /// the Rust variant's name): `NumAnchorsXFeatures` ->
-    /// `NUM_ANCHORS_X_FEATURES`.
+    /// `ScreamingSnakeCase` spells the matching `Ef*` variant:
+    /// `NumAnchorsXFeatures` -> `NUM_ANCHORS_X_FEATURES`.
     fn enumerator(prefix: &str, v: impl std::fmt::Debug) -> String {
         let mut out = format!("{prefix}_");
         for (i, c) in format!("{v:?}").chars().enumerate() {
@@ -325,8 +322,6 @@ mod tests {
 
     #[test]
     fn every_vocabulary_variant_has_a_c_enumerator() {
-        // The const block proves the listed values agree; this proves the
-        // lists are complete.
         assert_eq!(Nms::all().len(), 3, "add the EfNms enumerator");
         assert_eq!(
             DecoderType::all().len(),

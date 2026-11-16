@@ -3,22 +3,16 @@
 
 //! Testdata path resolution for tests, benchmarks, and doctests.
 //!
-//! Replaces compile-time [`include_bytes!`] / [`include_str!`] calls with
-//! runtime filesystem reads. Keeps test and bench binaries small by avoiding
-//! testdata embedding — critical for cross-compiled binaries deployed to
-//! target hardware, where embedded testdata bloats artifact downloads.
+//! Fixtures are read from the filesystem at runtime.
 //!
 //! # Resolution order
 //!
-//! 1. `EDGEFIRST_TESTDATA_DIR` environment variable. Set this in CI or
-//!    when running tests from an unusual location. The value is used
+//! 1. `EDGEFIRST_TESTDATA_DIR` environment variable. The value is used
 //!    verbatim with no further validation.
 //! 2. `<workspace>/testdata`, derived from this crate's compile-time
 //!    `CARGO_MANIFEST_DIR` (always `<workspace>/crates/bench`).
 //!
-//! If neither resolution yields a real directory, [`root`] panics with a
-//! diagnostic message — testdata absence is a developer / CI setup error,
-//! not a runtime condition that callers should handle.
+//! If neither resolution yields a real directory, [`root`] panics.
 //!
 //! # Example
 //!
@@ -52,8 +46,8 @@ pub fn root() -> PathBuf {
     if let Ok(dir) = std::env::var(ENV_VAR) {
         return PathBuf::from(dir);
     }
-    // CARGO_MANIFEST_DIR for this crate is <workspace>/crates/bench at
-    // compile time, so `testdata/` is two levels up.
+    // `CARGO_MANIFEST_DIR` is `<workspace>/crates/bench`; `testdata/` is two
+    // levels up.
     let candidate = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("..")
@@ -70,10 +64,7 @@ pub fn root() -> PathBuf {
 
 /// Returns the absolute path to a file or directory under `testdata/`.
 ///
-/// The `rel` argument is joined onto [`root`] verbatim and is not
-/// validated to exist — callers will get a clear filesystem error when
-/// they attempt to open the result. Use [`read`] or [`read_to_string`]
-/// for one-shot loads that should panic on missing files.
+/// `rel` is joined onto [`root`] verbatim and is not checked for existence.
 pub fn path(rel: impl AsRef<Path>) -> PathBuf {
     root().join(rel)
 }
@@ -83,7 +74,7 @@ pub fn path(rel: impl AsRef<Path>) -> PathBuf {
 /// # Panics
 ///
 /// Panics if the file cannot be read. The panic message includes the
-/// resolved absolute path to aid debugging.
+/// resolved absolute path.
 pub fn read(rel: impl AsRef<Path>) -> Vec<u8> {
     let p = path(rel.as_ref());
     std::fs::read(&p).unwrap_or_else(|e| panic!("read testdata {}: {}", p.display(), e))
@@ -106,10 +97,9 @@ mod tests {
     /// `root()` resolves to a real directory under default workspace layout.
     #[test]
     fn root_resolves_to_workspace_testdata() {
-        // SAFETY: tests run with the workspace's testdata/ in place.
-        // Unset any user-side override to test the workspace-fallback path.
+        // Unset any override.
         let saved = std::env::var(ENV_VAR).ok();
-        // SAFETY: tests in this module are run single-threaded via -j 1.
+        // SAFETY: tests in this module run single-threaded.
         unsafe {
             std::env::remove_var(ENV_VAR);
         }
@@ -117,9 +107,9 @@ mod tests {
         let r = root();
         assert!(r.is_dir(), "expected testdata dir at {}", r.display());
 
-        // Restore prior value if any.
+        // Restore.
         if let Some(v) = saved {
-            // SAFETY: see above.
+            // SAFETY: tests in this module run single-threaded.
             unsafe {
                 std::env::set_var(ENV_VAR, v);
             }
@@ -131,7 +121,7 @@ mod tests {
     fn env_var_override_is_respected() {
         let tmp = std::env::temp_dir();
         let saved = std::env::var(ENV_VAR).ok();
-        // SAFETY: tests in this module are run single-threaded via -j 1.
+        // SAFETY: tests in this module run single-threaded.
         unsafe {
             std::env::set_var(ENV_VAR, &tmp);
         }
@@ -152,7 +142,7 @@ mod tests {
     #[test]
     fn path_joins_relative_segments() {
         let saved = std::env::var(ENV_VAR).ok();
-        // SAFETY: see above.
+        // SAFETY: tests in this module run single-threaded.
         unsafe {
             std::env::set_var(ENV_VAR, "/fake/root");
         }

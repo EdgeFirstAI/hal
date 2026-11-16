@@ -114,13 +114,6 @@ case this library has to refuse, because every EdgeFirst library reaches the sam
 tensor implementation in `libedgefirst_tensor.so`: a handle minted by one is the
 same object to all of them, not a compatible copy that has to be translated.
 
-Earlier versions of this library held their own private copy of the tensor code,
-which made a tensor from elsewhere genuinely foreign — it had to be re-imported
-from its planes, a host-memory source had no shareable handle to import from, and
-a foreign destination would have been written through the re-import rather than
-into the caller's buffer. Both of those returned `EOPNOTSUPP`. Neither case
-exists any more; there is nothing left to special-case.
-
 ## Asynchronous convert
 
 `ef_image_processor_convert_fence` returns a sync-fence fd instead of blocking,

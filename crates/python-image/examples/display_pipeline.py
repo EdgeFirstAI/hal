@@ -4,12 +4,11 @@
 
 """Display-pipeline building blocks from Python, checked on the device.
 
-The pattern: the GPU renders the camera frame and the detection boxes into a
+The GPU renders the camera frame and the detection boxes into a
 hardware-only (``access="none"``) DMA-BUF canvas whose fd goes to the
 compositor, a CPU-written overlay lives in a ``access="write"`` image, and
 the decoder turns model outputs into boxes. On Linux both images come from
-the uncached CMA heap where available, so the compositor's per-frame mapping
-costs no CPU cache maintenance; the HAL refuses any CPU read of them.
+the uncached CMA heap where available; the HAL refuses any CPU read of them.
 
 Each step prints ``PASS``/``FAIL``; the decode step also times the decoder.
 
@@ -124,9 +123,7 @@ def check_display_images() -> None:
     """A GL-drawn hardware-only canvas with its fd exported, and a CPU-written
     overlay, both uncached; CPU reads of either are refused.
 
-    Converts and draws use separate processors, as the demo does: on the
-    i.MX 95's Mali GPU a draw leaves state behind that corrupts the next
-    convert on the same processor.
+    Converts and draws use separate processors.
     """
     proc, draw, readback_proc = ImageProcessor(), ImageProcessor(), ImageProcessor()
     camera = proc.create_image(W, H, PixelFormat.Rgba, access="readwrite")

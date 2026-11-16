@@ -7,16 +7,13 @@
 #   make aarch64          cross build for boards -> build/wuffs_bench.aarch64
 #   make x86_64           cross build (zig)      -> build/wuffs_bench.x86_64
 #
-# The 3.6 MB transpiled wuffs-v0.4.c is not vendored: `make deps` (run
-# automatically) fetches it at a pinned release tag and verifies its sha256,
-# keeping it out of git while keeping the build reproducible. Wuffs is
-# Apache-2.0.
+# `make deps` (run automatically) fetches wuffs-v0.4.c at a pinned release tag
+# and verifies its sha256. Wuffs is Apache-2.0.
 
 CC      ?= cc
 CFLAGS  ?= -O2 -g -Wall -Wextra -std=c11
 UNAME_S := $(shell uname -s)
-# libdl is separate from libm on Linux (both live in libSystem on Darwin);
-# cbench.h's --parity mode dlopens libturbojpeg.
+# libdl and libm are separate libraries on Linux; on Darwin both live in libSystem.
 ifeq ($(UNAME_S),Darwin)
 LDLIBS  :=
 else
@@ -26,7 +23,7 @@ BUILD   := build
 
 INCLUDES := -I../cbench -I$(BUILD)
 
-# Wuffs v0.4.0-alpha.10 (the v0.4 line is the first with the JPEG decoder).
+# Wuffs v0.4.0-alpha.10.
 WUFFS_URL    := https://raw.githubusercontent.com/google/wuffs/v0.4.0-alpha.10/release/c/wuffs-v0.4.c
 WUFFS_SHA256 := 1f8039ef82911604c063f6ac2ed57254bdb17d742aebdeae06356530d4a0fde7
 

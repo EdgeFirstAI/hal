@@ -1,18 +1,15 @@
 // SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! CPU JPEG-preprocessing path benchmark (Jetson Orin Nano profile target).
+//! CPU JPEG-preprocessing path benchmark.
 //!
-//! On the Orin Nano Super we deliberately keep JPEG decode + preprocessing +
-//! postprocessing on the CPU so TensorRT owns the GPU. JPEG decodes to the NV
-//! family (NV12 4:2:0, NV16 4:2:2, NV24 4:4:4) and the model wants planar RGB
-//! (`PlanarRgb`, i.e. CHW) — optionally widened to F32. This bench isolates the
-//! cells on that path so `perf` attribution is clean and before/after fusion +
-//! NEON work has a named gate per cell.
+//! JPEG decodes to the NV family (NV12 4:2:0, NV16 4:2:2, NV24 4:4:4) and the
+//! model takes planar RGB (`PlanarRgb`, i.e. CHW), optionally widened to F32.
+//! This bench measures the cells on that path.
 //!
-//! The CPU backend is pinned via `EDGEFIRST_FORCE_BACKEND=cpu` so GL/G2D never
-//! absorb a cell. Self-contained: sources are synthesized (Y luma gradient +
-//! neutral chroma), so NO testdata files are required on the target.
+//! The CPU backend is pinned via `EDGEFIRST_FORCE_BACKEND=cpu`. Sources are
+//! synthesized (Y luma gradient + neutral chroma), so no testdata files are
+//! required.
 //!
 //! ```bash
 //! EDGEFIRST_FORCE_BACKEND=cpu ./cpu_preprocess_benchmark --json cpu.json
@@ -33,7 +30,7 @@ use edgefirst_tensor::{DType, PixelFormat, TensorMapTrait, TensorTrait};
 const WARMUP: usize = 10;
 const DEFAULT_ITERATIONS: usize = 200;
 
-// Camera 1280x720 → model 640x640 (the profiler's letterbox geometry).
+// Camera 1280x720 → model 640x640.
 const IN_W: usize = 1280;
 const IN_H: usize = 720;
 const OUT_W: usize = 640;
@@ -71,11 +68,8 @@ fn fmt_name(f: PixelFormat) -> &'static str {
 }
 
 fn main() {
-    // Pin the CPU backend first, before anything that could spawn a thread:
-    // this bench characterises the CPU preprocessing path the Orin Nano
-    // deployment uses to keep the GPU free for TensorRT.
-    // SAFETY: set_var runs at the very top of main(), before env_logger,
-    // argument parsing, or any worker threads — the process is single-threaded.
+    // Pins the CPU backend when `EDGEFIRST_FORCE_BACKEND` is unset.
+    // SAFETY: the process is single-threaded at the top of main().
     if std::env::var("EDGEFIRST_FORCE_BACKEND").is_err() {
         unsafe { std::env::set_var("EDGEFIRST_FORCE_BACKEND", "cpu") };
     }
@@ -147,7 +141,7 @@ fn main() {
             ConvertOptions,
             Option<(f32, i32)>,
         )] = &[
-            // Pure convert (no resize) — isolates NV→RGB decode + planar scatter.
+            // Pure convert (no resize).
             (
                 "convert_720p_to_rgb",
                 IN_W,
@@ -166,7 +160,7 @@ fn main() {
                 plain,
                 None,
             ),
-            // Letterbox (convert + resize) — the real pipeline op.
+            // Letterbox (convert + resize).
             (
                 "letterbox_720p_to_640_planar_rgb",
                 OUT_W,
@@ -186,7 +180,7 @@ fn main() {
                 lb_crop,
                 None,
             ),
-            // Full preprocess to F16 (native-FP16 widen on capable CPUs).
+            // Full preprocess to F16.
             (
                 "letterbox_720p_to_640_planar_rgb_f16",
                 OUT_W,
@@ -196,7 +190,7 @@ fn main() {
                 lb_crop,
                 None,
             ),
-            // Plain i8 (the XOR bias), the baseline for the quantized cell.
+            // Plain i8 (the XOR bias).
             (
                 "letterbox_720p_to_640_planar_rgb_i8",
                 OUT_W,
@@ -251,8 +245,7 @@ fn main() {
                 dst.set_quantization(edgefirst_tensor::Quantization::per_tensor(scale, zp))
                     .unwrap();
             }
-            // Probe once: an unsupported cell is reported and skipped instead of
-            // panicking inside the timing loop.
+            // Probe once: an unsupported cell is reported and skipped.
             if let Err(e) = proc.convert(&src, &mut dst, Some(opts)) {
                 println!("  {name:50} [unsupported: {e}]");
                 continue;
@@ -260,8 +253,7 @@ fn main() {
             let r = run_bench(&name, WARMUP, iters, || {
                 proc.convert(&src, &mut dst, Some(opts)).unwrap();
             });
-            // Throughput is reported against source bytes; the f32/f16 cells
-            // share the same source so the numbers are comparable across dtypes.
+            // Throughput is reported against source bytes.
             r.print_summary_with_throughput(src_bytes);
             suite.record(&r);
         }

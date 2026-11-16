@@ -50,17 +50,14 @@ pub mod kalman;
 
 /// A bounding box produced by a detection model, suitable for use with a [`Tracker`].
 ///
-/// Implement this trait on your model's output type to feed it directly into
-/// [`ByteTrack`] without copying. The tracker crate has
-/// no dependency on `edgefirst-decoder`; any type that can report an XYXY box,
-/// a confidence score, and a class label satisfies this contract.
+/// Any type that reports an XYXY box, a confidence score and a class label
+/// can implement it.
 ///
 /// # Coordinates
 ///
 /// `bbox()` must return `[xmin, ymin, xmax, ymax]` in normalised `[0, 1]`
-/// coordinates or in pixel coordinates — the tracker does not prescribe units,
-/// but all detections passed to a single [`Tracker::update`] call must use the
-/// same coordinate space.
+/// coordinates or in pixel coordinates; all detections passed to a single
+/// [`Tracker::update`] call must use the same coordinate space.
 ///
 /// # Example
 ///
@@ -85,18 +82,11 @@ pub trait DetectionBox: Debug + Clone {
     /// ones (second-pass matching).
     fn score(&self) -> f32;
 
-    /// Class index (0-based). Stored in the tracklet for callers that need
-    /// per-class track metadata; the tracker itself does not gate matching
-    /// on label — a tracklet may receive detections from different classes.
+    /// Class index (0-based). The tracker does not gate matching on label; a
+    /// tracklet may receive detections from different classes.
     fn label(&self) -> usize;
 }
 
-/// The shared detection vocabulary satisfies the tracker's input contract.
-///
-/// The impl lives here rather than in `edgefirst-decoder` because the orphan
-/// rule requires it: `DetectionBox` is this crate's trait and
-/// [`DetectBox`](edgefirst_tensor::DetectBox) is `edgefirst-tensor`'s type, so
-/// the crate that owns the trait is the only sound home for it.
 #[cfg(feature = "tensor-boxes")]
 impl DetectionBox for edgefirst_tensor::DetectBox {
     fn bbox(&self) -> [f32; 4] {
@@ -111,10 +101,6 @@ impl DetectionBox for edgefirst_tensor::DetectBox {
 }
 
 /// A minimal detection box for unit tests and doc examples.
-///
-/// This type is **not** intended for production use. It is `#[doc(hidden)]` in
-/// the public docs but available as `edgefirst_tracker::MockDetection` so test
-/// code in downstream crates does not need to define its own dummy type.
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy)]
 pub struct MockDetection {
@@ -146,17 +132,14 @@ impl DetectionBox for MockDetection {
 
 /// Per-track metadata returned by [`Tracker::update`] and [`Tracker::get_active_tracks`].
 ///
-/// Every active track carries a stable [`Uuid`] assigned at track creation and
-/// preserved until the track is deleted. Callers can use the UUID to correlate
-/// tracks across frames or to drive per-track rendering (e.g. per-UUID colour
-/// assignment in `ColorMode::Track`).
+/// Every active track carries a [`Uuid`] assigned at track creation and
+/// preserved until the track is deleted.
 ///
 /// # Timestamps
 ///
 /// `created` and `last_updated` store the raw `timestamp` argument passed to
 /// [`Tracker::update`] at the corresponding event. The tracker does not
-/// interpret these values — they are caller-supplied nanoseconds in typical
-/// usage, but any monotonically increasing unit works.
+/// interpret these values; any monotonically increasing unit works.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TrackInfo {
     /// Globally unique identifier for this track, assigned when the tracklet is
@@ -164,15 +147,13 @@ pub struct TrackInfo {
     pub uuid: Uuid,
 
     /// Kalman-smoothed predicted location of the object in XYXY format
-    /// `[xmin, ymin, xmax, ymax]`. This is the **predicted** position for the
-    /// current frame, not the raw detection box — it may differ from the
-    /// detection that triggered the update. For the raw detection see
+    /// `[xmin, ymin, xmax, ymax]`: the predicted position for the current
+    /// frame, not the raw detection box. For the raw detection see
     /// [`ActiveTrackInfo::last_box`].
     pub tracked_location: [f32; 4],
 
     /// Number of times this track has been matched to a detection. Starts at 1
-    /// on the frame the track is created. Useful as a confidence signal —
-    /// tracks with a low count are newly created and may be false positives.
+    /// on the frame the track is created.
     pub count: i32,
 
     /// Timestamp (as supplied to [`Tracker::update`]) of the frame on which
@@ -187,19 +168,14 @@ pub struct TrackInfo {
 
 /// A [`TrackInfo`] paired with the most recent raw detection box for that track.
 ///
-/// Returned by [`Tracker::get_active_tracks`] for callers that need both the
-/// Kalman-smoothed position (in `info.tracked_location`) and the unsmoothed,
-/// model-output bounding box (`last_box`) — for example, to draw the exact
-/// predicted anchor alongside the smoothed track centre.
+/// Returned by [`Tracker::get_active_tracks`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ActiveTrackInfo<T: DetectionBox> {
     /// Smoothed track metadata.
     pub info: TrackInfo,
 
-    /// The last raw detection box associated with this track, as returned by
-    /// [`DetectionBox::bbox`] — before any Kalman smoothing. This reflects the
-    /// model's output on the most recent frame the track was matched, not the
-    /// current Kalman prediction.
+    /// The last raw detection box associated with this track, before any
+    /// Kalman smoothing.
     pub last_box: T,
 }
 
@@ -207,7 +183,7 @@ pub struct ActiveTrackInfo<T: DetectionBox> {
 ///
 /// Implementations associate a stream of per-frame detection boxes into
 /// persistent tracks. The tracker owns all internal state (tracklet filters,
-/// timestamps, IDs) and is mutable — `update` takes `&mut self`.
+/// timestamps, IDs).
 ///
 /// # Contract
 ///
@@ -216,10 +192,9 @@ pub struct ActiveTrackInfo<T: DetectionBox> {
 ///   spawned a new one, and `None` when it was too low-confidence to initiate or
 ///   continue a track.
 /// - `get_active_tracks` returns every tracklet that has not yet expired,
-///   including those not matched in the most recent frame (they remain alive
-///   until `extra_lifespan` elapses without a match).
+///   including those not matched in the most recent frame.
 /// - Callers must not share a single `Tracker` across concurrent threads without
-///   external synchronization — `update` takes `&mut self`.
+///   external synchronization.
 pub trait Tracker<T: DetectionBox> {
     /// Process one frame of detections and advance all internal tracklet states.
     ///

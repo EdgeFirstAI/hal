@@ -244,20 +244,7 @@ The excluded C-API leaves (`tensor-capi`, `image-capi`, `codec-capi`,
 the workspace's target directory — see [Clone and Build](#clone-and-build)
 above, or run `make lint-capi-modular` to cover all of them at once.
 
-**The leaves also carry their own `[lints]`, `[profile.release]` and `[profile.profiling]`
-tables, hand-copied from the root `Cargo.toml`, and must be kept in sync by
-hand.** Being excluded from the workspace (see the root `Cargo.toml`'s
-`[workspace] exclude` comment) means they inherit *nothing* from it — not
-`[workspace.lints]`, not `[profile.release]` — because each is its own
-standalone one-crate workspace (`[workspace] resolver = "3"` at the bottom
-of each leaf's manifest stops cargo's upward search), and `lints.workspace =
-true` only works for an actual member of the workspace it names. Cargo has
-no mechanism to propagate either table across that boundary automatically.
-Concretely: if you change `[workspace.lints.rust]` or either profile at
-the root, update every leaf's copy in the same commit, or they will
-silently drift — a leaf built with a stale profile is exactly how this
-project ended up shipping an unstripped, non-LTO `.so` with 17,035 symbols
-alongside a workspace built with LTO and stripping.
+**The leaves also carry their own `[lints]`, `[profile.release]` and `[profile.profiling]` tables, hand-copied from the root `Cargo.toml`, and must be kept in sync by hand.** Being excluded from the workspace (see the root `Cargo.toml`'s `[workspace] exclude` comment) means they inherit *nothing* from it — not `[workspace.lints]`, not `[profile.release]` — because each is its own standalone one-crate workspace (`[workspace] resolver = "3"` at the bottom of each leaf's manifest stops cargo's upward search), and `lints.workspace = true` only works for an actual member of the workspace it names. Cargo has no mechanism to propagate either table across that boundary automatically. If you change `[workspace.lints.rust]` or either profile at the root, update every leaf's copy in the same commit, or they will silently drift: a leaf built with a stale profile ships an unstripped, non-LTO `.so` alongside a workspace built with LTO and stripping.
 
 **`release` is for shipped artifacts only.** It links with fat LTO in a single codegen unit, which shrinks the C libraries by about a fifth and roughly doubles link time, so it runs only on `release/X.Y.Z` branches (`release.yml`) and in `make package`/`make wheel`. Every test, board archive and CI packaging smoke test uses `profiling`: the same optimisation level with thin LTO and line tables. Pass `--profile profiling` (or `PACKAGE_PROFILE=profiling` to `make package`) rather than `--release` when building to test.
 
@@ -370,7 +357,7 @@ Workflows are in `.github/workflows/`. HAL uses three tiers — see
 - **Full**: add the `ci:full` label (it sticks on later pushes). Host matrix,
   HAL extras (iOS, Android, software-GL, C-API, Python), coverage, scancode,
   SonarCloud. Use `ci:hardware` for the i.MX 8M Plus board only.
-- **Nightly**: Full + G13 differential + cargo hack/audit, only if `main` moved.
+- **Nightly**: Full + differential + cargo hack/audit, only if `main` moved.
 - **Release**: three workflows, and a tag that only deploys. Pushing to
   `release/X.Y.Z` runs `release.yml`, which builds every wheel and C-API
   archive and uploads them; merging that PR with `ci:full` runs

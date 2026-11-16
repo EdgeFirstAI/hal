@@ -15,7 +15,7 @@ cargo run --profile profiling -p hal_cpu -- --decode-only --decode-fmt rgb \
   --limit 50 --board x86-desktop --tensor-mem mem \
   --csv ../../results/x86-desktop/hal_cpu_rgb.csv
 
-# Article-1 e2e (decode + letterbox) — not part of the TurboJPEG decoder table
+# End-to-end (decode + letterbox) — not part of the TurboJPEG decoder table
 cargo run --profile profiling -p hal_cpu -- --limit 50 --board x86-desktop \
   --csv ../../results/x86-desktop/hal_cpu_e2e.csv
 ```

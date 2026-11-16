@@ -7,28 +7,11 @@ Capture a real TFLite model's raw outputs and the corresponding NumPy
 reference decoder's expected outputs into a single ``.safetensors`` file
 for use as an oracle in HAL Rust unit tests.
 
-The first decoder family supported is "per-scale YOLO segmentation":
-models produced by the EdgeFirst tflite-converter with
-``quantization_split`` enabled.  These models have their accuracy-
-sensitive tail layers (DFL / sigmoid / dist2bbox / per-scale concat)
-stripped from the graph so each FPN level keeps independent
-quantization parameters.  The HAL re-implements those stripped layers
-in higher precision on the CPU.  This generator captures every stage
-so HAL parity can be checked stage-by-stage.
+Supports per-scale YOLO segmentation models produced by the EdgeFirst
+tflite-converter with ``quantization_split`` enabled, and captures every
+decode stage.
 
-PHYSICAL OUTPUT DECOMPOSITION — WHY
-------------------------------------
-Standard YOLO TFLite models concatenate per-scale outputs and run DFL
-internally.  When the whole graph is quantized to int8, the concat and
-DFL steps amplify quantization error because they mix logits whose
-distributions span very different ranges.  The converter's
-``quantization_split`` mode keeps the per-FPN-level outputs separate,
-each with its own ``scale``/``zero_point``, and the runtime performs
-the DFL + concat + dist2bbox + sigmoid + NMS on the CPU in fp32 (or
-fp16).  This recovers most of the accuracy lost to monolithic
-quantization (yolov8n-seg: 47.16 → 52.38 mAP@0.5 on coco128).
-
-For a deep dive see ``scripts/per_scale_decode_reference.py``.
+See ``scripts/per_scale_decode_reference.py`` for the reference decoder.
 
 ARCHITECTURE STAGES → FIXTURE KEYS → HAL KERNELS
 -------------------------------------------------
@@ -68,8 +51,7 @@ Pin numpy and safetensors versions::
     pip install 'numpy>=1.26' 'safetensors>=0.4' 'pillow>=10' 'tflite_runtime>=2.14'
 
 The generator records ``reference_script_sha256`` and
-``generator_git_sha`` in the fixture metadata so a future regenerator
-can detect drift.
+``generator_git_sha`` in the fixture metadata.
 """
 from __future__ import annotations
 
@@ -158,8 +140,7 @@ def collect_raw_tensors_by_role(layout, raw_outputs_by_shape: dict) -> dict:
     layout : per_scale_decode_reference.PerScaleLayout
         Parsed model metadata.
     raw_outputs_by_shape : dict[tuple[int, ...], np.ndarray]
-        Lookup table of TFLite output tensors indexed by their shape
-        tuple — the same primary key the HAL ``resolve_bindings`` uses.
+        TFLite output tensors indexed by their shape tuple.
 
     Returns
     -------
@@ -204,8 +185,7 @@ def run_inference_collect_outputs(model_path: Path, image_path: Path):
         - ``raw_outputs_by_shape`` : dict[tuple[int,...], np.ndarray]
         - ``image_uint8`` : np.ndarray of shape (H, W, 3) — the
           letterbox-free resize fed to the model
-        - ``metadata`` : dict — the raw edgefirst.json, kept separately
-          since PerScaleLayout doesn't store it
+        - ``metadata`` : dict — the raw edgefirst.json
     """
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     try:
@@ -250,7 +230,7 @@ def capture_box_score_mc_intermediates(
 
     For DFL encoding the per-stage tensors are
     ``boxes_<lvl>.{dequant, ltrb, xywh}``; for LTRB the ``ltrb`` key is
-    skipped (the post-DFL stage doesn't exist in that path).
+    omitted.
 
     Score intermediates are always ``{dequant, activated}``; the
     activation is sigmoid for the per-scale path.
@@ -439,17 +419,9 @@ _LOGICAL_DSHAPE_FEATURE_NAMES = {
 def _patch_schema_dshape(metadata: dict) -> dict:
     """Synthesize missing ``dshape`` entries on logical parent outputs.
 
-    The EdgeFirst tflite-converter emits ``dshape`` on physical
-    per-scale children but not on the logical parents (``boxes``,
-    ``scores``, ``mask_coefs``). HAL's ``DecoderBuilder::build`` rejects
-    schemas where a logical with per-scale children lacks ``dshape``,
-    so the validator patches schemas in memory before passing them to
-    HAL. We do the same here at fixture-generation time so the bundled
-    schema is HAL-ready out of the box.
-
-    The patch is idempotent and non-destructive: the input metadata is
-    deep-copied; entries that already carry ``dshape`` or that don't
-    match the logical-with-children shape are left alone.
+    Adds ``dshape`` to the logical parents (``boxes``, ``scores``,
+    ``mask_coefs``) that have per-scale children and lack it. Other
+    entries are left alone.
 
     Returns a new ``dict``; the input is not mutated.
     """
@@ -495,11 +467,7 @@ def _file_sha256(path: Path) -> str:
 
 
 def build_stage_intermediates(layout, raw: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
-    """Capture per-level and protos intermediate tensors for a fixture.
-
-    Pure helper extracted from :func:`main` so stage capture can be unit-tested
-    without running TFLite inference.
-    """
+    """Capture per-level and protos intermediate tensors for a fixture."""
     tensors: dict[str, np.ndarray] = {}
     for lvl_idx, lvl in enumerate(layout.fpn_levels):
         box_q_t = raw[f"raw.boxes_{lvl_idx}"]
@@ -634,7 +602,7 @@ def main(argv: list[str] | None = None) -> int:
     if cfg.include_stages:
         tensors.update(build_stage_intermediates(layout, raw))
 
-    # Build shape_map directly (avoid bind_outputs' ndarray dance)
+    # Build shape_map
     outputs_in_order = list(raw_outputs_by_shape.values())
     shape_to_idx = {sh: i for i, sh in enumerate(raw_outputs_by_shape.keys())}
 

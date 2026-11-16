@@ -1,13 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
-//! COM error mapping and UTF-16 encoding shared by the D3D11 tasks.
-//!
-//! COM bindings come from the typed `windows` crate, not `windows-sys`:
-//! `windows-sys` has had no Direct3D or DXGI module at all since 0.52. The
-//! `windows` interface types (`ID3D11Device`, `IDXGIFactory1`, ...) are
-//! already reference-counted smart pointers, so this module carries no
-//! `ComPtr` of its own -- only the two small helpers every D3D11 call site
-//! needs.
+//! COM error mapping and UTF-16 encoding shared by the D3D11 modules.
 
 /// Turns a `windows::core::Result` into this crate's error, with the call
 /// name and the HRESULT attached.
@@ -21,8 +14,7 @@ pub(crate) fn hr<T>(what: &'static str, result: windows::core::Result<T>) -> cra
     })
 }
 
-/// Encodes `name` as UTF-16 with a trailing NUL, for named file mappings and
-/// shared handle names.
+/// Encodes `name` as UTF-16 with a trailing NUL.
 pub(crate) fn wide(name: &str) -> Vec<u16> {
     name.encode_utf16().chain(std::iter::once(0)).collect()
 }

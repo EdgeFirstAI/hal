@@ -9,7 +9,7 @@ use crate::{DecoderError, DecoderResult, Quantization};
 use edgefirst_tensor::{DType, TensorDyn};
 
 #[derive(Debug)]
-#[allow(dead_code)] // Wired by Task 21.
+#[allow(dead_code)]
 pub(crate) struct LevelBindings<'a> {
     pub(crate) boxes: &'a TensorDyn,
     pub(crate) scores: &'a TensorDyn,
@@ -25,25 +25,14 @@ pub(crate) struct FrameBindings<'a> {
 
 /// Read quantization from the bound tensor for an integer dtype, or
 /// return `Quantization::identity()` for float dtypes.
-///
-/// This is the **single source of truth** for runtime quantization in
-/// the per-scale subsystem: tensors carry their own quantization
-/// metadata via `Tensor::quantization()`, and the decoder reads it
-/// live each frame. The schema declares the intended quant; the
-/// upstream inference layer (or `apply_schema_quant` helper) is
-/// responsible for attaching it before calling the decoder.
-#[allow(dead_code)] // Wired by Task 21.
+#[allow(dead_code)]
 pub(crate) fn quant_from_tensor(
     t: &TensorDyn,
     role: &'static str,
     level: usize,
 ) -> DecoderResult<Quantization> {
     fn convert_quant(q: &edgefirst_tensor::Quantization) -> Quantization {
-        // Per-tensor quant: scale is length-1 and zero_point is `Some([zp])`
-        // (asymmetric) or `None` (symmetric). Per-channel quant (rejected
-        // upstream by the plan) would have longer slices; this conversion
-        // would silently use [0] for it, but the planner doesn't allow
-        // per-channel for per-scale, so we only see per-tensor here.
+        // The first scale (default 1.0) and the first zero point (default 0).
         Quantization {
             scale: q.scale().first().copied().unwrap_or(1.0),
             zero_point: q.zero_point().and_then(|z| z.first().copied()).unwrap_or(0),
@@ -79,25 +68,18 @@ pub(crate) fn quant_from_tensor(
 
 /// Read per-channel quantization from the bound box tensor for DFL decode.
 ///
-/// Returns `Ok(None)` when the tensor carries per-tensor quant (caller falls
-/// back to the per-tensor scalar kernel). Returns `Ok(Some((scales, zps)))`
-/// — borrowed from the tensor's quantization, no allocation — when per-channel
-/// quant is present; an **empty `zps`** slice means "all zero-points are 0"
-/// (the per-channel kernels treat a missing entry as 0). Returns
-/// `Err(QuantMissing)` when no quantization is attached to an integer tensor.
-///
-/// Borrowing (rather than `to_vec`) keeps this allocation-free on the per-frame
-/// decode hot path, where it runs once per FPN level per frame.
-///
-/// Float tensors (`F16`, `F32`) never carry per-channel quant from NPUs and
-/// always return `Ok(None)` so the per-tensor (identity) fast path is used.
+/// Returns `Ok(None)` when the tensor carries per-tensor quant or is a float
+/// tensor (`F16`, `F32`). Returns `Ok(Some((scales, zps)))`, borrowed from
+/// the tensor's quantization, when per-channel quant is present; an empty
+/// `zps` slice means every zero point is 0. Returns `Err(QuantMissing)` when
+/// no quantization is attached to an integer tensor.
 pub(crate) fn box_per_channel_quant_from_tensor(
     t: &TensorDyn,
     level: usize,
 ) -> DecoderResult<Option<(&[f32], &[i32])>> {
     /// Borrow per-channel `(scales, zps)` from a `Quantization` if it is
-    /// per-channel, otherwise return `None` (caller uses per-tensor path). An
-    /// empty `zps` is the "all zero-points = 0" convention (symmetric quant).
+    /// per-channel, otherwise return `None`. An empty `zps` means every zero
+    /// point is 0.
     fn extract(q: &edgefirst_tensor::Quantization) -> Option<(&[f32], &[i32])> {
         if !q.is_per_channel() {
             return None;
@@ -121,7 +103,7 @@ pub(crate) fn box_per_channel_quant_from_tensor(
         DType::U8 => quant!(u8, U8),
         DType::I16 => quant!(i16, I16),
         DType::U16 => quant!(u16, U16),
-        // Float tensors: no per-channel quant from NPUs — use per-tensor (identity).
+        // Float tensors use the per-tensor (identity) path.
         DType::F16 | DType::F32 => Ok(None),
         other => Err(DecoderError::DtypeMismatch {
             expected: DType::I8,
@@ -154,7 +136,7 @@ pub(crate) fn bind_one<'a>(
 }
 
 /// Resolve all per-frame bindings for a given plan.
-#[allow(dead_code)] // Wired by Task 21.
+#[allow(dead_code)]
 pub(crate) fn resolve_bindings<'a>(
     plan: &PerScalePlan,
     inputs: &'a [&'a TensorDyn],
@@ -202,16 +184,13 @@ use edgefirst_tensor::{CpuAccess, TensorMapTrait, TensorTrait};
 /// With a `score_threshold` the prefilter decodes only the anchors that
 /// can reach it (see [`crate::per_scale::prefilter`]); frames it cannot
 /// bound, such as float score tensors, are decoded densely.
-#[allow(dead_code)] // Wired by Task 24.
+#[allow(dead_code)]
 pub(crate) fn run<'a>(
     plan: &PerScalePlan,
     buffers: &'a mut DecodedOutputBuffers,
     inputs: &[&TensorDyn],
     score_threshold: Option<f32>,
 ) -> DecoderResult<DecodedOutputsRef<'a>> {
-    // Top-level span. The `n_levels` field gives at-a-glance shape in
-    // Perfetto's flame graph; per-level / per-role child spans below
-    // give the per-stage decomposition we need to find hotspots.
     let _outer = tracing::trace_span!(
         "decoder.per_scale_run",
         n_levels = plan.levels.len(),
@@ -225,11 +204,8 @@ pub(crate) fn run<'a>(
         resolve_bindings(plan, inputs)?
     };
 
-    // Anchors are independent: each writes disjoint ranges of `boxes` /
-    // `scores` / `mask_coefs`. The dense NHWC decode (the common TFLite
-    // case) splits the levels into pieces for the rayon pool. NCHW levels
-    // share `layout_scratch`, which would need per-level scratch buffers
-    // to parallelize safely, so they decode sequentially.
+    // The dense NHWC decode splits the levels into pieces for the rayon
+    // pool; a plan with an NCHW level decodes its levels sequentially.
     let mut dfl = std::mem::take(&mut buffers.dfl_tables);
     let mut score = std::mem::take(&mut buffers.score_tables);
     let levels = update_dfl_tables(plan, &bind, &mut dfl)
@@ -260,15 +236,12 @@ pub(crate) fn run<'a>(
     buffers.score_tables = score;
     let total_anchors = levels?;
 
-    // Protos — single tensor, no per-level structure. Always sequential.
-    // When the schema declares NCHW protos, we transpose into the NHWC
-    // scratch before dequant, matching the per-level NCHW strategy.
+    // Protos: a single tensor. NCHW protos are transposed into the NHWC
+    // scratch before dequant.
     if let (Some(proto_input), Some(proto_dispatch)) = (bind.protos, plan.proto_dispatch) {
         let _s = tracing::trace_span!("decoder.per_scale_run.protos").entered();
         let q = quant_from_tensor(proto_input, "protos", 0)?;
         let proto_layout = plan.proto_layout.unwrap_or(Layout::Nhwc);
-        // Destructure to get disjoint borrows on `protos` and
-        // `layout_scratch`, same pattern used by run_levels_sequential.
         let DecodedOutputBuffers {
             protos: ref mut proto_buf,
             layout_scratch,
@@ -312,7 +285,7 @@ pub(crate) fn run<'a>(
 
 /// Point each level's DFL exp table at its box tensor's scale, when the box
 /// kernel weighs bins through one. A table is rebuilt only when the scale
-/// changes, so a steady stream of frames builds each one once.
+/// changes.
 fn update_dfl_tables(
     plan: &PerScalePlan,
     bind: &FrameBindings<'_>,
@@ -418,8 +391,7 @@ fn run_box_kernel(
 /// untouched) when the threshold cannot be mapped onto every level's raw
 /// scores and the caller must decode densely.
 ///
-/// Runs on the calling thread: the kept set is a few percent of the
-/// anchors, too little work to repay a rayon scope.
+/// Runs on the calling thread.
 fn run_levels_prefiltered(
     plan: &PerScalePlan,
     bind: &FrameBindings<'_>,
@@ -450,8 +422,8 @@ fn run_levels_prefiltered(
             None => return Ok(None),
         }
     }
-    // A level with no survivors never maps its boxes or mask coefficients,
-    // so check their declared access up front, as the dense decode's maps do.
+    // Checks the declared read access of every level's boxes and mask
+    // coefficients up front.
     for lvl_bind in &bind.levels {
         lvl_bind.boxes.cpu_access().require(CpuAccess::Read)?;
         if let Some(mc) = lvl_bind.mask_coefs {
@@ -608,22 +580,10 @@ fn run_levels_sequential(
     buffers: &mut DecodedOutputBuffers,
     tables: LevelTables<'_>,
 ) -> DecoderResult<()> {
-    // Iterate levels by index so we can carve disjoint mutable slices
-    // out of the buffers per level. Each iteration maps the bound
-    // tensors fresh — `TensorMap` lifetime is tied to the borrow it
-    // takes, which the `with_mapped_input` helper encapsulates.
-    //
-    // For NCHW-declared children, `with_mapped_or_transposed_input`
-    // first transposes the bound tensor into the per-dtype scratch in
-    // `buffers.layout_scratch`, then passes the NHWC scratch view to
-    // the closure. Disjoint field borrows: dst slices come from the
-    // per-role buffers (boxes / scores / mask_coefs); the scratch lives
-    // in `layout_scratch`. We use the free `*_level_slice_of` helpers
-    // so each `&mut buffers.<field>` borrow is tracked independently.
+    // Each iteration maps the level's bound tensors. NCHW children are
+    // transposed into `buffers.layout_scratch` and read as NHWC.
     for (li, lvl_bind) in bind.levels.iter().enumerate() {
         let lvl = &plan.levels[li];
-        // Per-level span groups all role work (box / score / mc) for one
-        // FPN scale. `h*w` is the dominant cost factor.
         let _level_span = tracing::trace_span!(
             "decoder.per_scale_run.level",
             li = li,
@@ -642,10 +602,7 @@ fn run_levels_sequential(
             ..
         } = buffers;
 
-        // Boxes — DFL or LTRB depending on plan.box_encoding. The DFL
-        // path's softmax + weighted-sum is currently the per-anchor
-        // bottleneck on Cortex-A53; this span isolates the cost from
-        // score / mc.
+        // Boxes: DFL or LTRB depending on plan.box_encoding.
         {
             let _s = tracing::trace_span!("decoder.per_scale_run.level.boxes", encoding = ?plan.box_encoding)
                 .entered();
@@ -707,9 +664,7 @@ fn run_levels_sequential(
             }
         }
 
-        // Scores — dequant + optional sigmoid. ~32% of decode time per
-        // the per-stage estimate; isolating it lets us see whether the
-        // dequant or sigmoid dominates after NEON wiring.
+        // Scores: dequant + optional sigmoid.
         {
             let _s = tracing::trace_span!("decoder.per_scale_run.level.scores", activation = ?plan.score_activation).entered();
             let q = quant_from_tensor(lvl_bind.scores, "scores", li)?;
@@ -729,8 +684,7 @@ fn run_levels_sequential(
             )?;
         }
 
-        // Mask coefs — pure dequant; smaller channel count (32) than
-        // scores (80) but same anchor count.
+        // Mask coefs: dequant.
         if let (Some(mc_input), Some(mc_dispatch), Some(num_mc_gt0)) = (
             lvl_bind.mask_coefs,
             plan.mc_dispatch,
@@ -762,14 +716,11 @@ fn run_levels_sequential(
     Ok(())
 }
 
-/// Frames with fewer anchors than this decode on the calling thread: waking
-/// the rayon workers, and their spinning once the work runs out, costs more
-/// than the split saves.
+/// Frames with fewer anchors than this decode on the calling thread.
 const PARALLEL_MIN_ANCHORS: usize = 2048;
 
 /// A run of one level's anchors, decoded as one task of the dense parallel
-/// path. `start` is a multiple of [`PACK_ANCHORS`], so each element takes
-/// the same kernel path as in a decode of the whole level.
+/// path. `start` is a multiple of [`PACK_ANCHORS`].
 #[derive(Debug)]
 pub(crate) struct Piece {
     level: usize,
@@ -779,9 +730,8 @@ pub(crate) struct Piece {
 }
 
 /// The pieces of every level for `threads` rayon threads, in anchor order.
-/// Each level is cut into pieces of about `total / (2 * threads)` anchors,
-/// so the workers share the frame evenly however its anchors are spread
-/// over the levels; a single thread takes each level whole.
+/// Each level is cut into pieces of about `total / (2 * threads)` anchors;
+/// a single thread takes each level whole.
 pub(crate) fn split_into_pieces(plan: &PerScalePlan, threads: usize) -> Vec<Piece> {
     let target = plan
         .total_anchors
@@ -1017,22 +967,14 @@ fn split_buffer_into_levels<'a>(
 ///
 /// DFL: `4 * reg_max` (boxes carry the raw DFL bin distributions).
 /// LTRB / Direct: 4 (boxes carry the four LTRB grid-unit distances directly).
-///
-/// Used to size the per-level scratch buffer when an NCHW box child is
-/// transposed to NHWC. The count must match the actual channel-axis
-/// length of the bound tensor; a mismatch indicates schema-vs-runtime
-/// drift and would corrupt the transpose.
 fn box_channel_count_for_level(lvl: &crate::per_scale::plan::LevelPlan) -> usize {
-    // For both DFL (`reg_max > 1`) and LTRB (`reg_max == 1`), the
-    // channel count is `4 * reg_max`: 4 for LTRB (since reg_max == 1)
-    // and `4 * 16` (or whatever reg_max is) for DFL.
     4 * lvl.reg_max
 }
 
 /// Map a `TensorDyn`'s underlying slice. If the level's layout is NCHW,
 /// transpose it into the appropriate per-dtype scratch in
 /// `layout_scratch` and pass an NHWC `InputView` over the scratch to
-/// the closure. NHWC inputs pass through unchanged (zero overhead).
+/// the closure. NHWC inputs pass through unchanged.
 ///
 /// The transpose is the plan's [`TransposeDispatch`]: NEON on NEON tiers, the element loop on
 /// the scalar tier.
@@ -1093,8 +1035,7 @@ where
     }
 }
 
-/// Refuse an input whose rows carry a padded pitch: the per-scale kernels
-/// read their inputs as tightly packed slices.
+/// Refuse an input whose rows carry a padded pitch.
 fn reject_padded_input(t: &TensorDyn, role: &'static str, level: usize) -> DecoderResult<()> {
     match crate::decoder::tensor_bridge::padded_strides(t)? {
         None => Ok(()),
@@ -1159,7 +1100,7 @@ fn map_input<'a>(
         DType::F16 => mapped!(half::f16, F16),
         DType::F32 => mapped!(f32, F32),
         other => Err(DecoderError::DtypeMismatch {
-            expected: edgefirst_tensor::DType::I8, // arbitrary; we just want to flag mismatch
+            expected: edgefirst_tensor::DType::I8,
             actual: other,
             role,
             level,
@@ -1211,7 +1152,6 @@ mod tests {
     use edgefirst_tensor::{Tensor, TensorMemory};
 
     /// Build a small TensorDyn with the given shape and dtype.
-    /// Helper for tests.
     fn mk_i8_tensor(shape: &[usize]) -> TensorDyn {
         let t = Tensor::<i8>::new(shape, Some(TensorMemory::Mem), None).unwrap();
         t.into()
@@ -1289,14 +1229,6 @@ mod tests {
         use crate::per_scale::PerScaleDecoder;
         use crate::schema::SchemaV2;
 
-        // Use the synthetic yolov8n schema to build a plan, then verify
-        // PerScaleDecoder::new() produces buffers of the right size.
-        //
-        // Note: the plan was built expecting i8 tensors (per the schema's
-        // quantization), so the box_dispatch is selected as DflI8ToF32Lut.
-        // Feeding f32 tensors would hit the dispatch's mismatched-arm path
-        // → KernelDispatchUnreachable. End-to-end run() integration is
-        // exercised separately via the int8-with-attached-quant test below.
         let json =
             edgefirst_bench::testdata::read_to_string("per_scale/synthetic_yolov8n_schema.json");
         let schema: SchemaV2 = serde_json::from_str(&json).unwrap();
@@ -1305,7 +1237,6 @@ mod tests {
             .unwrap();
 
         let decoder = PerScaleDecoder::new(plan);
-        // After new, buffers should be sized.
         match &decoder.buffers.boxes {
             crate::per_scale::outputs::Buffer::F32(v) => {
                 assert_eq!(
@@ -1370,8 +1301,7 @@ mod tests {
         assert_eq!(outputs.num_classes, 80);
         assert_eq!(outputs.num_mask_coefs, 32);
 
-        // Boxes have finite, non-NaN values (zero-input + zero-zp + 0.1-scale →
-        // softmax uniform → distance 7.5 grid units).
+        // Every box value is finite.
         if let BufferRef::F32(v) = &outputs.boxes {
             for (i, &b) in v.iter().enumerate() {
                 assert!(b.is_finite(), "box[{i}] = {b} not finite");
@@ -1379,8 +1309,7 @@ mod tests {
         }
     }
 
-    /// Pieces tile every level in order from pack-aligned starts, and cut
-    /// a 960x544 frame's 8160/2040/510 levels into pieces of similar size.
+    /// Pieces tile every level in order from pack-aligned starts, in pieces of similar size.
     #[test]
     fn pieces_tile_each_level_from_pack_aligned_starts() {
         use crate::per_scale::DecodeDtype;

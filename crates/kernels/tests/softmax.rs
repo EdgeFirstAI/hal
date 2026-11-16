@@ -751,7 +751,7 @@ fn new_rejects_bad_params_i16() {
         ..GOOD_I16
     })
     .is_ok());
-    // input_scale * beta >= 5 would overflow TFLite's int32 left shift of the input difference.
+    // input_scale * beta >= 5 is unsupported.
     assert!(unsupported(SoftmaxI16Params {
         input: Quant::new(5.5, 0),
         ..GOOD_I16

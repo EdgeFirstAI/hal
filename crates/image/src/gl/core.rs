@@ -1,12 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! Portable renderer helpers shared by both platform backends.
-//!
-//! Pure, platform-neutral logic (no `gbm`/DMA-BUF or IOSurface types) that both
-//! the Linux (`gl::processor`) and macOS (`gl::macos_processor`) backends call,
-//! so the shared GL render logic has one definition. Compiled on every platform
-//! (the `gl` module is feature-gated on `opengl`, not on the OS).
+//! Portable renderer helpers shared by the platform backends:
+//! platform-neutral logic with no `gbm`/DMA-BUF or IOSurface types, compiled
+//! on every platform.
 
 use crate::{Error, ResolvedCrop};
 use std::ffi::CString;
@@ -14,7 +11,7 @@ use std::ffi::CString;
 /// Compile a GLSL shader of `kind` from source; returns the shader id.
 ///
 /// On failure the shader is deleted and an [`Error::OpenGl`] carrying the
-/// driver info-log is returned. The caller must have a current GL context.
+/// driver info-log is returned.
 ///
 /// # Safety
 /// Requires a current GL context.
@@ -49,17 +46,16 @@ unsafe fn compile_shader(kind: u32, src: &str) -> crate::Result<u32> {
 
 /// Compile + link a vertex/fragment program from source; returns the program id.
 ///
-/// Shared by both backends. The two shaders are detached and deleted after a
-/// successful link (GL frees them when the program is deleted), so the returned
-/// program id is the only resource the caller must track. On any error the
-/// partially-built shaders/program are cleaned up.
+/// The two shaders are deleted after a successful link; the returned program
+/// id is the only resource the caller tracks. On any error the partially-built
+/// shaders/program are deleted.
 ///
 /// # Safety
 /// Requires a current GL context.
 pub(super) unsafe fn compile_program(vertex_src: &str, fragment_src: &str) -> crate::Result<u32> {
     unsafe {
         let vs = compile_shader(edgefirst_gl::gl::VERTEX_SHADER, vertex_src)?;
-        // Own `vs`/`fs`/`program` so any early return cleans them up.
+        // Owns `vs`/`fs`/`program` and deletes them on an early return.
         struct ProgramBuild {
             vs: Option<u32>,
             fs: Option<u32>,
@@ -109,7 +105,7 @@ pub(super) unsafe fn compile_program(vertex_src: &str, fragment_src: &str) -> cr
             return Err(Error::OpenGl(format!("program link failed: {msg}")));
         }
 
-        // Success: detach + delete shaders, disarm cleanup, return the program.
+        // Success: delete the shaders, disarm cleanup, return the program.
         edgefirst_gl::gl::DeleteShader(state.vs.take().unwrap());
         edgefirst_gl::gl::DeleteShader(state.fs.take().unwrap());
         let program = state.program.take().unwrap();
@@ -119,10 +115,7 @@ pub(super) unsafe fn compile_program(vertex_src: &str, fragment_src: &str) -> cr
 }
 
 /// Set `MIN`/`MAG` filtering on the currently-bound texture of `target`.
-///
-/// Leaves `WRAP_S`/`WRAP_T` at the GL default (`REPEAT`) — correct for textures
-/// sampled strictly inside `[0,1]` (the render-quad sources here). Use
-/// [`set_tex_filter_clamp`] only where the original code also set the wrap mode.
+/// Leaves `WRAP_S`/`WRAP_T` at the GL default (`REPEAT`).
 ///
 /// # Safety
 /// Requires a current GL context and a bound texture on `target`.
@@ -142,7 +135,7 @@ pub(super) unsafe fn set_tex_filter(target: u32, filter: u32) {
 }
 
 /// Set `MIN`/`MAG` filtering and `CLAMP_TO_EDGE` `WRAP_S`/`WRAP_T` on the
-/// currently-bound texture of `target` (the four-call cluster).
+/// currently-bound texture of `target`.
 ///
 /// # Safety
 /// Requires a current GL context and a bound texture on `target`.
@@ -165,8 +158,7 @@ pub(super) unsafe fn set_tex_filter_clamp(target: u32, filter: u32) {
 /// Check that the currently-bound draw framebuffer is complete.
 ///
 /// Returns `Err(status)` with the raw `GL_FRAMEBUFFER_*` status code when the
-/// framebuffer is not `FRAMEBUFFER_COMPLETE`, so each backend can format its own
-/// context-specific error (and, on Linux, unbind before falling back to CPU).
+/// framebuffer is not `FRAMEBUFFER_COMPLETE`.
 ///
 /// # Safety
 /// Requires a current GL context with a framebuffer bound to `FRAMEBUFFER`.
@@ -181,13 +173,13 @@ pub(super) unsafe fn check_framebuffer_complete() -> Result<(), u32> {
     }
 }
 
-/// Crop-derived float render uniforms shared by both float render paths.
+/// Crop-derived float render uniforms shared by the float render paths.
 ///
-/// Computes `(src_rect_uv, dst_rect_px, pad_color)` from `crop` after running
-/// [`Crop::check_crop_dims`] (the dimension validation must happen first, as it
-/// can error). `src_rect_uv` is normalized to source dims; `dst_rect_px` is in
-/// single-plane pixel coords; `pad_color` is normalized `[0,1]` RGBA. When a
-/// rect is `None` the whole image is sampled/painted (identity transform).
+/// Runs [`Crop::check_crop_dims`], then computes
+/// `(src_rect_uv, dst_rect_px, pad_color)` from `crop`. `src_rect_uv` is
+/// normalized to source dims; `dst_rect_px` is in single-plane pixel coords;
+/// `pad_color` is normalized `[0,1]` RGBA. When a rect is `None` the whole
+/// image is sampled/painted.
 pub(super) fn float_crop_uniforms(
     crop: &ResolvedCrop,
     src_w: usize,
@@ -209,11 +201,7 @@ pub(super) fn float_crop_uniforms(
         Some(r) => [r.left as f32, r.top as f32, r.width as f32, r.height as f32],
         None => [0.0, 0.0, dst_w as f32, dst_h as f32],
     };
-    // Four components: a `PlanarRgba` or `Rgba` float destination pads its
-    // alpha plane too, with the same value the CPU reference writes there.
-    // A crop with no pad colour also has no destination rect, so the whole
-    // destination is content and the value below is never sampled; opaque
-    // black is the sane default for it.
+    // Four components; a crop with no pad colour pads with opaque black.
     let pad_color = match crop.dst_color {
         Some([r, g, b, a]) => [
             r as f32 / 255.0,
@@ -265,7 +253,6 @@ mod tests {
 
     #[test]
     fn out_of_bounds_src_rect_errors() {
-        // src_rect exceeds the source extent → check_crop_dims rejects it first.
         let crop = ResolvedCrop {
             src_rect: Some(Rect::new(6, 0, 4, 4)), // 6 + 4 = 10 > src_w = 8
             ..ResolvedCrop::no_crop()

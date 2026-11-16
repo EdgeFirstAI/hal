@@ -3,145 +3,77 @@
 
 //! The cross-package tensor protocol.
 //!
-//! Independently-linked EdgeFirst packages cannot share a Rust type: each
-//! Python extension module statically links its own copy of this crate, and
-//! PyO3 caches every `#[pyclass]`'s type object in a static belonging to the
-//! module that defined it. Two modules therefore see two distinct Python
-//! classes even when the Rust types are identical.
-//!
-//! So the contract between packages is a **descriptor**, not a type. A producer
-//! exposes `__edgefirst_tensor__()` returning a `PyCapsule` named
-//! `edgefirst_tensor_v2` whose payload leads with [`TensorDesc`] (followed by
-//! the quantization metadata `TensorDesc` deliberately does not carry -- see
+//! The contract between independently-linked EdgeFirst packages is a
+//! descriptor, not a type. A producer exposes `__edgefirst_tensor__()`
+//! returning a `PyCapsule` named `edgefirst_tensor_v2` whose payload leads
+//! with [`TensorDesc`] (followed by the quantization metadata, see
 //! `edgefirst-python-common`'s `QuantDesc`); a consumer reads the descriptor
-//! and never performs an `isinstance` check. That duck typing is
-//! what makes the protocol survive independent release cadences, and it is the
-//! same pattern numpy, pyarrow and DLPack use.
-//!
-//! DLPack cannot serve this role alone: it has no device type for dma-buf,
-//! IOSurface or PBO, which are precisely the zero-copy cases this library
-//! exists for.
+//! and performs no `isinstance` check.
 
 /// Protocol version, checked by `TensorDyn::import_descriptor` after the
-/// payload has already been read as this build's `TensorDesc`.
+/// payload has been read as this build's `TensorDesc`.
 ///
-/// This is the **second line of defense, not the gate**: it cannot catch a
-/// producer whose `TensorDesc` is a different *size*, since the
-/// out-of-bounds/misaligned read has already happened by the time this
-/// field could be inspected. The capsule name (`edgefirst_tensor_v2`, see
-/// `INTEROP.md`'s Versioning section) is what actually gates that --
-/// checked by `PyCapsule::pointer_checked` before any byte of the payload
-/// is read. DLPack reached the same conclusion after shipping an
-/// unversioned `dltensor` capsule and finding no upgrade path: its v1.0 fix
-/// added both a version field *and* a new capsule name, because the field
-/// alone is unreadable until the layout is already known.
-///
-/// This field covers the case the name rule does not: a change to what a
-/// *same-sized, same-layout* `TensorDesc`'s fields mean. Version `2`
-/// renumbered [`TensorDesc::kind`] onto the [`crate::TensorMemory`] codes
-/// (version `1` had its own numbering, in which `1` meant dma-buf), so a
-/// version-1 descriptor is refused rather than read with the wrong kinds.
+/// The capsule name (`edgefirst_tensor_v2`) gates the descriptor's size and
+/// layout; this field covers a change to what a same-sized, same-layout
+/// `TensorDesc`'s fields mean. Under version `2` [`TensorDesc::kind`] carries
+/// the [`crate::TensorMemory`] codes; a version-1 descriptor is refused.
 pub const ABI_VERSION: u32 = 2;
 
 /// Element type, as reported in [`TensorDesc::dtype`].
 ///
-/// These codes cross a package boundary and are read by value, so they are
-/// part of the ABI: append, never reorder. Re-exported from the wire module
-/// [`crate::DType`] itself generates (via `ef_vocabulary!`, see
-/// `vocabulary.rs`), so this and [`crate::DType::code`] are two views of the
-/// same declared literal per variant, not two hand-kept tables that could
-/// drift apart.
-///
-/// `protocol::dtype` is the canonical, documented path -- the source module,
-/// `crate::dtype_wire`, is `#[doc(hidden)]` because it exists only so this
-/// re-export has something public to alias; it is emission plumbing, not a
-/// second API for the same codes.
+/// These codes cross a package boundary and are part of the ABI. They are
+/// the [`crate::DType::code`] values, re-exported from the wire module
+/// [`crate::DType`] generates (via `ef_vocabulary!`, see `vocabulary.rs`).
 pub use crate::dtype_wire as dtype;
 
 /// Map a [`crate::DType`] to its wire code.
-///
-/// Compiled into both backends: [`from_parts`] is reached from
-/// `TensorDyn::descriptor_pinned`, which now exists on the `dynamic`
-/// backend too (task P2a). Nothing here touches storage -- it is the wire
-/// encoding of facts both backends can already answer -- so there was never
-/// a backend-specific reason for the gate this replaces, only a
-/// dead-code-warning one.
 pub(crate) fn dtype_of(d: crate::DType) -> u32 {
     d.code()
 }
 
 /// Map a wire [`dtype`] code back to a [`crate::DType`]. Inverse of
-/// [`dtype_of`]. `None` for a code this build does not recognise (e.g. a
-/// dtype added by a newer producer this build predates) — the caller
-/// rejects rather than guessing.
+/// [`dtype_of`]. `None` for a code this build does not recognise.
 pub fn dtype_to_dtype(code: u32) -> Option<crate::DType> {
     crate::DType::from_code(code)
 }
 
 /// HAL pixel format, as reported in [`TensorDesc::format`].
 ///
-/// Same ABI concern as [`dtype`]: these codes cross a package boundary, so
-/// they are appended, never reordered. [`crate::PixelFormat`] itself
-/// generates this module's per-variant constants (via `ef_vocabulary!`, see
-/// `vocabulary.rs`), so this and [`crate::PixelFormat::code`] are two views
-/// of the same declared literal per variant, not two hand-kept tables that
-/// could drift apart. [`format::NONE`] is the one constant this module adds
-/// beyond what the macro emits -- see its own doc.
+/// These codes cross a package boundary and are part of the ABI. They are
+/// the [`crate::PixelFormat::code`] values (generated via `ef_vocabulary!`,
+/// see `vocabulary.rs`), plus [`format::NONE`].
 ///
-/// This exists because [`TensorDesc::fourcc`] cannot represent every HAL
-/// format: `PlanarRgb`/`PlanarRgba` have no standard FourCC and both encode
-/// as `fourcc = 0`, the same sentinel a non-image tensor uses, so `fourcc`
-/// alone cannot tell "Planar RGB" apart from "no format". `fourcc` stays for
-/// third-party interop; a HAL-aware consumer prefers `format` and
-/// falls back to `fourcc` only when `format` is `0`.
-///
-/// `protocol::format` is the canonical, documented path -- the source
-/// module, `crate::pixel_format_wire`, is `#[doc(hidden)]` because it exists
-/// only so this re-export has something public to alias; it is emission
-/// plumbing, not a second API for the same codes.
+/// [`TensorDesc::fourcc`] cannot represent every HAL format:
+/// `PlanarRgb`/`PlanarRgba` have no standard FourCC and both encode as
+/// `fourcc = 0`, the same value a non-image tensor uses. A HAL-aware
+/// consumer reads `format` and falls back to `fourcc` only when `format` is
+/// `0`.
 pub mod format {
-    /// No format (non-image tensor), or a format this build predates. Not a
-    /// [`crate::PixelFormat`] variant -- every code `1..=11` below is one of
-    /// those, generated by the same `ef_vocabulary!` declaration as
-    /// [`crate::PixelFormat::code`]; `0` is a sentinel this module alone
-    /// defines, since "no format" has no corresponding Rust variant.
+    /// No format (non-image tensor), or a format this build does not
+    /// recognise. Not a [`crate::PixelFormat`] variant.
     pub const NONE: u32 = 0;
     pub use crate::format::pixel_format_wire::*;
 }
 
 /// Map a [`crate::PixelFormat`] to its [`mod@format`] wire code.
-///
-/// Compiled into both backends: same reason as [`dtype_of`].
 pub(crate) fn format_of(f: crate::PixelFormat) -> u32 {
     f.code()
 }
 
 /// Map a [`mod@format`] wire code back to a [`crate::PixelFormat`]. `None` for
-/// [`format::NONE`] or a code this build does not recognise (e.g. a format
-/// added by a newer producer).
+/// [`format::NONE`] or a code this build does not recognise.
 pub fn format_from_code(code: u32) -> Option<crate::PixelFormat> {
     crate::PixelFormat::from_code(code)
 }
 
 /// Bit flags, as reported in [`TensorDesc::flags`].
-///
-/// A bitfield rather than more discrete fields: the additions this protocol
-/// is most likely to need are booleans, and each one spent as its own `u32`
-/// would grow the descriptor -- which after release costs a capsule-name
-/// bump. Spending one `u32` now buys 32 of them for free.
 pub mod flags {
     /// [`TensorDesc::sync`] carries a real handle. When clear, `sync` is
     /// meaningless and must not be waited on.
     ///
-    /// A flag rather than a sentinel because every plausible sentinel is a
-    /// legal handle somewhere: `0` is a valid `GLsync`-adjacent value and a
-    /// valid fd number is never negative, so `-1` and `0` cannot both be
-    /// spare across the kinds this field spans.
-    ///
-    /// Under [`kind::D3D11_TEXTURE`] `sync` is not a handle at all: it is a
-    /// value on the timeline of the fence whose NT handle
-    /// [`TensorDesc::ptr`] carries, so a producer that sets this flag must
-    /// also fill in `ptr`.
+    /// Under [`kind::D3D11_TEXTURE`] `sync` is not a handle: it is a value on
+    /// the timeline of the fence whose NT handle [`TensorDesc::ptr`] carries,
+    /// so a producer that sets this flag must also fill in `ptr`.
     ///
     /// Bit 0.
     pub const SYNC_PRESENT: u32 = 1;
@@ -155,10 +87,7 @@ pub mod flags {
     /// The declaration includes CPU writes. Bit 3.
     pub const CPU_WRITE: u32 = 1 << 3;
     /// The tensor addresses part of a larger buffer (a `view`/`batch`
-    /// sub-region, at any offset), so an importer must treat its rows as
-    /// sharing cache lines with bytes outside it. Clear means a whole
-    /// tensor, which is also what a producer that predates the bit reports.
-    /// Bit 4.
+    /// sub-region, at any offset). Clear means a whole tensor. Bit 4.
     pub const VIEW: u32 = 1 << 4;
 
     /// The flag bits reporting `access`.
@@ -189,10 +118,9 @@ pub mod flags {
 /// Backing store kind, as reported in [`TensorDesc::kind`].
 ///
 /// These are the [`crate::TensorMemory`] codes, re-exported from the wire
-/// module that `TensorMemory` itself generates (via `ef_vocabulary!`, see
-/// `vocabulary.rs`), so a descriptor's `kind` and
-/// [`crate::TensorMemory::code`] are one numbering: `DMABUF` is `2` on every
-/// surface. What each kind means for the descriptor's fields:
+/// module that `TensorMemory` generates (via `ef_vocabulary!`, see
+/// `vocabulary.rs`): `DMABUF` is `2` on every surface. What each kind means
+/// for the descriptor's fields:
 ///
 /// * `MEM`, `SHM` -- host memory. `ptr` is valid; `handle` is -1. An
 ///   importer treats both the same way (see [`TensorDesc::is_host`]).
@@ -206,16 +134,14 @@ pub mod flags {
 ///   shared handle and `ptr` the device fence's NT shared handle, both valid
 ///   in the producing process (other modules of the same process included);
 ///   `sync` is the fence value of the last recorded GPU write when
-///   `SYNC_PRESENT` is set. The `ptr` reuse follows `PBO`'s vtable
-///   precedent. A Windows producer reports this for its `DmaBuf`-spelled
-///   tensors.
+///   `SYNC_PRESENT` is set. A Windows producer reports this for its
+///   `DmaBuf`-spelled tensors.
 pub use crate::tensor_memory_wire as kind;
 
 /// A raw pointer that may cross a `PyCapsule`.
 ///
-/// `PyCapsule::new` requires `T: Send`, which `*mut u8` is not. The producer
-/// discharges that obligation by keeping the owning tensor alive for the
-/// capsule's lifetime via the capsule's keepalive; see the module docs.
+/// The producer keeps the owning tensor alive for the capsule's lifetime via
+/// the capsule's keepalive.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug)]
 pub struct SendPtr(pub *mut u8);
@@ -237,12 +163,12 @@ impl SendPtr {
     }
 }
 
-/// The cross-package descriptor. Layout is part of the contract: it is
-/// `#[repr(C)]` and its size is pinned by test.
+/// The cross-package descriptor. `#[repr(C)]`; its layout is part of the
+/// contract.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct TensorDesc {
-    /// [`ABI_VERSION`]. Checked, never assumed.
+    /// [`ABI_VERSION`].
     pub version: u32,
     /// One of the [`mod@kind`] codes, which are the [`crate::TensorMemory`]
     /// codes.
@@ -250,84 +176,48 @@ pub struct TensorDesc {
     /// dma-buf fd, IOSurface id, GL buffer id or D3D11 texture NT handle
     /// value; `-1` when unused.
     pub handle: i64,
-    /// Host pointer when addressable, else null -- **except under
-    /// [`kind::PBO`]**, where it instead carries a `*const
-    /// crate::pbo::PboOpsVtable`, or null if the producer attached none,
-    /// **and under [`kind::D3D11_TEXTURE`]**, where it carries the process
+    /// Host pointer when addressable, else null. Under [`kind::PBO`] it
+    /// carries a `*const crate::pbo::PboOpsVtable`, or null if the producer
+    /// attached none; under [`kind::D3D11_TEXTURE`] it carries the process
     /// device fence's NT handle value, or null when [`Self::sync`] carries
     /// nothing to wait on.
-    /// Interpretation is keyed by [`Self::kind`], the same established
-    /// pattern [`Self::sync`]'s own doc comment already documents for that
-    /// field: a PBO tensor never takes a `HostPin` (`PboTensor` refuses
-    /// `pin_host` — the address cannot outlive the map), so this field is
-    /// otherwise permanently unused for that kind, which is exactly why it
-    /// is the field that carries the vtable instead of a new one requiring
-    /// a layout change. Valid under the exact same borrow contract as the
-    /// host-pointer case: only while the producer's own keepalive (for the
-    /// capsule protocol, the capsule's) keeps the owning tensor alive.
+    ///
+    /// Valid only while the producer's keepalive (for the capsule protocol,
+    /// the capsule's) keeps the owning tensor alive.
     pub ptr: SendPtr,
     /// Number of significant entries in `shape` and `strides`.
     pub ndim: u32,
     /// Element type, one of the [`dtype`] constants.
-    ///
-    /// Deliberately placed here: `ndim` leaves a 4-byte hole before the
-    /// 8-aligned `shape`, so this field costs nothing. Without it `strides`
-    /// — documented in *elements* — cannot be converted to bytes by a
-    /// consumer, and a `Tensor<f32>` is indistinguishable from a
-    /// `Tensor<u8>` of the same shape.
     pub dtype: u32,
     /// Logical shape, most-significant dimension first.
     pub shape: [u64; 8],
-    /// Strides **in bytes**, signed so a consumer can express flips.
-    ///
-    /// Bytes rather than elements so a hardware row pitch is always
-    /// representable: a pitch need not be a whole number of `dtype` elements
-    /// (and a sub-byte dtype has no element size to divide by). Multiply a
-    /// coordinate by the stride directly; do not scale by `dtype` size.
+    /// Strides in bytes, signed so a consumer can express flips. Multiply a
+    /// coordinate by the stride directly, without scaling by `dtype` size.
     pub strides: [i64; 8],
     /// V4L2 pixel format code ([`crate::PixelFormat::to_fourcc`]) of the
     /// pixel format, or 0 for a non-image tensor or a format with no V4L2
-    /// code. Kept for third-party interop; a HAL-aware consumer should prefer
-    /// [`Self::format`] and fall back to this only when `format` is 0
-    /// (see [`mod@format`]'s doc for why `fourcc` alone is insufficient).
+    /// code. A HAL-aware consumer reads [`Self::format`] first and falls back
+    /// to this only when `format` is 0.
     pub fourcc: u32,
     /// One of the [`mod@format`] constants, or 0 for a non-image tensor.
     pub format: u32,
     /// Packed colorimetry, or 0 when unspecified.
     pub colorimetry: u32,
     /// Bit flags; see [`mod@flags`]. Zero when nothing applies.
-    ///
-    /// Occupies what was a 4-byte alignment hole before `capacity`, so it
-    /// cost nothing to add.
     pub flags: u32,
     /// Bytes available in the producer's underlying allocation, from this
     /// tensor's window start (its [`TensorTrait::capacity_bytes`
-    /// ](crate::TensorTrait::capacity_bytes)) -- may exceed the byte size
-    /// `shape`/`strides` imply when the producer over-allocated: a pool
-    /// tensor sized for its largest expected image but holding a smaller
-    /// one today, or row-pitch/MCU-alignment padding a decoder needs beyond
-    /// the logical width. Without this, a consumer importing a host-memory
-    /// descriptor has no way to learn that headroom exists and must treat
-    /// the declared shape as the allocation's exact size -- which starves a
-    /// later `configure_image`/`set_logical_shape` of capacity the producer
-    /// actually has. `DMABUF`/`IOSURFACE` consumers query their real
-    /// capacity from the handle itself and do not depend on this field, but
-    /// it is populated for every kind for consistency.
+    /// ](crate::TensorTrait::capacity_bytes)). May exceed the byte size
+    /// `shape`/`strides` imply when the producer over-allocated. Populated
+    /// for every kind.
     pub capacity: u64,
     /// Completion handle for work still in flight against this tensor, or 0
     /// when [`flags::SYNC_PRESENT`] is clear.
     ///
     /// Filled in by [`kind::D3D11_TEXTURE`] producers, and left clear by
-    /// every other kind in this build. It was declared before any producer
-    /// set it because the field has to exist before the first release or
-    /// adding it later costs a capsule-name bump, and it is the one gap the
-    /// synchronous-at-the-boundary contract cannot close: a *foreign*
-    /// producer with queued GPU work has no other way to say "wait on this
-    /// first".
+    /// every other kind in this build.
     ///
-    /// Interpretation is keyed by [`Self::kind`], since each backing already
-    /// implies its own fence flavour and a separate discriminant would be
-    /// redundant:
+    /// Interpretation is keyed by [`Self::kind`]:
     ///
     /// * [`kind::DMABUF`] -- a `sync_file` fd from
     ///   `DMA_BUF_IOCTL_EXPORT_SYNC_FILE`. The consumer owns it and must
@@ -382,10 +272,9 @@ use crate::TensorMemory;
 
 /// Map a backing store to its [`kind`] code.
 ///
-/// The identity on [`TensorMemory::code`] except for `DmaBuf`, which is the
-/// portable spelling of "platform-native zero-copy GPU buffer": the
-/// descriptor names the concrete backing, because its `handle` field means
-/// something different for each (an fd, an IOSurface id, an NT handle).
+/// The identity on [`TensorMemory::code`] except for `DmaBuf`, which maps to
+/// the platform's concrete backing: `IOSURFACE` on macOS/iOS,
+/// `D3D11_TEXTURE` on Windows, `DMABUF` elsewhere.
 pub(crate) fn kind_of(memory: TensorMemory) -> u32 {
     match memory {
         TensorMemory::DmaBuf => {
@@ -409,25 +298,13 @@ pub(crate) fn kind_of(memory: TensorMemory) -> u32 {
 // ---------------------------------------------------------------------------
 // Consumer side: the per-kind field checks `TensorDyn::import_storage` needs
 // ---------------------------------------------------------------------------
-//
-// Each of these validates one kind's handle/pointer field and produces the
-// value a constructor takes. They live here, next to the descriptor they
-// read, rather than in either backend: a descriptor is an *untrusted*
-// cross-package payload, and two copies of "is this fd representable" or
-// "is this surface id in range" are two places for the refusals to drift.
 
 /// `dup` a `kind::DMABUF` descriptor's fd into one this process owns.
-///
-/// The producer still owns the original and will close it when its own
-/// tensor drops, so an import must have its own -- `from_fd` adopts what it
-/// is given.
 ///
 /// # Errors
 ///
 /// [`crate::Error::InvalidArgument`] when the descriptor carries no fd, or
-/// one not representable as a file descriptor. `as i32` would wrap a handle
-/// above `i32::MAX` onto an unrelated -- possibly live -- descriptor, which
-/// the `dup` would then adopt as the buffer.
+/// one not representable as a file descriptor.
 #[cfg(target_os = "linux")]
 pub(crate) fn dup_descriptor_fd(desc: &TensorDesc) -> crate::Result<std::os::fd::OwnedFd> {
     use std::os::fd::BorrowedFd;
@@ -442,9 +319,8 @@ pub(crate) fn dup_descriptor_fd(desc: &TensorDesc) -> crate::Result<std::os::fd:
             desc.handle
         ))
     })?;
-    // SAFETY: the producer owns `desc.handle` and the capsule keepalive
-    // holds it open for the duration of this call, so it is a valid fd to
-    // borrow (not adopt) for the dup below.
+    // SAFETY: the producer owns `desc.handle` and the capsule keepalive holds
+    // it open for the duration of this call. It is borrowed, not adopted.
     let borrowed = unsafe { BorrowedFd::borrow_raw(raw_fd) };
     Ok(nix::unistd::dup(borrowed)?)
 }
@@ -454,10 +330,7 @@ pub(crate) fn dup_descriptor_fd(desc: &TensorDesc) -> crate::Result<std::os::fd:
 /// # Errors
 ///
 /// [`crate::Error::InvalidArgument`] when the descriptor carries no id, or
-/// one out of `u32` range. Liveness is *not* checked here -- that belongs
-/// with the lookup, which happens inside the constructor (and, under the
-/// `dynamic` backend, inside `libedgefirst_tensor.so`) so no window exists
-/// between "found it" and "retained it".
+/// one out of `u32` range. Liveness is not checked here.
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 pub(crate) fn descriptor_surface_id(desc: &TensorDesc) -> crate::Result<u32> {
     if desc.handle < 0 {
@@ -477,8 +350,7 @@ pub(crate) fn descriptor_surface_id(desc: &TensorDesc) -> crate::Result<u32> {
 ///
 /// # Errors
 ///
-/// [`crate::Error::InvalidArgument`], naming the producer-side fix: a
-/// descriptive-only capsule was requested, so no address was pinned.
+/// [`crate::Error::InvalidArgument`].
 pub(crate) fn check_descriptor_host_ptr(desc: &TensorDesc) -> crate::Result<()> {
     if desc.ptr.is_null() {
         return Err(crate::Error::InvalidArgument(
@@ -493,12 +365,6 @@ pub(crate) fn check_descriptor_host_ptr(desc: &TensorDesc) -> crate::Result<()> 
 
 /// Read a `kind::PBO` descriptor's GL buffer id, and refuse one carrying no
 /// ops vtable.
-///
-/// Both checks together, unlike the other kinds' one apiece, because the
-/// `PBO` kind is the one that needs *two* of the descriptor's fields to be
-/// present before a constructor can be called at all -- `handle` names the
-/// buffer, `ptr` carries the vtable that can reach it, and either alone is
-/// useless.
 ///
 /// # Errors
 ///
@@ -531,15 +397,8 @@ pub(crate) fn descriptor_pbo_buffer_id(desc: &TensorDesc) -> crate::Result<u32> 
 /// producer recorded a GPU write, the fence handle plus value an import
 /// waits on before reading.
 ///
-/// Both checks together, like [`descriptor_pbo_buffer_id`]'s, because this
-/// kind also spends two of the descriptor's fields on one backing:
-/// `handle` names the texture and `ptr` the fence that orders access to it.
-/// The completion is optional -- a producer that has queued no GPU work
-/// leaves `SYNC_PRESENT` clear, and there is then nothing to wait for.
-///
-/// Both handles stay the producer's: they are its own, not duplicates, and
-/// are valid only while the capsule keepalive holds the producing tensor
-/// alive. `from_d3d11_shared_handle` duplicates what it keeps.
+/// Both handles stay the producer's: they are valid only while the capsule
+/// keepalive holds the producing tensor alive.
 ///
 /// # Errors
 ///
@@ -566,22 +425,10 @@ pub(crate) fn descriptor_d3d11_handles(
 /// The pixel format and image dimensions a `kind::D3D11_TEXTURE` import is
 /// built at, with the descriptor's shape checked against them.
 ///
-/// The dimensions come from the texture, not from `shape`: a shape cannot
-/// tell an allocation grid from an addressing grid, and a producer may
-/// legitimately send either (`descriptor_pinned` emits `shape()`, which is
-/// the allocation shape until someone calls `set_logical_shape`). The one
-/// thing the texture cannot supply is a semi-planar image's width -- such a
-/// texture is as wide as the driver's row pitch -- which is why `shape` is
-/// passed down to [`crate::d3d11_shared_handle_geometry`] rather than only
-/// checked here.
-///
-/// A third spelling is accepted here and nowhere else: a packed *window* of
-/// the texture, which is what a `view()` describes (`[h', w', c]` with `h'`
-/// and `w'` no larger than the texture's, and no smaller than one). The
-/// import still opens the whole texture; `restore_d3d11_logical_shape`
-/// narrows it to the window and the producer's plane offset places it. The
-/// blob transport does not take this spelling because nothing narrows on
-/// that path, so a window shape would be accepted and then ignored.
+/// The dimensions come from the texture, except a semi-planar image's width,
+/// which comes from `shape`. `shape` may be the allocation shape, the
+/// addressing shape, or a packed window of the texture (`[h', w', c]` with
+/// `h'` and `w'` no larger than the texture's, and no smaller than one).
 ///
 /// # Errors
 ///
@@ -627,8 +474,7 @@ enum ShapeRule {
 
 /// Whether `shape` is a packed sub-rectangle of a `width` x `height` image
 /// in `format`: the allocation spelling with a smaller height or width. A
-/// window is never a semi-planar or planar image (`Tensor::view` makes
-/// packed views only) and never empty.
+/// window is never a semi-planar or planar image and never empty.
 #[cfg(target_os = "windows")]
 fn is_packed_window_of(
     format: crate::PixelFormat,
@@ -647,11 +493,6 @@ fn is_packed_window_of(
 
 /// The image dimensions a shared D3D11 texture reports, with `shape` checked
 /// against them.
-///
-/// Split out of [`descriptor_d3d11_geometry`] so the blob's reference-mode
-/// import ([`crate::blob::import`]) makes the same refusal rather than a
-/// second copy of it: the two transports differ in how they name the format,
-/// not in which shapes describe a given texture.
 ///
 /// # Errors
 ///
@@ -704,16 +545,7 @@ unsafe fn d3d11_geometry_with_rule(
     )))
 }
 
-/// Inputs to [`from_parts`], grouped into one named-field struct rather than
-/// a positional argument list.
-///
-/// This crossed nine parameters once the pixel-format and capacity inputs
-/// were added, several of them same-typed (`fourcc: u32`, a `u32`
-/// handle-adjacent value, `colorimetry: u32`) — a positional call at that
-/// width compiles happily with two arguments transposed and silently
-/// corrupts the descriptor. Named fields make that a compile error instead. Internal to
-/// this crate: `TensorDyn::descriptor_pinned` is presently the only caller --
-/// on both backends now, not just `static` (task P2a).
+/// Inputs to [`from_parts`].
 pub(crate) struct DescParts<'a, 'p> {
     pub dims: &'a [usize],
     pub memory: TensorMemory,
@@ -721,7 +553,7 @@ pub(crate) struct DescParts<'a, 'p> {
     /// V4L2 pixel format code for [`TensorDesc::fourcc`]; 0 when the format
     /// has none.
     pub fourcc: u32,
-    /// The HAL format, source for both the row-dimension decision below and
+    /// The HAL format, source for both the row-dimension decision and
     /// [`TensorDesc::format`] (via [`format_of`]).
     pub format: Option<crate::PixelFormat>,
     /// Row pitch in bytes; see [`from_parts`]'s doc for how it maps to a
@@ -734,14 +566,11 @@ pub(crate) struct DescParts<'a, 'p> {
     pub capacity: u64,
     pub pin: Option<&'a crate::HostPin<'p>>,
     /// The producer's `PboOpsVtable` address, for [`TensorDesc::ptr`] under
-    /// [`kind::PBO`] — see that field's own doc comment. `None` for every
-    /// other kind (mutually exclusive with `pin`: a PBO tensor never has
-    /// one, since `PboTensor` refuses `pin_host`).
+    /// [`kind::PBO`]. `None` for every other kind.
     pub pbo_vtable_ptr: Option<*const std::ffi::c_void>,
     /// The process device fence's NT handle value, for [`TensorDesc::ptr`]
-    /// under [`kind::D3D11_TEXTURE`] — the third meaning that one field
-    /// carries, keyed by kind exactly as the PBO vtable is. `0` for every
-    /// other kind and for a device with no fence.
+    /// under [`kind::D3D11_TEXTURE`]. `0` for every other kind and for a
+    /// device with no fence.
     pub fence_handle: usize,
     /// The fence value of the producer's last recorded GPU write, for
     /// [`TensorDesc::sync`] under [`kind::D3D11_TEXTURE`]. `None` for every
@@ -756,11 +585,9 @@ pub(crate) struct DescParts<'a, 'p> {
 /// Row-major byte strides for `shape`, with the row dimension replaced by
 /// `row_stride` when one is recorded.
 ///
-/// The one definition of the stride convention both wire formats carry: the
-/// descriptor ([`from_parts`]) and the blob (`blob::export`). See
-/// [`from_parts`] for which dimension is the row dimension per layout, and
-/// why a planar image's plane stride follows the pitch. Also the source of
-/// the C API's `ef_tensor_strides`, so every surface reports one layout.
+/// The stride convention of the descriptor ([`from_parts`]), the blob
+/// (`blob::export`) and the C API's `ef_tensor_strides`. See [`from_parts`]
+/// for which dimension is the row dimension per layout.
 pub fn c_byte_strides(
     shape: &[u64],
     esz: i64,
@@ -777,8 +604,8 @@ pub fn c_byte_strides(
         return strides;
     };
     // A formatted tensor one rank above its image rank is a batch `[N, ...]`
-    // of images stacked at the padded pitch, so the row override applies to
-    // the per-image dims and `N` steps over one padded image.
+    // of images stacked at the padded pitch: the row override applies to the
+    // per-image dims and `N` steps over one padded image.
     let image_rank = match layout {
         Some(crate::PixelLayout::SemiPlanar) => Some(2),
         Some(crate::PixelLayout::Packed | crate::PixelLayout::Planar) => Some(3),
@@ -810,52 +637,25 @@ pub fn c_byte_strides(
 
 /// Build a descriptor from its parts.
 ///
-/// The single construction site: `TensorDyn::descriptor` and any future
-/// `Tensor<T>::descriptor` both route here, so the layout and the stride
-/// convention are defined once.
-///
 /// `ptr` is null unless a [`HostPin`](crate::HostPin) is supplied, or the
-/// tensor is PBO-backed and `pbo_vtable_ptr` is supplied instead — see
-/// [`TensorDesc::ptr`]'s own doc comment for why that one field carries two
-/// different meanings by [`TensorDesc::kind`]. A raw address is only
-/// meaningful while something guarantees the memory (or, for PBO, the
-/// `PboHandle` the vtable addresses) stays put, so the descriptor carries
-/// one only when the producer has pinned or built a vtable — and the
-/// capsule's keepalive then holds the relevant tensor alive for the
-/// consumer's benefit either way.
+/// tensor is PBO-backed and `pbo_vtable_ptr` is supplied; see
+/// [`TensorDesc::ptr`].
 ///
 /// `row_stride` is the producer's [`TensorDyn::row_stride`](crate::TensorDyn::row_stride)
-/// **in bytes**, or `None` for a tightly-packed tensor. A pitch-aligned image
-/// carries padding between rows that the shape alone cannot express, so when
-/// present it overrides the stride of the dimension that is actually the row
-/// dimension for `format`'s layout. `format` is also the source of
-/// [`TensorDesc::format`] (via [`format_of`]) and is taken separately
-/// from `fourcc` rather than derived from it: `PlanarRgb`/`PlanarRgba` both
-/// encode as `fourcc = 0` (no standard FourCC exists for them), the same
-/// sentinel a non-image tensor uses, so `fourcc` alone cannot tell Planar
-/// apart from "no format" — for either purpose.
+/// in bytes, or `None` for a tightly-packed tensor. When present it overrides
+/// the stride of the row dimension for `format`'s layout:
 ///
 /// * Packed (`[H, W, C]`) / SemiPlanar (`[combined_H, W]`): dimension 0.
-/// * Planar (`[C, H, W]`, e.g. `PlanarRgb`): dimension 1 — dimension 0 there
-///   is the *plane* count, and clobbering it with the row pitch would
-///   corrupt the plane stride while leaving the true per-row stride
-///   (dimension 1) unfixed. Dimension 0 becomes `row_stride * H` instead: a
-///   strided planar tensor stores its planes as `C * H` rows of one pitch,
-///   back to back (the layout `Tensor::map`, `copy_to_flat` and
-///   [`PixelFormat::plane_table`](crate::PixelFormat::plane_table) all
-///   assume), so the tight `H * W * size` would place plane 1 inside plane
-///   0's row padding.
+/// * Planar (`[C, H, W]`, e.g. `PlanarRgb`): dimension 1. Dimension 0, the
+///   plane stride, becomes `row_stride * H`: a strided planar tensor stores
+///   its planes as `C * H` rows of one pitch.
 ///
-/// `row_stride` is a byte pitch and is carried verbatim. It need not be a
-/// whole number of `dtype` elements: `set_row_stride` validates only
-/// `stride >= minimum`, not element alignment, and since strides are bytes
-/// there is no division to lose a remainder to. The element-stride
-/// representation this replaced could not express such a pitch at all — it
-/// fell back to the packed stride and reported a pitch the buffer does not
-/// have, across a package/ABI boundary.
+/// `row_stride` is a byte pitch and is carried verbatim; it need not be a
+/// whole number of `dtype` elements.
 ///
+/// `format` is also the source of [`TensorDesc::format`] (via [`format_of`]).
 /// `handle`, `colorimetry` and `capacity` are carried through verbatim; `-1`
-/// and `0` are the "unused"/"undefined" sentinels for the first two.
+/// and `0` are the "unused"/"undefined" values for the first two.
 pub(crate) fn from_parts(parts: DescParts) -> TensorDesc {
     let DescParts {
         dims,
@@ -875,20 +675,14 @@ pub(crate) fn from_parts(parts: DescParts) -> TensorDesc {
         view,
     } = parts;
     let desc_kind = kind_of(memory);
-    // Both fields are meaningful only under `D3D11_TEXTURE`, and only when
-    // the device has a fence to name: a value with no handle behind it would
-    // set `SYNC_PRESENT` on a descriptor no consumer can wait on.
+    // Both fields are set only under `D3D11_TEXTURE`, and only when the device
+    // has a fence.
     let completion = (desc_kind == kind::D3D11_TEXTURE && fence_handle != 0)
         .then_some(sync)
         .flatten()
         .map(|value| (fence_handle, value));
-    // `ndim` carries the TRUE rank even when it exceeds the eight slots the
-    // descriptor can hold, so a consumer can detect the case and refuse.
-    // Reporting the clamped value instead would ship a descriptor whose
-    // `ndim` disagrees with its own `dims`, and the consumer would address
-    // `product(dims[..8])` elements of a larger allocation -- silently wrong
-    // data across a package boundary. This mirrors the `row_stride` override
-    // below, which likewise refuses to truncate quietly.
+    // `ndim` carries the true rank even when it exceeds the eight slots the
+    // descriptor can hold.
     let ndim = dims.len();
     let filled = ndim.min(TensorDesc::MAX_NDIM);
     if ndim > TensorDesc::MAX_NDIM {
@@ -903,8 +697,7 @@ pub(crate) fn from_parts(parts: DescParts) -> TensorDesc {
     for (i, d) in dims.iter().take(filled).enumerate() {
         shape[i] = *d as u64;
     }
-    // `filled`, not `ndim`: the arrays hold MAX_NDIM slots and `ndim` may
-    // legitimately exceed that.
+    // `filled`, not `ndim`: the arrays hold MAX_NDIM slots.
     let byte_strides = c_byte_strides(
         &shape[..filled],
         dtype.size() as i64,
@@ -916,17 +709,8 @@ pub(crate) fn from_parts(parts: DescParts) -> TensorDesc {
         version: ABI_VERSION,
         kind: desc_kind,
         handle,
-        // Keyed by kind, because that is what this field's meaning is keyed
-        // by. Under `D3D11_TEXTURE` it is the fence handle or nothing, even
-        // when the producer also pinned a host address -- a Python capsule
-        // asked for `access="read"` does pin a texture tensor, and writing
-        // that address here would hand the consumer a host pointer to open
-        // as a fence. The pin stays the producer's own keepalive; a D3D11
-        // import reopens the texture and takes its own CPU mapping, so it
-        // never wanted the address. Otherwise `pin` and `pbo_vtable_ptr`
-        // are mutually exclusive by construction (see
-        // `DescParts::pbo_vtable_ptr`'s own doc comment) and `pin` takes
-        // precedence purely because it is the older, more general case.
+        // Keyed by kind: under `D3D11_TEXTURE` the fence handle or null; otherwise
+        // the pinned host address, else the PBO vtable address, else null.
         ptr: if desc_kind == kind::D3D11_TEXTURE {
             completion.map_or_else(SendPtr::null, |(h, _)| SendPtr(h as *mut u8))
         } else {
@@ -941,8 +725,6 @@ pub(crate) fn from_parts(parts: DescParts) -> TensorDesc {
         fourcc,
         format: format.map(format_of).unwrap_or(format::NONE),
         colorimetry,
-        // `D3D11_TEXTURE` is the one kind that fills these in; every other
-        // producer in this build leaves them clear. See the field docs.
         flags: flags::from_cpu_access(cpu_access)
             | if completion.is_some() {
                 flags::SYNC_PRESENT
@@ -957,27 +739,10 @@ pub(crate) fn from_parts(parts: DescParts) -> TensorDesc {
 
 // ---------------------------------------------------------------------------
 // Quantization, as it crosses the capsule.
-//
-// This lives here rather than in `edgefirst-python-common` beside
-// `TensorCapsulePayload`, which is the only thing that embeds it, for one
-// reason: it is unsafe pointer/length decoding of a versioned wire format,
-// and `edgefirst-python-common` cannot host a test that runs. That crate
-// pins `pyo3/extension-module`, which suppresses linking libpython, so its
-// test binary cannot link at all -- and `make test-rust` excludes it by
-// name regardless. Here, the round trip is covered by `quant_desc_tests`
-// below, which `make test` runs.
-//
-// It does NOT go in `TensorDesc`: that descriptor is also the C ABI's, and
-// the C libraries pass real `ef_tensor` handles into one shared
-// `libedgefirst_tensor.so` and never rebuild a tensor from a descriptor, so
-// they never lose the metadata. See `python-common/INTEROP.md`.
 // ---------------------------------------------------------------------------
 
-/// A `*const T` that may cross a `PyCapsule`.
-///
-/// The same obligation [`crate::SendPtr`] discharges for
-/// [`crate::TensorDesc::ptr`], for the two arrays [`QuantDesc`] points at: the
-/// producer keeps them alive for the capsule's lifetime, here via
+/// A `*const T` that may cross a `PyCapsule`. The producer keeps the
+/// pointed-to arrays alive for the capsule's lifetime, via
 /// `TensorCapsulePayload::quant_keepalive`.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug)]
@@ -996,34 +761,22 @@ impl<T> SendConstPtr<T> {
     }
 }
 
-/// Quantization metadata, in a form that can cross an `.so` boundary.
+/// Quantization metadata, in a form that can cross an `.so` boundary. It
+/// rides in the capsule payload beside [`crate::TensorDesc`].
 ///
-/// [`crate::TensorDesc`] deliberately does not carry this: it is the *shared*
-/// descriptor, pinned by `ABI_VERSION` and consumed by the C API, where
-/// tensors travel as real `ef_tensor` handles into one shared
-/// `libedgefirst_tensor.so` and no reconstruction ever happens. The Python
-/// packages are the only consumers that rebuild a tensor from a descriptor,
-/// so this rides in the capsule payload rather than widening a C ABI that
-/// does not need it.
-///
-/// Variable-length by nature -- per-channel quantization carries one scale
-/// (and optionally one zero-point) per channel -- so the arrays are
-/// *borrowed*, not inlined: `scales`/`zero_points` point into the
-/// `Quantization` that `TensorCapsulePayload::quant_keepalive` owns, on
-/// exactly the terms [`crate::TensorDesc::ptr`] borrows the producer's host
-/// address. A consumer copies the values out during import (see
-/// [`QuantDesc::to_quantization`]) while the capsule is still alive, and
-/// never retains the pointers.
+/// The arrays are borrowed, not inlined: `scales`/`zero_points` point into
+/// the `Quantization` that `TensorCapsulePayload::quant_keepalive` owns. A
+/// consumer copies the values out during import (see
+/// [`QuantDesc::to_quantization`]) while the capsule is alive, and does not
+/// retain the pointers.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct QuantDesc {
     /// Number of entries in `scales` (and in `zero_points` when non-null).
-    /// **Zero means the tensor carries no quantization** -- the one field a
-    /// consumer must check before reading either pointer.
+    /// Zero means the tensor carries no quantization.
     pub len: u64,
-    /// Channel axis for per-channel quantization, **plus one**; `0` means
-    /// per-tensor. Encoded this way so the whole struct zeroes to "absent"
-    /// rather than needing a separate presence flag for an `Option<usize>`.
+    /// Channel axis for per-channel quantization, plus one; `0` means
+    /// per-tensor.
     pub axis_plus_one: u64,
     /// `len` scale factors. Null iff `len == 0`.
     pub scales: SendConstPtr<f32>,
@@ -1059,15 +812,9 @@ impl QuantDesc {
     }
 
     /// Copy the borrowed arrays into an owned [`crate::Quantization`], or `None`
-    /// when the producer declared no quantization.
-    ///
-    /// `Ok(None)` means "the producer has none"; a descriptor that declares
-    /// quantization but cannot be read back as a valid [`crate::Quantization`] is
-    /// an `Err`, not a second spelling of `None`. Conflating the two is
-    /// what made the bug this whole capsule version exists to fix so hard
-    /// to place: a tensor that quietly arrives unquantized surfaces much
-    /// later as the consumer's own "requires quantization metadata", which
-    /// names the symptom and not the cause.
+    /// when the producer declared no quantization. A descriptor that declares
+    /// quantization but cannot be read back as a valid
+    /// [`crate::Quantization`] is an `Err`.
     ///
     /// # Safety
     ///
@@ -1086,22 +833,16 @@ impl QuantDesc {
             )));
         }
         let len = self.len as usize;
-        // SAFETY: the caller's obligation, above: the producer's
-        // `quant_keepalive` owns these arrays and the capsule holding it is
-        // alive, and `len` came from the same producer as the pointers.
+        // SAFETY: the producer's `quant_keepalive` owns these arrays and the
+        // capsule holding it is alive; `len` came from the same producer as the
+        // pointers.
         let scales = unsafe { std::slice::from_raw_parts(self.scales.0, len) }.to_vec();
         let zero_points = if self.zero_points.0.is_null() {
             None
         } else {
             Some(unsafe { std::slice::from_raw_parts(self.zero_points.0, len) }.to_vec())
         };
-        // Rebuilt through the named constructors so an ill-formed
-        // descriptor cannot produce a `Quantization` that the type's own
-        // invariants say is impossible -- `crate::Quantization::validate` rejects
-        // per-channel scales with no axis and a per-tensor scale that
-        // carries one, so those shapes cannot be forced into existence here
-        // either. A descriptor that names one of them is reported, not
-        // silently downgraded to "unquantized".
+        // Rebuilt through the named constructors, which validate the descriptor.
         let axis = self.axis_plus_one.checked_sub(1).map(|a| a as usize);
         let quant = match (axis, zero_points) {
             (None, None) if len == 1 => Ok(crate::Quantization::per_tensor_symmetric(scales[0])),
@@ -1109,7 +850,7 @@ impl QuantDesc {
             (Some(a), None) => crate::Quantization::per_channel_symmetric(scales, a),
             (Some(a), Some(zp)) => crate::Quantization::per_channel(scales, zp, a),
             // `len > 1` with no axis: per-channel scales that name no
-            // channel dimension. `Quantization` has no such shape.
+            // channel dimension.
             (None, _) => {
                 return Err(crate::Error::InvalidArgument(format!(
                     "malformed tensor capsule: {len} quantization scales but no \
@@ -1130,12 +871,10 @@ mod quant_desc_tests {
     use super::QuantDesc;
     use crate::Quantization;
 
-    /// Borrow `q`, then copy back out of the descriptor while `q` is still
-    /// alive -- exactly the producer/consumer ordering the capsule enforces
-    /// via `TensorCapsulePayload::quant_keepalive`.
+    /// Borrow `q`, then copy back out of the descriptor while `q` is alive.
     fn round_trip(q: &Quantization) -> Option<Quantization> {
         let desc = QuantDesc::borrowing(q);
-        // SAFETY: `q` outlives `desc` here, which is the whole contract.
+        // SAFETY: `q` outlives `desc`.
         unsafe { desc.to_quantization() }.expect("a well-formed descriptor must import")
     }
 
@@ -1158,20 +897,14 @@ mod quant_desc_tests {
         }
     }
 
-    /// The arms this type exists for. A per-tensor descriptor carries one
-    /// scale and no axis, so it would round-trip correctly even if the
-    /// length and the axis were both ignored -- only a per-channel case
-    /// exercises the borrowed variable-length arrays.
+    /// A per-channel symmetric quantization round-trips with its length and
+    /// axis.
     #[test]
     fn per_channel_symmetric_round_trips_with_its_length_and_axis() {
         let q = Quantization::per_channel_symmetric(vec![0.5, 0.25, 0.125], 0)
             .expect("per-channel symmetric");
         let imported = round_trip(&q).expect("per-channel must survive the descriptor");
         assert_eq!(imported, q);
-        // Spelled out rather than left to `PartialEq`: dropping the axis or
-        // truncating the array to one entry is the specific failure the
-        // borrowed-array encoding risks, and both would still be a valid
-        // `Quantization`.
         assert_eq!(imported.scale(), &[0.5, 0.25, 0.125]);
         assert_eq!(imported.axis(), Some(0));
         assert_eq!(imported.zero_point(), None);
@@ -1188,8 +921,7 @@ mod quant_desc_tests {
         assert_eq!(imported.zero_point(), Some(&[1, 2, 3][..]));
     }
 
-    /// A non-zero axis must survive as itself, not be clamped to 0 -- the
-    /// `+1` encoding is the one place an off-by-one would hide.
+    /// A non-zero axis survives the `+1` encoding.
     #[test]
     fn the_axis_plus_one_encoding_is_reversible() {
         for axis in 0..4usize {
@@ -1200,11 +932,7 @@ mod quant_desc_tests {
         }
     }
 
-    /// A descriptor that survives the capsule-name check but disagrees with
-    /// itself is *reported*, not forced into a `Quantization` whose own
-    /// invariants say it cannot exist -- and not quietly downgraded to
-    /// "unquantized" either, which would resurface as the consumer's own
-    /// "requires quantization metadata" and name the symptom, not the cause.
+    /// Per-channel scales with no axis are an error.
     #[test]
     fn per_channel_without_an_axis_is_an_error_not_a_silent_none() {
         let q = Quantization::per_channel_symmetric(vec![0.5, 0.25], 0).expect("per-channel");
@@ -1219,13 +947,12 @@ mod quant_desc_tests {
         );
     }
 
-    /// The other malformed shape the length field admits: a non-zero count
-    /// with nothing to read it from. Checked before any dereference.
+    /// A non-zero count with a null scale array is an error.
     #[test]
     fn a_null_scale_array_with_a_non_zero_length_is_an_error() {
         let mut desc = QuantDesc::absent();
         desc.len = 3;
-        // SAFETY: nothing is dereferenced -- the null check precedes it.
+        // SAFETY: nothing is dereferenced; the null check precedes it.
         let err =
             unsafe { desc.to_quantization() }.expect_err("a length with a null array is malformed");
         assert!(err.to_string().contains("null scale array"), "got: {err}");
@@ -1282,8 +1009,7 @@ mod desc_tests {
         );
     }
 
-    /// Planes of a strided planar image are `H` rows of the pitch apart, so
-    /// the plane stride follows the pitch rather than staying `H * W`.
+    /// Planes of a strided planar image are `H` rows of the pitch apart.
     #[test]
     fn a_recorded_pitch_moves_both_the_row_and_the_plane_stride_of_a_planar_image() {
         assert_eq!(
@@ -1338,8 +1064,8 @@ mod desc_tests {
         assert_eq!(view.flags & super::flags::VIEW, super::flags::VIEW);
     }
 
-    /// Only a D3D11 texture has a fence to name. A completion handed to any
-    /// other kind is dropped, never advertised as `SYNC_PRESENT`.
+    /// A completion handed to a kind other than a D3D11 texture is not
+    /// advertised as `SYNC_PRESENT`.
     #[test]
     fn a_completion_on_a_kind_with_no_fence_is_not_advertised() {
         let d = from_parts(parts(TensorMemory::Mem, 5, Some(9)));
@@ -1348,8 +1074,7 @@ mod desc_tests {
         assert!(d.ptr.is_null());
     }
 
-    /// On Windows the shared `DmaBuf` discriminant is a D3D11 texture: its
-    /// completion needs both the fence handle and a recorded value.
+    /// A texture completion needs both the fence handle and a recorded value.
     #[cfg(target_os = "windows")]
     #[test]
     fn a_texture_completion_needs_a_fence_handle() {

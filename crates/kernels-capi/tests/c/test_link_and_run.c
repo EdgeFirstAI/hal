@@ -1,7 +1,7 @@
 /* SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
  * SPDX-License-Identifier: Apache-2.0
  *
- * Links and RUNS against libedgefirst_kernels only: one plan of every type,
+ * Links and runs against libedgefirst_kernels only: one plan of every type,
  * one small tensor each, one hand-derived value each. */
 #include <edgefirst/kernels.h>
 #include <math.h>

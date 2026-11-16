@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Windows: allocate a texture tensor, read its layout, share it, record and
 // read a completion, wrap it again. Elsewhere: every export refuses with
-// ENOTSUP and the declared-everywhere rule holds.
+// ENOTSUP.
 #include <edgefirst/tensor.h>
 #include <assert.h>
 #include <errno.h>
@@ -11,8 +11,7 @@
 #ifdef _WIN32
 #include <windows.h>
 
-// The WARP software adapter has no CUDA device behind it, so a texture
-// allocated on it carries no CUDA handle and maps to NULL.
+// Whether an environment variable selects the WARP software adapter.
 static int warp_adapter_requested(void) {
     static const char *const vars[2] = {"EDGEFIRST_D3D11_ADAPTER",
                                         "EDGEFIRST_ANGLE_ADAPTER"};
@@ -79,10 +78,7 @@ int main(void) {
     memset(v.ptr, 0x3C, v.len);
     assert(ef_tensor_unmap(t) == 0);
 
-    // Ahead of the ef_tensor_set_gpu_write below: a CUDA map waits on the
-    // tensor's recorded fence value before copying, and nothing in this test
-    // signals the device fence, so a map taken after that write never
-    // returns. Nothing above records a write.
+    // The CUDA map is taken before any GPU write is recorded.
     if (ef_is_cuda_available()) {
         void *m = ef_tensor_cuda_map_mut(t);
         if (m == NULL && warp_adapter_requested()) {
@@ -90,7 +86,7 @@ int main(void) {
         } else {
             size_t n = 0;
             assert(m != NULL);
-            // The mapping is the texture's tight rows, not its staging pitch.
+            // The mapping is the texture's tight rows.
             assert(ef_tensor_cuda_device_ptr(m, &n) != NULL && n == 64 * 32 * 4);
             ef_tensor_cuda_unmap(m);
         }
@@ -125,7 +121,7 @@ int main(void) {
     assert(ef_tensor_shape(wrapped)[0] == 32 && ef_tensor_shape(wrapped)[1] == 64);
     ef_tensor_free(wrapped);
 
-    // dims that do not describe this texture are refused, not reinterpreted.
+    // dims that do not describe this texture are refused.
     uint64_t wrong[3] = {16, 16, 4};
     assert(ef_tensor_from_d3d11_texture(tex, EF_DTYPE_U8, wrong, 3, "rgba8",
                                         EF_CPU_ACCESS_READ, NULL) == NULL);

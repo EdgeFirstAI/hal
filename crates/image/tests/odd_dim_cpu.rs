@@ -4,12 +4,9 @@
 
 //! End-to-end odd-dimension CPU conversion tests.
 //!
-//! Covers Deliverable 1 (Part-1 assertion helper + reuse cell),
-//! Deliverable 2 (CPU convert cells for odd-W/H JPEG fixtures and
-//! analytically-constructed odd-both sources), and the resize strided-source
-//! path (Deliverable 3 subset).
-//!
-//! All cells run under the default feature set.
+//! Covers the representation assertion helper and reuse cell, CPU convert
+//! cells for odd-W/H JPEG fixtures and analytically-constructed odd-both
+//! sources, and the resize strided-source path.
 
 use edgefirst_codec::{ImageDecoder, ImageLoad};
 use edgefirst_image::{CPUProcessor, Crop, ImageProcessorTrait};
@@ -24,9 +21,8 @@ mod dma_require;
 #[allow(dead_code)]
 mod outcome;
 
-/// A padded-stride image, which is DMA-BUF backed: on Linux it must allocate
-/// when the DMA heap is usable; elsewhere `image_with_stride` is unsupported.
-/// `None` after a warning when it may not allocate.
+/// A padded-stride image, or `None` after a warning where it may fail to
+/// allocate.
 fn strided_image(w: usize, h: usize, fmt: PixelFormat, stride: usize) -> Option<Tensor<u8>> {
     let expect = if cfg!(target_os = "linux") {
         outcome::expect_dma(dma_require::decide(
@@ -53,7 +49,7 @@ fn strided_image(w: usize, h: usize, fmt: PixelFormat, stride: usize) -> Option<
 }
 
 // ---------------------------------------------------------------------------
-// Test-data helper — mirrors the codec test suite resolution order.
+// Test-data helper
 // ---------------------------------------------------------------------------
 
 fn testdata(name: &str) -> Vec<u8> {
@@ -72,16 +68,21 @@ fn testdata(name: &str) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
-// Part-1 assertion helper (Deliverable 1)
+// Representation assertion helper
 // ---------------------------------------------------------------------------
 
-/// Assert the Phase-1 representation invariants for a semi-planar / grey tensor.
+/// Assert the representation invariants for a semi-planar / grey tensor.
 ///
 /// * logical `width()` and `height()` match `logical_w` / `logical_h`.
 /// * `format()` matches `fmt`.
 /// * `effective_row_stride()` is 64-byte aligned and >= even(logical_w).
 /// * The mapped buffer is large enough to hold all planes at that stride.
-fn assert_part1(tensor: &Tensor<u8>, logical_w: usize, logical_h: usize, fmt: PixelFormat) {
+fn assert_allocation_geometry(
+    tensor: &Tensor<u8>,
+    logical_w: usize,
+    logical_h: usize,
+    fmt: PixelFormat,
+) {
     assert_eq!(
         tensor.width(),
         Some(logical_w),
@@ -104,8 +105,7 @@ fn assert_part1(tensor: &Tensor<u8>, logical_w: usize, logical_h: usize, fmt: Pi
         logical_w.next_multiple_of(2)
     );
 
-    // Use as_slice().len() to get the actual physical buffer capacity
-    // (honours byte_size_override when stride > tight).
+    // `as_slice().len()` is the physical buffer capacity.
     let map = tensor.map().unwrap();
     let buf_len = map.as_slice().len();
     let total_rows = match fmt {
@@ -123,11 +123,11 @@ fn assert_part1(tensor: &Tensor<u8>, logical_w: usize, logical_h: usize, fmt: Pi
 }
 
 // ---------------------------------------------------------------------------
-// Deliverable 1 — Part-1 assertion cells for each fixture
+// Representation assertion cells for each fixture
 // ---------------------------------------------------------------------------
 
 #[test]
-fn d1_part1_nv12_odd_w() {
+fn nv12_odd_w_allocation_geometry() {
     let jpeg = testdata("jaguar.jpg");
     let mut t = Tensor::<u8>::image(
         789,
@@ -139,7 +139,7 @@ fn d1_part1_nv12_odd_w() {
     .unwrap();
     let mut dec = ImageDecoder::new();
     t.load_image(&mut dec, &jpeg).unwrap();
-    assert_part1(&t, 789, 384, PixelFormat::Nv12);
+    assert_allocation_geometry(&t, 789, 384, PixelFormat::Nv12);
 
     let map = t.map().unwrap();
     let s = t.effective_row_stride().unwrap();
@@ -154,7 +154,7 @@ fn d1_part1_nv12_odd_w() {
 }
 
 #[test]
-fn d1_part1_nv16_odd_w() {
+fn nv16_odd_w_allocation_geometry() {
     let jpeg = testdata("jaguar_422.jpg");
     let mut t = Tensor::<u8>::image(
         789,
@@ -166,11 +166,11 @@ fn d1_part1_nv16_odd_w() {
     .unwrap();
     let mut dec = ImageDecoder::new();
     t.load_image(&mut dec, &jpeg).unwrap();
-    assert_part1(&t, 789, 384, PixelFormat::Nv16);
+    assert_allocation_geometry(&t, 789, 384, PixelFormat::Nv16);
 }
 
 #[test]
-fn d1_part1_nv24_odd_w() {
+fn nv24_odd_w_allocation_geometry() {
     let jpeg = testdata("jaguar_444.jpg");
     let mut t = Tensor::<u8>::image(
         789,
@@ -182,11 +182,11 @@ fn d1_part1_nv24_odd_w() {
     .unwrap();
     let mut dec = ImageDecoder::new();
     t.load_image(&mut dec, &jpeg).unwrap();
-    assert_part1(&t, 789, 384, PixelFormat::Nv24);
+    assert_allocation_geometry(&t, 789, 384, PixelFormat::Nv24);
 }
 
 #[test]
-fn d1_part1_grey_odd_h() {
+fn grey_odd_h_allocation_geometry() {
     let jpeg = testdata("grey.jpg");
     let mut t = Tensor::<u8>::image(
         1024,
@@ -198,11 +198,11 @@ fn d1_part1_grey_odd_h() {
     .unwrap();
     let mut dec = ImageDecoder::new();
     t.load_image(&mut dec, &jpeg).unwrap();
-    assert_part1(&t, 1024, 681, PixelFormat::Grey);
+    assert_allocation_geometry(&t, 1024, 681, PixelFormat::Grey);
 }
 
 #[test]
-fn d1_part1_nv12_odd_h() {
+fn nv12_odd_h_allocation_geometry() {
     let jpeg = testdata("grey-rgb.jpg");
     let mut t = Tensor::<u8>::image(
         1024,
@@ -214,16 +214,15 @@ fn d1_part1_nv12_odd_h() {
     .unwrap();
     let mut dec = ImageDecoder::new();
     t.load_image(&mut dec, &jpeg).unwrap();
-    assert_part1(&t, 1024, 681, PixelFormat::Nv12);
+    assert_allocation_geometry(&t, 1024, 681, PixelFormat::Nv12);
 }
 
 // ---------------------------------------------------------------------------
-// Deliverable 1 — canonical pre-alloc-max + decode-small reuse cell
+// Pre-alloc-max + decode-small reuse cell
 // ---------------------------------------------------------------------------
 
 #[test]
-fn d1_reuse_cell_max_alloc_decode_small() {
-    // Allocate at max size (1920×1088 NV12) and record the large buffer stride.
+fn max_alloc_tensor_is_reused_for_a_small_decode() {
     let mut pool = Tensor::<u8>::image(
         1920,
         1088,
@@ -236,12 +235,10 @@ fn d1_reuse_cell_max_alloc_decode_small() {
     assert_eq!(large_stride % 64, 0);
     assert!(large_stride >= 1920);
 
-    // Decode jaguar.jpg (789×384) into the large pool.
     let jpeg = testdata("jaguar.jpg");
     let mut dec = ImageDecoder::new();
     pool.load_image(&mut dec, &jpeg).unwrap();
 
-    // Logical dims must update to the decoded image's size.
     assert_eq!(pool.width(), Some(789), "logical width must update to 789");
     assert_eq!(
         pool.height(),
@@ -249,15 +246,12 @@ fn d1_reuse_cell_max_alloc_decode_small() {
         "logical height must update to 384"
     );
 
-    // The buffer stride must NOT shrink to 832 (tight for 789 wide) —
-    // the pre-allocated 1920-wide pitch is preserved.
     let post_stride = pool.effective_row_stride().unwrap();
     assert_eq!(
         post_stride, large_stride,
         "stride must stay at pre-alloc pitch {large_stride}, got {post_stride}"
     );
 
-    // The decoded 789×384 luma region must be non-trivial.
     let map = pool.map().unwrap();
     let luma_nonzero = (0..384usize)
         .flat_map(|r| {
@@ -273,7 +267,7 @@ fn d1_reuse_cell_max_alloc_decode_small() {
 }
 
 // ---------------------------------------------------------------------------
-// Helpers for Deliverable 2 (JPEG-based convert cells)
+// Helpers for the JPEG-based convert cells
 // ---------------------------------------------------------------------------
 
 /// MAE and max_diff between our CPU-converted RGB and the `image` crate's RGB.
@@ -340,53 +334,44 @@ fn jpeg_nv_to_rgb_mae(fixture: &str, fmt: PixelFormat, w: usize, h: usize) -> (f
 }
 
 // ---------------------------------------------------------------------------
-// Deliverable 2 — C-01 NV12 odd-W
+// NV12 odd-W
 // ---------------------------------------------------------------------------
 
 #[test]
-fn c01_nv12_odd_w_to_rgb() {
+fn nv12_odd_w_to_rgb() {
     let (mae, max_diff) = jpeg_nv_to_rgb_mae("jaguar.jpg", PixelFormat::Nv12, 789, 384);
-    eprintln!("C-01 NV12 odd-W: MAE={mae:.3}, max_diff={max_diff}");
-    assert!(
-        mae < 3.0,
-        "C-01: NV12 odd-W MAE {mae:.3} exceeds tolerance 3.0"
-    );
+    eprintln!("NV12 odd-W: MAE={mae:.3}, max_diff={max_diff}");
+    assert!(mae < 3.0, "NV12 odd-W MAE {mae:.3} exceeds tolerance 3.0");
 }
 
 // ---------------------------------------------------------------------------
-// Deliverable 2 — C-04 NV16 odd-W
+// NV16 odd-W
 // ---------------------------------------------------------------------------
 
 #[test]
-fn c04_nv16_odd_w_to_rgb() {
+fn nv16_odd_w_to_rgb() {
     let (mae, max_diff) = jpeg_nv_to_rgb_mae("jaguar_422.jpg", PixelFormat::Nv16, 789, 384);
-    eprintln!("C-04 NV16 odd-W: MAE={mae:.3}, max_diff={max_diff}");
-    assert!(
-        mae < 4.0,
-        "C-04: NV16 odd-W MAE {mae:.3} exceeds tolerance 4.0"
-    );
+    eprintln!("NV16 odd-W: MAE={mae:.3}, max_diff={max_diff}");
+    assert!(mae < 4.0, "NV16 odd-W MAE {mae:.3} exceeds tolerance 4.0");
 }
 
 // ---------------------------------------------------------------------------
-// Deliverable 2 — C-05 NV24 odd-W
+// NV24 odd-W
 // ---------------------------------------------------------------------------
 
 #[test]
-fn c05_nv24_odd_w_to_rgb() {
+fn nv24_odd_w_to_rgb() {
     let (mae, max_diff) = jpeg_nv_to_rgb_mae("jaguar_444.jpg", PixelFormat::Nv24, 789, 384);
-    eprintln!("C-05 NV24 odd-W: MAE={mae:.3}, max_diff={max_diff}");
-    assert!(
-        mae < 4.0,
-        "C-05: NV24 odd-W MAE {mae:.3} exceeds tolerance 4.0"
-    );
+    eprintln!("NV24 odd-W: MAE={mae:.3}, max_diff={max_diff}");
+    assert!(mae < 4.0, "NV24 odd-W MAE {mae:.3} exceeds tolerance 4.0");
 }
 
 // ---------------------------------------------------------------------------
-// Deliverable 2 — C-02 GREY odd-H
+// GREY odd-H
 // ---------------------------------------------------------------------------
 
 #[test]
-fn c02_grey_odd_h_to_rgb() {
+fn grey_odd_h_to_rgb() {
     let jpeg = testdata("grey.jpg");
     let w = 1024usize;
     let h = 681usize;
@@ -422,7 +407,7 @@ fn c02_grey_odd_h_to_rgb() {
     let map = dst_u8.map().unwrap();
     let our = map.as_slice();
 
-    // Grey→RGB: R=G=B=Y. Compare against luma reference.
+    // Grey→RGB gives R=G=B=Y; compares against the luma reference.
     let mut total: u64 = 0;
     let mut max_diff: u32 = 0;
     for y in 0..h {
@@ -437,43 +422,37 @@ fn c02_grey_odd_h_to_rgb() {
         }
     }
     let mae = total as f64 / (w * h * 3) as f64;
-    eprintln!("C-02 GREY odd-H: MAE={mae:.3}, max_diff={max_diff}");
-    assert!(
-        mae < 3.0,
-        "C-02: GREY odd-H MAE {mae:.3} exceeds tolerance 3.0"
-    );
+    eprintln!("GREY odd-H: MAE={mae:.3}, max_diff={max_diff}");
+    assert!(mae < 3.0, "GREY odd-H MAE {mae:.3} exceeds tolerance 3.0");
 }
 
 // ---------------------------------------------------------------------------
-// Deliverable 2 — C-03 NV12 odd-H
+// NV12 odd-H
 // ---------------------------------------------------------------------------
 
 #[test]
-fn c03_nv12_odd_h_to_rgb() {
+fn nv12_odd_h_to_rgb() {
     let (mae, max_diff) = jpeg_nv_to_rgb_mae("grey-rgb.jpg", PixelFormat::Nv12, 1024, 681);
-    eprintln!("C-03 NV12 odd-H: MAE={mae:.3}, max_diff={max_diff}");
-    assert!(
-        mae < 3.0,
-        "C-03: NV12 odd-H MAE {mae:.3} exceeds tolerance 3.0"
-    );
+    eprintln!("NV12 odd-H: MAE={mae:.3}, max_diff={max_diff}");
+    assert!(mae < 3.0, "NV12 odd-H MAE {mae:.3} exceeds tolerance 3.0");
 }
 
 // ---------------------------------------------------------------------------
-// Deliverable 2 — C-04 NV16 odd-H (analytic, even-W 64×63)
+// NV16 odd-H (analytic, even-W 64×63)
 // ---------------------------------------------------------------------------
 
 #[test]
-fn c04_nv16_odd_h_to_rgb() {
-    run_odd_both(64, 63, PixelFormat::Nv16, "C-04 NV16 64x63 odd-H");
+fn nv16_odd_h_to_rgb() {
+    run_odd_both(64, 63, PixelFormat::Nv16, "NV16 64x63 odd-H");
 }
 
 // ---------------------------------------------------------------------------
-// Deliverable 2 — C-05 NV24 odd-H (analytic, even-W 64×63)
+// NV24 odd-H (analytic, even-W 64×63)
 // ---------------------------------------------------------------------------
 
 #[test]
-fn c05_nv24_odd_h_to_rgb() {
-    run_odd_both(64, 63, PixelFormat::Nv24, "C-05 NV24 64x63 odd-H");
+fn nv24_odd_h_to_rgb() {
+    run_odd_both(64, 63, PixelFormat::Nv24, "NV24 64x63 odd-H");
 }
 
 // ---------------------------------------------------------------------------
@@ -526,10 +505,10 @@ fn degenerate_nv24_3x1() {
 }
 
 // ---------------------------------------------------------------------------
-// Deliverable 2 — C-06..08 analytically-constructed odd-both sources
+// Analytically-constructed odd-both sources
 // ---------------------------------------------------------------------------
 
-/// BT.601 full-range YCbCr→RGB (matches the HAL `yuv` crate kernel).
+/// BT.601 full-range YCbCr→RGB.
 fn bt601_ycbcr_to_rgb(y: u8, cb: u8, cr: u8) -> [u8; 3] {
     let y = y as f64;
     let cb = cb as f64 - 128.0;
@@ -546,7 +525,7 @@ fn bt601_ycbcr_to_rgb(y: u8, cb: u8, cr: u8) -> [u8; 3] {
 /// varies in both X and Y, and return the analytically-expected RGB output.
 ///
 /// Pattern: `Y(r,c) = (r*3 + c*5) % 256`
-/// Chroma:  `Cb(cc,cr) = (cc*7 + cr*11 + 40) % 256`  (non-neutral, creates colour)
+/// Chroma:  `Cb(cc,cr) = (cc*7 + cr*11 + 40) % 256`
 ///          `Cr(cc,cr) = (cc*13 + cr*3 + 80) % 256`
 /// where `cc`/`cr` are chroma-cell coordinates (divided by subsampling factor).
 fn make_odd_both_source(w: usize, h: usize, fmt: PixelFormat) -> (Tensor<u8>, Vec<[u8; 3]>) {
@@ -566,7 +545,7 @@ fn make_odd_both_source(w: usize, h: usize, fmt: PixelFormat) -> (Tensor<u8>, Ve
         PixelFormat::Nv24 => (0, 0),
         _ => panic!("unsupported format {fmt:?}"),
     };
-    // Number of chroma rows/columns: ceil(dim / divisor) to cover odd dims.
+    // Chroma rows and columns: ceil(dim / divisor).
     let chroma_h = h.div_ceil(1 << ch_shift);
     let chroma_w = w.div_ceil(1 << cw_shift);
 
@@ -581,12 +560,8 @@ fn make_odd_both_source(w: usize, h: usize, fmt: PixelFormat) -> (Tensor<u8>, Ve
                 buf[r * stride + c] = ((r * 3 + c * 5) % 256) as u8;
             }
         }
-        // Fill chroma (interleaved [Cb, Cr] per chroma column).
-        //
-        // NV12/NV16 UV row pitch = stride (same as luma): each chroma row
-        // occupies `stride` bytes.
-        // NV24 UV row pitch = stride*2: each image row of UV pairs occupies
-        // 2*stride bytes (the `yuv` crate uses `uv_stride = y_stride * 2`).
+        // Fill chroma (interleaved [Cb, Cr] per chroma column). The NV12/NV16
+        // UV row pitch is `stride`; the NV24 UV row pitch is `stride * 2`.
         let uv_row_stride = match fmt {
             PixelFormat::Nv24 => stride * 2,
             _ => stride,
@@ -602,17 +577,14 @@ fn make_odd_both_source(w: usize, h: usize, fmt: PixelFormat) -> (Tensor<u8>, Ve
         }
     }
 
-    // Tag the source BT.601 full-range so convert() uses the same matrix/range
-    // as the analytic `bt601_ycbcr_to_rgb` reference below. Without a tag, the
-    // colorimetry heuristic resolves an untagged SD tensor to BT.601 *limited*,
-    // expanding the luma and diverging from this full-range reference.
+    // Tags the source BT.601 full-range.
     src.set_colorimetry(Some(
         edgefirst_tensor::Colorimetry::default()
             .with_encoding(edgefirst_tensor::ColorEncoding::Bt601)
             .with_range(edgefirst_tensor::ColorRange::Full),
     ));
 
-    // Build analytic RGB reference using the same pattern and BT.601-full.
+    // Analytic RGB reference from the same pattern, BT.601 full-range.
     let mut expected = vec![[0u8; 3]; w * h];
     for r in 0..h {
         for c in 0..w {
@@ -681,57 +653,50 @@ fn run_odd_both(w: usize, h: usize, fmt: PixelFormat, label: &str) {
     let mut proc = CPUProcessor::default();
     proc.convert(&src_dyn, &mut dst_dyn, None).unwrap();
     let dst_u8 = dst_dyn.as_u8().unwrap();
-    // max_diff tolerance 4 (vs the analytic ideal): the YUV→RGB step rounds
-    // architecture-dependently — the `yuv` crate's NEON kernels differ from x86
-    // SSE by ~1 LSB, and NV12's 4:2:0 chroma upsampling at odd dimensions
-    // compounds it (observed max_diff 3 on aarch64 vs ≤2 on x86). Matches the
-    // colour tolerance of the sibling odd-width cases (C-04/C-05).
     check_analytic_rgb(dst_u8, &expected, w, h, label, 4);
 }
 
 #[test]
-fn c06_nv12_odd_both_small() {
-    run_odd_both(65, 63, PixelFormat::Nv12, "C-06 NV12 65x63");
+fn nv12_odd_both_small() {
+    run_odd_both(65, 63, PixelFormat::Nv12, "NV12 65x63");
 }
 
 #[test]
-fn c06_nv12_odd_both_medium() {
-    run_odd_both(789, 383, PixelFormat::Nv12, "C-06 NV12 789x383");
+fn nv12_odd_both_medium() {
+    run_odd_both(789, 383, PixelFormat::Nv12, "NV12 789x383");
 }
 
 #[test]
-fn c07_nv16_odd_both_small() {
-    run_odd_both(65, 63, PixelFormat::Nv16, "C-07 NV16 65x63");
+fn nv16_odd_both_small() {
+    run_odd_both(65, 63, PixelFormat::Nv16, "NV16 65x63");
 }
 
 #[test]
-fn c07_nv16_odd_both_medium() {
-    run_odd_both(789, 383, PixelFormat::Nv16, "C-07 NV16 789x383");
+fn nv16_odd_both_medium() {
+    run_odd_both(789, 383, PixelFormat::Nv16, "NV16 789x383");
 }
 
 #[test]
-fn c08_nv24_odd_both_small() {
-    run_odd_both(65, 63, PixelFormat::Nv24, "C-08 NV24 65x63");
+fn nv24_odd_both_small() {
+    run_odd_both(65, 63, PixelFormat::Nv24, "NV24 65x63");
 }
 
 #[test]
-fn c08_nv24_odd_both_medium() {
-    run_odd_both(789, 383, PixelFormat::Nv24, "C-08 NV24 789x383");
+fn nv24_odd_both_medium() {
+    run_odd_both(789, 383, PixelFormat::Nv24, "NV24 789x383");
 }
 
 // ---------------------------------------------------------------------------
-// Deliverable 2 — C-10 NV12→RGB i8 dtype
+// NV12→RGB i8 dtype
 // ---------------------------------------------------------------------------
 
-/// Decode jaguar.jpg to NV12, convert to RGB i8, verify the XOR-0x80 bias
-/// matches the u8 path.
+/// NV12→RGB into i8 equals the u8 output XOR 0x80.
 #[test]
-fn c10_nv12_to_rgb_i8() {
+fn nv12_to_rgb_i8() {
     let jpeg = testdata("jaguar.jpg");
     let w = 789usize;
     let h = 384usize;
 
-    // i8 output path
     let mut src_i8 = Tensor::<u8>::image(
         w,
         h,
@@ -757,7 +722,6 @@ fn c10_nv12_to_rgb_i8() {
     let mut proc = CPUProcessor::default();
     proc.convert(&src_i8_dyn, &mut dst_i8_dyn, None).unwrap();
 
-    // u8 reference path
     let mut src_u8 = Tensor::<u8>::image(
         w,
         h,
@@ -803,21 +767,20 @@ fn c10_nv12_to_rgb_i8() {
     }
     assert!(
         max_diff <= 1,
-        "C-10: i8 output vs XOR-biased u8, max_diff={max_diff} > 1"
+        "i8 output vs XOR-biased u8, max_diff={max_diff} > 1"
     );
 }
 
 // ---------------------------------------------------------------------------
-// Deliverable 2 — C-11 NV12→RGB f16 dtype
+// NV12→RGB f16 dtype
 // ---------------------------------------------------------------------------
 
 #[test]
-fn c11_nv12_to_rgb_f16() {
+fn nv12_to_rgb_f16() {
     let jpeg = testdata("jaguar.jpg");
     let w = 789usize;
     let h = 384usize;
 
-    // f16 output path
     let mut src_f16 = Tensor::<u8>::image(
         w,
         h,
@@ -843,7 +806,6 @@ fn c11_nv12_to_rgb_f16() {
     let mut proc = CPUProcessor::default();
     proc.convert(&src_f16_dyn, &mut dst_f16_dyn, None).unwrap();
 
-    // u8 reference path
     let mut src_u8 = Tensor::<u8>::image(
         w,
         h,
@@ -890,12 +852,12 @@ fn c11_nv12_to_rgb_f16() {
     }
     assert!(
         max_err <= tol,
-        "C-11: f16 output max error {max_err:.5} > tolerance {tol}"
+        "f16 output max error {max_err:.5} > tolerance {tol}"
     );
 }
 
 // ---------------------------------------------------------------------------
-// Deliverable 2 — Letterbox-resize sanity
+// Letterbox-resize sanity
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -915,7 +877,7 @@ fn letterbox_resize_sanity_nv12_to_rgb_640() {
     let mut dec = ImageDecoder::new();
     src.load_image(&mut dec, &jpeg).unwrap();
 
-    // Letterbox 789×384 into 640×640 — the backend computes the centred band.
+    // Letterbox 789×384 into 640×640.
     let _ = h;
     let crop = Crop::letterbox([114, 114, 114, 255]);
 
@@ -942,7 +904,6 @@ fn letterbox_resize_sanity_nv12_to_rgb_640() {
     let map = dst_u8.map().unwrap();
     let out = map.as_slice();
 
-    // Content band (mid-height row) should contain non-padding pixels.
     let mid_row = 640 / 2;
     let content_nonzero = out[mid_row * dst_stride..mid_row * dst_stride + 640 * 3]
         .iter()
@@ -953,7 +914,6 @@ fn letterbox_resize_sanity_nv12_to_rgb_640() {
         "letterbox mid row should have image content, got {content_nonzero} non-padding pixels"
     );
 
-    // Padding rows (top-of-frame) should be the fill colour.
     let pad_row = 10usize;
     assert_eq!(
         out[pad_row * dst_stride..pad_row * dst_stride + 3],
@@ -963,18 +923,15 @@ fn letterbox_resize_sanity_nv12_to_rgb_640() {
 }
 
 // ---------------------------------------------------------------------------
-// Deliverable 3 — RGB→NV16 encoder stride correctness
+// RGB→NV16 encoder stride correctness
 // ---------------------------------------------------------------------------
 
-/// Allocate a stride-aligned NV16 destination, fill via RGB→NV16, then
-/// convert back NV16→RGB and compare to the reference (both paths produce
-/// the same round-trip so max_diff == 0).
+/// RGB→NV16→RGB through a stride-aligned NV16 matches the same round trip through a second NV16.
 #[test]
-fn d3_rgb_to_nv16_stride_round_trip() {
+fn rgb_to_nv16_stride_round_trip() {
     let w = 789usize; // odd width
     let h = 64usize;
 
-    // Build reference RGB (tight)
     let build_ref_rgb = || -> Tensor<u8> {
         let mut s = Tensor::<u8>::image(
             w,
@@ -998,7 +955,7 @@ fn d3_rgb_to_nv16_stride_round_trip() {
         s
     };
 
-    // --- Strided NV16 path ---
+    // Strided NV16 path.
     let mut nv16 = Tensor::<u8>::image(
         w,
         h,
@@ -1019,7 +976,6 @@ fn d3_rgb_to_nv16_stride_round_trip() {
     let mut proc = CPUProcessor::default();
     proc.convert(&src_dyn, &mut nv16_dyn, None).unwrap();
 
-    // NV16 → RGB
     let mut out_dyn = TensorDyn::image(
         w,
         h,
@@ -1031,7 +987,7 @@ fn d3_rgb_to_nv16_stride_round_trip() {
     .unwrap();
     proc.convert(&nv16_dyn, &mut out_dyn, None).unwrap();
 
-    // --- Reference: direct RGB→RGB (no NV16 intermediate), same pattern ---
+    // Reference: direct RGB→RGB with the same pattern.
     let src2_dyn = TensorDyn::from(build_ref_rgb());
     let mut ref_dyn = TensorDyn::image(
         w,
@@ -1042,8 +998,7 @@ fn d3_rgb_to_nv16_stride_round_trip() {
         edgefirst_tensor::CpuAccess::ReadWrite,
     )
     .unwrap();
-    // To get the same YUV round-trip losses, also go through NV16→RGB using a
-    // fresh NV16 tensor (identical code path, tight or strided).
+    // The same round trip through a second NV16 tensor.
     let mut nv16_ref = Tensor::<u8>::image(
         w,
         h,
@@ -1073,7 +1028,6 @@ fn d3_rgb_to_nv16_stride_round_trip() {
             }
         }
     }
-    // Both use identical NV16 encode/decode — results must be identical.
     assert_eq!(
         max_diff, 0,
         "d3: strided NV16 round-trip differs from reference: max_diff={max_diff}"
@@ -1081,19 +1035,17 @@ fn d3_rgb_to_nv16_stride_round_trip() {
 }
 
 // ---------------------------------------------------------------------------
-// Deliverable 3 — CPU resize strided-source path
+// CPU resize strided-source path
 // ---------------------------------------------------------------------------
 
-/// Resize a strided RGB tensor and compare to the resize of the same tight
-/// source.  Proves the de-striding copy in `resize_flip_rotate_pf` is correct.
+/// Resizing a strided RGB tensor matches resizing the same tight source.
 #[test]
-fn d3_resize_strided_rgb_source() {
+fn resize_strided_rgb_source() {
     let w = 64usize;
     let h = 48usize;
     let dst_w = 32usize;
     let dst_h = 24usize;
 
-    // Build the pixel pattern
     let fill_pattern = |buf: &mut [u8], row_stride: usize| {
         for r in 0..h {
             for c in 0..w {
@@ -1105,7 +1057,6 @@ fn d3_resize_strided_rgb_source() {
         }
     };
 
-    // Tight source (natural stride = w*3 = 192)
     let tight_src = {
         let mut s = Tensor::<u8>::image(
             w,
@@ -1124,11 +1075,7 @@ fn d3_resize_strided_rgb_source() {
         s
     };
 
-    // Strided source: use `image_with_stride` to allocate an Rgb tensor with a
-    // row stride larger than w*3.  On Linux (DMA backing) this is natively
-    // supported and gives a real padded allocation.  On other platforms,
-    // fall back to the tight allocation (the resize path is still exercised,
-    // just without the copy-to-tight branch — a no-op is fine there).
+    // A source with a row stride larger than w*3, or the tight allocation where unsupported.
     let padded_stride = 256usize; // 64-aligned, > w*3=192
     let (strided_src, strided_stride) = match strided_image(w, h, PixelFormat::Rgb, padded_stride) {
         Some(mut s) => {
@@ -1140,7 +1087,7 @@ fn d3_resize_strided_rgb_source() {
             (s, stride)
         }
         None => {
-            // No padded-stride image here (warned above); use tight.
+            // No padded-stride image: use tight.
             let mut s = Tensor::<u8>::image(
                 w,
                 h,
@@ -1160,7 +1107,6 @@ fn d3_resize_strided_rgb_source() {
 
     let mut proc = CPUProcessor::default();
 
-    // Resize tight source
     let tight_dyn = TensorDyn::from(tight_src);
     let mut tight_dst = TensorDyn::image(
         dst_w,
@@ -1173,7 +1119,6 @@ fn d3_resize_strided_rgb_source() {
     .unwrap();
     proc.convert(&tight_dyn, &mut tight_dst, None).unwrap();
 
-    // Resize strided source
     let strided_dyn = TensorDyn::from(strided_src);
     let mut strided_dst = TensorDyn::image(
         dst_w,
@@ -1187,11 +1132,10 @@ fn d3_resize_strided_rgb_source() {
     proc.convert(&strided_dyn, &mut strided_dst, None).unwrap();
 
     if strided_stride == w * 3 {
-        // Both paths are identical (fallback hit); trivially passes.
+        // The tight fallback was used for both sources.
         return;
     }
 
-    // Both should produce identical resize output
     let t_u8 = tight_dst.as_u8().unwrap();
     let s_u8 = strided_dst.as_u8().unwrap();
     let t_map = t_u8.map().unwrap();
@@ -1215,7 +1159,7 @@ fn d3_resize_strided_rgb_source() {
 }
 
 // ---------------------------------------------------------------------------
-// WS0 correctness regressions
+// Packed-YUV to GREY and planar round trips
 // ---------------------------------------------------------------------------
 
 /// Convert a packed-YUV tensor to GREY through the public CPU pipeline and
@@ -1244,11 +1188,9 @@ fn cpu_to_grey_packed(src: Tensor<u8>, w: usize, h: usize) -> Vec<u8> {
     out
 }
 
-/// Packed YUYV/VYUY → GREY must read luma honouring the source row stride. A
-/// padded (DMA / V4L2) source previously chunked the flat map and read pad
-/// bytes as luma; the tight and strided sources must now agree. `luma_off` is
-/// the byte offset of the luma sample within each 2-byte unit (0 for YUYV's
-/// `[Y,C]`, 1 for VYUY's `[C,Y]`).
+/// Packed YUYV/VYUY → GREY gives the same output for a tight source and a
+/// padded-stride source. `luma_off` is the byte offset of the luma sample
+/// within each 2-byte unit (0 for YUYV's `[Y,C]`, 1 for VYUY's `[C,Y]`).
 fn packed_yuv_to_grey_strided_matches_tight(fmt: PixelFormat, luma_off: usize) {
     let w = 64usize; // even width: one YUYV/VYUY macropixel spans 2 px
     let h = 16usize;
@@ -1281,8 +1223,7 @@ fn packed_yuv_to_grey_strided_matches_tight(fmt: PixelFormat, luma_off: usize) {
     };
     let tight_grey = cpu_to_grey_packed(tight, w, h);
 
-    // Strided source is DMA-backed (Linux only); elsewhere `image_with_stride`
-    // returns NotImplemented and the tight path above is the whole assertion.
+    // Strided source, where `image_with_stride` is supported.
     let padded = 192usize; // 64-aligned, > w*2 = 128
     if let Some(mut s) = strided_image(w, h, fmt, padded) {
         let stride = s.effective_row_stride().unwrap_or(padded);
@@ -1300,21 +1241,18 @@ fn packed_yuv_to_grey_strided_matches_tight(fmt: PixelFormat, luma_off: usize) {
 }
 
 #[test]
-fn d4_yuyv_to_grey_strided_matches_tight() {
+fn yuyv_to_grey_strided_matches_tight() {
     packed_yuv_to_grey_strided_matches_tight(PixelFormat::Yuyv, 0);
 }
 
 #[test]
-fn d5_vyuy_to_grey_strided_matches_tight() {
+fn vyuy_to_grey_strided_matches_tight() {
     packed_yuv_to_grey_strided_matches_tight(PixelFormat::Vyuy, 1);
 }
 
-/// Planar → packed read-back (`convert_8bps_*` / `convert_prgba_*`) round-trips
-/// losslessly. Locks in the stride-aware `planar_to_packed` helper on the tight
-/// path; the strided planar path is not reachable through the public API
-/// (`image_with_stride` rejects planar layouts) but shares the same code.
+/// Planar → packed read-back (`convert_8bps_*` / `convert_prgba_*`) round-trips losslessly.
 #[test]
-fn d6_planar_packed_roundtrip() {
+fn planar_packed_roundtrip() {
     let w = 40usize;
     let h = 24usize;
 
@@ -1378,7 +1316,7 @@ fn d6_planar_packed_roundtrip() {
         "RGB→PlanarRgb→RGB not identity"
     );
 
-    // RGBA → PlanarRgba → RGBA is the identity (exercises the alpha plane).
+    // RGBA → PlanarRgba → RGBA is the identity.
     let mut rgba = Tensor::<u8>::image(
         w,
         h,
@@ -1414,16 +1352,6 @@ fn d6_planar_packed_roundtrip() {
 
 // ---------------------------------------------------------------------------
 // Fused NV→PlanarRgb / PlanarRgba (strip decode) parity
-//
-// The fused no-resize NV→planar path (`convert_nv_to_planar_fused`) decodes the
-// YUV source into packed RGB one row strip at a time and deinterleaves each
-// strip into the destination planes. It must be byte-for-byte identical to the
-// proven NV→RGB packed path (same `yuv` kernel, just full-image vs strip): NV12
-// 4:2:0 replicates one chroma row across two luma rows, so strip boundaries do
-// not change the per-row chroma pairing. The source fill is arbitrary — both
-// paths read the same bytes — so any seam from strip decoding would surface as a
-// mismatch. Sizes are chosen to straddle the 32-row strip boundary and exercise
-// odd widths/heights (the partial last strip).
 // ---------------------------------------------------------------------------
 
 fn fused_nv_planar_parity(w: usize, h: usize, fmt: PixelFormat, with_alpha: bool, label: &str) {
@@ -1460,7 +1388,7 @@ fn fused_nv_planar_parity(w: usize, h: usize, fmt: PixelFormat, with_alpha: bool
     .unwrap();
     proc.convert(&src_dyn, &mut planar, None).unwrap();
 
-    // Reference: the proven NV→RGB packed conversion (unchanged path).
+    // Reference: the NV→RGB packed conversion.
     let mut rgb = TensorDyn::image(
         w,
         h,
@@ -1536,12 +1464,7 @@ fn fused_nv_planar_parity_matrix() {
 // ---------------------------------------------------------------------------
 
 /// Convert `src_fmt` → YUYV at `w`×`h` and assert every destination byte was
-/// written — no poison survives.
-///
-/// YUYV packs two pixels per 4-byte `[Y0,U,Y1,V]` macropixel, so an odd width
-/// ends with an unpaired pixel whose row has room for only its `[Y,U]`. The
-/// per-row encoders must still write those 2 bytes; skipping them leaves the
-/// caller reading whatever the buffer held before as pixel data.
+/// written.
 fn yuyv_dst_fully_written(w: usize, h: usize, src_fmt: PixelFormat, label: &str) {
     const POISON: u8 = 0xAB;
 
@@ -1593,8 +1516,7 @@ fn yuyv_dst_fully_written(w: usize, h: usize, src_fmt: PixelFormat, label: &str)
             !row.iter().all(|&b| b == POISON),
             "{label}: row {y} was not written at all"
         );
-        // The trailing pixel of an odd-width row is the regression: it is the
-        // only part a per-row `chunks::<4>()` walk drops.
+        // The trailing pixel of an odd-width row.
         let tail = &row[row_bytes.saturating_sub(2)..];
         assert!(
             tail.iter().any(|&b| b != POISON),
@@ -1604,30 +1526,29 @@ fn yuyv_dst_fully_written(w: usize, h: usize, src_fmt: PixelFormat, label: &str)
 }
 
 #[test]
-fn d7_odd_width_rgb_to_yuyv_writes_every_byte() {
+fn odd_width_rgb_to_yuyv_writes_every_byte() {
     for (w, h) in [(5, 3), (7, 1), (1, 4), (65, 33)] {
         yuyv_dst_fully_written(w, h, PixelFormat::Rgb, &format!("rgb→yuyv {w}x{h}"));
     }
 }
 
 #[test]
-fn d7_odd_width_rgba_to_yuyv_writes_every_byte() {
+fn odd_width_rgba_to_yuyv_writes_every_byte() {
     for (w, h) in [(5, 3), (7, 1), (1, 4), (65, 33)] {
         yuyv_dst_fully_written(w, h, PixelFormat::Rgba, &format!("rgba→yuyv {w}x{h}"));
     }
 }
 
 #[test]
-fn d7_odd_width_grey_to_yuyv_writes_every_byte() {
+fn odd_width_grey_to_yuyv_writes_every_byte() {
     for (w, h) in [(5, 3), (7, 1), (1, 4), (65, 33)] {
         yuyv_dst_fully_written(w, h, PixelFormat::Grey, &format!("grey→yuyv {w}x{h}"));
     }
 }
 
-/// Even-width YUYV must be unchanged by the odd-width tail handling: every
-/// macropixel is a full pair, so the tail branch never runs.
+/// Even-width RGB → YUYV writes every destination byte.
 #[test]
-fn d7_even_width_rgb_to_yuyv_writes_every_byte() {
+fn even_width_rgb_to_yuyv_writes_every_byte() {
     for (w, h) in [(4, 2), (64, 32)] {
         yuyv_dst_fully_written(w, h, PixelFormat::Rgb, &format!("rgb→yuyv {w}x{h}"));
     }

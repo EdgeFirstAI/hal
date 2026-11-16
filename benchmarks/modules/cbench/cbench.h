@@ -3,14 +3,9 @@
  *
  * Shared C harness for single-library decode arms (stb_image, Wuffs).
  *
- * Every definition that moves a number is copied verbatim from
- * modules/turbojpeg/bench.c, which in turn mirrors benchmarks/common: the
- * evenly-spaced image selection, preload-before-timing, CLOCK_MONOTONIC
- * around decode alone, percentile index, median-CI ranks, MP/s definition,
- * peak-RSS source, and CSV schema. A new arm built on this header therefore
- * differs from the Rust and TurboJPEG arms only in the decoder it calls.
- * If a definition changes here, change bench.c and benchmarks/common to
- * match (and vice versa).
+ * Uses the same image selection, preload, CLOCK_MONOTONIC timing of decode
+ * alone, percentile index, median-CI ranks, MP/s definition, peak-RSS
+ * source and CSV schema as modules/turbojpeg/bench.c and benchmarks/common.
  */
 
 #ifndef EDGEFIRST_CBENCH_H
@@ -36,16 +31,8 @@
 #include <pthread/qos.h>
 #endif
 
-/* macOS has no taskset-equivalent core pinning, and unpinned P-core/E-core
- * migration between rounds is a real, measured source of extra spread on
- * mbp-m2-max (see BENCHMARKS.md's discussion of this board's Max-spread
- * column). QOS_CLASS_USER_INTERACTIVE is an *advisory* hint, not a hard
- * affinity pin — the scheduler is still free to migrate the thread — but it
- * biases toward the performance cores and away from being pre-empted by
- * lower-QoS background work, which is the best available substitute for
- * taskset on this platform. Call once, before the timed loop. No-op
- * (including on non-Apple platforms, where taskset does the real job).
- */
+/* Advisory QoS hint on macOS: bias the calling thread toward the performance
+ * cores. Call once, before the timed loop. No-op on non-Apple platforms. */
 static void cbench_pin_qos(void) {
 #ifdef __APPLE__
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
@@ -65,7 +52,7 @@ cbench_die(const char *fmt, ...) {
     exit(1);
 }
 
-/* --- timing / stats: identical definitions to benchmarks/common ---------- */
+/* --- timing / stats ------------------------------------------------------ */
 
 static double cbench_now_ms(void) {
     struct timespec ts;
@@ -78,7 +65,7 @@ static int cbench_cmp_double(const void *a, const void *b) {
     return (x > y) - (x < y);
 }
 
-/* `idx = round(p * (n - 1))`, as TimingStats::from_samples does. */
+/* `idx = round(p * (n - 1))`. */
 static double cbench_percentile(const double *sorted, size_t n, double p) {
     if (n == 0) return 0.0;
     double pos = p * ((double)n - 1.0);
@@ -87,9 +74,8 @@ static double cbench_percentile(const double *sorted, size_t n, double p) {
     return sorted[idx];
 }
 
-/* 0-based sorted-sample indices bounding the ~95% CI for the median, identical
- * to benchmarks/common median_ci_indices(): 1-based ranks
- * floor(n/2 - 1.96*sqrt(n)/2) and ceil(n/2 + 1 + 1.96*sqrt(n)/2), clamped. */
+/* 0-based sorted-sample indices bounding the ~95% CI for the median: 1-based
+ * ranks floor(n/2 - 1.96*sqrt(n)/2) and ceil(n/2 + 1 + 1.96*sqrt(n)/2), clamped. */
 static void cbench_median_ci_indices(size_t n, size_t *lo, size_t *hi) {
     if (n == 0) {
         *lo = *hi = 0;
@@ -105,7 +91,7 @@ static void cbench_median_ci_indices(size_t n, size_t *lo, size_t *hi) {
     *hi = (size_t)hi_rank - 1;
 }
 
-/* Peak RSS, matching peak_rss_mb(). Linux VmHWM is kB; Darwin ru_maxrss is bytes. */
+/* Peak RSS in MB. Linux VmHWM is kB; Darwin ru_maxrss is bytes. */
 static double cbench_peak_rss_mb(void) {
 #ifdef __APPLE__
     struct rusage ru;
@@ -128,16 +114,14 @@ static double cbench_peak_rss_mb(void) {
 #endif
 }
 
-/* Process CPU time; the decode loop is single-threaded, so this doubles as the
- * busiest-core figure. From the CPU clock rather than /proc/self/stat (jiffy
- * quantisation misreports short runs). */
+/* Process CPU time, from the process CPU clock. */
 static double cbench_process_cpu_seconds(void) {
     struct timespec ts;
     if (clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &ts) != 0) return 0.0;
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
 }
 
-/* --- image list: sorted, then evenly spaced, as list_jpegs() does -------- */
+/* --- image list: sorted, then evenly spaced ------------------------------ */
 
 typedef struct {
     char *name;
@@ -182,8 +166,7 @@ static CbenchImage *cbench_preload(char **paths, size_t total, size_t limit, siz
     size_t n = (limit > 0 && limit < total) ? limit : total;
     CbenchImage *images = (CbenchImage *)calloc(n, sizeof(*images));
     for (size_t i = 0; i < n; i++) {
-        /* paths[i * total / n] — the Rust harness's spacing, so every arm sees
-         * the same subset of val2017 for a given --limit. */
+        /* Evenly spaced subset: paths[i * total / n]. */
         const char *path = (limit > 0 && limit < total) ? paths[i * total / n] : paths[i];
         FILE *f = fopen(path, "rb");
         if (!f) cbench_die("open %s", path);
@@ -211,10 +194,9 @@ typedef struct {
     const char *csv_path;
     size_t limit, warmup;
     int verbose;
-    /* --parity: skip the timed loop entirely and instead report pixel
-     * parity (cosine/mean|d|/max|d|/PSNR) against dlopen'd libturbojpeg
-     * islow — see cbench_run_parity(). `parity_lib` overrides the search,
-     * same env var the Rust parity/turbojpeg arms use. */
+    /* --parity: skip the timed loop and report pixel parity
+     * (cosine/mean|d|/max|d|/PSNR) against dlopen'd libturbojpeg islow.
+     * `parity_lib` overrides the library search. */
     int parity;
     const char *parity_lib;
 } CbenchArgs;
@@ -252,8 +234,7 @@ static CbenchArgs cbench_parse_args(int argc, char **argv) {
         else if (!strcmp(arg, "--csv")) a.csv_path = CBENCH_NEXT("--csv");
         else if (!strcmp(arg, "--verbose")) a.verbose = 1;
         else if (!strcmp(arg, "--parity")) a.parity = 1;
-        /* Accepted and ignored: these arms only do decode-only, which is what
-         * the flag selects on the HAL side. */
+        /* Accepted and ignored. */
         else if (!strcmp(arg, "--decode-only")) continue;
         else cbench_usage(argv[0]);
 #undef CBENCH_NEXT
@@ -262,8 +243,8 @@ static CbenchArgs cbench_parse_args(int argc, char **argv) {
     return a;
 }
 
-/* Standard console line + CSV row (schema identical to benchmarks/common and
- * bench.c). `samples` is sorted in place. `notes` must not contain commas. */
+/* Standard console line + CSV row. `samples` is sorted in place. `notes` must
+ * not contain commas. */
 static void cbench_report(const CbenchArgs *a, const char *module, const char *notes,
                           double *samples, size_t n, double total_mpix, double cpu_pct) {
     qsort(samples, n, sizeof(*samples), cbench_cmp_double);
@@ -303,13 +284,8 @@ static void cbench_report(const CbenchArgs *a, const char *module, const char *n
 
 /* --- accuracy parity vs TurboJPEG islow (--parity) ----------------------- */
 /*
- * Neither stb_image nor Wuffs does box-upsample chroma resampling of its
- * own, so both are always graded against plain accurate `islow` — never
- * `TJFLAG_FASTUPSAMPLE` (that flag is EdgeFirst's/turbo's matched-config
- * comparison, not applicable here). This retires the doc-comment-only
- * "measured against djpeg" claims each arm's header used to carry with a
- * real, reproducible, in-process number tied to a `--parity` invocation
- * anyone can re-run — see BENCHMARKS.md § JPEG Decode.
+ * Grades an arm's output against libturbojpeg's accurate `islow` decode,
+ * without `TJFLAG_FASTUPSAMPLE`. See BENCHMARKS.md § JPEG Decode.
  */
 
 #define CBENCH_TJPF_RGB 0
@@ -333,7 +309,7 @@ typedef struct {
     const char *path;
 } CbenchTurboJpeg;
 
-/* Same candidate list as rgb_parity / turbojpeg/bench.c's tj_load. */
+/* Candidate libturbojpeg library names; `override` replaces the search. */
 static void cbench_tj_load(CbenchTurboJpeg *tj, const char *override) {
     if (override && *override) {
         tj->handle = dlopen(override, RTLD_NOW);
@@ -386,11 +362,8 @@ static const char *cbench_tj_err(const CbenchTurboJpeg *tj) {
 }
 
 /* Decode `img` to tight interleaved RGB into `*out` (realloc'd as needed,
- * `*out_cap` tracks the allocation so repeat calls reuse it — same
- * high-water-mark discipline the timed loop uses). Returns 0 on success,
- * nonzero to skip this image (recorded, not fatal — a handful of
- * arm-specific decode rejections, e.g. a shape one decoder declines, should
- * not abort an otherwise-representative parity run). */
+ * `*out_cap` tracks the allocation). Returns 0 on success, nonzero to skip
+ * this image. */
 typedef int (*CbenchParityDecodeFn)(const CbenchImage *img, unsigned char **out, size_t *out_cap,
                                     int *w, int *h);
 
@@ -399,9 +372,7 @@ static double cbench_parity_psnr(double mse) {
 }
 
 /* Runs the full corpus through `decode_fn` and through dlopen'd turbo
- * islow, reports aggregate cosine/mean|d|/max|d|/PSNR — the Table
- * A conformance numbers for an arm with no chroma-upsample filter choice
- * of its own (see the file-level comment above). */
+ * islow, and reports aggregate cosine/mean|d|/max|d|/PSNR. */
 static void cbench_run_parity(const CbenchArgs *a, const char *module,
                               CbenchParityDecodeFn decode_fn) {
     CbenchTurboJpeg tj = {0};

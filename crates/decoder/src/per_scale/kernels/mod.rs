@@ -18,8 +18,7 @@ pub(crate) fn decoder_cpu_features() -> Result<CpuFeatures, crate::DecoderError>
     )
 }
 
-/// A forced tier for the calling thread only, so a test can force an invalid tier without the
-/// process environment reaching tests running on other threads.
+/// A forced tier for the calling thread only.
 #[cfg(test)]
 pub(crate) mod forced_for_test {
     use std::cell::Cell;
@@ -108,7 +107,7 @@ mod cpu_tests {
         );
     }
 
-    /// Serializes tests that override an env var; the environment is per process.
+    /// Serializes tests that override an env var.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// Overrides an env var while holding `ENV_LOCK`, restoring it on drop (even on panic).
@@ -140,8 +139,7 @@ mod cpu_tests {
         }
     }
 
-    /// Sets `scalar`, a valid tier, so a plan built concurrently on another thread still gets a
-    /// valid dispatch; the only test that sets this variable.
+    /// `EDGEFIRST_DECODER_FORCE_KERNEL=scalar` in the environment gives the scalar tier.
     #[test]
     fn decoder_cpu_features_reads_the_documented_variable() {
         let _g = EnvGuard::set("EDGEFIRST_DECODER_FORCE_KERNEL", "scalar");

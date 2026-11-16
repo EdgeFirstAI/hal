@@ -9,23 +9,18 @@
 #   hal_fast         EdgeFirst DctMethod::Fast (AAN, opt-in; EDGEFIRST_CODEC_DCT=fast)
 #   tj_islow         libjpeg-turbo accurate IDCT (its default)
 #   tj_ifast         libjpeg-turbo fast IDCT
-#   tj_fastupsample  libjpeg-turbo accurate IDCT + TJFLAG_FASTUPSAMPLE (RGB
-#                    only): the matched-accuracy-class comparator for
-#                    EdgeFirst's fused native-4:2:0 box chroma upsample —
-#                    same discipline as tj_islow/tj_ifast for the IDCT
+#   tj_fastupsample  libjpeg-turbo accurate IDCT + TJFLAG_FASTUPSAMPLE (RGB only)
 #   zune             zune-jpeg (Rust; YCbCr / RGB output)
-#   image            image crate (Rust; RGB only — its API has no raw-YUV output)
+#   image            image crate (Rust; RGB only)
 #   stb              stb_image (C single-header; RGB only, allocates per call)
 #   wuffs            Wuffs v0.4 (Google, memory-safe C; RGB only)
 #
 # Release profile, no perf/trace. Arms alternate inside one session per round,
-# pinned to one core. The claim number is the MEDIAN p50 across rounds, with
-# every round's p50 and the min–max spread reported next to it (best-of-N
-# systematically favours the low tail; the median of interleaved rounds does
-# not). Build/run provenance for each host is captured to provenance.txt.
-# Supports aarch64 boards and x86_64 hosts (the turbojpeg C bench is compiled
-# on the remote host with its native gcc; Rust arms are cross-built with
-# zigbuild).
+# pinned to one core. Reports the median p50 across rounds, with every round's
+# p50 and the min–max spread. Build/run provenance for each host is captured
+# to provenance.txt. Supports aarch64 boards and x86_64 hosts (the turbojpeg C
+# bench is compiled on the remote host with its native gcc; Rust arms are
+# cross-built with zigbuild).
 #
 # Usage:
 #   ./benchmarks/scripts/decode-ab-sweep.sh imx8mp-frdm imx95-pro rpi5-hailo x86-desktop
@@ -45,11 +40,9 @@ ROUNDS="${ROUNDS:-3}"
 PIN="${PIN:-0}"
 REMOTE_COCO="${EDGEFIRST_BENCH_COCO_REMOTE:-/data/coco/val2017}"
 # Corpus identity (val2017, val2017-yuv420, jpeg-yuv420, …): names the
-# results subdirectory so control-corpus runs never overwrite the primary,
-# and extends the remote fallback search to ~/corpora/<name> (hosts where
-# /data is not writable).
+# results subdirectory and the remote fallback search path ~/corpora/<name>.
 CORPUS_NAME="$(basename "${REMOTE_COCO}")"
-# Home-relative: /tmp is quota-limited tmpfs on some hosts.
+# Remote directory, relative to the home directory.
 REMOTE_BIN_DIR="edgefirst-bench-decode-sweep"
 
 if [[ $# -gt 0 ]]; then
@@ -88,9 +81,8 @@ median_spread() {
     }'
 }
 
-# Record everything a reader needs to reproduce this host's numbers:
-# toolchain + comparator versions on the build side, kernel / CPU / governor /
-# clocks / libturbojpeg resolution on the run side.
+# Record toolchain + comparator versions on the build side, and kernel / CPU /
+# governor / clocks / libturbojpeg resolution on the run side.
 capture_provenance() { # host out_dir
   local host="$1" out="$2"
   {
@@ -183,8 +175,7 @@ for target in "${TARGETS[@]}"; do
   fi
   # stb + wuffs benches: statically compiled cross-binaries for either arch
   # (zig cc; their pinned single-file sources are fetched by `make deps`).
-  # Non-fatal: a missing zig / offline fetch loses the stb+wuffs arms for
-  # this target (their runs FAIL individually) without killing the sweep.
+  # A failed build drops the stb+wuffs arms for this target.
   if make -C "${BENCH_WS}/modules/stb" "${arch}" \
     && make -C "${BENCH_WS}/modules/wuffs" "${arch}"; then
     scp -q "${BENCH_WS}/modules/stb/build/stb_bench.${arch}" \
@@ -195,8 +186,7 @@ for target in "${TARGETS[@]}"; do
     echo "  WARN: stb/wuffs cross-build failed; their arms will FAIL on ${target}"
   fi
   ssh "${target}" "chmod +x ${REMOTE_BIN_DIR}/hal_cpu ${REMOTE_BIN_DIR}/rust_jpeg ${REMOTE_BIN_DIR}/turbojpeg_bench"
-  # Tolerant for the optional arms: absent binaries (failed cross-build/scp
-  # above) must not kill the sweep under set -e — their runs FAIL per-cell.
+  # The optional arms' binaries may be absent.
   ssh "${target}" "chmod +x ${REMOTE_BIN_DIR}/stb_bench ${REMOTE_BIN_DIR}/wuffs_bench 2>/dev/null" || true
 
   pin_cmd="taskset -c ${PIN}"
@@ -243,11 +233,8 @@ for target in "${TARGETS[@]}"; do
         run_arm wuffs "${round}" "${fmt}" \
           "./wuffs_bench --limit ${LIMIT} --warmup ${WARMUP} --board '${target}' \
            --decode-only --format rgb"
-        # Matched-accuracy-class comparator for EdgeFirst's fused native-4:2:0
-        # box chroma upsample: turbo's TJFLAG_FASTUPSAMPLE selects the same
-        # box/nearest-neighbour accuracy class, same discipline as tj_islow
-        # vs tj_ifast for the IDCT. RGB-only — --upsample is a no-op on the
-        # YUV arm (tjDecompressToYUV2 never resamples chroma).
+        # libjpeg-turbo with TJFLAG_FASTUPSAMPLE (box/nearest-neighbour chroma
+        # upsample). RGB only.
         run_arm tj_fastupsample "${round}" "${fmt}" \
           "./turbojpeg_bench --limit ${LIMIT} --warmup ${WARMUP} --board '${target}' \
            --decode-only --format rgb --dct accurate --upsample fast"

@@ -1,18 +1,18 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! Focused mask decode benchmark for the RETINA (scaled) path.
+//! Mask decode benchmark for the scaled (RETINA) path.
 //!
-//! Benchmarks `materialize_scaled_segmentations` — the COCO-eval critical path
-//! that upsamples i8 proto-plane logits to original-image resolution via
-//! bilinear interpolation + binary threshold.
+//! Benchmarks `materialize_scaled_segmentations`, which upsamples i8
+//! proto-plane logits to original-image resolution via bilinear interpolation
+//! and a binary threshold.
 //!
 //! ## Test data
 //!
 //! Uses `testdata/mask_decode_scaled.safetensors` containing post-NMS tensors
-//! (protos, coefficients, boxes) captured from a real YOLOv8n-seg inference.
-//! If the file doesn't exist, falls back to decoding from the raw `.bin`
-//! fixtures and generates the safetensors file for future runs.
+//! (protos, coefficients, boxes) from a YOLOv8n-seg inference. If the file
+//! doesn't exist, decodes from the raw `.bin` fixtures and generates the
+//! safetensors file.
 //!
 //! ## Run benchmarks (host)
 //! ```bash
@@ -46,20 +46,16 @@ const WARMUP: usize = 10;
 const ITERATIONS: usize = 100;
 
 // Quantization parameters from the YOLOv8 segmentation test model.
-// The fixtures were exported with these specific scale/zp values, so the
-// bench wires them into the Decoder schema verbatim.
 const BOXES_SCALE: f32 = 0.019_484_945;
 const BOXES_ZP: i32 = 20;
 const PROTOS_SCALE: f32 = 0.020_889_873;
 const PROTOS_ZP: i32 = -115;
 
-// Use a low threshold matching COCO evaluation (ara2-validator --with-masks).
-// This produces many detections (up to ~100+ per image) — the worst-case that
-// we need to optimize for. NMS IoU stays at 0.45 (standard).
+// COCO-evaluation score threshold and NMS IoU threshold.
 const SCORE_THRESHOLD: f32 = 0.001;
 const IOU_THRESHOLD: f32 = 0.45;
 
-// Typical COCO image dimensions (non-square, letterboxed into 640×640 model input).
+// COCO image dimensions (letterboxed into the 640×640 model input).
 const COCO_W: u32 = 640;
 const COCO_H: u32 = 480;
 
@@ -95,10 +91,8 @@ fn load_protos_tensor() -> TensorDyn {
     TensorDyn::I8(t)
 }
 
-/// Build a YOLOv8-seg decoder. The `score_threshold`, `pre_nms_top_k`,
-/// `max_det`, and `nms` parameters are tuned per call site to expose
-/// different points along the decode-cost curve (e.g. COCO-eval at 0.001
-/// vs. typical inference at 0.25).
+/// Build a YOLOv8-seg decoder with the given `score_threshold`,
+/// `pre_nms_top_k`, `max_det` and `nms`.
 fn build_decoder(
     score_threshold: f32,
     pre_nms_top_k: usize,
@@ -131,9 +125,7 @@ fn build_decoder(
         .expect("yolov8-seg bench decoder must build")
 }
 
-// Match the decoder's internal default top-K (kept in sync with
-// `crates/decoder/src/yolo.rs::MAX_NMS_CANDIDATES`). Used as the upper bound
-// when measuring "no top-K cap" decode cost.
+// The decoder's default pre-NMS top-K.
 const MAX_NMS_CANDIDATES: usize = 30_000;
 
 /// Run NMS decode to get ProtoData + DetectBox from raw fixtures.
@@ -155,8 +147,8 @@ fn decode_from_fixtures() -> (Vec<DetectBox>, ProtoData) {
     (output_boxes, proto_data)
 }
 
-/// Try to load pre-decoded data from safetensors. If the file doesn't exist,
-/// falls back to decoding from raw fixtures and optionally saves the result.
+/// Load pre-decoded data from safetensors, or decode from the raw fixtures
+/// and save the result.
 fn load_test_data() -> (Vec<DetectBox>, ProtoData) {
     let st_path = safetensors_path();
     if st_path.exists() {
@@ -171,7 +163,7 @@ fn load_test_data() -> (Vec<DetectBox>, ProtoData) {
     // Fall back: decode from raw .bin fixtures.
     let (detect, proto_data) = decode_from_fixtures();
 
-    // Try to save for future runs (non-fatal if it fails).
+    // Save for later runs; a failure is a warning.
     if let Err(e) = save_to_safetensors(&st_path, &detect, &proto_data) {
         eprintln!("  [warn] Could not save safetensors: {e}");
     }
@@ -195,14 +187,12 @@ fn load_from_safetensors(path: &Path) -> Result<(Vec<DetectBox>, ProtoData), Str
     let protos_tensor = Tensor::<i8>::from_slice(&protos_i8, &protos_shape)
         .map_err(|e| format!("protos tensor: {e}"))?;
 
-    // Use the well-known quantization constants (stored in safetensors
-    // metadata for documentation, but constants are authoritative).
     let quant = edgefirst_tensor::Quantization::per_tensor(PROTOS_SCALE, PROTOS_ZP);
     let protos_tensor = protos_tensor
         .with_quantization(quant)
         .map_err(|e| format!("set quant: {e}"))?;
 
-    // Load coefficients [N, 32] — may be i8 (new format) or f32 (legacy).
+    // Load coefficients [N, 32], i8 or f32.
     let coeff_view = st
         .tensor("coefficients")
         .map_err(|e| format!("coefficients: {e}"))?;
@@ -211,7 +201,7 @@ fn load_from_safetensors(path: &Path) -> Result<(Vec<DetectBox>, ProtoData), Str
     let coeff_bytes = coeff_view.data();
 
     let mask_coefficients: TensorDyn = if coeff_view.dtype() == safetensors::Dtype::I8 {
-        // New format: raw i8 with quantization.
+        // Raw i8 with quantization.
         let coeff_i8: Vec<i8> = coeff_bytes.iter().map(|b| *b as i8).collect();
         let t = Tensor::<i8>::from_slice(&coeff_i8, &coeff_shape)
             .map_err(|e| format!("coeff tensor: {e}"))?;
@@ -221,7 +211,7 @@ fn load_from_safetensors(path: &Path) -> Result<(Vec<DetectBox>, ProtoData), Str
             .map_err(|e| format!("coeff quant: {e}"))?;
         TensorDyn::I8(t)
     } else {
-        // Legacy f32 format.
+        // f32 coefficients.
         let coeff_f32: Vec<f32> = coeff_bytes
             .as_chunks::<4>()
             .0
@@ -276,7 +266,7 @@ fn load_from_safetensors(path: &Path) -> Result<(Vec<DetectBox>, ProtoData), Str
     Ok((detect, proto_data))
 }
 
-/// Save post-NMS data to safetensors for future benchmark runs.
+/// Save post-NMS data to safetensors.
 fn save_to_safetensors(
     path: &Path,
     detect: &[DetectBox],
@@ -458,8 +448,6 @@ fn bench_scaled_materialize(suite: &mut BenchSuite) {
     // 3. Scaled 1080×810 (high-res COCO variant)
     {
         let name = "scaled_1080x810_letterbox/i8";
-        // Letterbox for 1080×810 in 640×640: scale=640/1080=0.593, pad_y=(640-810*0.593)/2=...
-        // But we're materializing *output* at that res; letterbox is the same model-input transform.
         let result = run_bench(name, WARMUP, ITERATIONS, || {
             let _ = cpu
                 .materialize_scaled_segmentations(
@@ -475,7 +463,7 @@ fn bench_scaled_materialize(suite: &mut BenchSuite) {
         suite.record(&result);
     }
 
-    // 4. Proto-res (baseline for comparison — no bilinear upsample)
+    // 4. Proto-res (no bilinear upsample)
     {
         let name = "proto_res_160x160/i8";
         println!("\n  Benchmark: {name} (N={n}) — baseline without upsample");
@@ -489,7 +477,7 @@ fn bench_scaled_materialize(suite: &mut BenchSuite) {
     }
 }
 
-/// Benchmark with varying detection counts to understand scaling behaviour.
+/// Benchmark with varying detection counts.
 fn bench_detection_count_scaling(suite: &mut BenchSuite) {
     println!("\n== detection_count_scaling: N vs latency ==\n");
 
@@ -569,9 +557,8 @@ fn bench_detection_count_scaling(suite: &mut BenchSuite) {
     }
 }
 
-/// Isolate the logit precompute vs bilinear upsample costs.
-/// Runs the full path but also measures proto-res (which is just the dot product)
-/// to estimate the upsample overhead.
+/// Benchmark the proto-res path (dot product only) and the scaled path (dot
+/// product + bilinear upsample).
 fn bench_phase_breakdown(suite: &mut BenchSuite) {
     println!("\n== phase_breakdown: logit precompute vs bilinear upsample ==\n");
     println!("  Proto-res = logit dot product only (no bilinear).");
@@ -613,8 +600,6 @@ fn bench_phase_breakdown(suite: &mut BenchSuite) {
 }
 
 /// Benchmark the NMS decode phase (score filter + NMS + proto extraction).
-/// This matches the `nms_decode` portion of the user's pipeline when called
-/// with COCO-eval score_threshold=0.001.
 fn bench_nms_decode(suite: &mut BenchSuite) {
     println!("\n== nms_decode: score filter + NMS + proto extraction ==\n");
 
@@ -661,21 +646,21 @@ fn bench_nms_decode(suite: &mut BenchSuite) {
         suite,
     );
 
-    // Pre-NMS top-K=3000 (the key optimization: reduces NMS from O(8400²) to O(3000²))
+    // Pre-NMS top-K=3000
     bench_one(
         "nms_decode/topk_3000",
         build_decoder(SCORE_THRESHOLD, 3000, 300, Some(Nms::ClassAgnostic)),
         suite,
     );
 
-    // Pre-NMS top-K=300 (default — matches Ultralytics max_det=300)
+    // Pre-NMS top-K=300 (default)
     bench_one(
         "nms_decode/topk_300",
         build_decoder(SCORE_THRESHOLD, 300, 300, Some(Nms::ClassAgnostic)),
         suite,
     );
 
-    // Isolate: just score filtering + box decode (no NMS)
+    // Score filtering + box decode only (no NMS)
     bench_one(
         "nms_decode/score_filter_only",
         build_decoder(SCORE_THRESHOLD, MAX_NMS_CANDIDATES, 300, None),
@@ -687,7 +672,7 @@ fn main() {
     let mut suite = BenchSuite::from_args();
 
     if std::env::args().any(|a| a == "--generate") {
-        // Just generate safetensors and exit.
+        // Generate safetensors and exit.
         println!("Generating safetensors test data...");
         let (detect, proto_data) = decode_from_fixtures();
         println!("  {} detections from NMS", detect.len());

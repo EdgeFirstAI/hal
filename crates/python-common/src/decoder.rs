@@ -29,21 +29,14 @@ pub enum PyNms {
     ClassAgnostic = 3,
 }
 
-// PyO3 requires literal discriminants; pin each to the shared code. 0 is
-// NMS off, which Python spells `None`.
+// Compile-time checks that each discriminant equals the shared code. Code 0
+// is NMS off, which Python spells `None`.
 const _: () = {
     assert!(PyNms::Auto as u32 == Nms::Auto.code());
     assert!(PyNms::ClassAware as u32 == Nms::ClassAware.code());
     assert!(PyNms::ClassAgnostic as u32 == Nms::ClassAgnostic.code());
 };
 
-// Single-package (only `edgefirst.decoder` registers this type -- see its
-// `lib.rs`), so `eq_int`'s native-or-bare-int richcmp above has no
-// cross-package identity problem to fix. It was still unhashable (`eq`
-// without `hash` -- Python's own rule for a class defining `__eq__`), which
-// is independently worth fixing: hash the discriminant, matching both this
-// enum's own equality and `int.__hash__`'s identity behaviour for small
-// values, so `{Nms.ClassAgnostic: ...}` and `{Nms.ClassAgnostic, 0}` behave.
 #[pyo3::pymethods]
 impl PyNms {
     fn __hash__(&self) -> isize {
@@ -130,8 +123,6 @@ const _: () = {
     assert!(PyDecoderType::Semantic as u32 == configs::DecoderType::Semantic.code());
 };
 
-/// Single-package; see `PyNms`'s `__hash__` comment for why this is still
-/// worth fixing despite no cross-package equality problem.
 #[pyo3::pymethods]
 impl PyDecoderType {
     fn __hash__(&self) -> isize {
@@ -185,7 +176,6 @@ const _: () = {
     assert!(PyDecoderVersion::Yolo26 as u32 == configs::DecoderVersion::Yolo26.code());
 };
 
-/// Single-package; see `PyNms`'s `__hash__` comment.
 #[pyo3::pymethods]
 impl PyDecoderVersion {
     fn __hash__(&self) -> isize {
@@ -246,8 +236,8 @@ pub enum PyDimName {
     NumQueries = 11,
 }
 
-// `DimName.Unknown` (code 10) is not exposed: Python callers name only the
-// axes the decoder interprets.
+// Compile-time checks that each discriminant equals the shared code.
+// `DimName.Unknown` (code 10) is not exposed to Python.
 const _: () = {
     use configs::DimName;
     assert!(PyDimName::Batch as u32 == DimName::Batch.code());
@@ -263,7 +253,6 @@ const _: () = {
     assert!(PyDimName::NumQueries as u32 == DimName::NumQueries.code());
 };
 
-/// Single-package; see `PyNms`'s `__hash__` comment.
 #[pyo3::pymethods]
 impl PyDimName {
     fn __hash__(&self) -> isize {
@@ -326,8 +315,8 @@ fn parse_shape_dshape(
                 .iter()
                 .map(|(name, size)| ((*name).into(), *size))
                 .collect();
-            // shape left empty; DecoderBuilder::add_output() -> normalize_output()
-            // will derive it from dshape.
+            // `shape` is left empty; `DecoderBuilder::add_output()` derives it from
+            // `dshape`.
             Ok((Vec::new(), dshape))
         }
     }
@@ -574,8 +563,7 @@ fn decode_err(e: impl Into<edgefirst_decoder::DecoderError>) -> PyErr {
     crate::tensor::runtime_or_permission_error(e.cpu_access_denied().is_some(), e.to_string())
 }
 
-/// Decode to Rust boxes/masks. `self_` stays on the caller's stack so the
-/// PyO3 borrow flag remains set across `py.detach` (see `decode`).
+/// Decode to Rust boxes/masks.
 fn decode_native(
     decoder: &Decoder,
     py: Python<'_>,
@@ -629,9 +617,8 @@ fn decode_native(
 ///
 /// Holds raw mask coefficients and prototype tensors produced by
 /// :meth:`Decoder.decode_proto`. Pass to
-/// :meth:`ImageProcessor.materialize_masks` to compute per-instance masks
-/// for analytics or export, or use :meth:`ImageProcessor.draw_masks` for
-/// fused GPU rendering instead.
+/// :meth:`ImageProcessor.materialize_masks` to compute per-instance masks, or
+/// to :meth:`ImageProcessor.draw_masks` for fused GPU rendering.
 ///
 /// For detection-only models, :meth:`Decoder.decode_proto` returns ``None``
 /// instead of a ``ProtoData`` instance.
@@ -691,20 +678,11 @@ impl PyProtoData {
 
     /// Producer half of the cross-package ``ProtoData`` protocol.
     ///
-    /// Composes the existing ``__edgefirst_tensor__`` capsule protocol
-    /// rather than describing its own layout: a ``ProtoData`` is just two
-    /// tensors and an enum, and both tensors already cross packages safely
-    /// through that protocol (see ``interop::TensorArg``). Returns the
-    /// ``mask_coefficients`` and ``protos`` tensors as ``edgefirst_tensor_v2``
-    /// capsules -- exactly what ``Tensor.__edgefirst_tensor__()`` would
-    /// return for each -- plus the prototype layout as a string. No raw
-    /// pointer to ``ProtoData`` itself is ever exchanged, so unlike
-    /// ``Decoder.__edgefirst_decoder__`` this protocol carries no version
-    /// coupling between packages: it is sound by construction.
+    /// Returns the ``mask_coefficients`` and ``protos`` tensors as
+    /// ``edgefirst_tensor_v2`` capsules, as ``Tensor.__edgefirst_tensor__()``
+    /// returns for each, plus the prototype layout as a string.
     ///
-    /// Both tensors are pinned for host reads: ``materialize_masks`` always
-    /// computes ``mask_coeff @ protos`` on the CPU, so a consumer needs an
-    /// addressable pointer, not just a GPU/DMA handle.
+    /// Both tensors are pinned for host reads.
     fn __edgefirst_protodata__<'py>(
         &self,
         py: Python<'py>,
@@ -724,11 +702,8 @@ impl PyProtoData {
 }
 
 /// Build an ``edgefirst_tensor_v2`` capsule for `tensor`, pinned for host
-/// reads. Shared by [`PyProtoData::__edgefirst_protodata__`]; the payload
-/// shape (`crate::interop::TensorCapsulePayload`) is exactly what
-/// `PyTensor::__edgefirst_tensor__` produces, so any
-/// ``__edgefirst_tensor__`` consumer (i.e. `interop::TensorArg`) imports it
-/// unmodified.
+/// reads. The payload is the `crate::interop::TensorCapsulePayload` that
+/// `PyTensor::__edgefirst_tensor__` produces.
 fn tensor_capsule<'py>(
     py: Python<'py>,
     tensor: &edgefirst_tensor::TensorDyn,
@@ -736,10 +711,8 @@ fn tensor_capsule<'py>(
     use edgefirst_tensor::CpuAccess;
     let pin = tensor.pin_host(CpuAccess::Read).map_err(decode_err)?;
     let desc = tensor.descriptor_pinned(Some(&pin));
-    // Cloned into an `Arc` the payload owns: `quant` borrows these arrays,
-    // and the producing tensor may be dropped while the capsule lives.
-    // Carrying it matters most on exactly this path -- an int8 `ProtoData`
-    // is unusable by `materialize_masks` without its scales.
+    // The payload owns an `Arc` of the quantization, whose arrays `quant`
+    // borrows.
     let quant_keepalive = tensor.quantization().cloned().map(std::sync::Arc::new);
     let payload = crate::interop::TensorCapsulePayload {
         desc,
@@ -748,14 +721,8 @@ fn tensor_capsule<'py>(
             .map_or_else(crate::interop::QuantDesc::absent, |q| {
                 crate::interop::QuantDesc::borrowing(q)
             }),
-        // See `PyTensor::__edgefirst_tensor__`; the payload shape is the
-        // same one, so this field is filled the same way.
         plane_offset: tensor.plane_offset().unwrap_or(0) as u64,
         pin: Some(pin),
-        // `pin_host` above already succeeded, and PBO refuses `pin_host`
-        // outright -- so `tensor` is never PBO-backed here in practice, but
-        // asking is free and keeps this in sync with `PyTensor::
-        // __edgefirst_tensor__`'s shape rather than hand-assuming `None`.
         pbo_keepalive: tensor.pbo_keepalive(),
         quant_keepalive,
     };
@@ -792,15 +759,6 @@ pub struct PyDecoder {
 unsafe impl Send for PyDecoder {}
 unsafe impl Sync for PyDecoder {}
 
-// `Decoder` needs no `RawDecoderAccess`-style resolved-argument type the way
-// `TensorArg`/`RawTensorAccess` do: `decode`/`decode_proto` below borrow
-// `&Decoder` straight from `self_: PyRef<'py, Self>`, which they keep alive
-// on their own stack frame for the whole `py.detach` region rather than
-// converting into anything `'static`-ish. See `decode`'s comment at the
-// borrow site for why that -- not dropping the runtime borrow early, the
-// way an earlier revision of this function did -- is what soundness here
-// actually requires.
-
 #[pymethods]
 impl PyDecoder {
     /// Create a new Decoder from a configuration dictionary.
@@ -814,7 +772,7 @@ impl PyDecoder {
     ///         ``ClassAware``), ``Nms.ClassAgnostic``, ``Nms.ClassAware``,
     ///         or ``None`` to bypass NMS.
     ///     input_dims: Optional ``(width, height)`` model input override
-    ///         consumed by the EDGEAI-1303 normalization path. When set,
+    ///         consumed by the box normalization path. When set,
     ///         takes precedence over schema-derived dims; pass when building
     ///         from a config that does not declare an input shape but the
     ///         model emits pixel-space boxes (``Detection.normalized = False``).
@@ -844,11 +802,8 @@ impl PyDecoder {
             builder = builder.with_multi_label(v);
         }
 
-        // EDGEAI-1081: discriminate v2 vs legacy on the authoritative
-        // `schema_version` field. v2 dicts carry object-form quantization
-        // and spec-vocabulary type tags that the legacy `ConfigOutputs`
-        // deserialiser rejects; v1 (or version-less) dicts continue
-        // through the legacy path unchanged.
+        // The `schema_version` field selects the v2 or legacy path; v1 and
+        // version-less dicts take the legacy path.
         let value: serde_json::Value = pythonize::depythonize(&config)?;
         let schema_version: Option<u32> = value
             .get("schema_version")
@@ -876,10 +831,6 @@ impl PyDecoder {
 
     /// Create a new Decoder from a list of Output objects.
     ///
-    /// The default thresholds (0.25 / 0.45) are tuned for typical YOLO models.
-    /// The dict/JSON/YAML constructors use lower defaults (0.1 / 0.7) for
-    /// backward compatibility.
-    ///
     /// Args:
     ///     outputs: List of Output objects describing the model outputs.
     ///     score_threshold: Score threshold for filtering detections (default
@@ -893,8 +844,7 @@ impl PyDecoder {
     ///         See :meth:`__init__` for semantics.
     ///     multi_label: Emit one box per class above ``score_threshold``
     ///         instead of one per anchor (validation decode). ``None``
-    ///         (default) leaves it off, since outputs carry no
-    ///         ``nms_multi_label``.
+    ///         (default) leaves it off.
     ///         :meth:`decode_tracked` always uses one label per box.
     #[staticmethod]
     #[pyo3(signature = (outputs, score_threshold=0.25, iou_threshold=0.45, nms=PyNms::Auto, decoder_version=None, input_dims=None, multi_label=None))]
@@ -1022,14 +972,11 @@ impl PyDecoder {
     ///
     /// Args:
     ///     model_output: List of output :class:`Tensor` from model inference.
-    ///     max_boxes: Per-call **post-truncate cap** layered on top of the
-    ///         decoder's own :attr:`max_det` (default 300; set by assigning
-    ///         to :attr:`max_det` on this instance). The smaller of the two
-    ///         wins. ``max_boxes`` also pre-allocates the underlying box /
-    ///         mask buffers; the Rust decoder does not use buffer capacity
-    ///         as a semantic cap (EDGEAI-1302). Default ``100``. Also see
-    ///         :attr:`max_det` for the decoder-side cap and
-    ///         :attr:`pre_nms_top_k` for the pre-NMS candidate cap.
+    ///     max_boxes: Per-call cap applied after the decoder's own
+    ///         :attr:`max_det` (default 300). The smaller of the two wins.
+    ///         ``max_boxes`` also pre-allocates the box and mask buffers.
+    ///         Default ``100``. See :attr:`max_det` for the decoder-side cap
+    ///         and :attr:`pre_nms_top_k` for the pre-NMS candidate cap.
     ///
     /// Returns:
     ///     Tuple ``(boxes, scores, classes, masks)`` where ``boxes`` is a
@@ -1053,10 +1000,6 @@ impl PyDecoder {
             tracing::trace_span!("python.decode", n_tensors = model_output.len(), max_boxes)
                 .entered();
         let py = self_.py();
-        // Model outputs are read here, never written. `self_` stays on this
-        // stack so the PyO3 borrow flag remains set across `py.detach`
-        // inside `decode_native` — a concurrent setter would otherwise
-        // alias `&mut Decoder` (see `TensorArg::into_raw_access`).
         let (output_boxes, output_masks) =
             decode_native(&self_.decoder, py, model_output, max_boxes, false)?;
         let (boxes, scores, classes) = convert_detect_box(py, &output_boxes);
@@ -1076,9 +1019,8 @@ impl PyDecoder {
         let (output_boxes, output_masks) =
             decode_native(&self_.decoder, py, model_output, max_boxes, true)?;
 
-        // ByteTrack._associate_detections runs Kalman + the live/coasting
-        // rewrite off the GIL. Duck-typed trackers without that method keep
-        // the Python `update` / getattr rewrite path.
+        // A tracker with `_associate_detections` (ByteTrack) associates through
+        // it; any other tracker goes through its Python `update`.
         let boxes: Vec<[f32; 4]> = output_boxes
             .iter()
             .map(|b| <[f32; 4]>::from(b.bbox))
@@ -1182,9 +1124,8 @@ impl PyDecoder {
     }
 
     /// Decode model outputs and draw onto ``processor`` (an
-    /// ``edgefirst.image.ImageProcessor``) without this extension linking
-    /// image. Prefers ``draw_proto_masks`` when the model yields prototype
-    /// data; otherwise ``draw_decoded_masks``.
+    /// ``edgefirst.image.ImageProcessor``). Calls ``draw_proto_masks`` when
+    /// the model yields prototype data, otherwise ``draw_decoded_masks``.
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (processor, model_output, dst, background=None, opacity=1.0, content_region=None, color_mode=None))]
     pub fn draw_onto<'py>(
@@ -1343,19 +1284,11 @@ impl PyDecoder {
     /// detection-only models, returns ``None`` for ``proto_data`` but still
     /// populates detection boxes.
     ///
-    /// Note:
-    ///     Calling ``decode_proto`` + ``materialize_masks`` +
-    ///     ``draw_decoded_masks`` separately prevents the HAL from using its
-    ///     internal fused optimization. For render-only use cases, prefer
-    ///     :meth:`Decoder.draw_onto` which is 1.6–27× faster on tested
-    ///     platforms.
-    ///
     /// Args:
     ///     model_output: List of output :class:`Tensor` from model inference.
-    ///     max_boxes: Pre-allocates ``output_boxes`` capacity. The actual
+    ///     max_boxes: Pre-allocates ``output_boxes`` capacity. The
     ///         detection-count cap is the decoder's :attr:`max_det` (default
-    ///         300); the Rust decoder does not use buffer capacity as a
-    ///         semantic cap (EDGEAI-1302). Default ``100``.
+    ///         300). Default ``100``.
     ///
     /// Returns:
     ///     Tuple ``(boxes, scores, classes, proto_data)`` where ``proto_data``
@@ -1375,7 +1308,6 @@ impl PyDecoder {
         )
         .entered();
         let py = self_.py();
-        // Model outputs are read here, never written.
         let model_output: Vec<crate::interop::TensorArg> = model_output
             .iter()
             .map(|o| crate::interop::TensorArg::extract(o, None))
@@ -1384,11 +1316,8 @@ impl PyDecoder {
             .iter()
             .all(crate::interop::TensorArg::can_detach)
         {
-            // See `decode`: every input tensor's Python guard is gone by
-            // this point, and `self_`'s own guard is kept alive right here
-            // -- not moved into the closure -- for the whole detached
-            // region, so PyO3's borrow flag stays set and a concurrent
-            // `&mut self` setter errors instead of aliasing.
+            // Run the decode with the GIL released; `self_`'s guard stays alive
+            // across it.
             let raw_inputs: Vec<crate::interop::RawTensorAccess> = model_output
                 .into_iter()
                 .map(|t| t.into_raw_access())
@@ -1404,8 +1333,7 @@ impl PyDecoder {
                 Ok::<_, PyErr>((output_boxes, proto_data))
             })?
         } else {
-            // See `decode`: a GL-PBO-backed model output tensor keeps
-            // the GIL held.
+            // A PBO-backed model output: decode with the GIL held.
             let tensor_refs: Vec<&edgefirst_tensor::TensorDyn> =
                 model_output.iter().map(|t| t.as_ref()).collect();
             let mut output_boxes = Vec::with_capacity(max_boxes);
@@ -1415,9 +1343,8 @@ impl PyDecoder {
                 .map_err(decode_err)?;
             (output_boxes, proto_data)
         };
-        // Note: output_boxes and proto_data.mask_coefficients must stay in sync
-        // (same row count). Truncation here would break materialize_masks.
-        // The decoder's max_det (default 300) already caps output count.
+        // `output_boxes` and `proto_data.mask_coefficients` have the same row
+        // count.
         let (boxes, scores, classes) = convert_detect_box(py, &output_boxes);
         Ok((boxes, scores, classes, proto_data.map(PyProtoData)))
     }
@@ -1460,7 +1387,7 @@ impl PyDecoder {
     }
 
     /// Maximum number of candidates fed into NMS after score filtering;
-    /// ``0`` means no limit. Uses O(N) partial sort to reduce O(N²) NMS cost.
+    /// ``0`` means no limit.
     /// Reading it returns the cap :meth:`decode` uses. Unset, that is 300,
     /// or 30000 (Ultralytics' ``max_nms``) when :attr:`multi_label` is on,
     /// and :meth:`decode_tracked` (always argmax) uses 300. Assigning an
@@ -1468,30 +1395,16 @@ impl PyDecoder {
     /// it as given, even if it equals a default. Assigning ``None`` returns
     /// to the defaults.
     ///
-    /// .. warning::
+    /// Deployment::
     ///
-    ///    The default of 300 is tuned for **deployment** (``score_threshold >= 0.25``)
-    ///    where few anchors pass the score filter. For **COCO mAP evaluation**
-    ///    (``score_threshold = 0.001``), set this to ``0`` (no limit) to avoid
-    ///    discarding ~74% of valid candidates before NMS, which causes
-    ///    **~9 pp box mAP loss**. Under argmax decode the anchor count (8400
-    ///    for 640×640 YOLO models) also suffices; multi-label decode emits up
-    ///    to anchors × classes candidates.
+    ///     decoder.score_threshold = 0.25
+    ///     # decoder.pre_nms_top_k = 300  (default, appropriate)
     ///
-    ///    Deployment::
+    /// COCO mAP evaluation::
     ///
-    ///        decoder.score_threshold = 0.25
-    ///        # decoder.pre_nms_top_k = 300  (default, appropriate)
-    ///
-    ///    COCO mAP evaluation::
-    ///
-    ///        decoder.score_threshold = 0.001
-    ///        decoder.pre_nms_top_k = 0      # no limit
-    ///        decoder.max_det = 300
-    ///
-    ///    Post-processing latency scales with candidate count. At deployment
-    ///    thresholds the cost difference is negligible; at validation thresholds
-    ///    it is measurable but necessary for correct recall.
+    ///     decoder.score_threshold = 0.001
+    ///     decoder.pre_nms_top_k = 0      # no limit
+    ///     decoder.max_det = 300
     #[getter(pre_nms_top_k)]
     fn get_pre_nms_top_k(&self) -> usize {
         self.decoder.pre_nms_top_k_for(self.decoder.multi_label())
@@ -1516,64 +1429,42 @@ impl PyDecoder {
         Ok(())
     }
 
-    /// Returns the coordinate format of the boxes the decoder emits to
-    /// the caller.
+    /// The coordinate format of the boxes the decoder returns.
     ///
     /// - ``True``: Boxes are in normalized ``[0, 1]`` coordinates
     /// - ``False``: Boxes are in pixel coordinates relative to model input
     /// - ``None``: Unknown, caller must infer (e.g., check if any
     ///   coordinate > 1.0)
     ///
-    /// Four decode paths invoke the normalization helper uniformly across
-    /// all entry points (``decode``, ``decode_proto``, ``decode_tracked``,
-    /// ``decode_tracked_proto``, both quantized and float). For these,
-    /// this getter reports the post-decode coordinate space rather than
-    /// the raw schema annotation:
+    /// For per-scale decoders and for combined-output, split-output and
+    /// two-way segmentation models, this reports the coordinate space after
+    /// decoding: when the schema declares ``normalized: false`` and
+    /// :attr:`input_dims` is a valid ``(W, H)`` tuple, the decoder divides
+    /// by ``(W, H)`` and this returns ``True``; when :attr:`input_dims` is
+    /// ``None`` or zero, it returns ``False``.
     ///
-    /// - **Per-scale decoders**: the bridge always divides by ``(W, H)``
-    ///   before returning.
-    /// - **Combined-output segmentation** models: the helper fires across
-    ///   all entry points and element-type variants.
-    /// - **Split-output segmentation** models: aligned across all four
-    ///   entry points for both quantized and float variants.
-    /// - **Two-way segmentation** models: same four entry points and both
-    ///   element-type variants.
+    /// All other decoders (detection-only, end-to-end YOLO, and ModelPack)
+    /// return the schema annotation. For ``False`` from these model types,
+    /// divide by :attr:`input_dims` to obtain ``[0, 1]`` coordinates.
     ///
-    /// For all four paths, when the schema declares ``normalized: false``
-    /// and :attr:`input_dims` is a valid ``(W, H)`` tuple, the decoder
-    /// has already divided and returns ``True``. When :attr:`input_dims`
-    /// is ``None`` or zero, pixel-space leaks out and returns ``False``.
-    ///
-    /// **All other decoders** — detection-only, end-to-end YOLO, and
-    /// ModelPack — return the raw schema annotation. Callers that receive
-    /// ``False`` from these model types must consult :attr:`input_dims`
-    /// and divide themselves if ``[0, 1]`` output is required.
-    ///
-    /// Callers must not re-normalize when this returns ``True``; dividing
-    /// already-normalized coordinates by ``(W, H)`` collapses detections
-    /// to ~0.
+    /// Do not re-normalize when this returns ``True``.
     #[getter(normalized_boxes)]
     fn get_normalized_boxes(&self) -> Option<bool> {
         self.decoder.normalized_boxes()
     }
 
-    /// Model input dimensions ``(width, height)`` consumed by the
-    /// EDGEAI-1303 normalization path.
+    /// Model input dimensions ``(width, height)`` consumed by the box
+    /// normalization path.
     ///
-    /// Set to a non-``None`` value via the ``input_dims`` constructor
-    /// kwarg, or sourced from the schema's ``input.shape`` /
-    /// ``input.dshape`` when building from a v2 schema. On the per-scale
-    /// path and on the combined, split, and two-way segmentation paths,
-    /// when the schema declares pixel-space outputs and ``input_dims`` is
-    /// a valid tuple, the decoder divides post-NMS box coordinates by
-    /// ``(W, H)`` so they enter the canonical ``[0, 1]`` range before
-    /// mask cropping;
-    /// :attr:`normalized_boxes` then reports ``True`` to match. All other
-    /// decode paths (detection-only, end-to-end YOLO, ModelPack) do not
-    /// apply this division — see :attr:`normalized_boxes` for the
-    /// per-path contract. When ``None``, the four uniform-normalization
-    /// paths skip division and pixel-space boxes will trip the
-    /// ``protobox`` safety guard.
+    /// Set via the ``input_dims`` constructor argument, or taken from the
+    /// schema's ``input.shape`` / ``input.dshape`` when building from a v2
+    /// schema. On the per-scale path and on the combined, split, and two-way
+    /// segmentation paths, when the schema declares pixel-space outputs and
+    /// ``input_dims`` is a valid tuple, the decoder divides post-NMS box
+    /// coordinates by ``(W, H)`` before mask cropping and
+    /// :attr:`normalized_boxes` reports ``True``. All other decode paths
+    /// (detection-only, end-to-end YOLO, ModelPack) do not apply this
+    /// division. When ``None``, no path divides.
     #[getter(input_dims)]
     fn get_input_dims(&self) -> Option<(usize, usize)> {
         self.decoder.input_dims()
@@ -1584,50 +1475,9 @@ impl PyDecoder {
     /// The capsule borrows this decoder: it is valid only for the duration
     /// of the call it is passed into, and must not be stored.
     ///
-    /// # Safety hazard
-    ///
-    /// Unlike every other ``__edgefirst_*__`` producer in this crate (see
-    /// [`PyProtoData::__edgefirst_protodata__`], `Tensor.__edgefirst_tensor__`),
-    /// this one has no self-describing fallback: a `Decoder` is a live Rust
-    /// object carrying internal post-processing state, not a value that can
-    /// be decomposed into tensors and enums. The capsule therefore carries a
-    /// raw pointer, and the consumer's `unsafe { &*ptr }` is sound only if
-    /// the producer's and consumer's copies of `edgefirst-decoder` agree
-    /// bit-for-bit on `Decoder`'s memory layout.
-    ///
-    /// The guard (`interop::DecoderArg::extract`) checks
-    /// `size_of::<Decoder>()`/`align_of::<Decoder>()` equality, not version
-    /// string equality. Two reasons:
-    ///
-    /// - A version string says nothing about Cargo *features*. `Decoder`'s
-    ///   fields can be cfg-gated by features `edgefirst-decoder` exposes
-    ///   (e.g. `tracker`), and the two wheels can genuinely compute that
-    ///   feature set through different dependency graphs
-    ///   (`crates/image/Cargo.toml`'s `decode`/`tracker` features flow into
-    ///   `edgefirst-decoder` differently than `edgefirst-python-decoder`'s
-    ///   do). Comparing `size_of`/`align_of` catches that regardless of
-    ///   which features produced the mismatch; enumerating features by name
-    ///   is a list someone would forget to update.
-    /// - `crates/python-image/pyproject.toml` pins `edgefirst-decoder` with a
-    ///   `~=` compatible-release specifier, which admits patch releases against
-    ///   the version it was built for. Exact version-string equality would turn
-    ///   a pip-legal install into a hard `RuntimeError`; gating on layout
-    ///   instead lets a layout-compatible patch release work while still
-    ///   catching any layout change regardless of version.
-    ///
-    /// No version string rides along in the payload: an earlier revision
-    /// carried one as diagnostic-only text, but it was this crate's
-    /// (`edgefirst-python-common`'s) own `CARGO_PKG_VERSION`, not
-    /// `edgefirst-decoder`'s, and the error message named the wrong crate --
-    /// dropped along with the `&'static str` fat-pointer-in-`#[repr(C)]`
-    /// hazard it carried. The mismatch error below reports `size`/`align`
-    /// only, which is what the guard actually evaluated.
-    ///
-    /// This is accepted risk, not a solved problem: two `Decoder` layouts
-    /// of equal size and alignment but permuted field order would still
-    /// pass the guard undetected. `size_of`/`align_of` narrows the failure
-    /// mode from "any layout drift" to "a layout drift that also changes
-    /// size or alignment"; it does not eliminate it.
+    /// The capsule carries a raw pointer to the `Decoder` with its `size_of`
+    /// and `align_of`. The consumer (`interop::DecoderArg::extract`)
+    /// dereferences the pointer only when both match its own `Decoder`.
     fn __edgefirst_decoder__<'py>(
         &self,
         py: Python<'py>,

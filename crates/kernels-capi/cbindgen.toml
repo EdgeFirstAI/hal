@@ -3,9 +3,7 @@
 #
 # cbindgen configuration for edgefirst/kernels.h.
 #
-# NOTE: the include guard is written by hand in `header`/`trailer` rather than
-# via cbindgen's `include_guard`, which wraps only the *generated* body and
-# leaves `header` and `trailer` outside it.
+# The include guard is written in `header`/`trailer`.
 
 language = "C"
 autogen_warning = "/* WARNING: The generated portion of this file is produced by cbindgen. Do not modify it directly. */"

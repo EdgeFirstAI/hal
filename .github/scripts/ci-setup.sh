@@ -8,18 +8,13 @@
 # checkout as working directory, GH_TOKEN / GITHUB_TOKEN, and GITHUB_ENV /
 # GITHUB_PATH for exporting state to later steps.
 #
-#   SKIP_PACKAGES=1   skip apt (self-hosted boards already have the toolchain)
-#   SKIP_TESTDATA=1   skip the crate testdata merge, but still export the path.
-#                     Board jobs take the merged tree from the ci-testdata
-#                     artifact instead; their checkout has LFS pointers, not
-#                     content, so merging there would stage stub files that the
-#                     artifact then has to overwrite.
-#   BOARD=1           arm the on-target gates from what the board has, as
-#                     scripts/on-target-test.sh does: HAL_TEST_REQUIRE_GL=1
-#                     with a DRM render node, HAL_TEST_REQUIRE_G2D=1 with
-#                     libg2d.so.2 installed (HAL_TEST_SKIP_G2D=1 instead on
-#                     i.MX 95), EDGEFIRST_SKIP_VIVANTE_KNOWN_BUGS=1 with
-#                     /dev/galcore.
+#   SKIP_PACKAGES=1   skip apt
+#   SKIP_TESTDATA=1   skip the crate testdata merge, but still export the path
+#   BOARD=1           arm the on-target gates from what the board has:
+#                     HAL_TEST_REQUIRE_GL=1 with a DRM render node,
+#                     HAL_TEST_REQUIRE_G2D=1 with libg2d.so.2 installed
+#                     (HAL_TEST_SKIP_G2D=1 instead on i.MX 95),
+#                     EDGEFIRST_SKIP_VIVANTE_KNOWN_BUGS=1 with /dev/galcore.
 set -euo pipefail
 
 persist() {
@@ -59,38 +54,31 @@ case "${os}" in
             sudo apt-get update
             sudo apt-get install -y clang libclang-dev pkg-config nasm
         fi
-        # Hosted images ship SDKs HAL never uses; the workspace's debug test build needs that disk.
+        # Removes unused SDKs from a hosted image.
         if [[ "${RUNNER_ENVIRONMENT:-}" == "github-hosted" ]]; then
             sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
             df -h / | tail -1
         fi
         merge_testdata
-        # Opens the DMA heap to the job user and, only when a probe allocation
-        # succeeds, exports HAL_TEST_REQUIRE_DMA=1 through $GITHUB_ENV so the
-        # test step fails instead of skipping DMA tests. A pre-command's own
-        # exports do not reach later steps. Never fails this script.
+        # Opens the DMA heap to the job user and, when a probe allocation
+        # succeeds, exports HAL_TEST_REQUIRE_DMA=1 through $GITHUB_ENV.
         bash "$(dirname "${BASH_SOURCE[0]}")/dma-heap-setup.sh" \
             || echo "::warning::dma-heap-setup.sh failed; DMA tests may skip"
-        # Loads vivid on hosted runners for the V4L2 capture-import tests and,
-        # only when its nodes appear, exports HAL_TEST_REQUIRE_VIVID=1. Never
-        # fails this script; a no-op on boards and other self-hosted machines.
+        # Loads vivid on hosted runners and, when its nodes appear, exports
+        # HAL_TEST_REQUIRE_VIVID=1.
         bash "$(dirname "${BASH_SOURCE[0]}")/vivid-setup.sh" \
             || echo "::warning::vivid-setup.sh failed; vivid tests may skip"
         if [[ "${BOARD:-0}" == "1" ]]; then
-            # A board with a render node has a GPU, so a GL backend that does
-            # not come up is a defect there, not a fact of the machine; without
-            # the gate every require-gated test skips and the lane stays green.
-            # The Vivante driver has an intermittent double-free that otherwise
-            # reads as a regression in whatever changed.
+            # Requires GL on a board with a render node, and skips the known
+            # Vivante driver bugs on a board with /dev/galcore.
             if compgen -G "/dev/dri/renderD*" >/dev/null; then
                 persist HAL_TEST_REQUIRE_GL 1
             fi
             if [[ -e /dev/galcore ]]; then
                 persist EDGEFIRST_SKIP_VIVANTE_KNOWN_BUGS 1
             fi
-            # A board that ships libg2d must be able to use it, except an
-            # i.MX 95: its libg2d loads, but G2D is not supported there, so
-            # its tests skip.
+            # Requires G2D on a board with libg2d.so.2; on an i.MX 95 the G2D
+            # tests skip.
             if [[ "$(cat /sys/devices/soc0/soc_id 2>/dev/null)" == "i.MX95" ]]; then
                 persist HAL_TEST_SKIP_G2D 1
             elif compgen -G "/usr/lib/libg2d.so.2*" >/dev/null || compgen -G "/usr/lib/*/libg2d.so.2*" >/dev/null; then

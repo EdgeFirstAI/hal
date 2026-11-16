@@ -1,47 +1,29 @@
 // SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! Methods expressible purely over the primitive `TensorDyn` API, written
-//! once and compiled into both the `static` and `dynamic` backends.
+//! Methods expressible purely over the primitive `TensorDyn` API, compiled into
+//! both the `static` and `dynamic` backends.
 //!
-//! [`TensorDyn::import_descriptor`] is the first resident: the consumer
-//! half of the cross-package tensor protocol. It was `static`-only until
-//! `edgefirst-python-common` -- the first consumer to call `TensorDyn` at
-//! the Rust level under `dynamic` -- needed it, and almost all of it is
-//! backend-independent. Only the per-kind *construction* switch names
-//! constructors and therefore differs; that stays in each backend as
-//! `import_storage`, and the validation before it and the metadata restore
-//! after it live here, once. Writing the whole function twice was the
-//! alternative and it is the shape this branch exists to delete: the
-//! stride-restore reasoning below is forty lines of load-bearing
-//! commentary that a second copy would eventually contradict.
+//! [`TensorDyn::import_descriptor`] is the consumer half of the cross-package
+//! tensor protocol. The per-kind construction switch is each backend's
+//! `import_storage`; the validation before it and the metadata restore after it
+//! live here.
 
 use crate::{DType, Result, TensorDesc, TensorDyn};
 
 impl TensorDyn {
     /// Rebuild a tensor addressing the memory an [`crate::TensorDesc`]
-    /// describes — the consumer half of the cross-package tensor protocol
-    /// (see [`crate::protocol`]'s module docs).
+    /// describes: the consumer half of the cross-package tensor protocol (see
+    /// [`crate::protocol`]'s module docs).
     ///
-    /// **Borrow semantics.** The result *aliases* the producer's memory; it
-    /// is valid only while the producer keeps that memory alive. For the
-    /// capsule protocol, that is the capsule's own lifetime: the capsule's
-    /// keepalive holds the producing tensor (and, for a host-memory descriptor,
-    /// its pin) for as long as the capsule itself is alive. A `DMABUF`
-    /// import is the one exception with its own, narrower guarantee — this
-    /// function `dup`s the fd, so the imported tensor's fd stays valid even
-    /// after the producer's tensor drops (closing its own copy); the
-    /// underlying dma-buf allocation itself is still only alive as long as
-    /// *some* fd or GPU import references it. `D3D11_TEXTURE` behaves the
-    /// same way for the same reason: the import duplicates the texture and
-    /// fence NT handles it keeps, so the result outlives the producer's
-    /// tensor while the texture itself lives as long as some handle or view
-    /// references it. Both of the descriptor's handle values must be valid
-    /// **in this process** — the protocol duplicates, it does not reach into
-    /// another process's handle table (the blob transport does; see
-    /// [`crate::blob::import`]). A consumer needing to survive past the
-    /// capsule for any other kind (`HOST`, `IOSURFACE`) must take its own
-    /// reference explicitly — this function does not.
+    /// The result aliases the producer's memory and is valid only while the
+    /// producer keeps that memory alive; for the capsule protocol that is the
+    /// capsule's lifetime. A `DMABUF` import `dup`s the fd and a
+    /// `D3D11_TEXTURE` import duplicates the texture and fence NT handles, so
+    /// those results stay valid after the producer's tensor drops. Both handle
+    /// values of a `D3D11_TEXTURE` descriptor must be valid in this process.
+    /// For any other kind (`HOST`, `IOSURFACE`) a consumer that must outlive
+    /// the capsule takes its own reference.
     ///
     /// # Errors
     ///
@@ -61,13 +43,8 @@ impl TensorDyn {
     }
 }
 
-/// Refuse a descriptor this build cannot honour, and decode the two facts
-/// every `import_storage` arm needs from one that it can.
-///
-/// Separate from the construction switch so the refusals apply identically
-/// on both backends -- a descriptor is untrusted cross-package input, and
-/// "which producers do we refuse" is exactly the decision that must not
-/// have two implementations.
+/// Refuse a descriptor this build cannot honour, and decode the `dtype` and
+/// `shape` of one that it can.
 fn validate_descriptor(desc: &TensorDesc) -> Result<(DType, Vec<usize>)> {
     if desc.version != crate::ABI_VERSION {
         return Err(crate::Error::NotImplemented(format!(
@@ -86,15 +63,8 @@ fn validate_descriptor(desc: &TensorDesc) -> Result<(DType, Vec<usize>)> {
             crate::TensorDesc::MAX_NDIM
         )));
     }
-    // A producer advertising a fence we cannot wait on is a correctness
-    // problem, not a compatibility nicety: importing anyway would alias
-    // memory whose contents are still being written by the producer's
-    // device, and the corruption would be timing-dependent.
-    //
-    // `D3D11_TEXTURE` is the one kind with a wait path: its descriptor names
-    // an `ID3D11Fence` plus a value, and `from_d3d11_shared_handle` issues
-    // the GPU-side wait before the import is usable. Every other kind still
-    // has nowhere to wait, so a producer advertising a fence is refused.
+    // A fence is accepted only on a `D3D11_TEXTURE` descriptor, whose import
+    // waits on it.
     if desc.flags & crate::protocol::flags::SYNC_PRESENT != 0
         && desc.kind != crate::protocol::kind::D3D11_TEXTURE
     {
@@ -105,11 +75,8 @@ fn validate_descriptor(desc: &TensorDesc) -> Result<(DType, Vec<usize>)> {
                 .to_owned(),
         ));
     }
-    // The same refusal for a `D3D11_TEXTURE` descriptor that advertises a
-    // fence value with no fence to read it on: `ptr` is where that kind
-    // carries the fence handle, so a null one leaves a completion nobody can
-    // wait on, which is the in-flight-write hazard again rather than a
-    // missing feature.
+    // A `D3D11_TEXTURE` descriptor with a fence value needs the fence handle in
+    // `ptr`.
     if desc.flags & crate::protocol::flags::SYNC_PRESENT != 0
         && desc.kind == crate::protocol::kind::D3D11_TEXTURE
         && desc.ptr.is_null()
@@ -129,19 +96,13 @@ fn validate_descriptor(desc: &TensorDesc) -> Result<(DType, Vec<usize>)> {
 
 /// Restore the producer's format, row pitch and colorimetry onto a
 /// freshly-imported tensor.
-///
-/// Runs after `import_storage` on both backends, over the public setters
-/// (`set_format`, `set_row_stride`, `set_colorimetry`) both already have --
-/// which is what makes it shareable at all.
 fn restore_descriptor_metadata(
     t: &mut TensorDyn,
     desc: &TensorDesc,
     shape: &[usize],
 ) -> Result<()> {
-    // `format` is the HAL-aware format code; it can represent every
-    // `PixelFormat` (including Planar, which has no FourCC). Fall back
-    // to `fourcc` only when the producer left `format` at NONE, for
-    // third-party/DRM-only producers that never set it.
+    // `format` is the HAL format code; `fourcc` is used only when `format` is
+    // NONE.
     let format = if desc.format != crate::protocol::format::NONE {
         crate::protocol::format_from_code(desc.format)
     } else if desc.fourcc != 0 {
@@ -154,9 +115,6 @@ fn restore_descriptor_metadata(
         restore_imported_row_stride(t, desc, shape, fmt);
     }
 
-    // Colorimetry does not participate in `set_format`'s validation, so
-    // this can be unconditional: `0` unpacks to all-`None`, matching a
-    // freshly-imported tensor's default and costing nothing extra.
     t.set_colorimetry(if desc.colorimetry == 0 {
         None
     } else {
@@ -165,11 +123,10 @@ fn restore_descriptor_metadata(
 
     restore_d3d11_logical_shape(t, desc, shape)?;
 
-    // An alias may not allow more CPU access than its producer declared.
+    // Narrow the declared CPU access to the producer's.
     if let Some(access) = crate::protocol::flags::cpu_access(desc.flags) {
         t.restrict_cpu_access(access);
     }
-    // The descriptor cannot carry a `ViewOrigin`, so a view's import is marked instead.
     if desc.flags & crate::protocol::flags::VIEW != 0 {
         t.mark_view();
     }
@@ -177,31 +134,10 @@ fn restore_descriptor_metadata(
     Ok(())
 }
 
-/// Give a `kind::D3D11_TEXTURE` import the shape its producer had.
-///
-/// The import opens the texture at the format's *allocation* shape, because
-/// that is what `from_d3d11_shared_handle` builds from width and height. A
-/// producer that called `set_logical_shape` was carrying the *addressing*
-/// shape instead (`[h, w]` for a semi-planar image rather than
-/// `[combined_h, w]`), and the descriptor faithfully reported it; without
-/// this the consumer would see a shape its producer did not have. The same
-/// narrowing rebuilds a `view()`: its descriptor carries the window's shape,
-/// the import opens the whole texture, and this cuts it down to the window
-/// (`Tensor::set_logical_shape` keeps the texture's pitch as the row stride
-/// while it does, or `view()`'s tight stride for a single-row window, so
-/// the window maps in the texture's last row). Where the window sits is the
-/// plane offset, which the
-/// descriptor cannot carry and the capsule restores afterwards. The import
-/// arm has already checked `shape` is one of those three spellings of the
-/// geometry the texture itself reports, so nothing untrusted reaches
-/// `set_logical_shape` here.
-///
-/// After the format restore, not before: `set_format` validates the shape it
-/// finds, and an addressing shape is not one it accepts for a semi-planar
-/// format (`[481, 640]` is an unreachable combined-plane height).
-///
-/// No other kind needs this. Every one of them is imported at exactly the
-/// shape the descriptor carries.
+/// Give a `kind::D3D11_TEXTURE` import the shape its producer had: the import
+/// opens the texture at the format's allocation shape, and this narrows it to
+/// the descriptor's shape with `set_logical_shape`. Runs after the format
+/// restore.
 fn restore_d3d11_logical_shape(
     t: &mut TensorDyn,
     desc: &TensorDesc,
@@ -213,69 +149,10 @@ fn restore_d3d11_logical_shape(
     t.set_logical_shape(shape)
 }
 
-/// Restore the producer's physical row pitch (the row dimension
-/// convention documented on `protocol::from_parts`) so a decode
-/// that reconfigures this import within its allocation --
-/// `configure_image`'s pool-reuse path -- keeps writing at the
-/// producer's real stride instead of recomputing a tighter one
-/// that only fits today's logical shape. Without this, `capacity`
-/// alone is not enough: `configure_image` only *prefers* a prior
-/// stride when one is recorded, so a fresh import with no stride
-/// still picks a freshly-computed (and possibly narrower) pitch.
-///
-/// `MEM`, `SHM` and `DMABUF`. Historical note: restoring a stride for an
-/// imported `DMABUF` used to be actively harmful -- `Tensor::map`'s
-/// strided path rejected any imported (non-self-allocated) DMA-BUF
-/// outright, so recording one here would have made a foreign
-/// DMA-BUF's CPU map fail with `InvalidOperation`. That was fixed
-/// at the map site instead (a strided imported DMA-BUF is now
-/// accepted there, bounds-checked against `buf_size` exactly like
-/// a self-allocated one is -- `fstat`-derived kernel truth when
-/// the kernel reports a usable size, the declared logical size in
-/// the rare fallback, and either way an out-of-range mmap is still
-/// rejected by the kernel), which is what makes restoring it here
-/// safe: the same argument that justified loosening `Tensor::map`
-/// applies verbatim to the value being restored here -- it is
-/// bounds-checked again by `set_row_stride`'s caller
-/// (`configure_image`, later) and by `Tensor::map` itself at write
-/// time, so an oversized or malformed producer-reported stride
-/// cannot cause an OOB write even though it is trusted without
-/// independent verification.
-/// Confirmed load-bearing, not just anticipated: a pool-sized
-/// (oversized) DMA-BUF-backed destination decoding a smaller
-/// image lost its real pitch without this, recomputing a
-/// tighter one instead -- silent misalignment for any GPU
-/// consumer reading at the true (wider) physical pitch.
-///
-/// `IOSURFACE` is included for the same reason `DMABUF` is, and with the
-/// same bound. An IOSurface's `bytesPerRow` is a property of the surface
-/// itself -- the same in every process that maps it -- so the producer's
-/// stride is the consumer's, and `IoSurfaceTensor::capacity_bytes` is the
-/// whole surface, so the `stride * rows <= capacity` check below bounds
-/// it the same way. Without it a view of a pitched surface, reopened at
-/// the window's shape, was read at the window's tight row over rows the
-/// surface stores a pitch apart (issue #161; pinned by
-/// `descriptor_import_restores_the_iosurface_pitch_onto_a_view`).
-///
-/// `D3D11_TEXTURE` is deliberately excluded: a texture import has a pitch
-/// of its own -- `from_d3d11_shared_handle` records the one this device's
-/// staging copy reports -- and the producer's is a fact about the
-/// producer's driver, not about the texture as this process sees it.
-/// `PBO` is included for the same reason `DMABUF` and `IOSURFACE` are, and
-/// with the same bound. A GL buffer has no pitch of its own -- it is bytes
-/// -- so the producer's stride is the only description of how its rows are
-/// spaced, and `PboTensor::capacity_bytes` is the whole GL allocation, so
-/// the `stride * rows <= capacity` check below bounds it the same way.
-/// Without it a `view()` of a PBO, whose recorded stride is the PARENT's
-/// pitch, was rebuilt at the window's own tight row and every row after the
-/// first read the wrong columns -- the shear half of issue #162, which the
-/// storage-kind half (a view demoting to a host placeholder) hid until
-/// Stage B fixed it. Excluded before Stage B for a reason that was true
-/// then: `import_descriptor` had no `kind::PBO` arm at all, so no PBO
-/// descriptor ever reached this function.
-///
-/// `CUDA` is excluded because that import does not reconstruct a
-/// strided image today.
+/// Restore the producer's physical row pitch (the row dimension convention
+/// documented on `protocol::from_parts`) onto an import of kind `MEM`, `SHM`,
+/// `DMABUF`, `IOSURFACE` or `PBO`. A stride whose `stride * rows` exceeds the
+/// import's capacity is logged and not restored.
 fn restore_imported_row_stride(
     t: &mut TensorDyn,
     desc: &TensorDesc,
@@ -299,37 +176,14 @@ fn restore_imported_row_stride(
     if (desc.ndim as usize) < 2 {
         return;
     }
-    // `strides` is signed to leave room for a future flip
-    // (negative stride); nothing produces one today, and
-    // `set_row_stride` has no way to express it, so a
-    // negative value here is simply skipped rather than
-    // reinterpreted as a huge unsigned pitch.
+    // A negative stride is skipped.
     let Some(&stride_bytes) = desc.strides().get(row_dim) else {
         return;
     };
     let Ok(stride_bytes) = usize::try_from(stride_bytes) else {
         return;
     };
-    // `set_row_stride` enforces only a minimum
-    // (`stride >= min_stride`); it explicitly does no
-    // size validation, by design (it is pure layout
-    // metadata, reused by `strides_follow_row_stride
-    // _not_shape`-style tests that never touch a real
-    // allocation). Import is not that case: `desc` is
-    // an untrusted cross-package payload, and an
-    // oversized stride here would otherwise be
-    // caught only downstream, by whichever consumer
-    // happens to multiply it out first
-    // (`Tensor::map`'s strided path, or
-    // `configure_image`'s own capacity check). The
-    // multiply below is checked -- the descriptor's
-    // stride is untrusted input, so it must not wrap
-    // into a small-looking value that passes a
-    // capacity comparison it should fail.
-    //
-    // `desc.strides()` is in bytes, so there is no
-    // element->byte conversion here (and no second
-    // multiply that could overflow) any more.
+    // Rows the stride applies to; `desc.strides()` is in bytes.
     let rows: usize = match fmt.layout() {
         crate::PixelLayout::Planar if shape.len() >= 2 => shape[0].saturating_mul(shape[1]),
         _ => shape.first().copied().unwrap_or(0),

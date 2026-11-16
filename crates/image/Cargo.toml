@@ -19,18 +19,12 @@ workspace = true
 [features]
 default = ["opengl", "codec"]
 opengl = ["dep:edgefirst-egl", "dep:gbm", "dep:drm-fourcc"]
-# JPEG/PNG decode helpers used by tests, benches, and examples. Off in
-# image-capi and python-image so those artifacts do not embed the codec.
+# JPEG/PNG decode helpers used by tests, benches, and examples.
 codec = ["dep:edgefirst-codec"]
 # The decoder-taking convenience wrappers (`draw_masks`,
-# `draw_masks_tracked`). OFF by default: the generic drawing surface
-# (`draw_decoded_masks`, `draw_proto_masks`) is unconditional and equally
-# fused, so the default build renders masks without linking a model decoder
-# -- and without the YAML/JSON/stats stack that came with it.
+# `draw_masks_tracked`). Off by default.
 decode = ["dep:edgefirst-decoder"]
-# `tracker` implies `decode`: draw_masks_tracked needs the decoder, and
-# `edgefirst-decoder/tracker` cannot enable a feature on a dependency that is
-# otherwise off.
+# `tracker` implies `decode`.
 tracker = ["decode", "edgefirst-decoder/tracker", "dep:edgefirst-tracker", "edgefirst-tracker/tensor-boxes"]
 opencv = ["dep:opencv"]
 
@@ -63,23 +57,19 @@ yuv = { workspace = true }
 edgefirst-decoder = { workspace = true, optional = true }
 edgefirst-tracker = { workspace = true, optional = true, default-features = false }
 
-# The shared NEON mask kernels; other targets keep the crate's own loops.
+# The shared NEON mask kernels.
 [target.'cfg(target_arch = "aarch64")'.dependencies]
 edgefirst-kernels = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 dma-heap = { workspace = true }
-# Portable DRM FourCC enum (the type `gbm` re-exports), used directly so the
-# format mapping does not pull in `gbm`. DRM FourCC is a Linux/DMA-BUF concept,
-# so the dep lives with the other Linux graphics deps.
+# Portable DRM FourCC enum.
 drm-fourcc = { workspace = true, optional = true }
 g2d-sys = { workspace = true }
 gbm = { workspace = true, optional = true }
 
 [dev-dependencies]
-# Tests build real decoders to exercise the integration. A dev-dependency
-# never propagates to consumers, so this does not undo the `decode` gating --
-# `cargo tree -e normal` stays clean.
+# Tests build decoders.
 edgefirst-decoder = { workspace = true }
 ctor = { workspace = true }
 env_logger = { workspace = true }
@@ -90,10 +80,7 @@ image-compare = { workspace = true }
 safetensors = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-# The span-field capture in `gl/tests.rs` needs a subscriber with a real
-# current-span stack: `Span::current()` asks through `Subscriber::current_span`,
-# whose default is `Current::unknown()`, so a hand-rolled subscriber would make
-# every `Span::current().record()` under test look like a no-op.
+# The subscriber for the span-field capture in `gl/tests.rs`.
 tracing-subscriber = { workspace = true }
 
 [[bench]]

@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// Runs `n_tasks` independent tasks and returns after all have finished.
 ///
-/// Kernels tolerate a pool that repeats, skips or invents task indices: each block still runs exactly once.
+/// Kernels tolerate a pool that repeats, skips or invents task indices: each block runs exactly once.
 /// Tasks keep staging buffers of up to 32 KiB on the stack, so worker threads need about 64 KiB
 /// of stack headroom beyond the pool's own use.
 pub trait Pool: Sync {
@@ -80,7 +80,6 @@ pub(crate) fn for_each_block(
             f(start..start + base + usize::from(i < rem));
         }
     };
-    // A safe `Pool` cannot keep `run_block` past `run`, so its blocks are finished and visible here.
     pool.run(tasks, &run_block);
     // Blocks the pool skipped run here; claimed ones are skipped.
     (0..tasks).for_each(run_block);

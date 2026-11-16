@@ -1,49 +1,30 @@
 // SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! CUDA test policy: a skip must not be able to masquerade as coverage.
+//! CUDA test policy: whether an unmet precondition skips a test or fails it.
 //!
-//! The CUDA tests in `gl/tests.rs` used to return early whenever a
-//! precondition -- a CUDA runtime, a GL context, F32 render support, a
-//! PBO-backed destination, CUDA-GL interop -- was unmet, printing `SKIP` and
-//! reporting `ok`. On a host whose runtime soname the probe did not
-//! recognise (or that silently failed one of those other preconditions)
-//! that is indistinguishable from real coverage -- which is exactly how
-//! CUDA 13 hosts ran green while exercising nothing. `HAL_TEST_REQUIRE_CUDA=1`
-//! turns every one of those skips into a failure, and `make test-cuda` sets
-//! it whenever it located a runtime, so the lane cannot silently stop
-//! testing again.
+//! The CUDA tests in `gl/tests.rs` skip when a precondition -- a CUDA
+//! runtime, a GL context, F32 render support, a PBO-backed destination,
+//! CUDA-GL interop -- is unmet. `HAL_TEST_REQUIRE_CUDA=1` turns every one of
+//! those skips into a failure.
 //!
-//! [`decide`] is the pure core: given whether a precondition held and
-//! whether coverage is required, it returns or panics -- no environment
-//! access and no output, so its own tests never touch
-//! `HAL_TEST_REQUIRE_CUDA` and mean the same thing on every host.
-//! [`cuda_available_or_skip`] and [`require_or_skip`] are the two thin,
-//! env-reading callers `gl/tests.rs` uses; they print `SKIP {what}: {why}`
-//! when `decide` returns `false`, so a skip is only ever reported once,
-//! from the caller that knows it actually happened.
-//!
-//! Same philosophy as `tests/gpu_policy.py` for GPU-backed tests: on a
-//! platform where the feature must work, a vacuous skip is a product bug.
+//! [`decide`] takes whether a precondition held and whether coverage is
+//! required, and returns or panics. [`cuda_available_or_skip`] and
+//! [`require_or_skip`] read the environment, call it, and print
+//! `SKIP {what}: {why}` when it returns `false`.
 
-/// `true` when `HAL_TEST_REQUIRE_CUDA=1` is set -- the opt-in that turns a
-/// quiet skip into a visible failure.
+/// `true` when `HAL_TEST_REQUIRE_CUDA=1` is set.
 fn required() -> bool {
     std::env::var("HAL_TEST_REQUIRE_CUDA").as_deref() == Ok("1")
 }
 
-/// The pure decision: `true` when `satisfied`; otherwise a failure or a skip
-/// depending on `require`. No environment access and no output -- callers
-/// read `HAL_TEST_REQUIRE_CUDA` and pass the result in as `require`, and
-/// print the `SKIP` line themselves on a `false` return, which is what keeps
-/// this function (and its tests) meaningful and side-effect-free on every
-/// host.
+/// `true` when `satisfied`; otherwise a failure or a skip depending on
+/// `require`. Reads no environment and prints nothing.
 ///
 /// # Panics
 ///
-/// When `require` is `true` and `satisfied` is `false` -- the opt-in that
-/// turns "quietly skipped" into a visible failure. The panic message names
-/// `HAL_TEST_REQUIRE_CUDA=1`, `what`, and `why`.
+/// When `require` is `true` and `satisfied` is `false`. The panic message
+/// names `HAL_TEST_REQUIRE_CUDA=1`, `what`, and `why`.
 fn decide(satisfied: bool, require: bool, what: &str, why: &str) -> bool {
     if satisfied {
         return true;
@@ -73,11 +54,9 @@ pub(crate) fn cuda_available_or_skip(what: &str) -> bool {
 }
 
 /// `true` when the caller should run; `false` when it should return early.
-/// For preconditions inside a CUDA test other than the runtime itself --
-/// a GL context, F32 render support, a PBO-backed destination, CUDA-GL
-/// interop -- so that under `HAL_TEST_REQUIRE_CUDA=1` a skip anywhere in a
-/// required CUDA test is a failure, not just an absent runtime. Prints
-/// `SKIP {what}: {why}` to stderr on a `false` return.
+/// For preconditions inside a CUDA test other than the runtime itself: a GL
+/// context, F32 render support, a PBO-backed destination, CUDA-GL interop.
+/// Prints `SKIP {what}: {why}` to stderr on a `false` return.
 ///
 /// # Panics
 ///
@@ -95,39 +74,29 @@ pub(crate) fn require_or_skip(satisfied: bool, what: &str, why: &str) -> bool {
 mod tests {
     use super::decide;
 
-    /// Satisfied and required: runs, no assertion, no output.
+    /// Satisfied and required: runs.
     #[test]
     fn satisfied_and_required_runs() {
         assert!(decide(true, true, "what", "why"));
     }
 
-    /// Satisfied and not required: runs regardless of the opt-in.
+    /// Satisfied and not required: runs.
     #[test]
     fn satisfied_and_not_required_runs() {
         assert!(decide(true, false, "what", "why"));
     }
 
-    /// Unsatisfied and not required: an ordinary skip -- CI lanes without
-    /// the precondition must stay green.
+    /// Unsatisfied and not required: an ordinary skip.
     #[test]
     fn unsatisfied_and_not_required_is_an_ordinary_skip() {
         assert!(!decide(false, false, "what", "why"));
     }
 
-    /// Unsatisfied and required: a failure, not a skip. The panic message
-    /// must name the opt-in plus both the caller (`what`) and the reason
-    /// (`why`), so a CI failure is self-explanatory without extra digging.
-    /// This never touches `HAL_TEST_REQUIRE_CUDA` itself -- `decide` takes
-    /// `require` as a plain bool -- so the test means the same thing on
-    /// every host and needs no env save/restore.
+    /// Unsatisfied and required: panics, naming the opt-in, `what` and `why`.
     #[test]
     fn unsatisfied_and_required_panics_naming_the_opt_in_what_and_why() {
-        // The panic itself is the point of this test. Silence the default
-        // hook's "thread '...' panicked at ..." stderr line while we
-        // provoke it, so this test's own output -- and `cargo test`'s
-        // output for the lane as a whole -- stays pristine; restore the
-        // previous hook immediately after so it never leaks into any other
-        // test.
+        // Silence the default panic hook while provoking the panic, then
+        // restore it.
         let prev_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
         let caught = std::panic::catch_unwind(|| decide(false, true, "probe", "some reason"));

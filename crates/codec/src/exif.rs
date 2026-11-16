@@ -3,10 +3,10 @@
 
 //! EXIF orientation parsing.
 //!
-//! The codec reports the source's EXIF orientation in [`ImageInfo`] but never
-//! rotates pixels — geometry is applied downstream by `ImageProcessor::convert()`.
-//! The orientation tag follows the standard EXIF mapping (1 = identity,
-//! 3 = 180°, 6 = 90° CW, 8 = 270° CW, 2/4/5/7 = same with horizontal flip).
+//! The codec reports the source's EXIF orientation in [`ImageInfo`] and does
+//! not rotate pixels. The orientation tag follows the standard EXIF mapping
+//! (1 = identity, 3 = 180°, 6 = 90° CW, 8 = 270° CW, 2/4/5/7 = same with
+//! horizontal flip).
 
 /// Map a raw EXIF orientation tag (1..=8) to `(rotation_degrees, flip_horizontal)`.
 /// Unknown values map to the identity `(0, false)`.
@@ -29,8 +29,7 @@ pub(crate) fn orientation_from_tag(tag: u16) -> (u16, bool) {
 /// Accepts both the JPEG APP1 segment payload (which starts with the
 /// `"Exif\0\0"` identifier before the TIFF header) and a raw TIFF block (as
 /// carried in a PNG `eXIf` chunk). When the identifier is present it is
-/// stripped before parsing so kamadak-exif sees the byte-order marker
-/// (`MM` or `II`) first.
+/// stripped before parsing.
 pub(crate) fn read_exif_orientation(exif_data: &[u8]) -> (u16, bool) {
     let tiff_data = if exif_data.starts_with(b"Exif\0\0") {
         &exif_data[6..]

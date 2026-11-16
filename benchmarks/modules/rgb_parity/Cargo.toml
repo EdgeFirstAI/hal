@@ -16,14 +16,11 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
-# default-features off: the v4l2/nvjpeg hardware decoders would bypass the
-# software fused-RGB write this harness exists to check.
+# Built without the v4l2/nvjpeg hardware decoders.
 edgefirst-codec = { path = "../../../crates/codec", default-features = false }
 edgefirst-tensor = { path = "../../../crates/tensor" }
 libloading = "0.9"
-# Rust-ecosystem comparator engines (--engine zune|image). Same versions/
-# features as rust_jpeg's Cargo.toml — see the comment there on why `neon`/
-# `x86` are listed explicitly rather than left to zune-jpeg's defaults.
+# Rust-ecosystem comparator engines (--engine zune|image).
 zune-jpeg = { version = "0.5.15", features = ["x86", "neon", "std"] }
 zune-core = "0.5"
 image = { version = "0.25.10", default-features = false, features = ["jpeg"] }

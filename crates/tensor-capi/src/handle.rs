@@ -3,24 +3,10 @@
 
 //! The tensor handle and its accessors.
 //!
-//! Sibling `-capi` leaves link `libedgefirst_tensor.so` rather than embedding
-//! a private copy of the implementation, so every `ef_tensor` in the process
-//! is the same [`EfTensorImpl`] layout. Accessors cast the opaque handle and
-//! read it; there is no dispatch table. Sibling libraries export their own
-//! constructors (`ef_image_processor_create_image` and so on); everything
-//! past construction goes through this library.
-//!
-//! Layout that crosses the boundary — [`EfTensorPlane`] plus the
-//! dtype/storage-kind vocabularies — is declared in `edgefirst-tensor-abi`.
-//! The handle representation here is internal and is never declared in
-//! `tensor.h`.
-//!
-//! # Layout
-//!
-//! [`EfTensor`] is a fully opaque zero-sized marker: C never dereferences it
-//! directly, only ever holds a `*mut EfTensor`/`*const EfTensor` and passes
-//! it back through an exported accessor. The real allocation is
-//! [`EfTensorImpl`], reached by reinterpreting the same pointer.
+//! [`EfTensor`] is an opaque zero-sized marker: C holds a
+//! `*mut EfTensor`/`*const EfTensor` and passes it back through an exported
+//! accessor. The allocation behind it is [`EfTensorImpl`], reached by
+//! reinterpreting the same pointer.
 
 use std::ffi::{c_char, CString};
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -33,30 +19,18 @@ use crate::last_error::{set_errno, set_last_error_classified};
 
 /// An opaque tensor handle.
 ///
-/// Zero-sized on purpose: C only ever holds a pointer to this and passes it
-/// back through an exported accessor, which reinterprets the same address as
-/// [`EfTensorImpl`]. There is exactly one implementation library, so no
-/// vtable or type tag is needed to tell handles apart.
+/// C holds a pointer to this and passes it back through an exported
+/// accessor.
 #[repr(C)]
 pub struct EfTensor {
     _private: [u8; 0],
 }
 
-/// The real allocation behind an [`EfTensor`].
+/// The allocation behind an [`EfTensor`].
 ///
-/// The cached vectors exist because the accessors hand C a borrowed pointer:
-/// `shape()` returns `&[usize]`, which is neither `u64` nor guaranteed to
-/// outlive the call, so the C-visible representation is materialised once at
-/// construction.
-///
-/// `map_state` holds the outstanding `ef_tensor_map` guard, if any (see
-/// `crate::map`). It borrows nothing from `inner` -- `TensorDyn::map_bytes`
-/// returns a genuinely `'static` `HostView`, sharing ownership through its
-/// pin's keepalive `Arc` rather than referencing this struct -- so, unlike a
-/// self-referential field, its declaration order relative to `inner` carries
-/// no soundness requirement. `release_own` still drains it before dropping
-/// the `Box`, but that is drop hygiene and a leak diagnostic (a caller who
-/// forgot to `ef_tensor_unmap`), not a lifetime obligation.
+/// `shape_u64`, `strides_i64` and `format_c` are the C-visible forms of the
+/// tensor's shape, byte strides and format. `map_state` holds the
+/// outstanding `ef_tensor_map` guard, if any.
 #[repr(C)]
 pub(crate) struct EfTensorImpl {
     pub(crate) map_state: std::sync::Mutex<Option<crate::map::MapState>>,
@@ -64,27 +38,11 @@ pub(crate) struct EfTensorImpl {
     shape_u64: Vec<u64>,
     strides_i64: Vec<i64>,
     format_c: CString,
-    /// CPU-side handle count. `crate::map`'s exclusive-write gate reads this
-    /// directly, hence `pub(crate)` rather than private to this module.
+    /// CPU-side handle count.
     pub(crate) refs: std::sync::atomic::AtomicUsize,
-    /// Packed colorimetry (`Colorimetry::pack`'s wire form), the sole
-    /// authority for [`ef_tensor_colorimetry`]/[`ef_tensor_set_colorimetry`]
-    /// -- **not** a cache of `inner`'s own `colorimetry` field. Seeded from
-    /// it once in [`into_handle`] and never read back through `inner`
-    /// afterward, which is what lets both C entry points use `&self`-only
-    /// atomic ops instead of ever taking `&mut EfTensorImpl`: a `&mut` to
-    /// this struct while another thread holds a live `&EfTensorImpl` (e.g.
-    /// any other accessor's `imp(t)`, or a concurrent reader/writer on the
-    /// same retained handle -- `ef_tensor` is refcounted and explicitly
-    /// designed to cross threads, see `dynamic_backend.rs`'s module docs)
-    /// is undefined behaviour regardless of what a lock's *timing*
-    /// enforces, because the aliasing violation is about the reference
-    /// itself existing, not about whether the racing accesses happen to
-    /// touch the same bytes. `inner.colorimetry()`/`set_colorimetry()`
-    /// stay the source of truth for every purely-Rust caller (there are
-    /// none in this crate today -- confirmed by grep, `serialize.rs`'s
-    /// blob export never touches colorimetry), so nothing here needs those
-    /// two views kept in sync after construction.
+    /// Packed colorimetry (`Colorimetry::pack`'s wire form), read by
+    /// [`ef_tensor_colorimetry`] and written by [`ef_tensor_set_colorimetry`].
+    /// Seeded from `inner` in [`into_handle`].
     colorimetry: std::sync::atomic::AtomicU32,
 }
 
@@ -103,38 +61,10 @@ unsafe fn imp<'a>(t: *const EfTensor) -> Option<&'a EfTensorImpl> {
 
 /// Recover the implementation behind a handle for exclusive mutation.
 ///
-/// Used by `mutate.rs`/`quant.rs` for the handful of setters that change
-/// `inner`'s own fields (format, row stride, plane offset, shape,
-/// quantization) rather than a side field of `EfTensorImpl` -- unlike
-/// [`ef_tensor_set_colorimetry`], which stores into a dedicated `AtomicU32`
-/// specifically so it never needs `&mut EfTensorImpl` (see that function's
-/// doc comment and the F12 regression it fixed), these mutate `inner` in
-/// place because a live "geometry" primitive (shape, stride, format
-/// validation) genuinely does not fit a single atomic scalar the way a
-/// packed colorimetry value does.
-///
 /// # Safety
-/// `t` must be a live handle produced by [`into_handle`].
-///
-/// **This establishes exclusivity against nothing but the compiler's own
-/// aliasing check at this call site -- it does NOT make mutation through the
-/// returned reference safe under concurrent access from another thread.**
-/// `ef_tensor` handles are refcounted and designed to cross threads
-/// (`ef_tensor_retain`), and every *read-only* accessor in this file
-/// (`ef_tensor_dtype`, `ef_tensor_plane_at`, `ef_tensor_view_origin`, ...)
-/// takes only `&EfTensorImpl` and can be called from another thread at any
-/// time. A `&mut EfTensorImpl` obtained here that overlaps in time with any
-/// of those is the same class of aliasing violation F12 fixed for
-/// colorimetry -- this helper does not fix that class of bug, it only
-/// avoids widening it beyond the specific setters that call it. Those
-/// setters' own doc comments state the resulting constraint plainly: the
-/// caller must not call any other `tensor-capi` accessor on the same handle,
-/// from any thread, while one of these mutators is in flight. This is a
-/// real, narrower guarantee than [`ef_tensor_set_colorimetry`]'s, not an
-/// oversight -- every real caller of these setters (`import_image`,
-/// `configure_image`'s pool-reuse path, quantization setup at model load)
-/// calls them once, before the tensor is retained or shared with another
-/// thread, which is the shape of use this constraint fits.
+/// `t` must be a live handle produced by [`into_handle`]. No other
+/// `tensor-capi` accessor may run on the same handle, from any thread, while
+/// the returned reference is live.
 pub(crate) unsafe fn imp_mut<'a>(t: *mut EfTensor) -> Option<&'a mut EfTensorImpl> {
     unsafe {
         if t.is_null() {
@@ -144,15 +74,7 @@ pub(crate) unsafe fn imp_mut<'a>(t: *mut EfTensor) -> Option<&'a mut EfTensorImp
     }
 }
 
-// Every accessor is reachable from C with a null or foreign pointer, and an
-// unwind across the FFI boundary is undefined behaviour. Each one therefore
-// catches panics and returns a benign value rather than propagating.
-// Written out literally, not via a `macro_rules!` helper: cbindgen parses
-// this file's syntax directly and does not expand user macros, so a
-// macro-generated `#[no_mangle]` function is invisible to it -- the header
-// would silently stop declaring every accessor. (Confirmed the hard way:
-// routing these through a macro first passed `cargo build` clean but made
-// every one of these vanish from tensor.h.)
+// Each accessor catches panics and returns a benign value.
 
 /// Number of dimensions in the addressing grid; 0 for an invalid handle.
 ///
@@ -186,7 +108,7 @@ pub unsafe extern "C" fn ef_tensor_shape(t: *const EfTensor) -> *const u64 {
     }
 }
 
-/// Borrowed pointer to `ndim` strides in BYTES, valid while `t` lives.
+/// Borrowed pointer to `ndim` strides in bytes, valid while `t` lives.
 ///
 /// Returns NULL for an invalid or NULL handle.
 ///
@@ -288,16 +210,10 @@ pub unsafe extern "C" fn ef_tensor_format(t: *const EfTensor) -> *const c_char {
 /// Packed colorimetry (`space | transfer<<8 | encoding<<16 | range<<24`),
 /// or 0 when undefined. See `edgefirst_tensor::Colorimetry::pack`.
 ///
-/// Returns 0 for an invalid or NULL handle -- indistinguishable from a
-/// genuinely undefined colorimetry, which is the same ambiguity every other
-/// "0 means absent" wire value in this ABI already accepts.
+/// Returns 0 for an invalid or NULL handle.
 ///
 /// # Safety
 /// `t` must be `NULL` or a live handle from an EdgeFirst library.
-// This reads the dedicated `colorimetry` atomic (see `EfTensorImpl`'s field
-// doc), not `inner`, and `Relaxed` suffices because nothing else is
-// synchronized through this value -- it is an independent packed scalar,
-// not a guard for any other memory.
 #[no_mangle]
 pub unsafe extern "C" fn ef_tensor_colorimetry(t: *const EfTensor) -> u32 {
     unsafe {
@@ -339,22 +255,9 @@ pub unsafe extern "C" fn ef_tensor_plane_at(
                     }
                 }
                 // A bare (formatless) tensor is one plane spanning its whole
-                // allocation -- `size` is always that allocation's real byte
-                // count. `stride` used to be the same `capacity_bytes()` value
-                // unconditionally, which was never observably wrong before this
-                // task: no `ef_tensor_*` primitive could set a formatless
-                // tensor's `row_stride` field (`Tensor::set_row_stride` itself
-                // requires a format), so `row_stride()` was always `None` here
-                // and the two fell back to the same value. Task 17 added
-                // `ef_tensor_set_row_stride_unchecked`, precisely so a raw
-                // multiplane chroma plane (which by contract carries no format;
-                // see `Tensor::from_planes`) can record its own pitch -- once
-                // that primitive can set it, this accessor must read it back, or
-                // every caller of `ef_tensor_plane_at`/`effective_row_stride` on
-                // such a tensor would see the *whole buffer size* as its row
-                // pitch instead of the real one, the same "answer that looks
-                // plausible but is not the real one" class of bug `plane_offset`
-                // turned out to be in task 15.
+                // allocation: `size` is the allocation's byte count, and
+                // `stride` is the recorded row stride or, when none is set,
+                // the same byte count.
                 None => {
                     let cap = i.inner.capacity_bytes() as u64;
                     vec![edgefirst_tensor::PlaneGeometry {
@@ -382,18 +285,7 @@ pub unsafe extern "C" fn ef_tensor_plane_at(
 }
 
 /// Bytes of the underlying allocation, which is `>=` the tensor's logical
-/// size -- a pool tensor holding a smaller decoded image, or a
-/// pitch-aligned image whose padding the shape alone cannot express.
-///
-/// The producer side of [`edgefirst_tensor::TensorDesc::capacity`]: a
-/// consumer re-importing this tensor's memory needs the real allocation
-/// size, not the size the shape implies. Not derivable from
-/// `ef_tensor_plane_at`: for a *formatted* tensor that reports per-plane
-/// geometry over a computed plane table, whose sum is the logical image
-/// size and not the allocation's.
-///
-/// `-1` is a genuine sentinel, matching `ef_tensor_plane_offset`'s: a byte
-/// count can never be negative.
+/// size.
 ///
 /// @retval `>= 0` the allocation's byte count.
 /// @retval `-1` `t` is `NULL` or invalid.
@@ -413,19 +305,11 @@ pub unsafe extern "C" fn ef_tensor_capacity_bytes(t: *const EfTensor) -> i64 {
     }
 }
 
-/// The *recorded* row stride in bytes, or `-1` when none is recorded
+/// The recorded row stride in bytes, or `-1` when none is recorded
 /// (tightly packed).
 ///
-/// Deliberately distinct from `ef_tensor_plane_at`'s `stride`, which is the
-/// *effective* pitch -- the recorded one when there is one, else a pitch
-/// computed from the format and width. The difference is load-bearing for
-/// [`edgefirst_tensor::TensorDyn::descriptor`]: the cross-package protocol
-/// carries `None` for a tight tensor and lets the consumer recompute, and
-/// baking a computed pitch in instead would turn "no stride recorded" into
-/// "this exact stride is required" across a package boundary.
-///
-/// `-1` is a genuine sentinel, matching `ef_tensor_plane_offset`'s: a byte
-/// pitch can never be negative.
+/// `ef_tensor_plane_at`'s `stride` is the effective pitch: the recorded one
+/// when there is one, else a pitch computed from the format and width.
 ///
 /// @retval `>= 0` the recorded row stride in bytes.
 /// @retval `-1` `t` is `NULL`/invalid, or no row stride is recorded.
@@ -448,18 +332,12 @@ pub unsafe extern "C" fn ef_tensor_row_stride(t: *const EfTensor) -> i64 {
     }
 }
 
-/// The vendor tile-compression scheme this tensor's allocation actually
-/// resolved to; `EF_COMPRESSION_NONE` (0) for a linear layout, which is the
-/// answer everywhere except an Android AHardwareBuffer allocation that both
-/// requested compression and got it.
+/// The vendor tile-compression scheme this tensor's allocation resolved to,
+/// as an `ef_compression` code; `EF_COMPRESSION_NONE` (0) for a linear
+/// layout. Non-zero only for an Android AHardwareBuffer allocation that
+/// requested compression and received it.
 ///
-/// Returns 0 rather than an error code for a `NULL`/invalid handle: the
-/// return type is the vocabulary itself, with no spare bit pattern to carry
-/// a failure, and "linear" is the conservative answer -- a consumer that
-/// treats an unreadable handle as linear reads plausible bytes, whereas one
-/// that treated it as tiled would decode garbage. Callers who need to
-/// distinguish an invalid handle have `ef_tensor_dtype`/`ef_tensor_ndim`
-/// for that.
+/// Returns `EF_COMPRESSION_NONE` (0) for a `NULL`/invalid handle.
 ///
 /// # Safety
 /// `t` must be `NULL` or a live handle.
@@ -481,8 +359,7 @@ pub unsafe extern "C" fn ef_tensor_compression(t: *const EfTensor) -> u32 {
 /// map, copy or sync bracket whose direction it does not cover fails with
 /// `EACCES`.
 ///
-/// Returns `EF_CPU_ACCESS_NONE` (0) for a `NULL`/invalid handle, which no
-/// CPU access can be made through either.
+/// Returns `EF_CPU_ACCESS_NONE` (0) for a `NULL`/invalid handle.
 ///
 /// # Safety
 /// `t` must be `NULL` or a live handle.
@@ -502,8 +379,7 @@ pub unsafe extern "C" fn ef_tensor_cpu_access(t: *const EfTensor) -> u32 {
 /// Narrow this tensor's declared CPU access to the directions both it and
 /// `access` (an `ef_cpu_access` code) cover, on the chroma plane too.
 /// Never widens: a code wider than the declaration leaves it unchanged and
-/// is not an error. The descriptor import calls this with the producer's
-/// `CPU_ACCESS_*` flag bits, so an alias refuses what its producer refuses.
+/// is not an error.
 ///
 /// @return 0, or `EINVAL` for a `NULL`/invalid handle or an unknown code.
 ///
@@ -537,8 +413,7 @@ pub unsafe extern "C" fn ef_tensor_restrict_cpu_access(
 /// non-contiguous for the system heap, unknown for an imported fd and every
 /// other kind of memory.
 ///
-/// Returns unknown (0) for a `NULL`/invalid handle, which a caller checking
-/// for known non-contiguous memory treats as "cannot tell".
+/// Returns unknown (0) for a `NULL`/invalid handle.
 ///
 /// # Safety
 /// `t` must be `NULL` or a live handle.
@@ -610,8 +485,7 @@ pub unsafe extern "C" fn ef_tensor_is_view(t: *const EfTensor) -> std::ffi::c_in
 }
 
 /// Record that this tensor addresses part of a larger buffer, which
-/// `ef_tensor_is_view` then reports. Never cleared. The descriptor import
-/// calls this for a producer whose descriptor carries the `VIEW` flag.
+/// `ef_tensor_is_view` then reports. Never cleared.
 ///
 /// @return 0, or `EINVAL` for a `NULL`/invalid handle.
 ///
@@ -655,16 +529,7 @@ unsafe fn release_own(t: *mut EfTensor) {
         let imp = &*(t as *const EfTensorImpl);
         if imp.refs.fetch_sub(1, std::sync::atomic::Ordering::Release) == 1 {
             std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
-            // An outstanding `ef_tensor_map` at last-reference time is a caller
-            // bug (map without a matching unmap), but the platform sync bracket
-            // — the mmap, the IOSurface lock, whatever the guard's Drop runs —
-            // still has to fire before `inner` goes away, or it leaks silently
-            // inside the freed Box instead. Loud, not silent: this is the
-            // "released with a loud warning" the map-window spec calls for.
-            // Poison recovery mirrors the map/unmap sites: the slot is a
-            // single-assignment `Option`, so a lock poisoned by a shielded
-            // panic still holds a coherent value and the drain must not be
-            // skipped because of it.
+            // Drop an outstanding `ef_tensor_map` guard and log a warning.
             let mut slot = imp
                 .map_state
                 .lock()
@@ -688,10 +553,6 @@ unsafe fn release_own(t: *mut EfTensor) {
 
 /// Derive the three caches [`EfTensorImpl`] keeps alongside `inner`
 /// (`shape_u64`, `strides_i64`, `format_c`) from its current state.
-///
-/// Shared by [`into_handle`] (first derivation) and [`refresh_caches`]
-/// (re-derivation after a mutator changes `inner`'s shape, stride, or
-/// format) so the two never drift apart.
 fn derive_caches(inner: &TensorDyn) -> (Vec<u64>, Vec<i64>, CString) {
     let shape_u64: Vec<u64> = inner.shape().iter().map(|d| *d as u64).collect();
     let strides_i64 = edgefirst_tensor::protocol::c_byte_strides(
@@ -721,12 +582,8 @@ pub(crate) fn into_handle(inner: TensorDyn) -> *mut EfTensor {
     Box::into_raw(boxed) as *mut EfTensor
 }
 
-/// Re-derive `shape_u64`/`strides_i64`/`format_c` after a `mutate.rs`
-/// setter changes `imp.inner`'s shape, row stride, or format -- otherwise
-/// `ef_tensor_shape`/`ef_tensor_strides`/`ef_tensor_format` (which read the
-/// cached copies, not `inner` live) would report stale geometry the moment
-/// after, e.g., `ef_tensor_configure_image` genuinely changed it. Does not
-/// touch `colorimetry`: no mutator this task adds changes it.
+/// Re-derive `shape_u64`/`strides_i64`/`format_c` from `imp.inner`'s
+/// current shape, row stride and format. Does not touch `colorimetry`.
 pub(crate) fn refresh_caches(imp: &mut EfTensorImpl) {
     let (shape_u64, strides_i64, format_c) = derive_caches(&imp.inner);
     imp.shape_u64 = shape_u64;
@@ -735,8 +592,6 @@ pub(crate) fn refresh_caches(imp: &mut EfTensorImpl) {
 }
 
 /// The tensor behind a handle, for in-crate tests.
-///
-/// Not exported: C reaches the tensor only through the exported accessors.
 #[cfg(test)]
 pub(crate) fn inner_of<'a>(t: *const EfTensor) -> &'a TensorDyn {
     // SAFETY: `t` came from `into_handle` in the same test.
@@ -745,13 +600,12 @@ pub(crate) fn inner_of<'a>(t: *const EfTensor) -> &'a TensorDyn {
 
 /// The tensor behind a handle, for this crate's own entry points.
 pub(crate) fn tensor_of<'a>(t: *const EfTensor) -> Option<&'a TensorDyn> {
-    // SAFETY: `t` is checked non-null; the caller contracts it came from here.
+    // SAFETY: `imp` checks `t` for null; `t` came from `into_handle`.
     unsafe { imp(t).map(|i| &i.inner) }
 }
 
 /// The full implementation behind a handle, for this crate's own entry
-/// points that need more than [`tensor_of`] alone -- `crate::map` needs
-/// `map_state` alongside `inner`.
+/// points.
 ///
 /// # Safety
 /// `t` must be `NULL` or a live handle produced by [`into_handle`].
@@ -761,8 +615,7 @@ pub(crate) unsafe fn impl_of<'a>(t: *const EfTensor) -> Option<&'a EfTensorImpl>
 
 /// Allocate a host-memory tensor.
 ///
-/// The simplest constructor: `edgefirst-tensor` handles `mem` allocation
-/// itself, with no `ImageProcessor` involved. Returns `NULL` on failure.
+/// Returns `NULL` on failure.
 ///
 /// # Safety
 /// `dims` must point to `ndim` readable `uint64_t`.
@@ -807,22 +660,14 @@ pub unsafe extern "C" fn ef_tensor_name(t: *const EfTensor) -> *mut c_char {
     .unwrap_or(std::ptr::null_mut())
 }
 
-/// Wrap a caller-owned host allocation as a tensor, aliasing it rather than
-/// copying or owning it -- the consumer half of the cross-package capsule
-/// protocol's host-memory kinds (`MEM`, `SHM`).
+/// Wrap a caller-owned host allocation as a tensor that aliases it, without
+/// copying or owning it.
 ///
-/// `capacity` is the producer's real allocation size, which is `>=` the
-/// tight footprint `dims` implies: a pool tensor, or one padded to a
-/// decoder's pitch alignment, is larger than the shape it currently
-/// reports, and without carrying it the alias would be clamped to today's
-/// shape and unable to grow back into memory the producer actually has.
-/// Pass 0 to mean "exactly the tight footprint".
+/// `capacity` is the allocation's size in bytes, which is `>=` the tight
+/// footprint `dims` implies. Pass 0 for the tight footprint.
 ///
-/// **The returned tensor does not keep `ptr` alive.** It is valid only
-/// while the producer keeps that memory alive, which for the capsule
-/// protocol is the capsule keepalive's job; nothing here takes a reference
-/// to extend it. See
-/// [`edgefirst_tensor::TensorDyn::import_descriptor`].
+/// The returned tensor does not keep `ptr` alive: it is valid only while
+/// the caller keeps that memory alive.
 ///
 /// @retval a new tensor the caller must free with `ef_tensor_free`.
 /// @retval `NULL` for a `NULL` `ptr`/`dims`, `ndim == 0`, or an
@@ -844,10 +689,6 @@ pub unsafe extern "C" fn ef_tensor_wrap_host(
     ndim: u32,
 ) -> *mut EfTensor {
     unsafe {
-        // The quiet hook, before the catch: a caught panic must WRITE the
-        // thread-local, or a consumer reading `ef_tensor_last_error_class`
-        // after this returns NULL gets a class left behind by an earlier
-        // failure and reports it as this call's. See `ensure_hook_installed`.
         crate::last_error::ensure_hook_installed();
         catch_unwind(AssertUnwindSafe(|| {
             let Some(shape) = read_dims(dims, ndim, "wrap_host") else {
@@ -867,11 +708,7 @@ pub unsafe extern "C" fn ef_tensor_wrap_host(
                 );
                 return std::ptr::null_mut();
             };
-            // 0 means "no separate capacity declared": fall back to the
-            // tight footprint, which is what `from_raw_host` (the
-            // capacity-less constructor) records. A sentinel rather than a
-            // presence flag because a zero-byte allocation has nothing to
-            // alias in the first place -- `ptr` would have to be dangling.
+            // A `capacity` of 0 selects the tight footprint.
             let capacity = if capacity == 0 {
                 shape.iter().product::<usize>() * dt.size()
             } else {
@@ -896,16 +733,10 @@ pub unsafe extern "C" fn ef_tensor_wrap_host(
 /// Platforms: macOS, iOS.
 ///
 /// Wrap a live IOSurface, named by its cross-process `IOSurfaceID`, as a
-/// tensor -- the consumer half of the capsule protocol's `IOSURFACE` kind.
+/// tensor.
 ///
-/// Declared on every platform and refused at runtime off Apple, rather than
-/// existing only in an Apple build: this library's ABI surface is the same
-/// set of symbols everywhere, the same rule `ef_storage_kind` follows for
-/// naming `IO_SURFACE` on Linux. A platform-conditional symbol would make
-/// "does this build have it" a link-time question for every consumer.
-///
-/// IDs are reused after a surface is freed, so a stale one fails rather
-/// than resolving to an unrelated buffer.
+/// The symbol is exported on every platform and returns `NULL` off Apple
+/// platforms.
 ///
 /// @retval a new tensor the caller must free with `ef_tensor_free`. It
 ///         holds its own retain on the surface.
@@ -923,10 +754,6 @@ pub unsafe extern "C" fn ef_tensor_from_iosurface_id(
     ndim: u32,
 ) -> *mut EfTensor {
     unsafe {
-        // The quiet hook, before the catch: a caught panic must WRITE the
-        // thread-local, or a consumer reading `ef_tensor_last_error_class`
-        // after this returns NULL gets a class left behind by an earlier
-        // failure and reports it as this call's. See `ensure_hook_installed`.
         crate::last_error::ensure_hook_installed();
         catch_unwind(AssertUnwindSafe(|| {
             let Some(shape) = read_dims(dims, ndim, "from_iosurface_id") else {
@@ -967,11 +794,6 @@ pub unsafe extern "C" fn ef_tensor_from_iosurface_id(
 /// Read a `(dims, ndim)` pair into a shape, or set the last error and
 /// return `None`.
 ///
-/// Shared by the constructors above, and by `d3d11.rs`'s two, rather than
-/// repeated: the null/zero check and the `u64 -> usize` narrowing are
-/// exactly the places two hand-written copies drift into accepting
-/// different arguments.
-///
 /// # Safety
 /// `dims` must be `NULL` or point to `ndim` readable `uint64_t`.
 pub(crate) unsafe fn read_dims(dims: *const u64, ndim: u32, what: &str) -> Option<Vec<usize>> {
@@ -1001,16 +823,11 @@ pub(crate) unsafe fn read_dims(dims: *const u64, ndim: u32, what: &str) -> Optio
 /// Release one reference to a tensor handle. Freeing `NULL` is a no-op.
 ///
 /// `ef_tensor` is refcounted: `ef_tensor_retain` adds a reference and this
-/// function is the release. The tensor is destroyed only when the *last*
-/// reference is released -- whoever still holds a reference keeps the tensor
-/// alive, the `GstBuffer`/`CVPixelBuffer` convention. A handle you hold a
-/// reference to remains valid after another reference's `ef_tensor_free`
-/// call returns; it is a use-after-free only once *your own* last reference
-/// has been released.
+/// function releases one. The tensor is destroyed when the last reference
+/// is released. A handle the caller holds a reference to remains valid
+/// after another reference's `ef_tensor_free` call returns.
 ///
-/// Works on a handle from **any** EdgeFirst library: every library links
-/// this one's shared implementation, so every handle is the exact same
-/// layout, allocated by the exact same allocator.
+/// Accepts a handle from any EdgeFirst library.
 ///
 /// # Safety
 /// `t` must be `NULL` or a live handle from an EdgeFirst library. `t` must
@@ -1048,18 +865,11 @@ pub unsafe extern "C" fn ef_tensor_retain(t: *mut EfTensor) -> std::ffi::c_int {
     }
 }
 
-/// Attach/clear colorimetry metadata on a live handle. `packed` is
-/// `Colorimetry::pack`'s wire form; 0 clears it (matching `pack`'s own
-/// all-`None`-maps-to-0 convention, so a caller can round-trip
-/// [`ef_tensor_colorimetry`] straight back through this without special-
-/// casing "no colorimetry").
+/// Set or clear colorimetry metadata on a live handle. `packed` is
+/// `Colorimetry::pack`'s wire form; 0 clears it.
 ///
-/// **Concurrency.** `ef_tensor` is refcounted and its handles are designed
-/// to cross threads (`ef_tensor_retain` is exactly how two threads come to
-/// legitimately hold the same handle). This function and
-/// [`ef_tensor_colorimetry`] are safe to call concurrently -- from any
-/// number of threads, holding valid references to the same handle, in any
-/// interleaving -- with no external locking required around either call.
+/// This function and [`ef_tensor_colorimetry`] may be called concurrently
+/// on the same handle from any number of threads, with no external locking.
 ///
 /// # Safety
 /// `t` must be `NULL` or a live handle from an EdgeFirst library.
@@ -1074,27 +884,6 @@ pub unsafe extern "C" fn ef_tensor_set_colorimetry(
                 crate::last_error::set_last_error("set_colorimetry: null tensor");
                 return libc::EINVAL;
             }
-            // Deliberately `&EfTensorImpl` (via `imp`, the same shared-reference
-            // helper every read-only accessor uses), never `&mut EfTensorImpl`:
-            // an earlier version took `&mut` here while `ef_tensor_colorimetry`
-            // (this function's read counterpart) takes `&` with no
-            // synchronization between them -- real aliasing UB per Rust's
-            // memory model the moment two threads hold the same retained
-            // handle, which the ABI explicitly allows. Synchronizing only the
-            // timing (e.g. a lock around the old `&mut` cast) would not have
-            // fixed that: the violation is the reference itself existing while
-            // another is live, independent of whether the racing accesses land
-            // on the same bytes. The actual fix is that this never takes
-            // `&mut EfTensorImpl` at all -- it stores straight into the
-            // dedicated `colorimetry: AtomicU32` field (see that field's doc
-            // comment for why it, not `inner`, is the sole authority for this
-            // value) through the same `&EfTensorImpl` shape every other
-            // accessor already uses. `Relaxed` suffices on both the load
-            // (`ef_tensor_colorimetry`) and this store: colorimetry is an
-            // independent scalar with no documented ordering requirement
-            // against any other ABI-exposed state (format is immutable after
-            // construction; `map_state` and `refs` are unrelated), so there is
-            // no happens-before relationship for a stronger ordering to buy.
             let Some(imp) = imp(t) else {
                 crate::last_error::set_last_error("set_colorimetry: null tensor");
                 return libc::EINVAL;
@@ -1174,46 +963,20 @@ pub(crate) mod tests {
         let t = unsafe { ef_tensor_new(0, dims.as_ptr(), 1) };
         assert!(!t.is_null());
         assert_eq!(unsafe { ef_tensor_retain(t) }, 0);
-        // First free releases the retain; the handle must still answer.
+        // The first free releases the retained reference.
         unsafe { ef_tensor_free(t) };
         assert_eq!(unsafe { ef_tensor_ndim(t) }, 1);
-        // Second free destroys.
+        // The second free destroys the tensor.
         unsafe { ef_tensor_free(t) };
     }
 
     #[test]
     fn concurrent_colorimetry_read_and_write_do_not_race() {
-        // Regression for F12: an earlier version's `ef_tensor_set_colorimetry`
-        // took `&mut EfTensorImpl` (the whole struct) while every other
-        // accessor, including `ef_tensor_colorimetry`, took `&EfTensorImpl`
-        // unsynchronized with it -- real aliasing UB per Rust's memory
-        // model, not a benign timing race, and exactly the scenario two
-        // threads sharing one handle via `ef_tensor_retain` produce (the
-        // handle is refcounted and explicitly designed to cross threads).
-        //
-        // Ideally this runs under Miri (`cargo +nightly miri test`), whose
-        // data-race detector catches the aliasing violation deterministically
-        // rather than depending on hardware timing. That was attempted here
-        // and blocked by an unrelated environment issue: `cargo miri test`
-        // re-resolves against a newer `rustix` than the pinned lockfile
-        // uses, and `dma-heap 0.4.1` (an unconditional Linux dependency of
-        // `edgefirst-tensor`) fails to compile against it (`Opcode` changed
-        // from `u32` to `u64`) -- present with or without `--locked`, so it
-        // is a real toolchain/dependency mismatch, not something specific to
-        // this test. Not chased further; still worth running under Miri once
-        // that is fixed. Until then this loop is the plain-hardware fallback:
-        // it does not reliably fail on every run (small structs can tear
-        // without an observable wrong value on a given CPU/build), so treat
-        // a pass here as "no crash observed," not proof of absence -- the
-        // real guarantee is the code no longer takes `&mut EfTensorImpl`
-        // while a live `&EfTensorImpl` can exist elsewhere, checked by
-        // inspection above and in the SAFETY comments this change rewrote.
+        // One thread sets colorimetry while another reads it through a
+        // second reference to the same handle.
         let dims = [4u64];
         let t = unsafe { ef_tensor_new(0, dims.as_ptr(), 1) };
         assert!(!t.is_null());
-        // Two legitimate owners of the same handle -- the scenario the bug
-        // needs: `ef_tensor_retain` is exactly how a second thread comes to
-        // hold the same pointer.
         assert_eq!(unsafe { ef_tensor_retain(t) }, 0);
 
         let addr = t as usize;
@@ -1235,8 +998,7 @@ pub(crate) mod tests {
         writer.join().expect("writer thread must not panic");
         reader.join().expect("reader thread must not panic");
 
-        // Two references outstanding (the initial one plus the retain
-        // above): release both.
+        // Release both references.
         unsafe { ef_tensor_free(t) };
         unsafe { ef_tensor_free(t) };
     }

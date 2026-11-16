@@ -3,8 +3,7 @@
 
 //! Diagnostic: decode every JPEG in a directory through the codec (hardware
 //! path when available) and report per-image decode time, flagging slow
-//! frames. Used to isolate images that stall a V4L2 decoder — this is how the
-//! mxc-jpeg APP13 embedded-thumbnail wedge (COCO 000000122046.jpg) was found.
+//! frames.
 //!
 //! Usage: v4l2_scan <dir> [slow_ms]
 

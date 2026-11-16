@@ -16,5 +16,5 @@ publish = false
 [lints]
 workspace = true
 
-# No dependencies: this compiles into every leaf's build script.
+# No dependencies.
 [dependencies]

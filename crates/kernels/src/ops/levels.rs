@@ -42,7 +42,7 @@ pub(crate) enum Isa {
     Scalar,
     #[cfg(target_arch = "aarch64")]
     Neon,
-    /// FP16 arithmetic: NEON plus FEAT_FP16, seen by the runtime check as well.
+    /// FP16 arithmetic: NEON plus FEAT_FP16.
     #[cfg(target_arch = "aarch64")]
     NeonFp16,
 }
@@ -67,8 +67,7 @@ impl Isa {
     }
 }
 
-/// Most anchors in one block, the unit of staging and of parallel work.
-// Keep a multiple of 4 so blocks group anchors as the decoder's 4-anchor NEON dist2bbox does.
+/// Most anchors in one block, the unit of staging and of parallel work; a multiple of 4.
 pub(crate) const BLOCK: usize = 64;
 
 /// Largest `reg_max` the DFL plans take.

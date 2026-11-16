@@ -7,9 +7,7 @@
 //! de-interleave, `EOR`). Float scores are normalized as `((x − min) / (max − min) · 255) as u8`
 //! over the map's minimum and maximum (0 and 255 when it holds a NaN), each step rounded in the
 //! score type: f32, or f16 in `half` arithmetic (f32 operations rounded to f16 after each step,
-//! or native FP16 instructions, which round the same since f32 carries twice f16's precision
-//! plus two bits). A zero's sign in the minimum or maximum cannot change a `u8` result, so the
-//! vector reductions may pick either. The per-pixel argmax over interleaved channels returns the
+//! or native FP16 instructions). The per-pixel argmax over interleaved channels returns the
 //! first channel holding the largest score, as a `u8` (the index modulo 256).
 
 #![cfg(target_arch = "aarch64")]
@@ -271,7 +269,7 @@ fn load_part(src: &[u8], at: usize, n: usize, below: uint8x16_t) -> uint8x16_t {
     }
 }
 
-/// Channels up to which [`argmax_blocks`] runs: every index then fits a byte lane.
+/// Channels up to which [`argmax_blocks`] runs.
 const MAX_TREE_CHANNELS: usize = 256;
 
 /// Lane `p` of the result is the pairwise reduction `f` of the 16 lanes of `v[p]` (a tree of

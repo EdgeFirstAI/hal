@@ -7,8 +7,7 @@
 //! fails instead.
 //!
 //! The expected pictures are FNV-1a hashes of the visible NV12 bytes of
-//! each frame as FFmpeg decodes the fixture, in presentation order: H.264
-//! decoding is exact, so a hardware decoder must produce the same bytes.
+//! each frame as FFmpeg decodes the fixture, in presentation order.
 
 use std::collections::{BTreeSet, VecDeque};
 
@@ -341,8 +340,7 @@ fn frames_held_across_a_resolution_change_keep_their_provided_buffers() {
     let Some(mut decoder) = open(test, config) else {
         return;
     };
-    // The new format's pool is over the same tensors: the last pictures of
-    // the old one, still held, must not be decoded over.
+    // Hold the last pictures of the old format across the change.
     const HOLD: usize = 3;
     let mut held: VecDeque<(DecodedFrame, u64)> = VecDeque::new();
     let mut changed = false;
@@ -449,7 +447,7 @@ fn a_small_pool_recycles_dropped_frames() {
     ) else {
         return;
     };
-    // Holding one frame while decoding the next is what a count of 1 allows.
+    // A count of 1: hold one frame while decoding the next.
     let mut held = None;
     let mut run = Run::default();
     let stream = testdata(MAIN_BFRAMES_FILE);
@@ -477,8 +475,7 @@ fn a_pool_with_nothing_to_spare_still_returns_every_picture() {
     ) else {
         return;
     };
-    // The caller drops every frame at once; pictures the decoder releases
-    // together must still all come back.
+    // The caller drops every frame at once.
     let mut run = Run::default();
     decode_all(&mut decoder, &testdata(MAIN_BFRAMES_FILE), &mut run, 0);
     assert_eq!(run.hashes, MAIN_BFRAMES);
@@ -503,8 +500,7 @@ fn holding_every_frame_exhausts_the_pool_until_frames_are_dropped() {
                 exhausted += 1;
                 assert!(h > 0 && h <= pool, "{h} of {pool}");
                 assert!(held.len() >= h, "the caller holds {} frames", held.len());
-                // Dropping the frames frees the pool; the same access unit
-                // then decodes.
+                // Drop the frames, then decode the same access unit again.
                 held.clear();
                 decoder
                     .decode(au, i as u64)

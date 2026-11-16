@@ -85,8 +85,7 @@ impl Reference {
         }
     }
 
-    /// [`Self::overlaps`] for four vectors of boxes, one operation at a time across them: an
-    /// in-order core then overlaps the four latency chains.
+    /// [`Self::overlaps`] for four vectors of boxes, one operation at a time across them.
     #[inline(always)]
     fn overlaps4(&self, b: [[float32x4_t; 4]; 4]) -> [uint32x4_t; 4] {
         const K: [usize; 4] = [0, 1, 2, 3];
@@ -243,11 +242,10 @@ unsafe fn load_f16x8(p: *const f16) -> uint16x8_t {
 /// boxes have survived. On return `dead[j] != 0` marks the boxes flagged before the call and
 /// those suppressed.
 ///
-/// The overlap along an axis is `max(min(w_j/2 + w_i/2 − |c_j − c_i|, w_j, w_i), 0)`, which
-/// keeps a box's extent at f16 relative precision wherever its centre lies. Each step is
-/// rounded to f16, so a pair within about 2⁻⁹ of the threshold may be decided differently than
-/// [`nms_greedy_neon`] decides it. Sizes must be scaled so that areas and their sums stay finite
-/// and normal in f16; a box with a NaN field never suppresses and is never suppressed.
+/// The overlap along an axis is `max(min(w_j/2 + w_i/2 − |c_j − c_i|, w_j, w_i), 0)`. Each step
+/// is rounded to f16: a pair within about 2⁻⁹ of the threshold may be decided differently than
+/// [`nms_greedy_neon`] decides it. Sizes must be at a scale where areas and their sums stay
+/// finite and normal in f16; a box with a NaN field never suppresses and is never suppressed.
 ///
 /// The box slices and `dead` must share one length `n`, a multiple of [`LANES_FP16`], and
 /// `scratch` (overwritten) must hold `3 · n` values; padding boxes must be flagged dead.
@@ -296,8 +294,7 @@ pub unsafe fn nms_greedy_neon_fp16(
             let splat = |p: *const f16| vdupq_n_u16((*p.add(i)).to_bits());
             let (rcx, rcy, rw, rh) = (splat(cx), splat(cy), splat(w), splat(h));
             let (rex, rey, rarea) = (splat(ex), splat(ey), splat(area));
-            // Four blocks advance one operation at a time: an in-order core then overlaps
-            // their latency chains instead of running one block's chain to its end.
+            // Four blocks advance one operation at a time.
             let hit4 = |j: usize| {
                 let o = [j, j + L, j + 2 * L, j + 3 * L];
                 let b = [0, 1, 2, 3];

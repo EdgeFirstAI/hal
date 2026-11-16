@@ -7,10 +7,9 @@
 //! produced by `scripts/generate_exif_fixtures.py` and carry the same pixel
 //! data with only the EXIF orientation tag varying.
 //!
-//! The codec **reports** the EXIF orientation in [`ImageInfo`] but never rotates
-//! pixels: `info.width`/`info.height` are always the source's true (unrotated)
-//! dimensions, and `info.rotation_degrees`/`info.flip_horizontal` carry the
-//! geometry the consumer should apply downstream.
+//! The codec reports the EXIF orientation in [`ImageInfo`] and does not rotate
+//! pixels: `info.width`/`info.height` are the source's unrotated dimensions,
+//! and `info.rotation_degrees`/`info.flip_horizontal` carry the orientation.
 //!
 //! EXIF orientation → (rotation_degrees, flip_horizontal) mapping:
 //!
@@ -67,7 +66,7 @@ fn expected_orientation(o: u32) -> (u16, bool) {
 fn check_jpeg_orientation(o: u32) {
     let data = testdata(&format!("zidane_exif_{o}.jpg"));
 
-    // peek reports the source's true (unrotated) dims and the EXIF orientation.
+    // peek reports the source's unrotated dims and the EXIF orientation.
     let peeked = peek_info(&data).unwrap();
     assert_eq!(
         (peeked.width, peeked.height),
@@ -82,8 +81,7 @@ fn check_jpeg_orientation(o: u32) {
         "orientation {o}: peek orientation mismatch"
     );
 
-    // A full decode reports the same dims and orientation; the codec never
-    // rotates, so the destination tensor is sized for the source dims.
+    // A full decode reports the same dims and orientation.
     let mut tensor = Tensor::<u8>::image(
         W,
         H,

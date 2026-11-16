@@ -4,13 +4,12 @@
 //! NEON elementwise conversions, bit-identical to their scalar counterparts on every input.
 //!
 //! Each kernel converts 16 elements per step and runs its tail through the same vector code on
-//! a zero-padded stack block, so short slices are vectorized too; the 8-bit → f32 dequantizers
-//! and the integer → f32 `scale_bias` kernels are a plain loop the compiler vectorizes. Float
-//! arithmetic is done in the scalar order with no FMA, and f16 conversions use the ARMv8.0
-//! `FCVTL`/`FCVTN`, so results match `half` and `prim::dequant` bit for bit, NaN payloads
-//! included. The `scale_bias` kernels compute the decoder's generic dequantize
-//! `x · scale + bias` into possibly uninitialized outputs. Every kernel writes nothing when its
-//! slices differ in length.
+//! a zero-padded stack block; the 8-bit → f32 dequantizers and the integer → f32 `scale_bias`
+//! kernels are a plain loop the compiler vectorizes. Float arithmetic is done in the scalar
+//! order with no FMA, and f16 conversions use the ARMv8.0 `FCVTL`/`FCVTN`, so results match
+//! `half` and `prim::dequant` bit for bit, NaN payloads included. The `scale_bias` kernels
+//! compute the decoder's generic dequantize `x · scale + bias` into possibly uninitialized
+//! outputs. Every kernel writes nothing when its slices differ in length.
 
 #![cfg(target_arch = "aarch64")]
 
@@ -143,7 +142,7 @@ unsafe fn spread_bytes<const AT: usize>(p: *const u8) -> [uint8x16_t; 4] {
 impl LoadF32 for i8 {
     #[inline(always)]
     unsafe fn load16(p: *const Self) -> F32x16 {
-        // The byte sits in the top of each lane, so a 24-bit fixed-point conversion is exact.
+        // The byte sits in the top of each lane and converts as 24-bit fixed point.
         // SAFETY: the caller guarantees 16 readable elements; NEON is the aarch64 baseline.
         unsafe {
             spread_bytes::<3>(p.cast()).map(|v| vcvtq_n_f32_s32::<24>(vreinterpretq_s32_u8(v)))
@@ -275,7 +274,7 @@ fn dequant<S: LoadF32, D: StoreFloat>(src: &[S], q: Quant, dst: &mut [D]) {
 /// `round_half_away(x · inv_scale) + zero_point` per lane, saturating in i32.
 #[inline(always)]
 fn quantize_i32(v: F32x16, inv_scale: float32x4_t, zp: int32x4_t) -> [int32x4_t; 4] {
-    // FCVTAS rounds ties away from zero, saturates, and maps NaN to 0, as `quantize` does.
+    // FCVTAS rounds ties away from zero, saturates, and maps NaN to 0.
     // SAFETY: NEON is part of the aarch64 baseline.
     v.map(|x| unsafe { vqaddq_s32(vcvtaq_s32_f32(vmulq_f32(x, inv_scale)), zp) })
 }
@@ -416,7 +415,7 @@ dequant_kernel!(
     f16
 );
 
-/// `(x − zero_point) · scale` as a plain loop the compiler vectorizes; it must stay FMA-free.
+/// `(x − zero_point) · scale` as a plain loop the compiler vectorizes, with no FMA.
 #[inline(always)]
 fn dequant_loop<S: Copy + Into<f32>>(src: &[S], q: Quant, dst: &mut [f32]) {
     if src.len() != dst.len() {
@@ -429,8 +428,7 @@ fn dequant_loop<S: Copy + Into<f32>>(src: &[S], q: Quant, dst: &mut [f32]) {
 }
 
 dequant_kernel!(
-    /// `prim::dequant::dequant_i8_to_f32`, bit for bit (no FMA, unlike
-    /// `neon_baseline::dequant_i8_to_f32_neon`).
+    /// `prim::dequant::dequant_i8_to_f32`, bit for bit (no FMA).
     dequant_i8_to_f32_exact_neon,
     i8,
     f32,
@@ -456,8 +454,7 @@ dequant_kernel!(
     f32
 );
 dequant_kernel!(
-    /// `prim::dequant::dequant_i8_to_f16`, bit for bit (no FMA, unlike
-    /// `neon_baseline::dequant_i8_to_f16_neon`).
+    /// `prim::dequant::dequant_i8_to_f16`, bit for bit (no FMA).
     dequant_i8_to_f16_exact_neon,
     i8,
     f16
@@ -546,8 +543,7 @@ pub(crate) fn round_to_f16(v: F32x16) -> F32x16 {
 }
 
 /// `x · scale + bias` into f16 with `half`'s roundings: `x` to f16, the product to f16, the sum
-/// to f16. The f32 product of two f16 values is exact and an f32 sum of two rounds to the
-/// correctly rounded f16 sum, so each step equals the f16 operation.
+/// to f16.
 #[inline(always)]
 fn scale_bias_f16<S: LoadF32>(
     src: &[S],
@@ -1092,8 +1088,7 @@ mod tests {
         unsafe { &mut *(s as *mut [T] as *mut [MaybeUninit<T>]) }
     }
 
-    /// Every value of each 8- and 16-bit type through `x · scale + bias` into f32 and f16; the
-    /// outputs start as NaN, which no case produces, so an unwritten element fails.
+    /// Every value of each 8- and 16-bit type through `x · scale + bias` into f32 and f16.
     #[test]
     fn scale_bias_matches_the_generic_formula() {
         type F32Kernel<S> = unsafe fn(&[S], f32, Option<f32>, &mut [MaybeUninit<f32>]);

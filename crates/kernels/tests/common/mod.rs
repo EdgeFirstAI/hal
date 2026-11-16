@@ -3,7 +3,7 @@
 
 //! Shared helpers for the kernel integration tests: fixture loading, CPU tiers and pool checks.
 
-#![allow(dead_code)] // Each test binary uses a subset.
+#![allow(dead_code)]
 
 use std::num::NonZeroUsize;
 

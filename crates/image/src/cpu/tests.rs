@@ -11,24 +11,7 @@ mod cpu_tests {
     };
     use edgefirst_tensor::DetectBox;
 
-    /// A `C > 1` mask routed to the INSTANCE renderer must read channel 0.
-    ///
-    /// The semantic/instance split is decided from `segmentation[0]` ALONE
-    /// (`cpu/mod.rs`), so a list whose FIRST mask is `C == 1` sends every
-    /// later mask to `render_yolo_segmentation` regardless of its own channel
-    /// count — which is why this test needs two detections, the first with a
-    /// `C == 1` mask. With a `C == 3` mask in slot 0 the dispatcher would pick
-    /// the semantic renderer instead and never exercise the read under test.
-    ///
-    /// The former `Array3` read `.get([y, x, 0])` was correct for any `C`; a
-    /// flat `y * W + x` index is correct only for `C == 1` and, because it
-    /// stays in bounds, silently renders the wrong bytes for anything else.
-    ///
-    /// The oracle replaces the `C == 3` mask with a `C == 1` mask holding
-    /// exactly its channel 0, so correct channel extraction must give
-    /// byte-identical output. A weaker "something was drawn" assertion does
-    /// NOT catch the bug — a strided misread still lands on a set byte one
-    /// time in three.
+    /// The instance renderer rejects a `C > 1` mask in a list whose first mask is `C == 1`.
     #[test]
     fn instance_renderer_reads_channel_zero_of_a_multi_channel_mask() {
         use edgefirst_tensor::Segmentation;
@@ -36,20 +19,17 @@ mod cpu_tests {
         const W: usize = 8;
         const H: usize = 8;
 
-        // Non-uniform: a uniform mask makes a wrong-channel read
-        // coincidentally correct.
         let chan0: Vec<u8> = (0..H * W)
             .map(|i| if i % 3 == 0 { 255 } else { 0 })
             .collect();
-        // C == 3 with channel 0 == chan0 and the others inverted, so reading
-        // the wrong channel gives visibly different coverage.
+        // C == 3 with channel 0 == chan0 and the others inverted.
         let mut wide = vec![0u8; H * W * 3];
         for (px, &v) in chan0.iter().enumerate() {
             wide[px * 3] = v;
             wide[px * 3 + 1] = 255 - v;
             wide[px * 3 + 2] = 255 - v;
         }
-        // Slot 0 is always C == 1: it is what pins the dispatch to instance.
+        // Slot 0 is C == 1.
         let first: Vec<u8> = (0..H * W)
             .map(|i| if i % 2 == 0 { 255 } else { 0 })
             .collect();
@@ -101,14 +81,9 @@ mod cpu_tests {
             Ok(m.as_slice().to_vec())
         };
 
-        // The C == 1 list renders normally, and non-vacuously.
         let want = render(build(&chan0, &[H, W, 1])).expect("C=1 list must render");
         assert!(want.iter().any(|&v| v != 0), "oracle drew nothing");
 
-        // The mixed list is rejected rather than silently rendering the wrong
-        // bytes. Before this was a `debug_assert_eq!(classes, 1)`, which meant
-        // release builds read a flat `y * W + x` index -- in bounds, wrong
-        // channel, no diagnostic.
         let err = render(build(&wide, &[H, W, 3])).expect_err("C=3 must be rejected");
         let msg = format!("{err:?}");
         assert!(
@@ -118,10 +93,6 @@ mod cpu_tests {
     }
 
     /// The mask bytes of a `Segmentation`, as a flat `Vec<u8>`.
-    ///
-    /// `Segmentation::segmentation` is a `TensorDyn` rather than an
-    /// `ndarray::Array3<u8>`, so tests that used to call `.iter()` on it map
-    /// through this instead.
     fn seg_bytes(s: &edgefirst_tensor::Segmentation) -> Vec<u8> {
         let t = s.segmentation.as_u8().expect("segmentation must be U8");
         let m = t.map_read().expect("map segmentation");
@@ -132,8 +103,7 @@ mod cpu_tests {
         DType, PixelFormat, Tensor, TensorDyn, TensorMapTrait, TensorMemory, TensorTrait,
     };
 
-    /// A convert writing part of a buffer (a view) needs a `ReadWrite`
-    /// destination; a letterbox writes the whole destination and takes `Write`.
+    /// A convert into a view needs a `ReadWrite` destination; a letterbox into a whole destination takes `Write`.
     #[test]
     fn partial_destination_write_needs_readwrite() {
         use edgefirst_tensor::{CpuAccess, Error as TensorError};
@@ -158,7 +128,7 @@ mod cpu_tests {
             }
             other => panic!("expected CpuAccessDenied, got {other:?}"),
         }
-        // Rebuilt from its descriptor the view has no `ViewOrigin`, and is refused alike.
+        // The view rebuilt from its descriptor is refused alike.
         let pin = view.pin_host(CpuAccess::Write).unwrap();
         let mut rebuilt =
             TensorDyn::import_descriptor(&view.descriptor_pinned(Some(&pin))).unwrap();
@@ -177,8 +147,7 @@ mod cpu_tests {
         cpu.convert(&src, &mut whole, Some(letterbox)).unwrap();
     }
 
-    /// A padded destination resizes through a scratch seeded from it only when
-    /// pixels outside the placement survive, so a write-only one letterboxes.
+    /// A letterbox into a padded write-only destination succeeds.
     #[test]
     fn padded_write_only_destination_letterboxes() {
         use edgefirst_tensor::CpuAccess;
@@ -217,10 +186,7 @@ mod cpu_tests {
         }
     }
 
-    /// The buffer-geometry guards reject undersized/overflowing inputs with
-    /// `InvalidShape` instead of panicking. Exercised directly on plain slices
-    /// (the end-to-end malformed-tensor path needs an undersized `from_fd`/DMA
-    /// buffer, which is Linux+DMA-gated).
+    /// The buffer-geometry guards reject undersized and overflowing inputs with `InvalidShape`.
     #[test]
     fn buffer_geometry_guards_reject_bad_input() {
         use super::super::{guard_plane, split_semi_planar_mut};
@@ -299,8 +265,6 @@ mod cpu_tests {
         )
         .expect("Image Comparison failed");
         if similarity.score < threshold {
-            // image1.save(format!("{name}_1.png"));
-            // image2.save(format!("{name}_2.png"));
             similarity
                 .image
                 .to_color_map()
@@ -322,8 +286,8 @@ mod cpu_tests {
         assert_eq!(img1.height(), img2.height(), "Heights differ");
         assert_eq!(img1.width(), img2.width(), "Widths differ");
 
-        // Try converting both to RGB for comparison. If conversion is not
-        // supported (e.g. from PlanarRgb), fall back to raw byte comparison.
+        // Converts both to RGB for comparison, or compares raw bytes when the
+        // conversion is not supported.
         let mut converter = CPUProcessor::default();
         let w = img1.width().unwrap();
         let h = img1.height().unwrap();
@@ -350,7 +314,7 @@ mod cpu_tests {
             let r1 = converter.convert(img1, &mut rgb1, None);
             let r2 = converter.convert(img2, &mut rgb2, None);
             if r1.is_err() || r2.is_err() {
-                // Fallback: compare raw bytes as greyscale strip
+                // Compares raw bytes as a greyscale strip.
                 compare_images_convert_to_grey(img1, img2, threshold, name);
                 return;
             }
@@ -378,8 +342,6 @@ mod cpu_tests {
         )
         .expect("Image Comparison failed");
         if similarity.score < threshold {
-            // image1.save(format!("{name}_1.png"));
-            // image2.save(format!("{name}_2.png"));
             similarity
                 .image
                 .to_color_map()
@@ -392,12 +354,7 @@ mod cpu_tests {
         }
     }
 
-    /// CPU-processor tests operate on host memory: a tight `Mem` tensor whose
-    /// row stride equals `width * bpp`. Pinning these tests to `Mem` keeps them
-    /// deterministic across platforms — `None` auto-selects a pitch-padded DMA
-    /// tensor on i.MX (DMA heap present), which shears the flat `copy_from_slice`
-    /// fill and flat `as_slice()` assertions below. Padded-stride coverage lives
-    /// in the dedicated `odd_dim_cpu` integration suite.
+    /// Host memory: a tight `Mem` tensor whose row stride equals `width * bpp`.
     fn mem() -> Option<TensorMemory> {
         Some(TensorMemory::Mem)
     }
@@ -410,7 +367,7 @@ mod cpu_tests {
         bytes: &[u8],
     ) -> Result<TensorDyn, Error> {
         log::debug!("Current function is {}", function!());
-        // Default to host memory (tight) so the flat fill matches the layout.
+        // Defaults to host memory.
         let memory = memory.or_else(mem);
         let src = TensorDyn::image(
             width,
@@ -428,7 +385,6 @@ mod cpu_tests {
         (
         $src_fmt:expr,  $src_file:expr, $dst_fmt:expr, $dst_file:expr
     ) => {{
-            // Load source
             let src = load_bytes_to_tensor(
                 1280,
                 720,
@@ -437,7 +393,6 @@ mod cpu_tests {
                 &edgefirst_bench::testdata::read($src_file),
             )?;
 
-            // Load destination reference
             let dst = load_bytes_to_tensor(
                 1280,
                 720,
@@ -459,10 +414,6 @@ mod cpu_tests {
 
             converter.convert(&src, &mut converted, None)?;
 
-            // Post-WS1 the CPU YUV paths resolve per-source colorimetry against
-            // the BT.709 fixtures: every colour↔colour conversion here now
-            // measures ≥0.9946 (was the YUV-matrix delta that forced 0.95).
-            // Tightened to 0.99.
             compare_images_convert_to_rgb(&dst, &converted, 0.99, function!());
 
             Ok(())
@@ -473,7 +424,6 @@ mod cpu_tests {
         (
         $src_fmt:expr,  $src_file:expr, $dst_fmt:expr, $dst_file:expr
     ) => {{
-            // Load source
             let src = load_bytes_to_tensor(
                 1280,
                 720,
@@ -482,7 +432,6 @@ mod cpu_tests {
                 &edgefirst_bench::testdata::read($src_file),
             )?;
 
-            // Load destination reference
             let dst = load_bytes_to_tensor(
                 1280,
                 720,
@@ -504,18 +453,11 @@ mod cpu_tests {
 
             converter.convert(&src, &mut converted, None)?;
 
-            // Used whenever grey is on either side (compared in luma space). The
-            // floor is grey→colour (~0.978): one luma channel replicated to RGB
-            // inherently loses chroma vs a colour fixture — structural, not a
-            // colorimetry gap. Grey→grey / colour→grey measure ≥0.997. Tightened
-            // 0.95 → 0.97.
             compare_images_convert_to_grey(&dst, &converted, 0.97, function!());
 
             Ok(())
         }};
     }
-
-    // let mut dsts = [yuyv, rgb, rgba, grey, nv16, planar_rgb, planar_rgba];
 
     #[test]
     fn test_cpu_yuyv_to_yuyv() -> Result<()> {
@@ -927,7 +869,6 @@ mod cpu_tests {
 
     #[test]
     fn test_cpu_nearest() -> Result<()> {
-        // Load source
         let src = load_bytes_to_tensor(2, 1, PixelFormat::Rgb, None, &[0, 0, 0, 255, 255, 255])?;
 
         let mut converter = CPUProcessor::new_nearest();
@@ -955,7 +896,6 @@ mod cpu_tests {
 
     #[test]
     fn test_cpu_rotate_cw() -> Result<()> {
-        // Load source
         let src = load_bytes_to_tensor(
             2,
             2,
@@ -994,7 +934,6 @@ mod cpu_tests {
 
     #[test]
     fn test_cpu_rotate_ccw() -> Result<()> {
-        // Load source
         let src = load_bytes_to_tensor(
             2,
             2,
@@ -1033,7 +972,6 @@ mod cpu_tests {
 
     #[test]
     fn test_cpu_rotate_180() -> Result<()> {
-        // Load source
         let src = load_bytes_to_tensor(
             2,
             2,
@@ -1072,7 +1010,6 @@ mod cpu_tests {
 
     #[test]
     fn test_cpu_flip_v() -> Result<()> {
-        // Load source
         let src = load_bytes_to_tensor(
             2,
             2,
@@ -1111,7 +1048,6 @@ mod cpu_tests {
 
     #[test]
     fn test_cpu_flip_h() -> Result<()> {
-        // Load source
         let src = load_bytes_to_tensor(
             2,
             2,
@@ -1150,7 +1086,6 @@ mod cpu_tests {
 
     #[test]
     fn test_cpu_src_crop() -> Result<()> {
-        // Load source
         let src = load_bytes_to_tensor(2, 2, PixelFormat::Grey, None, &[10, 20, 30, 40])?;
 
         let mut converter = CPUProcessor::default();
@@ -1184,7 +1119,6 @@ mod cpu_tests {
 
     #[test]
     fn test_cpu_dst_crop() -> Result<()> {
-        // Load source
         let src = load_bytes_to_tensor(2, 2, PixelFormat::Grey, None, &[2, 4, 6, 8])?;
 
         let mut converter = CPUProcessor::default();
@@ -1199,16 +1133,12 @@ mod cpu_tests {
         let src_dyn = src;
         let converted_dyn = converted;
 
-        // Destination crop is now a destination view: render into the top-row
-        // sub-region; the bottom row keeps its pre-fill.
+        // Renders into the top-row sub-region view; the bottom row keeps its pre-fill.
         let mut dst_view = converted_dyn.view(Region::new(0, 0, 2, 1))?;
         converter.convert(&src_dyn, &mut dst_view, None)?;
 
-        // The untagged 2x2 Grey source is below the HD threshold, so the
-        // colorimetry heuristic resolves it to BT.601 limited range: grey luma
-        // is mapped into the 16..235 limited range (219-step), so the
-        // row-averaged grey [4, 6] yields Y = 19, 21. The second dst row is
-        // outside the crop and keeps its pre-fill value.
+        // The untagged Grey source resolves to BT.601 limited range: the
+        // row-averaged grey [4, 6] yields Y = 19, 21.
         assert_eq!(
             converted_dyn.as_u8().unwrap().map()?.as_slice(),
             &[19, 128, 21, 128, 200, 128, 200, 128]
@@ -1218,7 +1148,6 @@ mod cpu_tests {
 
     #[test]
     fn test_cpu_fill_rgba() -> Result<()> {
-        // Load source
         let src = load_bytes_to_tensor(1, 1, PixelFormat::Rgba, None, &[3, 3, 3, 255])?;
 
         let mut converter = CPUProcessor::default();
@@ -1234,8 +1163,8 @@ mod cpu_tests {
         let src_dyn = src;
         let mut converted_dyn = converted;
 
-        // Destination fill + sub-region render: fill the whole dst with the pad
-        // colour, then render the source into the sub-region view.
+        // Fills the whole dst with the pad colour, then renders the source into
+        // the sub-region view.
         let pad = load_bytes_to_tensor(1, 1, PixelFormat::Rgba, None, &[255, 0, 0, 255])?;
         converter.convert(&pad, &mut converted_dyn, None)?;
         let mut dst_view = converted_dyn.view(Region::new(1, 1, 1, 1))?;
@@ -1250,7 +1179,6 @@ mod cpu_tests {
 
     #[test]
     fn test_cpu_fill_yuyv() -> Result<()> {
-        // Load source
         let src =
             load_bytes_to_tensor(2, 1, PixelFormat::Rgba, None, &[3, 3, 3, 255, 3, 3, 3, 255])?;
 
@@ -1272,9 +1200,7 @@ mod cpu_tests {
         let mut dst_view = converted_dyn.view(Region::new(0, 1, 2, 1))?;
         converter.convert(&src_dyn, &mut dst_view, None)?;
 
-        // 2x3 YUYV is below the HD threshold, so the colorimetry heuristic
-        // resolves it to BT.601 limited (previously a BT.709 hardcode). Red
-        // (255,0,0) → Y=81, U=90, V=240 under BT.601 limited.
+        // Red (255,0,0) is Y=81, U=90, V=240 under BT.601 limited.
         assert_eq!(
             converted_dyn.as_u8().unwrap().map()?.as_slice(),
             &[81, 90, 81, 240, 19, 128, 19, 128, 81, 90, 81, 240]
@@ -1284,7 +1210,6 @@ mod cpu_tests {
 
     #[test]
     fn test_cpu_fill_grey() -> Result<()> {
-        // Load source
         let src =
             load_bytes_to_tensor(2, 1, PixelFormat::Rgba, None, &[3, 3, 3, 255, 3, 3, 3, 255])?;
 
@@ -1363,8 +1288,6 @@ mod cpu_tests {
         use edgefirst_tensor::Segmentation;
         use ndarray::Array3;
 
-        // draw_decoded_masks fully writes dst: we must pass the camera
-        // frame as a background via MaskOverlay, not as the dst canvas.
         let bg = crate::load_image_test_helper(
             &edgefirst_bench::testdata::read("giraffe.jpg"),
             Some(PixelFormat::Rgba),
@@ -1427,12 +1350,6 @@ mod cpu_tests {
             None,
         )
         .unwrap();
-        // Threshold 0.97 (was 0.99): the codec now decodes colour JPEGs to
-        // their native NV12 layout, so the `giraffe.jpg` background routes
-        // through an NV12 → RGBA conversion (chroma subsampling) before the
-        // mask is composited. The `output_render_cpu.jpg` golden was captured
-        // from the old direct-RGB JPEG decode, so the NV12-sourced background
-        // differs slightly. This mirrors the GL counterpart's 0.97 tolerance.
         compare_images_convert_to_rgb(&image, &expected, 0.97, function!());
     }
 
@@ -1443,7 +1360,6 @@ mod cpu_tests {
 
     #[test]
     fn test_convert_rgb_to_planar_rgb_generic() {
-        // Create PixelFormat::Rgb source image
         let src = TensorDyn::image(
             4,
             4,
@@ -1456,7 +1372,6 @@ mod cpu_tests {
         {
             let mut map = src.as_u8().unwrap().map().unwrap();
             let data = map.as_mut_slice();
-            // Fill with pattern: pixel 0 = [10, 20, 30], pixel 1 = [40, 50, 60], etc.
             for i in 0..16 {
                 data[i * 3] = (i * 10) as u8;
                 data[i * 3 + 1] = (i * 10 + 1) as u8;
@@ -1464,7 +1379,6 @@ mod cpu_tests {
             }
         }
 
-        // Create planar PixelFormat::Rgb destination using TensorDyn
         let mut dst = TensorDyn::image(
             4,
             4,
@@ -1480,7 +1394,6 @@ mod cpu_tests {
             __cv.convert(&src, &mut dst, None).unwrap();
         }
 
-        // Verify the conversion - check first few pixels of each plane
         let map = dst.as_u8().unwrap().map().unwrap();
         let data = map.as_slice();
 
@@ -1496,7 +1409,6 @@ mod cpu_tests {
 
     #[test]
     fn test_convert_rgba_to_planar_rgb_generic() {
-        // Create PixelFormat::Rgba source image
         let src = TensorDyn::image(
             4,
             4,
@@ -1509,7 +1421,6 @@ mod cpu_tests {
         {
             let mut map = src.as_u8().unwrap().map().unwrap();
             let data = map.as_mut_slice();
-            // Fill with pattern
             for i in 0..16 {
                 data[i * 4] = (i * 10) as u8; // R
                 data[i * 4 + 1] = (i * 10 + 1) as u8; // G
@@ -1518,7 +1429,6 @@ mod cpu_tests {
             }
         }
 
-        // Create planar PixelFormat::Rgb destination
         let mut dst = TensorDyn::image(
             4,
             4,
@@ -1534,7 +1444,6 @@ mod cpu_tests {
             __cv.convert(&src, &mut dst, None).unwrap();
         }
 
-        // Verify the conversion
         let map = dst.as_u8().unwrap().map().unwrap();
         let data = map.as_slice();
 
@@ -1545,7 +1454,6 @@ mod cpu_tests {
 
     #[test]
     fn test_copy_image_generic_same_format() {
-        // Create source image with data
         let src = TensorDyn::image(
             4,
             4,
@@ -1563,7 +1471,6 @@ mod cpu_tests {
             }
         }
 
-        // Create destination tensor
         let mut dst = TensorDyn::image(
             4,
             4,
@@ -1579,7 +1486,6 @@ mod cpu_tests {
             __cv.convert(&src, &mut dst, None).unwrap();
         }
 
-        // Verify data was copied
         let src_map = src.as_u8().unwrap().map().unwrap();
         let dst_map = dst.as_u8().unwrap().map().unwrap();
         assert_eq!(src_map.as_slice(), dst_map.as_slice());
@@ -1587,7 +1493,7 @@ mod cpu_tests {
 
     #[test]
     fn test_convert_unsupported_format_pair() {
-        // Try NV12 -> NV12 (not supported by CPU converter)
+        // NV12 → NV12 is not supported by the CPU converter.
         let src = TensorDyn::image(
             8,
             8,
@@ -1626,7 +1532,6 @@ mod cpu_tests {
             edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
-        // Initialize to zeros
         dst.as_u8().unwrap().map().unwrap().as_mut_slice().fill(0);
 
         // Fill outside a 2x2 crop in the center with red
@@ -1642,11 +1547,9 @@ mod cpu_tests {
         let map = dst.as_u8().unwrap().map().unwrap();
         let data = map.as_slice();
 
-        // Top-left corner should be filled (red)
         assert_eq!(&data[0..4], &[255, 0, 0, 255]);
 
-        // Center pixel (1,1) should still be zero (inside crop)
-        // row=1, col=1, width=4, bytes_per_pixel=4 -> offset = (1*4 + 1) * 4 = 20
+        // Pixel (1,1): offset = (1*4 + 1) * 4 = 20.
         let center_offset = 20;
         assert_eq!(&data[center_offset..center_offset + 4], &[0, 0, 0, 0]);
     }
@@ -1676,11 +1579,9 @@ mod cpu_tests {
         let map = dst.as_u8().unwrap().map().unwrap();
         let data = map.as_slice();
 
-        // Top-left corner should be green
         assert_eq!(&data[0..3], &[0, 255, 0]);
 
-        // Center pixel (1,1): row=1, col=1, width=4, bytes=3 -> offset = (1*4 + 1) * 3
-        // = 15
+        // Pixel (1,1): offset = (1*4 + 1) * 3 = 15.
         let center_offset = 15;
         assert_eq!(&data[center_offset..center_offset + 3], &[0, 0, 0]);
     }
@@ -1710,24 +1611,19 @@ mod cpu_tests {
         let map = dst.as_u8().unwrap().map().unwrap();
         let data = map.as_slice();
 
-        // For planar: R plane is [0..16], G plane is [16..32], B plane is [32..48]
-        // Top-left pixel (0,0) should have R=128, G=64, B=32
+        // Planar: R plane is [0..16], G plane is [16..32], B plane is [32..48].
         assert_eq!(data[0], 128); // R plane, pixel 0
         assert_eq!(data[16], 64); // G plane, pixel 0
         assert_eq!(data[32], 32); // B plane, pixel 0
 
-        // Center pixel (1,1): row=1, col=1, width=4 -> index = 1*4 + 1 = 5
+        // Pixel (1,1): index = 1*4 + 1 = 5.
         let center_idx = 5;
         assert_eq!(data[center_idx], 0); // R
         assert_eq!(data[16 + center_idx], 0); // G
         assert_eq!(data[32 + center_idx], 0); // B
     }
 
-    /// The semi-planar letterbox fill splits luma from chroma at
-    /// `row_stride * height` and advances both planes by the stride. Nv16
-    /// tensors *always* carry a 64-byte-aligned stride wider than the logical
-    /// width, so this is the normal case, not an edge case — the plane boundary
-    /// and every row offset move with the pitch.
+    /// The NV16 letterbox fill splits luma from chroma at `row_stride * height` and advances both planes by the stride.
     #[test]
     fn test_fill_image_outside_crop_nv16_strided() {
         const SENTINEL: u8 = 0x11;
@@ -1759,7 +1655,7 @@ mod cpu_tests {
             map.as_mut_slice().fill(SENTINEL);
         }
 
-        // The fill colour resolved exactly as `fill_image_outside_crop_u8` does.
+        // The fill colour as `fill_image_outside_crop_u8` resolves it.
         let rgba = [255u8, 0, 0, 255];
         let (y_fill, u_fill, v_fill) = {
             let t = dst.as_u8().unwrap();
@@ -1798,7 +1694,7 @@ mod cpu_tests {
                     "luma ({x},{y}): expected {want:#04x} (inside_crop={inside})"
                 );
             }
-            // Row padding past the logical width must never be filled.
+            // Row padding past the logical width is not filled.
             for x in w..stride {
                 assert_eq!(
                     luma[y * stride + x],
@@ -1809,7 +1705,7 @@ mod cpu_tests {
         }
 
         // Nv16 chroma is full height with one (Cb,Cr) pair per two luma columns,
-        // so the border maps to half-width columns at the SAME pitch.
+        // at the same pitch.
         for y in 0..h {
             let border_row = y < crop.top || y >= crop.top + crop.height;
             for cx in 0..w / 2 {
@@ -1839,11 +1735,7 @@ mod cpu_tests {
 
     #[test]
     fn test_fill_image_outside_crop_yuyv_odd_width() {
-        // The Yuyv fill runs the generic filler over `w / 2` four-byte
-        // macropixels, which for an odd width structurally misses the
-        // trailing unpaired pixel's `[Y, U]` bytes on every row — the same
-        // trailing-pixel class the odd-width YUYV encoders fixed. Those two
-        // bytes must be filled whenever that pixel lies outside the crop.
+        // An odd-width Yuyv fill covers the trailing unpaired pixel's `[Y, U]` bytes.
         const SENTINEL: u8 = 0xAB;
         let (w, h) = (5usize, 4usize);
 
@@ -1864,7 +1756,7 @@ mod cpu_tests {
             .as_mut_slice()
             .fill(SENTINEL);
 
-        // The fill colour resolved exactly as `fill_image_outside_crop_u8` does.
+        // The fill colour as `fill_image_outside_crop_u8` resolves it.
         let rgba = [255u8, 0, 0, 255];
         let yuyv = {
             let t = dst.as_u8().unwrap();
@@ -1890,15 +1782,14 @@ mod cpu_tests {
         let map = t.map().unwrap();
         let data = map.as_slice();
         for y in 0..h {
-            // The trailing unpaired pixel's [Y, U] — never covered by the
-            // macropixel fill at w/2 = 2 macropixels.
+            // The trailing unpaired pixel's [Y, U].
             let tail = y * stride + (w - 1) * 2;
             assert_eq!(
                 (data[tail], data[tail + 1]),
                 (yuyv[0], yuyv[1]),
                 "row {y}: trailing odd-width pixel's [Y, U] must be filled"
             );
-            // Crop interior stays untouched.
+            // The crop interior is untouched.
             let border_row = y < crop.top || y >= crop.top + crop.height;
             if !border_row {
                 let inside = y * stride;
@@ -1952,7 +1843,7 @@ mod cpu_tests {
 
     #[test]
     fn test_convert_rgb_to_bgra() {
-        // Convert PixelFormat::Rgb→PixelFormat::Rgba and PixelFormat::Rgb→PixelFormat::Bgra, verify R↔B swap matches
+        // Converts Rgb to Rgba and to Bgra and compares them with R and B swapped.
         let src = TensorDyn::image(
             2,
             1,
@@ -1998,7 +1889,6 @@ mod cpu_tests {
 
         assert_bgra_matches_rgba(&bgra_dst, &rgba_dst);
 
-        // Also verify the B,G,R channels are correct (alpha may vary)
         let map = bgra_dst.as_u8().unwrap().map().unwrap();
         let buf = map.as_slice();
         assert_eq!(buf[0], 200, "pixel 0 B");
@@ -2011,7 +1901,6 @@ mod cpu_tests {
 
     #[test]
     fn test_convert_grey_to_bgra() {
-        // 2x1 greyscale image
         let src = TensorDyn::image(
             2,
             1,
@@ -2042,14 +1931,14 @@ mod cpu_tests {
         }
         let map = dst.as_u8().unwrap().map().unwrap();
         let buf = map.as_slice();
-        // Grey→PixelFormat::Bgra: all channels same value, A=255; R↔B swap is no-op on grey
+        // Grey → Bgra: all channels the same value, A=255.
         assert_eq!(&buf[0..4], &[128, 128, 128, 255]);
         assert_eq!(&buf[4..8], &[64, 64, 64, 255]);
     }
 
     #[test]
     fn test_convert_bgra_to_bgra_copy() {
-        // Verify PixelFormat::Bgra→PixelFormat::Bgra is a straight copy
+        // Bgra → Bgra is a straight copy.
         let src = TensorDyn::image(
             2,
             1,
@@ -2084,9 +1973,7 @@ mod cpu_tests {
         assert_eq!(&buf[4..8], &[40, 50, 60, 128]);
     }
 
-    /// Helper: compare PixelFormat::Bgra output against PixelFormat::Rgba output by verifying R↔B swap.
-    /// Since CPU PixelFormat::Bgra conversion is PixelFormat::Rgba conversion + R↔B swizzle, the results
-    /// must be byte-exact after accounting for the channel swap.
+    /// Asserts `bgra` equals `rgba` with R and B swapped.
     fn assert_bgra_matches_rgba(bgra: &TensorDyn, rgba: &TensorDyn) {
         assert_eq!(bgra.format().unwrap(), PixelFormat::Bgra);
         assert_eq!(rgba.format().unwrap(), PixelFormat::Rgba);
@@ -2124,7 +2011,6 @@ mod cpu_tests {
         )
         .unwrap();
 
-        // Convert to both PixelFormat::Rgba and PixelFormat::Bgra, then compare
         let mut rgba_dst = TensorDyn::image(
             1280,
             720,
@@ -2350,10 +2236,8 @@ mod cpu_tests {
 
     #[test]
     fn test_materialize_empty_proto_data() {
-        // ProtoData from a detection-only model — caller passes no detections
-        // to the materializer (detection-only models have a ProtoData stub
-        // with an empty coefficient tensor). Materialization must not panic
-        // and must return an empty segmentation list.
+        // A `ProtoData` with an empty coefficient tensor and no detections
+        // returns an empty segmentation list.
         let cpu = CPUProcessor::new();
         let proto_data = make_proto_data(8, 8, 4, vec![]);
         let result = cpu.materialize_segmentations(&[], &proto_data, None);
@@ -2370,7 +2254,6 @@ mod cpu_tests {
         assert!(result.is_ok());
         let segs = result.unwrap();
         assert_eq!(segs.len(), 1);
-        // Segmentation should have shape (H, W, 1) with non-zero spatial dims
         assert!(segs[0].segmentation.shape()[0] > 0);
         assert!(segs[0].segmentation.shape()[1] > 0);
         assert_eq!(segs[0].segmentation.shape()[2], 1);
@@ -2402,7 +2285,6 @@ mod cpu_tests {
         );
         let segs = result.unwrap();
         assert_eq!(segs.len(), 1);
-        // xmin should be clamped to 0.0
         assert!((segs[0].xmin - 0.0).abs() < 0.01);
         assert!((segs[0].ymin - 0.0).abs() < 0.01);
     }
@@ -2410,7 +2292,7 @@ mod cpu_tests {
     #[test]
     fn test_materialize_invalid_coeff_shape() {
         let cpu = CPUProcessor::new();
-        // Proto has 4 channels but coefficients have 6 elements — mismatch
+        // 4 proto channels against 6 coefficients.
         let proto_data = make_proto_data(8, 8, 4, vec![vec![0.5; 6]]);
         let det = [make_detect_box(0.1, 0.1, 0.5, 0.5)];
         let result = cpu.materialize_segmentations(&det, &proto_data, None);
@@ -2528,8 +2410,8 @@ mod cpu_tests {
         let cpu = CPUProcessor::new();
         let proto_data = make_proto_data_with_values(8, 8, 1, vec![1.0_f32; 64], vec![vec![1.0]]);
         let det = [make_detect_box(0.95, 0.95, 1.0, 1.0)];
-        // Deliberately out-of-range letterbox values: this used to drive
-        // proto_x0/proto_y0 to the exclusive upper bound and panic in scaled_run.
+        // Out-of-range letterbox values put proto_x0/proto_y0 at the exclusive
+        // upper bound.
         let segs = cpu
             .materialize_scaled_segmentations(&det, &proto_data, Some([1.2, 1.2, 1.4, 1.4]), 32, 32)
             .expect("scaled path should clamp ROI starts and avoid OOB panics");
@@ -2541,18 +2423,12 @@ mod cpu_tests {
 
     #[test]
     fn test_materialize_nchw_i8_produces_correct_mask() {
-        // Verify that materialize_segmentations handles NCHW layout correctly.
-        // Proto data is stored as [K, H, W] (NCHW physical) with K=2, H=4, W=4.
-        // Channel 0 filled with +10, channel 1 filled with -10.
-        // Coefficient [+1, +1] → dot > 0 for all pixels (positive + negative = 0,
-        // but with symmetric scale the sum should still be evaluated correctly).
-        // Use coefficients [1, 0] to select only channel 0 → all positive → 255.
+        // NCHW protos [K=2, H=4, W=4]: channel 0 is +10, channel 1 is -10;
+        // coefficients [1, 0] select channel 0.
         use edgefirst_tensor::{Quantization, Tensor};
         let cpu = CPUProcessor::new();
         let (proto_h, proto_w, num_protos) = (4, 4, 2);
-        // NCHW physical: [K=2, H=4, W=4] → flat = [ch0 16 values, ch1 16 values]
         let mut proto_values = vec![0_i8; num_protos * proto_h * proto_w];
-        // Channel 0: all +10, Channel 1: all -10
         for i in 0..proto_h * proto_w {
             proto_values[i] = 10; // channel 0
             proto_values[proto_h * proto_w + i] = -10; // channel 1
@@ -2562,7 +2438,6 @@ mod cpu_tests {
         protos_t
             .set_quantization(Quantization::per_tensor(0.1, 0))
             .unwrap();
-        // Coefficient selects channel 0 only: [+1, 0] (raw i8 with scale=1.0)
         let coeff_values = vec![1_i8, 0_i8];
         let mut coeff_t = Tensor::<i8>::from_slice(&coeff_values, &[1, num_protos]).unwrap();
         coeff_t
@@ -2578,7 +2453,6 @@ mod cpu_tests {
             .materialize_segmentations(&det, &proto_data, None)
             .expect("NCHW i8 proto layout should be handled");
         assert_eq!(segs.len(), 1);
-        // All pixels should be 255 (positive dot product from channel 0)
         assert!(
             seg_bytes(&segs[0]).iter().all(|&v| v == 255),
             "NCHW proto with positive channel selected should yield all-255 mask"
@@ -2587,7 +2461,7 @@ mod cpu_tests {
 
     #[test]
     fn test_materialize_nchw_float_rejected() {
-        // NCHW layout with non-i8 protos should return NotSupported error.
+        // NCHW layout with non-i8 protos returns NotSupported.
         use edgefirst_tensor::Tensor;
         let cpu = CPUProcessor::new();
         let proto_values = vec![1.0_f32; 2 * 4 * 4];
@@ -2611,7 +2485,7 @@ mod cpu_tests {
 
     #[test]
     fn test_materialize_scaled_nchw_float_rejected() {
-        // NCHW layout with non-i8 protos on the scaled path should also error.
+        // NCHW layout with non-i8 protos on the scaled path returns an error.
         use edgefirst_tensor::Tensor;
         let cpu = CPUProcessor::new();
         let proto_values = vec![1.0_f32; 2 * 4 * 4];
@@ -2635,11 +2509,10 @@ mod cpu_tests {
 
     #[test]
     fn test_materialize_scaled_nchw_i8_produces_correct_mask() {
-        // Verify that the scaled path handles NCHW i8 layout correctly.
+        // NCHW i8 protos on the scaled path.
         use edgefirst_tensor::{Quantization, Tensor};
         let cpu = CPUProcessor::new();
         let (proto_h, proto_w, num_protos) = (4, 4, 2);
-        // NCHW physical: [K=2, H=4, W=4]
         let mut proto_values = vec![0_i8; num_protos * proto_h * proto_w];
         // Channel 0: all +10, Channel 1: all -10
         for i in 0..proto_h * proto_w {
@@ -2667,7 +2540,6 @@ mod cpu_tests {
             .materialize_scaled_segmentations(&det, &proto_data, None, 16, 16)
             .expect("NCHW i8 scaled path should succeed");
         assert_eq!(segs.len(), 1);
-        // All pixels should be 255 (positive dot product from channel 0)
         assert!(
             seg_bytes(&segs[0]).iter().all(|&v| v == 255),
             "NCHW i8 scaled path with positive channel should yield all-255 mask"
@@ -2676,23 +2548,16 @@ mod cpu_tests {
 
     #[test]
     fn test_materialize_nchw_i8_asymmetric_quantization() {
-        // Verify that NCHW i8 kernel handles non-zero zero-points correctly.
-        // Asymmetric quantization: real_value = (raw - zero_point) * scale
-        // Proto: zp=5, scale=0.1 → raw 15 means (15-5)*0.1 = 1.0
-        // Coeff: zp=10, scale=0.5 → raw 12 means (12-10)*0.5 = 1.0
-        //
-        // With K=2 channels: proto ch0=15 (→1.0), proto ch1=5 (→0.0)
-        // coeff = [12, 10] (→[1.0, 0.0])
-        // dot = 1.0*1.0 + 0.0*0.0 = 1.0 > 0 → mask = 255
+        // Asymmetric quantization: real_value = (raw - zero_point) * scale.
+        // Proto: zp=5, scale=0.1; ch0 raw 15 → 1.0, ch1 raw 5 → 0.0.
+        // Coeff: zp=10, scale=0.5; raw [12, 10] → [1.0, 0.0].
+        // dot = 1.0 > 0 → mask = 255.
         use edgefirst_tensor::{Quantization, Tensor};
         let cpu = CPUProcessor::new();
         let (proto_h, proto_w, num_protos) = (4, 4, 2);
 
-        // NCHW physical: [K=2, H=4, W=4]
         let mut proto_values = vec![0_i8; num_protos * proto_h * proto_w];
         let proto_zp: i8 = 5;
-        // Channel 0: raw = 15 → dequant = (15-5)*0.1 = 1.0
-        // Channel 1: raw = 5 → dequant = (5-5)*0.1 = 0.0
         for i in 0..proto_h * proto_w {
             proto_values[i] = 15; // channel 0
             proto_values[proto_h * proto_w + i] = proto_zp; // channel 1 (at zero-point)
@@ -2703,8 +2568,6 @@ mod cpu_tests {
             .set_quantization(Quantization::per_tensor(0.1, proto_zp as i32))
             .unwrap();
 
-        // Coefficient: zp=10, scale=0.5
-        // raw=[12, 10] → dequant=[(12-10)*0.5, (10-10)*0.5] = [1.0, 0.0]
         let coeff_zp: i8 = 10;
         let coeff_values = vec![12_i8, coeff_zp];
         let mut coeff_t = Tensor::<i8>::from_slice(&coeff_values, &[1, num_protos]).unwrap();
@@ -2722,22 +2585,18 @@ mod cpu_tests {
             .materialize_segmentations(&det, &proto_data, None)
             .expect("NCHW i8 asymmetric quantization should succeed");
         assert_eq!(segs.len(), 1);
-        // Dot product = 1.0 > 0 → all 255
         assert!(
             seg_bytes(&segs[0]).iter().all(|&v| v == 255),
             "NCHW i8 with non-zero zero-points: positive dot should yield all-255"
         );
 
-        // Now test case where dot < 0: use coeff that selects a negative channel.
-        // coeff raw=[10, 12] → dequant=[0.0, 1.0]; ch1 is at zero_point → 0.0
-        // dot = 1.0*0.0 + 0.0*1.0 = 0.0 → NOT > 0 → mask = 0
+        // Coeff raw [10, 12] → [0.0, 1.0] selects channel 1: dot = 0.0 → mask = 0.
         let coeff_neg = vec![coeff_zp, 12_i8]; // selects channel 1 which is zero
         let mut coeff_t_neg = Tensor::<i8>::from_slice(&coeff_neg, &[1, num_protos]).unwrap();
         coeff_t_neg
             .set_quantization(Quantization::per_tensor(0.5, coeff_zp as i32))
             .unwrap();
 
-        // Recreate protos tensor (Tensor doesn't implement Clone)
         let mut protos_t2 =
             Tensor::<i8>::from_slice(&proto_values, &[num_protos, proto_h, proto_w]).unwrap();
         protos_t2
@@ -2753,7 +2612,6 @@ mod cpu_tests {
             .materialize_segmentations(&det, &proto_data_neg, None)
             .expect("NCHW i8 asymmetric: zero-dot case");
         assert_eq!(segs_neg.len(), 1);
-        // dot = 0 → NOT > 0 → mask should be 0
         assert!(
             seg_bytes(&segs_neg[0]).iter().all(|&v| v == 0),
             "NCHW i8 with non-zero zero-points: zero dot should yield all-0"
@@ -2762,16 +2620,12 @@ mod cpu_tests {
 
     #[test]
     fn test_materialize_per_channel_i8_falls_through_to_f32() {
-        // Verify that I8 protos with per-channel quantization fall through
-        // from the i8×i8 fast path to the general f32 dequant path.
-        // This tests the regression fix: previously the i8 fast path returned
-        // NotSupported without falling back.
+        // I8 protos with per-channel quantization take the f32 dequant path.
         use edgefirst_tensor::{Quantization, Tensor};
         let cpu = CPUProcessor::new();
         let (proto_h, proto_w, num_protos) = (4, 4, 2);
 
-        // NHWC protos: [H, W, K] = [4, 4, 2]
-        // Channel 0: all +10, Channel 1: all -10
+        // NHWC protos: [H, W, K] = [4, 4, 2]; channel 0 is +10, channel 1 is -10.
         let mut proto_values = vec![0_i8; proto_h * proto_w * num_protos];
         for y in 0..proto_h {
             for x in 0..proto_w {
@@ -2805,27 +2659,13 @@ mod cpu_tests {
             .materialize_segmentations(&det, &proto_data, None)
             .expect("per-channel I8 protos should fall through to f32 path");
         assert_eq!(segs.len(), 1);
-        // Channel 0 is positive (10 * 0.1 = 1.0), coeff selects it → dot > 0 → 255
         assert!(
             seg_bytes(&segs[0]).iter().all(|&v| v == 255),
             "per-channel i8 fallback: positive dot should yield all-255"
         );
     }
 
-    /// Golden-byte anchor: runs the quantized decode + CPU mask materialization
-    /// file.
-    ///
-    /// Regression-protection intent: any refactor that changes the i8 fused
-    /// dequant+dot+sigmoid kernel, the NMS ordering, or the ROI coordinate
-    /// mapping will perturb the mask bytes and fail this test.
-    ///
-    /// Generating / refreshing the golden:
-    /// ```text
-    /// REGEN_GOLDEN=1 cargo test -p edgefirst-image --lib \
-    ///     test_materialize_golden_i8_cached_model
-    /// ```
-    /// writes `testdata/yolov8_mask0_160x160.bin` (or updates it). Commit
-    /// the resulting file; subsequent runs verify bit-exact.
+    /// The quantized decode and CPU mask materialization reproduce the golden mask bytes.
     #[test]
     fn test_materialize_golden_i8_cached_model() {
         use edgefirst_decoder::{configs, ConfigOutput, DecoderBuilder, Nms};
@@ -2884,9 +2724,8 @@ mod cpu_tests {
             .expect("materialize_segmentations failed on cached fixture");
         assert_eq!(segs.len(), detections.len());
 
-        // Serialize detection 0's binarized mask as a compact byte blob:
+        // Detection 0's mask as bytes:
         //   [u16 roi_h_le][u16 roi_w_le][roi_h * roi_w bytes of u8 mask data]
-        // (Channels dim is always 1; no need to store it.)
         let det0_seg = &segs[0].segmentation;
         let sh = det0_seg.shape();
         assert_eq!(sh.len(), 3, "segmentation must be rank-3");
@@ -2897,14 +2736,10 @@ mod cpu_tests {
         let mut actual: Vec<u8> = Vec::with_capacity(4 + roi_h * roi_w);
         actual.extend_from_slice(&(roi_h as u16).to_le_bytes());
         actual.extend_from_slice(&(roi_w as u16).to_le_bytes());
-        // A TensorDyn is contiguous by construction; no as_standard_layout()
-        // copy is needed before taking the bytes.
         let det0_map = det0_seg.as_u8().expect("U8 mask").map_read().unwrap();
         actual.extend_from_slice(det0_map.as_slice());
 
-        // Resolve testdata via EDGEFIRST_TESTDATA_DIR when set (on-target runs use
-        // a deployed copy; the compile-time manifest path does not exist there),
-        // falling back to the source tree for local runs.
+        // Resolves testdata via `EDGEFIRST_TESTDATA_DIR` when set, else the source tree.
         let golden_path = std::env::var_os("EDGEFIRST_TESTDATA_DIR")
             .map(|d| std::path::PathBuf::from(d).join("yolov8_mask0_160x160.bin"))
             .unwrap_or_else(|| {
@@ -3056,8 +2891,6 @@ mod cpu_tests {
             .expect("i8×i8 scaled path should succeed");
         assert_eq!(segs.len(), 1);
         assert_eq!(segs[0].segmentation.shape()[2], 1);
-        // All protos positive, all coeffs positive → dot products positive
-        // → all mask pixels should be 255.
         assert!(
             seg_bytes(&segs[0]).iter().all(|&v| v == 255),
             "uniform positive protos+coeffs should produce all-255 mask"
@@ -3088,7 +2921,6 @@ mod cpu_tests {
             .materialize_scaled_segmentations(&det, &proto_data, None, 16, 16)
             .expect("i8×i8 scaled path should succeed");
         assert_eq!(segs.len(), 1);
-        // Negative dot products → all mask pixels should be 0.
         assert!(
             seg_bytes(&segs[0]).iter().all(|&v| v == 0),
             "positive protos + negative coeffs should produce all-0 mask"
@@ -3097,9 +2929,7 @@ mod cpu_tests {
 
     #[test]
     fn test_materialize_scaled_i8_i8_mixed_sign_boundary() {
-        // Create a proto field where the left half is positive, right half
-        // is negative. This exercises the bilinear boundary interpolation
-        // code (the non-shortcut path).
+        // Proto field: left half positive, right half negative.
         let proto_h = 4;
         let proto_w = 4;
         let num_protos = 1;
@@ -3127,14 +2957,12 @@ mod cpu_tests {
             .expect("i8×i8 with mixed-sign protos should succeed");
         assert_eq!(segs.len(), 1);
         let mask = seg_bytes(&segs[0]);
-        // Mask should have both 0 and 255 values (left half ≈ 255, right ≈ 0).
         let has_255 = mask.contains(&255);
         let has_0 = mask.contains(&0);
         assert!(
             has_255 && has_0,
             "mixed-sign proto field should produce mixed mask"
         );
-        // All values should be binarized.
         assert!(
             mask.iter().all(|&v| v == 0 || v == 255),
             "mask must be binarized (0 or 255)"
@@ -3143,7 +2971,6 @@ mod cpu_tests {
 
     #[test]
     fn test_materialize_scaled_i8_i8_with_zero_points() {
-        // Test that zero-point correction is applied correctly.
         // Protos with zp=-5, coeffs with zp=3.
         let proto_h = 4;
         let proto_w = 4;
@@ -3151,7 +2978,6 @@ mod cpu_tests {
         // Raw proto values are 10, dequantized = (10 - (-5)) * 0.1 = 1.5
         let proto_values = vec![10_i8; proto_h * proto_w * num_protos];
         // Raw coeff values are 10, dequantized = (10 - 3) * 0.1 = 0.7
-        // Both positive → dot product positive → mask = 255
         let coeff_values = vec![10_i8; num_protos];
         let proto_data = make_proto_data_i8(
             proto_h,
@@ -3169,7 +2995,6 @@ mod cpu_tests {
             .materialize_scaled_segmentations(&det, &proto_data, None, 16, 16)
             .expect("i8×i8 with zero-points should succeed");
         assert_eq!(segs.len(), 1);
-        // Dequantized values are both positive → all 255.
         assert!(
             seg_bytes(&segs[0]).iter().all(|&v| v == 255),
             "positive dequantized values should produce all-255 mask"
@@ -3178,13 +3003,12 @@ mod cpu_tests {
 
     #[test]
     fn test_materialize_scaled_i8_i8_parity_with_float() {
-        // Compare i8×i8 integer path output against the f32 fallback path
-        // using symmetric quantization (zp=0) so the results should match exactly.
+        // Compares the i8×i8 integer path with the f32 path under symmetric
+        // quantization (zp=0).
         let proto_h = 8;
         let proto_w = 8;
         let num_protos = 4;
 
-        // Generate a structured proto field with varied values.
         let mut proto_i8 = Vec::with_capacity(proto_h * proto_w * num_protos);
         for y in 0..proto_h {
             for x in 0..proto_w {
@@ -3197,7 +3021,7 @@ mod cpu_tests {
 
         let coeff_i8: Vec<i8> = (0..num_protos).map(|k| k as i8 * 10 + 5).collect();
 
-        // Build f32 versions (symmetric quant, zp=0, scale=1.0).
+        // f32 versions (symmetric quant, zp=0, scale=1.0).
         let proto_f32: Vec<f32> = proto_i8.iter().map(|&v| v as f32).collect();
         let coeff_f32: Vec<f32> = coeff_i8.iter().map(|&v| v as f32).collect();
 
@@ -3232,8 +3056,6 @@ mod cpu_tests {
             "i8 and f32 paths should produce same-shaped masks"
         );
 
-        // With symmetric quantization (zp=0, scale=1.0), the sign of the
-        // dot product is identical, so binarized masks must match exactly.
         let f32_mask: Vec<u8> = seg_bytes(&segs_f32[0]).to_vec();
         let i8_mask: Vec<u8> = seg_bytes(&segs_i8[0]).to_vec();
         assert_eq!(
@@ -3429,9 +3251,7 @@ mod cpu_tests {
             .materialize_scaled_segmentations(&det, &proto_data, None, 16, 16)
             .expect("multiple detections i8×i8 should succeed");
         assert_eq!(segs.len(), 2);
-        // Det 0: positive coeffs → all 255.
         assert!(seg_bytes(&segs[0]).iter().all(|&v| v == 255));
-        // Det 1: negative coeffs → all 0.
         assert!(seg_bytes(&segs[1]).iter().all(|&v| v == 0));
     }
 
@@ -3456,7 +3276,7 @@ mod cpu_tests {
 
     #[test]
     fn test_multiplane_is_multiplane() -> Result<()> {
-        // Contiguous PixelFormat::Nv12 should NOT be multiplane
+        // Contiguous Nv12 is not multiplane.
         let contiguous = TensorDyn::image(
             640,
             480,
@@ -3468,7 +3288,7 @@ mod cpu_tests {
         assert!(!contiguous.as_u8().unwrap().is_multiplane());
         assert!(contiguous.as_u8().unwrap().chroma().is_none());
 
-        // from_planes should be multiplane
+        // `from_planes` is multiplane.
         let luma = Tensor::<u8>::new(&[480, 640], Some(TensorMemory::Mem), None)?;
         let chroma = Tensor::<u8>::new(&[240, 640], Some(TensorMemory::Mem), None)?;
         let multiplane = {
@@ -3478,7 +3298,7 @@ mod cpu_tests {
         assert!(multiplane.as_u8().unwrap().is_multiplane());
         assert!(multiplane.as_u8().unwrap().chroma().is_some());
 
-        // PixelFormat::Rgb should NOT be multiplane
+        // Rgb is not multiplane.
         let rgb = TensorDyn::image(
             640,
             480,
@@ -3493,12 +3313,12 @@ mod cpu_tests {
 
     #[test]
     fn test_multiplane_invalid_shapes() {
-        // Wrong format (PixelFormat::Rgb not supported for multiplane)
+        // Rgb is not a multiplane format.
         let luma = Tensor::<u8>::new(&[480, 640], Some(TensorMemory::Mem), None).unwrap();
         let chroma = Tensor::<u8>::new(&[240, 640], Some(TensorMemory::Mem), None).unwrap();
         assert!(Tensor::<u8>::from_planes(luma, chroma, PixelFormat::Rgb).is_err());
 
-        // Chroma height mismatch for PixelFormat::Nv12 (should be H/2)
+        // Chroma height mismatch for Nv12.
         let luma = Tensor::<u8>::new(&[480, 640], Some(TensorMemory::Mem), None).unwrap();
         let chroma = Tensor::<u8>::new(&[480, 640], Some(TensorMemory::Mem), None).unwrap();
         assert!(Tensor::<u8>::from_planes(luma, chroma, PixelFormat::Nv12).is_err());
@@ -3508,7 +3328,7 @@ mod cpu_tests {
         let chroma = Tensor::<u8>::new(&[240, 320], Some(TensorMemory::Mem), None).unwrap();
         assert!(Tensor::<u8>::from_planes(luma, chroma, PixelFormat::Nv12).is_err());
 
-        // 3D luma (should be 2D)
+        // 3D luma.
         let luma = Tensor::<u8>::new(&[480, 640, 1], Some(TensorMemory::Mem), None).unwrap();
         let chroma = Tensor::<u8>::new(&[240, 640], Some(TensorMemory::Mem), None).unwrap();
         assert!(Tensor::<u8>::from_planes(luma, chroma, PixelFormat::Nv12).is_err());
@@ -3516,7 +3336,6 @@ mod cpu_tests {
 
     #[test]
     fn test_multiplane_nv12_to_rgb_cpu() -> Result<()> {
-        // Load PixelFormat::Nv12 test data as contiguous buffer
         let nv12_bytes = edgefirst_bench::testdata::read("camera720p.nv12");
         let width = 1280usize;
         let height = 720usize;
@@ -3694,8 +3513,7 @@ mod cpu_tests {
     }
 
     // ──────────────────────────────────────────────────────────────────────
-    // src_rect clamping tests — verify that cropping from a larger buffer
-    // never samples padding pixels during bilinear resize.
+    // src_rect clamping tests
     // ──────────────────────────────────────────────────────────────────────
 
     /// Create a synthetic RGB tensor where the left half is pure red and the
@@ -3733,10 +3551,7 @@ mod cpu_tests {
         t
     }
 
-    /// Crop the blue (right) half of a red|blue image and resize to a smaller
-    /// destination. Verify no red pixels bleed into the interior output.
-    /// Edge pixels (first/last column) may have filter-radius bleed from the
-    /// resize library; we skip those and validate the interior is pure blue.
+    /// Cropping the blue right half of a red|blue image and resizing leaves no red in the interior.
     #[test]
     fn test_src_rect_crop_no_bleed_cpu() -> Result<()> {
         let src_w = 128;
@@ -3756,7 +3571,6 @@ mod cpu_tests {
 
         let mut cpu = CPUProcessor::default();
 
-        // Crop only the right (blue) half
         let crop = Crop::new().with_source(Some(Region::new(src_w / 2, 0, src_w / 2, src_h)));
 
         cpu.convert(
@@ -3765,7 +3579,7 @@ mod cpu_tests {
             Some(crate::ConvertOptions::new().crop(crop)),
         )?;
 
-        // Skip the leftmost 2 columns (resize filter radius at crop boundary)
+        // Skips the leftmost 2 columns.
         let map = dst.as_u8().unwrap().map()?;
         let data = map.as_slice();
         for y in 0..dst_h {
@@ -3783,7 +3597,7 @@ mod cpu_tests {
         Ok(())
     }
 
-    /// Crop the red (left) half and verify no blue bleeds into the interior.
+    /// Cropping the red left half and resizing leaves no blue in the interior.
     #[test]
     fn test_src_rect_crop_left_half_no_bleed_cpu() -> Result<()> {
         let src_w = 128;
@@ -3803,7 +3617,6 @@ mod cpu_tests {
 
         let mut cpu = CPUProcessor::default();
 
-        // Crop only the left (red) half
         let crop = Crop::new().with_source(Some(Region::new(0, 0, src_w / 2, src_h)));
 
         cpu.convert(
@@ -3812,7 +3625,7 @@ mod cpu_tests {
             Some(crate::ConvertOptions::new().crop(crop)),
         )?;
 
-        // Skip the rightmost 2 columns (resize filter radius at crop boundary)
+        // Skips the rightmost 2 columns.
         let map = dst.as_u8().unwrap().map()?;
         let data = map.as_slice();
         for y in 0..dst_h {
@@ -3830,8 +3643,7 @@ mod cpu_tests {
         Ok(())
     }
 
-    /// Crop at the exact red→blue boundary and resize. Interior pixels
-    /// (away from the crop edge) must be pure blue.
+    /// A crop at the exact red→blue boundary resizes to pure blue in the interior.
     #[test]
     fn test_src_rect_boundary_crop_no_bleed_cpu() -> Result<()> {
         let src_w = 256;
@@ -3851,7 +3663,6 @@ mod cpu_tests {
 
         let mut cpu = CPUProcessor::default();
 
-        // Crop the right half — boundary is exactly at the colour transition
         let crop = Crop::new().with_source(Some(Region::new(src_w / 2, 0, src_w / 2, src_h)));
 
         cpu.convert(
@@ -3860,7 +3671,7 @@ mod cpu_tests {
             Some(crate::ConvertOptions::new().crop(crop)),
         )?;
 
-        // Skip the leftmost 2 columns (filter radius near crop boundary)
+        // Skips the leftmost 2 columns.
         let map = dst.as_u8().unwrap().map()?;
         let data = map.as_slice();
         for y in 0..dst_h {
@@ -3882,14 +3693,12 @@ mod cpu_tests {
     // CPU F16/F32 float destination tests
     // =========================================================================
 
-    /// RGBA8 → Rgb F32 identity (same dims, no resize): every output element
-    /// must equal `src_byte as f32 / 255.0` exactly.
+    /// RGBA8 → Rgb F32 at the same size: every output element equals `src_byte as f32 / 255.0`.
     #[test]
     fn cpu_convert_rgba_to_rgb_f32_identity() -> Result<()> {
         const W: usize = 4;
         const H: usize = 4;
 
-        // Build a 4x4 RGBA source with a known per-pixel pattern.
         let src = TensorDyn::image(
             W,
             H,
@@ -3909,7 +3718,6 @@ mod cpu_tests {
             }
         }
 
-        // Destination: Rgb F32 same size.
         let mut dst = TensorDyn::image(
             W,
             H,
@@ -3923,7 +3731,6 @@ mod cpu_tests {
             cv.convert(&src, &mut dst, None)?;
         }
 
-        // Verify: dst[i*3+c] == src_u8[i*4+c] as f32 / 255.0 exactly.
         let src_map = src.as_u8().unwrap().map()?;
         let src_bytes = src_map.as_slice();
         let dst_map = dst.as_f32().unwrap().map()?;
@@ -3943,15 +3750,12 @@ mod cpu_tests {
         Ok(())
     }
 
-    /// RGBA8 → PlanarRgb F16 identity: verify [0,1] normalization within F16
-    /// rounding tolerance (2^-9 ≈ 1/512), and verify planar (channel-major)
-    /// layout — distinct R/G/B values land in the correct plane.
+    /// RGBA8 → PlanarRgb F16 at the same size normalizes to [0,1] within 2^-9 and places each channel in its plane.
     #[test]
     fn cpu_convert_rgba_to_planar_rgb_f16_identity() -> Result<()> {
         const W: usize = 4;
         const H: usize = 4;
 
-        // Use clearly distinct per-channel values to catch plane-swap bugs.
         // pixel (y,x): R = 50+x, G = 100+y*10, B = 200
         let src = TensorDyn::image(
             W,
@@ -3975,7 +3779,6 @@ mod cpu_tests {
             }
         }
 
-        // Destination: PlanarRgb F16 same size.
         let mut dst = TensorDyn::image(
             W,
             H,
@@ -3989,7 +3792,6 @@ mod cpu_tests {
             cv.convert(&src, &mut dst, None)?;
         }
 
-        // F16 tolerance: 2^-9 ≈ 0.00195 (one ULP at 0.5 for f16 with 10-bit mantissa)
         let tol = 2.0_f32.powi(-9);
 
         let src_map = src.as_u8().unwrap().map()?;
@@ -4025,8 +3827,6 @@ mod cpu_tests {
                     "B plane pixel ({x},{y}): got {b_actual}, expected {b_expected}"
                 );
 
-                // Verify planar layout: R/G/B must be distinct (not the same value
-                // copied to all planes).
                 let r_byte = src_bytes[i * 4];
                 let g_byte = src_bytes[i * 4 + 1];
                 let b_byte = src_bytes[i * 4 + 2];
@@ -4047,11 +3847,7 @@ mod cpu_tests {
         Ok(())
     }
 
-    /// Exercises the `widen_scratch` cache in `convert_dtype`'s U8→float arm:
-    /// the first convert allocates+stores the scratch, a second convert at the
-    /// same dst format/size takes the cache-hit branch, and a third at a
-    /// different size takes the reallocate branch. A single-convert test (as
-    /// all the others are) never reaches the cache-hit/realloc paths.
+    /// The `widen_scratch` cache is allocated on the first convert, reused at the same size and reallocated at a different one.
     #[test]
     fn cpu_widen_scratch_reused_across_converts() -> Result<()> {
         fn rgba(w: usize, h: usize) -> Result<TensorDyn> {
@@ -4076,7 +3872,6 @@ mod cpu_tests {
             Ok(src)
         }
 
-        // One processor instance so the scratch cache persists across calls.
         let mut cv = CPUProcessor::default();
 
         let src4 = rgba(4, 4)?;
@@ -4097,12 +3892,11 @@ mod cpu_tests {
             edgefirst_tensor::CpuAccess::ReadWrite,
         )?;
 
-        // 1st convert: scratch is None → allocate + cache.
+        // First convert: allocates the scratch.
         cv.convert(&src4, &mut dst_a, None)?;
-        // 2nd convert, same dst format+size → cache-hit branch (reuse scratch).
+        // Same dst format and size: reuses the scratch.
         cv.convert(&src4, &mut dst_b, None)?;
 
-        // Both results must be identical and correctly normalized.
         let a = dst_a.as_f32().unwrap().map()?;
         let b = dst_b.as_f32().unwrap().map()?;
         assert_eq!(
@@ -4111,7 +3905,7 @@ mod cpu_tests {
             "cache-hit produced different output"
         );
 
-        // 3rd convert at a different size → scratch mismatch → realloc branch.
+        // A different size: reallocates the scratch.
         let src8 = rgba(8, 8)?;
         let mut dst_c = TensorDyn::image(
             8,
@@ -4128,8 +3922,7 @@ mod cpu_tests {
         Ok(())
     }
 
-    /// `convert_dtype` returns `NotAnImage` when the destination tensor has no
-    /// pixel format (a bare, non-image tensor), rather than panicking.
+    /// `convert_dtype` returns `NotAnImage` when the destination tensor has no pixel format.
     #[test]
     fn cpu_convert_dst_without_format_errors() -> Result<()> {
         let src = TensorDyn::image(
@@ -4140,7 +3933,6 @@ mod cpu_tests {
             Some(TensorMemory::Mem),
             edgefirst_tensor::CpuAccess::ReadWrite,
         )?;
-        // A plain tensor with no image format set.
         let mut dst = TensorDyn::new(&[4, 4, 3], DType::F32, Some(TensorMemory::Mem), None)?;
         let mut cv = CPUProcessor::default();
         let err = cv.convert(&src, &mut dst, None).unwrap_err();
@@ -4180,10 +3972,7 @@ mod cpu_tests {
         out
     }
 
-    /// The CPU bilinear keeps two taps on downscale too, as the GL backend
-    /// and `INTER_LINEAR` do, rather than widening its kernel: for one, three
-    /// and four channels, an exact 2:1 shrink and a mixed shrink/grow, from
-    /// both `new` and `set_interpolation(Bilinear)`.
+    /// The CPU bilinear matches two-tap `INTER_LINEAR` on downscale and upscale for one, three and four channels.
     #[test]
     fn cpu_bilinear_matches_inter_linear_on_downscale_and_upscale() -> Result<()> {
         const SW: usize = 40;
@@ -4193,7 +3982,7 @@ mod cpu_tests {
             (PixelFormat::Rgb, 3),
             (PixelFormat::Rgba, 4),
         ] {
-            // High-frequency content: a widened kernel would visibly smooth it.
+            // High-frequency content.
             let pixels: Vec<u8> = (0..SW * SH * ch)
                 .map(|i| ((i * 2_654_435_761usize) >> 7) as u8)
                 .collect();
@@ -4232,7 +4021,6 @@ mod cpu_tests {
                         .zip(&expected)
                         .map(|(&got, &want)| (f32::from(got) - want).abs())
                         .fold(0.0f32, f32::max);
-                    // One level of rounding, plus the f32 reference's own error.
                     assert!(
                         worst <= 1.0 + 1e-3,
                         "{fmt} {which} {SW}x{SH} -> {dw}x{dh}: worst difference {worst}"
@@ -4243,8 +4031,7 @@ mod cpu_tests {
         Ok(())
     }
 
-    /// RGBA8 → Rgb F32 with downscale (8x8 → 4x4): output must be in [0,1]
-    /// and finite; a flat-color region survives resize exactly.
+    /// RGBA8 → Rgb F32 with an 8x8 → 4x4 downscale stays finite in [0,1] and keeps flat-colour regions exact.
     #[test]
     fn cpu_convert_rgba_to_rgb_f32_resize() -> Result<()> {
         const SW: usize = 8;
@@ -4252,7 +4039,7 @@ mod cpu_tests {
         const DW: usize = 4;
         const DH: usize = 4;
 
-        // Build an 8x8 source: right half (x >= 4) is solid blue [0,0,255,255].
+        // 8x8 source: the right half (x >= 4) is solid blue [0,0,255,255].
         let src = TensorDyn::image(
             SW,
             SH,
@@ -4268,7 +4055,6 @@ mod cpu_tests {
                 for x in 0..SW {
                     let i = y * SW + x;
                     if x >= 4 {
-                        // Solid blue in the right half
                         data[i * 4] = 0;
                         data[i * 4 + 1] = 0;
                         data[i * 4 + 2] = 255;
@@ -4301,7 +4087,6 @@ mod cpu_tests {
 
         assert_eq!(dst_floats.len(), DW * DH * 3, "wrong output element count");
 
-        // All values must be in [0, 1] and finite.
         for (i, &v) in dst_floats.iter().enumerate() {
             assert!(
                 v.is_finite() && (0.0..=1.0).contains(&v),
@@ -4309,9 +4094,7 @@ mod cpu_tests {
             );
         }
 
-        // The rightmost column (x=3 in 4x4) maps to src pixels x=6..7 which
-        // are entirely inside the solid-blue right half — bilinear resize of a
-        // flat region is exact.
+        // The rightmost column maps to src pixels x=6..7, inside the solid-blue half.
         for y in 0..DH {
             let x = DW - 1; // x=3
             let i = y * DW + x;
@@ -4323,13 +4106,8 @@ mod cpu_tests {
             assert_eq!(b, 1.0, "rightmost B must be 1.0 at ({x},{y})");
         }
 
-        // The left src half is [128, 64, 32] -> normalised [~0.502, ~0.251, ~0.125].
-        // x=0 in the 4x4 output maps to src x=0 whose bilinear kernel sits
-        // entirely within the left half — bilinear resize of a flat region is
-        // exact, so the tolerance just absorbs the f32 /255 rounding.  A zero-
-        // filled or miscopied left region would produce 0.0 here and be caught.
-        // (x=1 already blends with right-half blue due to the resampler's broad
-        // kernel reaching across the seam at src x=4.)
+        // The left src half is [128, 64, 32], normalised [~0.502, ~0.251, ~0.125];
+        // x=0 maps inside it.
         for y in 0..DH {
             let i = (y * DW) * 3; // x=0
             assert!(
@@ -4355,7 +4133,7 @@ mod cpu_tests {
     fn cpu_nv12_to_rgb_respects_tagged_709_vs_601() {
         use edgefirst_tensor::{ColorEncoding, ColorRange, Colorimetry};
         let make = |enc| {
-            // 2x2 NV12: 4 luma + 1 UV pair (U=200,V=40) — saturated chroma so 601≠709.
+            // 2x2 NV12: 4 luma + 1 UV pair (U=200,V=40).
             let mut src = load_bytes_to_tensor(
                 2,
                 2,
@@ -4390,8 +4168,7 @@ mod cpu_tests {
     fn cpu_nv16_to_rgb_respects_tagged_709_vs_601() {
         use edgefirst_tensor::{ColorEncoding, ColorRange, Colorimetry};
         let make = |enc| {
-            // 2x2 NV16 (4:2:2): 4 luma + full-height half-width chroma = 2 rows
-            // × 1 (Cb,Cr) pair = 4 chroma bytes (U=200,V=40, saturated so 601≠709).
+            // 2x2 NV16 (4:2:2): 4 luma + 2 rows × 1 (Cb,Cr) pair = 4 chroma bytes (U=200,V=40).
             let mut src = load_bytes_to_tensor(
                 2,
                 2,
@@ -4426,8 +4203,7 @@ mod cpu_tests {
     fn cpu_nv24_to_rgb_respects_tagged_709_vs_601() {
         use edgefirst_tensor::{ColorEncoding, ColorRange, Colorimetry};
         let make = |enc| {
-            // 2x2 NV24 (4:4:4): 4 luma + full-res chroma = 4 (Cb,Cr) pairs = 8
-            // chroma bytes (U=200,V=40, saturated so 601≠709).
+            // 2x2 NV24 (4:4:4): 4 luma + 4 (Cb,Cr) pairs = 8 chroma bytes (U=200,V=40).
             let mut src = load_bytes_to_tensor(
                 2,
                 2,
@@ -4461,7 +4237,6 @@ mod cpu_tests {
     #[test]
     fn cpu_convert_tagged_jfif_differs_from_untagged_heuristic_nv12() {
         use edgefirst_tensor::{ColorEncoding, ColorRange, Colorimetry};
-        // Same 2x2 NV12 bytes — saturated chroma so matrix/range choice matters.
         // NV12 2x2 = 4 Y-plane bytes + 2 UV-plane bytes = 6 total.
         let bytes = [180u8, 180, 180, 180, 200, 40];
         let convert = |cm: Option<Colorimetry>| {
@@ -4481,16 +4256,15 @@ mod cpu_tests {
                 .unwrap();
             dst.as_u8().unwrap().map().unwrap().as_slice().to_vec()
         };
-        // Tagged JFIF (BT.601 full-range) — what the codec sets for JPEG.
+        // Tagged JFIF (BT.601 full-range).
         let jfif = convert(Some(Colorimetry::jfif()));
-        // Untagged: 2x2 height is below HD_THRESHOLD (720) → heuristic resolves
-        // to BT.601 LIMITED.  JFIF is BT.601 FULL, so the two must differ.
+        // Untagged: resolves to BT.601 limited.
         let untagged = convert(None);
         assert_ne!(
             jfif, untagged,
             "JFIF (BT.601 full-range) must differ from heuristic (BT.601 limited)"
         );
-        // An explicitly-tagged BT.709-limited must also differ from BT.601 JFIF.
+        // Tagged BT.709 limited.
         let bt709 = convert(Some(
             Colorimetry::default()
                 .with_encoding(ColorEncoding::Bt709)
@@ -4502,9 +4276,8 @@ mod cpu_tests {
     #[test]
     fn cpu_convert_into_heap_subviews_no_aliasing() {
         // Two distinct RGBA sources converted into two RGB sub-views of one
-        // heap parent buffer. Each window must bit-match a standalone convert
-        // of its source — proving the CPU convert path honors the heap
-        // plane_offset with no aliasing. Runs on CI with no GPU/NPU.
+        // heap parent buffer; each window is compared with a standalone convert
+        // of its source.
         let mut converter = CPUProcessor::default();
 
         let mut src0 = TensorDyn::image(
@@ -4564,9 +4337,7 @@ mod cpu_tests {
         .unwrap();
         do_convert(&src1, &mut ref1);
 
-        // One RGB parent holding two stacked 4x4 frames (4 wide, 8 tall). The
-        // sub-views inherit the Rgb format, so each is a ready convert target
-        // and the plane offset survives.
+        // One RGB parent holding two stacked 4x4 frames (4 wide, 8 tall).
         let frame = 4 * 4 * 3;
         let parent = TensorDyn::image(
             4,
@@ -4599,21 +4370,14 @@ mod cpu_tests {
         );
     }
 
-    /// A *real* resize (not a same-size format conversion) into a padded
-    /// destination view must land each row at the view's stride, not a
-    /// tight `dst_w * channels` pitch. Regression coverage for the
-    /// `(Rotation::None, Flip::None)` resize branch, which used to build its
-    /// `fast_image_resize::images::Image` straight from the padded map
-    /// (implicitly tight), smearing later rows across the padding.
+    /// A resize into a padded destination view lands each row at the view's stride.
     #[test]
     fn resize_into_padded_view_matches_standalone() {
         let tile_w = 320usize;
         let tile_h = 240usize;
         let channels = 3usize; // PixelFormat::Rgb
 
-        // 640x480 Rgb source with non-uniform, deterministic content so a
-        // row-stride mismatch shows up as a byte mismatch rather than
-        // silently comparing padding zeros to padding zeros.
+        // 640x480 Rgb source with non-uniform, deterministic content.
         let mut src = TensorDyn::image(
             640,
             480,
@@ -4648,11 +4412,8 @@ mod cpu_tests {
         do_convert(&mut reference);
         let reference_bytes = reference.as_u8().unwrap().map().unwrap().to_vec();
 
-        // Parent: allocate wider than the tile (real spare capacity), narrow
-        // the logical width back to `tile_w` via `configure_image` (which
-        // keeps the wider physical allocation), then record a row stride
-        // padded +16 bytes past the tight `tile_w * channels` pitch — the
-        // shape a DMA pitch-aligned destination would present.
+        // Parent: allocated wider than the tile, narrowed to `tile_w` via
+        // `configure_image`, with a row stride 16 bytes past the tight pitch.
         let alloc_w = tile_w + 64;
         let mut parent = TensorDyn::image(
             alloc_w,
@@ -4673,9 +4434,8 @@ mod cpu_tests {
         let mut view = parent.view(Region::new(0, tile_h, tile_w, tile_h)).unwrap();
         do_convert(&mut view);
 
-        // Walk the view's window at the parent's real stride, comparing
-        // each row's tight `width * channels` bytes (skipping the padding)
-        // against the standalone reference.
+        // Compares each row's tight `width * channels` bytes at the parent's
+        // stride with the standalone reference.
         let parent_bytes = parent.as_u8().unwrap().map().unwrap().to_vec();
         let band_offset = tile_h * padded_stride;
         let tight_row = tile_w * channels;
@@ -4690,13 +4450,10 @@ mod cpu_tests {
         }
     }
 
-    // ---- Task 3: fused NV→planar source region + scale-identity gate ----
+    // ---- Fused NV→planar source region ----
 
-    /// Decode `full` (a whole-frame NV12→PlanarRgb convert, no crop) once and
-    /// slice each colour plane down to `region` by hand, entirely without
-    /// invoking any cropped-convert code path. This is the ground-truth
-    /// oracle both `fused_region_matches_general_path` and
-    /// `odd_origin_nv12_crop_falls_through` compare against.
+    /// Slices each colour plane of `full` (a whole-frame NV12→PlanarRgb
+    /// convert) down to `region`.
     fn manual_planar_rgb_crop(full: &TensorDyn, region: Region) -> Vec<u8> {
         let full_w = full.width().unwrap();
         let full_h = full.height().unwrap();
@@ -4717,21 +4474,7 @@ mod cpu_tests {
         out
     }
 
-    /// Full-frame (no-crop) NV12→PlanarRgb convert of `camera720p.nv12` —
-    /// the source both new tests below slice down to a sub-region by hand.
-    ///
-    /// Note this itself already routes through `convert_nv_to_planar_fused`
-    /// (with `region: None` — the pre-existing whole-frame gate, unchanged
-    /// by this task), not some independently-implemented "general path"
-    /// decode. It's still a valid oracle for `fused_region_matches_general_path`
-    /// because that test's *only* claim is that the fused function's
-    /// `region: Some(r)` strip arithmetic reproduces exactly what its own
-    /// `region: None` whole-frame arithmetic computes for the same pixels —
-    /// i.e. that the region offsets are correct, not that the fused decode
-    /// numerically matches the separate `convert_format_pf` pipeline (which
-    /// `odd_origin_nv12_crop_falls_through` exercises independently against
-    /// this same oracle, and which the frozen `crop_golden` fixtures pin
-    /// byte-for-byte as the ultimate independent check).
+    /// Full-frame NV12→PlanarRgb convert of `camera720p.nv12`.
     fn nv12_720p_to_planar_rgb_full(converter: &mut CPUProcessor) -> (TensorDyn, TensorDyn) {
         let src = load_bytes_to_tensor(
             1280,
@@ -4754,12 +4497,7 @@ mod cpu_tests {
         (src, full)
     }
 
-    /// A source crop whose size equals the destination (scale identity) with
-    /// an even (chroma-aligned) origin must take the fused NV→planar strip
-    /// path and produce output identical to decoding the whole frame once
-    /// and manually slicing the same sub-rectangle out of each plane (see
-    /// `nv12_720p_to_planar_rgb_full`'s doc for exactly what this oracle
-    /// does and doesn't independently prove).
+    /// A scale-identity source crop with an even origin matches the whole-frame decode sliced to the same region.
     #[test]
     fn fused_region_matches_general_path() {
         let mut converter = CPUProcessor::default();
@@ -4793,9 +4531,7 @@ mod cpu_tests {
         );
     }
 
-    /// The same scale-identity, chroma-aligned crop as above must actually
-    /// take the fused path — asserted via the test-only `fused_hits` counter
-    /// rather than by timing, so the path selection itself is under test.
+    /// A scale-identity, chroma-aligned crop takes the fused path, shown by the `fused_hits` counter.
     #[test]
     fn scale_identity_crop_takes_fused_path() {
         let mut converter = CPUProcessor::default();
@@ -4833,15 +4569,12 @@ mod cpu_tests {
         );
     }
 
-    /// An odd-origin NV12 crop (odd left AND top) fails the NV12 chroma-
-    /// alignment gate and must fall through to the general path — never
-    /// snapped to the nearest even origin, never shifted. The output must
-    /// still be correct.
+    /// An odd-origin NV12 crop takes the general path and matches the oracle.
     #[test]
     fn odd_origin_nv12_crop_falls_through() {
         let mut converter = CPUProcessor::default();
         let (src, full) = nv12_720p_to_planar_rgb_full(&mut converter);
-        let region = Region::new(257, 129, 640, 360); // odd left AND top
+        let region = Region::new(257, 129, 640, 360); // odd left and top
         let reference = manual_planar_rgb_crop(&full, region);
 
         let mut cropped = TensorDyn::image(
@@ -4877,14 +4610,7 @@ mod cpu_tests {
         );
     }
 
-    /// Regression: a scale-identity, chroma-aligned (even left/top) crop
-    /// whose *width* is odd used to error out of the fused NV12/NV16 region
-    /// path (`YuvError::ChromaPlaneMinimumSizeMismatch`). The `yuv` crate
-    /// needs `width.div_ceil(2) * 2` chroma bytes per row — a full trailing
-    /// U+V pair for the odd column's fractional pair, not `width` bytes —
-    /// but the packed UV scratch was sized to exactly `out_w`, one byte
-    /// short. Covers both NV12 (4:2:0) and NV16 (4:2:2): both pack one U+V
-    /// byte pair per two luma columns and so share the same rounding need.
+    /// A scale-identity, chroma-aligned crop with an odd width takes the fused NV12/NV16 path and matches the oracle.
     #[test]
     fn odd_width_scale_identity_crop_takes_fused_path_and_is_correct() {
         for (src_fmt, asset) in [
@@ -4911,8 +4637,7 @@ mod cpu_tests {
             .unwrap();
             converter.convert(&src, &mut full, None).unwrap();
 
-            // Even left/top (chroma-aligned) but an ODD width — the shape
-            // that used to crash.
+            // Even left/top with an odd width.
             let region = Region::new(256, 128, 641, 360);
             let reference = manual_planar_rgb_crop(&full, region);
 
@@ -4952,35 +4677,7 @@ mod cpu_tests {
         }
     }
 
-    /// `region.left == 0` crops exercise the fused path's zero-copy arm (no
-    /// y/uv row packing — the read slices the parent planes at a row
-    /// boundary) and its one mandatory exception. Cases:
-    ///
-    /// - NV12 flush-bottom, even height: zero-copy; the region's last
-    ///   luma/chroma rows are the planes' last rows, so any stride-chunking
-    ///   past a row's true end (the bug the packing arm exists to avoid for
-    ///   column-shifted crops) would read out of bounds or drop rows here.
-    /// - NV12 odd width, even height: zero-copy; the chroma read covers the
-    ///   trailing half-pair byte from the parent stride.
-    /// - NV12 odd width AND odd height, not flush-bottom: MUST fall back to
-    ///   the packing arm — the `yuv` crate's 4:2:0 odd-last-row handling
-    ///   (`chunks_exact(..).remainder()` / `.last()`) is only correct on a
-    ///   slice of exactly `height` rows, which a row-aligned slice running
-    ///   to the plane end is not. Without the fallback this case panics
-    ///   inside the crate ("range end index 641 out of range").
-    /// - NV16 odd width/height: zero-copy is safe at any height (4:2:2 has
-    ///   no vertical subsampling and no remainder path).
-    ///
-    /// All must stay fused. Even-height NV12 cases and NV16 are byte-exact
-    /// against the full-decode + manual plane crop oracle on every CPU. The
-    /// odd-height NV12 case compares its LAST row with a small tolerance
-    /// instead: an odd-height region decodes its final row through the
-    /// crate's halved-chroma-row kernel, while the even-height full-frame
-    /// oracle rendered that same source row through the paired kernel — and
-    /// on the plain-NEON (non-RDM) path those two kernels round ±1
-    /// differently (observed on i.MX 8M Plus Cortex-A53), so bit-equality
-    /// with this oracle is unattainable there by construction. All rows
-    /// before the last stay byte-exact, which still pins the addressing.
+    /// `region.left == 0` crops stay fused and match the oracle for NV12 and NV16 with even and odd sizes.
     #[test]
     fn left_edge_crop_zero_copy_arm_is_fused_and_correct() {
         for (src_fmt, asset, region, last_row_tol, label) in [
@@ -5067,9 +4764,8 @@ mod cpu_tests {
                      full-decode + manual plane crop reference"
                 );
             } else {
-                // Odd-height NV12: all rows but the last are byte-exact; the
-                // last row tolerates the paired-vs-halved chroma kernel
-                // rounding delta (see the test doc).
+                // Odd-height NV12: all rows but the last are byte-exact; the last
+                // row is compared with a tolerance.
                 let (w, h) = (region.width, region.height);
                 let plane = w * h;
                 for p in 0..3 {
@@ -5095,9 +4791,8 @@ mod cpu_tests {
         }
     }
 
-    /// Build a `w`x`h` tensor in `fmt` whose every mapped byte follows a
-    /// deterministic gradient, so neighbouring pixels differ and any misplaced
-    /// filter tap shows up as a byte difference.
+    /// Builds a `w`x`h` tensor in `fmt` whose mapped bytes follow a
+    /// deterministic gradient.
     fn gradient_image(w: usize, h: usize, fmt: PixelFormat) -> TensorDyn {
         let t = TensorDyn::image(
             w,
@@ -5118,24 +4813,7 @@ mod cpu_tests {
         t
     }
 
-    /// The crop-sized pre-resize intermediate must be byte-identical to the
-    /// pre-Task-4 full-frame intermediate for crops flush against every frame
-    /// edge — the cases where the halo clamps against the frame bounds instead
-    /// of finding real neighbouring pixels.
-    ///
-    /// The reference is the old algorithm rebuilt from the public API: convert
-    /// the whole frame once into the packed-RGB intermediate, then apply the
-    /// same crop+resize to *that* tensor. `Rgb -> Rgb` needs no intermediate,
-    /// so the reference convert runs the identical resize against a full-frame
-    /// source — exactly what the NV source used to do internally. Any halo
-    /// arithmetic error (too small, mis-snapped, or mis-rebased) makes the two
-    /// differ. This lives here rather than in `tests/crop_golden.rs` because it
-    /// also asserts the shrink actually happened, via the crate-private
-    /// `last_tmp_dims`, which an integration test cannot reach.
-    ///
-    /// Run for both resize algorithms: the golden matrix only ever builds a
-    /// `default()` (bilinear) processor, so `new_nearest()` — the one algorithm
-    /// with a genuinely zero filter reach — has no other coverage here.
+    /// The crop-sized pre-resize intermediate is byte-identical to a full-frame intermediate for crops flush against every frame edge.
     #[test]
     fn crop_edge_matches_full_frame_intermediate() {
         const SRC_W: usize = 640;
@@ -5151,7 +4829,7 @@ mod cpu_tests {
                 };
                 let src = gradient_image(SRC_W, SRC_H, src_fmt);
 
-                // The pre-Task-4 intermediate: the whole frame, converted once.
+                // The full-frame intermediate: the whole frame, converted once.
                 let mut full = gradient_image(SRC_W, SRC_H, PixelFormat::Rgb);
                 converter.convert(&src, &mut full, None).unwrap();
 
@@ -5196,7 +4874,7 @@ mod cpu_tests {
                             "crop-sized intermediate changed output bytes for {case}"
                         );
 
-                        // ...and the intermediate really did shrink to the crop.
+                        // The intermediate is crop-sized.
                         let (tw, th) = dims.unwrap_or_else(|| {
                             panic!("{case}: expected a pre-resize intermediate")
                         });
@@ -5214,17 +4892,7 @@ mod cpu_tests {
         }
     }
 
-    /// `Nearest` is the one algorithm whose filter reach is genuinely zero, so
-    /// without a halo *floor* an already-chroma-aligned crop grows by nothing:
-    /// the rebased source rect becomes the whole intermediate, `needs_resize`
-    /// in `resize_flip_rotate_pf` flips to false for the first time on this
-    /// shape, and control reaches `flip_rotate_ndarray_pf`, which assumes
-    /// tightly-packed destination rows and so bypasses the padded-destination
-    /// destride entirely.
-    ///
-    /// Scale-identity crop into a 320x240 view of a parent with a padded row
-    /// stride, checked against both a standalone tight convert and the
-    /// pre-change full-frame-intermediate oracle.
+    /// A nearest scale-identity crop into a padded view matches a standalone tight convert and the full-frame intermediate.
     #[test]
     fn nearest_scale_identity_crop_into_padded_view() {
         const SRC_W: usize = 640;
@@ -5234,9 +4902,7 @@ mod cpu_tests {
         let channels = 3usize; // PixelFormat::Rgb
 
         let src = gradient_image(SRC_W, SRC_H, PixelFormat::Nv12);
-        // Even origin on both axes: already chroma-aligned, so the even-snap
-        // grows nothing and only the halo floor can separate the rebased rect
-        // from the full intermediate.
+        // Even origin on both axes.
         let crop = Crop::new()
             .with_source(Some(Region::new(100, 52, tile_w, tile_h)))
             .with_fit(crate::Fit::Stretch);
@@ -5254,8 +4920,8 @@ mod cpu_tests {
             .unwrap();
         let reference_bytes = reference.as_u8().unwrap().map().unwrap().to_vec();
 
-        // Reference B: the pre-Task-4 algorithm — whole frame converted once
-        // into the packed-RGB intermediate, then the same crop applied to it.
+        // Reference B: the whole frame converted once into the packed-RGB
+        // intermediate, then the same crop applied to it.
         let mut full = gradient_image(SRC_W, SRC_H, PixelFormat::Rgb);
         converter.convert(&src, &mut full, None).unwrap();
         let mut oracle = gradient_image(tile_w, tile_h, PixelFormat::Rgb);
@@ -5272,9 +4938,8 @@ mod cpu_tests {
             "Nearest crop-sized intermediate diverged from the full-frame oracle"
         );
 
-        // Padded parent: allocate wider, narrow the logical width back, then
-        // record a row stride padded past the tight pitch — the shape a DMA
-        // pitch-aligned destination presents.
+        // Padded parent: allocated wider, narrowed to the logical width, with a
+        // row stride past the tight pitch.
         let mut parent = TensorDyn::image(
             tile_w + 64,
             2 * tile_h,
@@ -5312,10 +4977,7 @@ mod cpu_tests {
         }
     }
 
-    /// A multiplane (separate luma/chroma tensors) NV12 source must extract the
-    /// same crop as the contiguous layout — the two take different branches in
-    /// `extract_nv_region` (own chroma stride vs. `split_semi_planar`), and only
-    /// the contiguous one is exercised by the golden matrix.
+    /// A multiplane NV12 source extracts the same crop as the contiguous layout.
     #[test]
     fn crop_multiplane_nv12_matches_contiguous() {
         const W: usize = 640;
@@ -5342,7 +5004,7 @@ mod cpu_tests {
         };
 
         let mut converter = CPUProcessor::default();
-        // Cropped AND scaled, with an odd origin so the even-snap runs too.
+        // Cropped and scaled, with an odd origin.
         let crop = Crop::new()
             .with_source(Some(Region::new(101, 53, 320, 240)))
             .with_fit(crate::Fit::Stretch);
@@ -5371,16 +5033,7 @@ mod cpu_tests {
         );
     }
 
-    /// A cropped **and scaled** convert must size its pre-resize intermediate
-    /// to the crop (plus the resize filter's halo), not to the whole frame.
-    ///
-    /// 4032x2268 NV12 -> crop (512, 512, 640, 640) -> 320x320 Rgb: the crop is
-    /// scaled 2:1, so Task 3's scale-identity fused path does not swallow it
-    /// and the general pipeline's pre-resize intermediate is exercised. The
-    /// full frame is 9.1 MPix against the crop's 0.41 MPix — a ~22x
-    /// difference, so the assertion is about proportionality, not an exact
-    /// halo width (which is an implementation detail of the configured
-    /// filter).
+    /// A cropped and scaled convert sizes its pre-resize intermediate to the crop plus the filter halo.
     #[test]
     fn pre_resize_intermediate_is_crop_sized() {
         const SRC_W: usize = 4032;
@@ -5434,10 +5087,7 @@ mod cpu_tests {
             (SRC_W, SRC_H),
             "the pre-resize intermediate is still frame-sized"
         );
-        // Crop-sized: at least the crop, and at most the crop plus a small
-        // filter halo on each side. 16px of slack per side is far more than
-        // any supported filter needs at this 2:1 scale, and far less than the
-        // frame.
+        // At least the crop, and at most the crop plus 16 px per side.
         assert!(
             (CROP.2..=CROP.2 + 32).contains(&dims.0) && (CROP.3..=CROP.3 + 32).contains(&dims.1),
             "pre-resize intermediate {dims:?} is not crop-sized \
@@ -5446,12 +5096,7 @@ mod cpu_tests {
             CROP.3
         );
     }
-    /// The row-confined int8 bias -- the `I8` post-pass the G2D backend shares
-    /// with the CPU convert -- biases only the pixel bytes of each logical row.
-    /// On a pitch-padded destination the bytes between one row's pixels and the
-    /// next belong to nobody (an allocation pad) or to somebody else (a
-    /// `view()` parent's neighbouring tile), and a flat walk of the mapping
-    /// would bias them too. A tight destination is the flat walk exactly.
+    /// The row-confined int8 bias changes only the pixel bytes of each logical row at the declared stride.
     #[test]
     fn int8_bias_rows_touches_only_the_pixel_bytes_at_the_declared_stride() {
         use crate::cpu::{apply_int8_xor_bias, apply_int8_xor_bias_rows};
@@ -5465,7 +5110,7 @@ mod cpu_tests {
                 let bpp = fmt.channels();
                 let row_bytes = W * bpp;
                 let stride = wide * bpp;
-                // Allocate at the padded width, then re-declare the logical
+                // Allocates at the padded width, then declares the logical
                 // geometry and the pitch.
                 let mut t = Tensor::<u8>::image(
                     wide,
@@ -5490,8 +5135,7 @@ mod cpu_tests {
 
                 let after = t.map_read().unwrap().as_slice().to_vec();
                 for y in 0..H {
-                    // The flat helper on one row is the per-row oracle, alpha
-                    // skip included.
+                    // The flat helper on one row is the per-row oracle.
                     let mut want = before[y * stride..y * stride + row_bytes].to_vec();
                     apply_int8_xor_bias(&mut want, fmt);
                     assert_eq!(
@@ -5511,12 +5155,11 @@ mod cpu_tests {
     }
 
     // ---------------------------------------------------------------------
-    // Super-white luma must never decode to black (the `Fast` kernel wrap)
+    // Super-white luma
     // ---------------------------------------------------------------------
 
-    /// Decode a uniform limited-range BT.601 NV12 frame and return its first
-    /// RGBA pixel. 64x64 so the `yuv` kernels take their vectorized main loop
-    /// rather than only the scalar tail.
+    /// Decodes a uniform 64x64 limited-range BT.601 NV12 frame and returns
+    /// its first RGBA pixel.
     fn decode_uniform_nv12(y: u8, u: u8, v: u8) -> [u8; 4] {
         use edgefirst_tensor::{
             ColorEncoding, ColorRange, Colorimetry, DType, PixelFormat, TensorDyn, TensorMapTrait,
@@ -5654,7 +5297,7 @@ mod cpu_tests {
     }
 
     /// Exact YUV→RGB for luma/red/blue weights `kr`, `kb`, unclamped except
-    /// that limited-range footroom luma (Y < 16) is black, as on every backend.
+    /// that limited-range footroom luma (Y < 16) is black.
     fn exact_yuv(kr: f64, kb: f64, limited: bool) -> impl Fn(f64, f64, f64) -> [f64; 3] {
         let (ys, cs) = if limited {
             (255.0 / 219.0, 255.0 / 224.0)
@@ -5673,9 +5316,7 @@ mod cpu_tests {
         }
     }
 
-    /// The CPU YUV→RGB conversion stays within one level of the exact matrix,
-    /// with no systematic bias, across every luma and a 52x52 chroma grid, for
-    /// both matrices and ranges and for 4:4:4 and 4:2:0 sources.
+    /// The CPU YUV→RGB conversion stays within one level of the exact matrix with no systematic bias.
     #[test]
     fn nv_to_rgb_is_unbiased_and_within_one_level() {
         use edgefirst_tensor::{ColorEncoding, ColorRange, Colorimetry, PixelFormat};
@@ -5718,8 +5359,7 @@ mod cpu_tests {
         }
     }
 
-    /// Super-white luma (Y above the 235 limited-range white point) decodes to
-    /// the clamped exact value, never wrapping to its opposite.
+    /// Super-white luma (Y above 235) decodes to the clamped exact value.
     #[test]
     fn super_white_luma_never_decodes_to_black() {
         // Saturated chroma both ways, and a blue that only just saturates.
@@ -5737,8 +5377,7 @@ mod cpu_tests {
         }
     }
 
-    /// The content region reported for a convert is exactly the rectangle the
-    /// convert paints, for odd slack in either axis and both placements.
+    /// The content region reported for a convert is the rectangle the convert paints.
     #[test]
     fn content_region_matches_painted_rect() {
         use crate::{ConvertOptions, LetterboxPlacement};
@@ -5934,8 +5573,7 @@ mod cpu_tests {
             "box interior must not be drawn"
         );
 
-        // Translucent: blended with the colour's alpha. Every outline pixel,
-        // corners included, gets the same single blend.
+        // Translucent: every outline pixel gets one blend with the colour's alpha.
         let translucent = [200, 100, 50, 128];
         let want = box_blend(translucent, 128);
         let flat = crate::test_support::draw_box_fixture(&mut cpu, translucent, Some(3), 1.0);
@@ -5951,7 +5589,7 @@ mod cpu_tests {
             "top-right corner"
         );
 
-        // Opacity scales the colour's alpha, as it does for masks.
+        // Opacity scales the colour's alpha.
         let flat = crate::test_support::draw_box_fixture(&mut cpu, color, Some(3), 0.5);
         assert_eq!(box_px(&flat, left, mid), box_blend(color, 128));
 

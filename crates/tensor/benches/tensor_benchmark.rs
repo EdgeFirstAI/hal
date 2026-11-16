@@ -18,7 +18,6 @@
 //! ./tensor_benchmark --bench
 //! ```
 
-// Only the Unix (Shm / DMA-BUF / IOSurface) sections below consult it.
 #[cfg(unix)]
 use edgefirst_tensor::is_gpu_buffer_available;
 use edgefirst_tensor::{Tensor, TensorMapTrait as _, TensorMemory, TensorTrait as _};
@@ -93,7 +92,7 @@ fn main() {
 
     let mut suite = BenchSuite::from_args();
 
-    // Mem backend — always available
+    // Mem backend
     bench_backend::<u8>(&mut suite, TensorMemory::Mem, "mem", "u8");
     bench_backend::<i8>(&mut suite, TensorMemory::Mem, "mem", "i8");
 

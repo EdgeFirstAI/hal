@@ -11,12 +11,10 @@
 //! B = Y + 1.77200 · (Cb − 128)
 //! ```
 //!
-//! Fixed point matches libjpeg-turbo's `jdcolext-neon` shape: coefficients in
-//! Q14, applied with the rounding-doubling high half multiply (`SQRDMULH`) on
-//! a **doubled** chroma term — `sqrdmulh(2·c, round(k·2¹⁴)) = c·k` with one
-//! rounding step. `SQRDMULH` is baseline ASIMD, so the same kernel runs on
-//! Cortex-A53 through Apple Silicon. The scalar path reproduces the identical
-//! arithmetic bit-for-bit, so NEON/scalar parity is exact (max error vs. the
+//! Fixed point: coefficients in Q14, applied with the rounding-doubling high
+//! half multiply (`SQRDMULH`) on a doubled chroma term:
+//! `sqrdmulh(2·c, round(k·2¹⁴)) = c·k` with one rounding step. The scalar
+//! path reproduces the same arithmetic bit for bit (max error against the
 //! real-valued formula is ±1).
 
 /// Q14 coefficients: `round(k · 2^14)`.
@@ -25,9 +23,8 @@ const CB_G: i16 = 5638; //  0.34414
 const CR_G: i16 = 11700; // 0.71414
 const CB_B: i16 = 29032; // 1.77200
 
-/// Scalar model of `SQRDMULH` for the value ranges used here (no saturation
-/// needed: |2·chroma| ≤ 256 and coefficients < 2¹⁵ keep `2ab` far from i32
-/// overflow).
+/// Scalar model of `SQRDMULH` without saturation, for |2·chroma| ≤ 256 and
+/// coefficients < 2¹⁵.
 #[inline(always)]
 fn qrdmulh(a: i32, b: i32) -> i32 {
     (2 * a * b + 0x8000) >> 16
@@ -85,11 +82,6 @@ fn ycbcr_to_rgb_row_scalar(y: &[u8], cb: &[u8], cr: &[u8], dst: &mut [u8], start
 }
 
 /// Convert one or two adjacent 8×8 4:4:4 MCU blocks to interleaved RGB.
-///
-/// Pairing two full blocks keeps the 16-pixel `vst3q` kernel and does one ISA
-/// dispatch for the whole pair. Calling [`ycbcr_to_rgb_row`] per 8-pixel MCU
-/// row was thousands of extra calls (and a feature-detect each time) on
-/// in-order A53/A55.
 #[allow(clippy::too_many_arguments)]
 pub fn ycbcr_to_rgb_blocks(
     y0: &[u8; 64],
@@ -169,7 +161,7 @@ pub fn ycbcr_to_rgb_blocks(
 }
 
 /// Q14 butterfly on 8 i16 lanes → packed u8. Shared by the row and MCU-block
-/// NEON writers so 8-wide and 16-wide stores stay bit-identical.
+/// NEON writers.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 #[inline]
@@ -343,9 +335,6 @@ const RGB_SCATTER: [[[i8; 16]; 3]; 3] = [
 ];
 
 /// Interleave 16 pixels' worth of packed R/G/B bytes and store 48 bytes.
-///
-/// Replaces the byte-at-a-time store the earlier i32 kernel used: three
-/// shuffles and two ORs per 16-byte chunk instead of 16 scalar writes.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse4.1")]
 #[inline]
@@ -366,13 +355,9 @@ unsafe fn store_rgb16(r: __m128i, g: __m128i, b: __m128i, dst: *mut u8) {
 #[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::__m128i;
 
-/// SSE4.1 path: 16 pixels/iter in i16 lanes.
-///
-/// `pmulhrsw` computes `(a·b + 0x4000) >> 15`, which is exactly the scalar
-/// `qrdmulh` and NEON's `SQRDMULH`, so all three paths are bit-identical.
-/// One 8-pixel half: Q14 butterfly on i16 lanes. Shared by the row and
-/// MCU-block SSE4.1 writers so both stay bit-identical (`pmulhrsw` matches
-/// scalar `qrdmulh` and NEON `SQRDMULH` exactly).
+/// One 8-pixel half of the SSE4.1 path: Q14 butterfly on i16 lanes.
+/// `pmulhrsw` computes `(a·b + 0x4000) >> 15`, the value of the scalar
+/// `qrdmulh` and of NEON's `SQRDMULH`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse4.1")]
 #[inline]
@@ -398,11 +383,7 @@ unsafe fn ycbcr_half_sse41(
     (r, g, b)
 }
 
-/// Paired 8×8 blocks → 16 RGB pixels per row (SSE4.1). x86 mirror of
-/// `ycbcr_to_rgb_block16_neon`: without it the fused-RGB write fell to the
-/// scalar row tail on x86 (the 16-wide row kernel never engages at 8-pixel
-/// block width), which cost ~70% on the RGB arm of Rocket Lake after the
-/// per-MCU write path landed.
+/// Paired 8×8 blocks → 16 RGB pixels per row (SSE4.1).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse4.1")]
 #[allow(clippy::too_many_arguments)]
@@ -491,9 +472,8 @@ unsafe fn ycbcr_to_rgb_row_sse41(y: &[u8], cb: &[u8], cr: &[u8], dst: &mut [u8],
     ycbcr_to_rgb_row_scalar(y, cb, cr, dst, i, n);
 }
 
-/// AVX2 path: same Q14 butterfly, but all 16 pixels in one 256-bit i16 vector
-/// instead of two 128-bit halves. The interleaved store stays 128-bit —
-/// `vpshufb` cannot cross lanes, and the arithmetic is the expensive half.
+/// AVX2 path: the same Q14 butterfly with all 16 pixels in one 256-bit i16
+/// vector. The interleaved store stays 128-bit.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "sse4.1")]
 unsafe fn ycbcr_to_rgb_row_avx2(y: &[u8], cb: &[u8], cr: &[u8], dst: &mut [u8], n: usize) {
@@ -552,8 +532,8 @@ mod tests {
             .collect()
     }
 
-    /// Every (Y, Cb, Cr) triple lands within one level of the real-valued
-    /// equations, with no systematic bias on any channel.
+    /// Every (Y, Cb, Cr) triple is within one level of the real-valued
+    /// equations, with no bias on any channel.
     #[test]
     fn scalar_matches_float_reference_within_1_unbiased() {
         let y: Vec<u8> = (0..=255).collect();
@@ -584,7 +564,7 @@ mod tests {
 
     #[test]
     fn dispatch_matches_scalar_exactly() {
-        // Odd length exercises the 16-, 8-, and scalar tails together.
+        // Odd length: the 16-, 8- and scalar tails.
         let n = 133;
         let y = lcg_bytes(7, n);
         let cb = lcg_bytes(11, n);
@@ -651,9 +631,7 @@ mod tests {
     }
 
     /// Reference for the block16 kernels: two 8×8 blocks placed side by side
-    /// (16 wide) and converted with the scalar row kernel, row by row —
-    /// mirrors `mcu_blocks_match_row_kernel`'s construction so both the
-    /// dispatch-level and kernel-forced tests check the same thing.
+    /// (16 wide) and converted with the scalar row kernel, row by row.
     fn block16_reference(
         y0: &[u8; 64],
         cb0: &[u8; 64],
@@ -680,13 +658,7 @@ mod tests {
         exp
     }
 
-    /// The fused-RGB **block** SSE4.1 kernel (`ycbcr_to_rgb_block16_sse41`,
-    /// the direct-write 4:4:4 path — see `docs/BENCHMARKS_JPEG_REVIEW_v3.13.md`
-    /// item #5) must be bit-identical to the scalar model, called directly
-    /// rather than through `ycbcr_to_rgb_blocks`'s dispatch — dispatch-only
-    /// coverage (`mcu_blocks_match_row_kernel`) only ever exercises whichever
-    /// tier the CI/dev host happens to have, which is exactly the "benchmarks
-    /// never catch a fallback divergence" gap the review flags.
+    /// `ycbcr_to_rgb_block16_sse41` is bit-identical to the scalar model.
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn block16_sse41_matches_scalar() {
@@ -717,11 +689,8 @@ mod tests {
         assert_eq!(got, exp);
     }
 
-    /// ARM never gets the SSE4.1 path — its fused-RGB block write is the NEON
-    /// kernels below (`ycbcr_to_rgb_block16_neon`/`block8_neon`), called
-    /// directly rather than through dispatch for the same reason as the
-    /// SSE4.1 test above. Covers both the paired-block (16px) and
-    /// single-block (8px, right-edge MCU) kernels.
+    /// `ycbcr_to_rgb_block16_neon` and `ycbcr_to_rgb_block8_neon` are
+    /// bit-identical to the scalar model.
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn block_neon_kernels_match_scalar() {
@@ -772,8 +741,7 @@ mod tests {
         assert_eq!(got8, exp8, "block8_neon");
     }
 
-    /// Both x86 kernels must be bit-identical to the scalar model, not just
-    /// whichever one this host's tier happens to select.
+    /// Both x86 row kernels are bit-identical to the scalar model.
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn x86_kernels_match_scalar_exactly() {
@@ -802,7 +770,7 @@ mod tests {
 
     #[test]
     fn grey_input_stays_grey() {
-        // Cb = Cr = 128 must reproduce Y exactly on all three channels.
+        // Cb = Cr = 128 reproduces Y on all three channels.
         let y: Vec<u8> = (0..=255).collect();
         let c = vec![128u8; 256];
         let mut out = vec![0u8; 256 * 3];

@@ -19,13 +19,9 @@ fn main() {
         .write_to_file(output_dir.join("decoder.h"));
 
     edgefirst_build_support::soname("edgefirst_decoder");
-    // Calls into libedgefirst_tensor; `make capi-libs` builds tensor-capi into the same profile dir first.
     edgefirst_build_support::link_capi_to_tensor();
 
-    // The header is regenerated only when a source file or the cbindgen
-    // config changes -- NOT when the header itself is edited or deleted. Any
-    // test that reads the header must therefore depend on the source, or it
-    // is validating a stale artifact.
+    // Regenerates the header when a source file or the cbindgen config changes.
     println!("cargo:rerun-if-changed=src/");
     println!("cargo:rerun-if-changed=cbindgen.toml");
 }

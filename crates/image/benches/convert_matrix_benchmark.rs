@@ -4,23 +4,16 @@
 //! GL convert memory×format matrix benchmark.
 //!
 //! Measures every (src memory) × (dst memory) × (dst format) × (dst dtype)
-//! convert cell that the GL backend supports on the current target, using the
-//! profiler's letterbox geometry (1280×720 → 640×640). This is the per-cell
-//! before/after gate for the destination-path refactor: each cell maps onto
-//! one of the GL destination lowerings (DMA EGLImage, PBO↔PBO, any→PBO,
-//! PBO→Mem, texture readback), so a regression in any single lowering shows
-//! up as a named cell, not an average.
+//! convert cell that the GL backend supports on the current target, using
+//! letterbox geometry (1280×720 → 640×640).
 //!
 //! Memory backings are requested as {Auto, Dma, Mem} and the cell is named by
-//! the memory the allocation actually **resolved** to (`tensor.memory()`),
-//! because the interesting backing is target-dependent: Auto resolves to DMA
-//! on i.MX/RPi boards and to PBO on Orin (where the GL transfer backend is
-//! PBO and DMA import is unavailable). Cells whose resolved key collides
-//! (e.g. Auto == Dma on i.MX) are deduplicated; unsupported cells are
-//! reported and skipped.
+//! the memory the allocation resolved to (`tensor.memory()`). Cells whose
+//! resolved key collides are deduplicated; unsupported cells are reported and
+//! skipped.
 //!
-//! The GL backend is pinned via `EDGEFIRST_FORCE_BACKEND=opengl` so G2D/CPU
-//! never absorb a cell. Self-contained: sources are synthesized.
+//! The GL backend is pinned via `EDGEFIRST_FORCE_BACKEND=opengl`. Sources are
+//! synthesized.
 //!
 //! ```bash
 //! ./convert_matrix_benchmark --json matrix.json
@@ -67,9 +60,7 @@ fn mem_name(m: TensorMemory) -> &'static str {
         TensorMemory::Mem => "mem",
         TensorMemory::Shm => "shm",
         TensorMemory::Pbo => "pbo",
-        // Never produced here. `TensorMemory` is `#[non_exhaustive]`, so the
-        // wildcard is required; the known-but-unused variants are still spelled
-        // out so their labels do not silently become "unknown".
+        // Not produced by this benchmark.
         TensorMemory::IoSurface => "iosurface",
         TensorMemory::Cuda => "cuda",
         _ => "unknown",
@@ -136,8 +127,8 @@ fn main() {
     env_logger::init();
     let mut suite = BenchSuite::from_args();
 
-    // Pin the GL backend so G2D/CPU never absorb a cell.
-    // SAFETY: set_var is not thread-safe, but nothing else is running yet.
+    // Pin the GL backend.
+    // SAFETY: nothing else is running yet.
     unsafe { std::env::set_var("EDGEFIRST_FORCE_BACKEND", "opengl") };
     let proc = ImageProcessor::new();
     unsafe { std::env::remove_var("EDGEFIRST_FORCE_BACKEND") };
@@ -165,8 +156,7 @@ fn main() {
     ];
     let dtypes = [DType::U8, DType::I8];
 
-    // Dedup cells by the memory the allocation actually resolved to, so a
-    // board where Auto == Dma measures each real cell exactly once.
+    // Dedup cells by the memory the allocation resolved to.
     let mut seen: HashSet<String> = HashSet::new();
 
     for src_fmt in [PixelFormat::Nv12, PixelFormat::Rgba] {
@@ -212,11 +202,7 @@ fn main() {
                             continue; // resolved cell already measured
                         }
 
-                        // Probe twice: some driver bugs only appear on the
-                        // REPEAT convert of a cell (e.g. Mali GL_INVALID_VALUE
-                        // on the second heap-RGBA -> DMA-RGB convert), and a
-                        // single-shot probe would misclassify them as a panic
-                        // inside the timing loop.
+                        // Probe the convert twice before timing.
                         if let Err(e) = (0..2).try_for_each(|_| {
                             proc.convert(
                                 &src,
@@ -227,9 +213,8 @@ fn main() {
                             println!("  {name:55} [unsupported: {e}]");
                             continue;
                         }
-                        // Isolate the timing loop: a mid-loop convert failure
-                        // marks THIS cell failed and the matrix continues —
-                        // one broken cell must not cost the whole baseline.
+                        // A convert failure inside the timing loop marks this cell
+                        // failed and the matrix continues.
                         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             run_bench(&name, WARMUP, ITERATIONS, || {
                                 proc.convert(

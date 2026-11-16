@@ -1,13 +1,7 @@
 /* SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
  * SPDX-License-Identifier: Apache-2.0
  *
- * Links and RUNS against libedgefirst_decoder + libedgefirst_tensor.
- * A header that compiles is not the same as a library that loads.
- *
- * scripts/check-headers.sh compiles and runs exactly this file per modular
- * library, so it is the only lane that proves the exported symbols resolve
- * at runtime from a real C consumer -- the Rust `#[cfg(test)]` tests in
- * src/infer.rs call the same functions, but statically, within the crate.
+ * Links and runs against libedgefirst_decoder + libedgefirst_tensor.
  *
  * Run from the repository root: the model-config case reads
  * testdata/hf/segformer-512. */
@@ -22,10 +16,8 @@
 #include <unistd.h>
 
 /* Ultralytics schema inference, end to end: accumulate the signals an
- * inference runtime would report, infer a schema, and build a real decoder
- * from the JSON it produces. Two classes and a 6-wide feature dim rather
- * than COCO's 80/84, so the `names` dict stays readable while still being
- * internally consistent -- a mismatch is a hard error, not a warning. */
+ * inference runtime would report, infer a schema, and build a decoder from
+ * the JSON it produces. */
 static int infer_round_trip(void) {
     ef_infer_signals *s = ef_infer_signals_new(0); /* 0 = onnx */
     if (!s) { fprintf(stderr, "FAIL: ef_infer_signals_new returned NULL\n"); return 1; }
@@ -71,8 +63,7 @@ static int infer_round_trip(void) {
     }
 
     if (rc == 0) {
-        /* The point of the round trip: the inferred JSON must be something
-         * this same library will accept back as a decoder configuration. */
+        /* Build a decoder from the inferred JSON. */
         ef_decoder_params *p = ef_decoder_params_new();
         ef_decoder_params_set_config_json(p, schema_json, 0); /* 0 = NUL-terminated */
         ef_decoder_params_set_score_threshold(p, 0.25f);
@@ -92,9 +83,7 @@ static int infer_round_trip(void) {
     return rc;
 }
 
-/* A failed inference must report through err_out rather than crashing or
- * returning a handle -- and the caller must be able to free that message
- * with the same string free as any other returned string. */
+/* A failed inference returns no handle and reports through err_out. */
 static int infer_reports_failure(void) {
     ef_infer_signals *s = ef_infer_signals_new(0);
     if (!s) { fprintf(stderr, "FAIL: ef_infer_signals_new returned NULL\n"); return 1; }
@@ -133,8 +122,7 @@ static int copy_fixture(const char *dir, const char *name) {
 }
 
 /* Model configuration discovery: a model with Hugging Face configs beside it
- * resolves to a semantic schema and a preprocessing spec the image library
- * takes as-is (ef_convert_options_from_spec). */
+ * resolves to a semantic schema and a preprocessing spec. */
 static int model_config_round_trip(void) {
     const char *tmp = getenv("TMPDIR");
     char dir[512];

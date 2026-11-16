@@ -476,9 +476,8 @@ def run_hal_pipeline(image_path, metadata, interp, processor, save_path=None):
     src = Tensor.load(image_path, format=PixelFormat.Rgb)
     timings["load"] = (time.perf_counter() - t0) * 1000
 
-    # 2. Letterbox — `letterbox=` is the resize mode: preserve aspect ratio,
-    # centre the scaled image in the 640x640 destination, pad with grey. The
-    # backend computes the placement (the old manual dst_crop rect is gone).
+    # 2. Letterbox: preserve aspect ratio, centre the scaled image in the
+    # 640x640 destination, pad with grey.
     t0 = time.perf_counter()
     dst_rgb = Tensor.image(640, 640, PixelFormat.Rgb, access="readwrite")
     processor.convert(src, dst_rgb, letterbox=[114, 114, 114, 255])

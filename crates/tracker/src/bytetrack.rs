@@ -5,15 +5,12 @@
 //!
 //! [`ByteTrack`] is the crate's implementation of the [`Tracker`] trait.
 //! Each [`Tracker::update`] call predicts every tracklet forward with its
-//! Kalman filter, then matches detections in two passes — high-confidence
+//! Kalman filter, then matches detections in two passes: high-confidence
 //! detections (score >= `track_high_conf`) against all tracklets first, then
 //! the leftover low-confidence detections against whatever went unmatched.
-//! That second pass is what ByteTrack is named for: a briefly occluded object
-//! whose score dips still recovers its original track instead of being
-//! discarded and re-created with a new UUID.
 //!
-//! Both passes solve the assignment optimally with LAPJV over an IoU cost
-//! matrix. Unmatched detections spawn tracklets; tracklets that go
+//! Both passes solve the assignment with LAPJV over an IoU cost matrix.
+//! Unmatched detections spawn tracklets; tracklets that go
 //! `track_extra_lifespan` without a match are deleted.
 //!
 //! Build one with [`ByteTrackBuilder`]; see the crate root for a worked
@@ -29,10 +26,8 @@ use uuid::Uuid;
 
 /// Builder for [`ByteTrack`] with fluent setter methods.
 ///
-/// All parameters have defaults tuned for typical 30-fps inference pipelines.
-/// Call [`ByteTrackBuilder::new`] (or `Default::default()`) to start with the
-/// defaults, override only what you need, then call [`ByteTrackBuilder::build`]
-/// to construct the tracker.
+/// [`ByteTrackBuilder::new`] (or `Default::default()`) starts from the
+/// defaults; [`ByteTrackBuilder::build`] constructs the tracker.
 ///
 /// # Example
 ///
@@ -138,10 +133,10 @@ impl ByteTrackBuilder {
     }
 }
 
-/// ByteTrack multi-object tracker — the concrete [`Tracker`] implementation.
+/// ByteTrack multi-object tracker, the concrete [`Tracker`] implementation.
 ///
-/// Prefer constructing via [`ByteTrackBuilder`] rather than directly, since the
-/// public fields default to zero-values that are not usable defaults.
+/// Construct it with [`ByteTrackBuilder`]; the derived `Default` zeroes the
+/// public fields.
 ///
 /// # Algorithm overview
 ///
@@ -153,9 +148,7 @@ impl ByteTrackBuilder {
 ///    assigned to existing tracklets via LAPJV linear assignment on an IoU cost
 ///    matrix (cells below `track_iou` are set to `INVALID_MATCH`).
 /// 3. **Low-confidence pass.** Remaining unmatched tracklets are tried against
-///    all remaining detections (any score) — this recovers briefly occluded
-///    objects without admitting low-quality detections into the high-confidence
-///    pool.
+///    all remaining detections (any score).
 /// 4. **Expire.** Tracklets whose `last_updated` is more than `track_extra_lifespan`
 ///    nanoseconds behind `timestamp` are removed.
 /// 5. **Spawn.** Unmatched high-confidence detections spawn new tracklets.
@@ -196,10 +189,9 @@ pub struct ByteTrack<T: DetectionBox> {
 
 /// Internal state for one tracked object.
 ///
-/// Not part of the public API contract; exposed as `pub` for test and benchmark
-/// access only. The canonical public view of a tracklet is [`TrackInfo`]
-/// (returned by [`Tracker::update`]) or [`ActiveTrackInfo`] (returned by
-/// [`Tracker::get_active_tracks`]).
+/// Not part of the public API contract. The public view of a tracklet is
+/// [`TrackInfo`] (returned by [`Tracker::update`]) or [`ActiveTrackInfo`]
+/// (returned by [`Tracker::get_active_tracks`]).
 #[derive(Debug, Clone)]
 pub struct Tracklet<T: DetectionBox> {
     /// Globally unique identifier, assigned at tracklet creation and preserved
@@ -298,7 +290,7 @@ fn box_cost<T: DetectionBox>(
         return INVALID_MATCH;
     }
 
-    // use iou between predicted box and real box:
+    // IoU between the predicted box and the detection box.
     let predicted_xyah = track.filter.mean.as_slice();
     let expected = xyah_to_xyxy(predicted_xyah);
     let iou = iou(&expected, &new_box.bbox());
@@ -317,15 +309,14 @@ impl<T: DetectionBox> ByteTrack<T> {
         box_filter: &[bool],
         track_filter: &[bool],
     ) -> Matrix<f32> {
-        // costs matrix must be square
+        // The cost matrix is square.
         let dims = boxes.len().max(self.tracklets.len());
         let mut measurements = OMatrix::<f32, Dyn, U4>::from_element(boxes.len(), 0.0);
         for (i, mut row) in measurements.row_iter_mut().enumerate() {
             row.copy_from_slice(&xyxy_to_xyah(&boxes[i].bbox()));
         }
 
-        // TODO: use matrix math for IOU, should speed up computation, and store it in
-        // distances
+        // TODO: compute the IoU matrix with matrix math and store it in `distances`.
 
         Matrix::from_shape_fn((dims, dims), |(x, y)| {
             if x < boxes.len() && y < self.tracklets.len() {
@@ -335,7 +326,6 @@ impl<T: DetectionBox> ByteTrack<T> {
                     box_cost(
                         &self.tracklets[y],
                         &boxes[x],
-                        // distances[(x, y)],
                         0.0,
                         score_threshold,
                         iou_threshold,
@@ -366,12 +356,10 @@ impl<T: DetectionBox> ByteTrack<T> {
                 continue;
             }
 
-            // Filter out invalid assignments
             if costs[(i, x)] >= INVALID_MATCH {
                 continue;
             }
 
-            // Skip already matched boxes/tracklets
             if matched[i] || tracked[x] {
                 continue;
             }
@@ -401,7 +389,6 @@ impl<T: DetectionBox> ByteTrack<T> {
 
     /// Remove expired tracklets based on timestamp.
     fn remove_expired_tracklets(&mut self, timestamp: u64) {
-        // must iterate from the back
         for i in (0..self.tracklets.len()).rev() {
             let expiry = self.tracklets[i].last_updated + self.track_extra_lifespan;
             if expiry < timestamp {
@@ -525,10 +512,8 @@ where
             }
         }
 
-        // Remove expired tracklets
         self.remove_expired_tracklets(timestamp);
 
-        // Create new tracklets from unmatched high-confidence boxes
         self.create_new_tracklets(
             boxes,
             &high_conf_ind,
@@ -598,7 +583,6 @@ mod tests {
         let box1 = [0.0, 0.0, 0.5, 0.5];
         let box2 = [0.25, 0.25, 0.75, 0.75];
         let result = iou(&box1, &box2);
-        // Intersection: 0.25*0.25 = 0.0625, Union: 0.25+0.25-0.0625 = 0.4375
         assert!(result > 0.1 && result < 0.2, "IOU should be ~0.14");
     }
 
@@ -647,25 +631,22 @@ mod tests {
     fn test_bytetrack_tracking_across_frames() {
         let mut tracker = ByteTrackBuilder::new().build();
 
-        // Frame 1: Create tracklet with a larger box that's easier to track
+        // Frame 1: create a tracklet.
         let det1 = vec![MockDetection::new([0.2, 0.2, 0.4, 0.4], 0.9, 0)];
         let res1 = tracker.update(&det1, 1000);
         assert!(res1[0].is_some());
         let uuid1 = res1[0].unwrap().uuid;
         assert_eq!(tracker.tracklets.len(), 1);
-        // After creation, tracklet count is 1
         assert_eq!(tracker.tracklets[0].count, 1);
 
-        // Frame 2: Same location - should match existing tracklet
+        // Frame 2: same location.
         let det2 = vec![MockDetection::new([0.2, 0.2, 0.4, 0.4], 0.9, 0)];
         let res2 = tracker.update(&det2, 2000);
         assert!(res2[0].is_some());
         let info2 = res2[0].unwrap();
 
-        // Verify tracklet was matched, not a new one created
         assert_eq!(tracker.tracklets.len(), 1, "Should still have one tracklet");
         assert_eq!(info2.uuid, uuid1, "Should match same tracklet");
-        // After second update, the internal tracklet count should be 2
         assert_eq!(tracker.tracklets[0].count, 2, "Internal count should be 2");
     }
 
@@ -689,16 +670,16 @@ mod tests {
     #[test]
     fn test_bytetrack_tracklet_expiry() {
         let mut tracker = ByteTrackBuilder::new().build();
-        tracker.track_extra_lifespan = 1000; // 1 second
+        tracker.track_extra_lifespan = 1000;
 
         // Create tracklet
         let det1 = vec![MockDetection::new([0.1, 0.1, 0.3, 0.3], 0.9, 0)];
         tracker.update(&det1, 1000);
         assert_eq!(tracker.tracklets.len(), 1);
 
-        // Update with no detections after lifespan expires
+        // Update with no detections after the lifespan.
         let empty: Vec<MockDetection> = vec![];
-        tracker.update(&empty, 3000); // 2 seconds later
+        tracker.update(&empty, 3000);
 
         assert!(tracker.tracklets.is_empty(), "Tracklet should have expired");
     }
@@ -733,8 +714,6 @@ mod tests {
 
     #[test]
     fn test_two_stage_matching() {
-        // The core ByteTrack innovation: low-confidence detections are matched
-        // to existing tracklets in a second stage.
         let mut tracker = ByteTrackBuilder::new().build();
 
         // Frame 1: high-confidence detection creates a tracklet
@@ -744,8 +723,7 @@ mod tests {
         let uuid1 = res1[0].unwrap().uuid;
         assert_eq!(tracker.tracklets.len(), 1);
 
-        // Frame 2: same location but low confidence (0.3, below track_high_conf=0.7).
-        // Second-stage matching should still associate it with the existing tracklet.
+        // Frame 2: same location, low confidence (0.3, below `track_high_conf`).
         let det2 = vec![MockDetection::new([0.2, 0.2, 0.4, 0.4], 0.3, 0)];
         let res2 = tracker.update(&det2, 2_000_000);
         assert!(
@@ -789,8 +767,7 @@ mod tests {
         assert_eq!(tracker_default.tracklets.len(), 1);
         assert_eq!(tracker_extended.tracklets.len(), 1);
 
-        // Advance to 1s + 1s = 2s. Default lifespan (0.5s) should have expired,
-        // extended lifespan (2s) should still be active.
+        // Advance 1 s with no detections.
         let ts_after = ts_start + 1_000_000_000;
         let empty: Vec<MockDetection> = vec![];
         tracker_default.update(&empty, ts_after);
@@ -834,7 +811,6 @@ mod tests {
 
     #[test]
     fn test_builder_track_iou() {
-        // Tight IOU threshold: shifted detection should NOT match
         let mut tracker: ByteTrack<MockDetection> = ByteTrackBuilder::new().track_iou(0.8).build();
 
         // Frame 1: two well-separated detections
@@ -845,8 +821,7 @@ mod tests {
         tracker.update(&det1, 1000);
         assert_eq!(tracker.tracklets.len(), 2);
 
-        // Frame 2: shift the first detection slightly. With IOU threshold 0.8
-        // the overlap won't be enough for a match, so it creates a new tracklet.
+        // Frame 2: the first detection is shifted slightly.
         let det2 = vec![
             MockDetection::new([0.15, 0.15, 0.35, 0.35], 0.9, 0),
             MockDetection::new([0.5, 0.5, 0.7, 0.7], 0.9, 0),
@@ -854,8 +829,6 @@ mod tests {
         let res2 = tracker.update(&det2, 2000);
         assert_eq!(res2.len(), 2);
 
-        // The second detection (unchanged) should still match. The first (shifted)
-        // should fail the tight IOU threshold and create a new tracklet.
         assert!(
             tracker.tracklets.len() >= 3,
             "Shifted detection should create a new tracklet with tight IOU threshold, got {} tracklets",
@@ -865,7 +838,6 @@ mod tests {
 
     #[test]
     fn test_degenerate_zero_area_box() {
-        // A zero-area box (xmin == xmax) should not panic
         let mut tracker = ByteTrackBuilder::new().build();
         let det = vec![
             MockDetection::new([0.5, 0.1, 0.5, 0.3], 0.9, 0), // zero width
@@ -874,7 +846,6 @@ mod tests {
         let results = tracker.update(&det, 1000);
         assert_eq!(results.len(), 2);
 
-        // IOU between a zero-area box and a normal box should be 0
         let zero_box = [0.5, 0.1, 0.5, 0.3];
         let normal_box = [0.1, 0.1, 0.3, 0.3];
         let iou_val = iou(&zero_box, &normal_box);
@@ -900,8 +871,6 @@ mod tests {
         let res2 = tracker.update(&det2, 2_000_000);
         assert!(res2[0].is_some());
 
-        // With default IOU threshold the far-away detection should not match;
-        // a new tracklet is created instead.
         assert_eq!(
             tracker.tracklets.len(),
             2,
@@ -991,7 +960,6 @@ mod tests {
         let results = tracker.update(&det, 1000);
         assert_eq!(results.len(), 4);
 
-        // Only the high-confidence ones should create tracklets
         assert!(
             results[0].is_some(),
             "High-conf detection should create tracklet"
@@ -1017,7 +985,6 @@ mod tests {
         let outer = [0.0, 0.0, 1.0, 1.0];
         let inner = [0.25, 0.25, 0.75, 0.75];
         let result = iou(&outer, &inner);
-        // inner area = 0.25, outer area = 1.0, intersection = 0.25, union = 1.0
         assert!(
             (result - 0.25).abs() < 0.01,
             "IOU of contained box should be inner_area/outer_area = 0.25, got {result}"
@@ -1026,7 +993,6 @@ mod tests {
 
     #[test]
     fn test_xyxy_to_xyah_square_box() {
-        // A square box should have aspect ratio 1.0
         let square = [0.1, 0.2, 0.3, 0.4];
         let xyah = xyxy_to_xyah(&square);
         assert!((xyah[0] - 0.2).abs() < 1e-5, "Center x should be 0.2");
@@ -1060,7 +1026,6 @@ mod tests {
         tracker.update(&det, 1000);
 
         let pred = tracker.tracklets[0].get_predicted_location();
-        // The predicted location should be close to the original detection
         assert!(
             (pred[0] - 0.2).abs() < 0.1,
             "Predicted xmin should be near 0.2, got {}",

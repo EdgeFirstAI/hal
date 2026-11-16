@@ -2,8 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! ONNX `ModelProto.metadata_props`, read by walking the top-level protobuf
-//! fields and seeking past every other one, so the graph is never decoded or
-//! even read.
+//! fields and seeking past every other one; the graph is not decoded or read.
 
 use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom};
@@ -179,8 +178,7 @@ pub(crate) mod tests {
         assert_eq!(props["labels"], "a\nb");
     }
 
-    /// The graph bytes are 0xff, which are not a valid protobuf; reading them
-    /// as fields would fail, so a successful scan proves they were skipped.
+    /// The scan skips a graph of 0xff bytes, which are not a valid protobuf.
     #[test]
     fn onnx_scan_skips_graph_without_reading_it() {
         let bytes = model_proto(&[("hf_config", "{\"a\":1}")], 1 << 20);

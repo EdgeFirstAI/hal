@@ -3,48 +3,19 @@
 
 //! Persistent host mapping, decoupled from cache coherency.
 //!
-//! `map()` fuses two separate concerns: establishing a host address, and
-//! bracketing CPU access for coherency. Fusing them makes a whole class of
-//! consumer impossible to express — TFLite's `SetCustomAllocationForTensor`
-//! and ONNX Runtime's external tensors both retain a raw pointer for the
-//! interpreter's lifetime, far beyond any single access window
-//! ([#134](https://github.com/EdgeFirstAI/hal/issues/134)).
-//!
-//! The blocker is a borrow, not a lifetime: a map guard borrows the tensor,
-//! while `ImageProcessor::convert(&mut self, src, dst)` needs `&mut` on that
-//! same tensor every frame, and the two cannot coexist. So [`HostPin`] carries
-//! **no borrow of the tensor at all** — it holds an `Arc` keepalive over the
-//! memory instead, which is what lets a caller pin once and still mutate the
-//! tensor in the frame loop.
-//!
-//! IOSurface is the reference implementation this generalises: it already
-//! separates "address of the surface" (`IOSurfaceGetBaseAddress`, stable) from
-//! "CPU access window" (`IOSurfaceLock`), which is why the Apple path already
-//! works and the DMA-BUF one does not.
+//! [`HostPin`] is a stable host address that carries no borrow of the tensor:
+//! it holds an `Arc` keepalive over the memory.
 
 use std::sync::Arc;
 
-/// Opaque keepalive holding whatever owns the pinned memory alive.
-///
-/// Type-erased so a pin does not leak the element type or the backend, which
-/// is what allows `HostPin` to be a single type across every backend.
-///
-/// Deliberately **not** `dyn Any`: `Any` carries a `'static` bound, and this is
-/// never downcast — it exists only so its `Drop` runs. Requiring `'static`
-/// would assert the allocation lives for the whole program, which is false for
-/// a tensor; the keepalive only has to outlive the pin, which `'a` says
-/// exactly.
+/// Opaque, type-erased keepalive holding whatever owns the pinned memory alive.
 type Keepalive<'a> = Arc<dyn Send + Sync + 'a>;
 
 /// A stable host address for a tensor's data, valid until the pin is dropped.
-///
-/// Deliberately carries **no lifetime parameter and no reference to the
-/// tensor**: see the module docs. Cloning is cheap and shares the keepalive.
+/// Cloning is cheap and shares the keepalive.
 #[derive(Clone)]
 pub struct HostPin<'a> {
-    /// Held, never read: dropping this is what releases the producer's
-    /// allocation, so its lifetime IS the guarantee the pinned address stays
-    /// valid. Clippy cannot see that a field's only purpose is its Drop.
+    /// Held, never read: dropping it releases the producer's allocation.
     #[allow(dead_code)]
     keepalive: Keepalive<'a>,
     ptr: *mut u8,
@@ -52,10 +23,8 @@ pub struct HostPin<'a> {
 }
 
 // SAFETY: the keepalive holds the owning allocation alive for the pin's life,
-// and every backend that yields a pin has a base pointer that is stable for
-// that allocation's lifetime. Sharing the address across threads is therefore
-// sound; synchronising *access* is the caller's job via sync_for_cpu /
-// sync_for_device, exactly as it is for the underlying buffer.
+// and the base pointer is stable for that allocation's lifetime. Synchronising
+// access is the caller's job via sync_for_cpu / sync_for_device.
 unsafe impl Send for HostPin<'_> {}
 unsafe impl Sync for HostPin<'_> {}
 
@@ -69,21 +38,7 @@ impl<'a> HostPin<'a> {
     }
 
     /// Narrow this pin to `len` bytes, keeping the same address and keepalive.
-    ///
-    /// Backends produce a pin covering everything addressable from the tensor's
-    /// offset (capacity, including any pitch padding); the public
-    /// [`pin_host`](crate::Tensor::pin_host) narrows that to the tensor's
-    /// logical extent so a consumer cannot mistake padding for data, while a
-    /// map guard keeps the wider window it needs to expose padded rows.
-    ///
-    /// Narrowing only ever shrinks: a `len` larger than the current one is
-    /// clamped, so this cannot widen a window beyond what was mapped.
-    ///
-    /// `static`-only: the sole caller, `Tensor::pin_host` (`impl<T>
-    /// Tensor<T>` in `lib.rs`), is itself `#[cfg(not(edgefirst_tensor_dynamic))]`.
-    /// `dynamic`'s own `pin_host` (`dynamic_backend.rs`/`dynamic_tensor.rs`)
-    /// does not call this -- it hands back whatever extent `ef_tensor_map`
-    /// reports directly, unnarrowed.
+    /// A `len` larger than the current one is clamped.
     #[cfg(not(edgefirst_tensor_dynamic))]
     pub(crate) fn narrowed(mut self, len: usize) -> Self {
         self.len = self.len.min(len);
@@ -97,12 +52,6 @@ impl<'a> HostPin<'a> {
 
     /// The pinned host address, mutable.
     ///
-    /// Takes `&self` rather than `&mut self` on purpose: a raw pointer handed
-    /// out here can legitimately coexist with a `&mut` derived elsewhere (that
-    /// is the entire point of the pin), so pretending exclusivity via `&mut
-    /// self` would be a lie. Writing through it is the caller's obligation to
-    /// sequence — see [`crate::Tensor::sync_for_cpu`].
-    ///
     /// # Safety contract
     ///
     /// The caller must not write while a device may be reading, and must
@@ -111,17 +60,12 @@ impl<'a> HostPin<'a> {
         self.ptr
     }
 
-    /// The tensor's **logical** byte length, offset-adjusted for sub-region
-    /// views — not the backing allocation's capacity.
+    /// The tensor's logical byte length, offset-adjusted for sub-region views;
+    /// not the backing allocation's capacity.
     ///
-    /// Backends round allocations up (page size, pitch alignment), and every
-    /// backend reports the logical length so a consumer cannot mistake padding
-    /// for data. This is what TFLite's `SetCustomAllocationForTensor` wants.
-    ///
-    /// One consequence: for a **stride-padded** image the pinned window covers
-    /// `shape.product()` bytes, which is less than `row_stride * height`. Use a
-    /// map guard, which exposes the padded extent, when you need to write whole
-    /// padded rows.
+    /// For a stride-padded image the pinned window covers `shape.product()`
+    /// bytes, which is less than `row_stride * height`. A map guard exposes the
+    /// padded extent.
     pub fn len(&self) -> usize {
         self.len
     }
@@ -131,18 +75,13 @@ impl<'a> HostPin<'a> {
         self.len == 0
     }
 
-    /// Alignment of the pinned address, in bytes.
-    ///
-    /// TFLite requires 64-byte alignment (`kDefaultTensorAlignment`) unless the
-    /// caller opts out, and upstream warns that opting out can crash in
-    /// `Invoke()`. Page-backed mappings satisfy it, but a non-zero tensor
-    /// offset can break it — so callers can check rather than assume.
+    /// Alignment of the pinned address, in bytes: the largest power of two
+    /// dividing it, or 0 for a null address.
     pub fn alignment(&self) -> usize {
         let addr = self.ptr as usize;
         if addr == 0 {
             return 0;
         }
-        // A non-zero address has at most BITS - 1 trailing zeros.
         1usize << addr.trailing_zeros()
     }
 
@@ -160,18 +99,8 @@ impl<'a> HostPin<'a> {
     }
 }
 
-/// Owner of an `mmap` whose lifetime is independent of any map guard.
-///
-/// Shared by every fd-backed backend (DMA-BUF, SHM): the address a pin hands
-/// out is a property of the mapping, so the mapping has to be owned by
-/// something with its own lifetime rather than by the guard that happened to
-/// create it. That single change is what lets a host pointer outlive a guard
-/// at all — see the module docs and issue #134.
-///
-/// `static`-gated as well as unix-gated: both backends that own an mmap
-/// (DMA-BUF and SHM) are storage, and only the `static` backend has
-/// storage. Under `dynamic` the mapping is owned on the far side of the
-/// ABI and reached through `ef_tensor_map`, so nothing here constructs one.
+/// Owner of an `mmap` whose lifetime is independent of any map guard. Shared by
+/// every fd-backed backend (DMA-BUF, SHM).
 #[cfg(all(unix, not(edgefirst_tensor_dynamic)))]
 pub(crate) struct MmapOwner {
     ptr: std::ptr::NonNull<std::ffi::c_void>,
@@ -179,8 +108,7 @@ pub(crate) struct MmapOwner {
 }
 
 // SAFETY: the mapping is valid for `len` bytes until Drop, and MAP_SHARED
-// mappings are shareable across threads. Coherency is the caller's obligation
-// via sync_for_cpu / sync_for_device, exactly as for any map guard.
+// mappings are shareable across threads.
 #[cfg(all(unix, not(edgefirst_tensor_dynamic)))]
 unsafe impl Send for MmapOwner {}
 #[cfg(all(unix, not(edgefirst_tensor_dynamic)))]
@@ -199,15 +127,8 @@ impl MmapOwner {
 }
 
 /// Orders CPU mappings against GPU-driver calls that unmap an address range
-/// twice.
-///
-/// Adreno's proprietary EGL maps every imported DMA-BUF into the process at
-/// `eglCreateImage` and, inside a single `eglDestroyImage`, unmaps that range
-/// twice. A mapping another thread creates between the two `munmap`s can land
-/// in the freed range and is destroyed by the second one, so that thread's
-/// next access faults. Mappings are established under the shared side and
-/// such driver calls run under the exclusive side, which keeps this crate's
-/// own mappings out of that window.
+/// twice: mappings are established under the shared side and such driver calls
+/// run under the exclusive side.
 #[cfg(all(unix, not(edgefirst_tensor_dynamic)))]
 static CPU_MAPPING_GUARD: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
@@ -243,7 +164,7 @@ pub fn with_cpu_mappings_excluded<F: FnOnce() -> R, R>(f: F) -> R {
         // for the duration of the export's synchronous callback.
         let call = unsafe { &mut *ctx.cast::<Call<F, R>>() };
         if let Some(f) = call.f.take() {
-            // A panic must not unwind through the C frame.
+            // Catch a panic so it does not unwind through the C frame.
             call.out = Some(std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)));
         }
     }
@@ -270,12 +191,8 @@ pub fn with_cpu_mappings_excluded<F: FnOnce() -> R, R>(f: F) -> R {
 
 #[cfg(all(unix, not(edgefirst_tensor_dynamic)))]
 impl Drop for MmapOwner {
-    // munmap has no in-process observer that is not racy: probing the range
-    // afterwards can see another thread's new mapping at the same address.
     #[cfg_attr(test, mutants::skip)]
     fn drop(&mut self) {
-        // Nothing useful to do on failure at Drop time; the address space is
-        // reclaimed at process exit regardless.
         unsafe {
             let _ = nix::sys::mman::munmap(self.ptr, self.len);
         }

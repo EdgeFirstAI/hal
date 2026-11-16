@@ -103,14 +103,14 @@ pin.release()
 
 ## Interoperability
 
-Each `edgefirst-*` package is a separate PyO3 extension module, so `edgefirst.tensor.Tensor` and, say, `edgefirst.codec.Tensor` are different Python classes even though they wrap the same Rust type — a known PyO3 limitation ([issue #1444](https://github.com/PyO3/pyo3/issues/1444)). A tensor still crosses package boundaries safely, through the `__edgefirst_tensor__` capsule protocol every `Tensor` implements:
+Each `edgefirst-*` package is a separate PyO3 extension module, so `edgefirst.tensor.Tensor` and, say, `edgefirst.codec.Tensor` are different Python classes even though they wrap the same Rust type — a [known PyO3 limitation](https://github.com/PyO3/pyo3/issues/1444). A tensor still crosses package boundaries safely, through the `__edgefirst_tensor__` capsule protocol every `Tensor` implements:
 
 ```python
-# CORRECT — works regardless of which edgefirst.* package produced obj
+# Correct — works regardless of which edgefirst.* package produced obj
 if hasattr(obj, "__edgefirst_tensor__"):
     ...
 
-# WRONG — always False for a tensor from a sibling package
+# Wrong — always False for a tensor from a sibling package
 if isinstance(obj, edgefirst.image.Tensor):
     ...
 ```

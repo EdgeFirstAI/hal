@@ -1,8 +1,7 @@
 /* SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
  * SPDX-License-Identifier: Apache-2.0
  *
- * Links and RUNS against libedgefirst_tracker only.
- * A header that compiles is not the same as a library that loads. */
+ * Links and runs against libedgefirst_tracker only. */
 #include <edgefirst/tracker.h>
 #include <stdio.h>
 

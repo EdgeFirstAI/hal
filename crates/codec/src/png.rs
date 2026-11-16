@@ -5,8 +5,8 @@
 //!
 //! PNG is decoded to its native format (Luma/LumaA → `Grey`, RGB → `Rgb`,
 //! RGBA → `Rgba`); the decoder configures the destination tensor's dimensions
-//! and format accordingly and reports EXIF orientation. It never colour-
-//! converts or rotates — use `ImageProcessor::convert()` for that.
+//! and format accordingly and reports EXIF orientation. It never
+//! colour-converts or rotates.
 
 use crate::error::CodecError;
 use crate::exif::read_exif_orientation;

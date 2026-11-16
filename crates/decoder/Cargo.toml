@@ -21,12 +21,10 @@ default = []
 # Reads model configs embedded in ZIP trailers (TFLite associated files, HEF,
 # DVM, TensorRT). The ONNX reader and sidecar files need no feature.
 model-files = ["dep:zip"]
-#default = ["tracker"]
 tracker = ["dep:edgefirst-tracker", "edgefirst-tracker/tensor-boxes"]
 
 [dependencies]
 argminmax = { workspace = true }
-# `ndarray` lets the decoder materialise its masks into the TensorDyn that `Segmentation` carries.
 edgefirst-tensor = { workspace = true, default-features = false, features = ["ndarray"] }
 edgefirst-decoder-abi = { workspace = true }
 edgefirst-kernels = { workspace = true }

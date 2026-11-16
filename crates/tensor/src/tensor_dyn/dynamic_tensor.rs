@@ -1,34 +1,16 @@
 // SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! `dynamic`'s `Tensor<T>` — a typed lens over [`TensorDyn`], not a second
-//! storage-owning type.
+//! `dynamic`'s `Tensor<T>`: a typed lens over [`TensorDyn`] that owns no
+//! storage.
 //!
-//! `static`'s `Tensor<T>` (in `crate::lib` proper) owns real per-backend
-//! storage; `TensorDyn` there is an eleven-variant enum boxing one. Under
-//! `dynamic` there is no such enum -- `TensorDyn` already *is* the one
-//! handle -- so this `Tensor<T>` carries no storage of its own either. It
-//! exists only to attach a compile-time-known element type to a `TensorDyn`
-//! value, and every method here either forwards straight to the identical
-//! method [`TensorDyn`] (`dynamic_backend.rs`) already implements, or drives
-//! `edgefirst-tensor-ffi` directly for the handful of operations that need
+//! It attaches a compile-time element type to a `TensorDyn` value. Each method
+//! forwards to the same method on [`TensorDyn`] (`dynamic_backend.rs`), or
+//! drives `edgefirst-tensor-ffi` directly for the operations that need
 //! `T::DTYPE` (allocation, import) or a typed view (`map_with`).
 //!
-//! # `#[repr(transparent)]` and why the cast in `lens.rs` is sound here
-//!
-//! This struct has exactly one field with nonzero size -- `inner:
-//! TensorDyn` -- plus a zero-sized `PhantomData` marker, so
-//! `#[repr(transparent)]` gives it the identical layout of `TensorDyn`
-//! itself, whatever `TensorDyn`'s own fields happen to be (see
-//! `dynamic_backend.rs`'s module docs: it is a handle plus two cached
-//! facts, not a bare pointer). That is what makes `&TensorDyn as *const
-//! Tensor<T>` sound in `lens.rs`'s `dynamic` `as_typed`/`as_typed_mut` --
-//! contrast `static`, where `TensorDyn` is a tagged-union `enum` with
-//! eleven differently-typed payloads and the same cast would be UB (see
-//! `lens.rs`'s `static_lens` module docs, which uses `Any::downcast_ref`
-//! instead for exactly that reason). Same source-level idea -- "borrow the
-//! erased handle as a typed one" -- different validity argument per
-//! backend, because the two `TensorDyn`s have different actual layouts.
+//! The struct is `#[repr(transparent)]` over `TensorDyn`: one `inner:
+//! TensorDyn` field plus a zero-sized `PhantomData` marker.
 use std::fmt;
 use std::marker::PhantomData;
 
@@ -44,11 +26,6 @@ use crate::{
 #[repr(transparent)]
 pub struct Tensor<T: Element> {
     inner: TensorDyn,
-    // `fn() -> T`, not `T`: this tensor does not own a `T` (it owns a
-    // type-erased handle `T::DTYPE` describes), so the marker should not
-    // tie `Tensor<T>`'s variance or auto-trait derivation to `T`'s own --
-    // `Element` already requires `Send + Sync + 'static` directly, so this
-    // costs nothing and avoids implying a relationship that isn't there.
     _marker: PhantomData<fn() -> T>,
 }
 
@@ -60,11 +37,8 @@ impl<T: Element> Tensor<T> {
         }
     }
 
-    /// Create a new tensor with the given shape, optional memory backing,
-    /// and optional name. Same signature as `static`'s inherent `new` (the
-    /// wider constructor `TensorTrait::new` delegates to) -- kept identical
-    /// so shared call sites like [`crate::is_dma_available`] need no
-    /// backend-specific branch.
+    /// Create a new tensor with the given shape, optional memory backing, and
+    /// optional name.
     pub fn new(shape: &[usize], memory: Option<TensorMemory>, name: Option<&str>) -> Result<Self> {
         TensorDyn::new(shape, T::DTYPE, memory, name).map(Self::from_inner)
     }
@@ -76,11 +50,8 @@ impl<T: Element> Tensor<T> {
         TensorDyn::from_fd(fd, shape, T::DTYPE, name).map(Self::from_inner)
     }
 
-    /// Construct a tensor from a row-major element slice + shape. Allocates
-    /// a new buffer (`TensorMemory::Mem`) and memcpys the contents --
-    /// derived over [`Self::new`] plus [`TensorTrait::map`], identical
-    /// logic to `static`'s `Tensor::from_slice` (`lib.rs`); no primitive
-    /// needed beyond what construction and mapping already cover.
+    /// Construct a tensor from a row-major element slice + shape. Allocates a
+    /// new buffer (`TensorMemory::Mem`) and copies the contents.
     ///
     /// # Errors
     ///
@@ -105,9 +76,8 @@ impl<T: Element> Tensor<T> {
         Ok(t)
     }
 
-    /// Construct a tensor from a 3-D ndarray view. Respects strides -- one
-    /// copy in all cases; contiguous views take a memcpy fast path. Derived
-    /// the same way as [`Self::from_slice`] -- see its docs.
+    /// Construct a tensor from a 3-D ndarray view. Respects strides: one copy
+    /// in all cases; contiguous views take a memcpy fast path.
     ///
     /// Only available when the `ndarray` feature is enabled.
     #[cfg(feature = "ndarray")]
@@ -131,103 +101,45 @@ impl<T: Element> Tensor<T> {
         Ok(t)
     }
 
-    /// Runtime element type discriminant. Always `T::DTYPE` for a live
-    /// lens, but sourced from the handle (`ef_tensor_dtype`) rather than
-    /// the constant, so a lens opened by [`TensorDyn::as_typed`] reports
-    /// what the handle itself carries.
+    /// Runtime element type discriminant, read from the handle
+    /// (`ef_tensor_dtype`).
     pub fn dtype(&self) -> DType {
         self.inner.dtype()
     }
 
-    /// Whether this semi-planar tensor was assembled from separate
-    /// luma/chroma allocations (`from_planes`), as opposed to one
-    /// contiguous combined-plane buffer. Answered from the C handle
-    /// (`ef_tensor_is_multiplane`), so a tensor wrapped via `from_raw`
-    /// after `ef_tensor_from_planes` reports the same as this crate's
-    /// own `from_planes` wrapper.
+    /// Whether this semi-planar tensor was assembled from separate luma/chroma
+    /// allocations (`from_planes`), as opposed to one contiguous combined-plane
+    /// buffer. Read from the C handle (`ef_tensor_is_multiplane`).
     pub fn is_multiplane(&self) -> bool {
         self.inner.is_multiplane()
     }
 
     /// The chroma plane, if this is a two-allocation semi-planar tensor.
-    /// Borrowed from a cached lens over the retained `ef_tensor_chroma`
-    /// handle, so native handles borrowed from it remain valid for this
-    /// parent's lifetime.
+    /// Borrowed from a cached lens over the retained `ef_tensor_chroma` handle,
+    /// valid for this parent's lifetime.
     pub fn chroma(&self) -> Option<&Self> {
         self.inner.chroma()?.as_typed::<T>()
     }
 
-    // `as_dma` is deliberately ABSENT on this backend, where the static one
-    // has it (`lib.rs`). It used to exist here returning `None`
-    // unconditionally, on the reasoning that `DmaTensor<T>` is
-    // `static`-backend-internal storage this backend never constructs, that
-    // the return type matched, and that callers already handle `None`.
-    //
-    // Every part of that was true and the conclusion was still wrong. The
-    // callers handled `None` by *declining*: `crates/image`'s EGLImage
-    // import, its Path-B R8 import, `import_buffer_packed`, and all four
-    // G2D sites refused a genuinely DMA-backed tensor and fell back to a
-    // slower path. Nothing failed, nothing logged, and the suite stayed
-    // green because both backends still produced correct pixels -- so a
-    // user on i.MX lost the zero-copy hardware path with nothing reporting
-    // it. See task P2b's review, F3.
-    //
-    // Every one of those callers wanted exactly one thing from the
-    // `DmaTensor`: its `.fd`. They now use [`Self::dmabuf`], which both
-    // backends implement with the same signature. With no caller left, a
-    // stub that always answers "not DMA-backed" is a trap for the next one,
-    // so it is gone: a future `dynamic` caller of `as_dma` gets a compile
-    // error naming the problem instead of a silent, plausible `None`.
-
-    /// Create from separate Y and UV planes (multiplane NV12/NV16). Same
-    /// signature as `static`'s `Tensor::from_planes` (`lib.rs`).
+    /// Create from separate Y and UV planes (multiplane NV12/NV16). Drives
+    /// `ef_tensor_from_planes`.
     ///
-    /// Drives `ef_tensor_from_planes`, which resolves the combination
-    /// through the producer side's real `static::Tensor::from_planes` --
-    /// the NV12/NV16 combined-plane geometry lives there, not here.
-    /// **Consumes `luma` and `chroma`** (both `TensorDyn::into_raw`'d
-    /// before the call), matching `static`'s by-value signature exactly:
-    /// neither is usable afterward, on any outcome.
+    /// Consumes `luma` and `chroma`: neither is usable afterward, on any
+    /// outcome. When the library rejects the handles without consuming them (an
+    /// outstanding `ef_tensor_retain` or `ef_tensor_map` on either), the two
+    /// allocations are leaked.
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidArgument`] if the underlying call fails -- either
-    /// `Tensor::from_planes`'s own validation (format/shape mismatch; see
-    /// its doc comment in `lib.rs`), or one of `ef_tensor_from_planes`'s own
-    /// preconditions (see its Doxygen). A dtype mismatch between `luma` and
-    /// `chroma` is unreachable through this typed entry point -- both are
-    /// already the same `T` at compile time, unlike the type-erased C ABI
-    /// this drives.
-    ///
-    /// **Known residual risk, not silently hidden**: `ef_tensor_from_planes`
-    /// does *not* consume `luma`/`chroma` when it rejects them before ever
-    /// reaching `Tensor::from_planes` (an outstanding `ef_tensor_retain` or
-    /// `ef_tensor_map` on either handle -- reachable from safe Rust here via
-    /// e.g. `tensor.map_with(access)` leaving a live `'static` view while
-    /// `tensor` itself is still moved into this call). This wrapper cannot
-    /// distinguish that case from an ordinary consumed failure using only
-    /// the `NULL` return (both look identical from here), so on **any**
-    /// failure it does not attempt to reclaim `luma`/`chroma` itself --
-    /// guessing wrong in either direction would be a double-free or a
-    /// use-after-free. In the ordinary (consumed) failure case this is
-    /// exactly correct (the C library already freed them). In the rare
-    /// non-consuming rejection case, the two underlying allocations are
-    /// intentionally leaked rather than risking UB -- a documented trade-off,
-    /// not an oversight; leaking under a caller-created precondition
-    /// violation is a bounded, honest cost next to a double-free.
-    ///
-    /// **Consumes `luma` and `chroma`**. Multiplane is then answered from
-    /// the resulting C handle (`ef_tensor_is_multiplane` /
-    /// `ef_tensor_chroma`), including after `from_raw`.
+    /// [`Error::InvalidArgument`] if the underlying call fails.
     pub fn from_planes(luma: Self, chroma: Self, format: PixelFormat) -> Result<Self> {
         let c_format = std::ffi::CString::new(format.as_str()).map_err(|e| {
             Error::InvalidArgument(format!("pixel format string contains a NUL: {e}"))
         })?;
         let luma_raw = TensorDyn::from(luma).into_raw();
         let chroma_raw = TensorDyn::from(chroma).into_raw();
-        // SAFETY: both raw pointers are live, own-mint handles this
-        // backend minted; ownership was just forgotten above, matching
-        // `ef_tensor_from_planes`'s "consumes both inputs" contract.
+        // SAFETY: both raw pointers are live handles this backend minted, and
+        // their ownership passes to `ef_tensor_from_planes`.
         let handle = unsafe {
             edgefirst_tensor_ffi::ef_tensor_from_planes(luma_raw, chroma_raw, c_format.as_ptr())
         };
@@ -271,9 +183,8 @@ impl<T: Element> Tensor<T> {
         self.inner.cpu_access()
     }
 
-    /// Narrow the declared CPU access to the directions both it and
-    /// `access` cover; never widens. See `static`'s
-    /// `Tensor::restrict_cpu_access` (`lib.rs`).
+    /// Narrow the declared CPU access to the directions both it and `access`
+    /// cover; never widens.
     pub fn restrict_cpu_access(&mut self, access: CpuAccess) {
         self.inner.restrict_cpu_access(access)
     }
@@ -294,12 +205,9 @@ impl<T: Element> Tensor<T> {
         self.inner.effective_row_stride()
     }
 
-    /// The *recorded* row stride in bytes; `None` when the tensor is
-    /// tightly packed. Deliberately distinct from
-    /// [`Self::effective_row_stride`], which substitutes a computed pitch
-    /// when nothing is recorded -- see [`TensorDyn::row_stride`]'s own doc
-    /// comment for why the difference is load-bearing for the
-    /// cross-package descriptor.
+    /// The recorded row stride in bytes; `None` when the tensor is tightly
+    /// packed. Unlike [`Self::effective_row_stride`], it substitutes no
+    /// computed pitch when none is recorded.
     pub fn row_stride(&self) -> Option<usize> {
         self.inner.row_stride()
     }
@@ -310,67 +218,42 @@ impl<T: Element> Tensor<T> {
         self.inner.view_origin()
     }
 
-    /// Whether this tensor addresses part of a larger buffer. See `static`'s
-    /// `Tensor::is_view` (`lib.rs`).
+    /// Whether this tensor addresses part of a larger buffer.
     pub fn is_view(&self) -> bool {
         self.inner.is_view()
     }
 
-    /// Record that this tensor addresses part of a larger buffer. See
-    /// `static`'s `Tensor::mark_view` (`lib.rs`).
+    /// Record that this tensor addresses part of a larger buffer.
     pub fn mark_view(&mut self) {
         self.inner.mark_view()
     }
 
     /// Byte offset within the DMA-BUF where image data starts (`None` = 0).
-    /// Forwards to [`TensorDyn::plane_offset`], which drives the real
-    /// `ef_tensor_plane_offset` primitive.
-    ///
-    /// **Not** plane 0's `ef_tensor_plane_at` offset -- that is
-    /// `plane_table`'s intra-buffer layout, always 0 for plane 0 by
-    /// construction, a different quantity from this field entirely; an
-    /// earlier version of this method read that one by mistake, which
-    /// always reported `Some(0)` or `None` regardless of what
-    /// [`Self::set_plane_offset`] had actually been called with.
+    /// Forwards to [`TensorDyn::plane_offset`].
     pub fn plane_offset(&self) -> Option<usize> {
         self.inner.plane_offset()
     }
 
     /// Set the row stride, format-validated. Forwards to
-    /// [`TensorDyn::set_row_stride`], which drives the real
-    /// `ef_tensor_set_row_stride` primitive.
+    /// [`TensorDyn::set_row_stride`].
     pub fn set_row_stride(&mut self, stride: usize) -> Result<()> {
         self.inner.set_row_stride(stride)
     }
 
-    /// Set the row stride without format validation. Same signature as
-    /// `static`'s `Tensor::set_row_stride_unchecked` (`lib.rs`), which has
-    /// no `TensorDyn`-level counterpart there either (it is a `Tensor<T>`-
-    /// only raw escape hatch for sub-tensors without format metadata) --
-    /// forwards to [`TensorDyn::set_row_stride_unchecked`], which drives
-    /// the real `ef_tensor_set_row_stride_unchecked` primitive (task 17).
-    /// This used to always panic, because no primitive backed it; that
-    /// gap mattered in practice, not just in principle -- it is exactly
-    /// what a multiplane chroma sub-tensor needs (see
-    /// `from_planes`'s doc comments), and
-    /// `edgefirst-image`'s `import_image` calls it on one.
+    /// Set the row stride without format validation. Forwards to
+    /// [`TensorDyn::set_row_stride_unchecked`].
     pub fn set_row_stride_unchecked(&mut self, stride: usize) {
         self.inner.set_row_stride_unchecked(stride)
     }
 
-    /// Set the byte offset within the DMA-BUF where image data starts.
-    /// Forwards to [`TensorDyn::set_plane_offset`], which drives the real
-    /// `ef_tensor_set_plane_offset` primitive.
+    /// Set the byte offset within the DMA-BUF where image data starts. Forwards
+    /// to [`TensorDyn::set_plane_offset`].
     pub fn set_plane_offset(&mut self, offset: usize) {
         self.inner.set_plane_offset(offset)
     }
 
-    /// Borrow the DMA-BUF file descriptor backing this tensor.
-    ///
-    /// Derived from plane 0's native handle (`ef_tensor_plane_at`), the
-    /// same primitive [`TensorTrait::clone_fd`] dup's -- this borrows
-    /// instead of duplicating, matching `static`'s `dmabuf()` contract
-    /// (`lib.rs`) of a borrow scoped to `&self`.
+    /// Borrow the DMA-BUF file descriptor backing this tensor, read from plane
+    /// 0's native handle.
     ///
     /// # Errors
     ///
@@ -388,9 +271,6 @@ impl<T: Element> Tensor<T> {
     }
 
     /// Wrap a live `IOSurfaceRef` as a typed tensor (macOS/iOS).
-    ///
-    /// Same signature as `static`'s `Tensor::from_iosurface` so identity
-    /// wrap tests compile against both backends.
     ///
     /// # Safety
     ///
@@ -453,24 +333,16 @@ impl<T: Element> Tensor<T> {
 
     /// Record that GPU work writing this texture completes at `value` of the
     /// process device's fence. Monotonic: an older value never displaces a
-    /// newer one, so recording out of order is safe rather than merely
-    /// tolerated.
-    ///
-    /// Takes `&self` for the reason `static`'s own `Tensor::set_gpu_write`
-    /// does: the fence slot is an atomic, and a producer records a write on
-    /// a tensor its consumers already hold.
+    /// newer one.
     #[cfg(target_os = "windows")]
     pub fn set_gpu_write(&self, value: u64) -> Result<()> {
         self.inner.set_gpu_write(value)
     }
 
     /// Wrap an existing `ID3D11Texture2D` as a tensor. The texture is checked
-    /// against the layout the HAL would have chosen for `format`/`width`/
-    /// `height` and must live on the HAL's process device; ownership stays
-    /// with the caller, since this takes its own reference.
-    ///
-    /// Same signature as `static`'s `Tensor::from_d3d11_texture`, so a
-    /// caller compiles against either backend.
+    /// against the layout the HAL would have chosen for
+    /// `format`/`width`/`height` and must live on the HAL's process device.
+    /// This takes its own reference; ownership stays with the caller.
     ///
     /// # Safety
     ///
@@ -495,11 +367,8 @@ impl<T: Element> Tensor<T> {
 
     /// Open a shared texture by its NT handle on the HAL's device. When
     /// `completion` is given, its fence value is waited for on the immediate
-    /// context, so a same-device reader needs no further ordering. Both
-    /// handles stay owned by the caller: this duplicates what it keeps.
-    ///
-    /// Same signature as `static`'s `Tensor::from_d3d11_shared_handle`, for
-    /// the reason [`from_d3d11_texture`](Self::from_d3d11_texture) gives.
+    /// context. Both handles stay owned by the caller: this duplicates what it
+    /// keeps.
     ///
     /// # Safety
     ///
@@ -531,12 +400,9 @@ impl<T: Element> Tensor<T> {
         .map(Self::from_inner)
     }
 
-    /// CUDA registration for this tensor, if any.
-    ///
-    /// On the dynamic lens the `CudaHandle` lives in the library, so this
-    /// cannot borrow it and always returns `None` even after
-    /// [`Self::set_cuda_handle`]. Use [`Self::is_cuda_attached`] or
-    /// [`Self::cuda_map`] instead.
+    /// CUDA registration for this tensor. Always `None` on the dynamic lens,
+    /// where the `CudaHandle` lives in the library. Use
+    /// [`Self::is_cuda_attached`] or [`Self::cuda_map`] instead.
     #[deprecated(
         since = "0.32.0",
         note = "On the dynamic backend use is_cuda_attached() or cuda_map() — the CudaHandle is not borrowable through this lens."
@@ -553,12 +419,12 @@ impl<T: Element> Tensor<T> {
         self.inner.is_cuda_attached()
     }
 
-    /// See [`Self::cuda`]. `None` when the tensor carries no registration.
+    /// Fast-fail CUDA map; `None` when the tensor carries no registration.
     pub fn cuda_map(&self) -> Option<crate::cuda::CudaMap<'_>> {
         self.inner.cuda_map()
     }
 
-    /// See [`Self::cuda_map`]. Writable counterpart.
+    /// Writable counterpart of [`Self::cuda_map`].
     pub fn cuda_map_mut(&self) -> Option<crate::cuda::CudaMap<'_>> {
         self.inner.cuda_map_mut()
     }
@@ -571,33 +437,19 @@ impl<T: Element> Tensor<T> {
     /// Construct a tensor from a PBO tensor (for GL backends that allocate
     /// PBOs).
     ///
-    /// Drives `ef_tensor_wrap_pbo`: the GL buffer stays this process's, and
-    /// what crosses into `libedgefirst_tensor.so` is the **callback
-    /// channel** -- a frozen `EfClientState` plus the two op functions (see
-    /// [`crate::PboTensor::into_client_parts`]). The library builds real
-    /// `TensorStorage::Pbo` storage over it, so the returned tensor's
-    /// `memory()`, `map()`, `view()` and `capacity_bytes()` are all answered
-    /// by the handle rather than by a field on this side.
-    ///
-    /// **This allocates no host memory.** The previous implementation minted
-    /// a companion `TensorMemory::Mem` handle sized to the PBO's whole shape
-    /// -- ~63.3 MiB for a 4K RGBA16F surface -- purely to own something with
-    /// the right metadata, and stashed the real `PboTensor` beside it. That
-    /// second source of truth was dropped by every one of the thirteen
-    /// `from_handle` sites, which is what made `view()` on a PBO come back
-    /// as an all-zero host window (issue #162).
+    /// Drives `ef_tensor_wrap_pbo`: the GL buffer stays this process's, and the
+    /// callback channel (an `EfClientState` plus the two op functions, see
+    /// [`crate::PboTensor::into_client_parts`]) crosses into the library, which
+    /// builds `TensorStorage::Pbo` storage over it. Allocates no host memory.
     ///
     /// # Errors
-    /// Fails for a PBO sub-view (`view_offset != 0`), which
-    /// `ef_tensor_wrap_pbo`'s argument list cannot express -- take the view
-    /// on the far side instead -- and for anything the library refuses
-    /// (unknown dtype, a `size` smaller than the shape needs).
+    /// Fails for a PBO sub-view (`view_offset != 0`) and for anything the
+    /// library refuses (unknown dtype, a `size` smaller than the shape needs).
     pub fn from_pbo(pbo: crate::PboTensor<T>) -> Result<Self> {
         let parts = pbo.into_client_parts()?;
-        // SAFETY: `parts.state.ctx` borrows the `Arc<PboHandle>` `parts`
-        // still holds, and `ef_tensor_wrap_pbo` retains it before returning,
-        // so it stays live past the `drop(parts)` below. The op functions
-        // are this crate's own and uphold `PboOps`'s contract.
+        // SAFETY: `parts.state.ctx` borrows the `Arc<PboHandle>` `parts` still
+        // holds, and `ef_tensor_wrap_pbo` retains it before returning. The op
+        // functions are this crate's own and uphold `PboOps`'s contract.
         let inner = unsafe {
             TensorDyn::from_client_pbo(
                 parts.state,
@@ -609,34 +461,18 @@ impl<T: Element> Tensor<T> {
                 T::DTYPE,
             )
         }?;
-        // Drops this side's own reference on the channel; the library holds
-        // its own from here.
         drop(parts);
         Ok(Self::from_inner(inner))
     }
 
-    /// The GL buffer name for a PBO-backed tensor; `None` otherwise.
-    ///
-    /// This and [`Self::pbo_is_mapped`] replace the borrowed
-    /// `Option<&PboTensor<T>>` this lens used to hand out. There is nothing
-    /// here to borrow: this backend's PBO storage lives inside
-    /// `libedgefirst_tensor.so`. These two scalar facts are the entire
-    /// surface `edgefirst-image`'s call sites ever read off that borrow.
-    ///
-    /// Note that `T` does not gate the answer. `edgefirst-image` allocates
-    /// a PBO as `u8` and hands it back as an `i8` tensor, so the library's
-    /// own `PboTensor`'s element type need not be this lens's `T`;
-    /// `ef_tensor_pbo_id` reads the GL buffer id off the storage, which no
-    /// dtype retag touches. That is what the borrow-shaped accessor needed a
-    /// layout-asserted reinterpretation of `PboTensor<T>` to achieve, and
-    /// what these two `Copy`-returning accessors get for free.
+    /// The GL buffer name for a PBO-backed tensor; `None` otherwise. `T` does
+    /// not gate the answer.
     pub fn pbo_id(&self) -> Option<u32> {
         self.inner.pbo_id()
     }
 
-    /// Whether a PBO-backed tensor holds (or is establishing) a CPU
-    /// mapping; `None` when the tensor is not PBO-backed. See
-    /// [`Self::pbo_id`].
+    /// Whether a PBO-backed tensor holds (or is establishing) a CPU mapping;
+    /// `None` when the tensor is not PBO-backed.
     pub fn pbo_is_mapped(&self) -> Option<bool> {
         self.inner.pbo_is_mapped()
     }
@@ -648,18 +484,8 @@ impl<T: Element> Tensor<T> {
         self.inner.pbo_vtable_ptr()
     }
 
-    /// Allocate an image tensor with the given geometry, memory backing,
-    /// and CPU access declaration. Same signature as `static`'s
-    /// `Tensor::image` (`lib.rs`), which real production code calls
-    /// (`edgefirst-codec`'s V4L2 hardware JPEG decoder,
-    /// `jpeg/v4l2/mod.rs`) to allocate its destination tensor.
-    ///
-    /// Forwards to [`TensorDyn::image`], which drives the real
-    /// `ef_tensor_image_alloc` primitive -- the platform image geometry
-    /// (macOS IOSurface tiling, Android AHardwareBuffer, Linux DMA-BUF
-    /// 64-byte pitch alignment, odd-dimension chroma handling, `DmaBuf` →
-    /// `Mem` fallback) lives in `libedgefirst_tensor.so`'s `static::Tensor::image`,
-    /// not here; this does not reimplement or approximate any of it.
+    /// Allocate an image tensor with the given geometry, memory backing, and
+    /// CPU access declaration. Forwards to [`TensorDyn::image`].
     pub fn image(
         width: usize,
         height: usize,
@@ -670,18 +496,14 @@ impl<T: Element> Tensor<T> {
         TensorDyn::image(width, height, format, T::DTYPE, memory, access).map(Self::from_inner)
     }
 
-    /// See [`Self::image`]: same primitive, full-featured request form.
+    /// Allocate an image tensor from a full [`crate::ImageDesc`] request.
     /// Forwards to [`TensorDyn::image_desc`].
     pub fn image_desc(desc: &crate::ImageDesc) -> Result<Self> {
         TensorDyn::image_desc(desc).map(Self::from_inner)
     }
 
-    /// See [`Self::image`]: same primitive, externally-strided form.
-    /// Forwards to [`TensorDyn::image_with_stride`]. Argument order matches
-    /// `static`'s `Tensor::image_with_stride` (`lib.rs`) exactly --
-    /// `row_stride_bytes` before `memory`/`access` -- which real callers
-    /// (`edgefirst-image`'s `gl/dma_import.rs`, `lib.rs`) already call
-    /// positionally in that order.
+    /// Allocate an image tensor with a caller-supplied row stride. Forwards to
+    /// [`TensorDyn::image_with_stride`].
     pub fn image_with_stride(
         width: usize,
         height: usize,
@@ -702,32 +524,14 @@ impl<T: Element> Tensor<T> {
         .map(Self::from_inner)
     }
 
-    /// Set this tensor's pixel format. Same signature as `static`'s
-    /// `Tensor::set_format` (`lib.rs`), which real production code (e.g.
-    /// `edgefirst-image`'s `gl/threaded.rs::create_pbo_image`, right after
-    /// [`Self::from_pbo`]) calls directly on the typed `Tensor<T>` --
-    /// missing here (only `TensorDyn::set_format`, `dynamic_backend.rs`,
-    /// existed) until `image-capi` was first built against `dynamic` with
-    /// `opengl` enabled surfaced the gap.
-    ///
-    /// Forwards to [`TensorDyn::set_format`], which drives the real
-    /// `ef_tensor_set_format` primitive.
+    /// Set this tensor's pixel format. Forwards to [`TensorDyn::set_format`].
     pub fn set_format(&mut self, format: PixelFormat) -> Result<()> {
         self.inner.set_format(format)
     }
 
     /// Set this tensor's logical dimensions and pixel format to a decoded
-    /// image, reusing the existing allocation. Same signature as `static`'s
-    /// `Tensor::configure_image` (`lib.rs`), which real production code
-    /// calls (`edgefirst-codec`'s JPEG decode-into-pool path) to reconfigure
-    /// a pool-allocated destination tensor's shape/format/row-stride before
-    /// writing into it.
-    ///
-    /// Forwards to [`TensorDyn::configure_image`], which drives the real
-    /// `ef_tensor_configure_image` primitive -- the pool-reuse
-    /// stride-preservation and alignment rules live in
-    /// `libedgefirst_tensor.so`'s `static::Tensor::configure_image`, not
-    /// here.
+    /// image, reusing the existing allocation. Forwards to
+    /// [`TensorDyn::configure_image`].
     pub fn configure_image(
         &mut self,
         width: usize,
@@ -737,36 +541,21 @@ impl<T: Element> Tensor<T> {
         self.inner.configure_image(width, height, format)
     }
 
-    /// Pin a stable host address for this tensor's data, type-erased to
-    /// raw bytes -- same contract as [`TensorTrait::map_with`]'s pin, just
-    /// without the element-typed view wrapped around it. `static`'s
-    /// `Tensor<T>` exposes this as an inherent method too (`lib.rs`), for
-    /// callers (e.g. `edgefirst-image`'s `lib.rs`) that want the address
-    /// without going through `TensorMapTrait`.
+    /// Pin a stable host address for this tensor's data, type-erased to raw
+    /// bytes.
     pub fn pin_host<'a>(&self, access: CpuAccess) -> Result<crate::pin::HostPin<'a>> {
         self.inner.pin_host(access)
     }
 
-    /// Borrow a rectangular spatial sub-region as a zero-copy view. Same
-    /// signature as `static`'s `Tensor::view` (`lib.rs`). Forwards to
-    /// [`TensorDyn::view`], which drives the real `ef_tensor_view_region`
-    /// primitive.
+    /// Borrow a rectangular spatial sub-region as a zero-copy view. Forwards to
+    /// [`TensorDyn::view`].
     pub fn view(&self, region: Region) -> Result<Self> {
         self.inner.view(region).map(Self::from_inner)
     }
 }
 
-// Quantization accessors — type-gated to integer element types via the
-// sealed `IntegerType` trait, same as `static`'s equivalent block in
-// `lib.rs` (see `[[feedback_tensor_quantization_type_gated]]`: this must
-// stay a compile-time rejection for `Tensor<f32>`, not a runtime one).
-// Each method here forwards straight to `TensorDyn`'s real implementation
-// (`dynamic_backend.rs`), which drives the `ef_tensor_quantization_*`
-// primitives and owns the cache `quantization()`'s borrow is served from --
-// see that struct's `quantization_cache` field doc comment for why the
-// cache is sound under concurrent access, the question this block's
-// previous stub-era comment (before the primitive existed) had no answer
-// for.
+// Quantization accessors, available for integer element types only
+// (`IntegerType`). Each forwards to `TensorDyn`.
 impl<T: Element + IntegerType> Tensor<T> {
     /// Quantization metadata for this tensor.
     pub fn quantization(&self) -> Option<&Quantization> {
@@ -790,22 +579,9 @@ impl<T: Element + IntegerType> Tensor<T> {
     }
 }
 
-/// Generate the three downcast methods (ref, mut ref, owned) for one
-/// element type on [`TensorDyn`] -- the `dynamic`-backend counterpart to
-/// `static_backend.rs`'s own `downcast_methods!` macro (same names, same
-/// signatures, so a caller compiled against either backend needs no
-/// backend-specific branch). `static`'s version matches an enum variant;
-/// this one is built entirely on [`TensorDyn::as_typed`]/`as_typed_mut`
-/// (`lens.rs`), the existing dtype-checked `#[repr(transparent)]` lens
-/// `dynamic` already uses for exactly this "reinterpret the erased handle
-/// as a typed one" operation -- so unlike `PboTensor`/`CudaHandle` above,
-/// this family needed no new `TensorDyn` state and no new `ef_tensor_*`
-/// primitive, only these convenience wrappers. Found missing (`no method
-/// named as_u8/as_f32/... found for struct TensorDyn`) when `image-capi`
-/// was first built against `dynamic` with `opengl` enabled -- task 15/17's
-/// own `--no-default-features` verification never compiled `opengl`, so
-/// this gap was as invisible to them as the PBO/CUDA one (see task 9's
-/// report, "The verification hole").
+/// Generate the three downcast methods (ref, mut ref, owned) for one element
+/// type on [`TensorDyn`], built on [`TensorDyn::as_typed`]/`as_typed_mut`
+/// (`lens.rs`).
 macro_rules! downcast_methods {
     ($ty:ty, $as_name:ident, $as_mut_name:ident, $into_name:ident) => {
         /// Returns a shared reference to the inner tensor if the type matches.
@@ -819,7 +595,6 @@ macro_rules! downcast_methods {
         }
 
         /// Unwraps the inner tensor if the type matches, otherwise returns `self` as `Err`.
-        /// The Err variant is necessarily large (returns the unconsumed TensorDyn).
         #[allow(clippy::result_large_err)]
         pub fn $into_name(self) -> std::result::Result<Tensor<$ty>, Self> {
             if self.dtype() == <$ty as Element>::DTYPE {
@@ -846,40 +621,10 @@ impl TensorDyn {
 }
 
 impl<T: Element> From<Tensor<T>> for TensorDyn {
-    /// Erase the compile-time element type, re-asserting `T`'s dtype on the
-    /// handle as it goes.
-    ///
-    /// `Tensor<T>` already *is* a `TensorDyn` plus a zero-sized marker (see
-    /// the module docs), so the unwrap itself is free. The retag is not
-    /// decoration: it repairs the invariant `Tensor<T>` exists to carry.
-    ///
-    /// Under `static`, `TensorDyn` is an enum over eleven `Tensor<T>`, so
-    /// the dtype **is** the Rust type — `TensorDyn::from(t)` picks the
-    /// variant from `T` and a layout-identical `transmute` between
-    /// same-width `Tensor`s changes the reported dtype for free. Under
-    /// `dynamic` the dtype lives in the C handle instead, so that same
-    /// transmute changes a `PhantomData` and nothing else, and the erased
-    /// tensor keeps reporting whatever dtype the handle was *minted* with.
-    ///
-    /// That is not hypothetical. `edgefirst-image` allocates a PBO or DMA
-    /// buffer as `u8` and hands it back as `Tensor<i8>` by exactly that
-    /// transmute (twice, in `crates/image/src/lib.rs`), because the int8
-    /// shader applies an XOR 0x80 bias over the same bytes. Without the
-    /// retag, `create_image(dtype="int8")` returned a tensor reporting
-    /// `uint8` — a wrong answer rather than a refusal, and one that
-    /// propagates silently into quantization and inference rather than
-    /// stopping anything.
-    ///
-    /// Cost is one `ef_tensor_dtype` read on the common path, where the
-    /// handle already agrees and [`TensorDyn::set_dtype`] returns early.
-    ///
-    /// A failure here can only mean `T` is a different **width** than the
-    /// handle's dtype, which no layout-identical transmute can produce —
-    /// `Tensor<u8>` to `Tensor<u32>` is not layout-identical in the sense
-    /// this relies on. `From` cannot return an error, so that case is
-    /// logged rather than swallowed, and the dtype mismatch it leaves
-    /// behind is then caught by [`crate::TensorDyn::as_typed`], which
-    /// checks the handle's dtype against `T` before handing back a lens.
+    /// Erase the compile-time element type, setting `T`'s dtype on the handle
+    /// with [`TensorDyn::set_dtype`]. A `T` of a different width than the
+    /// handle's dtype is logged, and the erased tensor keeps the handle's
+    /// dtype.
     fn from(t: Tensor<T>) -> TensorDyn {
         let mut inner = t.inner;
         if let Err(e) = inner.set_dtype(T::DTYPE) {
@@ -897,9 +642,6 @@ impl<T: Element> From<Tensor<T>> for TensorDyn {
 
 impl<T: Element> fmt::Debug for Tensor<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Forward to `TensorDyn`'s own `Debug` rather than deriving: the
-        // lens carries no fields of its own to print, and this keeps one
-        // `Debug` implementation instead of two that could drift.
         fmt::Debug::fmt(&self.inner, f)
     }
 }
@@ -953,59 +695,20 @@ impl<T: Element> TensorTrait<T> for Tensor<T> {
         self.inner.reshape(shape)
     }
 
-    /// Forwarded rather than left on `TensorTrait`'s default, whose body is
-    /// `self.reshape(shape)` -- the strict rule under a name promising the
-    /// capacity-based one. See the static backend's own override
-    /// (`impl TensorTrait for Tensor<T>`, `lib.rs`) and task P2e.
+    /// Forwards to [`TensorDyn::set_logical_shape`].
     fn set_logical_shape(&mut self, shape: &[usize]) -> Result<()> {
         self.inner.set_logical_shape(shape)
     }
 
-    /// The allocation's real byte count, forwarded to
-    /// [`TensorDyn::capacity_bytes`] rather than left on
-    /// [`TensorTrait::capacity_bytes`]'s "the logical size" default.
-    ///
-    /// The default is wrong for this backend, not merely imprecise: a
-    /// pitch-aligned or pool-sized tensor really does have headroom past
-    /// its shape, and reporting the tight size discards it. Concretely, a
-    /// `Mem`-backed NV12 image at an odd width pads its rows to a 64-byte
-    /// pitch -- so a host-memory descriptor minted from it carried a `capacity`
-    /// equal to its shape, and a consumer importing that alias could not
-    /// `configure_image` back into memory the producer actually has. That
-    /// is `host_import_inherits_the_producers_capacity_headroom`
-    /// (`tests/protocol_roundtrip.rs`), which fails on its own
-    /// *precondition* without this -- it was never run against this
-    /// backend before task P2a, because `descriptor_pinned` did not exist
-    /// here to run it with. There was also no way to override the default
-    /// before P2a: no `ef_tensor_*` primitive reported an allocation's
-    /// byte count until `ef_tensor_capacity_bytes`.
+    /// The allocation's byte count, forwarded to [`TensorDyn::capacity_bytes`].
     fn capacity_bytes(&self) -> usize {
         self.inner.capacity_bytes()
     }
 
-    /// One `ef_tensor_map` call for the pointer (the same
-    /// `TensorDyn::map_pin` core `TensorDyn::map_bytes` shares), then an
-    /// ordinary typed [`crate::view::HostView`] over the resulting window
-    /// -- the slice operations a caller does with the mapped view
-    /// (`chunks_mut`, `split_at_mut`, `iter`, indexing, ...) are plain
-    /// `[T]` methods after that, not additional ABI calls.
-    ///
-    /// `byte_size_override` is `Some(pin.len())`, not `None`: `pin.len()`
-    /// is the real, already stride-aware extent `ef_tensor_map` mapped
-    /// (`self.inner.map_pin` -> `ef_tensor_plane_at`'s own geometry, task
-    /// 17's `vt_plane_at` fix included), which for a padded row (e.g. a
-    /// semi-planar image whose width is not a multiple of the 64-byte
-    /// alignment `configure_image` picks) is *larger* than
-    /// `self.inner.shape().iter().product()`, the tight logical size.
-    /// `None` here made [`HostView::len_elems`] fall back to that tight
-    /// product, silently truncating the mapped view to less than what the
-    /// real handle actually maps -- exactly the "full padded buffer" the
-    /// `static` backend's own `Tensor<T>::map_with` (`crate::lib`) exposes
-    /// for the identical reason (see that function's own doc comment). Not
-    /// reached by anything before task 9: no caller mapped a `dynamic`
-    /// `Tensor<T>` over a semi-planar image whose stride exceeds its tight
-    /// width until G3's host-memory JPEG decode exercised it for the first
-    /// time.
+    /// One `ef_tensor_map` call for the pointer (the `TensorDyn::map_pin`
+    /// core), then a typed [`crate::view::HostView`] over the mapped window.
+    /// The view's byte size is `pin.len()`, the stride-aware extent that was
+    /// mapped.
     fn map_with<'a>(&self, access: CpuAccess) -> Result<crate::view::HostView<'a, T>>
     where
         T: 'a,
@@ -1021,15 +724,7 @@ impl<T: Element> TensorTrait<T> for Tensor<T> {
     }
 
     /// The non-blocking counterpart of [`map_with`](Self::map_with), routed
-    /// through `ef_tensor_try_map` rather than left on `TensorTrait`'s
-    /// `map_with` default.
-    ///
-    /// The default would be wrong here, not merely imprecise: it would stall
-    /// on the Windows D3D11 texture's staging refresh under a name whose
-    /// whole contract is that it does not, so a caller polling this would
-    /// block instead of making progress elsewhere. Same body as `map_with`
-    /// otherwise -- including the `byte_size_override`, for the padded-row
-    /// reason that method's own doc comment gives.
+    /// through `ef_tensor_try_map`.
     fn try_map_with<'a>(&self, access: CpuAccess) -> Result<crate::view::HostView<'a, T>>
     where
         T: 'a,

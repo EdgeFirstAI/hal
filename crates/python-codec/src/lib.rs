@@ -20,8 +20,7 @@ fn _codec(m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?;
     edgefirst_python_common::init_module();
 
-    // The decode target. Each extension carries its own copy of this class:
-    // cross-module handoff uses the capsule protocol, not shared identity.
+    // The decode target; each extension registers its own copy of this class.
     m.add_class::<tensor::PyTensor>()?;
     m.add_class::<tensor::PyImageInfo>()?;
     m.add_class::<tensor::PyDctMethod>()?;

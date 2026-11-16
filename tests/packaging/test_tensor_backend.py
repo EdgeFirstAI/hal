@@ -26,7 +26,7 @@ def test_backend_is_a_known_value():
 
 
 def test_backend_is_the_shipped_one():
-    """Released wheels are dynamic; only the G13 comparison venv is built static on purpose."""
+    """The backend is dynamic, or static under EDGEFIRST_TENSOR_STATIC_COMPARISON."""
     expected = (
         "static" if os.environ.get("EDGEFIRST_TENSOR_STATIC_COMPARISON") else "dynamic"
     )
@@ -37,13 +37,13 @@ def test_backend_is_the_shipped_one():
 
 
 def test_extensions_agree_on_one_backend():
-    """A mixed install would hold more than one tensor implementation in the process."""
+    """The four extensions report the same backend."""
     backends = _backends()
     assert len(set(backends.values())) == 1, backends
 
 
 def test_dynamic_tensor_wheel_bundles_the_shared_library():
-    """The dynamic backend is only usable if edgefirst.tensor carries libedgefirst_tensor."""
+    """edgefirst.tensor bundles libedgefirst_tensor exactly when it is dynamic."""
     import edgefirst.tensor
 
     package_dir = pathlib.Path(edgefirst.tensor.__file__).parent

@@ -3,25 +3,18 @@
 
 //! Score-threshold prefilter for the per-scale decoder.
 //!
-//! Most anchors of a frame score far below any useful threshold (on a
-//! VisDrone yolov8n frame about 7% of anchors reach 0.001), yet decoding a
-//! box costs a DFL softmax per side. The prefilter compares each anchor's
-//! raw integer class scores against the threshold mapped into the
-//! quantized domain, gathers the anchors that can still pass into compact
-//! scratch, and lets the unchanged level kernels decode only those.
+//! The prefilter compares each anchor's raw integer class scores against
+//! the threshold mapped into the quantized domain, gathers the anchors that
+//! can pass into compact scratch, and has the level kernels decode only
+//! those.
 //!
 //! The bound is found by running the level's own score kernel over every
-//! raw value, so it accounts for the kernel's rounding and approximations:
-//! the kept set is a superset of the anchors that pass, the float
-//! candidate filter downstream still makes the exact decision, and the
-//! detections match the dense decode bit for bit.
+//! raw value. The kept set is a superset of the anchors that pass; the float
+//! candidate filter downstream makes the exact decision, and the detections
+//! match the dense decode bit for bit.
 //!
-//! A level whose anchor count is not a whole number of [`PACK_ANCHORS`]
-//! groups ends in a partial group, whose elements the level kernels may
-//! decode in a scalar tail that rounds differently from their vector path.
-//! Only the whole groups (the body) are packed; the trailing partial group
-//! is always decoded as one contiguous slice, so every element in it takes
-//! the same path it takes in the dense decode.
+//! Only a level's whole [`PACK_ANCHORS`] groups (the body) are packed; the
+//! trailing partial group is decoded as one contiguous slice.
 
 use super::kernels::dispatch::{DstSliceMut, InputView, ScoreLevelDispatch};
 use super::kernels::CpuFeatures;
@@ -32,11 +25,9 @@ use crate::{DecoderError, DecoderResult, Quantization};
 use edgefirst_tensor::DType;
 use half::f16;
 
-/// Kept anchors are decoded in whole groups of this many. Every role's
-/// packed slice is then a multiple of 16 elements, the widest NEON chunk
-/// of the level kernels, so each element takes the vector path exactly
-/// as it does in a full level instead of a scalar tail that rounds
-/// differently.
+/// Kept anchors are decoded in whole groups of this many, so every role's
+/// packed slice is a multiple of 16 elements, the widest NEON chunk of the
+/// level kernels.
 pub(crate) const PACK_ANCHORS: usize = 16;
 
 /// Per-level scratch for the compact decode, reused frame to frame.
@@ -134,8 +125,7 @@ impl LevelScratch {
 
 /// Lowest raw score whose decoded score passes the candidate filter's
 /// `score >= threshold` test, or `i32::MAX` when none does. The level's
-/// score kernel is run over every raw value of `dtype`, a multiple of
-/// [`PACK_ANCHORS`] long so each takes the vector path, and the result is
+/// score kernel is run over every raw value of `dtype`, and the result is
 /// cached in `scratch` for the quantization and threshold. `None` when
 /// the scores are not integers or the threshold keeps every anchor.
 pub(crate) fn raw_score_floor(
@@ -168,7 +158,7 @@ pub(crate) fn raw_score_floor(
     let u8s: Vec<u8>;
     let i16s: Vec<i16>;
     let u16s: Vec<u16>;
-    // Every raw value of these dtypes converts losslessly.
+    // Every raw value of `dtype`, in ascending order.
     let input = match dtype {
         DType::I8 => {
             i8s = raws.map(|r| r as i8).collect();
@@ -273,7 +263,7 @@ macro_rules! raw_score {
                         .filter(|(_, b)| Self::max_neon(b) >= floor)
                         .fold(0, |bits, (i, _)| bits | 1 << i);
                 }
-                // Ascending loads keep the hardware prefetcher streaming; most super blocks stop here.
+                // A super block with no value at the floor has no hits.
                 if Self::max_neon(sup) < floor {
                     return 0;
                 }
@@ -282,7 +272,7 @@ macro_rules! raw_score {
                     let p = sup.as_ptr();
                     let lowest = $dup(<$t>::MIN);
                     let (mut a0, mut a1, mut a2, mut a3) = (lowest, lowest, lowest, lowest);
-                    // The block re-read hits L1; the four blocks advance in step so their chains overlap.
+                    // The four blocks' maxima advance in step.
                     let mut k = 0;
                     while k < SCAN_BLOCK {
                         a0 = $max(a0, $ld(p.add(k)));
@@ -359,8 +349,7 @@ fn examine<T: RawScore>(
 
 /// Append to `anchors` every anchor whose largest raw class score is at or
 /// above `floor`. `input` holds NHWC `[anchors, num_classes]` score rows.
-/// The selection is the same on every tier; NEON only finds the blocks to
-/// examine faster.
+/// The selection is the same on every tier.
 pub(crate) fn select_anchors(
     input: &InputView<'_>,
     num_classes: usize,
@@ -434,8 +423,7 @@ pub(crate) fn select_anchors(
     Ok(())
 }
 
-/// Kept rows the gather prefetches ahead of the one it copies: the rows are scattered through
-/// the level, where the hardware prefetcher does not follow.
+/// Kept rows the gather prefetches ahead of the one it copies.
 const GATHER_AHEAD: usize = 8;
 
 /// Hint that the cache line at `p` is read soon.
@@ -454,8 +442,7 @@ fn prefetch<T>(p: *const T) {
     let _ = p;
 }
 
-/// `dst.copy_from_slice(src)` for a row of a few dozen elements: fixed-size pieces compile to
-/// register moves, where a call into `memcpy` per row costs more than the copy.
+/// `dst.copy_from_slice(src)` in fixed-size pieces.
 #[inline(always)]
 fn copy_row<T: Copy>(dst: &mut [T], src: &[T]) {
     const PIECE: usize = 16;
@@ -576,8 +563,7 @@ mod tests {
         }
     }
 
-    /// The floor is the lowest raw value whose kernel score passes, so no
-    /// raw value below it passes.
+    /// The floor is the lowest raw value whose kernel score passes.
     #[test]
     fn floor_is_the_lowest_passing_raw_value() {
         for (scale, zp) in [(0.17, 108), (0.0039, 0), (0.05, 200)] {
@@ -599,8 +585,7 @@ mod tests {
         }
     }
 
-    /// F16 output rounds a dequantized score up by many raw steps, so the
-    /// floor sits below the exact bound.
+    /// With F16 output the floor sits below the exact bound.
     #[test]
     fn floor_follows_f16_rounding() {
         let q = Quantization {
@@ -690,10 +675,7 @@ mod tests {
             .collect()
     }
 
-    /// The block scan keeps exactly the rows a row-by-row scan keeps on
-    /// every tier and raw dtype, for rows that straddle blocks, blocks
-    /// holding several rows, levels spanning many blocks, dense and sparse
-    /// passing values, and floors outside the raw type's range.
+    /// The block scan keeps exactly the rows a row-by-row scan keeps on every tier and raw dtype.
     #[test]
     fn select_matches_a_row_by_row_scan() {
         let mut x = 0x1234_5678_u32;

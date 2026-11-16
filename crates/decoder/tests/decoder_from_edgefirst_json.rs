@@ -4,8 +4,7 @@
 //! Build a [`Decoder`] from each of the three `edgefirst.json` schemas
 //! extracted from the YOLOv8n-seg t-2681 quant-u8-i8 model variants.
 //!
-//! These fixtures cover the three top-level output topologies the
-//! EdgeFirst tflite-converter emits:
+//! These fixtures cover three top-level output topologies:
 //!
 //! * `combined` — single fused detection tensor + protos (`YoloSegDet`).
 //! * `logical`  — boxes / scores / mask_coefs split into one tensor each
@@ -31,8 +30,7 @@ fn fixture_path(stem: &str) -> PathBuf {
     testdata_root().join("decoder").join(format!("{stem}.json"))
 }
 
-/// Parse the JSON schema and build a [`Decoder`], returning both so the
-/// caller can assert on the schema metadata it could not see post-build.
+/// Parse the JSON schema and build a [`Decoder`], returning both.
 fn build_from_fixture(stem: &str) -> (SchemaV2, edgefirst_decoder::Decoder) {
     let path = fixture_path(stem);
     let schema =
@@ -44,8 +42,7 @@ fn build_from_fixture(stem: &str) -> (SchemaV2, edgefirst_decoder::Decoder) {
     (schema, decoder)
 }
 
-/// Asserts shared by every fixture: same source model, so they share
-/// decoder version and input geometry.
+/// Asserts shared by every fixture: decoder version and input geometry.
 fn assert_common_invariants(stem: &str, schema: &SchemaV2, decoder: &edgefirst_decoder::Decoder) {
     assert_eq!(
         schema.decoder_version,
@@ -65,9 +62,8 @@ fn build_decoder_from_combined_schema() {
     let (schema, decoder) = build_from_fixture(stem);
     assert_common_invariants(stem, &schema, &decoder);
 
-    // `combined` packs detection + classes + mask coefficients into a
-    // single fused tensor, so the schema lists exactly two top-level
-    // outputs (detection + protos) with no per-scale children.
+    // `combined`: two top-level outputs (detection + protos) with no
+    // per-scale children.
     assert_eq!(
         schema.outputs.len(),
         2,
@@ -88,9 +84,8 @@ fn build_decoder_from_logical_schema() {
     let (schema, decoder) = build_from_fixture(stem);
     assert_common_invariants(stem, &schema, &decoder);
 
-    // `logical` keeps boxes / scores / mask_coefs as separate tensors
-    // (4 top-level outputs including protos) but does not split each
-    // head per stride — i.e. no per-scale children.
+    // `logical`: boxes / scores / mask_coefs and protos as 4 top-level
+    // outputs with no per-scale children.
     assert_eq!(
         schema.outputs.len(),
         4,
@@ -111,10 +106,8 @@ fn build_decoder_from_smart_schema() {
     let (schema, decoder) = build_from_fixture(stem);
     assert_common_invariants(stem, &schema, &decoder);
 
-    // `smart` fans each non-protos logical head out into one physical
-    // tensor per stride (8/16/32) — i.e. boxes, scores and mask_coefs
-    // each carry 3 per-scale children, while protos stays a single
-    // tensor.
+    // `smart`: boxes, scores and mask_coefs each carry 3 per-scale children
+    // (strides 8/16/32); protos is a single tensor.
     assert_eq!(
         schema.outputs.len(),
         4,

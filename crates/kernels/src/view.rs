@@ -140,8 +140,7 @@ fn check_raw<T>(ptr: *const T, needed: usize) -> Result<()> {
 /// The bytes a view reaches, from its first element to one past the last it addresses.
 ///
 /// Bindings that build an input and an output view from raw pointers compare their spans
-/// first: the views' slices cover whole spans, so overlapping spans, including interleaved
-/// views of one buffer, must be rejected before either view exists.
+/// first and reject overlapping spans, interleaved views of one buffer included.
 ///
 /// ```
 /// use edgefirst_kernels::ByteSpan;

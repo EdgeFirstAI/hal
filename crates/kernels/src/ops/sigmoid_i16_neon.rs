@@ -65,7 +65,7 @@ fn exp_on_negative_values_q3(a: int16x8_t) -> int16x8_t {
 fn one_over_one_plus_x_for_x_in_0_1(a: int16x8_t) -> int16x8_t {
     // SAFETY: NEON is part of the aarch64 baseline.
     unsafe {
-        // `a` is an exp result, never negative, where `VRHADD` equals `RoundingHalfSum`.
+        // `VRHADD` equals `RoundingHalfSum` for a non-negative `a`.
         let half_denominator = vrhaddq_s16(a, vdupq_n_s16(i16::MAX));
         let mut x = vaddq_s16(
             vdupq_n_s16(q16::C48_OVER_17),
@@ -103,8 +103,7 @@ fn logistic_pot8(x: int16x8_t) -> int16x8_t {
 }
 
 /// Maps the first `min(src.len(), dst.len())` elements through `f`, `V` independent 8-lane
-/// vectors per step to hide `f`'s dependency chains on in-order cores, then single vectors,
-/// then `scalar` on the last few.
+/// vectors per step, then single vectors, then `scalar` on the last few.
 #[inline(always)]
 fn map_vectors<const V: usize>(
     src: &[i16],
@@ -265,8 +264,7 @@ mod tests {
 
     #[test]
     fn sigmoid_i16_reference_neon_exhaustive() {
-        // The largest f32 input scale the plan still sends to the reference kernel, from the
-        // overflow bound `scale · 3 · 4096 < MAX_I16_MULTIPLIER + 1` downward.
+        // The largest f32 input scale the plan sends to the reference kernel.
         let mut largest = (f64::from(MAX_I16_MULTIPLIER + 1) / 12288.0) as f32;
         while i16_kernel(largest).is_none() {
             largest = f32::from_bits(largest.to_bits() - 1);
@@ -303,7 +301,7 @@ mod tests {
                 assert_eq!(got, want[skip..], "scale {scale} offset {skip}");
             }
         }
-        // The kernel's own power-of-two form, a zero multiplier, matches too.
+        // A zero multiplier: the kernel's own power-of-two form.
         let want: Vec<i16> = src
             .iter()
             .map(|&x| logistic_i16_reference(0, 2, x))

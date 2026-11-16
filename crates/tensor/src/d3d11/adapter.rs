@@ -3,12 +3,6 @@
 //! DXGI adapter selection: parsing the adapter environment variables,
 //! enumerating the DXGI adapters on the host, and resolving a selection to
 //! a concrete adapter LUID.
-//!
-//! Moved from `crates/image/src/gl/platform/windows.rs`, where the same
-//! logic picked ANGLE's D3D11 adapter under a single env var. This crate
-//! reads two names (see [`read_adapter_env`]) and hands callers a live
-//! [`DxgiAdapter`] instead of a bare LUID, since D3D11 device creation needs
-//! the `IDXGIAdapter1` itself.
 
 use super::com;
 use windows::Win32::Graphics::Dxgi::{
@@ -18,7 +12,7 @@ use windows::Win32::Graphics::Dxgi::{
 
 /// Primary adapter-selection env var.
 pub const ADAPTER_ENV: &str = "EDGEFIRST_D3D11_ADAPTER";
-/// Legacy name from the ANGLE-only code path; still read for compatibility.
+/// Second adapter-selection env var, read when [`ADAPTER_ENV`] is unset.
 pub const ADAPTER_ENV_ALIAS: &str = "EDGEFIRST_ANGLE_ADAPTER";
 
 /// Which D3D11 adapter the tensor crate should create its device on.
@@ -84,11 +78,8 @@ pub struct DxgiAdapter {
 
 #[cfg(test)]
 impl DxgiAdapter {
-    /// Test fixture: fabricated description/LUID/VRAM/software fields hung
-    /// off a real `IDXGIAdapter1`, since the struct no longer has a way to
-    /// hold a fake COM pointer. Enumeration always yields at least WARP on
-    /// Windows; callers skip the test (rather than fail it) when it errors,
-    /// matching `dxgi_enumeration_lists_adapters_or_skips` below.
+    /// Test fixture: fabricated description, LUID, VRAM and software fields on
+    /// a real `IDXGIAdapter1`.
     fn fake(
         description: &str,
         luid_low: u32,
@@ -113,11 +104,10 @@ impl DxgiAdapter {
     }
 }
 
-/// Enumerate the DXGI adapters (hardware and software) on this host.
-/// Errors when the DXGI factory is unavailable; callers degrade to the
-/// default adapter.
+/// Enumerate the DXGI adapters (hardware and software) on this host. Errors
+/// when the DXGI factory is unavailable.
 pub fn enumerate_dxgi_adapters() -> crate::Result<Vec<DxgiAdapter>> {
-    // SAFETY: documented factory creation with no preconditions.
+    // SAFETY: no preconditions.
     let factory: IDXGIFactory1 = com::hr("CreateDXGIFactory1", unsafe { CreateDXGIFactory1() })?;
     let mut out = Vec::new();
     for index in 0u32.. {
@@ -190,9 +180,8 @@ pub fn resolve_adapter(sel: AdapterSelection, adapters: &[DxgiAdapter]) -> Adapt
     }
 }
 
-/// Both [`ADAPTER_ENV`] and [`ADAPTER_ENV_ALIAS`] are read. When both are
-/// set and differ, the D3D11 name wins and the disagreement is logged once
-/// so a stale deployment variable cannot silently pick the adapter.
+/// Reads [`ADAPTER_ENV`] and [`ADAPTER_ENV_ALIAS`]. When both are set and
+/// differ, [`ADAPTER_ENV`] wins and the disagreement is logged.
 pub(crate) fn read_adapter_env() -> Option<String> {
     let primary = std::env::var(ADAPTER_ENV)
         .ok()
@@ -370,10 +359,7 @@ mod tests {
         );
     }
 
-    /// DXGI enumeration is a system facility; on a host where it is
-    /// unavailable (Server Core, a sandbox) the function errors and the
-    /// caller degrades, so the assertions apply only when enumeration
-    /// succeeds.
+    /// DXGI enumeration lists described adapters, or the test skips when it is unavailable.
     #[test]
     fn dxgi_enumeration_lists_adapters_or_skips() {
         match enumerate_dxgi_adapters() {

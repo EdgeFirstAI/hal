@@ -15,12 +15,6 @@ use edgefirst_tensor::{BorrowedTensor, DetectBox, TensorDyn};
 use edgefirst_tensor_ffi::EfTensor;
 
 /// An owned list of detections.
-///
-/// Opaque and heap-owned rather than a `(ptr, len)` pair, so a consumer cannot
-/// outlive the producer's allocation by holding the pointer. This is the one
-/// implementation of `ef_detect_box_list`: the tracker and any other consumer
-/// read a list via [`ef_detect_box_list_data`]/[`ef_detect_box_list_len`]
-/// without linking this library.
 pub struct EfDetectBoxList {
     boxes: Vec<EfDetectBox>,
 }
@@ -56,9 +50,6 @@ pub unsafe extern "C" fn ef_detect_box_list_push(
 }
 
 /// Decoder configuration, accumulated field by field.
-///
-/// A builder rather than a struct for the same reason the tensor builder is:
-/// per-field errors, and room to grow without breaking a caller's layout.
 pub struct EfDecoderParams {
     config_json: Option<String>,
     config_yaml: Option<String>,
@@ -85,9 +76,7 @@ pub struct EfSegmentationList {
     masks: Vec<Segmentation>,
     /// Borrowed views handed to C, materialised on first request.
     views: Option<Vec<EfSegmentation>>,
-    /// Host pins keeping the mask buffers mapped for as long as C holds a
-    /// pointer into them. Dropping these with a view still outstanding is what
-    /// would turn a valid pointer into a dangling one.
+    /// Host pins keeping the mask buffers mapped for the list's life.
     pins: Vec<edgefirst_tensor::HostPin<'static>>,
 }
 
@@ -145,11 +134,6 @@ where
 
 /// Minimum confidence for a detection to be kept.
 ///
-/// Written out rather than macro-generated: **cbindgen does not expand macros**,
-/// so a macro-defined `extern "C"` fn is exported by the library and absent
-/// from the header — present in `nm`, undeclarable by any C caller. That is a
-/// silent break, caught by the leaf's header-parity tests.
-///
 /// # Safety
 /// `p` must be `NULL` or a live parameter set.
 #[no_mangle]
@@ -183,12 +167,10 @@ pub unsafe extern "C" fn ef_decoder_params_set_iou_threshold(
 }
 
 /// How many candidates survive into NMS, ranked by score; 0 is unbounded.
-/// Bounds the worst-case NMS cost.
 ///
-/// Unset, the cap is 300, or 30 000 (Ultralytics' `max_nms`) when multi-label
-/// decode is on, from `ef_decoder_params_set_multi_label` or the model config's
-/// `nms_multi_label`. For validation and mAP runs at a low score threshold,
-/// pass 0 so every candidate reaches NMS.
+/// Unset, the cap is 300, or 30 000 when multi-label decode is on, from
+/// `ef_decoder_params_set_multi_label` or the model config's
+/// `nms_multi_label`.
 ///
 /// # Safety
 /// `p` must be `NULL` or a live parameter set.
@@ -205,8 +187,7 @@ pub unsafe extern "C" fn ef_decoder_params_set_pre_nms_top_k(
     }
 }
 
-/// Maximum detections returned per frame, on every decode path. Default 300,
-/// as in the Rust builder (Ultralytics' `max_det`).
+/// Maximum detections returned per frame, on every decode path. Default 300.
 ///
 /// # Safety
 /// `p` must be `NULL` or a live parameter set.
@@ -260,12 +241,12 @@ pub unsafe extern "C" fn ef_decoder_params_set_nms(p: *mut EfDecoderParams, nms:
     }
 }
 
-/// Multi-label decode: 1 emits one box per class above the score threshold
-/// (validation decode), 0 one per anchor. Overrides the model config's
-/// `nms_multi_label`; unset, the config decides, else off. The candidates
-/// go through the NMS mode unchanged: class-aware keeps every class of an
-/// anchor, class-agnostic suppresses across them. Tracked decode always uses
-/// one label per box. Any other value is `EINVAL`.
+/// Multi-label decode: 1 emits one box per class above the score threshold,
+/// 0 one per anchor. Overrides the model config's `nms_multi_label`; unset,
+/// the config decides, else off. The candidates go through the NMS mode
+/// unchanged: class-aware keeps every class of an anchor, class-agnostic
+/// suppresses across them. Tracked decode always uses one label per box. Any
+/// other value is `EINVAL`.
 ///
 /// # Safety
 /// `p` must be `NULL` or a live parameter set.
@@ -295,9 +276,6 @@ pub(crate) unsafe fn read_str(p: *const c_char, len: usize) -> Option<String> {
         if len == 0 {
             CStr::from_ptr(p).to_str().ok().map(str::to_string)
         } else {
-            // c_char is i8 on macOS and u8 on aarch64-linux, so this cast is
-            // load-bearing on one target and a no-op on the other. Neither can be
-            // written without the other's lint firing.
             #[allow(clippy::unnecessary_cast)]
             let bytes = std::slice::from_raw_parts(p as *const u8, len);
             std::str::from_utf8(bytes).ok().map(str::to_string)
@@ -369,9 +347,8 @@ pub unsafe extern "C" fn ef_decoder_params_set_config_file(
 
 /// Build a decoder. `NULL` on failure.
 ///
-/// **Exactly one** configuration source must be set — JSON, YAML, or a file.
-/// Two sources disagreeing has no defined resolution, so supplying none or more
-/// than one is an error rather than a precedence rule nobody remembers.
+/// Exactly one configuration source must be set: JSON, YAML, or a file.
+/// Supplying none or more than one is an error.
 ///
 /// The parameters are not consumed and may be reused.
 ///
@@ -422,8 +399,6 @@ pub unsafe extern "C" fn ef_decoder_new(p: *const EfDecoderParams) -> *mut EfDec
                 let Ok(content) = std::fs::read_to_string(f) else {
                     return std::ptr::null_mut();
                 };
-                // Extension first, then a content sniff: a `.yaml` holding JSON is
-                // rarer than a config file with no extension at all.
                 if f.ends_with(".json") || content.trim_start().starts_with('{') {
                     b = b.with_config_json_str(content);
                 } else {
@@ -546,9 +521,6 @@ pub unsafe extern "C" fn ef_decoder_model_type(d: *const EfDecoder) -> *mut c_ch
 
 /// Free a string this library returned. Freeing `NULL` is a no-op.
 ///
-/// Its own entry point rather than `free(3)`: the allocation came from Rust,
-/// and on some platforms the two allocators are not the same.
-///
 /// # Safety
 /// `s` must be `NULL` or have come from this library.
 #[no_mangle]
@@ -567,8 +539,7 @@ pub unsafe extern "C" fn ef_decoder_string_free(s: *mut c_char) {
 ///
 /// @return 0 on success, `EINVAL` for a `NULL` argument or zero `count`,
 ///         `EACCES` when an output is not declared CPU-readable, otherwise
-///         `EBADMSG`. Both out-parameters are written only on success, so a
-///         caller never has to free a partially-populated result.
+///         `EBADMSG`. Both out-parameters are written only on success.
 ///
 /// # Safety
 /// `outputs` must point to `count` live tensor handles.
@@ -596,8 +567,6 @@ pub unsafe extern "C" fn ef_decoder_decode(
                 return decode_errno(&e);
             }
 
-            // Written last, together: an early return after writing `out_boxes`
-            // would leak the list the caller never learned about.
             let list = Box::into_raw(Box::new(EfDetectBoxList {
                 boxes: boxes.iter().map(to_c_box).collect(),
             }));
@@ -651,9 +620,6 @@ pub unsafe extern "C" fn ef_detect_box_list_len(l: *const EfDetectBoxList) -> us
 
 /// Copy detection `index` into `out`.
 ///
-/// Copies rather than lending a pointer: a borrowed element would dangle the
-/// moment the list is freed or grown, and C gives the caller no way to notice.
-///
 /// @return 0 on success, `EINVAL` for a null argument or out-of-range index.
 ///
 /// # Safety
@@ -669,8 +635,6 @@ pub unsafe extern "C" fn ef_detect_box_list_get(
             if l.is_null() || out.is_null() {
                 return libc::EINVAL;
             }
-            // Bind through an explicit reference: `(*l).boxes.get(..)` autorefs the
-            // dereference of a raw pointer, which clippy rejects.
             let boxes = &(*l).boxes;
             match boxes.get(index) {
                 Some(b) => {
@@ -685,9 +649,6 @@ pub unsafe extern "C" fn ef_detect_box_list_get(
 }
 
 /// Borrow the detections as a C array, for `ef_bytetrack_update`.
-///
-/// A plain array rather than an opaque handle, so the tracker reads it without
-/// linking this library.
 ///
 /// # Safety
 /// `l` must be `NULL` or valid.
@@ -711,9 +672,7 @@ pub unsafe extern "C" fn ef_detect_box_list_data(l: *const EfDetectBoxList) -> *
 
 /// Free a detection list. Freeing `NULL` is a no-op.
 ///
-/// There is exactly one implementation of this type, in
-/// `libedgefirst_decoder`, so any `ef_detect_box_list *` from any EdgeFirst
-/// entry point is freed with this function.
+/// Frees an `ef_detect_box_list *` returned by any EdgeFirst entry point.
 ///
 /// # Safety
 /// `l` must be `NULL` or have come from this library.
@@ -747,8 +706,8 @@ pub unsafe extern "C" fn ef_segmentation_list_len(l: *const EfSegmentationList) 
 
 /// The mask region for entry `index`, in normalized coordinates.
 ///
-/// These bound the **mask region**, which is snapped to the proto grid and so
-/// encloses — rather than equals — the companion detection's box.
+/// The region is snapped to the proto grid and encloses the companion
+/// detection's box.
 ///
 /// @return 0 on success, `EINVAL` for a null argument or bad index.
 ///
@@ -786,12 +745,8 @@ pub unsafe extern "C" fn ef_segmentation_list_get_bbox(
 
 /// Borrow the masks as a C array.
 ///
-/// Materialises the borrowed views on first call and caches them, so repeated
-/// calls are free and every returned pointer stays valid for the list's life.
-///
-/// This is what lets `libedgefirst-image` draw decoder output without linking
-/// this library: it reads plain values and a borrowed byte pointer, needing no
-/// shared allocator and no symbol to resolve.
+/// The views are materialised on the first call and cached; every returned
+/// pointer stays valid for the list's life.
 ///
 /// @return the first element, or `NULL` for a null or empty list. Pair with
 ///         [`ef_segmentation_list_len`].
@@ -811,9 +766,7 @@ pub unsafe extern "C" fn ef_segmentation_list_data(
             if list.views.is_none() {
                 let mut views = Vec::with_capacity(list.masks.len());
                 for m in &list.masks {
-                    // Pin the mask so the pointer stays valid for the list's life;
-                    // an unpinned map would unmap at end of scope and hand C a
-                    // dangling pointer that reads fine until it does not.
+                    // Pin the mask for the list's life.
                     let Ok(pin) = m.segmentation.pin_host(edgefirst_tensor::CpuAccess::Read) else {
                         return std::ptr::null();
                     };
@@ -1186,14 +1139,14 @@ pub(crate) unsafe fn borrow_outputs<'a>(
     outputs: *const *const EfTensor,
     count: usize,
 ) -> Result<Vec<BorrowedTensor<'a>>, c_int> {
-    // SAFETY: the caller's contract.
+    // SAFETY: `outputs` points to `count` handles.
     let handles = unsafe { std::slice::from_raw_parts(outputs, count) };
     if handles.iter().any(|h| h.is_null()) {
         return Err(libc::EINVAL);
     }
     Ok(handles
         .iter()
-        // SAFETY: each handle is non-NULL and live; the caller's contract.
+        // SAFETY: each handle is non-NULL and live.
         .map(|&h| unsafe { TensorDyn::borrow_raw(h as *mut EfTensor) })
         .collect())
 }
@@ -1773,12 +1726,9 @@ mod tests {
     #[test]
     fn exactly_one_configuration_source_is_required() {
         unsafe {
-            // None.
             let p = ef_decoder_params_new();
             assert!(ef_decoder_new(p).is_null(), "no config must not build");
 
-            // Two. Rejected rather than resolved by a precedence rule, since
-            // two sources disagreeing has no defined answer.
             let j = std::ffi::CString::new("{}").unwrap();
             let y = std::ffi::CString::new("a: 1").unwrap();
             ef_decoder_params_set_config_json(p, j.as_ptr(), 0);
@@ -1793,7 +1743,6 @@ mod tests {
         unsafe {
             let p = ef_decoder_params_new();
             let json = b"{\"x\":1}extra";
-            // len given: the trailing bytes must be ignored.
             assert_eq!(
                 ef_decoder_params_set_config_json(p, json.as_ptr() as *const c_char, 7),
                 0
@@ -1896,8 +1845,6 @@ mod tests {
 
     #[test]
     fn data_and_len_describe_the_same_elements() {
-        // The borrowed-array route another library takes must agree with the
-        // copying accessor, or the two views of one list disagree.
         unsafe {
             let l = ef_detect_box_list_new();
             for i in 0..3u32 {

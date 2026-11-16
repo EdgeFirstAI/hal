@@ -4,8 +4,7 @@
 //! Mask-coefficient + proto level kernel: dequant only.
 //!
 //! Used for both per-scale mask_coefs (per-FPN-level) and the single
-//! protos tensor (no per-scale structure — but the same kernel cells
-//! apply since it's also pure dequant).
+//! protos tensor.
 
 #[cfg(target_arch = "aarch64")]
 use super::level_score::{NeonFloatToF32, NeonToF16};
@@ -50,8 +49,7 @@ impl_mc_level!(decode_mc_level_u16_to_f16, u16, f16, dequant_u16_to_f16);
 impl_mc_level!(decode_mc_level_f16_to_f16, f16, f16, dequant_f16_to_f16);
 impl_mc_level!(decode_mc_level_f32_to_f16, f32, f16, dequant_f32_to_f16);
 
-/// Single-tensor proto dequant. Same dequant cells; different driver
-/// (no per-level structure, takes flat input/output slices).
+/// Single-tensor proto dequant over flat input/output slices.
 macro_rules! impl_proto {
     ($name:ident, $i:ty, $f:ty, $dequant:ident) => {
         #[allow(dead_code)]
@@ -91,9 +89,7 @@ macro_rules! impl_mc_level_neon {
             let n = level.h * level.w * num_mc;
             debug_assert_eq!(input.len(), n);
             debug_assert_eq!(dst.len(), n);
-            // SAFETY: NEON is mandatory on aarch64; dispatch contract
-            // ensures this is only called when select() picked the
-            // *NeonBase variant.
+            // SAFETY: NEON is part of the aarch64 baseline.
             unsafe {
                 edgefirst_kernels::prim::neon_convert::$dequant_neon(input, q.into(), dst);
             }
@@ -132,7 +128,7 @@ macro_rules! impl_proto_neon {
         #[allow(dead_code)]
         pub(crate) fn $name(input: &[$i], q: Quantization, dst: &mut [f32]) {
             debug_assert_eq!(input.len(), dst.len());
-            // SAFETY: see impl_mc_level_neon.
+            // SAFETY: NEON is part of the aarch64 baseline.
             unsafe {
                 edgefirst_kernels::prim::neon_convert::$dequant_neon(input, q.into(), dst);
             }

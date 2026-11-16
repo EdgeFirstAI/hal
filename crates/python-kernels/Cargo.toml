@@ -18,7 +18,7 @@ crate-type = ["cdylib"]
 default = []
 abi3-py38 = ["pyo3/abi3-py38", "edgefirst-python-common/abi3-py38"]
 abi3-py311 = ["pyo3/abi3-py311", "edgefirst-python-common/abi3-py311"]
-# No-op: `_kernels` never links tensor; declared so the Makefile's uniform `--features tracing` loops resolve.
+# No-op feature; `_kernels` does not link tensor.
 tracing = []
 
 [dependencies]

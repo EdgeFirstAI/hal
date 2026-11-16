@@ -83,7 +83,10 @@ def _run(tmp_path, python3, env=None, with_wheels=True):
     (bundle / "scripts").mkdir(parents=True)
     shutil.copy(RUNNER, bundle / "scripts" / "on-target-run.sh")
     _stub(bundle / "scripts" / "dma-heap-setup.sh", "exit 0\n")
-    _stub(bundle / "scripts" / "check-single-home.sh", "echo '  G1   PASS'\n")
+    _stub(
+        bundle / "scripts" / "check-single-home.sh",
+        "echo '  PASS  the libraries share one tensor implementation'\n",
+    )
     _stub(bundle / "bin" / "edgefirst_fake-0123456789abcdef", LIBTEST_BINARY)
     _stub(bundle / "target" / "debug" / "test_two_library_user", "exit 0\n")
     _stub(bundle / "target" / "debug" / "test_codec_api", CODEC_C_PROGRAM)

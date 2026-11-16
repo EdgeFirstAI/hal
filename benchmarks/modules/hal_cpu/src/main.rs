@@ -4,8 +4,7 @@
 //! HAL software JPEG decode → HAL CPU letterbox convert.
 //!
 //! Forces `EDGEFIRST_FORCE_BACKEND=cpu` and `EDGEFIRST_DISABLE_V4L2=1`.
-//! Defaults decode source to heap Mem (matches historical `codec_benchmark`);
-//! override with `--tensor-mem dma` to measure DMA write-path cost.
+//! Defaults decode source to heap Mem; override with `--tensor-mem dma`.
 
 use clap::Parser;
 use edgefirst_bench_common::{run_hal_module, BenchArgs, HalModuleConfig};

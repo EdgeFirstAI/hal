@@ -18,21 +18,20 @@
 
 set -e
 
-# Clean previous coverage data to ensure fresh collection
+# Clean previous coverage data
 cargo llvm-cov clean --workspace
 
 # Export coverage environment (filter out info/warning lines)
 cargo llvm-cov show-env --export-prefix 2>&1 | grep '^export ' > /tmp/coverage-env.sh
 
-# Older cargo-llvm-cov exports RUSTFLAGS, which hides the leaves' .cargo/config.toml target table; the host-target variable joins with it.
+# Renames an exported RUSTFLAGS to the host target's CARGO_TARGET_<TRIPLE>_RUSTFLAGS.
 host_rustflags_var="CARGO_TARGET_$(rustc -vV | sed -n 's/^host: //p' | tr 'a-z-' 'A-Z_')_RUSTFLAGS"
 sed -i "s/^export RUSTFLAGS=/export ${host_rustflags_var}=/" /tmp/coverage-env.sh
 
 # Configure maturin to use the same target directory as cargo-llvm-cov
-# This ensures the instrumented .so files are in the expected location
 echo 'export CARGO_TARGET_DIR="$CARGO_LLVM_COV_TARGET_DIR/llvm-cov-target"' >> /tmp/coverage-env.sh
 
-# Override LLVM_PROFILE_FILE to write to llvm-cov-target where cargo llvm-cov report looks
+# Write profraw files to the llvm-cov-target directory
 echo 'export LLVM_PROFILE_FILE="$CARGO_LLVM_COV_TARGET_DIR/llvm-cov-target/hal-%p-%16m.profraw"' >> /tmp/coverage-env.sh
 
 echo "Coverage environment configured in /tmp/coverage-env.sh"

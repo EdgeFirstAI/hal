@@ -1,10 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 //
-// Golden sizes and offsets for every public by-value struct. These are the
-// drift class no name-level check can see; identical on all LP64 targets.
-// A failure here means the frozen-forever rule was violated -- the fix is a
-// suffixed successor struct, never an in-place edit.
+// Golden sizes and offsets for every public by-value struct.
 
 #include "edgefirst/tensor.h"
 
@@ -56,10 +53,7 @@ _Static_assert(offsetof(ef_quantization_info, axis) == 0, "");
 _Static_assert(offsetof(ef_quantization_info, count) == 4, "");
 _Static_assert(offsetof(ef_quantization_info, has_quantization) == 8, "");
 
-/* Three pointer-sized members at align 8. Frozen forever: this vocabulary
- * declines a struct_size handshake, so a field added here is a new suffixed
- * struct, never an edit. Mirrored by offset_of! assertions in
- * edgefirst-tensor-abi's own tests. */
+/* Three pointer-sized members at align 8. */
 _Static_assert(sizeof(ef_client_state) == 24, "client state frozen at 24");
 _Static_assert(_Alignof(ef_client_state) == 8, "client state align 8");
 _Static_assert(offsetof(ef_client_state, ctx) == 0, "");

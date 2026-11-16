@@ -7,9 +7,9 @@
 //! [`AttentionScratch`], in blocks of 4×4 bytes: keys as `[token/4][dim/4][4 tokens][4 dims]`,
 //! values as `[dim/4][token/4][4 dims][4 tokens]`. A task takes four query rows of one head,
 //! interleaved the same way, so each 16-byte block meets a query (or probability) block in one
-//! indexed dot product whose four lanes are four tokens (or four value dims), with no
-//! horizontal reductions. Zero points enter through sums, as in [`super::matmul_i8`]. CPUs
-//! without FEAT_DotProd use the layout of `attention_i8_neon_base` instead.
+//! indexed dot product whose four lanes are four tokens (or four value dims). Zero points enter
+//! through sums, as in [`super::matmul_i8`]. CPUs without FEAT_DotProd use the layout of
+//! `attention_i8_neon_base`.
 
 use std::borrow::Cow;
 
@@ -21,7 +21,7 @@ use crate::pool::{for_each_block, Pool};
 use crate::quant::{Quant, Rounding, TfliteKernels};
 use crate::view::{TensorMut, TensorRef, View};
 
-/// Most key/value tokens per head: each task keeps four rows of scores on the stack.
+/// Most key/value tokens per head.
 pub(crate) const ATTENTION_MAX_TOKENS: usize = 2048;
 
 /// Longest query/key and value vectors per head.
@@ -163,8 +163,8 @@ pub(super) enum Layout {
     Widened,
 }
 
-/// Packed queries, keys and values for one call, owned by the caller so `run` does not
-/// allocate. Build it with [`AttentionI8Plan::scratch`].
+/// Packed queries, keys and values for one call, owned by the caller. Build it with
+/// [`AttentionI8Plan::scratch`].
 ///
 /// A scratch serves the plan that built it, and any plan with the same kernel, for any number
 /// of calls, one at a time.
@@ -381,10 +381,9 @@ enum Kernel {
 /// `out[h, i, :] = softmax(q'[h, i, :] · k[h, :, :]ᵀ) · v[h, :, :]`, where `q'` is Q through
 /// the optional [`AttentionQMul`].
 ///
-/// It replaces TFLite's `MUL` (on Q) → `BATCH_MATMUL` → `SOFTMAX` → `BATCH_MATMUL` chain and
-/// the `TRANSPOSE`, `RESHAPE` and `SLICE` operators around it: Q, K and V are strided views
-/// (for example head slices of one token-major tensor), the output is a strided view, and the
-/// attention map is never materialized beyond four rows at a time.
+/// It computes TFLite's `MUL` (on Q) → `BATCH_MATMUL` → `SOFTMAX` → `BATCH_MATMUL` chain with
+/// Q, K and V as strided views (for example head slices of one token-major tensor) and a
+/// strided output view.
 ///
 /// It reproduces the chain's int8 roundings: the `MUL` table, the scores requantized as
 /// TFLite's `BATCH_MATMUL`, the float-table `SOFTMAX` (as [`SoftmaxI8Plan`]), and the output
@@ -437,8 +436,7 @@ pub(super) struct Geometry {
 /// Row length of the per-task buffers: scores are computed in whole groups of 16 tokens.
 pub(super) const ROW: usize = ATTENTION_MAX_TOKENS + 16;
 
-/// Per-task buffers. Every block writes the same prefixes, so the zero padding the dot
-/// products read past them stays zero.
+/// Per-task buffers.
 pub(super) struct Buffers {
     /// The int8 scores, then the softmax rows.
     pub(super) s8: [[i8; ROW]; TILE],
@@ -485,7 +483,7 @@ impl AttentionI8Plan {
             },
             f,
         )?;
-        // The two products, validated as the `BATCH_MATMUL`s they replace.
+        // The two products, validated as `BATCH_MATMUL`s.
         let scores = MatMulI8Plan::with_features(
             MatMulI8Params::tflite_batch_matmul(q_scaled, p.k, p.scores, p.kernels)?,
             CpuFeatures::default(),
@@ -511,8 +509,7 @@ impl AttentionI8Plan {
     }
 
     /// `Ok` when this crate's attention kernels take `tokens` key/value tokens per head and
-    /// `dk`-long queries and keys and `dv`-long values; `Unsupported` otherwise (the kernels
-    /// keep rows of scores and vectors in fixed stack buffers).
+    /// `dk`-long queries and keys and `dv`-long values; `Unsupported` otherwise.
     pub fn check_shape(tokens: usize, dk: usize, dv: usize) -> Result<()> {
         if tokens > ATTENTION_MAX_TOKENS
             || dk > ATTENTION_MAX_HEAD_DIM
@@ -998,8 +995,7 @@ mod tests {
         }
     }
 
-    /// Sixteen tokens: the chain's softmax runs its rows in groups of sixteen, the fused
-    /// kernels one row at a time, and both take the same 16-element arithmetic.
+    /// Sixteen tokens: the chain's softmax and the fused kernels take the same 16-element arithmetic.
     #[test]
     fn sixteen_tokens_equal_the_tflite_chain() {
         let (p, _) = params();
@@ -1037,7 +1033,7 @@ mod tests {
 
     /// Every query aligned with the `hot` tokens' keys and opposed to the others', so the
     /// scores saturate and the probability splits evenly over the hot tokens; every other value
-    /// dim at 127, so a sum of probabilities past 257 overflows 16 bits.
+    /// dim at 127.
     fn hot_keys(sh: Shape, hot: impl Fn(usize) -> bool) -> Vec<i8> {
         let mut x = input(sh, 5);
         let c = sh.c();
@@ -1054,10 +1050,7 @@ mod tests {
         x
     }
 
-    /// Rows whose probabilities sum past 257, which the A53 kernel splits: evenly over every
-    /// token (one each), over six adjacent tokens (43 each, within one group of 16), across a
-    /// group boundary, and spread; with a partial last block of rows and value dims in a pair
-    /// of 16-dim groups and a single one.
+    /// Rows whose probabilities sum past 257, which the A53 kernel splits into chunks.
     #[test]
     fn rounded_up_probabilities_equal_the_tflite_chain() {
         let (p, _) = params();
@@ -1138,8 +1131,7 @@ mod tests {
         }
     }
 
-    /// A scratch serves every plan whose kernel packs its layout, in any order, and is
-    /// rejected, before anything is written, by a plan whose kernel packs another.
+    /// A scratch serves every plan whose kernel packs its layout and is rejected by any other plan.
     #[test]
     fn a_scratch_serves_plans_with_its_layout() {
         for sh in [

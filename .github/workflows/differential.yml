@@ -1,19 +1,9 @@
-# Differential (Static vs. Dynamic Backend) workflow for EdgeFirst HAL
+# Differential (static vs. dynamic backend) workflow for EdgeFirst HAL
 #
-# Builds two comparison venvs from the SAME commit -- one with every Python
-# extension statically linking edgefirst-tensor, one with every Python
-# extension dynamically linking a shared libedgefirst_tensor.so -- and runs
-# the full Python test suite against both (G13, via `make test-differential`).
-# A single test outcome differing between the two backends is a real defect:
-# the two builds are supposed to be behaviorally identical.
-#
-# NOT run on every push/PR: G13 runs the suite twice, and up to four times
-# when anything diverges (a second full pass confirms a divergence survives
-# before it is reported, since some tests are flaky under load). Two full
-# wheel builds plus up to four full suite runs is too slow and too expensive
-# to gate every PR on, so this runs nightly and on demand instead. See
-# Makefile's `# DIFFERENTIAL TESTING (G13)` section for the target definitions
-# this workflow calls into, and scripts/check-single-home.sh for G13 itself.
+# Builds two venvs from the same commit, one with every Python extension
+# linking edgefirst-tensor statically and one linking a shared
+# libedgefirst_tensor.so, and runs the Python test suite against both through
+# `make test-differential`. Runs nightly and on demand.
 #
 # Action Versions (hash-pinned per SPS v2.1):
 # - actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd (v6.0.2)
@@ -44,12 +34,8 @@ env:
 
 jobs:
   test-differential:
-    name: G13 (static vs. dynamic, test for test)
+    name: Backend comparison (static vs. dynamic, test for test)
     # runner-class: larger
-    # Two wheel builds plus up to four full suite passes, the longest job in
-    # the fleet. Nightly is speed-optimised like Full: a G13 that runs into the
-    # working day delays the signal it exists to give. Phase 2 moves this to the
-    # self-hosted build-x86 class.
     runs-on: ubuntu-24.04-xlarge
     timeout-minutes: 120
 
@@ -57,7 +43,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
-          fetch-depth: 0  # G13's staleness guard needs real history for `git log -- crates/`
+          fetch-depth: 0
           lfs: true
 
       - name: Checkout LFS objects
@@ -74,8 +60,7 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Set up base Python virtual environment
-        # Only used to spawn the two comparison venvs (`venv/bin/python -m venv ...`
-        # in the Makefile) -- the comparison venvs get their own maturin/pytest/etc.
+        # The venv that spawns the two comparison venvs.
         run: python3 -m venv venv
 
       - name: Set up Rust stable toolchain
@@ -89,7 +74,7 @@ jobs:
           shared-key: rust-differential
           cache-on-failure: true
 
-      - name: Run G13 (make test-differential)
+      - name: Run make test-differential
         run: make test-differential
 
       - name: Upload differential wheels on failure

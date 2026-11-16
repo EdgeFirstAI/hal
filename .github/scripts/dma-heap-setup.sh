@@ -1,21 +1,14 @@
 #!/usr/bin/env bash
-# Open the Linux DMA system heap to the job user, prove it allocates, and arm
-# the HAL_TEST_REQUIRE_DMA gate only when it does.
+# Open the Linux DMA system heap to the job user, check that it allocates, and
+# arm the HAL_TEST_REQUIRE_DMA gate only when it does.
 #
-# GitHub's hosted Ubuntu images ship /dev/dma_heap/system as root:video 0660
-# with the runner user outside `video`, so every DMA test skips and reports
-# `ok`. This script makes the node world read-write when it can (root, or
-# passwordless sudo), then allocates and maps one page through the heap ioctl.
-# Only a successful allocation sets HAL_TEST_REQUIRE_DMA=1; from then on a
-# DMA test that would skip fails instead (see crates/tensor/TESTING.md).
+# Makes the node world read-write when it can (root, or passwordless sudo) on
+# a GitHub-hosted runner, then allocates and maps one page through the heap
+# ioctl. A successful allocation sets HAL_TEST_REQUIRE_DMA=1, which makes a
+# DMA test that would skip fail (see crates/tensor/TESTING.md).
 #
-# The hosted-runner heap is cached, cache-coherent system memory with no
-# /dev/dri behind it. A pass there proves the DMA code paths run; it is not
-# hardware validation of coherency, CMA or GPU import, which only the board
-# lanes provide.
-#
-# Never fails the job: every step is guarded, and a missing heap, sudo or
-# python3 leaves the gate unset and says why.
+# Never fails the job: a missing heap, sudo or python3 leaves the gate unset
+# and prints the cause.
 #
 # Exports, via $GITHUB_ENV when it is set and to this shell otherwise:
 #   HAL_TEST_REQUIRE_DMA=1          only when the probe allocated
@@ -53,10 +46,8 @@ if [[ ! -e "${node}" ]]; then
     exit 0
 fi
 
-# Only an ephemeral GitHub-hosted VM has its node opened up. On a persistent
-# self-hosted machine the chmod would outlive the job and let every local
-# user allocate DMA memory; grant access there by adding the runner user to
-# the node's group, and this script only probes.
+# Permissions are changed on a GitHub-hosted runner only; elsewhere the
+# script only probes.
 if [[ ! -r "${node}" || ! -w "${node}" ]] && [[ "${RUNNER_ENVIRONMENT:-}" != "github-hosted" ]]; then
     echo "dma-heap-setup: ${node} is not read-write for $(id -un); not changing permissions outside a GitHub-hosted runner"
 elif [[ ! -r "${node}" || ! -w "${node}" ]]; then
@@ -76,8 +67,7 @@ if ! command -v python3 > /dev/null 2>&1; then
 fi
 
 # DMA_HEAP_IOCTL_ALLOC is _IOWR('H', 0, struct dma_heap_allocation_data), and
-# that struct is { u64 len; u32 fd; u32 fd_flags; u64 heap_flags; } on every
-# architecture, so the request number is the same on x86_64 and aarch64.
+# that struct is { u64 len; u32 fd; u32 fd_flags; u64 heap_flags; }.
 probe_output="$(python3 - "${node}" 2>&1 <<'PY'
 import fcntl
 import mmap

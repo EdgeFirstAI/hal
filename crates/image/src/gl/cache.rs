@@ -14,63 +14,8 @@ pub(super) enum CacheKind {
 ///
 /// Generic over the platform's owned import object `I` — an `EglImage`
 /// (DMA-BUF) on Linux, an IOSurface-backed EGL pbuffer on macOS. Dropping
-/// the entry drops `I`, which releases the platform object.
-///
-/// **`import` is the anchor, and it is load-bearing for correctness, not
-/// only for speed.** The entry deliberately outlives the tensor it was built
-/// from: a cross-package `convert()` constructs a fresh tensor over the
-/// producer's buffer, uses it, and drops it within the call, so an entry tied
-/// to that tensor's lifetime would be created and destroyed every frame and
-/// never hit (measured: 0 hits / 50 misses, against 49/1 for a native
-/// source). Outliving the tensor is safe because the platform import holds
-/// its own driver-side reference to the buffer, so a cached entry keeps the
-/// underlying object alive even after every userspace handle is closed — the
-/// system key it is identified by (a dma-buf `(st_dev, st_ino)`, an
-/// `IOSurfaceID`) therefore cannot be recycled onto a *different* buffer
-/// while the entry lives, which is what makes a stale key impossible rather
-/// than merely unlikely. Verified on hardware, both directions: on Linux the
-/// buffer's inode is still listed in `/sys/kernel/debug/dma_buf/bufinfo`
-/// after the tensor drops (Vivante/imx8mp, Mali/imx95, V3D/rpi5) and
-/// disappears the moment the cache drops; on macOS the `IOSurfaceID` still
-/// resolves after the tensor drops and stops resolving once the cache drops.
-///
-/// The consequence for any future refactor: the cache must keep owning `I`.
-/// Storing only the raw handle (`Platform::import_handle`) would keep the
-/// key-matching behaviour and silently lose the anchor.
-///
-/// **The rule a cached key must satisfy, and where each platform enforces
-/// it.** A key is safe here only when the import this entry owns keeps the
-/// keyed object alive, because that is what stops the key being recycled onto
-/// a different buffer while the entry is still findable. Each
-/// `Platform::import_buffer*` implementation reaches its platform's object
-/// through an accessor no other backing answers — `dmabuf_fd` on Linux,
-/// `iosurface_ref` on macOS, the `AHardwareBuffer*` on Android, and
-/// `d3d11_texture` on Windows — so a `Mem` or PBO tensor cannot reach any of
-/// them and `IdentityKind::HostPtr` and `Pbo` are never cached.
-///
-/// Two cached kinds are raw pointers, recyclable in principle:
-/// `IdentityKind::D3d11Texture` (an `ID3D11Texture2D*`) and
-/// `AHardwareBufferPtr`. The anchor above is what rules a stale key out for
-/// them, since the EGLImage holds its own reference to the object, which
-/// therefore cannot be freed and its address reused while the entry lives.
-///
-/// Reaching the right accessor is *not* on its own proof that the identity
-/// names that object, and on Windows the two came apart: the dynamic tensor
-/// backend answered `d3d11_texture` correctly while identifying the tensor by
-/// its recyclable `ef_tensor` handle address, and converts rendered into
-/// dropped textures. So the Windows path checks rather than assumes, through
-/// [`GlPlatform::validate_import_identity`], which refuses in every build any
-/// texture whose identity is not `D3d11Texture` over that same pointer.
-///
-/// That check runs on **every** import, cache hits included, and that is why
-/// it is a separate hook rather than a line in `Platform::import_buffer*`:
-/// those run only on a miss, so a check made there could not see this cache
-/// serving an entry for a tensor whose identity had stopped matching its
-/// buffer — the one case that produces wrong pixels rather than none. The
-/// other three platforms take the default `Ok(())`: their identities are
-/// OS-level keys the kernel cannot recycle while the import holds the object.
-///
-/// [`GlPlatform::validate_import_identity`]: super::platform::GlPlatform::validate_import_identity
+/// the entry drops `I`, which releases the platform object. The entry
+/// outlives the tensor it was built from.
 pub(super) struct CachedImport<I> {
     pub(super) import: I,
     /// Optional GL renderbuffer backed by this import (used by direct RGB path).
@@ -81,13 +26,6 @@ pub(super) struct CachedImport<I> {
 
 /// Per-processor zero-copy telemetry: how convert sources reached the GPU
 /// and how often a zero-copy opportunity was declined into a copy path.
-///
-/// This is deliberately SEPARATE from [`GlCacheStats`]: that struct is the
-/// steady-state import-cache equality gate (tests assert exact equality on
-/// it), while these counters change on every convert. `src_uploads` staying
-/// at 0 across a Dma-source workload is the "no silent zero-copy drop"
-/// assertion callers (and the on-device validation harness) can make —
-/// EGLImage miss counts alone are blind to uploads.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ConvertStats {
     /// Sources fed zero-copy: the tensor's Dma buffer became the sampled
@@ -97,57 +35,28 @@ pub struct ConvertStats {
     pub src_pbo_uploads: u64,
     /// Sources fed by CPU map + TexImage upload — the copy path.
     pub src_uploads: u64,
-    /// Times a zero-copy source feed was attempted and DECLINED into a
-    /// copy path (import/attach failure). A nonzero value with Dma
-    /// sources means the platform/driver refused the fast path.
+    /// Times a zero-copy source feed was attempted and declined into a
+    /// copy path (import/attach failure).
     pub zero_copy_declines: u64,
-    /// Times a zero-copy DESTINATION import was attempted and DECLINED into
+    /// Times a zero-copy destination import was attempted and declined into
     /// the mapped-texture readback (render to a texture, read back through
-    /// `map()` at the destination's offset and pitch). The destination-side
-    /// twin of [`zero_copy_declines`](Self::zero_copy_declines): a nonzero
-    /// value with a Dma destination means the driver refused to render into
-    /// the buffer directly and the convert still produced correct pixels,
-    /// through a copy.
+    /// `map()` at the destination's offset and pitch).
     pub dst_import_fallbacks: u64,
 }
 
-/// Buffer-import cache owned by the GL processor.
-///
-/// Uses a HashMap with a monotonic counter for LRU eviction: each access
-/// updates the entry's `last_used` timestamp, and eviction removes the entry
-/// with the smallest `last_used` value. Recency is the *only* eviction
-/// signal — entries are retained past the lifetime of the tensor that
-/// produced them, which is what lets a re-imported buffer hit (see
-/// [`CachedImport`]), so `capacity` is the sole bound.
 /// Identity + geometry that uniquely determine an imported GPU buffer
 /// (an EGLImage over a DMA-BUF on Linux; an EGL pbuffer over an IOSurface
-/// on macOS — the key fields are platform-neutral).
+/// on macOS).
 ///
 /// `luma_id` / `chroma_id` are the buffer identities.
 ///
-/// A `view()`/`batch()` sub-region is a `glViewport`/`glScissor` ROI into its
-/// parent, **not** a distinct import: [`from_tensor`](BufferImportKey::from_tensor)
-/// keys such a tensor on its **parent** geometry (`view_origin`) with
-/// `plane_offset = 0`, so every sibling view of one buffer collapses to a single
-/// EGLImage and the per-tile offset becomes render state (the viewport). The
-/// remaining `plane_offset` use is a non-view tensor that carries a genuine
-/// foreign/multi-plane byte offset (e.g. an externally-imported buffer whose data
-/// starts past the fd origin); those still key distinctly.
+/// A destination `view()`/`batch()` sub-region is keyed on its parent
+/// geometry (`view_origin`) with `plane_offset = 0`: every sibling view of
+/// one buffer shares a single key. A source, and a non-view tensor carrying
+/// a byte offset, is keyed by its own `plane_offset`.
 ///
-/// A source rebased onto an aligned DMA-BUF base (issue #170) is keyed by its
-/// OWN `plane_offset`, not by the base it imports at, which is what keeps two
-/// views sharing one base but differing in remainder from aliasing: their
-/// imports are widened by different amounts. Keying on the base would collapse
-/// them onto one import and sample the wrong region for one of the two.
-///
-/// `width` / `height` / `row_stride` / `format` capture the geometry the
-/// EGLImage was imported with — the **parent's** for a view. A pooled buffer
-/// reused at a different size via `Tensor::configure_image` (e.g. a 128-wide pool
-/// decoding a 96-wide image) keeps the same identities but needs a fresh import:
-/// the import's pitch/dimensions/fourcc all derive from these fields. Omitting
-/// them reuses the stale-geometry EGLImage and the GPU samples the buffer at the
-/// wrong pitch — deterministically wrong single-threaded, nondeterministic in
-/// parallel, correct only on a heap source (which never takes this path).
+/// `width` / `height` / `row_stride` / `format` are the geometry the import
+/// was made with (the parent's for a destination view).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) struct BufferImportKey {
     pub(super) luma_id: u64,
@@ -161,22 +70,13 @@ pub(super) struct BufferImportKey {
 
 impl BufferImportKey {
     /// Build the cache key from a tensor and the format it will be imported as.
-    /// Every construction site MUST go through this so the key used to insert
-    /// an EGLImage matches the key used to look it up and to gate the texture
-    /// binding-skip.
     pub(super) fn from_tensor<T>(img: &Tensor<T>, format: PixelFormat, for_dst: bool) -> Self
     where
         T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync + edgefirst_tensor::Element,
     {
-        // A DESTINATION view()/batch() sub-region keys on its PARENT so all
-        // siblings of one buffer collapse to a single import; the view's offset is
-        // the viewport, not a key. It keys on the parent's `row_stride` (from
-        // `view_origin`), NOT the view's own `effective_row_stride` — a single-row
-        // view sets a tight stride for map-span safety, which would otherwise
-        // mis-key it apart from its multi-row siblings. A SOURCE view (or a whole
-        // tensor) keys on its OWN geometry + any genuine foreign/multi-plane
-        // plane_offset — a source view imports its own region (it is sampled, not
-        // rendered into), so it must NOT collapse onto the parent key.
+        // A destination view keys on its parent's geometry and row stride at
+        // offset 0. A source view or a whole tensor keys on its own geometry
+        // and plane offset.
         let view_origin = if for_dst { img.view_origin() } else { None };
         let (width, height, row_stride, plane_offset) = match view_origin {
             Some(vo) => (vo.parent_width, vo.parent_height, vo.parent_row_stride, 0),
@@ -200,46 +100,19 @@ impl BufferImportKey {
 }
 
 /// Snapshot of one EGLImage cache's hit/miss counters.
-///
-/// The counters themselves have always existed (logged at `Drop`); this
-/// snapshot makes them **assertable**: steady-state tests capture stats after
-/// warmup and after an N-frame loop and require `misses` to stay flat — any
-/// increase means a convert re-imported a buffer it should have found cached,
-/// which is the cache-behavior equality gate for GL refactors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CacheStats {
     pub hits: u64,
     pub misses: u64,
     pub entries: usize,
-    /// High-water mark of `entries`.
-    ///
-    /// Since entries are retained past the lifetime of the tensor that
-    /// produced them (the retention that `CachedImport` documents), each one
-    /// pins its buffer, so
-    /// occupancy — not hit rate — is what says how much memory a workload
-    /// holds. Below `capacity` this is the workload's true working-set size,
-    /// and the number to size `EDGEFIRST_EGL_CACHE_CAPACITY` against.
-    ///
-    /// It **saturates at `capacity`**, so on its own it cannot tell a
-    /// workload that exactly fits from one that is thrashing — both report
-    /// `peak_entries == capacity`. Read it together with [`evictions`], which
-    /// is what distinguishes them.
-    ///
-    /// [`evictions`]: Self::evictions
+    /// High-water mark of `entries`. Saturates at `capacity`.
     pub peak_entries: usize,
     /// Entries evicted to stay within `capacity`.
-    ///
-    /// The signal that `capacity` is too small for the workload: every
-    /// eviction discards an import that is likely to be asked for again, so
-    /// a steady-state pipeline should reach zero. Nonzero-and-climbing with
-    /// `peak_entries == capacity` is thrashing — raise
-    /// `EDGEFIRST_EGL_CACHE_CAPACITY`, at the cost of pinning more buffers.
     pub evictions: u64,
 }
 
 /// Combined snapshot of every EGLImage cache on the GL processor
-/// (source, destination, the Path-B NV R8 source cache, and its chroma-plane
-/// view for hardware-filtered NV resizes).
+/// (source, destination, the NV R8 source cache, and its chroma-plane view).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GlCacheStats {
     pub src: CacheStats,
@@ -249,17 +122,14 @@ pub struct GlCacheStats {
 }
 
 impl GlCacheStats {
-    /// Total imports performed (cache misses) across all caches — the number
-    /// steady-state loops assert stays flat.
+    /// Total imports performed (cache misses) across all caches.
     pub fn total_misses(&self) -> u64 {
         self.src.misses + self.dst.misses + self.nv_r8.misses + self.nv_uv.misses
     }
 
-    /// Peak entries summed across all caches — an UPPER bound on how many
-    /// buffers were pinned at once, not an exact count: `src`, `nv_r8` and
-    /// `nv_uv` routinely name the *same* source buffer (one NV12 tensor
-    /// imported several ways), and entries over one buffer pin it once.
-    /// Use the per-cache peaks to size capacity; use this to bound memory.
+    /// Peak entries summed across all caches. An upper bound on the number
+    /// of buffers pinned at once: entries in different caches can name the
+    /// same buffer.
     pub fn total_peak_entries(&self) -> usize {
         self.src.peak_entries
             + self.dst.peak_entries
@@ -267,12 +137,14 @@ impl GlCacheStats {
             + self.nv_uv.peak_entries
     }
 
-    /// Evictions across all caches — zero in a correctly sized steady state.
+    /// Evictions across all caches.
     pub fn total_evictions(&self) -> u64 {
         self.src.evictions + self.dst.evictions + self.nv_r8.evictions + self.nv_uv.evictions
     }
 }
 
+/// Buffer-import cache owned by the GL processor: a HashMap with a monotonic
+/// access counter for LRU eviction, bounded by `capacity`.
 pub(super) struct ImportCache<I> {
     pub(super) entries: std::collections::HashMap<BufferImportKey, CachedImport<I>>,
     pub(super) capacity: usize,
@@ -300,7 +172,7 @@ impl<I> ImportCache<I> {
         }
     }
 
-    /// Snapshot the hit/miss counters for steady-state assertions.
+    /// Snapshot the hit/miss counters.
     pub(super) fn stats(&self) -> CacheStats {
         CacheStats {
             hits: self.hits,
@@ -312,16 +184,8 @@ impl<I> ImportCache<I> {
     }
 
     /// Insert a freshly created import, evicting the least recently used
-    /// entry first if the cache is at capacity.
-    ///
-    /// Every insert site goes through here so that the capacity bound and the
-    /// high-water mark cannot drift apart from each other — a site that
-    /// inserted directly would silently raise the real peak above the number
-    /// [`stats`](Self::stats) reports, which is the number capacity is tuned
-    /// against.
-    ///
-    /// Eviction happens *after* the caller has successfully created the
-    /// import: a failed import must not cost the cache a live entry.
+    /// entry first if the cache is at capacity, and update the high-water
+    /// mark.
     pub(super) fn insert(&mut self, key: BufferImportKey, import: I, renderbuffer: Option<u32>) {
         if self.entries.len() >= self.capacity {
             self.evict_lru();
@@ -365,11 +229,6 @@ impl<I> Drop for ImportCache<I> {
                 unsafe { edgefirst_gl::gl::DeleteRenderbuffers(1, &rbo) };
             }
         }
-        // peak/evictions are the two numbers the capacity story rests on, and
-        // they were previously reachable only through the API -- so a field
-        // report of "GPU memory pressure" could not be diagnosed from a log.
-        // `peak < capacity` with zero evictions means correctly sized;
-        // evictions climbing means the producer's pool is deeper than the bound.
         log::debug!(
             "ImportCache stats: {} hits, {} misses, {} entries remaining, \
              peak {}/{}, {} evictions",
@@ -408,13 +267,7 @@ mod tests {
         }
     }
 
-    /// Two source views whose byte offsets share a 64-byte-aligned base but
-    /// differ in the remainder are DIFFERENT imports after issue #170 -- one
-    /// is widened by 8 texels and the other by 4 -- so their keys must not
-    /// collide. The key holds the tensor's own `plane_offset`, which is
-    /// finer than the base, so this holds by construction; it is asserted
-    /// because a future "key on the import base instead" would silently
-    /// alias two imports and sample one region for the other.
+    /// Source views whose offsets share a 64-byte-aligned base but differ in remainder key apart.
     #[test]
     fn source_keys_distinguish_offsets_that_share_an_aligned_base() {
         let a = key(1, 2048, 16, 16, 256, PixelFormat::Rgba);
@@ -430,9 +283,7 @@ mod tests {
         assert_eq!(map.len(), 3, "three remainders, three imports");
     }
 
-    /// The two numbers Task 7 (capacity sizing) reads, and the LRU order they
-    /// describe. Runs without a GL context: `evict_lru` only touches GL for an
-    /// entry that carries a renderbuffer, and these carry none.
+    /// `peak_entries` and `evictions` track capacity pressure, and eviction follows LRU order.
     #[test]
     fn peak_and_evictions_report_capacity_pressure() {
         use super::ImportCache;
@@ -445,7 +296,7 @@ mod tests {
         assert_eq!((full.entries, full.peak_entries), (2, 2));
         assert_eq!(full.evictions, 0, "a cache within capacity must not evict");
 
-        // Third distinct buffer at capacity: the LRU entry (k(1)) goes.
+        // A third buffer at capacity evicts the LRU entry, k(1).
         cache.insert(k(3), 30, None);
         let pressed = cache.stats();
         assert_eq!(pressed.entries, 2, "capacity is enforced");
@@ -462,12 +313,7 @@ mod tests {
 
     #[test]
     fn cache_key_distinguishes_foreign_plane_offset() {
-        // `plane_offset` no longer distinguishes view()/batch() sub-regions —
-        // those key on their parent and collapse (see
-        // `cache_key_collapses_sibling_views`). It survives ONLY for a non-view
-        // tensor carrying a genuine foreign/multi-plane byte offset (e.g. an
-        // externally-imported buffer whose data starts past the fd origin); two
-        // such imports at different offsets must remain DISTINCT entries.
+        // Two non-view imports at different plane offsets are distinct entries.
         let mut map: HashMap<BufferImportKey, u32> = HashMap::new();
         let base = key(0xABCD, 0, 64, 64, 64, PixelFormat::Grey);
         let at_offset = key(0xABCD, 4096, 64, 64, 64, PixelFormat::Grey);
@@ -481,7 +327,7 @@ mod tests {
         assert_eq!(map.get(&base), Some(&1));
         assert_eq!(map.get(&at_offset), Some(&2));
 
-        // Identical keys still collide (a genuine cache hit), as before.
+        // Identical keys collide.
         map.insert(base, 3);
         assert_eq!(map.len(), 2);
         assert_eq!(map.get(&base), Some(&3));
@@ -489,11 +335,7 @@ mod tests {
 
     #[test]
     fn cache_key_collapses_sibling_views() {
-        // The batch-engine pivot: a view()/batch() sub-region is a
-        // glViewport/scissor ROI into its parent, so sibling views of one buffer
-        // MUST produce the SAME cache key (one shared EGLImage import) and key
-        // identically to the whole parent. The per-tile offset is render state,
-        // never part of the key.
+        // Sibling destination views of one buffer key identically to the whole parent.
         use edgefirst_tensor::{Region, Tensor, TensorMemory};
         let parent = Tensor::<u8>::image(
             64,
@@ -520,9 +362,7 @@ mod tests {
         );
         assert_eq!((ka.width, ka.height), (64, 64), "keyed on parent geometry");
 
-        // SOURCES (`for_dst = false`) key on their OWN region — a source view is
-        // imported and SAMPLED, not rendered into, so two source views of one
-        // parent must NOT collapse (they'd alias and sample the wrong region).
+        // Sources (`for_dst = false`) key on their own region.
         let sa = BufferImportKey::from_tensor(&a, PixelFormat::Rgba, false);
         let sb = BufferImportKey::from_tensor(&b, PixelFormat::Rgba, false);
         assert_ne!(sa, sb, "source views key on their own region (no collapse)");
@@ -535,10 +375,7 @@ mod tests {
 
     #[test]
     fn cache_key_distinguishes_geometry() {
-        // Root-cause regression guard for the pool-recycle bug: ONE buffer
-        // (same luma_id + offset) reconfigured to different geometry via
-        // `configure_image` must produce DISTINCT keys — otherwise the EGLImage
-        // imported for the first geometry is reused at the wrong pitch.
+        // One buffer reconfigured to different geometry produces distinct keys.
         let mut map: HashMap<BufferImportKey, u32> = HashMap::new();
         let g0 = key(0xBEEF, 0, 128, 96, 128, PixelFormat::Grey);
         let g1 = key(0xBEEF, 0, 96, 128, 96, PixelFormat::Grey); // different w/h/stride
@@ -552,7 +389,7 @@ mod tests {
             "geometry/format-distinct reuses must not collide"
         );
 
-        // Same identity + same geometry is still a genuine hit.
+        // The same identity and geometry is a hit.
         let g0_again = key(0xBEEF, 0, 128, 96, 128, PixelFormat::Grey);
         map.insert(g0_again, 4);
         assert_eq!(map.len(), 3);
@@ -561,10 +398,7 @@ mod tests {
 
     #[test]
     fn cache_key_distinguishes_stride() {
-        // A stride-only change (same identity/offset/w/h/format, different
-        // row_stride — e.g. a padded vs tight pool buffer) must be a DISTINCT
-        // key. Guards against dropping `row_stride` from the key, which would
-        // reintroduce the wrong-pitch stale read on a re-padded pool.
+        // A stride-only change is a distinct key.
         let mut map: HashMap<BufferImportKey, u32> = HashMap::new();
         let tight = key(0xBEEF, 0, 128, 96, 128, PixelFormat::Grey);
         let padded = key(0xBEEF, 0, 128, 96, 256, PixelFormat::Grey); // stride differs

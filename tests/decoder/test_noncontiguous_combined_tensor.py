@@ -1,24 +1,6 @@
-"""Python-level reproducer for HAILORT_BUG.md.
+"""Mask-to-detection pairing for a non-contiguous combined tensor.
 
-Mirrors the exact tensor-passing pattern that
-`edgefirst-validator`'s `process_yolo_hal` uses on the Hailo path:
-
-  1. Build per-FPN-scale parts shaped `(H*W, 4 + nc + nm)` and
-     `np.concatenate(axis=0)` into `(total_anchors, 4 + nc + nm)`
-     C-contiguous.
-  2. Apply `.T[np.newaxis]` to get a **non-contiguous view** of shape
-     `(1, 4 + nc + nm, total_anchors)` — the same memory layout the
-     validator's `_prepare_raw_outputs` returns.
-  3. Apply the in-place `x[:, [0, 2]] /= width` normalization in the
-     same 3-dim-fancy-index style `check_normalized_boxes` uses.
-  4. Instantiate `ef.Tensor(shape, dtype).from_numpy(view)`
-     and pass to `decoder.decode(...)` exactly as the validator does.
-  5. Check each surviving detection's mask was rendered from the
-     mask_coef row at its own anchor index.
-
-Encodes an obvious high/low signal in mask_coefs + protos so any
-mask-to-detection index swap would flip the rendered mean by
-~250 u8 values.
+The combined tensor is a transposed numpy view copied in with `from_numpy`.
 """
 
 from __future__ import annotations
@@ -30,38 +12,26 @@ import numpy as np
 def _build_combined_detection_tensor(
     per_scale_parts, normalize_boxes, model_input=(640, 640)
 ):
-    """Replicate `_prepare_raw_outputs` tail + `check_normalized_boxes`.
+    """Concatenate the per-scale parts and return the transposed `(1, F, A)` view.
 
     * `per_scale_parts`: list of `(H*W, 4 + nc + nm)` float32 arrays.
-    * `normalize_boxes`: when True, divide xc/yc/w/h by model input size
-      (validator does this for pixel-space boxes from Hailo DFL decode).
+    * `normalize_boxes`: when True, divide xc/yc/w/h by the model input size.
     """
     width, height = model_input
     detection = np.concatenate(per_scale_parts, axis=0)  # (A, F)
     detection = detection.T[np.newaxis]  # (1, F, A) view
     if normalize_boxes:
-        # This is exactly what `check_normalized_boxes` does on a
-        # (1, 4, A) slice when the boundary fraction is < 0.80.
         detection[:, [0, 2]] /= width
         detection[:, [1, 3]] /= height
     return detection
 
 
 def test_hailort_validator_pattern_preserves_mask_detection_pairing():
-    """Full Python-stack replay of the validator's pattern.
-
-    Three FPN levels (strides 8/16/32) at 640×640, reg_max post-decode
-    so boxes are already xcycwh (we build xywh directly). Ten anchors
-    carry unique mask_coef one-hot signatures; protos are per-channel
-    distinct so a correctly-paired mask sigmoid-saturates (→ 255) and
-    any mis-indexed lookup renders as sigmoid(0) ≈ 0.5 (→ 128).
-    """
+    """Ten anchors across three FPN levels each render the mask of their own row."""
     nc = 80
     nm = 32
     feat = 4 + nc + nm  # 116
     width = height = 640
-    # Cheap grids — we don't need every anchor, just enough to put 10
-    # above threshold in three different FPN blocks.
     fpn = [(80, 80, 8), (40, 40, 16), (20, 20, 32)]
 
     # Build per-FPN-scale chunks. Most anchors are zero; ten specific
@@ -86,8 +56,7 @@ def test_hailort_validator_pattern_preserves_mask_detection_pairing():
             if part_idx != p:
                 continue
             # Place a non-overlapping box centred at a grid-derived
-            # position in pixel coords. Width/height small (~20px) so
-            # NMS doesn't suppress across targets.
+            # position in pixel coords.
             row = local_row // w
             col = local_row % w
             xc = (col + 0.5) * stride
@@ -105,8 +74,6 @@ def test_hailort_validator_pattern_preserves_mask_detection_pairing():
         parts, normalize_boxes=True, model_input=(width, height)
     )
     assert detection.shape == (1, feat, 80 * 80 + 40 * 40 + 20 * 20)
-    # Sanity: the view is NOT C-contiguous — that's the validator's
-    # pattern and the one we specifically want to test.
     assert not detection.flags["C_CONTIGUOUS"], (
         "test setup bug: combined detection tensor must be "
         ".T[np.newaxis] non-contig to replicate validator"
@@ -117,8 +84,7 @@ def test_hailort_validator_pattern_preserves_mask_detection_pairing():
     for k in range(nm):
         protos[0, k] = 5.0 + 0.1 * k
 
-    # Construct decoder via the dict API (validator's `init_decoder`
-    # path at runners/core.py:164).
+    # Construct the decoder via the dict API.
     hal_metadata = {
         "decoder_version": "yolov8",
         "nms": "class_agnostic",
@@ -151,8 +117,6 @@ def test_hailort_validator_pattern_preserves_mask_detection_pairing():
         nms=ef.Nms.ClassAgnostic,
     )
 
-    # Pass tensors via from_numpy exactly like validator's
-    # process_yolo_hal at runners/core.py:795-804.
     det_tensor = ef.Tensor(list(detection.shape), dtype="float32")
     det_tensor.from_numpy(detection)
     proto_tensor = ef.Tensor(list(protos.shape), dtype="float32")
@@ -166,9 +130,8 @@ def test_hailort_validator_pattern_preserves_mask_detection_pairing():
     )
     assert len(masks) == target_count
 
-    # For each surviving detection, verify its rendered mask was
-    # looked up at the CORRECT anchor index. Correct pairings render
-    # to ≈255; any misalignment would render to sigmoid(0) ≈ 128.
+    # A correct pairing renders to ≈255; a misaligned lookup renders to
+    # sigmoid(0) ≈ 128.
     for i, (b, m) in enumerate(zip(boxes, masks)):
         mean = float(np.mean(m))
         assert mean > 240.0, (
@@ -182,16 +145,7 @@ def test_hailort_validator_pattern_preserves_mask_detection_pairing():
 
 
 def test_hailort_validator_pattern_with_tensor_cache_across_frames():
-    """Replicate `_TENSOR_CACHE` reuse across multiple frames.
-
-    The validator's `process_yolo_hal` re-uses the same `Tensor`
-    across iterations via the module-level `_TENSOR_CACHE` dict,
-    calling `tensor.from_numpy(output)` each frame. If `from_numpy`
-    leaks stale data or fails to fully overwrite the buffer when
-    the source view is non-contiguous, the decode would pair each
-    frame's detections against some mix of stale + current
-    mask_coefs — manifesting as incorrect mask rendering.
-    """
+    """A `Tensor` refilled with `from_numpy` each frame holds only that frame."""
     nc = 80
     nm = 32
     feat = 4 + nc + nm
@@ -239,15 +193,9 @@ def test_hailort_validator_pattern_with_tensor_cache_across_frames():
         protos[0, k] = 5.0 + 0.1 * k
     proto_tensor.from_numpy(protos)
 
-    # Iterate 5 frames, each with DIFFERENT target anchors. If a stale
-    # buffer leaks, a later frame's detection would pick up an earlier
-    # frame's mask_coefs → mismatched mask mean vs expected.
+    # Iterate 5 frames, each with different target anchors.
     rng_sequence = [0xAAAA, 0xBBBB, 0xCCCC, 0xDDDD, 0xEEEE]
-    # Pre-compute the decoded centre for every anchor so we can enforce a
-    # spatial separation when sampling. Without this, two stride-8 neighbours
-    # could both be picked, their 20-px boxes overlap above IoU 0.5, and NMS
-    # would suppress one — making the stale-buffer assertion flaky for
-    # reasons unrelated to what this test is probing.
+    # Pre-compute the decoded centre for every anchor.
     anchor_centres = []
     offset = 0
     for h, w, stride in fpn:
@@ -261,7 +209,7 @@ def test_hailort_validator_pattern_with_tensor_cache_across_frames():
     for frame_idx, seed in enumerate(rng_sequence):
         rng = np.random.default_rng(seed)
         # Pick 10 spatially separated anchors (centres ≥ 20 px apart in both
-        # axes — i.e. non-overlapping box footprints) + random one-hot k.
+        # axes) + random one-hot k.
         order = rng.permutation(len(anchor_centres))
         targets = []
         selected_centres = []
@@ -337,7 +285,7 @@ def _numpy_reference_mask(mask_coefs, protos, bbox_norm, width, height):
     y2 = int(np.ceil(bbox_norm[3] * H_p))
     x2 = max(x2, x1 + 1)
     y2 = max(y2, y1 + 1)
-    # protos NHWC after HAL's internal protos_to_hwc: (H, W, nm)
+    # protos as NHWC: (H, W, nm)
     protos_hwc = protos.transpose(1, 2, 0)
     cropped = protos_hwc[y1:y2, x1:x2, :]  # (h, w, nm)
     mask_f = cropped @ mask_coefs  # (h, w)
@@ -345,14 +293,7 @@ def _numpy_reference_mask(mask_coefs, protos, bbox_norm, width, height):
 
 
 def test_hailort_validator_pattern_dense_realistic_mask_coefs_match_numpy_reference():
-    """Compare HAL's rendered masks against a NumPy reference using
-    realistic dense mask_coefs (not one-hot). Mirrors the actual
-    YOLOv8-seg runtime data distribution.
-
-    If HAL's mask rendering is correctly paired with each detection,
-    the per-pixel mask values should match the reference within
-    rounding tolerance (± 2 u8).
-    """
+    """HAL's rendered masks match a NumPy reference for dense mask coefficients."""
     nc = 80
     nm = 32
     feat = 4 + nc + nm
@@ -363,7 +304,7 @@ def test_hailort_validator_pattern_dense_realistic_mask_coefs_match_numpy_refere
     rng = np.random.default_rng(0x5E6D)
 
     # Place 12 non-overlapping detections at random anchors, each
-    # with dense Gaussian-like mask_coefs and realistic protos.
+    # with dense mask_coefs.
     targets = []
     used = set()
     while len(targets) < 12:
@@ -374,7 +315,7 @@ def test_hailort_validator_pattern_dense_realistic_mask_coefs_match_numpy_refere
         targets.append(a)
 
     # Dense protos: 32 proto channels each containing a smooth
-    # gradient pattern (realistic of segmentation proto outputs).
+    # gradient pattern.
     protos = np.zeros((1, nm, 160, 160), dtype=np.float32)
     yy, xx = np.meshgrid(
         np.linspace(-1, 1, 160), np.linspace(-1, 1, 160), indexing="ij"
@@ -405,7 +346,6 @@ def test_hailort_validator_pattern_dense_realistic_mask_coefs_match_numpy_refere
             chunk[local_row, 2] = w_px
             chunk[local_row, 3] = h_px
             chunk[local_row, 4] = 0.9
-            # Dense realistic mask_coefs.
             coefs = rng.standard_normal(nm).astype(np.float32) * 0.5
             chunk[local_row, 4 + nc : 4 + nc + nm] = coefs
             anchor_mask_coefs[tgt] = coefs
@@ -462,10 +402,9 @@ def test_hailort_validator_pattern_dense_realistic_mask_coefs_match_numpy_refere
     )
     assert len(boxes) == len(targets)
 
-    # For each HAL detection, find the matching anchor from the
-    # original setup (by bbox centre proximity in normalised coords),
-    # then compare HAL's rendered mask to a NumPy reference that uses
-    # that anchor's mask_coefs directly.
+    # For each HAL detection, find the matching anchor by bbox centre
+    # proximity, then compare HAL's rendered mask to a NumPy reference that
+    # uses that anchor's mask_coefs.
     matched = 0
     for b, m in zip(boxes, masks):
         cx = (b[0] + b[2]) * 0.5
@@ -503,19 +442,14 @@ def test_hailort_validator_pattern_dense_realistic_mask_coefs_match_numpy_refere
             f"detection at ({cx:.3f}, {cy:.3f}) mask diverges from "
             f"NumPy reference by up to {max_diff} u8 — HAL used the "
             f"WRONG mask_coefs row (indicating mask-detection "
-            f"misalignment per HAILORT_BUG.md hypothesis)"
+            f"misalignment)"
         )
         matched += 1
     assert matched == len(targets)
 
 
 def test_hailort_validator_pattern_contiguous_control():
-    """Control: same data but passed as a C-contiguous copy.
-
-    If the non-contig test fails and this one passes, the bug is in
-    `Tensor.from_numpy`'s non-contiguous copy path. If both pass, the
-    HAL decoder is not mis-pairing masks under validator-style input.
-    """
+    """Control: the same data passed as a C-contiguous copy."""
     nc = 80
     nm = 32
     feat = 4 + nc + nm
@@ -543,7 +477,6 @@ def test_hailort_validator_pattern_contiguous_control():
         parts.append(chunk)
 
     detection_view = _build_combined_detection_tensor(parts, normalize_boxes=True)
-    # Force a fresh C-contig copy.
     detection = np.ascontiguousarray(detection_view)
     assert detection.flags["C_CONTIGUOUS"]
 

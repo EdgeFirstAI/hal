@@ -3,10 +3,9 @@
 
 //! The C API for `edgefirst-tracker`: ByteTrack multi-object tracking.
 //!
-//! Takes detections as a plain `(const ef_detect_box *, size_t)` pair — the
-//! same view `ef_detect_box_list_data()`/`_len()` give back — so this library
-//! needs only the by-value `ef_detect_box` type, declared in
-//! `edgefirst/decoder.h`, and never links `libedgefirst_decoder`.
+//! Takes detections as a plain `(const ef_detect_box *, size_t)` pair, the
+//! view `ef_detect_box_list_data()`/`_len()` give back. `ef_detect_box` is
+//! declared in `edgefirst/detect.h`.
 
 pub mod bytetrack;
 
@@ -26,9 +25,8 @@ mod tests {
         .expect("cbindgen wrote include/edgefirst/tracker.h")
     }
 
-    /// `-Werror`: a header that merely parses is not enough. The vtable once
-    /// declared a type before it existed and warned on every dispatch while
-    /// still exiting 0.
+    /// Syntax-checks `src` against the headers with `-Werror -Wall`. `None`
+    /// when no C compiler is available.
     fn cc_syntax_check(src: &str) -> Option<std::process::Output> {
         let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
         match std::process::Command::new(&cc)
@@ -66,10 +64,10 @@ mod tests {
     }
 
     #[test]
-    fn the_header_carries_none_of_the_monoliths_symbols() {
+    fn the_header_carries_no_hal_symbols() {
         assert!(
             !header_text().contains("hal_"),
-            "tracker.h must not carry the monolith's hal_* symbols"
+            "tracker.h must not carry hal_* symbols"
         );
     }
 

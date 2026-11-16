@@ -1,25 +1,9 @@
 """The shipped type stubs must describe the module that ships with them.
 
-Nothing compared `__init__.pyi` to the extension module it annotates, so the
-0.29 packaging split left four stubs quietly wrong: `edgefirst.tensor`'s stub
-declared a `TensorMap` class that no longer exists and a `normalize_to_numpy` /
-`save_jpeg` pair that live in other packages, while `HostPin`, `HostView` and
-`CpuAccessGuard` had no stubs at all. A stub is API documentation the type
-checker enforces on *users*, so a wrong one is worse than a missing one — it
-makes correct code fail to type-check and incorrect code pass.
-
-Two directions, because each catches a different rot:
-
-* **coverage** — every public runtime name has a stub declaration, module-level
-  names and class members alike. Catches new API that nobody stubbed:
-  `ImageProcessor.convert`, `convert_deferred` and `flush` went unstubbed for a
-  release because the module-level pass sees only the class.
-* **ghosts** — every unconditionally-stubbed class and method exists at
-  runtime. Catches API that was removed or moved to another package.
-
-Names bound inside an `if` in the stub (`if sys.platform == "linux":`) are
-counted for coverage but exempt from the ghost check: they are deliberately
-absent on other platforms.
+Checks coverage (every public runtime name, module-level and class member, has a stub
+declaration) and ghosts (every unconditionally stubbed class and method exists at
+runtime). Names bound inside an `if` in the stub count for coverage and are exempt from
+the ghost check.
 """
 
 from __future__ import annotations
@@ -77,7 +61,7 @@ def _imported_bases(tree: ast.Module) -> dict[str, tuple[str, str]]:
     """Imported name -> (module, original name), `if` bodies included.
 
     `from edgefirst.tensor import Tensor as _BaseTensor` maps `_BaseTensor` to
-    `("edgefirst.tensor", "Tensor")`, which is enough to open that stub.
+    `("edgefirst.tensor", "Tensor")`.
     """
     bases: dict[str, tuple[str, str]] = {}
 
@@ -95,11 +79,9 @@ def _imported_bases(tree: ast.Module) -> dict[str, tuple[str, str]]:
 
 
 def _stub_class_members(module: str, name: str) -> set[str]:
-    """Members `class <name>` declares in the stub of `module`, if it is one
-    of ours.
+    """Members `class <name>` declares in the stub of `module`, if it is one of ours.
 
-    A base from `typing` or `enum` has no stub here, so it contributes nothing:
-    `vars()` on the runtime class does not see those members either.
+    A base from `typing` or `enum` contributes nothing.
     """
     prefix = "edgefirst."
     if not module.startswith(prefix) or module[len(prefix) :] not in PACKAGES:
@@ -115,11 +97,7 @@ def _stub_class_members(module: str, name: str) -> set[str]:
 
 
 def _runtime_members(cls) -> set[str]:
-    """Public, non-dunder callables and properties the class itself defines.
-
-    `vars`, not `dir`: an inherited `object` member is not this class's API and
-    no stub is expected to redeclare it.
-    """
+    """Public, non-dunder callables and properties the class itself defines."""
     kinds = (
         property,
         staticmethod,
@@ -143,8 +121,7 @@ def _runtime_members(cls) -> set[str]:
 @pytest.mark.parametrize("pkg", PACKAGES)
 def test_every_runtime_name_is_stubbed(pkg: str):
     tree = ast.parse(stub_path(pkg).read_text())
-    # Conditional bodies count here: a name gated on sys.platform is still
-    # stubbed, and this test may run on the platform that has it.
+    # Names in conditional bodies count as stubbed.
     conditional = [
         c for n in tree.body if isinstance(n, ast.If) for c in (*n.body, *n.orelse)
     ]
@@ -162,12 +139,7 @@ def test_every_runtime_name_is_stubbed(pkg: str):
 
 @pytest.mark.parametrize("pkg", PACKAGES)
 def test_every_runtime_class_member_is_stubbed(pkg: str):
-    """The module-level pass above sees a class, never its methods.
-
-    A method missing from a stubbed class is invisible to both older
-    directions: coverage stops at the class name, and the ghost pass only
-    walks the other way.
-    """
+    """Every public member of a runtime class is declared in its stub class."""
     tree = ast.parse(stub_path(pkg).read_text())
     conditional = [
         c for n in tree.body if isinstance(n, ast.If) for c in (*n.body, *n.orelse)
@@ -184,7 +156,7 @@ def test_every_runtime_class_member_is_stubbed(pkg: str):
     for name, node in classes.items():
         runtime_cls = getattr(mod, name, None)
         if not isinstance(runtime_cls, type):
-            continue  # a ghost, or a re-exported alias; the other test owns it
+            continue  # a ghost, or a re-exported alias
         declared = {m for m in _class_members(node) if not m.startswith("_")}
         bases = [
             imported[b.id]
@@ -192,17 +164,13 @@ def test_every_runtime_class_member_is_stubbed(pkg: str):
             if isinstance(b, ast.Name) and b.id in imported
         ]
         if bases:
-            # The class inherits part of its surface from a stub this file does
-            # not contain (`edgefirst.codec`'s Tensor extends
-            # `edgefirst.tensor`'s). The additions this stub class makes on
-            # its own must exist on the runtime class.
+            # The additions a stub class with an imported base makes must exist
+            # on the runtime class.
             absent += [
                 f"{name}.{m}" for m in sorted(declared) if not hasattr(runtime_cls, m)
             ]
-        # The runtime class is not a Python subclass of the base (each
-        # extension registers its own `Tensor`, with the shared methods
-        # repeated on it), so `vars()` holds the base's members too. Those
-        # are the base stub's to declare; what is left must be declared here.
+        # `vars()` on the runtime class holds the base's members too; those are
+        # the base stub's to declare.
         inherited: set[str] = set()
         for module, base_name in bases:
             inherited |= _stub_class_members(module, base_name)
@@ -231,9 +199,6 @@ def test_no_stubbed_name_is_a_ghost(pkg: str):
             continue
         runtime_cls = getattr(mod, node.name, None)
         if runtime_cls is None:
-            # An imported alias re-exported under another name is not a class
-            # this module defines; only flag names the stub declares with
-            # `class`, which this branch is.
             ghosts.append(f"class {node.name}")
             continue
         have = {m for m in dir(runtime_cls)}
@@ -241,7 +206,7 @@ def test_no_stubbed_name_is_a_ghost(pkg: str):
             if not isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
             if member.name.startswith("__"):
-                continue  # dunders come from the metaclass/protocol, not dir()
+                continue
             if member.name not in have:
                 ghosts.append(f"{node.name}.{member.name}")
 

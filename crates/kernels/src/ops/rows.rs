@@ -71,7 +71,7 @@ impl<T> Clone for RowsPtr<T> {
 }
 impl<T> Copy for RowsPtr<T> {}
 
-// SAFETY: rows never overlap (checked) and each block runs once; a safe `Pool` cannot keep the task past `run`, so the caller sees every write.
+// SAFETY: rows never overlap and each block runs once; a `Pool` does not keep the task past `run`.
 unsafe impl<T: Send> Sync for RowsPtr<T> {}
 
 impl<T> RowsPtr<T> {
@@ -83,7 +83,7 @@ impl<T> RowsPtr<T> {
 
 /// Rejects a view whose axes, sorted by stride, do not each step past the extent of the smaller ones.
 ///
-/// This guarantees no element is addressed twice; it also rejects interleaved layouts that do not alias.
+/// An accepted view addresses no element twice; interleaved layouts that do not alias are rejected too.
 pub(crate) fn check_no_overlap(shape: &[usize], strides: &[isize]) -> Result<()> {
     if shape.contains(&0) {
         return Ok(());
@@ -515,11 +515,9 @@ impl<'a> Offsets<'a> {
 /// order; chunks may run concurrently on `pool`.
 ///
 /// Input and output must have the same shape (any rank, including 0). Every chunk starts at a
-/// multiple of [`CHUNK`], so a kernel whose result depends on an element's position modulo its
-/// vector width gives the same result as one call over the whole flattened tensor, whatever
-/// the strides and the pool. Non-contiguous sides are staged through stack buffers. The output
-/// must pass [`check_no_overlap`]. Everything is validated before the first write. `chunk` must
-/// write every element of its output slice.
+/// multiple of [`CHUNK`], whatever the strides and the pool. Non-contiguous sides are staged
+/// through stack buffers. The output must pass [`check_no_overlap`]. Everything is validated
+/// before the first write. `chunk` must write every element of its output slice.
 pub(crate) fn for_each_chunk<I, O>(
     input: &View<'_, I>,
     output: &mut ViewMut<'_, O>,
@@ -647,12 +645,10 @@ const TILE_COLS: usize = 64;
 /// `chunk(input tile, output tile)` on 16×64 tiles of those two axes, transposed from the
 /// input into a stack buffer in output order and written back as output row segments.
 ///
-/// A task owns one 64-wide column block and walks every input block of it, so each source
-/// row is read once while cached and the output is written in whole 64-element runs; tasks
-/// may run concurrently on `pool`.
+/// A task owns one 64-wide column block and walks every input block of it; tasks may run
+/// concurrently on `pool`.
 ///
-/// Returns `None`, touching nothing, when the views are not such a pair; the caller then takes
-/// [`for_each_chunk`].
+/// Returns `None`, touching nothing, when the views are not such a pair.
 pub(crate) fn for_each_transposed_tile<T>(
     input: &View<'_, T>,
     output: &mut ViewMut<'_, T>,
@@ -741,11 +737,8 @@ where
 /// of [`for_each_transposed_tile`] when both tile axes are multiples of 16, as 16×16 tiles
 /// transposed in registers with each of the 16 vectors passed through `f`; and when the input
 /// axis is two or four long, sixteen of its runs at a time deinterleaved with `ld2`/`ld4`.
-/// Axes contiguous on both sides are merged first, so a channel slice of an NHWC tensor
-/// written channel-major is one long transpose. A 16×64 strip is
-/// staged on the stack so every output row is written as one 64-byte run: with output rows far
-/// apart, short scattered stores cost more than the arithmetic. Tasks own 64-wide column
-/// blocks as there.
+/// Axes contiguous on both sides are merged first. A 16×64 strip is staged on the stack and
+/// every output row is written as one 64-byte run. Tasks own 64-wide column blocks as there.
 ///
 /// Returns `None`, touching nothing, when the views are not such a pair, the elements are not
 /// bytes, or an axis does not suit either path.
@@ -820,7 +813,7 @@ where
         for (bi, bo, ob) in outer_items(r, axes, col_blocks) {
             let o0 = ob * TILE_COLS;
             let to = (no - o0).min(TILE_COLS);
-            // One 16-row strip of the block, staged so each output row is written as one run.
+            // One 16-row strip of the block.
             let mut strip = [0u8; TILE_EDGE * TILE_COLS];
             if narrow {
                 let first = bi + o0 * in_step;
@@ -905,8 +898,7 @@ where
     Some(Ok(()))
 }
 
-/// Copies `n` elements; a full row of one-byte elements moves as four 16-byte registers rather
-/// than through a `memcpy` call.
+/// Copies `n` elements; a full row of one-byte elements moves as four 16-byte registers.
 ///
 /// # Safety
 /// As [`core::ptr::copy_nonoverlapping`].
@@ -1000,8 +992,7 @@ impl<'a, T> RowGroup<'a, T> {
 /// sides, calls `group` on consecutive groups of [`ROW_GROUP`] rows (fewer for the last);
 /// groups may run concurrently on `pool`.
 ///
-/// Rows are walked in output memory order (outer axes sorted by output stride, largest first),
-/// so consecutive groups write consecutive memory.
+/// Rows are walked in output memory order (outer axes sorted by output stride, largest first).
 ///
 /// The views agree on every axis but the last, which holds the rows; input and output rows may
 /// differ in length. Returns `None`, touching nothing, when the outer axes differ or a row is
@@ -1035,7 +1026,7 @@ where
     if rows == 0 || n == 0 || m == 0 {
         return Some(Ok(()));
     }
-    // Unit axes never move; dropping them keeps the innermost walked axis a real one.
+    // Unit axes are dropped.
     let mut axes = [Axis::default(); MAX_RANK];
     let mut n_axes = 0;
     for (a, &extent) in outer.iter().enumerate().filter(|&(_, &d)| d > 1) {
@@ -1327,7 +1318,7 @@ where
     let out_strides = out_strides.get(..shape.len()).unwrap_or(&[]);
     let (lhs_dense, rhs_dense) = (lhs.as_contiguous(), rhs.as_contiguous());
     let out_dense = output.as_contiguous_mut().is_some();
-    // Row segments in place, unless the dense path below already passes whole chunks.
+    // Row segments in place, unless the dense path below passes whole chunks.
     let row_runs = !(lhs_dense.is_some() && rhs_dense.is_some() && out_dense)
         && [lhs.strides(), rhs.strides(), out_strides]
             .iter()
@@ -1398,7 +1389,7 @@ mod tests {
         assert!(check_no_overlap(&[4, 8], &[7, 1]).is_err());
         assert!(check_no_overlap(&[4, 8], &[8, 0]).is_err());
         assert!(check_no_overlap(&[2, 3, 4], &[1, 4, 2]).is_err());
-        // Injective but interleaved: rejected by design.
+        // Injective but interleaved.
         assert!(check_no_overlap(&[3, 2], &[2, 3]).is_err());
     }
 

@@ -9,8 +9,6 @@ use half::f16;
 /// Numerically-stable sigmoid:
 /// - For x >= 0: 1 / (1 + exp(-x))
 /// - For x <  0: exp(x) / (1 + exp(x))
-///
-/// Avoids overflow in either direction.
 #[inline]
 fn sigmoid_one_f32(x: f32) -> f32 {
     if x >= 0.0 {
@@ -69,7 +67,6 @@ pub fn fast_sigmoid(f: f32) -> f32 {
     if f.abs() > 80.0 {
         f.signum() * 0.5 + 0.5
     } else {
-        // exp_raw is only valid for -88 < x < 88; the guard above keeps us in range
         1.0 / (1.0 + exp_raw(-f))
     }
 }

@@ -180,9 +180,7 @@ fn attention_plans_and_scratch_are_send_and_sync() {
     assert_send_sync::<AttentionScratch>();
 }
 
-/// The scalar tier gives TFLite's bytes; the NEON tiers give the crate's chain on that tier
-/// bit for bit, whose only departure from TFLite is the NEON softmax's ±1 LSB, and they stay
-/// within one LSB of TFLite on these fixtures.
+/// The scalar tier gives TFLite's bytes; the NEON tiers give the crate's chain bit for bit.
 #[test]
 fn fixtures_match_tflite_and_the_chain() {
     for name in FIXTURES {
@@ -210,8 +208,7 @@ fn fixtures_match_tflite_and_the_chain() {
     }
 }
 
-/// The largest shapes the kernels take, and one less, on every tier: the fused plan equals the
-/// chain, so the stack buffers and scratch hold every row and vector.
+/// The largest shapes the kernels take, and one less: the fused plan equals the chain on every tier.
 #[test]
 fn limits_equal_the_chain() {
     let p = AttentionI8Params {
@@ -290,9 +287,7 @@ fn limits_equal_the_chain() {
     assert!(plan.scratch(usize::MAX, usize::MAX, 8, 8, 8).is_err());
 }
 
-/// Head slices of one token-major `[tokens, heads · (2·dk + dv)]` tensor, as a TFLite graph
-/// holds Q, K and V, into a token-major output with a gap after each token: every tier
-/// equals its run on contiguous copies.
+/// Head slices of one token-major tensor equal the run on contiguous copies.
 #[test]
 fn strided_views_match_contiguous() {
     let g = common::load_graph("attention_i8_odd");
@@ -395,8 +390,7 @@ fn strided_views_match_contiguous() {
     }
 }
 
-/// One scratch serves many calls; a scratch built for other shapes, or by a plan whose kernel
-/// packs another layout, is rejected before anything is written.
+/// One scratch serves many calls; a mismatched scratch is rejected before anything is written.
 #[test]
 fn scratch_is_reused_and_mismatches_are_rejected() {
     let g = common::load_graph("attention_i8_odd");

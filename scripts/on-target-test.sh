@@ -2,21 +2,10 @@
 # SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 # SPDX-License-Identifier: Apache-2.0
 #
-# Cross-build a tests bundle (scripts/on-target-bundle.sh: the Rust test
-# binaries, the modular C-API libraries and the G3 two-library-user C
-# binary), deploy it to SSH hosts, and run the suite -- plus
-# scripts/check-single-home.sh's G1/G2/G4/G9/G11 -- on real hardware through
-# the bundle's own scripts/on-target-run.sh.
-#
-# The hardware-test workflow runs the same bundle and the same board-side
-# script on the self-hosted fleet. This is the ssh path to the same run, for
-# any board you can reach, which is how you catch behaviour that differs by
-# SoC (older cores taking lower-precision SIMD fallbacks, kernels built
-# without DMA-BUF heaps, vendor GPU quirks) on hardware the fleet lacks, and
-# how a new board is validated before it is given a fleet label.
-#
-# Hosts are yours to supply — there are no defaults. Anything reachable by
-# `ssh <host>` works; put the connection details in ~/.ssh/config.
+# Cross-builds a tests bundle with scripts/on-target-bundle.sh, deploys it to
+# SSH hosts and runs the bundle's scripts/on-target-run.sh on each. The
+# hardware-test workflow runs the same bundle and board-side script on the
+# self-hosted fleet.
 #
 # Usage:
 #   ./scripts/on-target-test.sh <ssh-host> [ssh-host...]
@@ -25,41 +14,26 @@
 # Env:
 #   EDGEFIRST_TARGETS  space-separated SSH hosts (alternative to arguments)
 #   CRATES             cargo packages to test  (default: every crate with tests)
-#   CAPI_CRATES        the -capi leaves to build+deploy for G1/G2/G3/G4/
-#                      G9/G11 (default: all of them; each is its own standalone
-#                      workspace, see each crate's own Cargo.toml comment)
+#   CAPI_CRATES        the -capi leaves to build and deploy (default: all of
+#                      them)
 #   GLIBC              glibc floor for the build (default: the project floor,
 #                      see README "Toolchain and Platform Floors")
-#   FEATURES           cargo features for the TEST build, space- or
-#                      comma-separated (default: none, so the crates build
-#                      with their own defaults). The DMA-BUF and G2D suites
-#                      need no feature: they always build and are enforced on
-#                      the board by HAL_TEST_REQUIRE_DMA/_G2D. With more than one package selected,
-#                      cargo wants a feature that is not shared spelled
-#                      `<pkg>/<feature>`. Applied to the test build only, not
-#                      to the C-API leaves.
-#   FILTER             test-name filter passed to each binary. Matches the test
-#                      FUNCTION name, not the file or binary name; one naming a
-#                      source file matches nothing and every binary runs zero
-#                      tests, reported as NO-TESTS.
+#   FEATURES           cargo features for the test build, space- or
+#                      comma-separated (default: none); `<pkg>/<feature>` when
+#                      more than one package is selected. Not applied to the
+#                      C-API leaves.
+#   FILTER             test-name filter passed to each binary. It matches the
+#                      test function name; a filter that matches nothing makes
+#                      every binary run zero tests, reported as NO-TESTS.
 #   REMOTE_DIR         remote bundle dir       (default: /tmp/hal-ontarget)
 #   SYNC_TESTDATA      1 to rsync testdata/    (default: 1); 0 keeps the
 #                      testdata already on the host
 #   REQUIRE_GPU        1 to fail a host without a DRM render node as NO-GPU
-#                      instead of letting every GPU test skip (default: 0)
+#                      (default: 0)
 #
-# Exit status is non-zero if any host reported a test failure, and also if a
-# host ran no tests at all, reported as NO-TESTS and distinct from FAIL: a run
-# that exercised nothing cannot exit zero. A host that is unreachable, or that
-# lacks the hardware a test needs, is reported separately and does NOT mask a
-# real failure elsewhere. So is a host another run is using, as BUSY: two runs
-# against one host share REMOTE_DIR on it and the host's results directory
-# here, and would read back each other's results. Same rule for the deployed
-# check-single-home.sh: G5 (footprint) and G7 (Miri) only ever make sense on
-# the build host and are never deployed, so they correctly read
-# cannot_measure on every board -- a named, attributable gap for those two
-# gates specifically, not counted as a failure here. G1/G1b/G2/G4/G9/G11 have
-# everything they need on a board and a failure there IS counted.
+# Exits non-zero when any host reports a test failure or ran no tests
+# (NO-TESTS). An unreachable host and a host another run is using (BUSY) are
+# reported separately.
 
 set -uo pipefail
 
@@ -67,13 +41,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT}"
 
 CRATES="${CRATES:-edgefirst-tensor edgefirst-codec edgefirst-image edgefirst-decoder edgefirst-tracker edgefirst-kernels}"
-# The modular C-API leaves: each is
-# its own standalone `[workspace]` (see each Cargo.toml's own comment), so
-# these are built by `--manifest-path`, not `-p`, unlike CRATES above.
+# Each -capi leaf is its own workspace, built by `--manifest-path`.
 CAPI_CRATES="${CAPI_CRATES:-tensor-capi image-capi codec-capi decoder-capi tracker-capi kernels-capi}"
-# The project's chosen glibc floor, not a probed value: binaries are built
-# against it so one set runs on every supported target. Declared alongside the
-# MSRV in the README -- change it there and here together.
+# The glibc floor the binaries are built against.
 GLIBC="${GLIBC:-2.35}"
 FEATURES="${FEATURES:-}"
 FILTER="${FILTER:-}"
@@ -109,10 +79,7 @@ mkdir -p "${RESULTS}"
 # ---------------------------------------------------------------------------
 # Probe
 # ---------------------------------------------------------------------------
-# Which architectures to build, and what hardware each host has, are discovered
-# from the hosts themselves, so adding a board is purely a matter of naming it
-# on the command line. The glibc floor is NOT discovered -- it is a declared
-# project floor (see above).
+# Reads each host's architecture and hardware from the host.
 declare -a OK_HOSTS=() OK_ARCH=()
 declare -a SUMMARY=()
 
@@ -161,14 +128,9 @@ done
 # ---------------------------------------------------------------------------
 overall=0
 
-# One run per host at a time, held for the whole deploy-run-fetch of that
-# host. mkdir is the lock because it is atomic in every shell, BusyBox's
-# included. The owner line (machine, pid, start time) is the lock's token: a
-# run releases the lock only while the owner file still holds its own token,
-# so it never removes a lock another run took, including one taken after the
-# stale-lock command below cleared this run's. A lock left by a killed run is
-# cleared by hand (the BUSY message says how) or by the board's next reboot,
-# since REMOTE_DIR is in /tmp.
+# Takes one lock per host for its deploy, run and fetch: a directory made
+# with mkdir, holding an owner file with this run's token. A run releases a
+# lock only while the owner file holds its own token.
 LOCK="${REMOTE_DIR}.lock"
 CURRENT_LOCK=""
 LOCK_OWNER=""
@@ -228,12 +190,8 @@ for i in "${!OK_HOSTS[@]}"; do
   out_dir="${RESULTS}/${target//[^A-Za-z0-9._-]/_}"
   rm -rf "${out_dir}"; mkdir -p "${out_dir}"
 
-  # --delete: a renamed or deleted test binary must not keep running from a
-  # previous deploy. rsync, not scp: testdata/ is large and mostly unchanged
-  # run to run. With SYNC_TESTDATA=0 the bundle has no testdata/, and the
-  # exclude keeps --delete from removing the host's copy. A minimal BSP image
-  # may have no rsync; tar over ssh replaces the whole bundle instead, keeping
-  # testdata/ the same way.
+  # Syncs the bundle with rsync --delete, or with tar over ssh on a host
+  # without rsync. With SYNC_TESTDATA=0 the host's testdata/ is kept.
   ssh_q "${target}" "mkdir -p '${REMOTE_DIR}'"
   if ssh_q "${target}" "command -v rsync" > /dev/null 2>&1; then
     has_rsync=1

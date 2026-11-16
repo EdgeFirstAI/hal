@@ -3,22 +3,15 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # 4:2:0 control corpus: transcode COCO val2017 (4:4:4 as distributed) to
-# 4:2:0 with libjpeg-turbo cjpeg — same 5000 images, subsampling changed.
-# This is the control that answers "is the measured decoder gap driven by the
-# corpus being 4:4:4?": rerun the decoder A/B against this directory and
-# compare the relative gaps.
+# 4:2:0 with libjpeg-turbo cjpeg.
 #
-# The transcode re-encodes at a fixed --quality (default 90), so against the
-# ORIGINAL corpus two variables change (quality + subsampling). Pass
-# --with-444-twin to also emit a 4:4:4 re-encode at the same quality: the
-# twin pair differs ONLY in subsampling and is the airtight isolate.
+# The transcode re-encodes at a fixed --quality (default 90). Pass
+# --with-444-twin to also emit a 4:4:4 re-encode at the same quality.
 #
-# Greyscale sources (10 in val2017) pass through djpeg|cjpeg unchanged in
-# kind (no chroma to subsample) so every arm still sees all 5000 files.
+# Greyscale sources pass through djpeg|cjpeg as single-component JPEGs.
 #
-# COCO images carry individual Flickr CC licenses (some NC): NEVER publish or
-# redistribute the transcoded JPEGs — generate locally, sync only to private
-# board/S3 storage.
+# COCO images carry individual Flickr CC licenses (some NC): do not publish
+# or redistribute the transcoded JPEGs.
 #
 # Usage:
 #   ./benchmarks/scripts/make-coco-yuv420.sh [--src DIR] [--quality N]
@@ -69,7 +62,7 @@ transcode_dir() { # sample_arg out_dir
   echo "    ${n_out}/${n_src} files"
   [[ "${n_out}" == "${n_src}" ]] || { echo "ERROR: incomplete transcode in ${out}" >&2; exit 1; }
 
-  # Record the exact recipe next to the corpus.
+  # Record the recipe next to the corpus.
   {
     echo "source: ${SRC}"
     echo "recipe: djpeg | cjpeg -quality ${QUALITY} -sample ${sample}"

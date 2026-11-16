@@ -17,7 +17,7 @@ use crate::view::{TensorMut, TensorRef};
 /// Parameters of an int8 softmax.
 ///
 /// The output must be quantized with scale 1/256 (within 0.1%) and zero point −128, as TFLite
-/// requires for int8 `SOFTMAX`. The input zero point is unused: softmax is shift-invariant.
+/// requires for int8 `SOFTMAX`. The input zero point is unused.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SoftmaxI8Params {
     pub input: Quant,
@@ -36,7 +36,7 @@ enum Kernel {
 ///
 /// Reproduces TFLite's `optimized_ops::Softmax<int8_t, int8_t>`: the scalar tier bit for bit
 /// where `f32::exp` is glibc's `expf` (as on the Linux targets; another libm can move a table
-/// entry by an ulp), the NEON tiers within ±1 LSB (they sum the row in a different order).
+/// entry by an ulp), the NEON tiers within ±1 LSB.
 ///
 /// ```
 /// use edgefirst_kernels::{Quant, SoftmaxI8Params, SoftmaxI8Plan, TensorMut, TensorRef, View, ViewMut};
@@ -270,8 +270,7 @@ pub(super) fn exp16_tables(scale: f32) -> [[u8; 16]; 4] {
 
 /// One 16-element row with the arithmetic of the 16-row NEON kernel
 /// (`softmax_i8_neon::rows16`), lane for lane. On NEON tiers every 16-element row takes this
-/// result, alone or in a group of sixteen, so the op and the fused kernels that call
-/// [`SoftmaxI8Plan::row`] agree. Each `exp` is the exact product `A·B` of the
+/// result, alone or in a group of sixteen. Each `exp` is the exact product `A·B` of the
 /// [`exp16_tables`] entries (1.0 is 65535²); the sum adds each product shifted right by 4 with
 /// rounding; the output is `e / (16·sum·out_scale)` rounded half away from zero, saturated to
 /// `0..=255`, less 128 (the plan's output zero point).

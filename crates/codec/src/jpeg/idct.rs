@@ -15,33 +15,19 @@ pub mod sse2;
 #[cfg(target_arch = "x86_64")]
 pub mod avx2;
 
-/// IDCT function signature: takes 64 **quantised** coefficients and the
+/// IDCT function signature: takes 64 quantised coefficients and the
 /// component's quantisation table, both in natural (row-major) order.
-/// Dequantisation happens inside the kernel (libjpeg-turbo model: the entropy
-/// decoder emits raw `i16` coefficients; SIMD kernels dequantise 8 lanes at a
-/// time). Writes 64 clamped u8 values into `output` at the given stride.
+/// Dequantisation happens inside the kernel. Writes 64 clamped u8 values into
+/// `output` at the given stride.
 ///
 /// # Range
 ///
-/// Both arguments come from the file, so `coefficient × quantiser` is not
-/// evaluated over the full `i16 × u16` range the types allow. As in
-/// libjpeg-turbo, the dequantised block is held in `i16` and the multiply
-/// **wraps**, and the workspace between the two passes is narrowed back to
-/// `i16` **saturating**. JPEG syntax permits products that overflow both
-/// (1023 × 255), but no encoder emits them: a large quantiser means the
-/// encoder already divided the coefficient down to match.
-///
-/// What every kernel guarantees for such a stream is that it is absorbed as
-/// defined arithmetic — no panic under overflow checks, no write outside the
-/// block ([`tests::extreme_coefficients_do_not_panic_or_overrun`]). What no
-/// kernel guarantees is the resulting pixel values, which past the saturation
-/// point depend on where each kernel loses range. [`scalar`] is written to
-/// wrap and saturate at exactly the points the vector kernels are forced to,
-/// so the x86 kernels stay bit-exact with it over the whole input space; the
-/// NEON kernel splits its final descale and so tracks the reference to ±1, as
-/// its `assert_parity` records. Decoding a *valid* stream is therefore
-/// tier-independent on x86 and tier-independent to ±1 on aarch64, which is the
-/// same tolerance libjpeg-turbo allows between its own scalar and SIMD paths.
+/// The dequantised block is held in `i16` and the multiply wraps; the
+/// workspace between the two passes is narrowed back to `i16` saturating. A
+/// stream whose products overflow is absorbed as defined arithmetic: no panic
+/// and no write outside the block; the resulting pixel values are
+/// unspecified. For a valid stream the x86 kernels are bit-exact with
+/// [`scalar`] and the NEON kernel is within ±1 of it.
 pub type IdctFn = fn(coeffs: &[i16; 64], quant: &[u16; 64], output: &mut [u8], stride: usize);
 
 /// Select the best available IDCT implementation for this CPU.
@@ -71,8 +57,7 @@ pub fn select_idct() -> IdctFn {
                     return sse2::idct_8x8_sse2;
                 }
             }
-            // The islow kernel needs only SSE2 (`pmullw`, `pmaddwd`, `packssdw`,
-            // `packuswb`), so SSE4.1 has nothing to add over it.
+            // The SSE4.1 tier uses the SSE2 kernel.
             IntelTier::Sse41 | IntelTier::Sse2 => {
                 if is_x86_feature_detected!("sse2") {
                     return sse2::idct_8x8_sse2;
@@ -119,13 +104,8 @@ pub fn select_idct_dc_only() -> IdctDcOnlyFn {
 mod tests {
     use super::*;
 
-    /// Coefficients and quantisers both come from the file, so their product
-    /// can overflow the `i16` the kernels dequantise into — JPEG syntax allows
-    /// 1023 × 255 even though no encoder emits it. Every kernel, the scalar
-    /// reference included, must absorb that as defined wrapping/saturating
-    /// arithmetic: no panic under a debug build's overflow checks, and no write
-    /// outside the 8×8 block. Pixel *values* past the overflow point are
-    /// deliberately not asserted equal across tiers — see [`IdctFn`].
+    /// Products that overflow `i16` do not panic and do not write outside the
+    /// 8×8 block, in any kernel.
     #[test]
     fn extreme_coefficients_do_not_panic_or_overrun() {
         let mut seed = 0x9E37_79B9_7F4A_7C15u64;
@@ -174,12 +154,8 @@ mod tests {
         }
     }
 
-    /// The DC-only shortcut has to agree with the scalar reference over the
-    /// whole `i32` argument, not just the range a valid stream produces: the
-    /// value is a dequantised coefficient, and the MCU loop reaches the
-    /// shortcut on corrupt blocks too. The fixed-point scaling inside these
-    /// kernels overflows well before `i32::MAX`, which is a debug-build panic
-    /// unless the arithmetic is written to wrap.
+    /// The selected DC-only kernel matches the scalar reference over the whole
+    /// `i32` argument range.
     #[test]
     fn selected_dc_only_matches_scalar() {
         let dc_only = select_idct_dc_only();
@@ -213,11 +189,8 @@ mod tests {
         }
     }
 
-    /// The DC-only shortcut stands in for the full kernel on blocks whose AC
-    /// coefficients are all zero, so it has to produce what the full kernel
-    /// would — including on the corrupt blocks the MCU loop still routes
-    /// through it. `dc_only_coefficient` in `mcu.rs` is what keeps the two
-    /// paths dequantising the same way.
+    /// The DC-only shortcut produces what the full kernel does on blocks whose
+    /// AC coefficients are all zero.
     #[test]
     fn dc_only_shortcut_matches_the_full_kernel() {
         let idct = select_idct();
@@ -246,8 +219,7 @@ mod bench {
     use std::time::Instant;
 
     /// Blocks with a JPEG-like sparsity profile: energy concentrated in the low
-    /// frequencies, ~8 non-zero AC coefficients, so the kernels see the branch
-    /// and data mix they meet on real photographic content.
+    /// frequencies, about 8 non-zero AC coefficients.
     fn corpus(n: usize) -> Vec<([i16; 64], [u16; 64])> {
         let mut seed = 0x2545_F491_4F6C_DD1Du64;
         let mut next = move || {
@@ -277,7 +249,7 @@ mod bench {
             .collect()
     }
 
-    /// Per-block cost of the selected IDCT. Not a correctness test — run with
+    /// Per-block cost of the selected IDCT. Run with
     /// `cargo test -p edgefirst-codec --release -- --ignored --nocapture idct_kernel_cost`.
     #[test]
     #[ignore = "timing benchmark, not a correctness check"]

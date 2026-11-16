@@ -16,67 +16,24 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 
-/// EGL library handle. Intentionally leaked (never dlclose'd) to avoid SIGBUS
-/// on process exit: GPU drivers may keep internal state that outlives explicit
-/// EGL cleanup, and dlclose can unmap memory still referenced by the driver.
+/// EGL library handle. Leaked (never dlclose'd).
 static EGL_LIB: OnceLock<&'static libloading::Library> = OnceLock::new();
 
-/// Global mutex serializing GL/EGL **lifecycle** operations across every
-/// `GLProcessorST` instance in the process — and, on Vivante only, every
-/// per-message operation as well.
+/// Global mutex serializing GL/EGL lifecycle operations across every
+/// `GLProcessorST` instance in the process, and every per-message operation
+/// under the Full serialization policy.
 ///
-/// The Vivante `galcore` driver (i.MX 8M Plus) is not thread-safe for
-/// concurrent EGL/GL calls, even when each thread targets an independent
-/// context: concurrent access corrupts driver-internal state (deadlocks or
-/// SIGSEGV inside kernel ioctls). On Vivante the worker therefore acquires
-/// this mutex for **every** message (`SerializationPolicy::Full`) — the
-/// pre-2026-06 behavior for all platforms.
-///
-/// ANGLE (GLES over Metal/D3D — the only GL on macOS) takes the same Full
-/// policy, for a different reason: a deferred draw does not reliably execute
-/// with the per-draw state its own processor programmed while another context
-/// is active. Measured on a real Apple M2 Max, not only paravirtual Metal.
-/// See `requires_full_serialization` in `processor/mod.rs` for the evidence,
-/// and `tests/gl_concurrent_stress.rs` for the reproducer.
-///
-/// Everywhere else (Mali, V3D, Tegra, llvmpipe) the per-message acquisition
-/// is skipped (`SerializationPolicy::LifecycleOnly`): each
-/// `GLProcessorThreaded` owns a dedicated worker thread and its own EGL
-/// context held current for the thread's life, and the EGL spec requires
-/// concurrent contexts on distinct threads to work. The P0 spike (2026-06,
-/// 4 processors × barrier × 200-convert oracle stress, 5 reps per leg)
-/// validated this clean on Mali G310, V3D, and Tegra/Orin — **those three
-/// drivers are the whole validated set**; treat any other driver's
-/// parallelism as unmeasured until it has been through the same stress.
-///
-/// What ALWAYS stays under this mutex, on every platform:
+/// Held for:
 /// - Initialization (`GLProcessorST::new` — EGL display probe/init, context
 ///   creation, shader compilation, DMA-BUF verification)
 /// - Teardown (`GLProcessorST::drop` → `GlContext::drop`)
 ///
-/// These are rare, cheap-to-serialize events that cover driver bring-up
-/// races. NOTE: the known Vivante concurrent-multi-processor double-free
-/// (see `EDGEFIRST_SKIP_VIVANTE_KNOWN_BUGS`) is NOT prevented by any
-/// locking — it reproduces with full serialization and appears to live in
-/// driver thread-exit TLS destructors; the test skip remains necessary.
-///
-/// Override: `EDGEFIRST_GL_SERIALIZE=full|lifecycle` forces the policy —
-/// `full` is the escape hatch for unknown-bad drivers, `lifecycle` forces
-/// parallelism (e.g. Vivante experiments). Unset = per-driver default.
+/// `EDGEFIRST_GL_SERIALIZE=full|lifecycle` forces the per-message policy;
+/// unset selects the per-driver default.
 pub(super) static GL_MUTEX: Mutex<()> = Mutex::new(());
 
-/// Dedicated short lock serializing EGLImage create/destroy across
-/// processors (a separate mutex from `GL_MUTEX`: in `Full` policy the
-/// worker already holds `GL_MUTEX` when creating images, and `std::sync::
-/// Mutex` is not reentrant).
-///
-/// `eglCreateImageKHR`/`eglDestroyImageKHR` are display-level operations
-/// the EGL spec requires to be thread-safe, but this module's premise is
-/// embedded drivers violating the spec. The P0 spike ran Mali/V3D/Tegra
-/// clean WITHOUT this lock (5 reps each), so it is likely removable; it is
-/// kept because the steady-state cost is zero — image creation is
-/// cache-miss-only (one import per buffer after warmup, pinned by the
-/// `image.convert.gl.egl_import` span gates).
+/// Lock serializing EGLImage create/destroy across processors. Separate
+/// from `GL_MUTEX`.
 static EGL_IMAGE_MUTEX: Mutex<()> = Mutex::new(());
 
 /// Acquire the EGLImage lifecycle lock (see [`EGL_IMAGE_MUTEX`]).
@@ -84,14 +41,8 @@ pub(super) fn image_lifecycle_guard() -> std::sync::MutexGuard<'static, ()> {
     EGL_IMAGE_MUTEX.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Shared EGL display — created once, reused by all `GlContext` instances.
-///
-/// On Vivante galcore (i.MX8M Plus), opening multiple DRM fds causes
-/// kernel-level deadlocks between the galcore and DRM ioctl paths. Sharing
-/// one display (and its backing GBM device / DRM fd) avoids the conflict.
-///
-/// The display is never terminated (intentional leak). Same pattern as
-/// `EGL_LIB` above and `SHARED_DRM_FD` in `crates/tensor/src/dmabuf.rs`.
+/// Shared EGL display — created once, reused by all `GlContext` instances,
+/// and never terminated.
 struct SharedEglDisplay {
     display: egl::Display,
     kind: EglDisplayKind,
@@ -108,22 +59,20 @@ enum SharedDisplayResources {
     Default,
 }
 
-// SAFETY: SharedEglDisplay is only accessed under GL_MUTEX or OnceLock
-// initialization (which is itself synchronized). The egl::Display handle
-// is a raw pointer, but all EGL calls using it are serialized by GL_MUTEX.
+// SAFETY: SharedEglDisplay is only accessed under GL_MUTEX or during
+// OnceLock initialization.
 unsafe impl Send for SharedEglDisplay {}
 unsafe impl Sync for SharedEglDisplay {}
 
 static SHARED_DISPLAY: OnceLock<Result<SharedEglDisplay, String>> = OnceLock::new();
 
-/// Initialize the shared EGL display. Called once per process via `OnceLock`.
-///
-/// Probes display types in priority order (PlatformDevice → GBM → Default),
-/// initializes the first that works, and detects DMA-BUF support via
-/// display extension queries. No temporary GL context is created —
-/// Vivante galcore corrupts state on context create/destroy cycles.
+/// Opens one kind of EGL display.
 type DisplayFn = fn(&Egl) -> Result<EglDisplayType, crate::Error>;
 
+/// Initialize the shared EGL display. Probes display types in priority order
+/// (PlatformDevice → GBM → Default), or only `kind` when given, initializes
+/// the first that works, and detects DMA-BUF support via display extension
+/// queries.
 fn init_shared_display(
     egl: &Rc<Egl>,
     kind: Option<EglDisplayKind>,
@@ -161,9 +110,7 @@ fn init_shared_display(
             continue;
         }
 
-        // Adreno's EGL_PLATFORM_DEVICE_EXT display initializes but segfaults
-        // on eglQueryString(EGL_EXTENSIONS); its GBM display is fully
-        // functional. EGL_VENDOR is safe to query on the device display.
+        // Skip the PlatformDevice display on Qualcomm Adreno.
         if kind == EglDisplayKind::PlatformDevice {
             let is_qualcomm = egl
                 .query_string(Some(display), egl::VENDOR)
@@ -199,17 +146,12 @@ fn init_shared_display(
             continue;
         }
 
-        // Check DMA-BUF support (display extension query — no context needed)
+        // Check DMA-BUF support through the display extension string.
         let transfer_backend = if GlContext::egl_check_support_dma(egl, display).is_ok() {
             TransferBackend::DmaBuf
         } else {
             TransferBackend::Sync
         };
-
-        // Do NOT create a temporary context here to probe has_compute.
-        // On Vivante galcore, creating and destroying a context before
-        // the real one corrupts driver state and causes deadlocks.
-        // Each GlContext::new() will try GLES 3.1 → 3.0 itself.
 
         let resources = match display_type {
             EglDisplayType::Gbm(_, gbm) => SharedDisplayResources::Gbm(gbm),
@@ -235,42 +177,34 @@ pub(super) fn get_egl_lib() -> Result<&'static libloading::Library, crate::Error
         Ok(egl)
     } else {
         let egl = unsafe { libloading::Library::new("libEGL.so.1")? };
-        // Leak the library to prevent dlclose on process exit
+        // Leak the library.
         let egl: &'static libloading::Library = Box::leak(Box::new(egl));
         Ok(EGL_LIB.get_or_init(|| egl))
     }
 }
 
-// `Egl` type alias now lives at `super::Egl` (in `gl/mod.rs`) so both the
-// Linux and macOS platform modules can use it without cross-cfg re-exports.
 pub(super) use super::Egl;
 
 /// Probe for available EGL displays supporting headless OpenGL ES 3.0.
 ///
-/// When a shared display already exists (from a prior `GlContext::new()`
-/// call or earlier probe), returns only that display's kind. Opening
-/// additional DRM fds would risk galcore deadlocks on Vivante.
-///
-/// When no shared display exists, probes in priority order
-/// (PlatformDevice, GBM, Default) and caches the first successful
-/// display in `SHARED_DISPLAY` for future use. The display is
-/// intentionally never terminated (same leak pattern as `EGL_LIB`).
+/// When a shared display exists, returns only that display's kind.
+/// Otherwise probes in priority order (PlatformDevice, GBM, Default) and
+/// caches the first successful display in `SHARED_DISPLAY`. The display is
+/// never terminated.
 ///
 /// An empty list means OpenGL is not available on this system.
 ///
 /// # Errors
 ///
 /// Returns an error only if `libEGL.so.1` cannot be loaded. Individual
-/// display probe failures are silently skipped.
+/// display probe failures are skipped.
 pub fn probe_egl_displays() -> Result<Vec<EglDisplayInfo>, Error> {
-    // Serialize with all other EGL/GL operations — see `GL_MUTEX` doc comment.
+    // Serialize with all other EGL/GL operations.
     let _guard = GL_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
 
     let egl: Egl = unsafe { Instance::<Dynamic<_, EGL1_4>>::load_required_from(get_egl_lib()?)? };
 
-    // If a shared display already exists, report only its kind.
-    // Opening additional DRM fds to probe other display types would
-    // deadlock galcore on Vivante when the shared display is alive.
+    // If a shared display exists, report only its kind.
     if let Some(Ok(shared)) = SHARED_DISPLAY.get() {
         let description = match shared.kind {
             EglDisplayKind::PlatformDevice => {
@@ -285,12 +219,10 @@ pub fn probe_egl_displays() -> Result<Vec<EglDisplayInfo>, Error> {
         }]);
     }
 
-    // No shared display yet — safe to probe all types. The first
-    // successful probe populates SHARED_DISPLAY for future use.
     let egl_rc: Rc<Egl> = Rc::new(egl);
 
-    // Try to initialize the shared display (probes in priority order).
-    // This populates SHARED_DISPLAY as a side effect.
+    // Initialize the shared display (probes in priority order), which
+    // populates SHARED_DISPLAY.
     let shared_result = SHARED_DISPLAY.get_or_init(|| init_shared_display(&egl_rc, None));
 
     let mut results = Vec::new();
@@ -309,11 +241,6 @@ pub fn probe_egl_displays() -> Result<Vec<EglDisplayInfo>, Error> {
         });
     }
 
-    // Note: we intentionally do NOT probe additional display types here.
-    // The shared display is the only one that will be used, and probing
-    // others would open DRM fds that risk galcore deadlocks if a GL
-    // context is later created on the shared display.
-
     Ok(results)
 }
 
@@ -323,10 +250,7 @@ pub(super) struct GlContext {
     pub(super) ctx: egl::Context,
     /// Whether the context is GLES 3.1+ (compute shaders available).
     pub(super) has_compute: bool,
-    /// Wrapped in ManuallyDrop because the khronos-egl Dynamic instance's
-    /// Drop calls eglReleaseThread() which can panic during process shutdown
-    /// if the EGL library has been partially unloaded. We drop it explicitly
-    /// inside catch_unwind in GlContext::drop.
+    /// Wrapped in `ManuallyDrop` and never dropped.
     pub(super) egl: ManuallyDrop<Rc<Egl>>,
 }
 
@@ -372,7 +296,7 @@ impl GlContext {
         let display = shared.display;
         let transfer_backend = shared.transfer_backend;
 
-        // Bind API for this thread (required per EGL spec — thread-local state)
+        // Bind the API for this thread.
         egl.bind_api(egl::OPENGL_ES_API)?;
 
         // Create a new GL context on the shared display.
@@ -411,7 +335,6 @@ impl GlContext {
     }
 
     fn egl_get_default_display(egl: &Egl) -> Result<EglDisplayType, crate::Error> {
-        // get the default display
         if let Some(display) = unsafe { egl.get_display(egl::DEFAULT_DISPLAY) } {
             debug!("default display: {display:?}");
             return Ok(EglDisplayType::Default(display));
@@ -423,7 +346,6 @@ impl GlContext {
     }
 
     fn egl_get_gbm_display(egl: &Egl) -> Result<EglDisplayType, crate::Error> {
-        // init a GBM device
         let gbm = Device::new(Card::open_global()?)?;
 
         debug!("gbm: {gbm:?}");
@@ -492,9 +414,7 @@ impl GlContext {
     }
 
     fn egl_check_support_dma(egl: &Egl, display: egl::Display) -> Result<(), crate::Error> {
-        // Query **display** extensions (not client extensions) because
-        // EGL_EXT_image_dma_buf_import is a display extension on Mali and
-        // other GPUs — it does not appear in the client extension string.
+        // Query the display extension string.
         let extensions = egl.query_string(Some(display), egl::EXTENSIONS)?;
         let extensions = extensions.to_string_lossy();
         log::debug!("EGL Display Extensions (DMA check): {}", extensions);
@@ -630,14 +550,8 @@ impl GlContext {
 
 impl Drop for GlContext {
     fn drop(&mut self) {
-        // Quietening teardown panics means swapping the panic hook, but
-        // `take_hook`/`set_hook` themselves panic when the current thread is
-        // already unwinding ("cannot modify the panic hook from a panicking
-        // thread"). If this context is dropped while a panic is in flight (e.g.
-        // a GL test assertion failed), swapping the hook would double-panic and
-        // abort the whole test binary — aborting every test queued after it.
-        // Only swap when not already panicking; the `catch_unwind` below still
-        // contains any teardown panic either way.
+        // Silence the panic hook during teardown, unless this thread is
+        // already panicking.
         let prev_hook = (!std::thread::panicking()).then(|| {
             let prev = std::panic::take_hook();
             std::panic::set_hook(Box::new(|_| {}));
@@ -648,20 +562,13 @@ impl Drop for GlContext {
 
             let _ = self.egl.destroy_context(self.display, self.ctx);
 
-            // The EGL display is process-global (SharedEglDisplay in
-            // SHARED_DISPLAY) and intentionally never terminated. Calling
-            // eglTerminate here would tear down the display for all active
-            // GlContext instances. The display is leaked on process exit,
-            // same as EGL_LIB.
+            // The process-global EGL display is not terminated.
         }));
         if let Some(prev_hook) = prev_hook {
             std::panic::set_hook(prev_hook);
         }
 
-        // The Rc<Egl> (ManuallyDrop) is intentionally NOT dropped. The
-        // khronos-egl Dynamic instance's Drop calls eglReleaseThread() which
-        // panics if the EGL library has been unloaded (local/x86_64) or
-        // causes heap corruption by calling into invalid memory (ARM).
+        // The `Rc<Egl>` (ManuallyDrop) is not dropped.
     }
 }
 
@@ -669,19 +576,17 @@ impl Drop for GlContext {
 /// A simple wrapper for a device node.
 pub(super) struct Card(std::fs::File);
 
-/// Implementing `AsFd` is a prerequisite to implementing the traits found
-/// in this crate. Here, we are just calling `as_fd()` on the inner File.
+/// Borrows the inner File's descriptor.
 impl std::os::unix::io::AsFd for Card {
     fn as_fd(&self) -> std::os::unix::io::BorrowedFd<'_> {
         self.0.as_fd()
     }
 }
 
-/// With `AsFd` implemented, we can now implement `drm::Device`.
 impl DrmDevice for Card {}
 impl DrmControlDevice for Card {}
 
-/// Simple helper methods for opening a `Card`.
+/// Helper methods for opening a `Card`.
 impl Card {
     pub fn open(path: &str) -> Result<Self, crate::Error> {
         let mut options = std::fs::OpenOptions::new();
@@ -748,8 +653,8 @@ pub(super) mod egl_ext {
     /// Defined as ((EGLConfig)0) in the EGL spec.
     ///
     /// # Safety
-    /// The EGL spec defines EGL_NO_CONFIG_KHR as a null pointer. This is
-    /// a safe transmute since `Config` is a newtype wrapper around `*mut c_void`.
+    /// `Config` is a newtype wrapper around `*mut c_void`, and the EGL spec
+    /// defines EGL_NO_CONFIG_KHR as a null pointer.
     pub(crate) const NO_CONFIG_KHR: edgefirst_egl::Config =
         unsafe { std::mem::transmute(std::ptr::null_mut::<std::ffi::c_void>()) };
 }

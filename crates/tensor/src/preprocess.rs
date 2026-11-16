@@ -5,11 +5,6 @@
 //! are normalized, how a source is fit into a model input, where the image
 //! content lands ([`letterbox_rect`], [`ContentRegion`]), and a model's whole
 //! recipe as one value ([`PreprocessSpec`]).
-//!
-//! They live here, beside [`unletter_norm`](crate::unletter_norm), so the
-//! image crate (which applies them) and the decoder crate (which reads them
-//! from model metadata) share one definition without depending on each
-//! other. Only plain values and pure functions belong in this module.
 
 use crate::{BoundingBox, Error, Region, Result};
 
@@ -329,9 +324,6 @@ pub enum Fit {
 /// to keep the aspect ratio (rounded, at least one pixel), and `placement`
 /// positions it. A zero-sized source fills the destination.
 ///
-/// This is the one letterbox computation: `convert` paints this rectangle,
-/// and [`ContentRegion`]s are built from it.
-///
 /// ```
 /// use edgefirst_tensor::{letterbox_rect, LetterboxPlacement, Region};
 ///
@@ -413,10 +405,8 @@ impl ContentRegion {
     }
 }
 
-/// Something that knows where it puts the image content in a destination,
-/// such as the image crate's `ConvertOptions` or a [`PreprocessSpec`]. The
-/// decoder takes it to map its output back to the source image with the same
-/// geometry the convert used.
+/// Something that knows where it puts the image content in a destination, such
+/// as the image crate's `ConvertOptions` or a [`PreprocessSpec`].
 pub trait ContentRegionSource {
     /// The content region for an `src_w`×`src_h` source converted into a
     /// `dst_w`×`dst_h` destination.
@@ -541,7 +531,6 @@ mod tests {
             Region::new(0, 0, 320, 320)
         );
         assert_eq!(letterbox_rect(0, 5, 32, 16, c), Region::new(0, 0, 32, 16));
-        // A sliver keeps at least one pixel.
         assert_eq!(
             letterbox_rect(10000, 1, 64, 64, t),
             Region::new(0, 0, 64, 1)

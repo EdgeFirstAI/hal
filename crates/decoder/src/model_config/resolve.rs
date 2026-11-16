@@ -85,7 +85,7 @@ impl ModelSources {
 ///
 /// [`preprocessing`](Self::preprocessing) and
 /// [`decode_mode`](Self::decode_mode) are authoritative; `schema` carries a
-/// copy of them for consumers that read the schema alone.
+/// copy of them.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct ResolvedModelConfig {
@@ -760,8 +760,7 @@ fn family_letterbox(
 /// Resolves a configuration from already-read sources.
 ///
 /// When the signals carry no metadata, the embedded files' metadata stands
-/// in for it, so Ultralytics inference sees the ONNX props or the TFLite
-/// `metadata.json` the container holds.
+/// in for it.
 ///
 /// # Errors
 ///

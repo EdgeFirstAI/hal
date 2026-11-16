@@ -1,13 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! RGB packing benchmarks — measures the cost of different strategies for
+//! RGB packing benchmarks: measures the cost of different strategies for
 //! producing packed RGB (`RGBRGB...`) and planar RGB (`RRR...GGG...BBB...`)
 //! output from an RGBA source via GL rendering.
 //!
-//! OpenGL ES doesn't allow rendering to RGB-only surfaces (only RGBA), so the
-//! HAL needs efficient paths to produce packed/planar RGB for model input
-//! tensors. This module benchmarks five strategies:
+//! Strategies:
 //!
 //! 1. **packed_r8** — packed RGB into R8 texture, W*3 x H
 //! 2. **packed_rgba8** — packed RGB into RGBA8 texture, W*3/4 x H
@@ -347,9 +345,7 @@ unsafe fn cleanup_gl(fbo: u32, textures: &[u32]) {
 // ---------------------------------------------------------------------------
 
 /// Run verification tests at the same `(src, dst)` configs used by the
-/// benchmarks. This ensures we exercise exactly the resolutions and DMA
-/// buffer sizes the benchmarks rely on and avoids false failures from
-/// non-standard intermediate dimensions.
+/// benchmarks.
 pub fn run_verify(ctx: &GpuContext) {
     println!("== Verification: RGB Packing ==");
 
@@ -358,8 +354,7 @@ pub fn run_verify(ctx: &GpuContext) {
     let configs: &[(u32, u32, &str)] = &[(640, 640, "1080p_to_640"), (320, 320, "1080p_to_320")];
 
     for &(dst_w, dst_h, label) in configs {
-        // Source: dst_w x dst_h RGBA — the packing shaders operate on the
-        // resized frame, so the source for verification IS the dst dimensions.
+        // Source: dst_w x dst_h RGBA.
         let src_w = dst_w;
         let src_h = dst_h;
         let src_bytes = (src_w * src_h * 4) as usize;

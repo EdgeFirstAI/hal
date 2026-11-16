@@ -1,15 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! Bridge between the per-scale fast path's `DecodedOutputsRef` and the
-//! existing post-NMS pipeline (score filter → top-K → NMS → optional mask
-//! materialisation).
+//! Bridge between the per-scale path's `DecodedOutputsRef` and the post-NMS
+//! pipeline (score filter → top-K → NMS → optional mask materialisation).
 //!
-//! Boxes and scores reach the candidate filter in the dtype the per-scale
-//! pipeline decoded them in: f16 scores are compared as f16, only the
-//! candidates' boxes and scores are converted to f32 (exactly), and on a CPU
-//! with FP16 arithmetic the NMS overlap tests run in FP16. Mask coefficients
-//! and protos are always f32, the type the mask kernels take.
+//! Boxes and scores go to the candidate filter and NMS in their own dtype.
 
 use half::f16;
 use ndarray::{ArrayView2, ArrayView3, Axis};
@@ -129,9 +124,7 @@ pub(super) fn per_scale_to_proto_data<'a>(
             multi_label,
         )?
     };
-    // Per-scale `dist2bbox_anchor_*` emits pixel-space coords by design.
-    // Apply EDGEAI-1303 normalization so output bboxes land in the
-    // canonical [0, 1] range expected by Decoder callers.
+    // Normalizes the pixel-space boxes to [0, 1].
     crate::yolo::maybe_normalize_boxes_in_place(&mut det_indices, normalized, input_dims);
 
     match mask_views(decoded)? {
@@ -183,9 +176,7 @@ pub(super) fn per_scale_to_masks<'a>(
             multi_label,
         )?
     };
-    // Per-scale `dist2bbox_anchor_*` emits pixel-space coords by design.
-    // Normalize before mask processing so `protobox` sees [0, 1] coords
-    // and the returned bboxes match the contract of `Decoder::decode`.
+    // Normalizes the pixel-space boxes to [0, 1] before mask processing.
     crate::yolo::maybe_normalize_boxes_in_place(&mut det_indices, normalized, input_dims);
 
     match mask_views(decoded)? {

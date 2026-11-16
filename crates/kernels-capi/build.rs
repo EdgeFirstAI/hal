@@ -18,22 +18,14 @@ fn main() {
         .expect("Unable to generate C bindings")
         .write_to_file(output_dir.join("kernels.h"));
 
-    // DT_SONAME carries only the major version, matching the convention used
-    // by glibc/OpenSSL/zlib: it is copied verbatim into every dependent's
-    // DT_NEEDED, so embedding MINOR or PATCH would force downstream re-links
-    // on every release and defeat ABI versioning.
+    // DT_SONAME carries only the major version.
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     if target_os == "linux" {
         let major = env::var("CARGO_PKG_VERSION_MAJOR").unwrap();
         println!("cargo:rustc-cdylib-link-arg=-Wl,-soname,libedgefirst_kernels.so.{major}");
     }
 
-    // Kernels links no sibling library: no DT_NEEDED, no rpath.
-
-    // The header is regenerated only when a source file or the cbindgen
-    // config changes -- NOT when the header itself is edited or deleted. Any
-    // test that reads the header must therefore depend on the source, or it
-    // is validating a stale artifact.
+    // The header is regenerated when a source file or the cbindgen config changes.
     println!("cargo:rerun-if-changed=src/");
     println!("cargo:rerun-if-changed=cbindgen.toml");
 }

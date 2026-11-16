@@ -215,11 +215,7 @@ fn bench_image_crate(suite: &mut BenchSuite) {
 }
 
 // =============================================================================
-// 4. EXIF orientation fixtures — decode throughput per spec-defined EXIF
-//    orientation. The codec reports orientation but never rotates pixels, so
-//    these should be constant across all 8 variants (they share scan/IDAT
-//    content and differ only in the EXIF/eXIf orientation tag). The benchmark
-//    confirms there is no per-orientation decode cost.
+// 4. EXIF orientation fixtures: decode throughput per EXIF orientation.
 //
 //    Reported names:
 //      codec/exif/jpeg/orient_<N>  — NV12 decode time for orientation N
@@ -279,23 +275,16 @@ fn bench_exif_overhead(suite: &mut BenchSuite) {
 }
 
 // =============================================================================
-// 5. V4L2 JPEG persistent-stream throughput (on-target only: Linux + v4l2 hw)
-//
-// Reuses ONE V4L2 decoder across all iterations — the same steady-state
-// stream-reuse mode that `v4l2_persistent_loop` in tests/v4l2_jpeg.rs was
-// implicitly measuring. Self-skips when no `/dev/video*` device is present
-// (dev-machine or CI without V4L2 hardware) or when the V4L2 backend is
-// disabled via `EDGEFIRST_DISABLE_V4L2=1`.
+// 5. V4L2 JPEG persistent-stream throughput (Linux with V4L2 hardware): one
+//    decoder reused across all iterations. Skipped when no `/dev/video*`
+//    device is present or `EDGEFIRST_DISABLE_V4L2` is set.
 //
 //   codec/jpeg/nv12/zidane_720p_persistent_stream
 // =============================================================================
 
 #[cfg(all(target_os = "linux", feature = "v4l2"))]
 fn bench_v4l2_persistent_stream(suite: &mut BenchSuite) {
-    // Runtime guard: skip cleanly when no V4L2 JPEG device is available or
-    // the backend is explicitly disabled. The bench output is absent rather
-    // than present-but-measuring-CPU, so bench_compare.py treats missing
-    // cells as one-sided (no regression gate fires on dev machines).
+    // Skip when the backend is disabled or no V4L2 JPEG device is available.
     if std::env::var("EDGEFIRST_DISABLE_V4L2").is_ok() {
         println!("\n== v4l2 persistent-stream: SKIP (EDGEFIRST_DISABLE_V4L2 set) ==\n");
         return;
@@ -317,9 +306,7 @@ fn bench_v4l2_persistent_stream(suite: &mut BenchSuite) {
 
     println!("\n== edgefirst-codec: V4L2 JPEG persistent-stream (steady-state reuse) ==\n");
 
-    // ONE decoder reused across warmup + all measured iterations: this is the
-    // persistent-stream path where the V4L2 stream is built once and then kept
-    // alive for subsequent frames.
+    // One decoder reused across warmup and all measured iterations.
     let mut tensor = Tensor::<u8>::image(
         1280,
         720,
@@ -329,7 +316,7 @@ fn bench_v4l2_persistent_stream(suite: &mut BenchSuite) {
     )
     .unwrap();
     let mut decoder = ImageDecoder::new();
-    // First decode triggers stream setup; subsequent ones exercise the reuse path.
+    // The first decode sets up the stream.
     tensor.load_image(&mut decoder, &ZIDANE_JPG).unwrap();
 
     let r = run_bench(
@@ -347,7 +334,7 @@ fn bench_v4l2_persistent_stream(suite: &mut BenchSuite) {
 
 #[cfg(not(all(target_os = "linux", feature = "v4l2")))]
 fn bench_v4l2_persistent_stream(suite: &mut BenchSuite) {
-    // Not on Linux or v4l2 feature disabled — skip silently.
+    // Not on Linux, or the v4l2 feature is disabled.
     let _ = suite;
 }
 

@@ -23,7 +23,6 @@ use half::f16;
 const F32_REL_SCALAR: f64 = 4.0 * f32::EPSILON as f64;
 const F32_REL_NEON: f64 = 4.0 * f32::EPSILON as f64;
 /// f16 sigmoid outputs: ulps of the reference rounded to f16, per tier.
-/// Scalar cells round `x` to f16 first, costing up to `|x| < 9.7` ulps, plus 1 for the roundings.
 const F16_ULPS_SCALAR: i32 = 11;
 const F16_ULPS_NEON: i32 = 1;
 const F16_ULPS_NEON_FP16: i32 = 2;
@@ -115,8 +114,7 @@ fn level(n: usize) -> LevelPlan {
     }
 }
 
-/// The scalar tier's variant names end in `Scalar`; NEON tiers select none of them, and
-/// f16 scores take the native FP16 cell exactly on tiers with FEAT_FP16.
+/// NEON tiers select no `Scalar` variant, and f16 scores take the native FP16 cell exactly on tiers with FEAT_FP16.
 #[test]
 fn every_cell_runs_neon_on_neon_tiers() {
     for (tier, f) in tiers() {
@@ -139,8 +137,7 @@ fn every_cell_runs_neon_on_neon_tiers() {
     }
 }
 
-/// The forced tier is the one the cells run: `scalar` selects scalar cells even where NEON
-/// exists, and `neon` never selects an FP16 cell.
+/// `scalar` selects scalar cells even where NEON exists, and `neon` never selects an FP16 cell.
 #[test]
 fn forced_tier_governs_cell_selection() {
     let scalar = decoder_cpu_features_from(Some("scalar")).unwrap();
@@ -288,8 +285,7 @@ fn f16_bound(f: &CpuFeatures) -> i32 {
     }
 }
 
-/// Every cell on every tier against the scalar tier and the float64 reference. Prints the
-/// worst error of each sigmoid cell.
+/// Every cell on every tier against the scalar tier and the float64 reference.
 #[test]
 fn every_cell_matches_scalar_or_bound_on_every_tier() {
     let scalar = CpuFeatures::default();
@@ -368,7 +364,7 @@ fn check_sigmoid_f32(raw: &Raw, q: Quantization, got: &[f32], f: &CpuFeatures, l
             continue;
         }
         let err = (f64::from(g) - r).abs();
-        // The sigmoid's condition number is about |x|, so an f32-rounded x costs |x| eps.
+        // The bound scales with `1 + |x|`.
         let scaled = r * (1.0 + x.abs());
         if r > tiny {
             worst = worst.max(err / scaled);

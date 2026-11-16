@@ -3,62 +3,38 @@
 
 //! The integer vocabularies, as named C enumerators.
 //!
-//! Without these a C caller writes `ef_tensor_builder_dtype(b, 0)` and hopes,
-//! and a surface that numbers a vocabulary on its own can silently disagree
-//! with the others.
-//!
-//! So each enumerator's value is asserted against the Rust vocabulary **at
-//! compile time**. A renumbering on either side is a build failure here, not a
-//! silent misinterpretation at a library boundary. This is the same mechanism
-//! used for the Python bindings' discriminants.
+//! Each enumerator's value is asserted against the Rust vocabulary at compile
+//! time.
 
 use edgefirst_tensor::{CompressionScheme, Contiguity, CpuAccess, DType, TensorMemory};
 pub use edgefirst_tensor_abi::{
     EfCompression, EfCompressionRequest, EfContiguity, EfCpuAccess, EfDtype, EfStorageKind,
 };
 
-/// Wire code -> validated *map direction*. `None` (0) and unknown codes are
-/// not mappable directions: the wire rule says validate the integer, never
-/// materialize an enum from it.
+/// Wire code -> validated map direction. Returns `None` for
+/// `EF_CPU_ACCESS_NONE` (0) and for unknown codes.
 ///
-/// For the constructors, which take `access` as a *declaration* of what CPU
-/// access to provision rather than as a direction to map in, use
-/// [`declared_cpu_access_from_code`]: `EF_CPU_ACCESS_NONE` is a legitimate
-/// answer there and a nonsensical one here.
+/// For a declaration of CPU access, where `EF_CPU_ACCESS_NONE` is valid, use
+/// [`declared_cpu_access_from_code`].
 pub fn cpu_access_from_code(code: u32) -> Option<edgefirst_tensor::CpuAccess> {
     CpuAccess::from_code(code).filter(|a| *a != CpuAccess::None)
 }
 
 /// Wire code -> validated Rust access, for an allocation or wrap request.
-///
-/// The same mapping `ef_tensor_image_desc_set_access` uses, `None` (0)
-/// included: "no CPU access at all" is what a caller wrapping a texture it
-/// will only ever touch from the GPU asks for, and it is what the Python
-/// constructors default to. Refusing it would cost that caller a staging
-/// texture it never reads.
+/// `EF_CPU_ACCESS_NONE` (0) is accepted.
 pub fn declared_cpu_access_from_code(code: u32) -> Option<edgefirst_tensor::CpuAccess> {
     CpuAccess::from_code(code)
 }
 
 /// Rust scheme -> wire code, with `None` (linear) as code 0.
-///
-/// The `Option` is the whole reason this is a function rather than a bare
-/// `.code()` call: `CompressionScheme` has no variant for "linear", so the
-/// absent case has to be folded into the same integer space here. Every
-/// present case delegates to `.code()`, which is generated from the same
-/// declaration the `EfCompression` enumerators are asserted against below --
-/// there is no second table to drift.
 pub fn compression_code(scheme: Option<edgefirst_tensor::CompressionScheme>) -> u32 {
     scheme
         .map(|s| s.code())
         .unwrap_or(EfCompression::None as u32)
 }
 
-/// Compile-time proof that the C enumerators and the Rust vocabulary agree.
-///
-/// Deliberately exhaustive rather than spot-checked: a mapping is only safe if
-/// *every* variant lines up, and the one that gets renumbered is never the one
-/// someone thought to sample.
+/// Compile-time proof that the C enumerators and the Rust vocabulary agree,
+/// for every variant.
 const _: () = {
     assert!(EfDtype::U8 as u32 == DType::U8.code());
     assert!(EfDtype::I8 as u32 == DType::I8.code());
@@ -84,11 +60,8 @@ const _: () = {
     assert!(EfCompression::Afbc as u32 == CompressionScheme::Afbc.code());
     assert!(EfCompression::Pvric as u32 == CompressionScheme::Pvric.code());
     assert!(EfCompression::Dcc as u32 == CompressionScheme::Dcc.code());
-    // 0 is reserved for "linear", the state `CompressionScheme` spells
-    // `Option::None` and therefore has no variant (hence no `.code()`) for.
-    // That 0 stays unassigned on the Rust side is asserted at runtime, in
-    // `zero_is_reserved_for_linear_on_both_sides` -- `from_code` is not a
-    // `const fn`, so it cannot be checked here.
+    // 0 is reserved for "linear", which `CompressionScheme` spells
+    // `Option::None`.
     assert!(EfCompression::None as u32 == 0);
 
     assert!(EfContiguity::Unknown as u32 == Contiguity::Unknown.code());
@@ -107,9 +80,6 @@ mod tests {
 
     #[test]
     fn every_dtype_has_a_c_enumerator() {
-        // The const block above proves the values agree; this proves the set is
-        // complete. Adding a Rust variant without a C one would otherwise be
-        // invisible -- the assertions only cover what is listed.
         assert_eq!(
             DType::all().len(),
             11,
@@ -140,10 +110,6 @@ mod tests {
 
     #[test]
     fn every_compression_scheme_has_a_c_enumerator() {
-        // Same shape as `every_dtype_has_a_c_enumerator`: the const block
-        // above proves the values agree, this proves the set is complete.
-        // Without it, adding a `CompressionScheme` variant is invisible --
-        // the assertions only cover what is listed there.
         assert_eq!(
             CompressionScheme::all().len(),
             4,
@@ -154,10 +120,6 @@ mod tests {
 
     #[test]
     fn zero_is_reserved_for_linear_on_both_sides() {
-        // The half of the `EfCompression::None == 0` assertion that the
-        // const block above cannot make (`from_code` is not `const`): that
-        // no `CompressionScheme` variant claims code 0. A scheme declared
-        // as 0 would round-trip as "linear" and decode garbage.
         assert_eq!(CompressionScheme::from_code(0), None);
     }
 
@@ -176,12 +138,6 @@ mod tests {
 
     #[test]
     fn an_unknown_compression_code_maps_to_no_scheme() {
-        // `from_code` has no variant to return for a code this build does
-        // not know, so it answers `None`. What a *consumer* should do with
-        // that is a separate decision, made and justified where the
-        // consumer is -- `TensorDyn::compression` (`dynamic_backend.rs`),
-        // which logs the unrecognised code rather than passing it off as a
-        // linear layout in silence.
         assert_eq!(CompressionScheme::from_code(0), None);
         assert_eq!(CompressionScheme::from_code(99), None);
         assert_eq!(CompressionScheme::from_code(u32::MAX), None);

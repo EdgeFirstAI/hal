@@ -4,8 +4,8 @@
 //! Optional helper: walk a schema-v2 document and attach
 //! per-tensor `Quantization` to integer input tensors via shape match.
 //!
-//! Use when the upstream inference layer hasn't already attached
-//! quantization metadata to the tensors.
+//! Use when the upstream inference layer has not attached quantization
+//! metadata to the tensors.
 
 use crate::schema::SchemaV2;
 use crate::{DecoderError, DecoderResult};
@@ -15,16 +15,13 @@ use edgefirst_tensor::{Quantization as TQ, TensorDyn};
 /// attaching per-tensor `Quantization` to any matching integer tensor
 /// in `tensors` (matched by shape).
 ///
-/// **Behavior:**
-/// - Per-channel quantization is silently skipped — the per-scale
-///   subsystem only consumes per-tensor quant.
-/// - Float tensors are silently skipped (they don't carry quantization).
-/// - Tensors with no matching schema entry are silently left alone.
+/// - Per-channel quantization is skipped.
+/// - Float tensors are skipped.
+/// - Tensors with no matching schema entry are left alone.
 /// - If a schema entry has a quant declaration but no tensor matches
 ///   the declared shape, returns `InvalidShape`.
 ///
-/// **Idempotent:** safe to call multiple times; later calls overwrite
-/// the attached quantization.
+/// A repeated call overwrites the attached quantization.
 pub fn apply_schema_quant(schema: &SchemaV2, tensors: &mut [&mut TensorDyn]) -> DecoderResult<()> {
     for logical in &schema.outputs {
         // Per-scale children
@@ -48,9 +45,7 @@ fn attach_per_tensor_quant_by_shape(
     expected_shape: &[usize],
     schema_q: &crate::schema::Quantization,
 ) -> DecoderResult<()> {
-    // Reject empty scale up-front so a malformed schema fails fast at
-    // attach time instead of silently looking "per-channel" here and
-    // surfacing as `QuantMissing` later at decode time.
+    // An empty scale is rejected.
     if schema_q.scale.is_empty() {
         return Err(DecoderError::InvalidShape(format!(
             "apply_schema_quant: schema declares quantization for shape \
@@ -58,8 +53,7 @@ fn attach_per_tensor_quant_by_shape(
         )));
     }
     if !schema_q.is_per_tensor() {
-        // Per-channel — skip silently. The per-scale planner errors
-        // separately when it actually needs to use a per-channel quant.
+        // Per-channel quantization is skipped.
         return Ok(());
     }
     let scale = schema_q.scale[0];
@@ -67,7 +61,7 @@ fn attach_per_tensor_quant_by_shape(
 
     for t in tensors.iter_mut() {
         if t.shape() == expected_shape {
-            // Try to attach to integer variants; silently skip floats.
+            // Attaches to integer variants; floats are skipped.
             macro_rules! try_attach {
                 ($ty:ty) => {
                     if let Some(inner) = t.as_typed_mut::<$ty>() {
@@ -85,7 +79,7 @@ fn attach_per_tensor_quant_by_shape(
             try_attach!(u8);
             try_attach!(i16);
             try_attach!(u16);
-            // Float / other dtypes silently skipped.
+            // Float and other dtypes are skipped.
             return Ok(());
         }
     }
@@ -102,21 +96,18 @@ mod tests {
 
     #[test]
     fn applies_quant_to_int8_by_shape() {
-        // Build a tiny schema with one logical output `boxes` having an int8 child.
         let json =
             edgefirst_bench::testdata::read_to_string("per_scale/synthetic_yolov8n_schema.json");
         let schema: SchemaV2 = serde_json::from_str(&json).unwrap();
 
-        // Build a tensor matching one box child's shape.
-        // The yolov8n schema's first box child has shape [1, 80, 80, 64].
+        // A tensor with the shape of the schema's first box child.
         let t = Tensor::<i8>::new(&[1, 80, 80, 64], Some(TensorMemory::Mem), None).unwrap();
         assert!(t.quantization().is_none(), "fresh tensor has no quant");
         let mut td: TensorDyn = t.into();
         let mut tensors: Vec<&mut TensorDyn> = vec![&mut td];
 
         apply_schema_quant(&schema, &mut tensors).unwrap_err();
-        // Errors because not all schema-declared shapes have matching tensors.
-        // (We only provided one tensor, but schema has many children.)
+        // The schema's other children have no matching tensor.
     }
 
     #[test]
@@ -125,7 +116,7 @@ mod tests {
             edgefirst_bench::testdata::read_to_string("per_scale/synthetic_yolov8n_schema.json");
         let schema: SchemaV2 = serde_json::from_str(&json).unwrap();
 
-        // Build the full set of input tensors matching every schema child + protos.
+        // One tensor for every schema child and the protos.
         let shapes_int8 = [
             vec![1, 80, 80, 64],
             vec![1, 80, 80, 80],
@@ -150,7 +141,6 @@ mod tests {
 
         apply_schema_quant(&schema, &mut refs).unwrap();
 
-        // All 10 tensors should now carry quant.
         for td in &owned {
             if let Some(t) = td.as_typed::<i8>() {
                 assert!(
@@ -163,9 +153,6 @@ mod tests {
 
     #[test]
     fn empty_scale_errors_instead_of_silently_skipping() {
-        // Regression for Copilot review on PR #63: an empty `scale`
-        // vector used to slip past `is_per_tensor()` and return Ok,
-        // masking a malformed schema until decode time.
         use crate::schema::{DType, Quantization};
         let bad_q = Quantization {
             scale: vec![],
@@ -194,19 +181,15 @@ mod tests {
             edgefirst_bench::testdata::read_to_string("per_scale/synthetic_yolov8n_schema.json");
         let schema: SchemaV2 = serde_json::from_str(&json).unwrap();
 
-        // Build float tensors instead of int8.
+        // A float tensor with a box child's shape.
         let shape = vec![1, 80, 80, 64];
         let t = Tensor::<f32>::new(&shape, Some(TensorMemory::Mem), None).unwrap();
         let mut td: TensorDyn = t.into();
         let mut refs: Vec<&mut TensorDyn> = vec![&mut td];
 
-        // Float tensors don't take quant; the helper returns Ok and the schema
-        // declaration is silently skipped on this single mismatched-shape input.
-        // (Actually it'll error on InvalidShape for the OTHER schema children
-        // that have no matching tensor. That's the expected behaviour.)
+        // The schema's other children have no matching tensor.
         let r = apply_schema_quant(&schema, &mut refs);
         assert!(r.is_err());
-        // What we're really testing: float tensors don't crash.
         assert_eq!(td.dtype(), edgefirst_tensor::DType::F32, "unexpected dtype");
     }
 }

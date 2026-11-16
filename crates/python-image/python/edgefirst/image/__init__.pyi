@@ -1,19 +1,10 @@
-"""Type stubs for ``edgefirst.image``.
-
-Split from the pre-0.29 monolithic ``edgefirst_hal.pyi``; assignment
-mirrors the pymodule registrations in crates/python-image/src/lib.rs.
-"""
+"""Type stubs for ``edgefirst.image``."""
 
 import enum
 import sys
 
-# Public re-exports from `edgefirst.tensor`, a hard dependency of this package
-# (see pyproject.toml). The redundant `as` form is what marks a name a public
-# re-export to type checkers. TensorMemory/Colorimetry and the colour axis
-# enums are registered directly in this module too (see
-# crates/python-image/src/lib.rs), so an image tensor with an explicit memory
-# backend or colorimetry override can be built using only edgefirst.image
-# imports.
+# Public re-exports from `edgefirst.tensor`. TensorMemory, Colorimetry and the
+# colour axis enums are also registered in this module.
 from typing import Protocol, Sequence
 
 import numpy as np
@@ -24,12 +15,11 @@ from edgefirst.tensor import ColorRange as ColorRange
 from edgefirst.tensor import ColorSpace as ColorSpace
 from edgefirst.tensor import ColorTransfer as ColorTransfer
 
-# DType is a type alias, not a runtime class — nothing to re-export.
+# DType is a type alias.
 from edgefirst.tensor import DType
 
-# Image-only: no decoder or tracker dependency. Drawing takes boxes+masks+
-# proto data via the capsule protocol; fused decode+draw lives on
-# ``Decoder.draw_onto``.
+# The cross-package capsule protocol accepted by the convert and drawing
+# methods.
 from edgefirst.tensor import EdgeFirstTensorExportable as EdgeFirstTensorExportable
 from edgefirst.tensor import PixelFormat as PixelFormat
 from edgefirst.tensor import Region as Region
@@ -42,7 +32,7 @@ class EdgeFirstProtoDataExportable(Protocol):
 
     def __edgefirst_protodata__(self) -> tuple[object, object, str]: ...
 
-# "dynamic" in every wheel; "static" only in the G13 comparison build.
+# "dynamic" in every wheel; "static" only in the comparison build.
 __tensor_backend__: str
 
 def version() -> str:
@@ -52,7 +42,7 @@ class ColorMode(enum.Enum):
     """Controls how mask colors are assigned to detections."""
 
     Class: ColorMode
-    """Color chosen by class label (default, correct for semantic segmentation)"""
+    """Color chosen by class label (default)"""
     Instance: ColorMode
     """Color chosen by detection index (unique color per instance)"""
     Track: ColorMode
@@ -65,11 +55,11 @@ class MaskResolution:
     Construct via classmethods:
 
     - ``MaskResolution.Proto()`` — per-detection tiles at proto-plane
-      resolution (historical default). Mask values are continuous sigmoid
+      resolution (default). Mask values are continuous sigmoid
       ``uint8 [0, 255]``.
     - ``MaskResolution.Scaled(width, height)`` — per-detection tiles at
       caller-specified pixel resolution, produced by upsampling the full
-      proto plane once (correct edge-clamp bilinear) and cropping by bbox
+      proto plane once (edge-clamp bilinear) and cropping by bbox
       after sigmoid. Mask values are binary ``uint8 {0, 255}`` —
       interchangeable with the continuous sigmoid output via the same
       ``> 127`` test. If a ``content_region`` is also passed to
@@ -125,10 +115,9 @@ class EglDisplayKind(enum.Enum):
 
     Display types (probed in priority order):
         PlatformDevice: EGL device enumeration via EGL_EXT_device_enumeration.
-            Headless/compositor-free with zero external deps. Works on NVIDIA
-            and newer Vivante drivers.
+            Headless, with no compositor.
         Gbm: Direct GPU access via DRM render node (/dev/dri/renderD128).
-            No compositor required. Needed on ARM Mali and older Vivante.
+            No compositor required.
         Default: Uses eglGetDisplay(EGL_DEFAULT_DISPLAY). Connects to
             Wayland compositor or X server if available. May block on
             headless systems.
@@ -165,14 +154,12 @@ if sys.platform == "linux":
 
 def align_width_for_gpu_pitch(width: int, bpp: int) -> int:
     """Round ``width`` up so that ``width * bpp`` satisfies the GPU DMA-BUF
-    pitch alignment requirement (currently 64 bytes).
+    pitch alignment requirement (64 bytes).
 
-    Use when allocating a DMA-BUF that will later be imported as an
-    EGLImage by HAL's GL backend (or by any GLES driver that requires
-    64-byte aligned pitches — currently Mali Valhall on i.MX 95).
+    Use when allocating a DMA-BUF that will be imported as an EGLImage by
+    the GL backend.
 
-    Pre-aligned widths (640, 1280, 1920, 3008, 3840, …) round-trip
-    unchanged. Misaligned widths are bumped up to the next valid value.
+    Widths that are already aligned are returned unchanged.
     Returns ``width`` unchanged if ``bpp == 0``, ``width == 0``, or if the
     rounded value would overflow.
 
@@ -206,8 +193,8 @@ def align_width_for_pixel_format(
 
 def gpu_dma_buf_pitch_alignment_bytes() -> int:
     """Required DMA-BUF row pitch alignment in bytes for GL backend imports
-    (currently 64). External callers that need to allocate their own
-    DMA-BUFs should size them so each row pitch is a multiple of this value.
+    (64). Each row pitch of an externally allocated DMA-BUF must be a
+    multiple of this value.
     """
 
 class LetterboxPlacement(enum.Enum):
@@ -224,8 +211,7 @@ class Fit(enum.Enum):
     C ``EF_FIT_*`` codes."""
 
     Stretch: Fit
-    """Scale each axis to fill the destination (the hot path; identity for
-    the full-square tiles the grid produces)."""
+    """Scale each axis to fill the destination."""
 
     Letterbox: Fit
     """Preserve aspect ratio and pad the rest."""
@@ -408,8 +394,7 @@ class ConvertOptions:
         """Where ``convert`` puts the image content when converting a
         ``src_w`` x ``src_h`` source into a ``dst_w`` x ``dst_h``
         destination with these options: the letterbox rectangle, or the
-        whole destination for a stretch. Computed by the code the convert
-        paints with, so mapping results back through it is exact.
+        whole destination for a stretch.
 
         Raises:
             ValueError: A zero size, or the source crop falls outside the
@@ -452,32 +437,23 @@ class ImageProcessor:
         """
         Draw detection boxes and optional segmentation masks onto ``dst``.
 
-        This method draws pre-decoded results. For fused decode+draw, use
-        ``Decoder.draw_onto`` on the decoder wheel.
+        This method draws pre-decoded results; ``Decoder.draw_onto`` decodes
+        and draws.
 
-        This function **always fully overwrites** ``dst`` — its prior contents
-        are discarded.  If ``background`` is provided the output is
-        ``background + masks``; otherwise ``dst`` is cleared to transparent
-        (``0x00000000``) before masks are drawn.
-
-        .. note::
-
-            **Migrating from v0.16.3 or earlier:** if you previously loaded an
-            image into ``dst`` before calling this function, you must now pass
-            that image via ``background=`` instead.
+        ``dst`` is always fully overwritten. If ``background`` is provided the
+        output is ``background + masks``; otherwise ``dst`` is cleared to
+        transparent (``0x00000000``) before masks are drawn.
 
         On Windows the destination's ``gpu_completion()`` reflects this draw
-        afterwards, as it does after ``convert``.
+        afterwards.
 
-        A ``BGRA`` ``background=`` onto a GPU-backed destination raises: the
-        OpenGL base-layer draw has no ``BGRA`` arm and the CPU backend renders
-        only ``RGBA``/``RGB``. It previously returned without writing ``dst``.
+        A ``BGRA`` ``background=`` onto a GPU-backed destination raises.
 
         Args:
             dst: Output image tensor (always fully written by this call). Must
                 be ``RGBA`` or ``RGB`` for the CPU backend, or
-                ``RGBA``/``BGRA``/``RGB`` for OpenGL -- ``BGRA`` without a
-                ``background=``, per the note above.
+                ``RGBA``/``BGRA``/``RGB`` for OpenGL (``BGRA`` only without a
+                ``background=``).
             bbox: ``(N, 4)`` float32 array of normalized bounding boxes in
                 ``[x1, y1, x2, y2]`` format with values in ``[0, 1]``.
             scores: ``(N,)`` float32 array of confidence scores.
@@ -493,7 +469,7 @@ class ImageProcessor:
                 written as ``background + masks``. When ``None``, ``dst`` is
                 cleared to ``0x00000000`` before masks are drawn. Must have the
                 same dimensions and format as ``dst``, and must reference a
-                **distinct underlying buffer** — aliasing ``dst`` (directly or
+                distinct underlying buffer; aliasing ``dst`` (directly or
                 via two ``Tensor`` wrappers over the same dmabuf fd) raises
                 ``RuntimeError``.
             opacity: Scales the alpha of rendered mask and box colors.
@@ -535,24 +511,16 @@ class ImageProcessor:
 
         - ``MaskResolution.Proto()`` (default when ``resolution`` is
           ``None``): returns per-detection tiles at proto-plane resolution
-          with **continuous sigmoid** values in ``uint8 [0, 255]``.
+          with continuous sigmoid values in ``uint8 [0, 255]``.
         - ``MaskResolution.Scaled(width, height)``: returns per-detection
-          tiles at ``(width, height)`` pixel resolution with **binary**
+          tiles at ``(width, height)`` pixel resolution with binary
           ``uint8 {0, 255}`` values (sigmoid > 0.5 threshold). The upsample
           happens on the full proto plane with edge-clamp bilinear
-          sampling — correct by construction, unlike per-tile resize.
-          Drop-in replacement for the continuous output under the caller's
-          ``> 127`` threshold.
+          sampling.
 
         The returned masks can be inspected for analytics, IoU computation,
         or export, and also passed to :meth:`draw_decoded_masks` for
         GPU-interpolated rendering.
-
-        .. note::
-
-            Calling ``materialize_masks`` + ``draw_decoded_masks`` separately
-            prevents the HAL from using its internal fused optimization. For
-            render-only use cases, prefer ``Decoder.draw_onto``.
 
         Args:
             bbox: ``(N, 4)`` float32 array of normalized bounding boxes.
@@ -591,8 +559,8 @@ class ImageProcessor:
         ``edgefirst.*`` package via the ``__edgefirst_protodata__`` capsule.
 
         On Windows the destination's ``gpu_completion()`` reflects this draw
-        afterwards, as it does after ``convert``. The same ``BGRA``
-        ``background=`` restriction as :meth:`draw_decoded_masks` applies.
+        afterwards. The same ``BGRA`` ``background=`` restriction as
+        :meth:`draw_decoded_masks` applies.
 
         Raises:
             PermissionError: As :meth:`draw_decoded_masks`.
@@ -610,10 +578,8 @@ class ImageProcessor:
     ) -> Tensor:
         """Create an image tensor with the processor's optimal memory backend.
 
-        Selects the best available backing storage based on hardware capabilities:
-        DMA-buf > PBO (GPU buffer) > system memory. Images created this way
-        benefit from zero-copy GPU paths when used with this processor's
-        ``convert()``.
+        Selects the backing storage from the hardware capabilities, in the
+        order DMA-buf, PBO (GPU buffer), system memory.
 
         Args:
             width: Image width in pixels.
@@ -628,51 +594,43 @@ class ImageProcessor:
                 ``"float32"`` (for GPU float model-input paths); other types
                 still prefer DMA-buf when available and otherwise use system
                 memory.
-            access: Declared CPU access — ``"readwrite"`` (default),
+            access: Declared CPU access: ``"readwrite"`` (default),
                 ``"read"``, ``"write"`` (whole-buffer writes only), or
                 ``"none"`` (hardware-only, required for tile compression).
                 Hardware (GPU/NPU/G2D/compositor) access is always implied.
-                The declaration is enforced on every CPU map, the HAL's own
-                included: a map outside it raises ``PermissionError``, and so
-                does HAL CPU work (a CPU convert or draw) it does not cover.
+                A CPU map outside the declaration raises ``PermissionError``,
+                as does HAL CPU work (a CPU convert or draw) it does not cover.
                 On Linux a ``"none"`` or ``"write"`` DMA-BUF image comes from
-                the uncached CMA heap where available: devices mapping it
-                need no CPU cache maintenance, and nothing reads it on the
-                CPU. What this processor's own ``convert()``
-                may do to the image as a destination on the CPU is added, so
-                ``Tensor.declared_cpu_access`` may be wider than ``access``:
-                ``"write"`` when it may fill the whole image (CPU backend,
-                host memory, a format or float dtype the GPU does not
-                render), ``"readwrite"`` when a pass reads back what it wrote
-                or writes only part of it (an ``"int8"`` image through the
-                CPU or G2D, a ``Bgra`` image through the CPU, a G2D ``Rgb``
+                the uncached CMA heap where available. What this processor's
+                own ``convert()`` may do to the image as a destination on the
+                CPU is added, so ``Tensor.declared_cpu_access`` may be wider
+                than ``access``: ``"write"`` when it may fill the whole image
+                (CPU backend, host memory, a format or float dtype the GPU
+                does not render), ``"readwrite"`` when a pass reads back what
+                it wrote or writes only part of it (an ``"int8"`` image through
+                the CPU or G2D, a ``Bgra`` image through the CPU, a G2D ``Rgb``
                 letterbox border). Nothing is added for use as a convert
                 source (declare ``"read"``) or for a CPU mask draw (declare
-                ``"readwrite"``). On Android, pass ``"none"`` for an image
-                you never map, so gralloc can keep a tiled or compressed
-                allocation. A ``"none"``
-                image the GPU renders needs the GPU to accept the source too:
-                when it declines, the CPU fallback raises ``PermissionError``
-                naming the GPU's reason.
-            compression: Tile-compression request — ``None`` (default,
+                ``"readwrite"``). On Android a ``"none"`` image lets gralloc
+                keep a tiled or compressed allocation. When the GPU declines
+                the source of a convert into a ``"none"`` image, the CPU
+                fallback raises ``PermissionError`` naming the GPU's reason.
+            compression: Tile-compression request: ``None`` (default,
                 linear), ``"any"`` (device's native scheme when eligible,
-                counted linear fallback), or a specific scheme (``"ubwc"``,
-                ``"afbc"``, ``"pvric"``, ``"dcc"`` — allocation fails unless
+                linear otherwise), or a specific scheme (``"ubwc"``,
+                ``"afbc"``, ``"pvric"``, ``"dcc"``; allocation fails unless
                 the device's native scheme matches). Requires
-                ``access="none"``. Read the outcome via
-                ``Tensor.compression``.
+                ``access="none"``. ``Tensor.compression`` reports the
+                outcome.
             contiguous: Require physically contiguous memory: a DMA-BUF from
-                the Linux CMA heap, or an error naming the heap, never a
-                fallback to the system heap, a PBO or system memory. Read
-                the outcome via ``Tensor.contiguity``.
+                the Linux CMA heap, or an error naming the heap.
+                ``Tensor.contiguity`` reports the outcome.
 
         Returns:
             A new image ``Tensor`` backed by the optimal memory type.
 
         Example: a display canvas the GPU renders and a Wayland compositor
-        shows (linux-dmabuf), and an overlay the CPU writes. Neither is read
-        on the CPU, so on Linux both come from uncached CMA where available,
-        and the compositor's per-frame mapping costs no cache maintenance::
+        shows (linux-dmabuf), and an overlay the CPU writes::
 
             proc = ImageProcessor()
             frame = proc.create_image(1920, 1080, PixelFormat.Rgba, access="none")
@@ -754,21 +712,17 @@ class ImageProcessor:
         pad_output: tuple[float, float, float, float] | None = None,
         normalization: NormalizationArg | None = None,
     ) -> None:
-        """Convert without waiting for the GPU — the batch-preprocessing
-        primitive.
+        """Convert without waiting for the GPU.
 
         Same arguments as :meth:`convert`, but the OpenGL backend skips the
         per-call ``glFinish()``. Render N model inputs by looping this over
         ``dst.batch(n)`` / ``dst.view(region)`` row-bands of one batched
-        destination, then call :meth:`flush` once: the backend imports the
-        destination a single time and renders each tile as a viewport band,
-        syncing once at flush. A deferred destination is not safe to read
-        (or ``cuda_map``) until :meth:`flush` returns. Non-GL backends
-        complete synchronously and :meth:`flush` is a no-op.
+        destination, then call :meth:`flush` once. A deferred destination is
+        not safe to read (or ``cuda_map``) until :meth:`flush` returns.
+        Non-GL backends complete synchronously and :meth:`flush` is a no-op.
 
         On Windows the destination's ``gpu_completion()`` reflects this
-        convert afterwards — the value covers the queued render, so a device
-        consumer waits on that fence rather than on :meth:`flush`.
+        convert afterwards; the value covers the queued render.
 
         Raises:
             PermissionError: As :meth:`convert`.
@@ -801,25 +755,20 @@ class ImageProcessor:
 
         Platforms:
             Linux, macOS, iOS, Android (sync-file descriptor) and Windows
-            (event handle). Declared and callable on every platform; the two
-            families return different handle kinds, so close each with the
-            matching call -- see Returns below.
+            (event handle). Declared and callable on every platform.
 
-        Same ``src``/``dst``/``rotation``/``flip``/``source``/``letterbox``
-        arguments as an ordinary convert; this call differs only in what it
-        returns. The handle is the GL to NPU handoff primitive: hand it to a
-        consumer, or wait on it, instead of paying a blocking GPU sync.
+        Takes the same ``src``/``dst``/``rotation``/``flip``/``source``/
+        ``letterbox`` arguments as :meth:`convert`.
 
         Returns:
             A sync-file descriptor on Linux and Android, an event handle
             (as an integer) on Windows, or ``None`` when the convert
             completed synchronously (no native fence on this display). The
-            caller owns the handle -- close it (``os.close`` for the fd,
+            caller owns the handle and closes it (``os.close`` for the fd,
             ``ctypes.windll.kernel32.CloseHandle`` for the Windows handle).
 
         On Windows the destination's ``gpu_completion()`` reflects this
-        convert afterwards, so a device consumer can be handed the fence
-        value instead of this event.
+        convert afterwards.
 
         Raises:
             PermissionError: As :meth:`convert`.
@@ -836,9 +785,8 @@ class ImageProcessor:
     ) -> Tensor:
         """Allocate the tall packed batch destination ``[tile_w, n*tile_h]``.
 
-        A single GL-importable parent that stacks ``n`` tiles vertically.
-        Uses the same DMA-pitch alignment and ``Dma > Pbo > Mem`` selection
-        as :meth:`create_image`. Caller-owned for pool reuse.
+        A single parent that stacks ``n`` tiles vertically. Uses the same
+        DMA-pitch alignment and memory selection as :meth:`create_image`.
 
         Args:
             n: Number of tiles to stack vertically.
@@ -849,9 +797,8 @@ class ImageProcessor:
                 auto-select.
             access: Declared CPU access (``"readwrite"``/``"read"``/
                 ``"write"``/``"none"``). Default ``"readwrite"``; widened as
-                for :meth:`create_image`, except that tiles are written
-                through views, so any predicted CPU write is added as
-                ``"readwrite"``.
+                for :meth:`create_image`, with any predicted CPU write added
+                as ``"readwrite"``.
 
         Returns:
             A new batched image ``Tensor`` sized ``[tile_w, n*tile_h]``.
@@ -865,8 +812,7 @@ class ImageProcessor:
     ) -> list[TilePlacement]:
         """Compute the tile grid and per-tile placements for a frame.
 
-        Runs **without touching the GPU**. Call once per frame to size pools
-        and drive a tile stream.
+        Runs without touching the GPU.
 
         Args:
             width: Full-frame width in pixels.
@@ -909,9 +855,8 @@ class ImageProcessor:
     ) -> None:
         """Render exactly one tile of ``src`` into a single destination slot.
 
-        Deferred — call :meth:`flush` on your own cadence so tiles overlap
-        with inference. All geometry rides in ``placement`` (from
-        :meth:`plan_tiles`).
+        Deferred: call :meth:`flush` to complete it. ``placement`` (from
+        :meth:`plan_tiles`) carries the geometry.
 
         Args:
             src: Whole-frame source image.
@@ -1099,11 +1044,11 @@ class TileSpec:
         """Grid column."""
 
 class TilePlacement:
-    """How one tile was cut from the full frame and fed to the model — the
-    shared input/output contract produced by the tiling grid and consumed by
+    """How one tile was cut from the full frame and fed to the model.
+    Produced by the tiling grid and consumed by
     :func:`edgefirst.decoder.lift_tile_boxes` and
     :class:`edgefirst.decoder.TiledFrameAccumulator`. All fields are
-    full-frame **pixels** except ``content_region`` (the normalized image
+    full-frame pixels except ``content_region`` (the normalized image
     content of a letterboxed tile on the model input).
     """
 
@@ -1120,7 +1065,7 @@ class TilePlacement:
 
         Args:
             index: Tile index within the frame grid, ``0..count``.
-            count: Total tiles for this frame (the streaming fan-in fence).
+            count: Total tiles for this frame.
             origin: Native crop origin ``(ox, oy)`` in full-frame pixels.
             crop_size: Native crop size ``(cw, ch)`` in full-frame pixels.
             frame_dims: Full-frame dimensions ``(frame_w, frame_h)`` in pixels.
@@ -1156,10 +1101,9 @@ def tile_grid(
     tile on an axis, in which case that axis yields a single whole-frame crop.
 
     Note:
-        Argument order here is width-first, following Python imaging
-        conventions. The Rust (``edgefirst_image::tile_grid``) and C
-        (``hal_tile_grid``) APIs are height-first:
-        ``(frame_h, frame_w, tile_h, tile_w)``. Mind the swap when porting.
+        Argument order here is width-first. The Rust
+        (``edgefirst_image::tile_grid``) and C (``hal_tile_grid``) APIs are
+        height-first: ``(frame_h, frame_w, tile_h, tile_w)``.
 
     Args:
         frame_w: Full-frame width in pixels.
@@ -1176,6 +1120,5 @@ def tile_grid(
             dimension is zero.
     """
 
-# `Protocol` must not remain bound: stub-parity treats every top-level name
-# as this package's public surface.
+# Remove `Protocol` from the module's public names.
 del Protocol

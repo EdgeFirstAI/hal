@@ -230,8 +230,7 @@ pub unsafe extern "C" fn ef_tile_placement_list_free(list: *mut EfTilePlacementL
 /// Allocate a tall packed batch that stacks `n` tiles.
 ///
 /// The declared access is widened as for `ef_image_processor_create_image`;
-/// tiles are written through views, so any predicted CPU write is added as
-/// `EF_CPU_ACCESS_READ_WRITE`.
+/// any predicted CPU write is added as `EF_CPU_ACCESS_READ_WRITE`.
 ///
 /// # Safety
 /// `format` is a NUL-terminated wire code.

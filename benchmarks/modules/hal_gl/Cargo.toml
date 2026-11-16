@@ -7,7 +7,7 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "HAL software JPEG→NV12 + HAL GL letterbox (plan H3)"
+description = "HAL software JPEG→NV12 + HAL GL letterbox"
 
 [[bin]]
 name = "hal_gl"

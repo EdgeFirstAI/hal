@@ -23,10 +23,7 @@ ndarray = ["dep:ndarray"]
 tracing = ["dep:tracing-chrome", "dep:tracing-subscriber"]
 
 [dependencies]
-# The frozen `EfClientState` vocabulary. Always on, both backends: `pbo.rs`'s
-# `PboOpsVtable` is a C-ABI view onto `PboOps` and is compiled into both, so
-# the struct it embeds has to be visible in both. That crate is
-# dependency-free by charter, so the edge costs nothing downstream.
+# The `EfClientState` vocabulary.
 edgefirst-tensor-abi = { workspace = true }
 half = { workspace = true }
 libloading = { workspace = true }
@@ -38,8 +35,7 @@ tracing = { workspace = true }
 tracing-chrome = { workspace = true, optional = true }
 tracing-subscriber = { workspace = true, optional = true }
 uuid = { workspace = true }
-# Errno constants for the dynamic backend, plus DMA/IOSurface FFI. Always on
-# so Windows/Android C-API leaves that compile `dynamic` still type-check.
+# Errno constants for the dynamic backend, plus DMA/IOSurface FFI.
 libc = { workspace = true }
 
 # The dynamic backend (`--cfg edgefirst_tensor_dynamic`) calls libedgefirst_tensor through these declarations.
@@ -61,16 +57,12 @@ ctor = { workspace = true }
 env_logger = { workspace = true }
 edgefirst-bench = { workspace = true }
 serde_json = { workspace = true }
-# `tests/dynamic_primitives.rs` drives `ef_tensor_builder_*` directly to
-# build a tensor as "another producer" would, independent of this crate's
-# own `dynamic`-backend constructors -- not re-exported by this crate's own
-# public API, so the integration test needs its own dependency edge.
+# `tests/dynamic_primitives.rs` drives `ef_tensor_builder_*` directly.
 edgefirst-tensor-ffi = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 procfs = { workspace = true }
-# `tests/vivid_capture_import.rs` captures from the kernel's vivid driver to
-# import a real padded V4L2 capture buffer.
+# `tests/vivid_capture_import.rs` captures from the kernel's vivid driver.
 edgefirst-v4l2 = { workspace = true }
 
 [[bench]]

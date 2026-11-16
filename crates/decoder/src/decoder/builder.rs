@@ -15,26 +15,15 @@ use crate::DecoderError;
 
 /// Extract `(width, height)` from a schema [`crate::schema::InputSpec`].
 ///
-/// Prefers named dims (`DimName::Width` / `DimName::Height`) when the
-/// `dshape` is populated, falling back to the NHWC convention
-/// (`shape[1] = H, shape[2] = W`) for 4-element shapes whenever either
-/// named dim is missing. Returns `None` for any other shape arity — the
-/// decoder treats that as "input dims unknown" and skips the EDGEAI-1303
-/// normalization path.
-///
-/// The fallback fires when **either** `Height` or `Width` is missing from
-/// the dshape (not only when both are absent), so a partially-named
-/// dshape (e.g. only `Width`) still resolves both dims via positional
-/// inference instead of silently disabling normalization.
+/// Uses the named dims (`DimName::Width` / `DimName::Height`) of a populated
+/// `dshape`, and the NHWC convention (`shape[1] = H, shape[2] = W`) of a
+/// 4-element shape for a named dim that is missing. Returns `None` when a
+/// dim stays unresolved.
 fn input_dims_from_spec(input: &crate::schema::InputSpec) -> Option<(usize, usize)> {
     use crate::configs::DimName;
     let mut h = None;
     let mut w = None;
-    // `SchemaV2::validate()` doesn't currently enforce
-    // `dshape.len() <= shape.len()`, so a malformed schema can trip an
-    // out-of-bounds index here. Use `shape.get(i)` to silently skip
-    // dshape entries that overflow the shape — the caller treats
-    // missing dims as "unknown" and disables EDGEAI-1303 normalization.
+    // A dshape entry past the end of the shape is skipped.
     for (i, (name, _)) in input.dshape.iter().enumerate() {
         match name {
             DimName::Height => h = input.shape.get(i).copied(),
@@ -43,10 +32,7 @@ fn input_dims_from_spec(input: &crate::schema::InputSpec) -> Option<(usize, usiz
         }
     }
     if (h.is_none() || w.is_none()) && input.shape.len() == 4 {
-        // NHWC default: [N, H, W, C]. Mirrors the per-scale `extract_hw`
-        // fallback (`crates/decoder/src/per_scale/plan.rs::extract_hw`).
-        // Only fill the missing axis so a partial named dshape still
-        // resolves both dims.
+        // NHWC: [N, H, W, C]. Fills only the missing axis.
         h = h.or(Some(input.shape[1]));
         w = w.or(Some(input.shape[2]));
     }
@@ -91,30 +77,21 @@ mod input_dims_from_spec_tests {
 
     #[test]
     fn malformed_dshape_longer_than_shape_does_not_panic() {
-        // Regression for Copilot review on PR #63: indexing
-        // `input.shape[i]` while iterating dshape can OOB-panic when
-        // `dshape.len() > shape.len()`. The fix uses `shape.get(i)`
-        // and silently treats overflow as "dim missing".
         let spec = InputSpec {
-            shape: vec![640, 480], // 2-D shape
+            shape: vec![640, 480],
             dshape: vec![
                 (DimName::Width, 640),
                 (DimName::Height, 480),
-                (DimName::NumFeatures, 3), // overflow — index 2 ≥ shape.len()
+                (DimName::NumFeatures, 3), // past the end of the shape
             ],
             cameraadaptor: None,
             preprocessing: None,
         };
-        // First two dshape entries resolve via `shape.get()`; the third
-        // is a no-op. Width/Height both resolved, so we expect Some.
         assert_eq!(input_dims_from_spec(&spec), Some((640, 480)));
     }
 
     #[test]
     fn malformed_dshape_only_overflow_returns_none() {
-        // All dshape entries are past the shape boundary — width and
-        // height stay None and the 4-D NHWC fallback doesn't fire
-        // (shape.len() == 1), so we get None instead of a panic.
         let spec = InputSpec {
             shape: vec![1],
             dshape: vec![
@@ -133,8 +110,7 @@ mod input_dims_from_spec_tests {
 pub const DEFAULT_PRE_NMS_TOP_K: usize = 300;
 
 /// Default [`DecoderBuilder::with_pre_nms_top_k`] cap when multi-label decode
-/// is on: Ultralytics' `max_nms`, since multi-label emits up to
-/// anchors × classes candidates.
+/// is on.
 pub const MULTI_LABEL_PRE_NMS_TOP_K: usize = 30_000;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -159,7 +135,7 @@ pub struct DecoderBuilder {
     pre_nms_top_k: Option<usize>,
     max_det: usize,
     /// Explicit override for the model input dimensions `(width, height)`,
-    /// consumed by EDGEAI-1303 normalization. When set, takes precedence
+    /// consumed by box normalization. When set, takes precedence
     /// over schema-derived dims; when `None`, the value is read from the
     /// schema's `input.shape` / `input.dshape` at build time.
     input_dims: Option<(usize, usize)>,
@@ -174,7 +150,7 @@ enum ConfigSource {
     Json(String),
     Config(ConfigOutputs),
     /// Schema v2 metadata. During build the schema is either converted
-    /// to a legacy [`ConfigOutputs`] (flat case) or used to construct a
+    /// to a [`ConfigOutputs`] (flat case) or used to construct a
     /// [`DecodeProgram`] that performs per-child dequant + merge at
     /// decode time.
     Schema(SchemaV2),
@@ -282,9 +258,7 @@ impl DecoderBuilder {
     }
 
     /// Loads a model configuration. Does not check if the configuration is
-    /// correct. Intended to be used when the user needs control over the
-    /// deserialize of the configuration information. Use
-    /// `DecoderBuilder.build()` to parse the model configuration.
+    /// correct. Use `DecoderBuilder.build()` to parse the model configuration.
     ///
     /// # Examples
     /// ```rust,no_run
@@ -308,9 +282,8 @@ impl DecoderBuilder {
     /// [`SchemaV2::parse_yaml`], [`SchemaV2::parse_file`], or
     /// constructed programmatically. The builder validates the schema,
     /// compiles a decode program for any split logical outputs
-    /// (per-scale or channel sub-splits), and downconverts the
-    /// logical-level semantics to the legacy [`ConfigOutputs`]
-    /// representation consumed by the existing decoder dispatch.
+    /// (per-scale or channel sub-splits), and lowers the logical outputs
+    /// to the [`ConfigOutputs`] representation the decoder dispatches on.
     ///
     /// # Examples
     ///
@@ -334,12 +307,8 @@ impl DecoderBuilder {
 
     /// Choose the dtype the per-scale pipeline decodes boxes and scores in.
     ///
-    /// Without this call the decoder uses [`DecodeDtype::native`]: `F16` on
-    /// a CPU with FP16 arithmetic, `F32` on any other. Has no effect on
-    /// schemas without per-scale children (which use the legacy decode
-    /// path). `F16` rounds boxes and scores to 11 significant bits, which
-    /// keeps YOLO detections within about a quarter pixel and 1e-4 in score
-    /// of `F32`; [`Decoder::decode_dtype`] reports the dtype in use.
+    /// Defaults to [`DecodeDtype::native`]. Has no effect on schemas
+    /// without per-scale children.
     ///
     /// # Examples
     ///
@@ -774,13 +743,11 @@ impl DecoderBuilder {
     /// a time. The decoder resolves the model type from the combination of
     /// outputs during `build()`.
     ///
-    /// If `dshape` is non-empty on the output, `shape` is automatically
-    /// derived from it (the size component of each named dimension). This
-    /// prevents conflicts between `shape` and `dshape`.
+    /// If `dshape` is non-empty on the output, `shape` is derived from it
+    /// (the size component of each named dimension).
     ///
-    /// This uses the programmatic config path. Calling this after
-    /// `with_config_json_str()` or `with_config_yaml_str()` replaces the
-    /// string-based config source.
+    /// Calling this after `with_config_json_str()` or
+    /// `with_config_yaml_str()` replaces the string-based config source.
     ///
     /// # Examples
     /// ```rust
@@ -946,11 +913,10 @@ impl DecoderBuilder {
         self
     }
 
-    /// Enable multi-label box decode for validation runs.
+    /// Enable multi-label box decode.
     ///
     /// When `true`, the decoder emits one candidate per `(anchor, class)` pair
-    /// for every class whose score meets the threshold — matching the
-    /// Ultralytics `val` multi-label decode that drives COCO mAP evaluation.
+    /// for every class whose score meets the threshold.
     ///
     /// **Default:** the model config's `nms_multi_label`, else `false`
     /// (argmax: one class per anchor). An explicit call overrides the config
@@ -962,8 +928,7 @@ impl DecoderBuilder {
     /// The candidates go through the decoder's NMS mode unchanged. Class-aware
     /// NMS (the default when neither the caller nor the config sets a mode)
     /// keeps every class of an anchor; an explicit `Nms::ClassAgnostic`
-    /// suppresses across classes, as Ultralytics
-    /// `non_max_suppression(multi_label=True, agnostic=True)` does.
+    /// suppresses across classes.
     ///
     /// Unless [`with_pre_nms_top_k`](Self::with_pre_nms_top_k) is called,
     /// multi-label decode raises the pre-NMS cap to
@@ -987,40 +952,18 @@ impl DecoderBuilder {
     }
 
     /// Sets the maximum number of candidate boxes fed into NMS after score
-    /// filtering; `0` means unbounded. Uses partial sort (O(N)) to select the
-    /// top-K candidates, dramatically reducing the O(N²) NMS cost when many
-    /// low-confidence proposals pass the threshold (common with mAP eval at
-    /// 0.001). Equal scores at the cut keep the lower anchor index. Applies
-    /// to every NMS decode path; ignored when NMS is bypassed.
+    /// filtering; `0` means unbounded. Equal scores at the cut keep the lower
+    /// anchor index. Applies to every NMS decode path; ignored when NMS is
+    /// bypassed.
     ///
     /// Default: [`DEFAULT_PRE_NMS_TOP_K`] (300), or
-    /// [`MULTI_LABEL_PRE_NMS_TOP_K`] (30 000, Ultralytics' `max_nms`) when
-    /// multi-label decode is on, whether from
-    /// [`with_multi_label`](Self::with_multi_label) or the model's
-    /// `nms_multi_label`; argmax decodes of a multi-label decoder (the
+    /// [`MULTI_LABEL_PRE_NMS_TOP_K`] (30 000) when multi-label decode is on,
+    /// whether from [`with_multi_label`](Self::with_multi_label) or the
+    /// model's `nms_multi_label`; argmax decodes of a multi-label decoder (the
     /// tracking entry points) keep 300. Unset, the built decoder's
     /// [`Decoder::pre_nms_top_k`](crate::Decoder::pre_nms_top_k) is `None` and
     /// is resolved per decode; an explicit call stores `Some(n)`, which every
     /// decode uses as given.
-    ///
-    /// # ⚠️ Validation vs Deployment
-    ///
-    /// The default is appropriate for **deployment** where
-    /// `score_threshold ≥ 0.25` means few anchors survive filtering and
-    /// top-K is effectively a no-op.
-    ///
-    /// For **COCO mAP evaluation** (`score_threshold ≈ 0.001`), set this to
-    /// `0` (unbounded) so that all score-passing candidates reach NMS.
-    /// Under argmax decode there is one candidate per anchor, so the anchor
-    /// count (8 400 for a 640 × 640 YOLO model) is also enough; under
-    /// multi-label decode there are up to anchors × classes candidates, so use
-    /// `0` or leave the multi-label default. Failing to raise the cap causes
-    /// **~9 pp box mAP loss** — the decoder math is correct but the
-    /// evaluation protocol requires full recall across the confidence range.
-    ///
-    /// Post-processing latency scales with candidate count. At deployment
-    /// thresholds the cost difference is negligible; at validation thresholds
-    /// it is measurable but necessary for correct results.
     ///
     /// # Examples
     ///
@@ -1061,7 +1004,6 @@ impl DecoderBuilder {
     }
 
     /// Sets the maximum number of detections returned after NMS.
-    /// Matches the Ultralytics `max_det` parameter.
     ///
     /// Default: 300.
     ///
@@ -1083,17 +1025,9 @@ impl DecoderBuilder {
         self
     }
 
-    /// Sets the model input dimensions `(width, height)` consumed by the
-    /// EDGEAI-1303 normalization path. Use this when building via
-    /// [`with_config`](Self::with_config) / [`add_output`](Self::add_output)
-    /// (no schema) and the model emits pixel-space boxes that need to be
-    /// divided by `(W, H)` before NMS.
-    ///
-    /// When the builder is also configured with [`with_schema`](Self::with_schema)
-    /// (or `with_config_json_str` / `with_config_yaml_str`) and the schema's
-    /// `input` block carries usable dims, this explicit override **takes
-    /// precedence** so callers can correct schemas with missing or wrong
-    /// input specs without rewriting the schema.
+    /// Sets the model input dimensions `(width, height)` consumed by box
+    /// normalization, which divides pixel-space boxes by `(W, H)` before NMS.
+    /// Takes precedence over the dims of a schema's `input` block.
     ///
     /// # Examples
     /// ```rust
@@ -1153,34 +1087,17 @@ impl DecoderBuilder {
             Some(ConfigSource::Schema(schema)) => Self::build_from_schema(schema, decode_dtype)?,
             None => return Err(DecoderError::NoConfig),
         };
-        // Explicit `with_input_dims(W, H)` overrides any schema-derived
-        // value so callers can fix schemas with missing or wrong input
-        // specs without rewriting the schema (EDGEAI-1303).
+        // Explicit `with_input_dims(W, H)` overrides the schema-derived value.
         let input_dims = explicit_input_dims.or(schema_input_dims);
 
-        // Enforce the physical-order contract: when dshape is present
-        // it must describe the same axes as shape in the same order,
-        // listed from outermost to innermost. Ambiguous-layout roles
-        // (Protos, Boxes, Scores, MaskCoefficients, Classes, Detection)
-        // may still omit dshape when shape is already in the decoder's
-        // canonical order.
+        // Validates that an output's dshape, when present, names the axes of
+        // its shape in the same order.
         for output in &config.outputs {
             Decoder::validate_output_layout(output.into())?;
         }
 
-        // Extract normalized flag from config outputs.
-        //
-        // The per-scale subsystem (DFL/LTRB → dist2bbox → sigmoid) emits
-        // boxes in pixel coordinates by design — `(grid + dist) * stride`
-        // — independently of any `normalized: true` annotation in the
-        // schema. Override to `Some(false)` so the per-scale bridge's
-        // call to `yolo::maybe_normalize_boxes_in_place` fires and
-        // divides by `input_dims`, yielding `[0, 1]` output. The
-        // accessor `Decoder::normalized_boxes()` applies the
-        // pixel→normalized upgrade for the per-scale path and for any
-        // legacy `ModelType` whose every entry point normalizes
-        // uniformly (currently `YoloSegDet`, `YoloSplitSegDet`, and
-        // `YoloSegDet2Way`); other paths surface the raw flag.
+        // The normalized flag is `Some(false)` on the per-scale path, which
+        // emits pixel coordinates, and the config outputs' flag otherwise.
         let normalized = if per_scale_plan.is_some() {
             Some(false)
         } else {
@@ -1204,10 +1121,6 @@ impl DecoderBuilder {
         //   Some(ClassAgnostic|ClassAware) → explicit user override
         //   Some(Auto) → resolve from config, fallback to ClassAware
         //   None → NMS disabled (explicit)
-        //
-        // `Auto` is always resolved to a concrete mode here — it never
-        // persists into the built `Decoder`, even if the config itself
-        // contains `Auto`.
         let resolve_auto = |nms: Option<configs::Nms>| match nms {
             Some(configs::Nms::Auto) | None => Some(configs::Nms::ClassAware),
             concrete => concrete,
@@ -1216,17 +1129,9 @@ impl DecoderBuilder {
             Some(configs::Nms::Auto) => resolve_auto(config.nms),
             other => other,
         };
-        // When the per-scale path is active, the per_scale subsystem owns
-        // model decoding entirely — `decode` / `decode_proto` short-circuit
-        // on `per_scale.is_some()` before reading `model_type`. Skip the
-        // legacy ModelType validation, which otherwise rejects per-scale
-        // schemas that carry `decoder_version: yolo26` (an
-        // "end-to-end" hint) but use the per-scale split outputs rather
-        // than the end-to-end split-output shape the legacy validator
-        // expects. We keep a placeholder `ModelType` so the field remains
-        // valid; it is dead state for per-scale Decoders.
+        // The per-scale path skips `ModelType` validation and carries the
+        // `ModelType::PerScale` placeholder.
         let model_type = if per_scale_plan.is_some() {
-            // Drop the un-needed config; the per-scale subsystem owns it.
             drop(config);
             ModelType::PerScale
         } else if semantic_only {
@@ -1263,17 +1168,9 @@ impl DecoderBuilder {
         })
     }
 
-    /// Validate a [`SchemaV2`] and lower it to the (legacy `ConfigOutputs`,
-    /// optional `DecodeProgram`, optional `PerScalePlan`) tuple the rest
-    /// of `build()` consumes.
-    ///
-    /// Centralises the v2 lowering so JSON, YAML, and direct
-    /// `with_schema` callers all go through the same validation,
-    /// merge-program, and per-scale plan construction. `SchemaV2::parse_json`
-    /// / `parse_yaml` already auto-detect v1 vs v2 input and return a v2
-    /// schema either way (v1 inputs are upgraded in memory via
-    /// `from_v1`), so this helper is the sole place that turns a
-    /// schema into builder-ready state.
+    /// Validate a [`SchemaV2`] and lower it to the state `build()` consumes:
+    /// `ConfigOutputs`, an optional `DecodeProgram` and an optional
+    /// `PerScalePlan`.
     fn build_from_schema(
         schema: SchemaV2,
         decode_dtype: DecodeDtype,
@@ -1293,26 +1190,16 @@ impl DecoderBuilder {
                 merged_order: None,
             });
         }
-        // The per-scale subsystem claims per-scale schemas in full and owns
-        // their decode end-to-end (`decode` / `decode_proto` short-circuit on
-        // `per_scale.is_some()`). Build it first and use its claim as the
-        // single source of truth: only fall back to the schema-v2 merge
-        // program for split schemas it does NOT claim (e.g. ARA-2 channel
-        // sub-splits). This keeps `decode_program` `None` for per-scale
-        // schemas so the merge path never sees per-scale logicals.
+        // A schema the per-scale subsystem claims gets no merge program.
         let per_scale = PerScalePlan::try_from_schema(&schema, decode_dtype)?;
         let program = if per_scale.is_some() {
             None
         } else {
             DecodeProgram::try_from_schema(&schema)?
         };
-        // Extract model input (W, H) from `input.shape`/`dshape`. Used by
-        // the legacy decode path to honour `normalized: false` (see
-        // EDGEAI-1303). `None` is fine when the schema omits the input
-        // spec — the decoder falls back to the protobox `>2.0` reject.
         let legacy = schema.to_legacy_config_outputs()?;
-        // Per-scale outputs are bound by that subsystem. Merged outputs are
-        // produced one per decoded logical, so only their order is open.
+        // Per-scale outputs are bound by that subsystem; merged outputs take
+        // only a lookup order.
         let (binding, merged_order) = match (&per_scale, &program) {
             (Some(_), _) => (None, None),
             (None, Some(_)) => (None, binding::lookup_order(&legacy.outputs)),
@@ -1335,7 +1222,7 @@ impl DecoderBuilder {
     }
 
     /// Lowers a programmatic configuration. One with a semantic output goes
-    /// through the schema path, as JSON and YAML do.
+    /// through the schema path.
     fn build_from_config(
         c: ConfigOutputs,
         decode_dtype: DecodeDtype,
@@ -1380,8 +1267,8 @@ impl DecoderBuilder {
     }
 
     /// The semantic output of a schema with a `decoder: semantic` output.
-    /// Such a model is decoded only by `Decoder::decode_semantic`, so every
-    /// other output must be typeless.
+    /// Errors when another output is typed or the schema has more than one
+    /// semantic output.
     fn semantic_from_schema(schema: &SchemaV2) -> Result<Option<SemanticConfig>, DecoderError> {
         let (semantic, others): (Vec<_>, Vec<_>) = schema
             .outputs
@@ -1414,14 +1301,13 @@ impl DecoderBuilder {
                 _ => {}
             }
         }
-        None // not specified
+        None
     }
 
     fn get_model_type(
         configs: ConfigOutputs,
         end2end: Option<bool>,
     ) -> Result<ModelType, DecoderError> {
-        // yolo or modelpack
         let mut yolo = false;
         let mut modelpack = false;
         for c in &configs.outputs {
@@ -1489,10 +1375,8 @@ impl DecoderBuilder {
         });
         let tagged = configs.decoder_version.map(|v| v.is_end_to_end());
         let is_end_to_end = end2end != Some(false) && tagged.unwrap_or(is_end_to_end_dshape);
-        // The Yolo26 tag alone does not make a head end-to-end: an export
-        // made without the embedded NMS keeps the tag and the YOLOv8 head.
-        // Where the schema does not state `end2end`, a head that cannot be
-        // end-to-end is decoded as that export.
+        // With `end2end` unstated, a Yolo26-tagged head that fails end-to-end
+        // verification is decoded as a head with external NMS.
         let tag_only = end2end.is_none() && tagged == Some(true);
 
         if is_end_to_end {
@@ -2221,22 +2105,8 @@ impl DecoderBuilder {
                 segmentation.shape
             )));
         }
-        // ModelPack segmentation is canonical NHWC: [Batch, Height, Width,
-        // NumClasses]. Structural integrity of the dshape (rank, per-axis size
-        // agreement with `shape`, no duplicate axes) is already enforced for
-        // every output by `Decoder::validate_output_layout` at build entry, so
-        // here we only require the spatial axes to be named and recover the
-        // class count from the channel axis below.
-        //
-        // Metadata producers that lack embedded metadata (the validator's
-        // shape-inference fallback for ModelPack `.keras` models) tag the
-        // channel axis as `num_protos` or omit its name, which previously
-        // hard-failed here with "Segmentation dshape missing required
-        // dimension NumClasses" (DE-2651 / DE-2628). That is unnecessarily
-        // strict: an unnamed or mis-named channel axis at position 3 is sorted
-        // to the canonical tail by `swap_axes_if_needed`, so the physical NHWC
-        // order — and therefore decode — is unaffected. Infer the class count
-        // from the NHWC shape instead of rejecting the model.
+        // Requires the batch and spatial axes to be named. The channel axis may
+        // be tagged `num_classes` or `num_protos`, or left unnamed.
         if !segmentation.dshape.is_empty() {
             let names =
                 HashSet::<DimName>::from_iter(segmentation.dshape.iter().map(|(name, _)| *name));
@@ -2262,14 +2132,9 @@ impl DecoderBuilder {
         Ok(())
     }
 
-    /// Number of segmentation classes for a ModelPack segmentation output.
-    ///
-    /// Prefers an explicit `NumClasses` dshape dimension when present;
-    /// otherwise falls back to the canonical NHWC channel axis (`shape[3]`).
-    /// This tolerates metadata that omits or mis-tags the class axis while
-    /// still honouring a correctly-tagged dshape. Only called after
-    /// `verify_modelpack_seg` has validated that `shape` is rank-4 (it returns
-    /// `InvalidConfig` otherwise), so `shape[3]` cannot panic.
+    /// Number of segmentation classes for a ModelPack segmentation output:
+    /// the `NumClasses` dshape dimension when present, otherwise the NHWC
+    /// channel axis (`shape[3]`). `shape` must be rank-4.
     fn modelpack_seg_num_classes(segmentation: &configs::Segmentation) -> usize {
         segmentation.shape[crate::semantic::modelpack_class_axis(&segmentation.dshape)]
     }
@@ -2515,8 +2380,8 @@ fn configured_outputs(schema: &SchemaV2, legacy: &ConfigOutputs) -> Vec<Configur
         .collect()
 }
 
-/// A ModelPack model whose segmentation output has no semantic view still
-/// decodes boxes and masks, so the reason is logged rather than returned.
+/// Logs the reason a ModelPack segmentation output has no semantic view and
+/// returns `None` for it.
 fn warn_no_semantic(config: Result<SemanticConfig, DecoderError>) -> Option<SemanticConfig> {
     config
         .map_err(|e| tracing::warn!("ModelPack segmentation has no semantic decode: {e}"))

@@ -1,52 +1,42 @@
 # HAL Project Makefile
 #
-# This Makefile implements workflows from the Au-Zone Software Process Specification:
+# Workflows:
 #   - Code formatting with nightly Rust and ruff for Python
 #   - Linting with clippy and ruff
 #   - Testing with cargo-nextest and llvm-cov (using profiling profile)
 #   - SBOM generation and license policy validation
 #   - Pre-release quality checks and version verification
 #
-# IMPORTANT: Since HAL is performance-focused, tests use the 'profiling' profile
-# which produces optimized binaries with full debug symbols.
+# Tests use the 'profiling' profile, which produces optimized binaries with
+# full debug symbols.
 #
 # Prerequisites: See README.md or CONTRIBUTING.md for tool installation.
 #
 # ===========================================================================
 
-# Use bash for shell commands (required for source <(...) syntax)
+# Use bash for shell commands
 SHELL := /bin/bash
 
 # Project configuration
 PROJECT_NAME := hal
-# One extension module per package (the single crates/python and the edgefirst-hal meta-crate
-# are both gone since 0.29).
+# One extension module per package.
 PYTHON_PACKAGES := tensor codec image decoder tracker kernels
 PYTHON_CRATES := $(addprefix crates/python-,$(PYTHON_PACKAGES))
-# cargo package names, for --exclude: these are cdylibs with no meaningful
-# line coverage of their own, and llvm-cov cannot instrument them usefully.
+# cargo package names of the Python extension crates, for --exclude.
 PYTHON_CRATE_NAMES := edgefirst-python-common \
 	$(addprefix edgefirst-python-,$(PYTHON_PACKAGES))
 TEST_DIR := tests
-# Must match ci.yml ruff-paths; ruff lints Python in python-common's .md files.
+# Paths ruff checks, including the Python in python-common's .md files.
 RUFF_PATHS := $(PYTHON_CRATES) crates/python-common $(TEST_DIR)
 
-# The modular C-API leaves: standalone packages excluded from the
-# workspace so each library resolves its own features and lockfile, and
-# workspace builds never re-link them over the artifacts the gates read.
-# Every invocation MUST carry --target-dir target: their artifact-reading
-# tests hardcode the shared <root>/target dir, and EF_REQUIRE_FRESH_ARTIFACTS=1
-# makes a wrong target dir a hard failure instead of a silent skip.
-# tensor-capi comes first: the dynamic leaves link the library it builds.
+# The modular C-API leaves: standalone packages excluded from the workspace,
+# in build order.
 CAPI_MODULAR_CRATES := tensor-capi image-capi codec-capi decoder-capi tracker-capi kernels-capi
 
 # Selects edgefirst-tensor's dynamic backend for checks of the libraries (see
-# ARCHITECTURE.md, Tensor Backend Selection). The leaves select it themselves
-# through their own .cargo/config.toml, so they are always built from their
-# crate directory. Never RUSTFLAGS: that replaces .cargo/config.toml's
-# per-target flags.
+# ARCHITECTURE.md, Tensor Backend Selection).
 TENSOR_DYNAMIC := --config $(CURDIR)/.cargo/tensor-dynamic.toml
-# An environment RUSTFLAGS suppresses every config rustflags, so a dynamic-backend lane would quietly build static.
+# Fails when RUSTFLAGS is set in the environment.
 define require_fragment_rustflags
 	@if [ -n "$$RUSTFLAGS" ]; then \
 		echo "ERROR: RUSTFLAGS is set, which hides the tensor backend cfg; use CARGO_TARGET_<TRIPLE>_RUSTFLAGS instead" >&2; \
@@ -68,36 +58,24 @@ PUBLISHED_CRATES := edgefirst-tensor-abi edgefirst-tensor-ffi edgefirst-tensor e
 
 # Use profiling profile for testing (optimized with debug symbols)
 CARGO_PROFILE := --profile profiling
-# For cargo-llvm-cov nextest, the cargo profile flag is different
+# The same profile, as cargo-llvm-cov nextest spells it
 LLVM_COV_PROFILE := --cargo-profile profiling
 
-# Rust features (all except opencv, which requires libclang at build time)
+# Rust features (all except opencv)
 RUST_FEATURES := --features opengl,ndarray,edgefirst-decoder/model-files
 
-# Interpreter used to RUN this repo's helper scripts (check_wheel_layout,
-# check_macho_alignment, generate_notice, ...). `python3` first, as on Linux,
-# macOS and every CI runner; Git Bash on a Windows dev box often has only
-# `python`, and `python3` there may be the Microsoft Store stub, which exits
-# 49 with "Python was not found" instead of failing to resolve. So probe by
-# RUNNING each candidate, not by `command -v` alone -- the same rule, and the
-# same hazard, that scripts/package-capi.sh documented first. Keeping the two
-# in step matters because `make package` calls that script and then a checker.
-#
-# Distinct from PYTHON_INTERPRETER below, which is a different question: that
-# one must be a VERSIONED name for maturin -i and is not used to run anything.
+# The interpreter that runs this repository's helper scripts: the first of
+# python3 and python that executes.
 PYTHON := $(shell \
 	for c in python3 python; do \
 		if command -v "$$c" >/dev/null 2>&1 && "$$c" -c 'pass' >/dev/null 2>&1; then \
 			echo "$$c"; break; \
 		fi; \
 	done)
-# Fall back to the literal so a recipe fails with a readable
-# "python3: command not found" rather than trying to exec the .py file itself.
+# Falls back to the literal python3 when neither executes.
 PYTHON := $(if $(PYTHON),$(PYTHON),python3)
 
-# Python interpreter name for maturin -i (cross-compile requires a versioned
-# name like 'python3.10' because maturin parses major.minor from the filename
-# — it cannot execute a target-arch Python to introspect its ABI).
+# Versioned Python interpreter name for maturin -i, such as 'python3.10'.
 PYTHON_INTERPRETER := $(shell \
 	if [ -x venv/bin/python ]; then \
 		venv/bin/python -c "import sys; print(f'python{sys.version_info.major}.{sys.version_info.minor}')"; \
@@ -111,10 +89,9 @@ PYTHON_INTERPRETER := $(shell \
 TARGET ?=
 
 # Optional abi3 stable-ABI version (py38, py311, ...). When set, selects the
-# matching 'abi3-<PYABI>' feature in crates/python/Cargo.toml and produces a
-# version-agnostic wheel (tagged cp<abi>-abi3) usable by any CPython at or
-# above that minimum. Empty value produces a wheel tagged for the interpreter
-# chosen by -i (e.g. cp310-cp310).
+# matching 'abi3-<PYABI>' feature and produces a version-agnostic wheel (tagged
+# cp<abi>-abi3) usable by any CPython at or above that minimum. Empty value
+# produces a wheel tagged for the interpreter chosen by -i (e.g. cp310-cp310).
 #   make PYABI=py38 wheel                         # abi3 wheel, Python 3.8+
 #   make TARGET=aarch64-unknown-linux-gnu PYABI=py311 wheel
 PYABI ?=
@@ -205,12 +182,11 @@ lint-rust:
 		-- -D warnings
 	@echo "✓ Clippy passed"
 
-# The workspace lanes compile the Python bindings under abi3-py311 only;
-# this lints the abi3-py38 configuration every wheel also ships. `-p` per
-# crate keeps each extension's own python-common feature set.
+# Lints the Python bindings under the abi3-py38 configuration, one crate at a
+# time.
 .PHONY: lint-python-abi3-py38
 lint-python-abi3-py38:
-	@echo "Running clippy on the Python bindings under abi3-py38 (the ABI regular CI otherwise never compiles)..."
+	@echo "Running clippy on the Python bindings under abi3-py38..."
 	@for pkg in $(PYTHON_PACKAGES); do \
 		(cd crates/python-$$pkg && cargo clippy --features abi3-py38 --all-targets -- -D warnings) || exit 1; \
 	done
@@ -257,9 +233,8 @@ check-standalone:
 	@echo "✓ Standalone check passed"
 	@$(MAKE) --no-print-directory check-backends
 
-# Every library a shared-library leaf compiles in, against both tensor
-# backends. Libraries never name the backend, so a dynamic-only compile
-# break is otherwise found only by the C-API and wheel builds.
+# Checks every library a shared-library leaf compiles in against both tensor
+# backends.
 .PHONY: check-backends
 check-backends:
 	$(require_fragment_rustflags)
@@ -269,8 +244,9 @@ check-backends:
 	@cargo check $(TENSOR_DYNAMIC) $(foreach c,$(BACKEND_CHECK_CRATES),-p $(c)) --features $(BACKEND_CHECK_FEATURES) --lib
 	@echo "✓ Both backends check"
 
-# Only edgefirst-tensor and the shared-library leaves may name the tensor
-# backend, and nothing may select it through RUSTFLAGS.
+# Fails when a path outside BACKEND_SCOPE_ALLOWED names the tensor backend, when
+# RUSTFLAGS selects it, or when a leaf's .cargo/config.toml differs from
+# .cargo/tensor-dynamic.toml.
 BACKEND_SCOPE_ALLOWED := ^(crates/tensor/|crates/build-support/|crates/(image|codec|decoder|tensor)-capi/|crates/python-(tensor|codec|image|decoder)/|\.cargo/tensor-dynamic\.toml|Cargo\.toml|Makefile|\.github/|scripts/|tests/|[^:]*\.md:)
 .PHONY: lint-backend-scope
 lint-backend-scope:
@@ -286,8 +262,7 @@ lint-backend-scope:
 	done
 	@echo "✓ Backend scope clean"
 
-# Each guard must reject the wrong backend with its own message; a build that
-# fails for any other reason does not count as the guard working.
+# Checks that each leaf rejects the wrong tensor backend with its own message.
 .PHONY: check-backend-guards
 check-backend-guards:
 	$(require_fragment_rustflags)
@@ -306,7 +281,7 @@ check-backend-guards:
 			|| { echo "$$out" | tail -20; echo "ERROR: python-$$p accepted the static backend"; exit 1; }; \
 	done
 	@EDGEFIRST_TENSOR_STATIC_COMPARISON=1 cargo check -q -p edgefirst-python-image \
-		|| { echo "ERROR: the G13 static comparison opt-in no longer builds"; exit 1; }
+		|| { echo "ERROR: the static comparison opt-in does not build"; exit 1; }
 	@echo "✓ Every leaf guard fires"
 
 .PHONY: check-capi-modular
@@ -317,9 +292,7 @@ check-capi-modular:
 	done
 	@echo "✓ Modular C-API check passed"
 
-# The root workspace excludes benchmarks/, so no workspace build, lint or
-# test compiles it. Type-check it against the current library APIs; the
-# benchmarks themselves are built and run by hand (see benchmarks/README.md).
+# Type-checks benchmarks/, which the root workspace excludes.
 .PHONY: check-benchmarks
 check-benchmarks:
 	@echo "Running cargo check on the benchmarks workspace..."
@@ -348,11 +321,7 @@ capi-libs:
 	@echo "✓ Modular C-API build complete"
 	@$(MAKE) capi-symlinks
 
-# G5 (scripts/check-single-home.sh) measures footprint against
-# target/release -- BASELINE_BYTES is a release measurement, and a debug
-# comparison would be meaningless -- while capi-libs above only ever
-# produces target/debug. This is that release build, kept separate so a
-# plain `make capi-libs` (used by test-capi-modular and friends) stays fast.
+# Builds the C libraries under the release or profiling profile.
 .PHONY: capi-libs-release capi-libs-profiling
 capi-libs-release capi-libs-profiling: capi-libs-%:
 	@echo "Building the modular C-API crates ($*)..."
@@ -362,11 +331,8 @@ capi-libs-release capi-libs-profiling: capi-libs-%:
 	@echo "✓ Modular C-API $* build complete"
 	@$(MAKE) capi-symlinks
 
-# build.rs sets `-soname libedgefirst_X.so.0` / install_name
-# `libedgefirst_X.0.dylib`, but cargo only ever writes the unversioned
-# name, so no C binary (or Rust test harness) can load one via DT_NEEDED /
-# @rpath. Cargo never writes the versioned symlink, so this target creates
-# it next to each leaf.
+# Creates the versioned symlink (libedgefirst_X.so.0, libedgefirst_X.0.dylib)
+# next to each leaf library.
 .PHONY: capi-symlinks
 capi-symlinks:
 	@for l in tensor image codec decoder tracker kernels; do \
@@ -379,9 +345,8 @@ capi-symlinks:
 	done
 
 # One relocatable archive: headers, soversioned libraries, pkg-config,
-# LICENSE, INSTALL.txt. tar.gz on Linux, zip on Windows and macOS. The same
-# script release.yml's build-capi job runs, so local `make package` and CI
-# cannot drift. PACKAGE_PROFILE=profiling packages a test build (CI smoke tests on ordinary PRs).
+# LICENSE, INSTALL.txt. tar.gz on Linux, zip on Windows and macOS.
+# PACKAGE_PROFILE=profiling packages a test build.
 PACKAGE_PROFILE ?= release
 .PHONY: package
 package: capi-libs-$(PACKAGE_PROFILE)
@@ -390,17 +355,9 @@ package: capi-libs-$(PACKAGE_PROFILE)
 	@$(PYTHON) scripts/check_macho_alignment.py dist
 	@echo "✓ C archive in dist/"
 
-# The Mach-O alignment regression gate, runnable on its own. Pure file parsing,
-# so it is meaningful on any OS: a Linux or Windows runner validates a macOS
-# wheel just as well as a Mac does. `make wheel` and `make package` already run
-# it over what they produce; this target points it at a plain build tree.
-#
+# Runs the Mach-O alignment check over the MACHO_DIRS paths that exist.
 # Override MACHO_DIRS to scan elsewhere, e.g.
 #   make check-macho MACHO_DIRS="target/wheels dist"
-#
-# Paths that do not exist yet are dropped rather than failing: the point is to
-# check what has been built, and "you have not built wheels" is not a
-# violation. The script itself stays strict about a path it is handed.
 MACHO_DIRS ?= target/release target/wheels
 
 .PHONY: check-macho
@@ -492,11 +449,8 @@ test-rust:
 	@echo "Coverage report: target/rust-coverage.lcov"
 	@$(MAKE) --no-print-directory test-doc
 
-# cargo-nextest does not run doctests, so `make test` never compiled a single
-# `///` example. A private `use` that made a public type unnameable shipped
-# green through 1474 nextest cases and was caught only by running these by
-# hand. The PyO3 binding crates are excluded on purpose: their doc comments
-# are Python `__doc__` in reStructuredText, not Rust.
+# Runs the doctests of the Rust crates, which cargo-nextest does not run.
+# The PyO3 binding crates are excluded.
 .PHONY: test-doc
 test-doc:
 	@echo "Running Rust doctests (nextest does not)..."
@@ -505,58 +459,18 @@ test-doc:
 		--exclude edgefirst-python-common
 	@echo "✓ Doctests passed"
 
-# The PEP 517 source-directory install, split out of test-python so CI can
-# exercise it without paying for the whole suite. `pip install <dir>/` is a
-# different code path from the `maturin build` + `pip install *.whl` route
-# every workflow uses, and it is the ONLY path the repair failure broke -- so
-# it is the only path worth a dedicated gate. Narrow it with PYTHON_PACKAGES to
-# check the mechanism for one package:
+# The PEP 517 source-directory install (`pip install <dir>/`) of each Python
+# package. Narrow it with PYTHON_PACKAGES:
 #
 #   make install-python PYTHON_PACKAGES=tensor
-#
-# tensor is the meaningful single choice: it is the package whose build.rs
-# bundles libedgefirst_tensor, which is the dependency maturin's repair step
-# could not resolve.
 .PHONY: install-python
 install-python:
 	@echo "  Installing Python bindings ($(PYTHON_PACKAGES))..."
-	@# --no-deps is required, not an optimisation. Every edgefirst-* sibling is
-	@# being built from THIS tree in this same loop, so the `~=` pins in each
-	@# pyproject.toml -- which describe what a *published* wheel needs from PyPI
-	@# -- must not be resolved. Resolving them either fails outright (the version
-	@# under development is unpublished, as any unreleased version is) or, worse,
-	@# silently installs a published sibling over the locally built one, so the
-	@# suite tests released code instead of the branch. numpy is the only
-	@# third-party runtime dependency, so it is installed explicitly.
 	@if [ -f "venv/bin/activate" ]; then \
 		. venv/bin/activate && pip install -q numpy || exit 1; \
 	else \
 		pip install -q numpy || exit 1; \
 	fi
-	@# MATURIN_PEP517_ARGS is the only channel `pip install <dir>/` has for
-	@# reaching maturin's own CLI -- pip drives the PEP 517 backend, which
-	@# shells out to `maturin pep517 build-wheel` with arguments pip chooses.
-	@# Every OTHER maturin call site in this file and in the workflows already
-	@# passes `--auditwheel skip` (see build-python, wheel, and release.yml's
-	@# wheel job); this loop could not, and was the one path that let maturin's
-	@# repair step run. On macOS that step fails outright:
-	@#
-	@#   Cannot repair wheel, because required library
-	@#   @rpath/libedgefirst_tensor.0.dylib could not be located.
-	@#
-	@# The library is not missing. crates/python-tensor/build.rs stages it into
-	@# `python/edgefirst/tensor/`, maturin's `python-source` ships it in the
-	@# wheel as a sibling of `_tensor.cpython-*.so`, and that extension carries
-	@# `-rpath,@loader_path` so it resolves there at import time. maturin's
-	@# repair resolves `@rpath/...` against LINK-time search paths only and
-	@# cannot see what `python-source` is about to package, so it declares a
-	@# self-contained wheel unrepairable. Skipping repair is correct here, not
-	@# a workaround: these wheels are bundled by build.rs by design.
-	@#
-	@# Linux never hit this because maturin skips auditwheel entirely under the
-	@# `--compatibility off` that pip's invocation carries; the macOS dylib
-	@# repair path has no such opt-out. pip runs maturin from the crate
-	@# directory, so the crate's .cargo/config.toml selects the dynamic backend.
 	@for c in $(PYTHON_CRATES); do \
 		if [ -f "venv/bin/activate" ]; then \
 			. venv/bin/activate && MATURIN_PEP517_ARGS="--auditwheel skip --profile profiling" \
@@ -585,18 +499,8 @@ test-python: install-python
 	fi
 	@echo "✓ Python tests passed"
 
-# The modular C-API leaves (CAPI_MODULAR_CRATES).
-# Each leaf is a standalone package excluded from the workspace, so it is
-# built and tested via --manifest-path/--target-dir rather than picked up
-# by the workspace-wide test-rust run.
-#
-# Coverage note, made consciously: these leaves leave `cargo llvm-cov nextest
-# --workspace`'s lcov (test-rust above). Their tests still RUN here (plain
-# `cargo test`); doctests do not apply -- each leaf's crate-type is
-# staticlib/cdylib only (no rlib), so cargo never compiles or runs doctests
-# for it, on any invocation. Nothing was lost: the old workspace `test-doc`
-# run skipped these crates for the identical reason. Only their lines leave
-# the coverage denominator.
+# Builds and tests the modular C-API leaves (CAPI_MODULAR_CRATES) via
+# --manifest-path/--target-dir.
 .PHONY: test-capi-modular
 test-capi-modular: capi-libs
 	@echo "Running tests for the modular C-API crates..."
@@ -605,11 +509,7 @@ test-capi-modular: capi-libs
 	done
 	@echo "✓ Modular C-API tests passed"
 
-# `test-rust` runs the static backend; this runs edgefirst-tensor's own
-# tests against the dynamic one. `capi-libs` first: under the dynamic cfg the
-# crate's build.rs links its test binaries against target/debug's
-# libedgefirst_tensor, so a missing library is a link error. Targets are
-# named because the crate's `--lib` unit tests are static-only.
+# Runs the named edgefirst-tensor test targets against the dynamic backend.
 DYNAMIC_TEST_TARGETS := dynamic_primitives protocol_roundtrip map_access \
 	identity scenarios no_global_state vocabulary logical_shape
 
@@ -623,7 +523,7 @@ test-tensor-dynamic: capi-libs
 	done
 	@echo "✓ Dynamic-backend tests passed"
 
-# Clippy for the dynamic backend, which `lint-rust` (static) never compiles.
+# Clippy for the dynamic backend.
 .PHONY: lint-tensor-dynamic
 lint-tensor-dynamic:
 	$(require_fragment_rustflags)
@@ -637,79 +537,33 @@ lint-tensor-dynamic:
 	@echo "✓ Dynamic-backend clippy passed"
 
 # Compiles every shipped header as C11 and C++17 under -Werror, then links
-# AND RUNS one consumer binary per modular C-API library. `-fsyntax-only`
-# (used elsewhere) proves a header parses; this is the only lane that proves
-# a library actually loads and its symbols resolve at runtime -- see
-# scripts/check-headers.sh for why that gap mattered.
+# and runs one consumer binary per modular C-API library.
 .PHONY: test-capi-link
 test-capi-link: capi-libs
 	@./scripts/check-headers.sh
 
-# The Definition of Done for the single-tensor-home plan, as a command. See
-# scripts/check-single-home.sh for what each gate measures and why.
+# Runs scripts/check-single-home.sh over the debug and release C libraries.
 .PHONY: check-single-home
 check-single-home: capi-libs capi-libs-release
 	@./scripts/check-single-home.sh
 
 # ===========================================================================
-# DIFFERENTIAL TESTING (G13)
+# DIFFERENTIAL TESTING
 # ===========================================================================
 #
-# G13 (scripts/check-single-home.sh --differential-only) proves the two
-# tensor backends agree test-for-test, not merely that both compile -- see
-# that gate's own comment for why a compile-only or method-parity check
-# would have caught none of the four real behavioural divergences task P2
-# found (a missing reshape primitive, `map` refusing PBO-backed tensors,
-# `clone_fd` refusing SHM-backed ones, `create_image(dtype="int8")`
-# reporting `uint8`). It needs one venv with each backend installed,
-# supplied by PY_STATIC_VENV/PY_DYNAMIC_VENV -- building those two venvs is
-# packaging work, done here rather than by hand, so G13 can run in CI.
-#
-# Both venvs build from the same commit. The static side builds from the
-# repository root, outside the leaves' .cargo/config.toml, and sets
-# EDGEFIRST_TENSOR_STATIC_COMPARISON=1, the only opt-in that lets a
-# tensor-linked wheel build static (build-support's guard).
+# Builds one venv per tensor backend from the same commit and runs
+# scripts/check-single-home.sh --differential-only over them. The static
+# side builds from the repository root with
+# EDGEFIRST_TENSOR_STATIC_COMPARISON=1.
 DIFFERENTIAL_STATIC_VENV := $(CURDIR)/target/differential-static-venv
 DIFFERENTIAL_DYNAMIC_VENV := $(CURDIR)/target/differential-dynamic-venv
-# Matches venv's own pinned versions (`pip freeze`), not "latest" -- G13's
-# own guard flags divergent optional-package availability between the two
-# venvs as `cannot_measure` rather than let it read as a false backend
-# divergence, but mismatched versions of the SAME package could still shift
-# behaviour underneath the comparison without tripping that guard. The full
-# list the suite actually reaches for (confirmed against tests/, not
-# guessed): pyyaml/safetensors/psutil were missing from an earlier version
-# of this list, caught by p2a-dynamic-surface (G13's own author) before
-# this lane ran for real -- would have produced import-skip cannot_measure
-# on both venvs identically, silently narrowing what G13 actually compares.
+# The packages the Python suite imports, pinned to the versions in venv.
 DIFFERENTIAL_TEST_DEPS := numpy==2.4.6 pillow==12.2.0 \
 	pytest==9.0.3 pyyaml==6.0.3 safetensors==0.8.0 psutil==7.2.2
 
-# One shared --target-dir for both venvs: cargo keeps the static and
-# dynamic builds side by side in it, so neither side rebuilds the other.
-# A DEDICATED wheel output directory per venv (`-o`), never the shared
-# target/wheels/ `make wheel`/`make build-python` use -- reusing that one
-# is exactly how a stale wheel from unrelated manual testing (an aarch64
-# cross-build left over from verifying task P2's own work) got installed
-# into an x86_64 venv instead of the freshly-built native one. Always
-# cleared before building into it, so an install glob over its contents can
-# never see anything but this run's own output. Each crate's own build.rs
-# carries the matching half of this discipline for its OWN generated
-# artifacts: a static build actively removes any stale libedgefirst_tensor.
-# so* a previous dynamic build in the same tree left behind, rather than
-# just skipping regeneration -- proven necessary, not assumed, the same
-# failure shape recurring one layer down (see crates/python-tensor/build.rs).
-#
-# Isolation (a dedicated, always-cleared directory) closes THIS instance of
-# that bug; it does not close the class. Isolation fails silently if
-# anything ever writes the wrong architecture into the right directory --
-# a `--target` added later, a cached artifact, a stray copy step. So this
-# also asserts the actual architecture of every .so this run is about to
-# install, not just where it came from: a wheel built for the wrong host
-# cannot import, and "cannot import" looks exactly like "imports and
-# misbehaves" until someone tries it -- the whole reason G13 exists. A
-# build-time assertion names the mismatched file directly; G13 itself,
-# even hardened, can only ever read the resulting failure as
-# `cannot_measure`, never say which artifact was wrong.
+# Both venvs share one --target-dir, and each has its own wheel output
+# directory, cleared before the build. DIFFERENTIAL_ASSERT_ARCH checks the
+# architecture of every .so about to be installed.
 define DIFFERENTIAL_ASSERT_ARCH
 	host_arch=$$(uname -m); \
 	case "$$host_arch" in \
@@ -728,25 +582,8 @@ define DIFFERENTIAL_ASSERT_ARCH
 	done
 endef
 
-# Architecture is not the only claim a wheel can silently fail to keep --
-# three stale-artifact bugs surfaced in this same task (the ARM library,
-# a stale libedgefirst_tensor.so* bundled into a subsequent static wheel by
-# build.rs, and a stale venv compared as if it were current), and the
-# common thread is stale output surviving into a fresh-looking artifact.
-# So this also asserts the actual BACKEND matches what each side claims,
-# not just that the architecture is right: a "static" wheel could still
-# link dynamically (a feature flag not threaded through correctly) and
-# pass the architecture check while comparing dynamic against itself.
-# Each wheel's `__tensor_backend__` attribute is the in-process counterpart.
-#
-# Dynamic: reuses scripts/check_wheel_layout.py's own A3 check (already
-# verified against both directions when it was written) rather than a
-# second, divergent copy of the same rule -- the tensor wheel must carry
-# exactly one libedgefirst_tensor.so, the other three must carry none.
-#
-# Static: the inverse of dynamic's claim, and simpler -- NOTHING in this
-# set should carry libedgefirst_tensor.so at all, since a genuinely
-# static build embeds the implementation and needs nothing external.
+# Asserts that no wheel of the static set carries libedgefirst_tensor. The
+# dynamic set is checked by scripts/check_wheel_layout.py.
 define DIFFERENTIAL_ASSERT_STATIC_SELF_CONTAINED
 	for w in $(1)/*.whl; do \
 		found=$$(unzip -Z1 "$$w" | grep -c 'libedgefirst_tensor' || true); \
@@ -757,17 +594,7 @@ define DIFFERENTIAL_ASSERT_STATIC_SELF_CONTAINED
 	done
 endef
 
-# `mkdir -p` after each `rm -rf`, not left to maturin's own `-o` handling:
-# observed once, on a clean tree, that `venv-dynamic`'s first wheel build
-# failed with "failed to create file .../edgefirst_tensor-...whl: No such
-# file or directory" while the otherwise-identical venv-static run in the
-# same session did not. Not reproduced deterministically after several
-# further runs, including immediately re-running venv-dynamic alone right
-# after the failure -- so the exact trigger (a maturin timing assumption
-# about who creates -o's directory, some interaction with the nested
-# tensor-capi build only the dynamic path runs, or something else) is not
-# confirmed. Explicit creation removes the dependency on that assumption
-# regardless of which it turns out to be, and costs nothing to keep.
+# Build one comparison venv per backend from freshly built wheels.
 .PHONY: venv-static
 venv-static:
 	@echo "Building the static-backend comparison venv..."
@@ -808,14 +635,12 @@ venv-dynamic:
 
 .PHONY: test-differential
 test-differential: venv-static venv-dynamic
-	@echo "Running G13 (static vs. dynamic, test for test)..."
+	@echo "Running the backend comparison (static vs. dynamic, test for test)..."
 	@PY_STATIC_VENV=$(DIFFERENTIAL_STATIC_VENV) PY_DYNAMIC_VENV=$(DIFFERENTIAL_DYNAMIC_VENV) \
 		./scripts/check-single-home.sh --differential-only
 
-# G3: the minimal two-library user. Links only edgefirst_codec and
-# edgefirst_tensor (not the other three leaves) and decodes a real JPEG into
-# a host-memory tensor. Proves the two-library split is actually usable, not
-# just that the libraries happen to build.
+# Builds and runs the two-library C program, which links edgefirst_codec and
+# edgefirst_tensor and decodes a JPEG into a host-memory tensor.
 .PHONY: test-two-library-user
 test-two-library-user: capi-libs
 	@cc -std=c11 -Wall -Wextra -Werror -o target/test_two_library_user \
@@ -825,16 +650,7 @@ test-two-library-user: capi-libs
 		-Wl,-rpath,$(PWD)/target/debug
 	@./target/test_two_library_user
 
-# Optional CUDA device-pointer tests (convert -> cuda_map -> cudaMemcpy). Not
-# part of `make test`: they need a CUDA-capable GPU + libcudart at runtime.
-# On a dev PC with only the driver, install the CUDA runtime into the local
-# venv (`pip install nvidia-cuda-runtime-cu12`) and this target points the HAL's
-# dlopen at it via LD_LIBRARY_PATH. On Jetson/Orin libcudart is already on the
-# system path so the venv lookup is simply skipped. Runtime-skips cleanly when
-# no GPU/libcudart is present.
-# Deliberately NOT part of `make test`: it needs hardware reachable over SSH.
-# CI runs the hardware suite on its own runners; this covers the boards CI does
-# not have. Hosts are supplied by the caller -- there is no built-in list.
+# Runs the test suite on the SSH hosts given in TARGETS.
 .PHONY: test-ontarget
 test-ontarget:
 	@echo "Running the test suite on target hardware..."
@@ -869,8 +685,7 @@ bench:
 	@echo "✓ Benchmarks complete"
 
 # On-target nvJPEG decode benchmark (Jetson). Points the loader at the CUDA
-# library path (libnvjpeg.so.12 is not on the default loader path) and runs
-# only the codec bench; the nvjpeg cells self-skip without CUDA/libnvjpeg.
+# library path and runs only the codec bench.
 .PHONY: bench-nvjpeg
 bench-nvjpeg:
 	@echo "Running nvJPEG benchmark (on-target)..."
@@ -883,13 +698,7 @@ bench-nvjpeg:
 # SBOM & LICENSE COMPLIANCE
 # ===========================================================================
 
-# Targets whose dependency graph reaches a distributed artifact. A graph is
-# resolved per target, so a host-only scan omits every target-conditional
-# dependency, such as the `windows-*` crates.
-#
-# Enumerated rather than cargo-cyclonedx's `all`, which disables platform
-# filtering altogether and so pulls in `[target."cfg(...)"]` blocks for cfgs no
-# build sets, including `cfg(fuzzing)`. An SBOM describes what ships.
+# Targets whose dependency graph reaches a distributed artifact.
 SBOM_TARGETS := \
 	x86_64-unknown-linux-gnu \
 	aarch64-unknown-linux-gnu \
@@ -901,22 +710,14 @@ SBOM_TARGETS := \
 	aarch64-linux-android \
 	x86_64-linux-android
 
-# The C-API leaves are excluded from the workspace, so `cargo cyclonedx
-# --all` never sees them, yet they are the shipped libraries. Each carries its
-# own lockfile, resolving independently of the workspace's, so each is scanned
-# from its own manifest. ci.yml's sbom job passes the same list.
+# The C-API leaf manifests, each scanned with its own lockfile.
 SBOM_CAPI_MANIFESTS := $(wildcard crates/*-capi/Cargo.toml)
 
-# The policy scripts live in EdgeFirstAI/.github, at the commit ci.yml pins, so
-# this target enforces the same policy the Quick tier does. hal's own copies
-# drifted from the org ones and the two disagreed about the same dependencies.
+# Generates the SBOM and checks the licence policy with the scripts from
+# EdgeFirstAI/.github, then checks NOTICE against it.
 .PHONY: sbom
 sbom:
 	@echo "Fetching the org license policy..."
-	@# SBOM_TARGETS and SBOM_EXTRA_MANIFESTS are read by the org policy script,
-	@# which resolves a graph per target and per out-of-workspace manifest, then
-	@# merges only the scans that run produced. Scans left in the tree by an
-	@# earlier run are ignored, so the output depends on the source alone.
 	@mkdir -p target
 	@CI_SCRIPTS=$$(.github/scripts/fetch-ci-scripts.sh); \
 		echo "Generating SBOM (policy from $$CI_SCRIPTS)..."; \
@@ -927,15 +728,6 @@ sbom:
 		OUTPUT_DIR=sbom SCRIPT_DIR="$$CI_SCRIPTS" \
 		"$$CI_SCRIPTS/generate_sbom.sh" 2>&1 | tee target/sbom-policy.log; \
 		exit $${PIPESTATUS[0]}
-	@# The shared validator warns rather than fails on a missing component, which
-	@# suits a NOTICE that is curated by hand. hal generates NOTICE, so a missing
-	@# component there is drift and is worth failing on.
-	@#
-	@# The check asks generate_notice.py what it would write rather than reading
-	@# the validator's warning, because that warning covers every component
-	@# regardless of licence while the generator omits the ones asking for no
-	@# attribution. Gating on the warning would fail on a component NOTICE is
-	@# correct to omit, and `make notice` could never clear it.
 	@$(PYTHON) .github/scripts/generate_notice.py --check sbom/sbom.json NOTICE
 	@echo "Validating SBOM format..."
 	@if command -v cyclonedx >/dev/null 2>&1; then \
@@ -945,8 +737,7 @@ sbom:
 	fi
 	@echo "✓ SBOM generated and validated (sbom/sbom.json)"
 
-# generate_sbom.sh validates NOTICE but never writes it; regenerating is a
-# deliberate step because NOTICE is a published artifact.
+# Regenerates NOTICE from sbom/sbom.json.
 .PHONY: notice
 notice:
 	@CI_SCRIPTS=$$(.github/scripts/fetch-ci-scripts.sh); \
@@ -959,8 +750,7 @@ notice:
 # VERSION VERIFICATION
 # ===========================================================================
 
-# The same script gates release.yml and publish.yml, so a local pass means
-# the release branch passes the check CI runs.
+# Checks version consistency with .github/scripts/verify_version.py.
 .PHONY: verify-version
 verify-version:
 	@$(PYTHON) .github/scripts/verify_version.py

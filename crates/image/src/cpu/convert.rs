@@ -11,26 +11,20 @@ use super::{CPUProcessor, ColorParams};
 
 #[inline(always)]
 pub(super) fn limit_to_full(l: u8) -> u8 {
-    // Expand limited-range luma (16..=235, a 219-step swing) to full-range
-    // (0..=255). Luma uses the 219 swing, NOT the 224 chroma swing — this must
-    // match `colorimetry::yuv_to_rgb_coeffs` (255/219). Real decoded YUV (e.g.
-    // JPEG → NV12) can carry luma below 16 or above 235, so clamp into the valid
-    // limited range first to avoid u16 underflow on the `l - 16` term (and keep
-    // the result within 0..=255).
+    // Expands limited-range luma (16..=235, a 219-step swing) to full-range
+    // (0..=255); the input is clamped into the limited range first.
     let l = (l as u16).clamp(16, 235);
     (((l - 16) * 255 + (235 - 16) / 2) / (235 - 16)) as u8
 }
 
 #[inline(always)]
 pub(super) fn full_to_limit(l: u8) -> u8 {
-    // Compress full-range luma (0..=255) into limited-range luma (16..=235,
-    // the 219-step swing — luma max is 235, not the 240 chroma max).
+    // Compresses full-range luma (0..=255) into limited-range luma (16..=235).
     ((l as u16 * (235 - 16) + 255 / 2) / 255 + 16) as u8
 }
 
 /// Select the luma-decode mapping for grey/luma extraction. Limited-range
-/// sources expand 16..=235 → 0..=255; full-range sources copy the byte as-is
-/// (the luma channel is already the grey value).
+/// sources expand 16..=235 → 0..=255; full-range sources copy the byte as-is.
 #[inline(always)]
 fn luma_mapper(full_range: bool) -> fn(u8) -> u8 {
     if full_range {
@@ -40,11 +34,8 @@ fn luma_mapper(full_range: bool) -> fn(u8) -> u8 {
     }
 }
 
-/// YUV↔RGB conversion mode for the `yuv` crate.
-///
-/// `Professional` rounds to within ±1 of the exact matrix with no bias, and is
-/// the same NEON kernel on every aarch64 core. `Fast` and `Balanced` are biased
-/// by up to half a level per channel and are slower on Cortex-A53 cores.
+/// YUV↔RGB conversion mode for the `yuv` crate: `Professional`, which rounds
+/// to within ±1 of the exact matrix with no bias.
 #[inline]
 fn yuv_mode() -> yuv::YuvConversionMode {
     yuv::YuvConversionMode::Professional
@@ -57,13 +48,8 @@ type YuyvRowSplit<'s, 'd> = (&'s [u8], &'d mut [u8], Option<(&'s [u8], &'d mut [
 /// Split one row of a YUYV-destination convert into its whole macropixels and,
 /// at an odd width, the trailing unpaired pixel.
 ///
-/// YUYV packs two pixels into a 4-byte `[Y0, U, Y1, V]` macropixel, so an
-/// odd-width row ends with a pixel that has no partner. Its destination is the
-/// 2 bytes `[Y, U]` — a row is `width * 2` bytes, which leaves no room for the
-/// trailing `V`, so that pixel's chroma is necessarily half-written whatever we
-/// do. Encoding it anyway is still right: the alternative is leaving whatever
-/// the destination held before, and a caller that did not pre-clear its buffer
-/// then reads stale bytes as pixel data.
+/// YUYV packs two pixels into a 4-byte `[Y0, U, Y1, V]` macropixel. The
+/// trailing pixel of an odd-width row has the 2 destination bytes `[Y, U]`.
 ///
 /// Returns `(paired_src, paired_dst, tail)`; `tail` is `None` at even widths.
 fn split_yuyv_row<'s, 'd>(
@@ -113,8 +99,7 @@ struct YuyvEncodeCoeffs {
 }
 
 impl YuyvEncodeCoeffs {
-    /// `BIAS` is Q20 fixed point — retained from the pre-refactor hand-coded
-    /// tables to keep encoder output byte-identical.
+    /// Q20 fixed point.
     const BIAS: i32 = 20;
     const ROUND: i32 = 1 << (Self::BIAS - 1);
     const ROUND2: i32 = 1 << Self::BIAS;
@@ -123,15 +108,12 @@ impl YuyvEncodeCoeffs {
     /// are full-range (255/255) or limited-range (219/224) per `cp.range_kind`;
     /// the `KR`/`KB` luma weights come from `cp.encoding` (BT.601 / 709 / 2020).
     fn from_params(cp: ColorParams) -> Self {
-        // KR/KB luma weights and luma/chroma swings come from the canonical
-        // source in `edgefirst_tensor::colorimetry`, shared with the in-shader
-        // GL coefficients (see `crate::colorimetry::yuv_to_rgb_coeffs`).
         let w = cp.encoding.luma_weights();
         let (kr, kb) = (w.kr, w.kb);
         let kg = w.kg();
         let s = cp.range_kind.scaling();
-        // Chroma is always centred on 128; the luma black level (`y_off`) and
-        // the swings come from the resolved range.
+        // Chroma is centred on 128; the luma black level (`y_off`) and the
+        // swings come from the resolved range.
         let (y_swing, c_swing, y_off, c_off) = (s.y_swing, s.c_swing, s.y_offset as i32, 128);
         let b = Self::BIAS;
         let yscale = (1_i64 << b) as f64 * y_swing / 255.0;
@@ -151,8 +133,8 @@ impl YuyvEncodeCoeffs {
         }
     }
 
-    /// Encode two adjacent RGB pixels into a YUYV macropixel `[Y0,U,Y1,V]`,
-    /// matching the original subsampled-chroma averaging.
+    /// Encode two adjacent RGB pixels into a YUYV macropixel `[Y0,U,Y1,V]`;
+    /// the chroma is the average over both pixels.
     #[inline(always)]
     fn encode_pair(&self, p0: [i32; 3], p1: [i32; 3]) -> [u8; 4] {
         let [r0, g0, b0] = p0;
@@ -200,13 +182,10 @@ impl YuyvEncodeCoeffs {
 }
 
 /// Scatter a packed `src_ch`-channel image into single-channel destination
-/// planes, honouring **both** source and destination row strides — rows are
-/// pitch-padded on DMA/IOSurface tensors (and `None`-memory tensors auto-select
-/// DMA on i.MX), so a flat `as_slice()` read shears the image. `plane_src[p]`
+/// planes, honouring both source and destination row strides. `plane_src[p]`
 /// selects the source channel copied into plane `p`, or `None` to fill that
 /// plane with a constant `255` (the alpha plane of a planar-RGBA destination).
-/// Each plane only touches the `w` logical bytes of every row; planes run
-/// concurrently.
+/// Each plane only touches the `w` logical bytes of every row.
 fn pack_to_planar(
     src: &Tensor<u8>,
     dst: &mut Tensor<u8>,
@@ -222,9 +201,7 @@ fn pack_to_planar(
     let mut dst_map = dst.map_for_write()?;
     let dst_bytes = dst_map.as_mut_slice();
 
-    // Validate the mapped buffers against the derived geometry before indexing,
-    // so a malformed/untrusted tensor yields `InvalidShape` instead of a panic
-    // (mirrors `planar_to_packed` / `split_semi_planar`).
+    // Validates the mapped buffers against the derived geometry before indexing.
     let src_row = w.checked_mul(src_ch).ok_or_else(|| {
         Error::InvalidShape(format!(
             "pack_to_planar src row overflow (w={w}, ch={src_ch})"
@@ -262,10 +239,8 @@ fn pack_to_planar(
     // Fast path: identity colour mapping (R,G,B ← src channels 0,1,2) with a
     // 3- or 4-channel packed source, and either no alpha plane, a constant
     // alpha plane (RGB → PlanarRgba), or an alpha plane copied from src
-    // channel 3 (RGBA → PlanarRgba). This covers every current caller. A single
-    // NEON deinterleaving pass reads the packed source once and writes all
-    // planes, replacing the per-plane scalar gather (which re-read the source
-    // once per plane). Parallelism moves from per-plane to per-row-strip.
+    // channel 3 (RGBA → PlanarRgba). One deinterleaving pass reads the packed
+    // source once and writes all planes.
     let n_planes = plane_src.len();
     let identity_rgb = n_planes >= 3
         && plane_src[0] == Some(0)
@@ -285,12 +260,7 @@ fn pack_to_planar(
         let ap = planes.next(); // Some(_) only when n_planes == 4
         let src_rows = &src_bytes[..h * src_stride];
 
-        // Serial, one pass per row: the NEON `vld3`/`vld4` deinterleave reads
-        // the packed source once and is memory-bandwidth-bound, so on Orin's
-        // shared bus row-level rayon parallelism measured no faster than serial
-        // for the model-preprocessing sizes (≤1080p) while adding scheduling
-        // overhead on small frames. The rare arbitrary-mapping path below keeps
-        // its per-plane parallelism.
+        // Serial, one pass per row.
         match ap {
             Some(ap) if alpha_from_src => {
                 src_rows
@@ -305,10 +275,8 @@ fn pack_to_planar(
             }
             other => {
                 if let Some(ap) = other {
-                    // Constant alpha plane (RGB → PlanarRgba): fill only the `w`
-                    // logical bytes of each row, matching this function's
-                    // contract and the slow-path `None` handling (leave per-row
-                    // padding untouched rather than filling the whole plane).
+                    // Constant alpha plane (RGB → PlanarRgba): fills the `w`
+                    // logical bytes of each row.
                     for row in ap.chunks_mut(dst_stride).take(h) {
                         row[..w].fill(255);
                     }
@@ -352,11 +320,10 @@ fn pack_to_planar(
 
 impl CPUProcessor {
     /// Shared decode for every semi-planar (NV12/NV16/NV24) → packed
-    /// conversion: wrap the already-resolved planes/strides in a
-    /// `YuvBiPlanarImage` and run the format-specific `yuv` kernel. `decode`
-    /// is a closure that forwards to the right `yuv::yuv_nvXX_to_rgb[a]` with
-    /// the matrix/range bound from `ColorParams`; only the plane geometry
-    /// (resolved by the `convert_nvXX` wrappers) differs between formats.
+    /// conversion: wraps the resolved planes/strides in a `YuvBiPlanarImage`
+    /// and runs `decode`, a closure that forwards to the format's
+    /// `yuv::yuv_nvXX_to_rgb[a]` kernel with the matrix/range from
+    /// `ColorParams`.
     #[allow(clippy::too_many_arguments)]
     fn semi_planar_decode<F>(
         y_plane: &[u8],
@@ -392,11 +359,10 @@ impl CPUProcessor {
     }
 
     /// Resolve an NV12 (4:2:0) source's planes/strides and decode. The chroma
-    /// plane is half-height with one `(Cb,Cr)` pair per two luma columns ⇒ the
-    /// same row pitch as luma. A true-multiplane source reads the chroma
-    /// plane's own stride (a raw tensor whose `effective_row_stride()` has no
-    /// width fallback — default to even(width)); the contiguous buffer's two
-    /// planes share the one stride.
+    /// plane is half-height with one `(Cb,Cr)` pair per two luma columns, at
+    /// the same row pitch as luma. A multiplane source reads the chroma
+    /// plane's own stride, defaulting to even(width); a contiguous buffer's
+    /// two planes share one stride.
     fn convert_nv12<F>(src: &Tensor<u8>, dst: &mut Tensor<u8>, decode: F) -> Result<()>
     where
         F: FnOnce(
@@ -450,9 +416,9 @@ impl CPUProcessor {
         })
     }
 
-    // NOTE: The `*_to_rgba` helpers below all accept BGRA destinations.
-    // They always write pixels in RGBA channel order; for BGRA destinations the
-    // caller applies an R<->B swizzle afterwards via `swizzle_rb_4chan`.
+    // The `*_to_rgba` helpers below accept BGRA destinations: they write
+    // pixels in RGBA channel order and the caller applies an R<->B swizzle
+    // via `swizzle_rb_4chan`.
     pub(super) fn convert_nv12_to_rgba(
         src: &Tensor<u8>,
         dst: &mut Tensor<u8>,
@@ -469,9 +435,7 @@ impl CPUProcessor {
         cp: ColorParams,
     ) -> Result<()> {
         // NV12→GREY drops chroma and copies the luma plane (the first `src_h`
-        // rows). Honour the source row stride so padded buffers and odd widths
-        // are handled correctly, and the destination grey stride so we write a
-        // tightly-packed [H, W] output.
+        // rows) at the source row stride into the destination at its grey stride.
         let src_w = src.width().unwrap();
         let src_h = src.height().unwrap();
         let src_stride = super::tensor_row_stride(src);
@@ -593,18 +557,15 @@ impl CPUProcessor {
         dst: &mut Tensor<u8>,
         cp: ColorParams,
     ) -> Result<()> {
-        // YUYV→GREY keeps the luma samples and drops chroma. Honour the source
-        // row stride so padded/odd-width buffers are not read across row
-        // boundaries (a flat `as_chunks` over the whole map ignores stride and
-        // reads pad bytes as luma — see EDGEAI stride-handling fix).
+        // YUYV→GREY keeps the luma samples and drops chroma, row by row at the
+        // source row stride.
         let src_w = src.width().unwrap();
         let src_h = src.height().unwrap();
         let src_stride = super::tensor_row_stride(src);
         let dst_stride = super::tensor_row_stride(dst);
         let luma = luma_mapper(cp.src_full_range);
 
-        // Each macropixel is 2 bytes/px; check the row width for overflow so a
-        // malformed width can't wrap and slip past `guard_plane`.
+        // 2 bytes per pixel; the row width is checked for overflow.
         let src_row = src_w.checked_mul(2).ok_or_else(|| {
             Error::InvalidShape(format!("yuyv→grey src row overflow (w={src_w})"))
         })?;
@@ -640,8 +601,7 @@ impl CPUProcessor {
         let src_map = src.map_read()?;
         let src_bytes = src_map.as_slice();
         let mut dst_map = dst.map_for_write()?;
-        // Split at the stride-aligned luma plane boundary, not the tight one,
-        // validating the destination holds the full combined plane first.
+        // Splits at the stride-aligned luma plane boundary.
         let (y_plane, uv_plane) = super::split_semi_planar_mut(
             dst_map.as_mut_slice(),
             dst_stride,
@@ -651,7 +611,7 @@ impl CPUProcessor {
 
         // YUYV byte order per two-pixel macropixel: [Y0, Cb, Y1, Cr].
         // The NV16 chroma row is `even(dst_w)` bytes wide (one (Cb,Cr) pair per
-        // 2 luma columns, rounded up), so slice the UV row to the even width.
+        // 2 luma columns, rounded up).
         let chroma_w = dst_w.next_multiple_of(2);
         for row in 0..src_h {
             let src_row = &src_bytes[row * src_rs..row * src_rs + src_w * 2];
@@ -667,10 +627,8 @@ impl CPUProcessor {
                 xi += 2;
                 si += 4;
             }
-            // Odd width: one trailing lone pixel. Write its Y and the full
-            // (Cb,Cr) chroma pair so the even-width chroma row is fully
-            // initialized; the lone pixel has no second-Y Cr in the source, so
-            // replicate Cb when absent.
+            // Odd width: one trailing lone pixel. Writes its Y and the full
+            // (Cb,Cr) chroma pair, replicating Cb when Cr is absent.
             if xi < dst_w && si + 1 < src_row.len() {
                 y_row[xi] = src_row[si];
                 uv_row[xi] = src_row[si + 1]; // Cb
@@ -770,17 +728,15 @@ impl CPUProcessor {
         dst: &mut Tensor<u8>,
         cp: ColorParams,
     ) -> Result<()> {
-        // VYUY→GREY keeps the luma samples and drops chroma. Honour the source
-        // row stride so padded/odd-width buffers are not read across row
-        // boundaries (a flat `as_chunks` over the whole map ignores stride).
+        // VYUY→GREY keeps the luma samples and drops chroma, row by row at the
+        // source row stride.
         let src_w = src.width().unwrap();
         let src_h = src.height().unwrap();
         let src_stride = super::tensor_row_stride(src);
         let dst_stride = super::tensor_row_stride(dst);
         let luma = luma_mapper(cp.src_full_range);
 
-        // Each macropixel is 2 bytes/px; check the row width for overflow so a
-        // malformed width can't wrap and slip past `guard_plane`.
+        // 2 bytes per pixel; the row width is checked for overflow.
         let src_row = src_w.checked_mul(2).ok_or_else(|| {
             Error::InvalidShape(format!("vyuy→grey src row overflow (w={src_w})"))
         })?;
@@ -816,8 +772,7 @@ impl CPUProcessor {
         let src_map = src.map_read()?;
         let src_bytes = src_map.as_slice();
         let mut dst_map = dst.map_for_write()?;
-        // Split at the stride-aligned luma plane boundary, not the tight one,
-        // validating the destination holds the full combined plane first.
+        // Splits at the stride-aligned luma plane boundary.
         let (y_plane, uv_plane) = super::split_semi_planar_mut(
             dst_map.as_mut_slice(),
             dst_stride,
@@ -826,7 +781,7 @@ impl CPUProcessor {
         )?;
 
         // VYUY byte order per two-pixel macropixel: [V, Y0, U, Y1]. The NV16
-        // chroma row is `even(dst_w)` bytes wide, so slice UV to the even width.
+        // chroma row is `even(dst_w)` bytes wide.
         let chroma_w = dst_w.next_multiple_of(2);
         for row in 0..src_h {
             let src_row = &src_bytes[row * src_rs..row * src_rs + src_w * 2];
@@ -842,9 +797,8 @@ impl CPUProcessor {
                 xi += 2;
                 si += 4;
             }
-            // Odd width: one trailing lone pixel — write Y and the full (Cb,Cr)
-            // pair (both are present in this macropixel's V,Y0,U bytes) so the
-            // even-width chroma row is fully initialized.
+            // Odd width: one trailing lone pixel. Writes its Y and the full
+            // (Cb,Cr) pair.
             if xi < dst_w && si + 2 < src_row.len() {
                 y_row[xi] = src_row[si + 1];
                 uv_row[xi] = src_row[si + 2]; // U (Cb)
@@ -945,7 +899,6 @@ impl CPUProcessor {
         let mut dst_map = dst.map_for_write()?;
         let dst_bytes = dst_map.as_mut_slice();
         // NV16 luma plane: src_h rows, then UV plane: another src_h rows.
-        // Validate the destination holds the full combined plane before splitting.
         let (y_plane, uv_plane) = super::split_semi_planar_mut(
             dst_bytes,
             dst_stride,
@@ -1071,8 +1024,7 @@ impl CPUProcessor {
         let dst_stride = super::tensor_row_stride(dst);
         let mut dst_map = dst.map_for_write()?;
 
-        // Split at the stride-aligned luma plane boundary, not the tight one,
-        // validating the destination holds the full combined plane first.
+        // Splits at the stride-aligned luma plane boundary.
         let (y_plane, uv_plane) = super::split_semi_planar_mut(
             dst_map.as_mut_slice(),
             dst_stride,
@@ -1200,8 +1152,7 @@ impl CPUProcessor {
         let dst_stride = super::tensor_row_stride(dst);
         let mut dst_map = dst.map_for_write()?;
 
-        // Split at the stride-aligned luma plane boundary, not the tight one,
-        // validating the destination holds the full combined plane first.
+        // Splits at the stride-aligned luma plane boundary.
         let (y_plane, uv_plane) = super::split_semi_planar_mut(
             dst_map.as_mut_slice(),
             dst_stride,
@@ -1229,12 +1180,6 @@ impl CPUProcessor {
 
     /// Run `f(src_row, dst_row)` over the logical rows of a source/destination
     /// pair, each row clipped to its own pixel bytes.
-    ///
-    /// The row-confined form of "map both tensors and walk the slices": that
-    /// flat walk is only correct when both sides are tightly packed, and it
-    /// silently mis-places every row of a padded destination — or, for a
-    /// `Tensor::view()` destination, packs the whole output into the head of the
-    /// parent buffer and overwrites pixels beside the view.
     fn for_each_row(
         src: &Tensor<u8>,
         dst: &mut Tensor<u8>,
@@ -1270,8 +1215,7 @@ impl CPUProcessor {
     }
 
     /// Row-wise copy between two same-format images. Each side is walked at its
-    /// own row pitch, so a padded — or `view()`-derived — destination lands its
-    /// rows at the parent pitch instead of packing them into the buffer head.
+    /// own row pitch.
     pub(super) fn copy_image(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
         let (src_rows, src_row_bytes) = super::logical_surface(src)?;
         let (dst_rows, dst_row_bytes) = super::logical_surface(dst)?;
@@ -1284,15 +1228,11 @@ impl CPUProcessor {
         Self::for_each_row(src, dst, "copy_image", |s, d| d.copy_from_slice(s))
     }
 
-    /// Swap R and B channels in-place for an interleaved 4-channel image.
-    ///
-    /// Confined to each row's logical bytes: past them lies stride padding or,
-    /// for a `view()` destination, the parent image's neighbouring pixels, which
-    /// a whole-buffer swizzle would silently recolour.
+    /// Swap R and B channels in-place for an interleaved 4-channel image,
+    /// confined to each row's logical bytes.
     pub(super) fn swizzle_rb_4chan(dst: &mut Tensor<u8>) -> Result<()> {
         let (rows, row_bytes) = super::logical_surface(dst)?;
         let stride = super::tensor_row_stride(dst);
-        // Read-modify-write: a write-only map would not make device writes visible.
         let mut map = dst.map_mut()?;
         let buf = map.as_mut_slice();
         super::guard_plane(buf.len(), stride, rows, row_bytes, "swizzle dst")?;
@@ -1305,10 +1245,8 @@ impl CPUProcessor {
     }
 
     /// Resolve an NV16 (4:2:2) source's planes/strides and decode. The UV plane
-    /// is full-height with one `(Cb,Cr)` pair per two luma columns ⇒ `width`
-    /// bytes per chroma row, i.e. the SAME pitch as luma; both planes use the
-    /// buffer's (possibly even-padded) row stride (the logical width would
-    /// corrupt every row past the first for an odd width where stride > width).
+    /// is full-height with one `(Cb,Cr)` pair per two luma columns, at the same
+    /// pitch as luma; both planes use the buffer's row stride.
     fn convert_nv16<F>(src: &Tensor<u8>, dst: &mut Tensor<u8>, decode: F) -> Result<()>
     where
         F: FnOnce(
@@ -1370,9 +1308,8 @@ impl CPUProcessor {
     /// Resolve an NV24 (4:4:4 semi-planar) source's planes/strides and decode.
     /// The contiguous layout is `[3H, W]`: the Y plane (H rows) then the
     /// full-resolution interleaved UV plane (2H rows of W ⇒ `2*W` bytes per
-    /// chroma row), so the UV stride is twice the luma stride. Handles
-    /// true-multiplane (separate Y / CbCr buffers) as well as the contiguous
-    /// buffer so NV24 is not silently mis-sliced when chroma is its own tensor.
+    /// chroma row), so the UV stride is twice the luma stride. Multiplane
+    /// sources (separate Y / CbCr buffers) are handled as well.
     fn convert_nv24<F>(src: &Tensor<u8>, dst: &mut Tensor<u8>, decode: F) -> Result<()>
     where
         F: FnOnce(
@@ -1441,11 +1378,8 @@ impl CPUProcessor {
         cp: ColorParams,
     ) -> Result<()> {
         let src_w = src.width().unwrap();
-        // The luma plane height: for a true-multiplane NV24 the (luma) tensor's
-        // shape[0] is already the logical height; for the contiguous combined
-        // buffer the shape is [3H, W] so divide by three. Computing this before
-        // the multiplane check (as the previous code did) truncated multiplane
-        // output to one third of its rows.
+        // The luma plane height: a multiplane NV24 tensor's shape[0] is the
+        // logical height; the contiguous buffer's shape is [3H, W].
         let src_h = if src.is_multiplane() {
             src.shape()[0]
         } else {
@@ -1477,20 +1411,10 @@ impl CPUProcessor {
     /// source into `dst`, a `region.width × region.height` tensor of the *same*
     /// pixel format.
     ///
-    /// This is the extraction step of the crop-sized pre-resize intermediate:
-    /// `Tensor::view` only supports packed layouts, so a sub-rectangle of an
-    /// NV source cannot be expressed as a strided view — its two planes sit at
-    /// different offsets and subsample independently. Copying `region`'s luma
-    /// and chroma rows into a small NV tensor lets the *unmodified* format
-    /// converters decode just the crop.
-    ///
-    /// The copy is byte-exact by construction as long as `region`'s origin sits
-    /// on a chroma sample boundary — even `left` for NV12/NV16, even `top` for
-    /// NV12 — because a luma pixel's chroma sample is then found at the same
-    /// relative index in the extracted plane as in the frame. The caller
-    /// (`pre_resize_region`) guarantees that alignment; this function
-    /// re-validates it rather than trusting it, and validates `region` against
-    /// both buffers so a malformed tensor yields `InvalidShape`, not a panic.
+    /// `region`'s origin must sit on a chroma sample boundary: even `left` for
+    /// NV12/NV16, even `top` for NV12. The function checks that alignment and
+    /// validates `region` against both buffers, returning `InvalidShape`
+    /// otherwise.
     pub(super) fn extract_nv_region(
         src: &Tensor<u8>,
         dst: &mut Tensor<u8>,
@@ -1508,7 +1432,6 @@ impl CPUProcessor {
             )));
         }
 
-        // Plane geometry, mirroring `convert_nv12`/`convert_nv16`/`convert_nv24`.
         // `chroma_div` maps a luma row to its chroma row; `chroma_x` converts a
         // luma-column offset into a chroma byte offset.
         let y_stride = src
@@ -1534,9 +1457,7 @@ impl CPUProcessor {
                 )));
             }
         };
-        // Chroma-boundary alignment (see the doc comment): without it the
-        // extracted chroma plane would be offset by half a sample against the
-        // luma and the decode would not match the frame's.
+        // Chroma-boundary alignment check.
         let misaligned = match fmt {
             Nv12 => !region.left.is_multiple_of(2) || !region.top.is_multiple_of(2),
             Nv16 => !region.left.is_multiple_of(2),
@@ -1617,26 +1538,20 @@ impl CPUProcessor {
     }
 
     /// Strip-fused NV12/NV16/NV24 → PlanarRgb/PlanarRgba for the no-resize
-    /// case. Decodes the YUV source into packed RGB one cache-resident row
-    /// strip at a time (into the reused [`Self::nv_strip_scratch`]) and
-    /// NEON-deinterleaves each strip straight into the destination planes, so
-    /// the full-size packed-RGB intermediate never round-trips through DRAM and
-    /// is not reallocated per frame. The strip height keeps a `width × 3`
-    /// strip resident in L2 between the YUV decode and the deinterleave.
+    /// case. Decodes the YUV source into packed RGB one row strip at a time
+    /// (into the reused [`Self::nv_strip_scratch`]) and deinterleaves each
+    /// strip into the destination planes.
     ///
     /// `region` (source pixels) selects a sub-rectangle to decode: `None`
-    /// decodes the whole source (the original whole-frame hot path). `Some(r)`
-    /// decodes only `r`, writing the dense `r.width × r.height` result — the
-    /// caller (the gate in `cpu/mod.rs`) guarantees `r` is scale-identity with
-    /// the destination and chroma-aligned for `src_fmt`; this function itself
-    /// only validates `r` against the source bounds.
+    /// decodes the whole source. `Some(r)` decodes only `r`, writing the dense
+    /// `r.width × r.height` result. The caller guarantees `r` is
+    /// scale-identity with the destination and chroma-aligned for `src_fmt`;
+    /// this function validates `r` against the source bounds.
     ///
-    /// Geometry mirrors `convert_nv12`/`convert_nv16`/`convert_nv24` (contiguous
-    /// and multiplane sources). NV12 (4:2:0) advances the chroma plane by half
-    /// the luma rows; the strip height is even so each strip starts on an even
-    /// luma row (relative to `region.top`, which the gate guarantees is even
-    /// for NV12). The destination is validated against the derived plane sizes
-    /// (untrusted dims → `InvalidShape`, not a panic), like the other helpers.
+    /// Contiguous and multiplane sources are handled. NV12 (4:2:0) advances the
+    /// chroma plane by half the luma rows; the strip height is even. The
+    /// destination is validated against the derived plane sizes and
+    /// `InvalidShape` is returned on a mismatch.
     pub(super) fn convert_nv_to_planar_fused(
         &mut self,
         src: &Tensor<u8>,
@@ -1648,9 +1563,7 @@ impl CPUProcessor {
     ) -> Result<()> {
         use edgefirst_tensor::PixelFormat::{Nv12, Nv16, Nv24, PlanarRgb, PlanarRgba};
 
-        /// Strip height (rows). Even (NV12 4:2:0 needs an even strip start) and
-        /// sized so one packed-RGB strip stays in L2 across realistic widths
-        /// (32 × 1920 × 3 ≈ 180 KiB).
+        /// Strip height in rows; even.
         const STRIP_ROWS: usize = 32;
 
         let src_w = src.width().unwrap();
@@ -1658,9 +1571,8 @@ impl CPUProcessor {
         let has_alpha = dst_fmt == PlanarRgba;
         debug_assert!(matches!(dst_fmt, PlanarRgb | PlanarRgba));
 
-        // `region` in source pixels; `None` is the whole-frame case (left=0,
-        // top=0, out dims == source dims), preserving the original behaviour
-        // exactly.
+        // `region` in source pixels; `None` is the whole frame (left=0,
+        // top=0, out dims == source dims).
         let (region_left, region_top, out_w, out_h) = match region {
             Some(r) => (r.left, r.top, r.width, r.height),
             None => (0, 0, src_w, src_h),
@@ -1673,7 +1585,7 @@ impl CPUProcessor {
             )));
         }
 
-        // ---- source plane geometry (mirrors convert_nv12/nv16/nv24) ----
+        // ---- source plane geometry ----
         let y_stride = src
             .effective_row_stride()
             .unwrap_or(src_w.next_multiple_of(2));
@@ -1754,41 +1666,18 @@ impl CPUProcessor {
         }
 
         // Chroma bytes per row for `out_w` luma columns: NV12/NV16 pack one
-        // U+V byte pair per two luma columns (1 byte/column on average), so
-        // an odd `out_w` still needs the *whole* trailing byte pair for the
-        // column pair it's the first half of — round up to the next even
-        // count, not down. NV24 carries a full-resolution U+V pair per luma
-        // column (2 bytes/column, always exact). The gate requires an even
-        // `region_left`, so this rounding never reads past the row's own
-        // stride: the source region is always validated to fit within
-        // `src_w <= uv_stride` (both `uv_stride` and `region_left` are even
-        // for a chroma-subsampled format, so an odd `out_w` — the only case
-        // that adds the extra byte — keeps `region_left + out_w` odd and
-        // therefore strictly less than the even `uv_stride`, leaving room
-        // for the pad byte).
+        // U+V byte pair per two luma columns, rounded up to an even count;
+        // NV24 carries a U+V pair per luma column.
         let chroma_row_bytes = if src_fmt == Nv24 {
             out_w * 2
         } else {
             out_w.div_ceil(2) * 2
         };
 
-        // See the `nv_strip_y_pack`/`nv_strip_uv_pack` field docs: a nonzero
-        // column offset always needs packing. Row-aligned reads
-        // (`region_left == 0` — left-edge crops and the whole frame) slice
-        // at row boundaries with the parent stride, so every stride-sized
-        // chunk the `yuv` crate walks is a real, fully-owned source row and
-        // the read can stay zero-copy — EXCEPT the NV12 odd-height,
-        // non-flush-bottom case: the crate's 4:2:0 odd-last-row handling
-        // takes `chunks_exact(2*stride).remainder()` / `uv.chunks_exact(
-        // stride).last()`, which are only the region's own last rows when
-        // the slice holds EXACTLY `height` rows. A row-aligned slice runs to
-        // the plane's end, which is exact only when the region is flush with
-        // the source's bottom edge; otherwise the remainder is empty or the
-        // wrong row entirely (caught by
-        // `left_edge_crop_zero_copy_arm_is_fused_and_correct`). Even heights
-        // never reach that handling (the paired loop is bounded by the
-        // destination zip), and NV16/NV24 have no vertical subsampling and
-        // therefore no remainder path.
+        // A nonzero column offset is packed. Row-aligned reads
+        // (`region_left == 0`) slice the parent planes at row boundaries,
+        // except NV12 with an odd height that is not flush with the source's
+        // bottom edge, which is packed too.
         let flush_bottom = region_top + out_h == src_h;
         let needs_pack =
             region_left != 0 || (src_fmt == Nv12 && !out_h.is_multiple_of(2) && !flush_bottom);
@@ -1814,12 +1703,9 @@ impl CPUProcessor {
             let sh = STRIP_ROWS.min(out_h - r0);
             let src_row = region_top + r0;
 
-            // `img_y`/`img_uv` always start at column 0 of a real source row,
-            // so the crate's internal `stride`-sized chunking never reads
-            // past a row it doesn't own: a column-shifted region is packed to
-            // `stride == width` first (see the `nv_strip_y_pack` field doc),
-            // while a row-aligned region (`region_left == 0`) slices the
-            // parent planes directly at its first row and stays zero-copy.
+            // `img_y`/`img_uv` start at column 0 of a source row: packed to
+            // `stride == width`, or sliced from the parent planes at the
+            // region's first row.
             let (img_y, img_y_stride, img_uv, img_uv_stride): (&[u8], u32, &[u8], u32) =
                 if needs_pack {
                     let chroma_rows = sh.div_ceil(chroma_div);
@@ -1841,9 +1727,7 @@ impl CPUProcessor {
                         chroma_row_bytes as u32,
                     )
                 } else {
-                    // `region_left`/`chroma_x` are always 0 here (row-aligned
-                    // region or whole frame), so this is exactly the original
-                    // zero-copy read, offset to the region's first row.
+                    // `region_left` and `chroma_x` are 0 here.
                     let yoff = src_row * y_stride + region_left;
                     let uvoff = (src_row / chroma_div) * uv_stride + chroma_x;
                     (
@@ -1881,8 +1765,8 @@ impl CPUProcessor {
                     break;
                 }
             }
-            // The strip's packed RGB is now hot in the scratch; scatter each row
-            // into the destination planes at its frame-row offset.
+            // Scatters each row of the strip into the destination planes at its
+            // frame-row offset.
             for i in 0..sh {
                 let s = &scratch[i * out_w * 3..i * out_w * 3 + out_w * 3];
                 let roff = (r0 + i) * dst_stride;
@@ -1911,9 +1795,7 @@ impl CPUProcessor {
     /// source has one (`PlanarRgba`), otherwise filled with 255 (`PlanarRgb`).
     ///
     /// Plane offsets are derived from `height * row_stride` and rows are walked
-    /// individually, so strided / pitch-aligned sources (DMA, `create_image`)
-    /// are not mis-sliced or read across their per-row padding — a flat
-    /// `mapped_len / channels` split reads pad bytes as pixels on padded buffers.
+    /// individually.
     fn planar_to_packed(
         src: &Tensor<u8>,
         dst: &mut Tensor<u8>,
@@ -1925,7 +1807,7 @@ impl CPUProcessor {
         let src_stride = super::tensor_row_stride(src);
         let dst_stride = super::tensor_row_stride(dst);
         let has_alpha_plane = dst_ch == 4 && src_planes >= 4;
-        // Planes actually read: R/G/B always, plus the alpha plane when the
+        // Planes read: R/G/B always, plus the alpha plane when the
         // destination has one and the source supplies it.
         let planes_read = if has_alpha_plane { 4 } else { 3 };
 
@@ -1934,12 +1816,8 @@ impl CPUProcessor {
         let mut dst_map = dst.map_for_write()?;
         let dst_bytes = dst_map.as_mut_slice();
 
-        // Validate the buffers against the derived geometry before indexing.
-        // Like `split_semi_planar`, an imported tensor may carry a stride/shape
-        // that exceeds its actual allocation (untrusted input), so use checked
-        // arithmetic and return `InvalidShape` instead of panicking with an
-        // out-of-bounds slice. `src_stride >= w`, so a plane spans at most
-        // `h * src_stride` bytes and the last row's `w` bytes stay in-plane.
+        // Validates the buffers against the derived geometry with checked
+        // arithmetic before indexing.
         let plane_stride = src_stride.checked_mul(h).ok_or_else(|| {
             Error::InvalidShape(format!(
                 "planar plane size overflow (stride={src_stride}, h={h})"
@@ -2020,8 +1898,7 @@ impl CPUProcessor {
 
     pub(crate) fn rgba_to_grey(rgba: [u8; 4]) -> [u8; 1] {
         const BIAS: i32 = 20;
-        // Conventional BT.601 luma weights (Rec.601 is the standard luma basis
-        // for RGB→grayscale; full-range, no 16/235 expansion).
+        // BT.601 luma weights, full-range.
         const KR: f64 = 0.299f64;
         const KB: f64 = 0.114f64;
         const KG: f64 = 1.0 - KR - KB;

@@ -10,8 +10,7 @@ use edgefirst_decoder_abi::EfDetectBox;
 use edgefirst_tracker::bytetrack::ByteTrack;
 use edgefirst_tracker::{ByteTrackBuilder, DetectionBox, TrackInfo, Tracker};
 
-/// Plain detection value for the C surface. Tracker does not depend on
-/// `edgefirst-tensor`; it only needs six scalars per box.
+/// Plain detection value for the C surface: six scalars per box.
 #[derive(Debug, Clone, Copy)]
 struct CDetectBox {
     bbox: [f32; 4],
@@ -40,10 +39,8 @@ pub struct EfByteTrack {
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct EfTrackInfo {
-    /// Stable identity for this track, as raw UUID bytes.
-    ///
-    /// Bytes rather than a string so the struct stays a plain value with no
-    /// allocation; format it with [`ef_uuid_to_string`] when a human needs it.
+    /// Stable identity for this track, as raw UUID bytes. Format it with
+    /// [`ef_uuid_to_string`].
     pub uuid: [u8; 16],
     /// Smoothed predicted location, XYXY normalized.
     pub location: [f32; 4],
@@ -124,13 +121,13 @@ pub unsafe extern "C" fn ef_bytetrack_free(t: *mut EfByteTrack) {
 /// Advance the tracker by one frame.
 ///
 /// `timestamp` is in nanoseconds and must be monotonic; the tracker uses it for
-/// track age and expiry, so a non-monotonic value corrupts both.
+/// track age and expiry.
 ///
 /// @return a track list the caller must free, or `NULL` on a null argument.
 ///
 /// # Safety
 /// `detections` must point to `count` readable elements, or be `NULL` when
-/// `count` is 0 — obtain them from `ef_detect_box_list_data`.
+/// `count` is 0. Obtain them from `ef_detect_box_list_data`.
 #[no_mangle]
 pub unsafe extern "C" fn ef_bytetrack_update(
     t: *mut EfByteTrack,
@@ -143,8 +140,6 @@ pub unsafe extern "C" fn ef_bytetrack_update(
             if t.is_null() || (detections.is_null() && count != 0) {
                 return std::ptr::null_mut();
             }
-            // A borrowed C array, not a handle: passing an opaque list across would
-            // force this library to link the one that owns it.
             let boxes: Vec<CDetectBox> = if count == 0 {
                 Vec::new()
             } else {
@@ -178,8 +173,7 @@ pub unsafe extern "C" fn ef_bytetrack_active_tracks(t: *const EfByteTrack) -> *m
             if t.is_null() {
                 return std::ptr::null_mut();
             }
-            // `get_active_tracks` returns the richer ActiveTrackInfo; the C
-            // surface exposes the smoothed TrackInfo, matching `update`.
+            // Reduce each `ActiveTrackInfo` to its smoothed `TrackInfo`.
             let tracks: Vec<TrackInfo> = (*t)
                 .inner
                 .get_active_tracks()
@@ -211,9 +205,6 @@ pub unsafe extern "C" fn ef_track_info_list_len(l: *const EfTrackInfoList) -> us
 }
 
 /// Copy track `index` into `out`.
-///
-/// Copies rather than lending a pointer: a borrowed element dangles the moment
-/// the list is freed, and C gives the caller no way to notice.
 ///
 /// @return 0 on success, `EINVAL` for a null argument or out-of-range index.
 ///
@@ -259,9 +250,7 @@ pub unsafe extern "C" fn ef_track_info_list_free(l: *mut EfTrackInfoList) {
 
 /// Format a track's UUID into `out` as 36 characters plus a NUL.
 ///
-/// `out` must have room for 37 bytes. Writing into a caller's buffer rather
-/// than returning an allocation keeps ownership with the caller and needs no
-/// matching free.
+/// `out` must have room for 37 bytes.
 ///
 /// @return 0 on success, `EINVAL` on a null argument.
 ///
@@ -304,8 +293,6 @@ mod tests {
 
     #[test]
     fn a_detection_becomes_a_track_with_a_stable_identity() {
-        // The property that matters: the same object across two frames keeps
-        // one UUID. A per-frame list would satisfy a length check but not this.
         unsafe {
             let t = ef_bytetrack_new_default();
             let mut first = [0u8; 16];
@@ -345,11 +332,9 @@ mod tests {
         unsafe {
             let mut out = EfTrackInfo::default();
             assert!(ef_bytetrack_update(std::ptr::null_mut(), std::ptr::null(), 0, 0).is_null());
-            // A null array with a non-zero count is a caller bug, not an
-            // empty frame: refuse rather than read.
             let t = ef_bytetrack_new_default();
             assert!(ef_bytetrack_update(t, std::ptr::null(), 5, 0).is_null());
-            // A genuinely empty frame is legal — objects can leave the scene.
+            // An empty frame.
             let empty = ef_bytetrack_update(t, std::ptr::null(), 0, 0);
             assert!(!empty.is_null(), "an empty detection set is a valid frame");
             ef_track_info_list_free(empty);
@@ -368,8 +353,6 @@ mod tests {
     fn a_uuid_formats_to_36_characters_plus_nul() {
         unsafe {
             let bytes = [0xABu8; 16];
-            // c_char is i8 on macOS and u8 on aarch64-linux; naming the type
-            // keeps this compiling on both.
             let mut buf = [0 as c_char; 37];
             assert_eq!(ef_uuid_to_string(bytes.as_ptr(), buf.as_mut_ptr()), 0);
             let s = std::ffi::CStr::from_ptr(buf.as_ptr()).to_str().unwrap();

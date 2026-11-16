@@ -1,8 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! Per-scale quantized decoder — see
-//! `.claude/plans/2026-04-28-per-scale-decoder-optimized-design.md`.
+//! Per-scale quantized decoder.
 
 pub mod helper;
 pub(crate) mod kernels;
@@ -16,20 +15,13 @@ pub use helper::apply_schema_quant;
 
 /// Element type the per-scale pipeline decodes boxes and scores into, set with
 /// [`DecoderBuilder::with_decode_dtype`](crate::DecoderBuilder::with_decode_dtype).
-///
-/// Mask coefficients and protos are always f32, the type the mask kernels take. Detections are
-/// reported in f32 either way: with `F16` the box and score values are f16-rounded (about a
-/// quarter pixel at 640 and 1e-4 in score).
-///
-/// A builder that is not given a dtype uses [`DecodeDtype::native`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DecodeDtype {
     /// 32-bit float boxes and scores.
     #[default]
     F32,
-    /// 16-bit float boxes and scores: half the memory bandwidth of the candidate filter, and on
-    /// a CPU with FP16 arithmetic the NMS overlap tests of large candidate sets run eight boxes
-    /// per vector instead of four.
+    /// 16-bit float boxes and scores. On a CPU with FP16 arithmetic the NMS overlap tests of
+    /// large candidate sets run in FP16.
     F16,
 }
 
@@ -38,8 +30,7 @@ impl DecodeDtype {
     /// [`F16`](Self::F16) on a CPU with native FP16 arithmetic (AArch64 `fphp`/`asimdhp`, such
     /// as the Cortex-A55, A76 and A78), [`F32`](Self::F32) on any other (the Cortex-A53, x86).
     ///
-    /// The probe is the decoder's, so `EDGEFIRST_DECODER_FORCE_KERNEL=neon` (or `scalar`)
-    /// selects `F32` on an FP16 CPU.
+    /// `EDGEFIRST_DECODER_FORCE_KERNEL=neon` (or `scalar`) selects `F32` on an FP16 CPU.
     ///
     /// # Examples
     ///
@@ -57,13 +48,10 @@ impl DecodeDtype {
     }
 }
 
-/// Activation function applied after dequantization on a logical output.
-///
-/// Sourced from the schema's `activation_required` field. Currently only
-/// `Sigmoid` is wired through the per-scale pipeline; future activations
-/// (e.g. `Softmax` on objectness) extend this enum without ripple.
+/// Activation function applied after dequantization on a logical output, from the schema's
+/// `activation_required` field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[allow(dead_code)] // consumed by per-scale pipeline tasks
+#[allow(dead_code)]
 pub(crate) enum Activation {
     #[default]
     None,
@@ -73,7 +61,7 @@ pub(crate) enum Activation {
 impl Activation {
     /// Translate a schema activation to a per_scale Activation.
     /// Returns Activation::None when the schema declares no activation.
-    #[allow(dead_code)] // consumed by per-scale pipeline tasks
+    #[allow(dead_code)]
     pub(crate) fn from_schema(s: Option<crate::schema::Activation>) -> Self {
         match s {
             Some(crate::schema::Activation::Sigmoid) => Self::Sigmoid,
@@ -88,7 +76,7 @@ pub(crate) use plan::PerScalePlan;
 /// Per-scale decoder for schema-v2 per-scale models. Built once at
 /// `DecoderBuilder::build()` time; consumed per-frame via `run()`.
 #[derive(Debug)]
-#[allow(dead_code)] // Wired by Task 24's Decoder integration.
+#[allow(dead_code)]
 pub(crate) struct PerScaleDecoder {
     pub(crate) plan: PerScalePlan,
     pub(crate) buffers: DecodedOutputBuffers,
@@ -96,7 +84,7 @@ pub(crate) struct PerScaleDecoder {
 
 impl PerScaleDecoder {
     /// Build a decoder from a plan, allocating output buffers.
-    #[allow(dead_code)] // Wired by Task 23's builder.
+    #[allow(dead_code)]
     pub(crate) fn new(plan: PerScalePlan) -> Self {
         let buffers = DecodedOutputBuffers::new(
             plan.out_dtype,
@@ -113,7 +101,7 @@ impl PerScaleDecoder {
     /// With a `score_threshold`, only anchors that can reach it are
     /// decoded and the outputs hold just those, in anchor order; `None`
     /// decodes every anchor.
-    #[allow(dead_code)] // Wired by Task 24.
+    #[allow(dead_code)]
     pub(crate) fn run<'a>(
         &'a mut self,
         inputs: &[&edgefirst_tensor::TensorDyn],
@@ -125,9 +113,7 @@ impl PerScaleDecoder {
 
 /// Owned f32 snapshot of pre-NMS per-scale outputs.
 ///
-/// Returned by [`crate::Decoder::_testing_run_per_scale_pre_nms`] and
-/// used by integration tests to compare against fixture intermediates
-/// without the noise of NMS ordering.
+/// Returned by [`crate::Decoder::_testing_run_per_scale_pre_nms`].
 #[doc(hidden)]
 pub struct PreNmsCapture {
     pub boxes_xywh: ndarray::Array2<f32>,
@@ -233,7 +219,7 @@ pub mod bench {
                     if !std::arch::is_aarch64_feature_detected!("fp16") {
                         return Err(unavailable(kernel));
                     }
-                    // SAFETY: FEAT_FP16 was just detected; the lengths match the level.
+                    // SAFETY: FEAT_FP16 is present; the lengths match the level.
                     unsafe { level_box::dfl_neon(input, q, p, level_box::Exp::Fp16, dst) }
                 }
                 #[cfg(target_arch = "aarch64")]
@@ -636,8 +622,7 @@ mod bench_tests {
         }
     }
 
-    /// Every DFL kernel hook given a short `input` or `dst` fails with `InvalidShape` and writes
-    /// nothing.
+    /// Every DFL kernel hook given a short `input` or `dst` fails with `InvalidShape` and writes nothing.
     #[test]
     fn dfl_level_rejects_mismatched_lengths_before_writing() {
         let level = DflLevel::new(5, 4, 8.0, 0.1, 2);

@@ -4,15 +4,14 @@
 //! NEON int8 softmax kernels.
 //!
 //! A row's outputs depend only on the table index `255 - max + x`. Long rows sum their
-//! exponentials from the f32 table in four interleaved partial sums, which keeps the sum within
-//! an ulp or so of TFLite's sequential one, then build a per-row byte table of quantized
-//! outputs and map the row through it with `tbl`. Only the top of the table needs building:
-//! where the probabilities have decayed to the zero point the lookup takes that value by
-//! default, which for attention scores usually leaves a single 64-entry slice. Short rows with
-//! a wide value range gather and quantize each element instead, summing in four partial sums. Rows of exactly sixteen run sixteen at a time, one row per
-//! lane after an in-register transpose, with every exponential from the split tables.
+//! exponentials from the f32 table in four interleaved partial sums, then build a per-row byte
+//! table of quantized outputs and map the row through it with `tbl`. Only the top of the table
+//! is built: where the probabilities have decayed to the zero point the lookup takes that value
+//! by default. Short rows with a wide value range gather and quantize each element, summing in
+//! four partial sums. Rows of exactly sixteen run sixteen at a time, one row per lane after an
+//! in-register transpose, with every exponential from the split tables.
 //!
-//! Every path is within ±1 LSB of the scalar kernel's sequential f32 sum, and unbiased.
+//! Every path is within ±1 LSB of the scalar kernel's sequential f32 sum.
 
 #![cfg(target_arch = "aarch64")]
 
@@ -58,9 +57,8 @@ pub(super) unsafe fn softmax_row_i8_neon(
     }
     // SAFETY: `max` is the row's maximum (`min_max` above).
     let inv = 1.0 / (unsafe { gather_sum(table, max, src) } * out_scale);
-    // 64-entry slices, counted from the top, that the row's indices reach. Below the top `s`
-    // slices every index quantizes to `zero` when their largest entry does, since scaling by
-    // `inv` and rounding are monotonic; those lanes take the default instead of a lookup.
+    // 64-entry slices, counted from the top, that the row's indices reach, less those whose
+    // largest entry quantizes to `zero`; lanes below them take `zero` without a lookup.
     let zero = quantize_prob(0.0, zp);
     let reach = 4 - (255 - range) / 64;
     let slices = (1..reach)
@@ -91,7 +89,7 @@ fn min_max(src: &[i8]) -> (i8, i8) {
     let (chunks, tail) = rest.as_chunks::<16>();
     let (mut lo, mut hi) = (i8::MAX, i8::MIN);
     if !(pairs.is_empty() && chunks.is_empty()) {
-        // Two accumulator pairs, so each load has the other pair's work to hide behind.
+        // Two accumulator pairs.
         let mut vlo = [vdupq_n_s8(i8::MAX); 2];
         let mut vhi = [vdupq_n_s8(i8::MIN); 2];
         for c in pairs {
@@ -119,10 +117,10 @@ fn min_max(src: &[i8]) -> (i8, i8) {
 /// The row sum of `table[255 - max + x]`, in four interleaved f32 accumulators (element `j`
 /// into accumulator `j % 4`); `max` must be the row's maximum.
 ///
-/// Whole 16-element chunks run in a software-pipelined loop for the in-order Cortex-A55: the
-/// bytes go straight to general registers, each sign-extended byte is the element's offset from
-/// `table + 255 - max`, and every `fadd` trails its load by four elements, the last four of a
-/// chunk being added at the top of the next.
+/// Whole 16-element chunks run in a software-pipelined loop: the bytes go straight to general
+/// registers, each sign-extended byte is the element's offset from `table + 255 - max`, and
+/// every `fadd` trails its load by four elements, the last four of a chunk being added at the
+/// top of the next.
 ///
 /// # Safety
 /// `max` must be at least every element of `src`: the loop reads `table[255 − max + x]` unchecked.
@@ -132,11 +130,11 @@ unsafe fn gather_sum(table: &[f32; 256], max: i8, src: &[i8]) -> f32 {
     let (chunks, rest) = src.as_chunks::<16>();
     let mut a = [0.0f32; 4];
     if !chunks.is_empty() {
-        // Up to 383 entries past the start, so possibly past the end; only `base + x` is read.
+        // `base` may lie past the table's end; only `base + x` is read.
         let base = table.as_ptr().wrapping_offset(255 - isize::from(max));
         let [mut a0, mut a1, mut a2, mut a3] = a;
         // SAFETY: reads the chunks' bytes, and table entries `255 - max + x` for bytes `x` of
-        // the row, which lie in `0..=255` because `-128 <= x <= max <= 127`.
+        // the row; `-128 <= x <= max <= 127` keeps them in `0..=255`.
         unsafe {
             core::arch::asm!(
                 "movi d20, #0",
@@ -292,7 +290,7 @@ fn build_out_table(table: &[f32; 256], inv: f32, zp: i32, start: usize, otab: &m
 /// map to `zero`.
 ///
 /// The slices are loaded XOR `zero`, so each slice's `tbl` gives 0 for lanes outside it and
-/// the slices combine with independent `tbl`s and `orr`s instead of a chain of `tbx`.
+/// the slices combine with independent `tbl`s and `orr`s.
 #[target_feature(enable = "neon")]
 fn lookup<const S: usize>(otab: &[i8; 256], zero: i8, off: u8, src: &[i8], dst: &mut [i8]) {
     let z = vdupq_n_s8(zero);
@@ -316,8 +314,7 @@ fn lookup<const S: usize>(otab: &[i8; 256], zero: i8, off: u8, src: &[i8], dst: 
         }
         veorq_s8(r, z)
     };
-    // Four vectors per step, each stage across all four, so the in-order core has independent
-    // work while a load or `tbl` completes.
+    // Four vectors per step, each stage across all four.
     let (quads, rest) = src.as_chunks::<64>();
     let (dquads, drest) = dst.as_chunks_mut::<64>();
     for (c, d) in quads.iter().zip(dquads.iter_mut()) {
@@ -406,9 +403,8 @@ impl SplitExp {
 /// Sixteen rows of sixteen elements at once, one row per lane: the rows are transposed in
 /// registers, each lane's max taken across the sixteen element vectors, every `exp` formed
 /// from the split tables of [`super::softmax_i8::exp16_tables`] as an exact `A·B` product
-/// (1.0 is 65535²), and the quantized outputs transposed back. Each `exp` is within about
-/// 2⁻¹⁶ of the float table's and the products are rounded, not truncated, so outputs stay
-/// within ±1 LSB of the float-table row kernel without bias. Each lane computes exactly what
+/// (1.0 is 65535²), and the quantized outputs transposed back. Outputs are within ±1 LSB of
+/// the float-table row kernel. Each lane computes exactly what
 /// [`super::softmax_i8::softmax_row16_split`] computes for its row.
 ///
 /// Does nothing unless the group is 16 rows of 16.
@@ -423,12 +419,11 @@ pub(super) unsafe fn rows16(exp16: &[[u8; 16]; 4], out_scale: f32, g: &RowGroup<
     // SAFETY: the group is 16 rows of 16 (checked above).
     let (v, max) = unsafe { load16(g) };
     let tables = SplitExp::new(exp16);
-    // `e[j][q]`: element `j` of rows `4q..4q + 4`; every entry is written before it is read.
+    // `e[j][q]`: element `j` of rows `4q..4q + 4`.
     let mut e = core::mem::MaybeUninit::<[[uint32x4_t; 4]; 16]>::uninit();
     let ep: *mut [uint32x4_t; 4] = e.as_mut_ptr().cast();
     let mut sum = [vdupq_n_u32(0); 4];
-    // Four elements per step, each stage across all four, so the in-order core always has
-    // independent work.
+    // Four elements per step, each stage across all four.
     for (j0, x) in v.as_chunks::<4>().0.iter().enumerate() {
         let (a, b) = tables.entries(max, x);
         for u in 0..4 {
@@ -438,7 +433,7 @@ pub(super) unsafe fn rows16(exp16: &[[u8; 16]; 4], out_scale: f32, g: &RowGroup<
                 vmull_u16(vget_low_u16(a[u][1]), vget_low_u16(b[u][1])),
                 vmull_high_u16(a[u][1], b[u][1]),
             ];
-            // Sixteen terms below 2³² each fit a u32 lane after a rounding shift by 4.
+            // Each term enters the sum after a rounding shift by 4.
             for (s, &t) in sum.iter_mut().zip(&p) {
                 *s = vrsraq_n_u32::<4>(*s, t);
             }
@@ -453,8 +448,8 @@ pub(super) unsafe fn rows16(exp16: &[[u8; 16]; 4], out_scale: f32, g: &RowGroup<
     let c: [float32x4_t; 4] = core::array::from_fn(|q| {
         vdivq_f32(one, vmulq_n_f32(vcvtq_f32_u32(sum[q]), 16.0 * out_scale))
     });
-    // The output zero point is -128 (the plan requires it): `q` lies in 0..=256, so it is
-    // saturated to a byte and its top bit flipped, which subtracts 128.
+    // `q` is saturated to a byte and its top bit flipped, which subtracts 128, the output
+    // zero point.
     let flip = vdupq_n_u8(0x80);
     let mut out = [vdupq_n_u8(0); 16];
     for (o, ej) in out
@@ -523,7 +518,7 @@ mod tests {
             let mut lens: Vec<usize> = (1..=70).collect();
             lens.extend([255, 256, 257, 1008, 1009, 4097, 70_000]);
             for &n in &lens {
-                // Spans of 1, 16, 63, 64, 65, 128, 192 and 256 values exercise every table-slice count.
+                // These spans exercise every table-slice count.
                 for &span in &[1i32, 16, 63, 64, 65, 128, 192, 256] {
                     let base = rng.random_range(-128..=(128 - span));
                     let row: Vec<i8> = (0..n)
@@ -548,8 +543,7 @@ mod tests {
         eprintln!("neon vs portable: {off} of {total} off by one");
     }
 
-    /// The pipelined gather adds element `j` into accumulator `j % 4`, in order, exactly as a
-    /// plain loop does, for every row maximum (negative ones put the table base past its end).
+    /// The pipelined gather equals a plain loop adding element `j` into accumulator `j % 4`.
     #[test]
     fn gather_sum_is_the_interleaved_sum_bit_for_bit() {
         let mut rng = rand::rngs::StdRng::seed_from_u64(0x6A7E_5011);
@@ -597,8 +591,7 @@ mod tests {
         unsafe { softmax_row_i8_neon(&t, &slice_max(&t), 1.0 / 256.0, -128, &[], &mut empty) };
     }
 
-    /// Rows of 16 in groups of 16 (the DFL layout: `[4, anchors, 16]` read from
-    /// `[anchors, 64]`) stay within ±1 LSB of the portable plan, rarely and without bias.
+    /// Rows of 16 in groups of 16 (the DFL layout) stay within ±1 LSB of the portable plan.
     #[test]
     fn row_groups_match_portable() {
         use super::super::softmax_i8::{SoftmaxI8Params, SoftmaxI8Plan};
@@ -652,8 +645,7 @@ mod tests {
         );
     }
 
-    /// The 16-row kernel gives each row exactly what the plan's single-row path gives it, so a
-    /// 16-element row's result does not depend on whether it was grouped.
+    /// The 16-row kernel gives each row exactly what the plan's single-row path gives it.
     #[test]
     fn row_groups_equal_single_rows() {
         use super::super::softmax_i8::{SoftmaxI8Params, SoftmaxI8Plan};

@@ -3,10 +3,9 @@
 
 """Tests for NOTICE generation from a CycloneDX SBOM.
 
-NOTICE is the attribution artifact shipped to downstream consumers. These tests
-pin the three shapes a CycloneDX licence entry takes -- an SPDX id, an SPDX
-expression, and a free-form name carrying the licence as text -- and the rule
-that a component is never dropped because its licence could not be identified.
+Covers the three shapes of a CycloneDX licence entry (an SPDX id, an SPDX expression,
+and a free-form name carrying the licence as text) and that a component with an
+unidentified licence is kept.
 """
 
 import base64
@@ -58,8 +57,6 @@ class TestLicenceExtraction:
         ) == {"MIT"}
 
     def test_expression_is_split_into_its_terms(self):
-        # "Unlicense OR MIT" must yield MIT, or every dual-licensed crate that
-        # offers a public-domain option would fall out of NOTICE.
         assert generate_notice.extract_license_from_component(
             component([{"expression": "Unlicense OR MIT"}])
         ) == {"Unlicense", "MIT"}
@@ -71,16 +68,13 @@ class TestLicenceExtraction:
 
     @pytest.mark.parametrize("placeholder", ["Unknown", "NOASSERTION", "none"])
     def test_uninformative_names_do_not_count_as_identification(self, placeholder):
-        # These fall through to the licence text rather than being recorded as if
-        # they named a licence. With no text to fall through to, the entry still
-        # carried a claim, so it lands on Unclassified.
+        # A placeholder name with no licence text lands on Unclassified.
         assert generate_notice.extract_license_from_component(
             component([{"license": {"name": placeholder}}])
         ) == {"Unclassified"}
 
     @pytest.mark.parametrize("blank", ["", "  "])
     def test_an_empty_name_carries_no_claim_at_all(self, blank):
-        # Distinct from "Unknown": there is nothing here to be unclassified.
         assert (
             generate_notice.extract_license_from_component(
                 component([{"license": {"name": blank}}])
@@ -90,9 +84,7 @@ class TestLicenceExtraction:
 
     @pytest.mark.parametrize("name", ["MIT License", "AcmeCorp Internal", "Apache 2"])
     def test_unrecognised_name_does_not_shortcut_the_licence_text(self, name):
-        # A free-form name is not an identifier. Treating one as identification
-        # would mark the component classified, skip the text that can place it,
-        # and then drop it for not matching the attribution set.
+        # The licence text, not the free-form name, identifies the licence.
         assert generate_notice.extract_license_from_component(
             component([{"license": {"name": name, "text": {"content": MIT_BODY}}}])
         ) == {"MIT"}
@@ -171,8 +163,6 @@ class TestAttributionPolicy:
 
     @pytest.mark.parametrize("licence", ["Unlicense", "CC0-1.0", "0BSD"])
     def test_attribution_not_required(self, licence):
-        # Public-domain-equivalent licences ask for nothing. A component under
-        # one of these alongside MIT is still attributed, via the MIT term.
         assert not generate_notice.requires_attribution({licence})
 
     def test_dual_licence_with_a_permissive_term_is_attributed(self):
@@ -180,7 +170,7 @@ class TestAttributionPolicy:
 
 
 class TestNoticeRendering:
-    """`generate_notice` reads an SBOM from disk, so these go through a file."""
+    """Rendering of NOTICE from an SBOM file."""
 
     @staticmethod
     def render(tmp_path, sbom):
@@ -213,11 +203,10 @@ class TestNoticeRendering:
         )
         assert "  * alpha 1.0.0 (MIT)" in notice
         assert "  * beta 2.3.4 (MIT)" in notice
-        # gamma asks for no attribution, so it is absent by policy, not by accident.
+        # gamma asks for no attribution.
         assert "gamma" not in notice
 
     def test_copyright_line_is_present(self, tmp_path):
-        # The org validator fails outright on a NOTICE with no copyright line.
         assert "Copyright" in self.render(tmp_path, {"components": []})
 
     def test_entries_are_sorted_so_regeneration_produces_a_readable_diff(
@@ -250,7 +239,7 @@ class TestNoticeRendering:
 
 
 class TestCheckMode:
-    """`--check` gates on what the generator would WRITE, not on the SBOM."""
+    """`--check` compares NOTICE against what the generator would write."""
 
     @staticmethod
     def write(tmp_path, sbom, notice_text):
@@ -289,9 +278,7 @@ class TestCheckMode:
         assert generate_notice.check_notice(s, n) == 0
 
     def test_a_no_attribution_licence_cannot_wedge_the_gate(self, tmp_path):
-        # CC0-1.0 asks for nothing, so the generator omits it. Gating on the full
-        # component list would fail here with no way to clear it, since
-        # regenerating NOTICE would correctly go on omitting it.
+        # The generator omits CC0-1.0, which asks for no attribution.
         sbom = {
             "components": [
                 {
@@ -312,8 +299,6 @@ class TestCheckMode:
         assert generate_notice.check_notice(s, n) == 0
 
     def test_a_stale_version_is_caught(self, tmp_path):
-        # Matching on name alone would miss a dependency bump that left NOTICE
-        # naming the old version.
         sbom = {
             "components": [
                 {
@@ -329,8 +314,6 @@ class TestCheckMode:
         assert generate_notice.check_notice(s, n) == 1
 
     def test_duplicate_component_records_are_counted_once(self, tmp_path):
-        # The merged SBOM carries the same (name, version) from several
-        # per-target scans.
         entry = {
             "name": "alpha",
             "version": "1.0.0",

@@ -1,21 +1,7 @@
 """End-to-end tests for ImageProcessor.materialize_masks(MaskResolution.Scaled).
 
-Replays the exact tensor-passing pattern the EdgeFirst validator uses in
-``runners/core.py::process_yolo_hal`` but substitutes the new Scaled path
-for the per-tile ``ImageProcessor.convert()`` loop that exhibits the
-wraparound bug described in HAILORT_BUG.md.
-
-Verifies:
-
-1. Scaled masks are binary ``uint8 {0, 255}`` (not continuous sigmoid).
-2. Binary encoding is drop-in interchangeable with Proto continuous
-   masks via the same ``> 127`` threshold.
-3. Scaled output bbox-crop dimensions match the detection bbox mapped to
-   the target ``(width, height)``.
-4. Scaled masks match a NumPy ``sigmoid(coefs @ protos_upsampled) > 0.5``
-   retina-style reference within the fast_sigmoid approximation
-   tolerance (<0.5% pixel mismatch) when the bbox and protos are
-   well-conditioned.
+Covers the binary ``uint8 {0, 255}`` encoding, the bbox-crop dimensions and agreement
+with a NumPy reference.
 """
 
 from __future__ import annotations
@@ -64,12 +50,11 @@ def _to_tensor(arr: np.ndarray) -> ef.Tensor:
 
 
 def _build_validator_pattern_tensors(rng, placements):
-    """Replicate `_prepare_raw_outputs` + `check_normalized_boxes` tail.
+    """Build the combined detection view and the protos.
 
-    Returns `(combined_view, protos_nchw)` where `combined_view` is a
-    non-contiguous `(1, 4+NC+NM, 8400)` view produced by `.T[np.newaxis]`
-    on a C-contiguous `(8400, 4+NC+NM)` base, with pixel-space xywh
-    divided by W/H exactly as the validator does pre-decode.
+    Returns `(combined_view, protos_nchw)` where `combined_view` is a `(1, 4+NC+NM,
+    8400)` array built with `.T[np.newaxis]` on a C-contiguous `(8400, 4+NC+NM)` base,
+    with pixel-space xywh divided by W/H.
     """
     total_anchors = 8400
     det = np.zeros((total_anchors, 4 + NC + NM), dtype=np.float32)
@@ -82,7 +67,7 @@ def _build_validator_pattern_tensors(rng, placements):
         det[i, 4 + NC + (i % NM)] = 4.0  # mask coef one-hot at (i % NM)
 
     combined = det.T[np.newaxis]  # (1, 4+NC+NM, 8400) non-contig view
-    # Validator does this in-place on a copy before decode.
+    # Normalize xywh by W and H on a copy.
     combined = combined.copy()
     combined[:, [0, 2]] /= W
     combined[:, [1, 3]] /= H
@@ -202,11 +187,7 @@ def test_scaled_bbox_crop_dims_match_target_resolution():
 
 
 def test_scaled_binary_threshold_matches_greater_than_127():
-    """Binary ``{0, 255}`` output is drop-in under the caller's ``> 127`` test.
-
-    Validator code already does ``(mask > 127).astype(...)`` on continuous
-    sigmoid masks. For Scaled masks this must be identical to ``mask == 255``.
-    """
+    """Binary ``{0, 255}`` output gives the same mask under ``> 127`` as ``== 255``."""
     rng = np.random.default_rng(123)
     placements = [(0.20, 0.25, 0.55, 0.70)]
     combined, protos = _build_validator_pattern_tensors(rng, placements)
@@ -229,14 +210,9 @@ def test_scaled_binary_threshold_matches_greater_than_127():
 
 
 def test_scaled_matches_numpy_retina_reference():
-    """Scaled masks match a NumPy retina-style reference to within ``fast_sigmoid``
-    approximation tolerance (<1% pixel mismatch per detection).
-
-    Uses a small 96×96 target and 32×32 proto plane so the NumPy reference
-    runs in seconds rather than minutes.
-    """
+    """Scaled masks match a NumPy retina-style reference within tolerance."""
     rng = np.random.default_rng(1729)
-    # Override the full-size constants to keep the reference loop tractable.
+    # Override the full-size constants.
     target_w, target_h = 96, 96
     proto_h, proto_w, nm, nc = 32, 32, 8, 4
     total_anchors = 8400
@@ -304,7 +280,7 @@ def test_scaled_matches_numpy_retina_reference():
 
     coefs = np.zeros(nm, dtype=np.float32)
     coefs[0] = 1.0
-    # Use the HAL-returned bbox (post-snap) so proto-pixel rounding matches.
+    # Use the HAL-returned bbox (post-snap).
     bbox_hal = tuple(float(v) for v in boxes[0])
     # Local reference (uses the scaled-down proto dims above).
     protos_hwc = protos[0].transpose(1, 2, 0)

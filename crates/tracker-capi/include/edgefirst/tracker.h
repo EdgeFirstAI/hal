@@ -10,10 +10,9 @@
  *
  * Associates detections across frames, giving each object a stable identity.
  *
- * Takes detections as a plain `(const ef_detect_box *, size_t)` pair — the
- * same view `ef_detect_box_list_data()`/`_len()` give back — so this library
- * needs only the by-value `ef_detect_box` type, declared in
- * edgefirst/detect.h, and never links the decoder.
+ * Takes detections as a `(const ef_detect_box *, size_t)` pair, the view
+ * `ef_detect_box_list_data()`/`_len()` give back. `ef_detect_box` is
+ * declared in edgefirst/detect.h.
  */
 
 #include <stdarg.h>
@@ -30,9 +29,6 @@ extern "C" {
 
 /**
  * @brief An opaque tracker.
- *
- * Forward-declared so callers write `ef_bytetrack *` without the `struct`
- * keyword. Its definition is private: tracker state is not part of the ABI.
  */
 typedef struct ef_bytetrack ef_bytetrack;
 
@@ -54,10 +50,8 @@ typedef struct ef_track_info_list ef_track_info_list;
  */
 typedef struct ef_track_info {
   /**
-   * Stable identity for this track, as raw UUID bytes.
-   *
-   * Bytes rather than a string so the struct stays a plain value with no
-   * allocation; format it with [`ef_uuid_to_string`] when a human needs it.
+   * Stable identity for this track, as raw UUID bytes. Format it with
+   * [`ef_uuid_to_string`].
    */
   uint8_t uuid[16];
   /**
@@ -110,13 +104,13 @@ void ef_bytetrack_free(ef_bytetrack *t);
  * Advance the tracker by one frame.
  *
  * `timestamp` is in nanoseconds and must be monotonic; the tracker uses it for
- * track age and expiry, so a non-monotonic value corrupts both.
+ * track age and expiry.
  *
  * @return a track list the caller must free, or `NULL` on a null argument.
  *
  * # Safety
  * `detections` must point to `count` readable elements, or be `NULL` when
- * `count` is 0 — obtain them from `ef_detect_box_list_data`.
+ * `count` is 0. Obtain them from `ef_detect_box_list_data`.
  */
 ef_track_info_list *ef_bytetrack_update(ef_bytetrack *t,
                                         const ef_detect_box *detections,
@@ -144,9 +138,6 @@ uintptr_t ef_track_info_list_len(const ef_track_info_list *l);
 /**
  * Copy track `index` into `out`.
  *
- * Copies rather than lending a pointer: a borrowed element dangles the moment
- * the list is freed, and C gives the caller no way to notice.
- *
  * @return 0 on success, `EINVAL` for a null argument or out-of-range index.
  *
  * # Safety
@@ -165,9 +156,7 @@ void ef_track_info_list_free(ef_track_info_list *l);
 /**
  * Format a track's UUID into `out` as 36 characters plus a NUL.
  *
- * `out` must have room for 37 bytes. Writing into a caller's buffer rather
- * than returning an allocation keeps ownership with the caller and needs no
- * matching free.
+ * `out` must have room for 37 bytes.
  *
  * @return 0 on success, `EINVAL` on a null argument.
  *

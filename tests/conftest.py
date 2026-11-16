@@ -1,9 +1,7 @@
 # SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 # SPDX-License-Identifier: Apache-2.0
 
-"""Shared pytest hooks. GPU marker registration so ``-m gpu`` is valid
-even when a leaf test file is collected in isolation.
-"""
+"""Shared pytest hooks: registers the ``gpu`` marker."""
 
 
 def pytest_configure(config):

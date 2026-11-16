@@ -3,10 +3,7 @@
 
 """The Python option enums use the C header's numbering.
 
-Each image and decoder option vocabulary is declared once in Rust. The C
-enumerators and the Python enum values are both pinned to that declaration
-at compile time; this test closes the loop by comparing the two shipped
-surfaces directly, for every member.
+Compares the shipped Python enum values with the C enumerators, for every member.
 """
 
 from __future__ import annotations
@@ -24,11 +21,8 @@ DECODER_H = ROOT / "crates/decoder-capi/include/edgefirst/decoder.h"
 DETECT_H = ROOT / "crates/decoder-abi/include/edgefirst/detect.h"
 HEADERS = (IMAGE_H, DECODER_H, DETECT_H)
 
-# The codes of vocabularies new in this release, as their `ef_vocabulary!`
-# declarations document them (suffixes are the declared wire constants). A
-# checkout whose headers do not declare one yet is checked against this
-# table; once a header does, the two must agree
-# (`test_documented_codes_match_the_c_headers`).
+# Documented codes per vocabulary, keyed by the declared wire constant's
+# suffix. A vocabulary no header declares is checked against this table.
 DOCUMENTED = {
     "EF_INTERPOLATION": {"BILINEAR": 0, "NEAREST": 1, "BICUBIC": 2, "AREA": 3},
     "EF_PAD_SPACE": {"PIXEL": 0, "NORMALIZED": 1},
@@ -94,7 +88,7 @@ def _squash(name: str) -> str:
 
 
 # (Python enum, C prefix, Python member -> C suffix overrides,
-#  C suffixes Python deliberately does not expose)
+#  C suffixes Python does not expose)
 CASES = [
     (img.Rotation, "EF_ROTATION", {"Rotate0": "NONE"}, set()),
     (img.Flip, "EF_FLIP", {"NoFlip": "NONE"}, set()),
@@ -133,8 +127,7 @@ def _members(enum) -> dict[str, object]:
 )
 def test_python_values_match_the_c_header(enum, prefix, overrides, c_only):
     c_codes = _enumerators(prefix)
-    # Word breaks in a C suffix are a spelling choice (EDGEFIRST vs
-    # EDGE_FIRST); the code each name carries is the contract.
+    # Match names with word breaks removed (EDGEFIRST vs EDGE_FIRST).
     by_squashed = {_squash(k): k for k in c_codes}
     members = _members(enum)
     assert members, f"{enum.__name__} has no members"

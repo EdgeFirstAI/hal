@@ -4,8 +4,8 @@
 //! Model configuration discovery: a model's schema, labels and input
 //! preprocessing from what it carries, with the source of each value.
 //!
-//! The preprocessing crosses to libedgefirst_image as an `ef_preprocess_spec`
-//! (declared in `edgefirst/detect.h`), so neither library links the other.
+//! The preprocessing is exported as an `ef_preprocess_spec` (declared in
+//! `edgefirst/detect.h`).
 
 use std::ffi::{c_char, c_int, CStr, CString};
 use std::panic::{catch_unwind, AssertUnwindSafe};

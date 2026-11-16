@@ -4,15 +4,12 @@
 //! Kalman filtering for tracklet motion.
 //!
 //! Each tracklet owns one [`ConstantVelocityXYAHModel2`], a constant-velocity
-//! filter over the state `[x, y, a, h, ẋ, ẏ, ȧ, ḣ]` — box centre, aspect
-//! ratio, height, and their velocities. Tracking in XYAH rather than XYXY
-//! means an object's aspect ratio is modelled as one slowly-varying quantity
-//! instead of being smeared across four correlated corner coordinates.
+//! filter over the state `[x, y, a, h, ẋ, ẏ, ȧ, ḣ]`: box centre, aspect
+//! ratio, height, and their velocities.
 //!
 //! The filter supplies the predicted box that
 //! [`crate::bytetrack::ByteTrack`] matches detections against, and the
-//! smoothed box reported as [`crate::TrackInfo::tracked_location`]. Nothing
-//! here is public API beyond the model type itself; the tracker drives it.
+//! smoothed box reported as [`crate::TrackInfo::tracked_location`].
 
 use nalgebra::{
     allocator::Allocator, convert, dimension::U4, DVector, DefaultAllocator, Dyn, OMatrix,
@@ -33,12 +30,7 @@ use nalgebra::{
 ///
 /// Measurements arriving via [`update`](Self::update) are in 4-dimensional
 /// XYAH space (no velocity), projected from the 8-D state by the observation
-/// matrix `H`.  The filter uses a scale-adaptive process-noise covariance:
-/// noise magnitude scales proportionally with the box height `h`, so
-/// fast-moving large objects tolerate wider uncertainty than small static ones.
-///
-/// This is the same Kalman filter parameterisation used in the original
-/// ByteTrack paper (Zhang et al., 2022).
+/// matrix `H`. The process-noise covariance scales with the box height `h`.
 #[derive(Debug, Clone)]
 pub struct ConstantVelocityXYAHModel2<R>
 where
@@ -76,17 +68,11 @@ where
 }
 
 /// Distance metric used by [`ConstantVelocityXYAHModel2::gating_distance`].
-///
-/// `Mahalanobis` accounts for the current state uncertainty and is the
-/// theoretically correct gating criterion; `Gaussian` (squared Euclidean) is
-/// faster but scale-dependent.  In the current ByteTrack integration only the
-/// IoU-based cost matrix is used for assignment; this enum is available for
-/// future association strategies that want a filter-based gate.
 #[allow(dead_code)]
 pub enum GatingDistanceMetric {
     /// Squared Euclidean distance (no covariance weighting).
     Gaussian,
-    /// Mahalanobis distance — normalised by the projected state covariance.
+    /// Mahalanobis distance, normalised by the projected state covariance.
     Mahalanobis,
 }
 
@@ -96,9 +82,9 @@ where
 {
     /// Initialise the filter from the first observation.
     ///
-    /// `measurement` is `[x, y, a, h]` in XYAH space.  Velocity components are
-    /// initialised to zero.  The initial covariance is set proportionally to
-    /// the box height so larger boxes start with wider uncertainty.
+    /// `measurement` is `[x, y, a, h]` in XYAH space. Velocity components are
+    /// initialised to zero. The initial covariance is proportional to the box
+    /// height.
     ///
     /// `update_factor` is stored and applied as a measurement gain in
     /// [`update`](Self::update).
@@ -158,9 +144,8 @@ where
     /// Advance the filter by one time step with no measurement.
     ///
     /// Applies the constant-velocity motion model (`mean' = F * mean`,
-    /// `cov' = F * cov * Fᵀ + Q`) using a scale-adaptive process-noise
-    /// covariance `Q` proportional to the current box height.  Called once
-    /// per frame for every active tracklet before the assignment step.
+    /// `cov' = F * cov * Fᵀ + Q`) with a process-noise covariance `Q`
+    /// proportional to the current box height.
     pub fn predict(&mut self) {
         let height = self.mean[3];
         let diag = [
@@ -185,10 +170,8 @@ where
 
     /// Project the 8-D state into 4-D measurement space.
     ///
-    /// Returns `(projected_mean, projected_covariance)` — the expected
+    /// Returns `(projected_mean, projected_covariance)`: the expected
     /// measurement and its uncertainty under the current state estimate.
-    /// Used by [`update`](Self::update) and by
-    /// [`gating_distance`](Self::gating_distance).
     pub fn project(&self) -> (OMatrix<R, U4, U1>, OMatrix<R, U4, U4>) {
         let height = self.mean[3];
         let diag = [
@@ -207,16 +190,13 @@ where
 
     /// Correct the state estimate with a new measurement.
     ///
-    /// `measurement` is `[x, y, a, h]` in XYAH space, as produced by
-    /// [`xyxy_to_xyah`](super::bytetrack) in the ByteTrack update loop.
+    /// `measurement` is `[x, y, a, h]` in XYAH space.
     ///
     /// The Kalman gain is computed via Cholesky decomposition of the projected
-    /// covariance.  If the decomposition fails (degenerate covariance) the
-    /// update is silently skipped and the prior state is preserved.
+    /// covariance. If the decomposition fails the update is skipped and the
+    /// prior state is preserved.
     ///
-    /// The innovation is scaled by `self.update_factor` before being applied,
-    /// which effectively attenuates the correction — lower values produce
-    /// smoother trajectories at the cost of slower response to abrupt motion.
+    /// The innovation is scaled by `self.update_factor` before being applied.
     pub fn update(&mut self, measurement: &[R; 4]) {
         let measurement = SVector::<R, 4>::from_row_slice(&[
             measurement[0],
@@ -235,14 +215,9 @@ where
             .transpose();
 
         let innovation = (measurement - projected_mean).scale(self.update_factor);
-        // println!("kalman_gain={}", kalman_gain);
-        // println!("innovation={}", innovation);
         let diff = innovation.transpose() * kalman_gain.transpose();
         self.mean += diff.transpose();
         self.covariance -= kalman_gain * projected_cov * kalman_gain.transpose();
-        // let new_mean = self.mean + diff.transpose();
-        // let new_cov = self.covariance - kalman_gain * projected_cov *
-        // kalman_gain.transpose();
     }
 
     /// Compute per-measurement gating distances from the current state.
@@ -254,9 +229,6 @@ where
     ///
     /// `only_position` restricts the comparison to the first two components
     /// (`x`, `y`), ignoring aspect and height.
-    ///
-    /// Not used by the current ByteTrack integration (which gates via IoU);
-    /// exposed for future association strategies.
     #[allow(dead_code)]
     pub fn gating_distance(
         &self,
@@ -270,10 +242,6 @@ where
         let mean = mean.columns_range(0..ndims);
         let covariance = cov.view_range(0..ndims, 0..ndims);
         let measurements = measurements.columns_range(0..ndims);
-        // let _ = only_position;
-        // let mean = m.transpose();
-        // let covariance = cov;
-        // let measurements = measurements;
 
         let mut mean_broadcast =
             OMatrix::<R, Dyn, U4>::from_element(measurements.shape().0, convert(0.0));
@@ -344,7 +312,6 @@ mod tests {
         t.update(&[0.42, 0.5, 1.0, 0.5]);
         t.predict();
 
-        // distances range from 0 to 1e6 for maha
         let mut measurements = OMatrix::<f32, Dyn, U4>::from_element(1, 0.0);
         measurements.copy_from_slice(&[0.3, 0.5, 1.0, 0.5]);
 
@@ -362,17 +329,13 @@ mod tests {
 
     #[test]
     fn test_predict_constant_velocity() {
-        // Initialize filter and give it a few updates to establish velocity,
-        // then verify predictions drift in the expected direction.
         let mut t = ConstantVelocityXYAHModel2::new(&[0.5, 0.5, 0.1, 2.0], 0.25);
         t.predict();
         t.update(&[0.5, 0.5, 0.1, 2.0]);
 
-        // Record position after first predict-update cycle
         let x_before: f32 = t.mean[0];
         let y_before: f32 = t.mean[1];
 
-        // Run several predict-only cycles to let velocity dominate
         for _ in 0..5 {
             t.predict();
         }
@@ -381,7 +344,6 @@ mod tests {
         let y_after: f32 = t.mean[1];
         let h_after: f32 = t.mean[3];
 
-        // The position should remain numerically reasonable (no NaN/Inf)
         assert!(x_after.is_finite(), "x should be finite after predictions");
         assert!(y_after.is_finite(), "y should be finite after predictions");
         assert!(
@@ -389,7 +351,6 @@ mod tests {
             "height should be finite after predictions"
         );
 
-        // With near-zero velocity the predicted position should not explode
         assert!(
             (x_after - x_before).abs() < 5.0,
             "x drift should be bounded, got delta={}",
@@ -406,12 +367,10 @@ mod tests {
     fn test_numerical_stability_1000_cycles() {
         let mut t = ConstantVelocityXYAHModel2::new(&[0.5, 0.5, 1.0, 0.5], 0.25);
 
-        // Run 1000 predict-only cycles without any update
         for _ in 0..1000 {
             t.predict();
         }
 
-        // Verify no NaN or Inf in the mean vector
         for i in 0..8 {
             let val: f32 = t.mean[i];
             assert!(
@@ -420,7 +379,6 @@ mod tests {
             );
         }
 
-        // Verify no NaN or Inf in the covariance matrix
         for r in 0..8 {
             for c in 0..8 {
                 let val: f32 = t.covariance[(r, c)];
@@ -435,14 +393,13 @@ mod tests {
     #[test]
     fn test_gating_distance_edge_cases() {
         let mut t = ConstantVelocityXYAHModel2::new(&[0.5, 0.5, 1.0, 0.5], 0.25);
-        // Run a few predict-update cycles to stabilize
         for _ in 0..3 {
             t.predict();
             t.update(&[0.5, 0.5, 1.0, 0.5]);
         }
         t.predict();
 
-        // Measurement exactly at the predicted state -- distance should be near 0
+        // Measurement at the predicted state.
         let (projected_mean, _) = t.project();
         let mut meas_close = OMatrix::<f32, Dyn, U4>::from_element(1, 0.0);
         meas_close
@@ -460,7 +417,7 @@ mod tests {
             dist_close[0]
         );
 
-        // Measurement far away -- distance should be large
+        // Measurement far away.
         let mut meas_far = OMatrix::<f32, Dyn, U4>::from_element(1, 0.0);
         meas_far.copy_from_slice(&[10.0, 10.0, 5.0, 10.0]);
 
@@ -501,7 +458,6 @@ mod tests {
     fn test_covariance_positive_diagonal() {
         let t = ConstantVelocityXYAHModel2::new(&[0.5, 0.5, 1.0, 0.5], 0.25);
 
-        // All diagonal elements of the covariance should be positive
         for i in 0..8 {
             let val: f32 = t.covariance[(i, i)];
             assert!(
@@ -558,7 +514,6 @@ mod tests {
         assert!(dist_gauss[0].is_finite());
         assert!(dist_maha[0].is_finite());
 
-        // Both should be non-negative for a non-zero offset
         assert!(
             dist_gauss[0] > 0.0,
             "Gaussian distance should be > 0 for offset measurement"
@@ -602,7 +557,6 @@ mod tests {
         let measurement = [0.3, 0.7, 1.5, 2.0];
         let t = ConstantVelocityXYAHModel2::new(&measurement, 0.25);
 
-        // Position portion of mean should match the measurement exactly
         let x: f32 = t.mean[0];
         let y: f32 = t.mean[1];
         let a: f32 = t.mean[2];
@@ -612,7 +566,6 @@ mod tests {
         assert!((a - 1.5).abs() < 1e-6, "Mean a should be 1.5, got {a}");
         assert!((h - 2.0).abs() < 1e-6, "Mean h should be 2.0, got {h}");
 
-        // Velocity portion should be zero
         for i in 4..8 {
             let v: f32 = t.mean[i];
             assert!((v).abs() < 1e-6, "Velocity mean[{i}] should be 0, got {v}");

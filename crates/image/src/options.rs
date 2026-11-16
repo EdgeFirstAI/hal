@@ -190,7 +190,7 @@ impl ConvertOptions {
         self.normalization = spec.normalization;
         self.interpolation = Some(spec.interpolation);
         self.pad_output = None;
-        // Comparisons, not a match: an unknown fit stretches and an unknown pad space is pixel.
+        // An unknown fit stretches and an unknown pad space is pixel.
         self.crop.fit = if spec.fit != FitMode::Letterbox {
             crate::Fit::Stretch
         } else if spec.pad_space == PadSpace::Normalized {
@@ -220,8 +220,7 @@ impl ConvertOptions {
     /// Where `convert` puts the image content when converting an
     /// `src_w`×`src_h` source into a `dst_w`×`dst_h` destination with these
     /// options: the letterbox rectangle, or the whole destination for a
-    /// stretch. It is computed by the same code the convert paints with, so
-    /// mapping results back through it is exact.
+    /// stretch.
     ///
     /// # Errors
     ///
@@ -305,8 +304,7 @@ pub(crate) fn output_map_for(
 ///   zero_point[c], lo[c], hi[c])`, stored as its low byte.
 ///
 /// Colour channels carry the normalization (and quantization). Alpha maps to
-/// `x / 255` for float destinations and stays the raw byte for integer ones,
-/// as a plain convert always has.
+/// `x / 255` for float destinations and stays the raw byte for integer ones.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct OutputMap {
     /// Per destination channel, in the destination's channel order.
@@ -318,7 +316,7 @@ pub(crate) struct OutputMap {
     /// Integer destinations: the quantization scale per channel, which an
     /// output-domain pad is divided by.
     pub(crate) quant_scale: [f32; 4],
-    /// The mapping a plain convert has always applied for this dtype.
+    /// Whether this is the mapping a plain convert applies for this dtype.
     pub(crate) is_default: bool,
 }
 
@@ -580,8 +578,7 @@ mod tests {
             let x = m.sample_for(c, want).expect("0.0 is reachable");
             assert_eq!(m.apply(c, x), want);
         }
-        // A coarse quantization skips values: 10.0 / 0.5 is not reachable at
-        // scale 1/255 per step 0.5.
+        // A coarse quantization skips values.
         let q = Quantization::per_tensor(1.0 / 512.0, 0);
         let m = OutputMap::resolve(
             &Normalization::unsigned(),

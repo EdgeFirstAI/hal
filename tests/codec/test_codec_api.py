@@ -3,8 +3,8 @@
 
 """edgefirst.codec: engines, capabilities, JPEG encoding and video.
 
-Video tests run where this machine has a hardware codec and skip with the
-reason elsewhere; there is no software video codec to fall back to.
+Video tests run where this machine has a hardware codec and skip with the reason
+elsewhere.
 """
 
 import gc

@@ -38,10 +38,7 @@ Each sub-crate has a single responsibility in the inference pipeline:
 - [`edgefirst-tensor-capi`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor-capi/) — C ABI for tensors (`libedgefirst_tensor`, `edgefirst/tensor.h`). Sibling leaves cover codec, image, decoder, tracker and kernels. Detection layouts are header-only in `edgefirst/detect.h`.
 - [`crates/python-common`](https://github.com/EdgeFirstAI/hal/blob/main/crates/python-common/) — the shared PyO3 binding rlib, plus four thin `cdylib` crates (`python-tensor`, `python-codec`, `python-image`, `python-decoder`) published as the independent `edgefirst-tensor` / `edgefirst-codec` / `edgefirst-image` / `edgefirst-decoder` wheels under the `edgefirst.` PEP 420 namespace. Contains the three-path numpy copy dispatcher.
 
-There is no umbrella crate. `edgefirst-hal` was deleted in 0.29 — every
-crate is a real, independently-consumable library, and the optional Chrome
-JSON tracing subscriber moved into `edgefirst-tensor` behind its `tracing`
-feature.
+There is no umbrella crate: every crate is an independently-consumable library, and the optional Chrome JSON tracing subscriber lives in `edgefirst-tensor` behind its `tracing` feature.
 
 The internal dependency graph and external dependency list live in
 [README.md § Dependencies](https://github.com/EdgeFirstAI/hal/blob/main/README.md#dependencies).
@@ -95,39 +92,11 @@ That is why `Tensor.from_fd` and `Tensor.fd` read `Linux, macOS.` while
 on all four, and wheels are published for three of them, one of which has
 no file descriptors.
 
-**Windows (x86_64)** runs the same GL engine on ANGLE's Direct3D 11 backend
-(`crates/image/src/gl/platform/windows.rs`), and its zero-copy kind is a
-D3D11 texture. The tensor crate owns the device: it enumerates DXGI,
-creates one `ID3D11Device` for the process (`crates/tensor/src/d3d11/`,
-design record § 4.1 -- an internal document, cited here and below for the
-reasoning behind a decision rather than as something to open) and hands it
-to ANGLE, which builds its display on
-that device through `eglCreateDeviceANGLE` rather than creating a second
-one. ANGLE imports a texture only from its own device, so the two must be
-the same device; a host that already has one installs it with
-`d3d11::use_external_device` before anything creates the HAL's. Copies of
-the tensor crate linked into one process rendezvous on that device and its
-fence, so two independently linked packages share one device.
+**Windows (x86_64)** runs the same GL engine on ANGLE's Direct3D 11 backend (`crates/image/src/gl/platform/windows.rs`), and its zero-copy kind is a D3D11 texture. The tensor crate owns the device: it enumerates DXGI, creates one `ID3D11Device` for the process (`crates/tensor/src/d3d11/`) and hands it to ANGLE, which builds its display on that device through `eglCreateDeviceANGLE` rather than creating a second one. ANGLE imports a texture only from its own device, so the two must be the same device; a host that already has one installs it with `d3d11::use_external_device` before anything creates the HAL's. Copies of the tensor crate linked into one process rendezvous on that device and its fence, so two independently linked packages share one device.
 
-`TensorMemory::DmaBuf` on Windows is therefore an `ID3D11Texture2D`
-(design record § 4.3): `ImageProcessor::create_image` allocates one,
-the GL engine imports it as an EGLImage through
-`EGL_ANGLE_image_d3d11_texture` (design record § 5), and `map()` reaches
-the pixels through a staging texture whose pitch becomes the tensor's row
-stride. Every convert records a fence value on the destination
-(design record § 5.3, § 6), which a D3D12, CUDA or Media Foundation
-consumer waits on instead of a blocking GPU sync. CUDA reads the same
-texture as external memory (design record § 4.5). Textures cross process
-boundaries as shared NT handles and cross package boundaries through the
-`D3D11_TEXTURE` protocol kind (design record § 7.4).
+`TensorMemory::DmaBuf` on Windows is therefore an `ID3D11Texture2D`: `ImageProcessor::create_image` allocates one, the GL engine imports it as an EGLImage through `EGL_ANGLE_image_d3d11_texture`, and `map()` reaches the pixels through a staging texture whose pitch becomes the tensor's row stride. Every convert records a fence value on the destination, which a D3D12, CUDA or Media Foundation consumer waits on instead of a blocking GPU sync. CUDA reads the same texture as external memory. Textures cross process boundaries as shared NT handles and cross package boundaries through the `D3D11_TEXTURE` protocol kind.
 
-The adapter is chosen with `EDGEFIRST_D3D11_ADAPTER`, or with the older
-`EDGEFIRST_ANGLE_ADAPTER` (both names are read, hardware / WARP / LUID /
-name match); when both are set and differ the D3D11 name wins and the
-disagreement is logged once. WARP is classified as a software renderer. Note the ordering
-consequence of the device being a process singleton: `is_gpu_buffer_available()`
-creates it, because the only honest answer to "can this host allocate one"
-is to try.
+The adapter is chosen with `EDGEFIRST_D3D11_ADAPTER`, or with its alias `EDGEFIRST_ANGLE_ADAPTER` (both names are read, hardware / WARP / LUID / name match); when both are set and differ the D3D11 name wins and the disagreement is logged once. WARP is classified as a software renderer. The device is a process singleton, and `is_gpu_buffer_available()` creates it, because the only way to answer "can this host allocate one" is to try.
 
 **iOS (16+)** shares the macOS column's architecture — ANGLE (EGL→Metal)
 via the prebuilt xcframeworks and IOSurface-backed `TensorMemory::DmaBuf`
@@ -255,16 +224,7 @@ at call time because the mismatched pair never links. Note that the SONAME
 deliberately does *not* separate a 1.2 library from a 1.3 one — post-1.0 that
 pair is compatible, so there is nothing to reject.
 
-Pre-1.0 there is no such enforcement, and this document states that plainly
-rather than implying a guarantee the code does not provide. Every library's
-SONAME is `libedgefirst_X.so.0`, so the loader binds any 0.x to any other
-0.x — including the 0.N/0.N+1 pair the pre-1.0 rule above calls incompatible
-— and the `ef_*_abi_version()` probes below are consulted by nothing.
-**Across a pre-1.0 minor the rule is therefore an obligation on whoever
-deploys, not a runtime promise the libraries make**: ship and deploy the five
-libraries as one set from one release, and pin the minor. That is what
-"pin the archive version you built against" in `packaging/c/README.md` is
-asking for, and it is the whole of the mitigation until the probes are wired.
+Pre-1.0 there is no such enforcement. Every library's SONAME is `libedgefirst_X.so.0`, so the loader binds any 0.x to any other 0.x — including the 0.N/0.N+1 pair the pre-1.0 rule above calls incompatible — and the `ef_*_abi_version()` probes below are consulted by nothing. **Across a pre-1.0 minor the rule is therefore an obligation on whoever deploys, not a runtime promise the libraries make**: ship and deploy the five libraries as one set from one release, and pin the minor. That is what "pin the archive version you built against" in `packaging/c/README.md` is asking for, and it is the whole of the mitigation until the probes are wired.
 
 **Why the SONAME carries the major only.** Each `build.rs` emits
 `-Wl,-soname,libedgefirst_X.so.{major}`, matching the glibc/OpenSSL/zlib
@@ -273,11 +233,11 @@ so embedding a minor or patch would force a downstream relink on every
 release. That is why the loader can only ever police the major boundary —
 which is the right boundary post-1.0 and the wrong one before it, as above.
 
-**The `ef_*_abi_version()` probes are how that gap is meant to be closed.** Every C library exports one (`ef_tensor_abi_version`, `ef_image_abi_version`, `ef_codec_abi_version`, `ef_decoder_abi_version`, `ef_tracker_abi_version`). It returns a monotonic ABI generation for that library, hand-maintained and independent of the package version, and it **must be bumped whenever that library's C interface changes in a way that is not backward compatible**: a layout change, a removed or re-signatured symbol, or a change to what an existing argument, value or return means (an enum value reassigned, a return code reinterpreted, a field whose units change). The meaning case is the one most easily missed and the one that most needs the signal: if a call keeps its name, its signature and its struct layouts but reads its inputs differently, the consumer gets no link error, no size mismatch and no loader diagnostic. The probe is the only thing left that can tell them. `ef_decoder_abi_version` 3 and `ef_image_abi_version` 2 are this case: the decoder's model I/O `dtype` argument changed from `0x100`-based codes to `EF_DTYPE_*`, and the image library refuses `color_mode` and `fit` codes it used to accept, with every signature and layout unchanged.
+**The `ef_*_abi_version()` probes are how that gap is meant to be closed.** Every C library exports one (`ef_tensor_abi_version`, `ef_image_abi_version`, `ef_codec_abi_version`, `ef_decoder_abi_version`, `ef_tracker_abi_version`). It returns a monotonic ABI generation for that library, hand-maintained and independent of the package version, and it **must be bumped whenever that library's C interface changes in a way that is not backward compatible**: a layout change, a removed or re-signatured symbol, or a change to what an existing argument, value or return means (an enum value reassigned, a return code reinterpreted, a field whose units change). The meaning case is the one most easily missed and the one that most needs the signal: if a call keeps its name, its signature and its struct layouts but reads its inputs differently, the consumer gets no link error, no size mismatch and no loader diagnostic. The probe is the only thing left that can tell them.
 
 **A changed default is not a probe bump.** Defaults (thresholds, caps, what an automatic mode resolves to, which merge a default config selects) are library behaviour, not interface: every value a caller passes still means what it did, and a caller that depends on a particular value sets it explicitly through the same call. A default change is recorded in the CHANGELOG under Changed and follows the version table above, which pre-1.0 means a minor.
 
-**A bug fix is not a probe bump either**, even though a caller can observe it. Bringing behaviour into line with the documented contract is what a patch release is for, and it stays inside the patch row of the table above. That includes a C default that disagreed with the library default it is documented to take, such as `ef_decoder_params_new` defaulting `max_det` to 100 while the library default was 300. Advancing the generation for either would be actively harmful: a consumer doing an exact-equality probe check would start rejecting releases it should accept, which is the opposite of what the probe is for.
+**A bug fix is not a probe bump either**, even though a caller can observe it. Bringing behaviour into line with the documented contract is what a patch release is for, and it stays inside the patch row of the table above. That includes a C default that disagrees with the library default it is documented to take. Advancing the generation for either would be actively harmful: a consumer doing an exact-equality probe check would start rejecting releases it should accept, which is the opposite of what the probe is for.
 
 > **Not yet enforced.** Nothing in this tree compares a probe to anything.
 > All five are defined, declared in their headers, and called only by the
@@ -339,14 +299,7 @@ This yields the rule:
   the entry points that take that struct. Weigh that against a major bump
   rather than reaching for it reflexively.
 
-**Why there is no `struct_size` handshake.** A first-member
-`uint32_t struct_size` that the caller sets — Linux's `copy_struct_from_user`
-convention (`clone_args`, `sched_attr`), Win32's `cbSize` — is the one
-mechanism that would let a struct grow *in place* within a minor post-1.0.
-It was considered for this codebase and **declined**, because it only works
-as a convention and this vocabulary cannot adopt it as one. Of the fourteen
-by-value structs across the five libraries, only three are caller-filled
-configuration where the handshake means anything:
+**Why there is no `struct_size` handshake.** A first-member `uint32_t struct_size` that the caller sets — Linux's `copy_struct_from_user` convention (`clone_args`, `sched_attr`), Win32's `cbSize` — is the one mechanism that would let a struct grow *in place* within a minor post-1.0. This codebase does not use it, because it only works as a convention and this vocabulary cannot adopt it as one. Of the fourteen by-value structs across the five libraries, only three are caller-filled configuration where the handshake means anything:
 
 | Class | Structs | Verdict |
 |---|---|---|
@@ -354,15 +307,7 @@ configuration where the handshake means anything:
 | Library-filled `*out` | `ef_tensor_view`, `ef_tensor_plane`, `ef_image_desc_view`, `EfViewOrigin`, `ef_quantization_info`, `ef_tile_spec`, `ef_decoder_track`, `ef_track_info` | inverts the contract — the caller would be declaring its buffer size, paid per call on hot accessors |
 | Arrayed elements | `ef_detect_box`, `ef_segmentation`, `ef_tile_placement` | actively harmful |
 
-The third class settles it. These travel as contiguous blocks —
-`ef_detect_box_list_data()` hands back a packed array a consumer can `memcpy`
-or wrap zero-copy — so a per-element size field would add four identical
-redundant bytes per element (about 1.2 KB on a 300-box frame) and break that
-contract outright. A convention that cannot cover the vocabulary is not a
-convention, and applying it to `ef_merge_config` alone would leave
-`ef_tiling_config` — same shape, same hazard, same library family — without
-it. That asymmetry is the kind that produced a successor struct in the first
-place.
+The third class decides it. These travel as contiguous blocks — `ef_detect_box_list_data()` hands back a packed array a consumer can `memcpy` or wrap zero-copy — so a per-element size field would add four identical redundant bytes per element (about 1.2 KB on a 300-box frame) and break that contract. A convention that cannot cover the vocabulary is not a convention, and applying it to `ef_merge_config` alone would leave `ef_tiling_config` — same shape, same hazard, same library family — without it.
 
 Convert options, which grow with the image pipeline, are an opaque handle
 (`ef_convert_options`) with one setter per option, so they gain options by
@@ -417,24 +362,11 @@ layout move stops being a permitted minor-bump event and becomes a major one.
 — the exported `ef_*` symbol set, the `DECLARED` list in `tensor-ffi`, and
 the header declarations must agree exactly.
 
-**Worked example.** `ef_merge_config` shipped without a `mode` field in every
-0.29 release. 0.29.0 through 0.29.4 each held its layout and its
-`ef_decoder_abi_version` unchanged, exactly as the patch guarantee requires,
-so the compatibility boundary is 0.29.4 → 0.30.0 and not any boundary inside
-the 0.29 series. The field then went into the 4-byte tail pad the struct
-already had: `sizeof` stayed 32 and no earlier offset moved, so the change is
-size-safe — a caller built against any 0.29 header still allocates exactly the
-right number of bytes. It is *not* value-safe: that caller never wrote the
-pad, so a 0.30 library reading `mode` from it reads whatever was on the stack.
+**Worked example.** `ef_merge_config` holds its `mode` field in the 4-byte tail pad of the struct: `sizeof` is 32 with or without the field and no earlier offset depends on it, so adding such a field is size-safe — a caller built against a header without it still allocates exactly the right number of bytes. It is *not* value-safe: that caller never writes the pad, so a library reading `mode` from it reads whatever was on the stack.
 
-Both facts together are why the change takes a **minor** bump to 0.30.0. The patch guarantee would have forbidden it outright, which is why none of 0.29.2, 0.29.3 or 0.29.4 could have carried it; the minor is what licenses the break and what tells a consumer not to mix. `ef_decoder_abi_version` went to `2` for the same reason, as the pre-1.0 in-place rule above requires: an older caller's `mode` is unwritten padding. The default tiled merge changed from the enclosing union to keep-best suppression in the same release; that change alone is a changed default, recorded in the CHANGELOG, and would not have moved the probe.
+Both facts together are why such a change takes a **minor** bump pre-1.0. The patch guarantee forbids it; the minor is what licenses the break and what tells a consumer not to mix. `ef_decoder_abi_version` moves for the same reason, as the pre-1.0 in-place rule above requires: an older caller's `mode` is unwritten padding. A changed default in the same release (which merge a default config selects) is recorded in the CHANGELOG and does not move the probe on its own.
 
-Note what the mismatch does *not* do: `mode_from()` rejects any value that is
-not `0` or `1`, so a garbage pad usually yields a refused call. "Usually" is
-the problem — fresh stack and `calloc` memory reads as `0`, which is a
-*valid* mode, so the same mismatch silently selects keep-best on one run and
-refuses on another. That is the mixed-version gap above in miniature, and the
-reason the probe check has to be real rather than emergent.
+`mode_from()` rejects any value that is not `0` or `1`, so a garbage pad usually yields a refused call. Fresh stack and `calloc` memory reads as `0`, which is a *valid* mode, so the same mismatch silently selects keep-best on one run and refuses on another. That is the mixed-version gap above, and the reason the probe check has to be real rather than emergent.
 
 ---
 
@@ -468,8 +400,8 @@ rustdoc does not read target tables, so doctests and `cargo doc` always describe
 | `libedgefirst_{image,codec,decoder}` | `{image,codec,decoder}-capi` | dynamic, links `libedgefirst_tensor` | refuses static (`compile_error!`) |
 | `libedgefirst_tracker` | `tracker-capi` | none (no tensor) | — |
 | `libedgefirst_kernels` | `kernels-capi` | none (no tensor) | — |
-| `edgefirst.tensor` wheel | `python-tensor` | dynamic, bundles `libedgefirst_tensor` | refuses static outside the G13 comparison |
-| `edgefirst.{codec,image,decoder}` wheels | `python-{codec,image,decoder}` | dynamic, rpath `../tensor` | refuses static outside the G13 comparison |
+| `edgefirst.tensor` wheel | `python-tensor` | dynamic, bundles `libedgefirst_tensor` | refuses static outside the comparison build |
+| `edgefirst.{codec,image,decoder}` wheels | `python-{codec,image,decoder}` | dynamic, rpath `../tensor` | refuses static outside the comparison build |
 | `edgefirst.tracker` wheel | `python-tracker` | none (no tensor) | — |
 | `edgefirst.kernels` wheel | `python-kernels` | none (no tensor) | — |
 | Rust crates | `edgefirst-*` | static | — |
@@ -552,14 +484,7 @@ a per-map round-trip.
 
 ### D3D11 texture import path (Windows)
 
-A `TensorMemory::DmaBuf` tensor on Windows is an `ID3D11Texture2D`, and CUDA
-reads it as external memory: the texture's shared NT handle is imported with
-`cudaImportExternalMemory(D3D11Resource)` and the process device's fence as an
-external semaphore, so the mapping is ordered after whatever GPU write the
-producer recorded (design record § 4.5). Like the DMA-BUF path this needs no
-GL thread; unlike it, a texture is not linear, so each `cuda_map()` copies the
-texture into a linear device buffer on the CUDA side. The copy is per map, not
-per tensor.
+A `TensorMemory::DmaBuf` tensor on Windows is an `ID3D11Texture2D`, and CUDA reads it as external memory: the texture's shared NT handle is imported with `cudaImportExternalMemory(D3D11Resource)` and the process device's fence as an external semaphore, so the mapping is ordered after whatever GPU write the producer recorded. Like the DMA-BUF path this needs no GL thread; unlike it, a texture is not linear, so each `cuda_map()` copies the texture into a linear device buffer on the CUDA side. The copy is per map, not per tensor.
 
 The mapping's layout is tight rows of `width * bytes_per_texel`, and the length
 `CudaMap::len()` reports is their sum. `row_stride()` is the D3D11 staging pitch
@@ -645,7 +570,7 @@ jpeg/png ─► source ─► convert ─► (batch tile n) ─► invoke ─►
 is element *n*, contiguous in memory whichever layout is used (a row-band in the
 physical buffer). `convert_deferred` + `flush` render all N tiles into a single
 parent import via `glViewport`, syncing once after the last tile (a plain
-`convert` per tile still works and finishes eagerly). The first batch engine
+`convert` per tile still works and finishes eagerly). The batch engine
 covers the single-pass `Rgba`/`Bgra`/`Grey` u8/i8 DMA path; two-pass packed-RGB,
 planar, and the macOS GL backend fall back to an eager per-tile convert (correct,
 not yet one-import). The per-backend lowering (GL `glViewport`,
@@ -656,17 +581,16 @@ The `BufferIdentity`-sharing contract for regions lives in
 
 ### Three batch memory representations, reconciled
 
-Three conventions for addressing a batch coexist across HAL and its consumers, and nothing previously stated how they relate.
+Three conventions for addressing a batch coexist across HAL and its consumers.
 
 1. **Engine batch inputs — `dst.batch(n)`.** The convention above: `N` the leading dimension over a packed `[N, H, W, C]` or planar `[N, C, H, W]` tensor, addressed by batch index. For a packed destination, `Tensor::batch(n)` (`crates/tensor/src/lib.rs`) treats the underlying buffer as a tall `(W, N·H)` parent and composes a `view_origin` so the GL backend imports it once and renders tile `n` as a `glViewport` row-band at `y = n·H` — the mechanism the "Convert → tile" step above relies on. Planar/semi-planar tensors take the plain per-element subview instead, with no composed `view_origin`; batching a non-packed layout stays on the per-slot path.
 2. **Tile rendering — `dst.view(Region)`.** `ImageProcessor::tile_into`'s destination is expected to come from `alloc_tile_batch`, which builds the same tall `[tile_w, N·tile_h]` parent shape as (1) but through `create_image` — so DMA pitch alignment applies — rather than through a pre-shaped batched tensor. `render_tile` addresses tile `index` as a spatial region view, `dst.view(Region::new(0, index·tile_h, tile_w, tile_h))`, of that parent when the destination has room for the whole tile count; a single-slot `tile_one` destination without that capacity is converted into directly instead of viewed. So (1) and (2) share the same tall-packed-buffer physical layout — batch index and region view are two ways of reaching the same row-band — but (2) is reached through the general region-view API rather than `batch(n)`, and always goes through `create_image`'s pitch alignment.
-3. **Profiler device-batch mode — `plane_offset = e × input_frame_size`.** An external convention used by the EdgeFirst Studio profiler's device batch invoke path, documented in the profiler repository's `SAHI.md` §D2: the accelerator addresses element `e` of a batch by a fixed per-element frame-size offset rather than through either of the above. It is not part of this repository's tensor or tiling API and is out of scope for HAL's memory-layout guarantees — a caller building a batched invoke against it must not assume `dst.batch(n)` or `dst.view(Region)` semantics apply.
+3. **Profiler device-batch mode — `plane_offset = e × input_frame_size`.** An external convention used by the EdgeFirst Studio profiler's device batch invoke path: the accelerator addresses element `e` of a batch by a fixed per-element frame-size offset rather than through either of the above. It is not part of this repository's tensor or tiling API and is out of scope for HAL's memory-layout guarantees — a caller building a batched invoke against it must not assume `dst.batch(n)` or `dst.view(Region)` semantics apply.
 
-Two caveats from `SAHI.md`'s audit of the tall batch apply to (1) and (2), since they share physical layout, and are carried over verbatim:
+Two caveats apply to (1) and (2), since they share physical layout:
 
-> If `row_stride > tile_w · channels`, the buffer is **not** a dense `[N, tile_h, tile_w, C]` tensor and no engine can consume it directly. (§D1)
-
-> HAL's root `ARCHITECTURE.md` notes the one-import batch engine covers "the single-pass `Rgba`/`Bgra`/`Grey` u8/i8 DMA path", with two-pass packed-RGB, planar, and macOS falling back to eager per-tile converts. (§D5)
+- If `row_stride > tile_w · channels`, the buffer is **not** a dense `[N, tile_h, tile_w, C]` tensor and no engine can consume it directly.
+- The one-import batch engine covers the single-pass `Rgba`/`Bgra`/`Grey` u8/i8 DMA path; two-pass packed-RGB, planar, and macOS fall back to eager per-tile converts.
 
 ---
 
@@ -787,21 +711,9 @@ A `TensorDyn` under the `dynamic` backend is a lens over a handle inside
 that can be re-derived from the handle**; anything authoritative belongs in
 the library.
 
-The reason is mechanical, not stylistic. Fourteen sites construct a
-`TensorDyn` from a bare handle (`TensorDyn::from_handle`) — `view`, `batch`,
-`import`, every derived-handle path — and none of them can carry a field none
-of them knows about. A *cache* dropped there is harmless: the next call
-re-derives it. An *authoritative* field dropped there is silent data loss.
-That is exactly what made a PBO's `view()` return an all-zero window (#162):
-the real GL buffer lived in a field the C ABI could not see.
+The reason is mechanical. Fourteen sites construct a `TensorDyn` from a bare handle (`TensorDyn::from_handle`) — `view`, `batch`, `import`, every derived-handle path — and none of them can carry a field none of them knows about. A *cache* dropped there is harmless: the next call re-derives it. An *authoritative* field dropped there is silent data loss: a PBO whose GL buffer lived in a field the C ABI could not see would return an all-zero window from `view()`.
 
-So the bug class is made unrepresentable rather than guarded. A future
-backing whose answer the library can already compute needs only an accessor;
-one that needs client cooperation gets an `ef_client_state` channel and
-becomes real storage (or an attach) in the library. Neither shape leaves a
-second source of truth on the consumer's side. Stages C and D of 0.32.0
-moved CUDA registration (`ef_tensor_cuda_attach`) and multiplane chroma
-(`ef_tensor_is_multiplane` / `ef_tensor_chroma`) onto that library handle.
+A backing whose answer the library can already compute needs only an accessor; one that needs client cooperation gets an `ef_client_state` channel and becomes real storage (or an attach) in the library. Neither shape leaves a second source of truth on the consumer's side. CUDA registration (`ef_tensor_cuda_attach`) and multiplane chroma (`ef_tensor_is_multiplane` / `ef_tensor_chroma`) live on the library handle in the same way.
 
 ---
 
@@ -922,12 +834,7 @@ Each per-crate `ARCHITECTURE.md` documents the spans that crate emits.
   `tracing` as a **required** (non-optional) dependency. The span
   macros are always compiled. Cost when disabled: one `Relaxed` atomic
   load per span site.
-- **`edgefirst-tensor::trace`** gates `tracing-chrome` and
-  `tracing-subscriber` behind the `tracing` feature (default on). These
-  provide the capture infrastructure — the subscriber that actually
-  writes the Chrome JSON file. It lived in the `edgefirst-hal` umbrella
-  crate until 0.29; with that crate deleted, the subscriber moved down to
-  the one crate every other crate already depends on.
+- **`edgefirst-tensor::trace`** gates `tracing-chrome` and `tracing-subscriber` behind the `tracing` feature (default on). These provide the capture infrastructure — the subscriber that writes the Chrome JSON file. It lives in the one crate every other crate depends on.
 - **Binding crates** (Python, C API) forward the feature flag and
   provide language-appropriate start/stop APIs.
 
@@ -1236,7 +1143,7 @@ export → re-import unifies) interns identities on
 (API 31+, resolved via `dlsym` to keep the API-26 link floor). Every
 re-wrap of the same physical buffer resolves to the same
 `BufferIdentity`, and the EGLImage cache hits in steady state exactly as
-the pooled-tensor contract above. The pointer is deliberately NOT used
+the pooled-tensor contract above. The pointer is deliberately not used
 as a key on older APIs (a released buffer's address can be reallocated —
 the ABA aliasing class); API 26–30 keeps fresh-per-wrap identities,
 correct but uncached, visible in the miss counters. See

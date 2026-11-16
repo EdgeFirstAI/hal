@@ -1,9 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 //
-// The builder as a C caller actually uses it: chained, with a single check at
-// the end. That pattern only works because errors are sticky — this file is
-// the executable form of that claim.
+// The builder as a C caller uses it: chained, with a single check at the end.
 
 #include <stdio.h>
 
@@ -12,8 +10,7 @@
 int main(void) {
   int failures = 0;
 
-  // The happy path, written the way a C++ wrapper would chain it: no check
-  // per line, one check at the end.
+  // A valid chain, with one check at the end.
   {
     ef_tensor_builder *b = ef_tensor_builder_new();
     uint64_t dims[2] = {4, 4};
@@ -30,8 +27,7 @@ int main(void) {
     ef_tensor_builder_free(b);
   }
 
-  // The whole point: a fault in the middle of a chain is still reported at
-  // the end, and is still the FIRST fault rather than the last call's status.
+  // A fault in the middle of a chain is reported at the end.
   {
     ef_tensor_builder *b = ef_tensor_builder_new();
     uint64_t dims[2] = {4, 4};

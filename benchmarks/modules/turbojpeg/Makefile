@@ -6,7 +6,7 @@
 #   make                  host build            -> build/turbojpeg_bench
 #   make aarch64          cross build for boards -> build/turbojpeg_bench.aarch64
 #
-# libturbojpeg is dlopen'd at run time, so the cross build needs no sysroot.
+# libturbojpeg is dlopen'd at run time.
 
 CC      ?= cc
 CFLAGS  ?= -O2 -g -Wall -Wextra -std=c11
@@ -19,9 +19,8 @@ LDLIBS  := -ldl -lm
 endif
 BUILD   := build
 
-# Linux aarch64 boards. Prefer a GNU cross gcc when present; otherwise zig
-# (same toolchain cargo-zigbuild uses). Always link libdl — the target is
-# Linux even when this Makefile runs on Darwin.
+# Linux aarch64 boards: a GNU cross gcc when present, otherwise zig. Always
+# links libdl.
 ifeq ($(shell command -v aarch64-linux-gnu-gcc 2>/dev/null),)
 AARCH64_CC ?= zig cc -target aarch64-linux-gnu
 AARCH64_LDLIBS := -ldl -lm

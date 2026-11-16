@@ -82,7 +82,7 @@ fn nal_end(data: &[u8], from: usize) -> usize {
 /// `au` with `parameter_sets` inserted before its first NAL unit, or after
 /// it when that is an access unit delimiter, which must come first
 /// (§7.4.1.2.3).
-#[cfg_attr(not(all(windows, feature = "media-foundation")), allow(dead_code))] // Media Foundation backend use only
+#[cfg_attr(not(all(windows, feature = "media-foundation")), allow(dead_code))]
 pub(crate) fn with_parameter_sets(au: &[u8], parameter_sets: &[u8]) -> Vec<u8> {
     let at = if nal_types(au).first() == Some(&NAL_AUD) {
         nal_end(au, 0)

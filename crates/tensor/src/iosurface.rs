@@ -3,34 +3,22 @@
 
 //! IOSurface-backed tensor storage for macOS.
 //!
-//! `IoSurfaceTensor<T>` is the macOS counterpart to `DmaTensor<T>` on
-//! Linux: a zero-copy GPU↔CPU buffer that the OpenGL backend (ANGLE on
-//! macOS) can import directly via `EGL_ANGLE_iosurface_client_buffer`.
-//! Both fit into the `TensorMemory::DmaBuf` slot — the variant name is
-//! shared, the inner storage type differs per platform.
+//! `IoSurfaceTensor<T>` is the macOS counterpart to `DmaTensor<T>` on Linux: a
+//! zero-copy GPU↔CPU buffer that the OpenGL backend (ANGLE on macOS) can import
+//! directly via `EGL_ANGLE_iosurface_client_buffer`. Both fit into the
+//! `TensorMemory::DmaBuf` slot.
 //!
-//! ## Bindings approach
-//!
-//! Raw FFI to the IOSurface and CoreFoundation frameworks (linked via
-//! `#[link]`). The `objc2-io-surface` crate's Obj-C wrappers want
-//! `NSDictionary` for properties and don't accept CFDictionary cleanly
-//! through their `initWithProperties` API; the C IOSurface API takes
-//! `CFDictionaryRef` directly, which is what we have to hand and what
-//! the spike at `spikes/angle_iosurface/` validates.
+//! The bindings are raw FFI to the IOSurface and CoreFoundation frameworks.
 //!
 //! ## CPU access
 //!
-//! `map()` returns `IoSurfaceMap<T>` which holds an `IOSurfaceLock` and
-//! exposes the base address as a slice. `unmap()`/`Drop` calls the
-//! matching unlock. IOSurface handles GPU↔CPU cache coherency
-//! implicitly — no separate `DMA_BUF_IOCTL_SYNC` analog needed.
+//! A map holds an `IOSurfaceLock` for its lifetime and exposes the base address
+//! as a slice; dropping it calls the matching unlock.
 //!
 //! ## Cross-process sharing
 //!
-//! IOSurfaces are identified by `IOSurfaceID` (u32) within a host. The
-//! GL backend uses this id as part of the buffer-identity cache key so
-//! repeated frames for the same IOSurface reuse the EGL pbuffer import.
-//! Full Mach port passing is deferred.
+//! IOSurfaces are identified by `IOSurfaceID` (u32) within a host. The GL
+//! backend uses this id as part of the buffer-identity cache key.
 
 #![cfg(any(target_os = "macos", target_os = "ios"))]
 
@@ -60,10 +48,7 @@ const K_IOSURFACE_LOCK_READ_ONLY: u32 = 0x01;
 #[allow(dead_code)]
 const K_IOSURFACE_LOCK_AVOID_SYNC: u32 = 0x02;
 
-// IOSurface depends on CoreFoundation for the CFDictionary properties
-// dict and CFNumber values. Both frameworks must be linked explicitly:
-// clippy warns about the duplicate `kind` attribute but it's required —
-// each framework is its own dylib.
+// IOSurface and CoreFoundation are separate frameworks; both are linked.
 #[allow(clippy::duplicated_attributes)]
 #[link(name = "IOSurface", kind = "framework")]
 #[link(name = "CoreFoundation", kind = "framework")]
@@ -81,9 +66,7 @@ extern "C" {
 
     fn CFRetain(cf: *const c_void) -> *const c_void;
     fn CFRelease(cf: *const c_void);
-    // Called only from `#[cfg(test)]` retain-count assertions. The lib
-    // target (what iOS clippy `-D warnings` sees first) would otherwise
-    // trip `dead_code`.
+    // Called only from `#[cfg(test)]` retain-count assertions.
     #[cfg_attr(not(test), expect(dead_code))]
     fn CFGetRetainCount(cf: *const c_void) -> isize;
 
@@ -105,15 +88,8 @@ extern "C" {
     static kCFTypeDictionaryValueCallBacks: c_void;
 }
 
-/// Derive a [`BufferIdentity`] from `IOSurfaceGetID`.
-///
-/// The id is the system's own identifier for the surface, stable across
-/// every wrap of it within a host. Without deriving from it, two
-/// independently-linked copies of this crate (or a re-wrap crossing a
-/// library boundary, e.g. a producer handing off an `IOSurfaceID`) would
-/// disagree on the identity, and the GL backend's EGLImage import cache
-/// would miss -- re-importing the same surface every frame instead of
-/// reusing the bound pbuffer.
+/// Derive a [`BufferIdentity`] from `IOSurfaceGetID`, the system's identifier
+/// for the surface, stable across every wrap of it within a host.
 fn identity_from_surface(surface: IOSurfaceRef) -> BufferIdentity {
     let id = unsafe { IOSurfaceGetID(surface) };
     BufferIdentity::derived(IdentityKind::IoSurface, id as u64)
@@ -126,10 +102,8 @@ pub(crate) struct OwnedIoSurface {
     inner: Arc<IoSurfaceHandle>,
 }
 
-/// Inner wrapper that handles the actual CFRelease in Drop. Wrapping in
-/// Arc means multiple clones of `OwnedIoSurface` share the same retain
-/// count and the surface is released exactly once when the last clone
-/// drops.
+/// Inner wrapper that calls `CFRelease` on drop. The surface is released once,
+/// when the last clone of `OwnedIoSurface` drops.
 #[derive(Debug)]
 struct IoSurfaceHandle(IOSurfaceRef);
 
@@ -178,19 +152,13 @@ impl OwnedIoSurface {
     }
 }
 
-/// Recover a live `IOSurfaceRef` from a cross-process/cross-package
-/// IOSurfaceID — the identifier `Tensor::iosurface_id` reports and that
+/// Recover a live `IOSurfaceRef` from an IOSurfaceID: the identifier
+/// `Tensor::iosurface_id` reports and that
 /// [`crate::protocol::TensorDesc::handle`] carries for
 /// [`crate::protocol::kind::IOSURFACE`] descriptors.
 ///
-/// `IOSurfaceLookup` hands back a new (+1) reference the caller owns; this
-/// is why every call site pairs a successful lookup with [`release`] once
-/// it has taken (or failed to take) its own independent retain, e.g. via
-/// [`OwnedIoSurface::from_external`]'s `CFRetain`.
-///
-/// Returns `None` when no live surface has that id — a stale id, or a
-/// surface whose producer already released it (the descriptor's borrow
-/// contract was violated, or the capsule outlived its keepalive).
+/// The result is a new (+1) reference the caller owns and gives back with
+/// [`release`]. Returns `None` when no live surface has that id.
 pub(crate) fn lookup_by_id(id: u32) -> Option<*mut c_void> {
     let ptr = unsafe { IOSurfaceLookup(id) };
     if ptr.is_null() {
@@ -224,35 +192,24 @@ where
     /// Row pitch in bytes (from `IOSurfaceGetBytesPerRow`). IOSurface rounds
     /// this up to 64-byte alignment, so for image-formatted surfaces it can
     /// exceed the natural `width × bytes_per_pixel`. Image-formatted tensors
-    /// carry this as their row stride so CPU consumers iterate rows correctly;
-    /// raw byte surfaces (`new_with_byte_size`, a single padded row) leave the
-    /// tensor stride natural.
+    /// carry this as their row stride; raw byte surfaces (`new_with_byte_size`,
+    /// a single padded row) leave the tensor stride natural.
     pub(crate) bytes_per_row: usize,
     /// Whether this tensor was constructed from an externally-provided
-    /// IOSurface via `from_surface`. Mirrors `DmaTensor::is_imported`
-    /// and is reserved for diagnostic and C-API parity uses. Not yet
-    /// consumed by any decision logic on macOS — IOSurface lifecycle is
-    /// CFRetain/CFRelease symmetric regardless of import origin.
+    /// IOSurface via `from_surface`.
     #[allow(dead_code)]
     pub(crate) is_imported: bool,
     /// Byte offset of this tensor's window into the shared IOSurface. Non-zero
-    /// only for sub-views (`view`/`batch`), which share the surface + identity
-    /// and address a sub-region by this offset — mirrors `DmaTensor::mmap_offset`.
-    /// CPU maps add it to the locked base address; the GL path keys the import
-    /// on the parent identity and renders the sub-region via `glViewport`.
+    /// only for sub-views (`view`/`batch`), which share the surface and
+    /// identity. CPU maps add it to the locked base address.
     pub(crate) view_offset: usize,
 }
 
 unsafe impl<T> Send for IoSurfaceTensor<T> where T: Num + Clone + fmt::Debug + Send + Sync {}
 unsafe impl<T> Sync for IoSurfaceTensor<T> where T: Num + Clone + fmt::Debug + Send + Sync {}
 
-/// Keepalive holding an IOSurface's CPU lock for a map's lifetime.
-///
-/// `host_pin` deliberately takes no lock — an IOSurface address is stable
-/// without one. A *map* is different: it promises coherent CPU access for its
-/// duration, so it locks here and unlocks on drop, replaying the SAME options
-/// as the lock (Apple requires the pair to match, which is why the options are
-/// stored rather than re-derived).
+/// Keepalive holding an IOSurface's CPU lock for a map's lifetime. Locks on
+/// construction and unlocks on drop with the same options.
 pub(crate) struct IoSurfaceMapLock {
     surface: OwnedIoSurface,
     options: u32,
@@ -268,13 +225,8 @@ impl Drop for IoSurfaceMapLock {
     }
 }
 
-/// Lock options for a CPU access direction.
-///
-/// A read-only lock skips the cache flush at unlock — the caller promised not
-/// to write, so there is nothing to publish to the GPU. Apple requires the
-/// options passed to `IOSurfaceUnlock` to MATCH the ones passed to
-/// `IOSurfaceLock`, which is precisely why both halves of the sync API take the
-/// direction rather than inferring it.
+/// Lock options for a CPU access direction: read-only unless the access writes.
+/// `IOSurfaceUnlock` must be passed the same options as `IOSurfaceLock`.
 fn lock_options(access: crate::CpuAccess) -> u32 {
     if access.writes() {
         0
@@ -287,12 +239,8 @@ impl<T> IoSurfaceTensor<T>
 where
     T: Num + Clone + fmt::Debug + Send + Sync,
 {
-    /// Establish a persistent host address for this surface.
-    ///
-    /// Takes **no lock**: `IOSurfaceGetBaseAddress` is stable for the
-    /// surface's lifetime, and the lock is a coherency window, not an
-    /// addressing one. Separating them is the whole point — the surface is
-    /// retained as the pin's keepalive, so the address outlives any guard.
+    /// Establish a persistent host address for this surface. Takes no lock; the
+    /// surface is retained as the pin's keepalive.
     pub(crate) fn host_pin<'a>(&self) -> crate::Result<crate::pin::HostPin<'a>>
     where
         T: 'a,
@@ -303,10 +251,7 @@ where
                 "IOSurfaceGetBaseAddress returned null; surface is not host-addressable",
             ))
         })?;
-        // The whole surface; Tensor::pin_host narrows to the logical extent.
-        // IOSurface rounds its row pitch to 64 bytes, so this is wider than the
-        // logical size for image-formatted surfaces -- which is exactly what a
-        // map guard needs to expose padded rows.
+        // The whole surface; `Tensor::pin_host` narrows to the logical extent.
         let len = self.buf_size;
         Ok(crate::pin::HostPin::new(
             std::sync::Arc::new(self.surface.clone()),
@@ -354,9 +299,7 @@ where
     }
 
     /// Lock the surface and pin its address for the resulting view's lifetime.
-    ///
-    /// Unlike [`host_pin`](Self::host_pin), which takes no lock, this is the
-    /// map path: the lock is held until the pin's keepalive drops.
+    /// The lock is held until the pin's keepalive drops.
     pub(crate) fn scoped_pin<'a>(&self, access: crate::CpuAccess) -> Result<crate::pin::HostPin<'a>>
     where
         T: 'a,
@@ -380,8 +323,7 @@ where
             ))
         })?;
         // SAFETY: the sole caller, `map_inner`, refuses `view_offset + exposed`
-        // past `buf_size` before it gets here, so this stays inside the
-        // surface's allocation.
+        // past `buf_size`, so this stays inside the surface's allocation.
         let data = unsafe { (base_ptr.as_ptr() as *mut u8).add(self.view_offset) };
         let len = self.buf_size.saturating_sub(self.view_offset);
         Ok(crate::pin::HostPin::new(keepalive, data, len))
@@ -437,8 +379,6 @@ where
     }
 
     fn memory(&self) -> TensorMemory {
-        // Unified variant: macOS reports Dma, same as Linux. The variant
-        // name is shared; the inner storage type differs per platform.
         TensorMemory::DmaBuf
     }
 
@@ -494,12 +434,9 @@ where
         Ok(())
     }
 
-    /// Zero-copy sub-region view sharing this surface (CFRetain via the
-    /// `Arc`-backed `OwnedIoSurface`) and [`BufferIdentity`], positioned at
-    /// `offset_bytes` from this tensor's own window with logical `shape`. The
-    /// GL backend keys the IOSurface import on the shared identity and renders
-    /// the sub-region via `glViewport`; a CPU map adds `view_offset` to the
-    /// locked base address. Mirrors [`DmaTensor::view`](crate::TensorTrait::view).
+    /// Zero-copy sub-region view sharing this surface and [`BufferIdentity`],
+    /// positioned at `offset_bytes` from this tensor's own window with logical
+    /// `shape`.
     ///
     /// # Errors
     ///
@@ -544,20 +481,14 @@ impl<T> IoSurfaceTensor<T>
 where
     T: Num + Clone + fmt::Debug + Send + Sync,
 {
-    /// Allocate a new IOSurface large enough to hold `byte_size` bytes
-    /// arranged as `shape`. The surface is created as a 1-row,
-    /// 1-byte-per-element layout — the GL backend separately allocates
-    /// properly-shaped image IOSurfaces (with YUYV/NV12/BGRA FOURCC) via
-    /// `crates/image/src/gl/iosurface_import.rs`.
+    /// Allocate a new IOSurface large enough to hold `byte_size` bytes arranged
+    /// as `shape`. The surface is created as a 1-row, 1-byte-per-element
+    /// layout.
     pub(crate) fn new_with_byte_size(
         shape: &[usize],
         byte_size: usize,
         name: Option<&str>,
     ) -> Result<Self> {
-        // Span name follows the project convention `<crate>.<function>`
-        // (see `ARCHITECTURE.md § Span naming conventions`). The
-        // `memory = "iosurface"` field tags the variant so traces can
-        // filter macOS-specific allocations.
         let _span =
             tracing::trace_span!("tensor.alloc", memory = "iosurface", byte_size,).entered();
 
@@ -594,20 +525,13 @@ where
         })
     }
 
-    /// Allocate an image-formatted IOSurface — proper FourCC + per-pixel
-    /// byte count + 2D dimensions, suitable for binding directly via
-    /// `EGL_ANGLE_iosurface_client_buffer` on the GL backend.
+    /// Allocate an image-formatted IOSurface (FourCC, per-pixel byte count and
+    /// 2D dimensions) that the GL backend can bind via
+    /// `EGL_ANGLE_iosurface_client_buffer`.
     ///
-    /// Unlike `new_with_byte_size`, the returned IOSurface has the
-    /// format ANGLE expects when the GL backend later wraps it in a
-    /// pbuffer. Used by `Tensor::image()` on macOS when the caller
-    /// requests `TensorMemory::DmaBuf`.
-    ///
-    /// For planar pixel formats (`PlanarRgb`, `PlanarRgba`) the
-    /// IOSurface is allocated as a single-channel float surface sized
-    /// `(width, channels * height)` — the channel planes stack
-    /// vertically and the byte layout matches the tensor's
-    /// `[channels, H, W]` shape.
+    /// For planar pixel formats (`PlanarRgb`, `PlanarRgba`) the channel planes
+    /// stack vertically and the byte layout matches the tensor's `[channels, H,
+    /// W]` shape.
     pub(crate) fn new_image(
         width: usize,
         height: usize,
@@ -631,24 +555,15 @@ where
         //   * Packed formats (Rgba/Bgra/Yuyv, any supported dtype):
         //     surface dimensions = (width, height).
         //
-        //   * PlanarRgb[a] u8: not currently supported (no FourCC).
+        //   * PlanarRgb[a] u8: not supported (no FourCC).
         //
-        //   * PlanarRgb[a] F16: ANGLE only accepts RGBA16F (FourCC
-        //     'RGhA') for float IOSurfaces. We pack 4 contiguous f16
-        //     elements of the planar `[C, H, W]` byte stream into
-        //     each RGBA16F pixel — surface dimensions become
-        //     `(W/4, C*H)` via `packed_rgba16f_layout`. The byte
-        //     layout is identical to a (nonexistent) R16F `(W, C*H)`
-        //     surface and ORT consumes the locked base address as
-        //     `&[f16]` with shape `[1, C, H, W]` without
-        //     rearrangement. W must be a multiple of 4 for the
-        //     packing to align — validated by `packed_rgba16f_layout`.
+        //   * PlanarRgb[a] F16: an RGBA16F surface (FourCC 'RGhA'). Each
+        //     RGBA16F pixel holds 4 contiguous f16 elements of the planar
+        //     `[C, H, W]` byte stream, giving surface dimensions
+        //     `(W/4, C*H)` via `packed_rgba16f_layout`. W must be a
+        //     multiple of 4.
         let (surface_width, surface_height) = match (format, dtype) {
             (PixelFormat::PlanarRgb | PixelFormat::PlanarRgba, DType::F16) => {
-                // Delegate W%4 check and (W/4, C*H) computation to the
-                // canonical single source of truth. The only failure mode
-                // here is misaligned width (packed_rgba16f_layout returns
-                // None); overflow is not possible at these dimensions.
                 let layout =
                     packed_rgba16f_layout(format, dtype, width, height).ok_or_else(|| {
                         Error::InvalidShape(format!(
@@ -658,9 +573,7 @@ where
                     })?;
                 (layout.surface_w, layout.surface_h)
             }
-            // Packed RGB u8/i8 rides an RGBA8888 surface at (W*3/4, H) —
-            // the same canonical rule as the Android allocation and the GL
-            // engine's two-pass packed-RGB render geometry.
+            // Packed RGB u8/i8 uses an RGBA8888 surface at (W*3/4, H).
             (PixelFormat::Rgb, DType::U8 | DType::I8) => {
                 let layout = crate::packed_rgb888_layout(width, height).ok_or_else(|| {
                     Error::InvalidShape(format!(
@@ -682,10 +595,9 @@ where
                 })?;
                 (width, sh)
             }
-            // Semi-planar YUV (NV12/NV16/NV24): bind the whole contiguous
-            // combined-plane buffer as one R8 texture, sized to the 64-aligned
-            // row pitch (see `PixelFormat::semi_planar_surface_dims` for the
-            // ANGLE width==pitch rationale).
+            // Semi-planar YUV (NV12/NV16/NV24): the whole contiguous
+            // combined-plane buffer as one R8 surface, sized to the 64-aligned
+            // row pitch.
             (PixelFormat::Nv12 | PixelFormat::Nv16 | PixelFormat::Nv24, _) => format
                 .semi_planar_surface_dims(width, height, bpe)
                 .ok_or_else(|| {
@@ -728,32 +640,22 @@ where
         })
     }
 
-    /// Wrap an existing IOSurface as a tensor. Used by the GL backend
-    /// when importing an externally-allocated surface (e.g. from
-    /// VideoToolbox or cross-process `IOSurfaceID` lookup).
+    /// Wrap an existing IOSurface as a tensor.
     ///
-    /// `surface_ref` must be a valid `IOSurfaceRef`. The pointer is
-    /// retained for the tensor's lifetime; the external owner keeps its
-    /// own reference and must release it independently.
+    /// The pointer is retained for the tensor's lifetime; the external owner
+    /// keeps its own reference and releases it independently. The type-erased
+    /// entry point is [`crate::TensorDyn::from_iosurface`], and
+    /// [`crate::Tensor::from_iosurface`] is the typed wrapper.
     ///
-    /// The type-erased public entry point is [`crate::TensorDyn::from_iosurface`]
-    /// (and [`crate::Tensor::from_iosurface`] for the typed wrapper);
-    /// most callers should prefer those over calling this inner
-    /// constructor directly.
+    /// # Errors
+    ///
+    /// `InvalidShape` if the shape footprint (`shape.iter().product::<usize>()
+    /// * std::mem::size_of::<T>()`) exceeds the IOSurface's allocated byte size
+    /// (`IOSurfaceGetAllocSize`).
     ///
     /// # Safety
     ///
-    /// The caller must ensure `surface_ref` is a valid live
-    /// `IOSurfaceRef`. Passing a stale or invalid pointer is UB.
-    ///
-    /// The shape footprint
-    /// (`shape.iter().product::<usize>() * std::mem::size_of::<T>()`) is
-    /// validated against the IOSurface's allocated byte size
-    /// (`IOSurfaceGetAllocSize`) and the constructor returns
-    /// `Err(InvalidShape)` if it does not fit. This catches accidental
-    /// mismatches that would otherwise cause out-of-bounds reads/writes
-    /// in [`crate::Tensor::map`]; it does not relax the pointer-validity
-    /// requirement above.
+    /// `surface_ref` must be a valid live `IOSurfaceRef`.
     pub unsafe fn from_surface(
         surface_ref: *mut c_void,
         shape: &[usize],
@@ -798,47 +700,32 @@ where
     }
 
     /// Row pitch in bytes as reported by `IOSurfaceGetBytesPerRow` (64-byte
-    /// aligned). For image-formatted surfaces this is the authoritative row
-    /// stride; CPU consumers must iterate rows by this value, not by
-    /// `width × bytes_per_pixel`.
+    /// aligned). For image-formatted surfaces this is the row stride.
     pub(crate) fn bytes_per_row(&self) -> usize {
         self.bytes_per_row
     }
 
-    /// Physical IOSurface dimensions in *texels* (`IOSurfaceGetWidth` /
-    /// `IOSurfaceGetHeight`), independent of the tensor's current logical shape.
-    ///
-    /// A reused pool surface keeps these fixed for its whole life while
-    /// `configure_image` changes the logical frame shape per decode. The GL
-    /// backend binds the EGL pbuffer at these physical dims so one cached
-    /// pbuffer serves every frame, and `texelFetch(col, row)` resolves to memory
-    /// `row * bytes_per_row + col` (the row pitch is carried by the surface, not
-    /// the declared texel width) — matching the codec's fixed-grid byte layout.
+    /// Physical IOSurface dimensions in texels (`IOSurfaceGetWidth` /
+    /// `IOSurfaceGetHeight`), independent of the tensor's current logical
+    /// shape.
     pub(crate) fn physical_surface_dims(&self) -> (usize, usize) {
         let w = unsafe { IOSurfaceGetWidth(self.surface.as_ptr()) };
         let h = unsafe { IOSurfaceGetHeight(self.surface.as_ptr()) };
         (w, h)
     }
 
-    /// Row pitch to honour as an *image* stride when a tensor is reconfigured
-    /// to a smaller image (`Tensor::configure_image`), or `None` for a generic
-    /// byte-bag surface.
-    ///
-    /// A byte-bag (`new_with_byte_size`) is a single `height == 1` row whose
-    /// `bytes_per_row` equals the entire allocation — meaningless as a per-row
-    /// image pitch. Adopting it would set a row stride spanning the whole buffer
-    /// and blow up the strided map's size check. Only genuine 2D image-formatted
-    /// surfaces (`new_image`, height > 1) carry a real row pitch to preserve.
+    /// Row pitch to honour as an image stride when a tensor is reconfigured to
+    /// a smaller image (`Tensor::configure_image`): `bytes_per_row` for a 2D
+    /// image-formatted surface (height > 1), `None` for a single-row byte
+    /// surface (`new_with_byte_size`).
     pub(crate) fn image_backing_row_stride(&self) -> Option<usize> {
         let (_w, h) = self.physical_surface_dims();
         (h > 1).then_some(self.bytes_per_row)
     }
 
-    /// Lock and map exposing `byte_size` bytes via `as_slice()` for strided
-    /// row iteration. The caller (`Tensor::map`) validates
-    /// `byte_size <= buf_size` first. The IOSurface lock yields the full
-    /// surface base address, so the strided view is genuinely zero-copy — no
-    /// staging buffer, just a wider slice over the same locked allocation.
+    /// Lock and map exposing `byte_size` bytes via `as_slice()` for strided row
+    /// iteration. The caller (`Tensor::map`) validates `byte_size <= buf_size`
+    /// first.
     pub(crate) fn map_with_byte_size<'a>(
         &self,
         byte_size: usize,
@@ -863,11 +750,7 @@ where
 }
 
 // ---------------------------------------------------------------------------
-// Tensor<T>::iosurface_ref accessor — macOS-only.
-//
-// The GL backend (image crate) calls this when importing an
-// IOSurface-backed tensor as an EGL pbuffer. Returns None for tensors
-// backed by SHM/Mem/Pbo since they have no associated IOSurface.
+// Tensor<T> IOSurface accessors (macOS only).
 // ---------------------------------------------------------------------------
 
 impl<T> crate::Tensor<T>
@@ -903,10 +786,6 @@ where
     /// Physical IOSurface dimensions in texels (`IOSurfaceGetWidth` /
     /// `IOSurfaceGetHeight`), independent of the logical shape. `None` when not
     /// IOSurface-backed.
-    ///
-    /// The GL backend binds the EGL pbuffer at these dims so one cached pbuffer
-    /// serves every frame a reused pool surface holds; `texelFetch` then
-    /// resolves to `row * bytesPerRow + col` against the surface's real pitch.
     pub fn iosurface_physical_dims(&self) -> Option<(usize, usize)> {
         match &self.storage {
             crate::TensorStorage::Dma(io_tensor) => Some(io_tensor.physical_surface_dims()),
@@ -916,23 +795,18 @@ where
 
     /// Wrap an externally-allocated IOSurface as a tensor (macOS only).
     ///
-    /// Used to import IOSurfaces from VideoToolbox, AVFoundation, or
-    /// other producers, and to recover a tensor from an IOSurfaceID
-    /// received over a Mach port or XPC connection. The surface is
-    /// retained for the tensor's lifetime; the external owner keeps
-    /// its own reference and must release it independently.
+    /// The surface is retained for the tensor's lifetime; the external owner
+    /// keeps its own reference and must release it independently.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidShape` if `shape.iter().product::<usize>() *
+    /// std::mem::size_of::<T>()` exceeds the IOSurface's allocated byte size
+    /// (`IOSurfaceGetAllocSize`).
     ///
     /// # Safety
     ///
-    /// `surface_ref` must be a valid live `IOSurfaceRef`. Passing a
-    /// stale or invalid pointer is UB.
-    ///
-    /// HAL validates that
-    /// `shape.iter().product::<usize>() * std::mem::size_of::<T>()` fits
-    /// within the IOSurface's allocated byte size
-    /// (`IOSurfaceGetAllocSize`) and returns `Err(InvalidShape)`
-    /// otherwise. The pointer-validity requirement above is the
-    /// caller's responsibility.
+    /// `surface_ref` must be a valid live `IOSurfaceRef`.
     pub unsafe fn from_iosurface(
         surface_ref: *mut c_void,
         shape: &[usize],
@@ -945,10 +819,6 @@ where
         Ok(crate::Tensor::wrap(crate::TensorStorage::Dma(inner)))
     }
 }
-
-// ---------------------------------------------------------------------------
-// IoSurfaceMap — locked-for-CPU view.
-// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // CFDictionary builder for IOSurfaceCreate
@@ -966,10 +836,8 @@ unsafe fn build_props(
     fourcc: u32,
 ) -> Result<CFDictionaryRef> {
     unsafe {
-        // Checked arithmetic (mirrors the image crate's `build_image_props`): an
-        // overflowing pitch or allocation size would describe an under-sized
-        // IOSurface that the GL import then treats as a valid buffer — a memory
-        // hazard. Fail loudly instead of wrapping.
+        // Checked arithmetic: an overflowing pitch or allocation size is
+        // reported as an error.
         let bytes_per_row = width
             .checked_mul(bytes_per_element)
             .and_then(|b| b.checked_add(63))
@@ -1060,7 +928,6 @@ mod tests {
         assert!(t.buf_size >= 256, "buf_size should accommodate shape");
         assert_eq!(t.memory(), TensorMemory::DmaBuf);
 
-        // Write via map
         {
             let mut m = t.map().expect("map");
             let slice = m.as_mut_slice();
@@ -1069,7 +936,6 @@ mod tests {
                 *b = (i & 0xff) as u8;
             }
         }
-        // Read back via fresh map
         {
             let m = t.map().expect("remap");
             let slice = m.as_slice();
@@ -1081,9 +947,6 @@ mod tests {
 
     #[test]
     fn wrap_clone_drop_moves_cf_retain_count_by_one() {
-        // IOSurfaceCreate returns a +1 ref that from_created takes ownership of.
-        // Arc-cloning OwnedIoSurface must not CFRetain. from_external must +1,
-        // and dropping that handle must -1. Silence here was the G20 deferral.
         let t = IoSurfaceTensor::<u8>::new(&[64], None).expect("alloc");
         let ptr = t.surface.as_ptr() as *const c_void;
         let base = unsafe { CFGetRetainCount(ptr) };
@@ -1116,10 +979,8 @@ mod tests {
     fn image_surface_strided_map_honours_bytes_per_row() {
         use crate::Tensor;
 
-        // Packed RGBA U8 at width 17: natural row = 68 B, which IOSurface pads
-        // up to a 64-aligned `bytes_per_row` (128 B). Previously `image()`
-        // rejected this (forcing an SHM fallback); now it allocates a padded
-        // IOSurface and records the stride, so CPU access is correct + zero-copy.
+        // RGBA u8 at width 17: a 68-byte natural row, padded by IOSurface to
+        // 128 bytes.
         let h = 3usize;
         let w = 17usize;
         let t = Tensor::<u8>::image(
@@ -1138,7 +999,6 @@ mod tests {
         assert_eq!(t.width(), Some(w));
         assert_eq!(t.height(), Some(h));
 
-        // Write a distinct value per logical pixel, iterating rows by `stride`.
         {
             let mut m = t.map().expect("strided IOSurface map");
             let buf = m.as_mut_slice();
@@ -1149,7 +1009,6 @@ mod tests {
                 }
             }
         }
-        // Read back via a fresh lock and verify the padded layout round-trips.
         {
             let m = t.map().expect("remap");
             let buf = m.as_slice();
@@ -1169,10 +1028,8 @@ mod tests {
     fn copy_to_flat_compacts_padded_rows() {
         use crate::{Tensor, TensorDyn};
 
-        // Width 17 RGBA u8: natural row = 68 B, IOSurface pads to 128 B —
-        // the recorded-stride case copy_to_flat exists for. Write a
-        // distinct byte per logical pixel via the strided map, then verify
-        // the flat copy is tight and padding-free.
+        // RGBA u8 at width 17: a 68-byte natural row, padded by IOSurface to
+        // 128 bytes.
         let (w, h) = (17usize, 3usize);
         let t = Tensor::<u8>::image(
             w,
@@ -1205,12 +1062,9 @@ mod tests {
             }
         }
 
-        // Wrong destination size errors instead of truncating.
         let mut short = vec![0u8; h * w * 4 - 1];
         assert!(t.copy_to_flat(&mut short).is_err());
 
-        // Tight tensors (no recorded stride) degenerate to one memcpy —
-        // exercised through the TensorDyn dispatch layer.
         let tight = TensorDyn::image(
             64,
             4,
@@ -1238,12 +1092,6 @@ mod tests {
     fn explicit_dma_unmapped_image_format_errors() {
         use crate::Tensor;
 
-        // Explicit-Dma contract: `Some(TensorMemory::DmaBuf)` for an image whose
-        // (format, dtype) has no IOSurface FourCC mapping must error loudly —
-        // NOT silently allocate a generic 'L008' byte-bag that every GL
-        // import later rejects with EGL_BAD_ATTRIBUTE. Width 64 keeps the
-        // natural pitch 64-aligned so this exercises the mapping check, not
-        // the alignment guard.
         for (name, result) in [
             (
                 "PlanarRgb u8",
@@ -1279,9 +1127,6 @@ mod tests {
             }
         }
 
-        // The designed 'L008' semi-planar arm is a mapping, not a byte-bag:
-        // NV12 u8 with explicit Dma must still allocate (the R8 plane the
-        // YUV shaders sample) — the contract fix must not break it.
         let nv12 = Tensor::<u8>::image(
             64,
             8,
@@ -1305,14 +1150,11 @@ mod tests {
         assert_eq!(t.shape(), &[16, 16]);
         t.reshape(&[256]).expect("flatten");
         assert_eq!(t.shape(), &[256]);
-        // Element count mismatch rejected
         assert!(t.reshape(&[100]).is_err());
     }
 
     #[test]
     fn fourcc_layout_u8_packed_unchanged() {
-        // U8 packed formats keep the legacy mappings (regression
-        // guard for the refactor that added dtype to the lookup).
         assert_eq!(
             crate::iosurface_layout::image_iosurface_layout(PixelFormat::Rgba, DType::U8),
             Some((u32::from_be_bytes(*b"RGBA"), 4))
@@ -1325,9 +1167,6 @@ mod tests {
             crate::iosurface_layout::image_iosurface_layout(PixelFormat::Yuyv, DType::U8),
             Some((u32::from_be_bytes(*b"2C08"), 2))
         );
-        // Packed RGB u8 rides an RGBA8888 surface at (W*3/4, H) — the
-        // format is RGBA even though the pixel format is Rgb (matches
-        // the Android AHardwareBuffer table).
         assert_eq!(
             crate::iosurface_layout::image_iosurface_layout(PixelFormat::Rgb, DType::U8),
             Some((u32::from_be_bytes(*b"RGBA"), 4))
@@ -1336,10 +1175,6 @@ mod tests {
 
     #[test]
     fn fourcc_layout_f16_packed_rgba16f() {
-        // ANGLE's iosurface_client_buffer extension supports exactly
-        // one float (type, internal_format) pair: (GL_HALF_FLOAT,
-        // GL_RGBA) = RGBA16F, FourCC 'RGhA'. All HAL F16 IOSurface
-        // destinations (packed Rgba or planar) use this mapping.
         let expected = (u32::from_be_bytes(*b"RGhA"), 8);
         assert_eq!(
             crate::iosurface_layout::image_iosurface_layout(PixelFormat::Rgba, DType::F16),
@@ -1357,8 +1192,6 @@ mod tests {
 
     #[test]
     fn fourcc_layout_unsupported_combinations_return_none() {
-        // PlanarRgb / PlanarRgba u8 not supported on the IOSurface
-        // path — those tensors stay on SHM/Mem storage.
         assert_eq!(
             crate::iosurface_layout::image_iosurface_layout(PixelFormat::PlanarRgb, DType::U8),
             None
@@ -1367,9 +1200,6 @@ mod tests {
             crate::iosurface_layout::image_iosurface_layout(PixelFormat::PlanarRgba, DType::U8),
             None
         );
-        // F32 isn't accepted by ANGLE's IOSurface extension at all —
-        // no GL_FLOAT entry on the allowlist. Any F32 combination
-        // must return None so consumers fall back to staging.
         assert_eq!(
             crate::iosurface_layout::image_iosurface_layout(PixelFormat::Rgba, DType::F32),
             None
@@ -1378,13 +1208,10 @@ mod tests {
             crate::iosurface_layout::image_iosurface_layout(PixelFormat::PlanarRgb, DType::F32),
             None
         );
-        // NV12/NV16/NV24/GREY (u8) now map to 'L008' (R8) so the GPU can sample
-        // the contiguous semi-planar buffer as a single-channel texture.
         assert_eq!(
             crate::iosurface_layout::image_iosurface_layout(PixelFormat::Nv12, DType::U8),
             Some((u32::from_be_bytes(*b"L008"), 1))
         );
-        // Float for YUYV / Grey isn't a meaningful combination.
         assert_eq!(
             crate::iosurface_layout::image_iosurface_layout(PixelFormat::Yuyv, DType::F16),
             None
@@ -1397,12 +1224,8 @@ mod tests {
 
     #[test]
     fn new_image_planar_f16_packs_into_rgba16f() {
-        // PlanarRgb F16: logical 64×32 image gets a packed RGBA16F
-        // IOSurface sized (64/4, 3*32) = (16, 96). 8 B/pixel,
-        // bytes_per_row rounded to 64-byte alignment (16*8 = 128,
-        // already aligned) = 128, * 96 rows = 12288 bytes total. The
-        // byte payload exactly matches an [3, 32, 64] f16 tensor
-        // (3*32*64*2 = 12288 bytes).
+        // PlanarRgb F16 64×32: an RGBA16F surface of (64/4, 3*32) = (16, 96)
+        // texels at 8 bytes per texel, 128 bytes per row, 12288 bytes in total.
         let shape = [3, 32, 64];
         let t = IoSurfaceTensor::<half::f16>::new_image(
             64,
@@ -1418,9 +1241,6 @@ mod tests {
 
     #[test]
     fn new_image_planar_f16_rejects_misaligned_width() {
-        // W=63 isn't divisible by 4 — packing would mis-align the
-        // last column. HAL must reject at allocation time rather than
-        // silently truncate.
         let shape = [3, 32, 63];
         let err = IoSurfaceTensor::<half::f16>::new_image(
             63,
@@ -1442,9 +1262,8 @@ mod tests {
 
     #[test]
     fn new_image_packed_rgba_f16_alloc_size_matches_dtype() {
-        // Packed Rgba F16 at 64×32 → 64 pixels × 8 bytes/pixel = 512 B/row
-        // (8-byte aligned, padded up to 64-byte stride), × 32 rows
-        // ≥ 16384 bytes. (Equals 32*64*8 = 16384 bytes.)
+        // Rgba F16 64×32: 64 pixels × 8 bytes = 512 bytes per row, × 32 rows =
+        // 16384 bytes.
         let shape = [32, 64, 4];
         let t = IoSurfaceTensor::<half::f16>::new_image(
             64,
@@ -1460,13 +1279,10 @@ mod tests {
 
     #[test]
     fn from_surface_rejects_shape_overflowing_alloc() {
-        // Allocate a small backing surface and try to import it under a
-        // shape whose footprint is much larger than the allocation.
         let src = IoSurfaceTensor::<u8>::new(&[64], None).expect("alloc");
         let alloc = src.buf_size;
         let surface_ref = src.surface.as_ptr();
 
-        // u32 element type: requested bytes = (alloc + 1) * 4 ≫ alloc.
         let bad_shape = [alloc + 1];
         let err = unsafe { IoSurfaceTensor::<u32>::from_surface(surface_ref, &bad_shape, None) }
             .expect_err("oversized shape must be rejected");
@@ -1478,21 +1294,17 @@ mod tests {
             other => panic!("expected InvalidShape, got {other:?}"),
         }
 
-        // Sanity check: the same surface accepts a shape that does fit.
         let ok_shape = [alloc / std::mem::size_of::<u32>()];
         unsafe { IoSurfaceTensor::<u32>::from_surface(surface_ref, &ok_shape, None) }
             .expect("fitting shape should succeed");
     }
 
-    /// A `subview` of an IOSurface shares the surface + identity and reads its
-    /// own window through the CPU map — the macOS half of the decoder sub-view
-    /// fix (previously this errored with "subview only supported for Mem, Dma,
-    /// and Shm tensors" because the `Dma` arm was Linux-gated).
+    /// A `subview` of an IOSurface shares the surface and identity and reads
+    /// its own window through the CPU map.
     #[test]
     fn subview_iosurface_shares_identity_and_offsets_map() {
         use crate::{Tensor, TensorTrait};
 
-        // 256-byte IOSurface filled with a ramp so each byte equals its index.
         let parent = Tensor::<u8>::new(&[256], Some(TensorMemory::DmaBuf), None).expect("alloc");
         assert_eq!(parent.memory(), TensorMemory::DmaBuf);
         {
@@ -1502,7 +1314,6 @@ mod tests {
             }
         }
 
-        // A 64-byte window starting at offset 64 must alias the same buffer.
         let view = parent
             .subview(64, &[64])
             .expect("iosurface subview must succeed");
@@ -1512,7 +1323,6 @@ mod tests {
             "subview shares the parent BufferIdentity (one GL import)"
         );
 
-        // The window reads bytes [64, 128) — offset honoured by the CPU map.
         let m = view.map().expect("map iosurface subview");
         let s = m.as_slice();
         assert_eq!(s.len(), 64, "window exposes exactly its logical length");
@@ -1525,7 +1335,6 @@ mod tests {
             );
         }
 
-        // Writes through the window land in the parent buffer (zero-copy alias).
         drop(m);
         {
             let mut mw = view.map().expect("remap for write");
@@ -1539,26 +1348,8 @@ mod tests {
         );
     }
 
-    /// Pins the bound `map_inner` already enforces, which issue #161 made
-    /// load-bearing: before it, `view_offset` could only come from `view()`
-    /// under that function's own bounds check, and now `set_plane_offset`
-    /// writes a descriptor's restored offset -- untrusted cross-package input
-    /// -- straight into it.
-    ///
-    /// Nothing here is new behaviour; the point is that removing the
-    /// `view_offset + exposed <= buf_size` check in `map_inner` would now be
-    /// reachable from a descriptor rather than only from a bug in `view()`.
-    /// Two things would go wrong. `scoped_pin` offsets the locked base
-    /// address by `view_offset`, which leaves the allocation entirely -- and
-    /// forming that pointer is undefined behaviour before anything reads it.
-    /// And an offset merely *close* to the end yields a map shorter than the
-    /// image while the tensor still reports its full shape, which the GL
-    /// upload path reads `width x height` from through a raw pointer that
-    /// cannot see a slice's length.
-    ///
-    /// `D3d11TextureTensor` had no equivalent of this check; see
-    /// `d3d11_map_refuses_a_plane_offset_past_the_backing`, which this test's
-    /// bounds now match.
+    /// `map_inner` refuses a plane offset that leaves too little of the surface
+    /// for the image.
     #[test]
     fn iosurface_map_refuses_a_plane_offset_that_cannot_hold_the_image() {
         use crate::{DType, Tensor, TensorDyn, TensorTrait};
@@ -1572,8 +1363,6 @@ mod tests {
         let id = parent_dyn
             .iosurface_id()
             .expect("parent is IOSurface-backed");
-        // The surface's own allocation, which IOSurface may round up past the
-        // 256 bytes asked for -- the bound is the real one, not the request.
         let capacity = parent_dyn
             .map_bytes(crate::CpuAccess::Read)
             .expect("map parent")
@@ -1583,8 +1372,6 @@ mod tests {
         let mut rebuilt = TensorDyn::from_iosurface_id(id, &[WINDOW], DType::U8, None)
             .expect("reconstruct at the view's shape");
 
-        // A window that still holds its whole 64 bytes is fine, including the
-        // one that ends exactly at the surface's end.
         rebuilt.set_plane_offset(capacity - WINDOW);
         assert_eq!(
             rebuilt
@@ -1596,8 +1383,6 @@ mod tests {
             "a window ending exactly at the surface's end must still map"
         );
 
-        // One byte further and the image no longer fits. Refused, rather than
-        // handed back one byte short.
         rebuilt.set_plane_offset(capacity - WINDOW + 1);
         let err = rebuilt
             .map_bytes(crate::CpuAccess::Read)
@@ -1607,16 +1392,12 @@ mod tests {
             "expected InsufficientCapacity, got {err}"
         );
 
-        // The degenerate one-past-the-end offset: a legal pointer, an empty
-        // window, and a tensor that still calls itself 64 bytes wide.
         rebuilt.set_plane_offset(capacity);
         assert!(
             rebuilt.map_bytes(crate::CpuAccess::Read).is_err(),
             "an empty window for a non-empty tensor must not map"
         );
 
-        // Far past the surface, and a value chosen to overflow if the bound
-        // were computed with wrapping arithmetic.
         rebuilt.set_plane_offset(usize::MAX);
         assert!(
             rebuilt.map_bytes(crate::CpuAccess::Read).is_err(),
@@ -1624,31 +1405,8 @@ mod tests {
         );
     }
 
-    /// Restoring a plane offset onto a *reconstructed* IOSurface tensor must
-    /// move where `map()` starts. Regression test for issue #161.
-    ///
-    /// `TensorDesc` has no field for the plane offset, so every path that
-    /// rebuilds a tensor from a descriptor puts the offset back by calling
-    /// `Tensor::set_plane_offset` — `edgefirst-python-common`'s
-    /// `interop::apply_plane_offset` is the caller that matters. That call was
-    /// a silent no-op on this backing: `set_plane_offset`'s `Dma` arm was
-    /// `cfg(target_os = "linux")`, and because `TensorStorage::Dma` is a
-    /// cfg-multiplexed *name* rather than one type, macOS did not fail to
-    /// compile — it fell through to the catch-all. A reconstructed `view()`
-    /// therefore addressed the parent surface's origin, silently, with no
-    /// error to follow.
-    ///
-    /// Distinct from `subview_iosurface_shares_identity_and_offsets_map`
-    /// above, which covers the *fresh* view path: `IoSurfaceTensor::view` sets
-    /// its own `view_offset` and always did. Only restoring an offset onto an
-    /// already-built tensor was broken — which is exactly why a freshly
-    /// created view was correct on every platform and only the descriptor
-    /// round trip was wrong.
-    ///
-    /// The reconstruction is spelled with `TensorDyn::from_iosurface_id`
-    /// because that is the same `lookup_by_id` + `from_iosurface` pair that
-    /// `import_storage`'s `kind::IOSURFACE` arm runs, without needing the
-    /// Python capsule layer to reach it.
+    /// Restoring a plane offset onto a reconstructed IOSurface tensor moves
+    /// where `map()` starts.
     #[test]
     fn set_plane_offset_moves_the_iosurface_map_window() {
         use crate::{DType, Tensor, TensorDyn, TensorTrait};
@@ -1657,8 +1415,6 @@ mod tests {
         const OFFSET: usize = 64;
         const WINDOW: usize = 64;
 
-        // Ramp the parent surface so byte i holds i: a window that lands at
-        // the wrong origin cannot coincidentally match the expected bytes.
         let parent = Tensor::<u8>::new(&[PARENT], Some(TensorMemory::DmaBuf), None).expect("alloc");
         assert_eq!(parent.memory(), TensorMemory::DmaBuf);
         {
@@ -1672,8 +1428,6 @@ mod tests {
             .iosurface_id()
             .expect("parent is IOSurface-backed");
 
-        // Reopen the *whole* surface at the sub-region's shape, as an import
-        // does: the handle names the parent, so this lands at its origin.
         let mut rebuilt = TensorDyn::from_iosurface_id(id, &[WINDOW], DType::U8, None)
             .expect("reconstruct at the view's shape");
         {
@@ -1687,7 +1441,6 @@ mod tests {
             );
         }
 
-        // The restore under test.
         rebuilt.set_plane_offset(OFFSET);
         assert_eq!(
             rebuilt.plane_offset(),
@@ -1703,7 +1456,7 @@ mod tests {
         assert_ne!(
             s[0], 0,
             "map() still starts at the parent's origin — set_plane_offset was \
-             a no-op on IOSurface storage (issue #161)"
+             a no-op on IOSurface storage"
         );
         for (i, b) in s.iter().enumerate() {
             assert_eq!(
@@ -1715,19 +1468,7 @@ mod tests {
         }
     }
 
-    /// A nested `subview` must not compound its offset now that
-    /// `set_plane_offset` writes through to IOSurface storage.
-    ///
-    /// The double-apply guard for the fix above, and the reason it needed
-    /// checking rather than assuming: `Tensor::subview` sets the offset
-    /// *twice* by two different routes. `TensorStorage::view` computes
-    /// `view_offset + offset_bytes` inside `IoSurfaceTensor::view`, and then
-    /// `subview` calls `set_plane_offset(plane_offset + offset_bytes)` on the
-    /// result. Those are the same number only while the wrapper field and the
-    /// storage field stay in sync — which is what the new arm makes true, and
-    /// what an unguarded restore got wrong on `MEM` in the DMA-BUF half of
-    /// this fix (PR #160). Two levels, because a single level cannot tell an
-    /// idempotent write apart from one that compounds from zero.
+    /// A nested `subview` does not compound its offset.
     #[test]
     fn nested_iosurface_subviews_do_not_compound_their_plane_offset() {
         use crate::{Tensor, TensorTrait};
@@ -1760,18 +1501,8 @@ mod tests {
         }
     }
 
-    /// `set_format` must clear the IOSurface storage offset, not just the
-    /// wrapper field.
-    ///
-    /// The mirror of `set_plane_offset_moves_the_iosurface_map_window`, and
-    /// the reason the fix for it is a set/clear pair rather than one arm:
-    /// `set_format` deliberately drops stride and offset when the format
-    /// changes, because neither is necessarily valid for the new one. It
-    /// dropped them with the same Linux-gated match the setter had, so
-    /// clearing on macOS left `plane_offset()` reporting `None` while
-    /// `map()` still started at the old offset -- a stale window instead of
-    /// a lost one, and the failure mode that making the setter take effect
-    /// would otherwise have introduced.
+    /// `set_format` clears the IOSurface storage offset as well as the
+    /// wrapper field, so `map()` starts at the surface origin afterwards.
     #[test]
     fn set_format_clears_the_iosurface_map_window() {
         use crate::{PixelFormat, Tensor, TensorTrait};
@@ -1787,9 +1518,6 @@ mod tests {
             }
         }
 
-        // An 8x8 greyscale window carrying an offset, so there is something
-        // to clear. The surface is a 256-byte byte-bag, so the 64-byte window
-        // plus the offset still fits.
         t.set_logical_shape(&[8, 8, 1]).expect("logical shape");
         t.set_format(PixelFormat::Grey).expect("format");
         t.set_plane_offset(OFFSET);
@@ -1799,7 +1527,6 @@ mod tests {
             "precondition: the offset is live before the format change"
         );
 
-        // Changing the format drops the offset it cannot vouch for.
         t.set_logical_shape(&[4, 8, 3]).expect("rgb logical shape");
         t.set_format(PixelFormat::Rgb).expect("new format");
         assert_eq!(t.plane_offset(), None, "the wrapper field is cleared");
@@ -1807,33 +1534,18 @@ mod tests {
             t.map().expect("map after").as_slice()[0],
             0,
             "map() still starts at the old offset — set_format cleared the \
-             wrapper field but not the IOSurface storage (issue #161)"
+             wrapper field but not the IOSurface storage"
         );
     }
 
-    /// A descriptor round trip must restore the surface's pitch onto an
-    /// IOSurface view import. Regression test for the second half of issue
-    /// #161's IOSurface fix.
-    ///
-    /// `restore_imported_row_stride` was host and `DMABUF` only, on the
-    /// grounds that nothing had reported the gap for IOSurface. A view of a
-    /// pitched surface reports its parent's pitch in `strides[0]`; the import
-    /// reopened the whole surface at the window's shape and, dropping that
-    /// stride, read a 16-texel RGBA window at 64-byte rows over a surface
-    /// whose rows are 256 bytes apart -- every row but the first sheared.
-    /// The merged convert test hid it by calling `set_row_stride` by hand,
-    /// which a real capsule consumer never does.
-    ///
-    /// Unlike D3D11 (whose exclusion stands: a staging pitch is the local
-    /// driver's), an IOSurface's `bytesPerRow` is a property of the shared
-    /// surface, so the producer's stride is the consumer's.
+    /// A descriptor round trip restores the surface's pitch onto an IOSurface
+    /// view import.
     #[test]
     fn descriptor_import_restores_the_iosurface_pitch_onto_a_view() {
         use crate::{Region, Tensor, TensorDyn, TensorTrait};
 
-        // Width 50 RGBA: a 200-byte natural row, which IOSurface pads to a
-        // 64-aligned 256-byte pitch. The two must differ or this test cannot
-        // tell a restored pitch from a dropped one.
+        // Width 50 RGBA: a 200-byte natural row, padded by IOSurface to a
+        // 256-byte pitch.
         let parent = Tensor::<u8>::image(
             50,
             8,
@@ -1870,7 +1582,7 @@ mod tests {
             Some(pitch),
             "restore_imported_row_stride dropped the IOSurface pitch: a 16-wide \
              window over a {pitch}-byte-pitched surface would be read at 64-byte \
-             rows (issue #161)"
+             rows"
         );
     }
 }

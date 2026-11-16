@@ -2,10 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // Golden sizes and offsets for every public by-value struct this library
-// declares. This is the drift class no name-level check can see; identical on
-// all LP64 targets. A failure here means a layout moved: before 1.0 that is
-// allowed (see the ABI note in the root README), but it must be deliberate,
-// and it must come with a bump to `ef_decoder_abi_version`.
+// declares, on LP64 targets.
 
 #include "edgefirst/decoder.h"
 
@@ -29,15 +26,14 @@ _Static_assert(offsetof(ef_segmentation, mask) == 16, "");
 _Static_assert(offsetof(ef_segmentation, width) == 24, "");
 _Static_assert(offsetof(ef_segmentation, height) == 28, "");
 
-/* max_det is uintptr_t, so 4 bytes of pad after class_agnostic. */
+/* max_det is uintptr_t: 4 bytes of pad after class_agnostic. */
 _Static_assert(sizeof(ef_merge_config) == 32, "merge config is 32 bytes");
 _Static_assert(offsetof(ef_merge_config, metric) == 0, "");
 _Static_assert(offsetof(ef_merge_config, threshold) == 4, "");
 _Static_assert(offsetof(ef_merge_config, class_agnostic) == 8, "");
 _Static_assert(offsetof(ef_merge_config, max_det) == 16, "");
 _Static_assert(offsetof(ef_merge_config, score_threshold) == 24, "");
-/* `mode` fills what was the tail pad, so the struct is 32 bytes with or
-   without it and every earlier offset is unmoved. */
+/* `mode` occupies the last 4 bytes. */
 _Static_assert(offsetof(ef_merge_config, mode) == 28, "");
 
 /* Two uintptr_t, four f32, c_int, content_region[4], two f32: 60, align 8 -> 64. */

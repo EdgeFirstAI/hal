@@ -1,11 +1,5 @@
 #!/usr/bin/env bash
-# Coverage must still attribute to every crate after the packaging split.
-#
-# The failure mode here is silent UNDER-reporting, not an error: splitting into
-# one dynamic object per package changes where .profraw files originate, and the
-# .init_array constructor that each cdylib used to carry is gone -- covguard is
-# now installed from each pymodule_init instead. If aggregation breaks, the
-# report simply shrinks, which no test would otherwise notice.
+# Checks that the coverage report attributes records to every crate.
 set -euo pipefail
 REPORT="${1:-target/rust-coverage.lcov}"
 
@@ -22,10 +16,8 @@ for crate in tensor codec image decoder tracker kernels; do
     fi
 done
 
-# The extension cdylibs are excluded from instrumentation on purpose --
-# they are registration shims with no logic worth measuring, and llvm-cov
-# cannot usefully instrument a cdylib. Their bindings live in python-common,
-# which IS measured, so assert that rather than the shims.
+# The extension cdylibs are not instrumented; their bindings are measured
+# through python-common.
 if grep -q "crates/python-common/src" "$REPORT"; then
     n=$(grep -c "crates/python-common/src" "$REPORT")
     printf '  %-9s %s records\n' "python-common" "$n"

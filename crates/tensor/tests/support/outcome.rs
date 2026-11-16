@@ -3,18 +3,13 @@
 
 //! What a test does when it cannot exercise what it tests.
 //!
-//! A skip is a warning, never a silent pass. [`report_skip`] writes
-//! `WARNING: SKIPPED: <reason>` straight to stderr, which neither libtest's
-//! nor nextest's capture can swallow, so the line reaches the console, the
-//! JUnit `system-err`, `scripts/on-target-run.sh`'s summary and
-//! `.github/scripts/test_warnings.py`'s audit.
+//! [`report_skip`] writes `WARNING: SKIPPED: <reason>` straight to stderr.
 //!
 //! An allocation a test depends on either must succeed ([`Expect::Succeeds`]),
-//! when a failure fails the test, or may legitimately fail on this host
+//! when a failure fails the test, or may fail on this host
 //! ([`Expect::MayFail`]), when a failure is a warning and the test skips.
 //!
-//! This file has no crate references so it can be `#[path]`-included from any
-//! crate's library `test_support` module or integration tests.
+//! This file has no crate references.
 
 use std::fmt::Debug;
 

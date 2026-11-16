@@ -129,8 +129,7 @@ int run_s7_child() {
     report("S7.C", bad == 0 ? Verdict::Pass : Verdict::Fail, "child: reads the parent's upload: %zu mismatches", bad);
     failures += bad != 0;
   }
-  // D3D11 opens fences only by handle; the name lookup lives on the D3D12
-  // device, which resolves the same kernel object.
+  // Open the named fence through a D3D12 device.
   ComPtr<ID3D11Fence> fence;
   {
     ComPtr<IDXGIAdapter> adapter;

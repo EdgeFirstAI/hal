@@ -5,15 +5,10 @@
 # Restart-interval (DRI) control corpus: losslessly add restart markers to
 # every JPEG in a directory with `jpegtran -restart`.
 #
-# jpegtran re-serialises the SAME DCT coefficients — pixels and quality are
-# bit-identical to the source; the ONLY change is the restart-marker
-# structure. That makes this the exact isolate for the claim that
-# libjpeg-turbo's fast Huffman decoder is disabled on DRI streams (its README
-# documents up to ~20% slower): rerun the decoder A/B on the -dri directory
-# and any timing change is attributable to restart handling alone.
+# jpegtran re-serialises the same DCT coefficients: pixels and quality are
+# bit-identical to the source and only the restart-marker structure changes.
 #
-# `-restart 1` = one restart marker per MCU row, the camera-stream-like
-# density (hardware encoders emit restarts for error resilience).
+# `-restart 1` = one restart marker per MCU row.
 #
 # Usage:
 #   ./benchmarks/scripts/make-dri-corpus.sh --src DIR [--restart N] [--jobs N]

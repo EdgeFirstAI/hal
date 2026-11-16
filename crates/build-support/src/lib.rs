@@ -4,11 +4,10 @@
 //! Build-script helpers for the shared-library leaves.
 //!
 //! The C libraries (`image`, `codec`, `decoder`) and the tensor-linked Python
-//! extensions do not embed the tensor implementation: they are built with
-//! `--cfg edgefirst_tensor_dynamic` (see `.cargo/tensor-dynamic.toml`) and
-//! call into `libedgefirst_tensor`, which `edgefirst-tensor-capi` builds from
-//! the static backend. This crate holds the build-script half of that
-//! arrangement in one place:
+//! extensions are built with `--cfg edgefirst_tensor_dynamic` (see
+//! `.cargo/tensor-dynamic.toml`) and call into `libedgefirst_tensor`, which
+//! `edgefirst-tensor-capi` builds from the static backend. This crate holds
+//! the build-script half of that arrangement:
 //!
 //! - [`tensor_dynamic`] / [`require_dynamic_tensor`]: read and enforce the backend cfg.
 //! - [`link_capi_to_tensor`] / [`tensor_lib_dir`]: a C leaf links the producer built beside it.
@@ -18,7 +17,7 @@
 //! - [`soname`], [`python_extension`], [`coverage_instrumented`]: per-leaf link boilerplate.
 //!
 //! Everything that inspects the environment is a thin wrapper over a pure
-//! function, so the decisions are unit-tested without a cargo build.
+//! function.
 
 use std::env;
 use std::ffi::OsString;
@@ -28,7 +27,7 @@ use std::process::Command;
 /// The cfg that selects `edgefirst-tensor`'s dynamic backend.
 pub const DYNAMIC_CFG: &str = "edgefirst_tensor_dynamic";
 
-/// Opt-in for a static build of a Python leaf, used only by the G13 differential gate.
+/// Opt-in for a static build of a Python leaf.
 pub const STATIC_COMPARISON_ENV: &str = "EDGEFIRST_TENSOR_STATIC_COMPARISON";
 
 /// Overrides the directory a C leaf links `libedgefirst_tensor` from.
@@ -53,7 +52,7 @@ pub fn require_dynamic_tensor(package: &str) -> bool {
             "{package} links libedgefirst_tensor and must be built with the dynamic tensor \
              backend: build it from its crate directory, whose .cargo/config.toml selects it \
              (as `make wheel` and `pip install crates/<crate>` do). Set {STATIC_COMPARISON_ENV}=1 \
-             only for the G13 static comparison build."
+             only for the static comparison build."
         ),
     }
 }
@@ -70,9 +69,7 @@ fn backend_decision(dynamic: bool, static_opt_in: bool) -> Result<bool, ()> {
 ///
 /// [`TENSOR_LIB_DIR_ENV`] wins when set; otherwise this is the profile
 /// directory of the current build (`<target-dir>[/<triple>]/<profile>`),
-/// where `make capi-libs` builds `tensor-capi` beforehand. Derived from
-/// `OUT_DIR` so custom target dirs, cross targets and custom profiles all
-/// resolve correctly.
+/// derived from `OUT_DIR`.
 pub fn tensor_lib_dir() -> PathBuf {
     println!("cargo::rerun-if-env-changed={TENSOR_LIB_DIR_ENV}");
     if let Some(dir) = env::var_os(TENSOR_LIB_DIR_ENV).filter(|d| !d.is_empty()) {
@@ -89,7 +86,7 @@ pub fn link_capi_to_tensor() {
 
 /// Links a tensor-linked Python extension against a nested build of `libedgefirst_tensor`.
 ///
-/// Returns the directory holding the built library, or `None` for the G13 static
+/// Returns the directory holding the built library, or `None` for the static
 /// comparison build (see [`require_dynamic_tensor`]).
 pub fn link_python_extension_to_tensor(rpath: Rpath) -> Option<PathBuf> {
     let package = env::var("CARGO_PKG_NAME").expect("CARGO_PKG_NAME is set for build scripts");
@@ -113,9 +110,6 @@ pub fn python_extension() {
 }
 
 /// Sets an ELF cdylib's DT_SONAME to `lib<name>.so.<major>`.
-///
-/// Only the major version: dependents copy the SONAME into DT_NEEDED, so MINOR or PATCH
-/// would force a re-link on every release.
 pub fn soname(name: &str) {
     if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
         let major = env::var("CARGO_PKG_VERSION_MAJOR").expect("CARGO_PKG_VERSION_MAJOR is set");
@@ -133,7 +127,7 @@ fn crates_dir() -> PathBuf {
 }
 
 fn profile_dir_from_out_dir(out_dir: &Path) -> PathBuf {
-    // OUT_DIR is always `<profile-dir>/build/<pkg>-<hash>/out`.
+    // OUT_DIR is `<profile-dir>/build/<pkg>-<hash>/out`.
     out_dir
         .ancestors()
         .nth(3)
@@ -170,8 +164,7 @@ pub fn link_shared_tensor(lib_dir: &Path, rpath: Rpath) {
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
     match target_os.as_str() {
         "windows" => {
-            // A plain `dylib=edgefirst_tensor` resolves the Rust staticlib cargo writes next to the
-            // DLL, duplicating std at link time (LNK2005); name the DLL's import library verbatim.
+            // Names the DLL's import library verbatim.
             let import_dir = windows_import_lib_dir(lib_dir);
             if import_dir != lib_dir {
                 println!("cargo:rustc-link-search=native={}", import_dir.display());
@@ -179,23 +172,20 @@ pub fn link_shared_tensor(lib_dir: &Path, rpath: Rpath) {
             println!("cargo:rustc-link-lib=dylib:+verbatim=edgefirst_tensor.dll.lib");
         }
         "linux" => {
-            // Trailing link args land after the crate's rlibs, and --no-as-needed keeps the
-            // DT_NEEDED even when the binary's own objects never name an ef_tensor_* symbol
-            // (aarch64 bfd otherwise drops it).
+            // Links `-ledgefirst_tensor` as a trailing argument under `--no-as-needed`.
             println!("cargo:rustc-link-arg=-Wl,--no-as-needed");
             println!("cargo:rustc-link-arg=-ledgefirst_tensor");
             println!("cargo:rustc-link-arg=-Wl,--as-needed");
         }
         _ => println!("cargo:rustc-link-lib=dylib=edgefirst_tensor"),
     }
-    // RUNPATH is not transitive, so each leaf carries its own.
     if let Some(path) = rpath.origin_relative(&target_os) {
         println!("cargo:rustc-cdylib-link-arg=-Wl,-rpath,{path}");
     }
 }
 
 fn windows_import_lib_dir(lib_dir: &Path) -> PathBuf {
-    // Cargo writes the import library under deps/ and may also uplift it next to the DLL.
+    // The import library is under deps/ or next to the DLL.
     let candidates = [lib_dir.to_path_buf(), lib_dir.join("deps")];
     candidates
         .iter()
@@ -243,9 +233,8 @@ fn flags_instrument_coverage(flags: &str) -> bool {
 /// Builds `edgefirst-tensor-capi` (the static producer of `libedgefirst_tensor`) in a nested
 /// cargo invocation for a Python leaf, and returns the directory the library landed in.
 ///
-/// `nested_target_dir` must differ from the outer build's target dir, whose lock the outer
-/// cargo holds. The nested build receives the outer rustflags minus the dynamic cfg, so
-/// instrumentation reaches the producer while the producer stays static.
+/// `nested_target_dir` must differ from the outer build's target dir. The
+/// nested build receives the outer rustflags minus the dynamic cfg.
 pub fn build_tensor_producer(nested_target_dir: &Path) -> PathBuf {
     let crates_dir = crates_dir();
     let producer_manifest = crates_dir.join("tensor-capi/Cargo.toml");
@@ -268,7 +257,7 @@ pub fn build_tensor_producer(nested_target_dir: &Path) -> PathBuf {
         );
     }
 
-    // PROFILE only says debug or release; the profile directory names a custom profile such as `profiling`.
+    // The profile directory names the profile, custom ones included.
     let out_dir = env::var_os("OUT_DIR").expect("OUT_DIR is set for build scripts");
     let profile_dir = profile_dir_from_out_dir(Path::new(&out_dir));
     let profile = profile_dir
@@ -295,7 +284,6 @@ pub fn build_tensor_producer(nested_target_dir: &Path) -> PathBuf {
         cmd.arg("--target").arg(&target);
     }
     if coverage_instrumented() {
-        // tensor-capi's exports map collides with coverage's own version script.
         cmd.env("EF_SKIP_VERSION_SCRIPT", "1");
     }
     let status = cmd

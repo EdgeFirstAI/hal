@@ -3,30 +3,24 @@
 
 //! Opt-in fast 8×8 IDCT (AAN factorisation, libjpeg `ifast` class).
 //!
-//! **Off by default.** Selected via [`crate::DctMethod::Fast`]; the default
-//! path remains the accurate `islow`-class kernel, and every published
-//! comparison against libjpeg-turbo quotes the accurate kernel. This kernel
-//! trades a bounded accuracy loss (small quantised-domain rounding error, and
-//! the documented `ifast` degeneration at very high quality factors ≥ ~97)
-//! for roughly an eighth of the multiplies:
+//! Selected via [`crate::DctMethod::Fast`]; less accurate than the default
+//! `islow`-class kernel.
 //!
-//! - The per-coefficient AAN scale factors are folded into the **dequant
-//!   table** at derive time ([`derive_fast_quant`]), so the butterfly needs
-//!   only four constants.
+//! - The per-coefficient AAN scale factors are folded into the dequant table
+//!   at derive time ([`derive_fast_quant`]), so the butterfly needs only four
+//!   constants.
 //! - All four constants are applied as `x·(1+c)` or `x·(2+c)` with `c < 1`
-//!   in Q15, i.e. one `SQDMULH` plus adds — no widening multiplies, the
-//!   whole transform stays in 16-bit lanes end to end.
-//! - Like the accurate kernels, arithmetic wraps on out-of-contract inputs
-//!   (a hostile stream garbles only its own pixels; see `IdctFn`).
+//!   in Q15, i.e. one `SQDMULH` plus adds; the whole transform stays in
+//!   16-bit lanes.
+//! - Arithmetic wraps on out-of-contract inputs (see `IdctFn`).
 //!
 //! The scalar kernel is the reference: it mirrors the NEON ops exactly
-//! (including `SQDMULH` semantics and rounding shifts), so scalar↔NEON
-//! parity is bit-exact — same discipline as `color.rs`.
+//! (including `SQDMULH` semantics and rounding shifts), so scalar and NEON
+//! results are bit-identical.
 
 /// AAN dequant scale factors in Q14: `2^14 · f(row) · f(col)` where
-/// `f(0) = 1` and `f(k) = √2 · cos(kπ/16)` — the classic `aanscales` table.
-/// Verified against the closed form in the tests below.
-#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))] // fast kernels bind on NEON only
+/// `f(0) = 1` and `f(k) = √2 · cos(kπ/16)`.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 #[rustfmt::skip]
 pub const AANSCALES: [u16; 64] = [
     16384, 22725, 21407, 19266, 16384, 12873,  8867,  4520,
@@ -48,12 +42,10 @@ const F_0_082: i16 = 2700; //  1.082392200 − 1
 const F_0_613: i16 = 20091; // 2.613125930 − 2
 
 /// Derive the AAN-prescaled dequant table: `(quant · aanscale + 2^11) >> 12`
-/// (Q14 scale, keeping the `ifast` 2-bit headroom). Values stay well inside
-/// `i16` (255 · 31521 ≫ 12 = 1962) and are always positive, so they are
-/// stored in the same `[u16; 64]` shape the kernels already take and
-/// reinterpreted as `i16` lanes at multiply time, exactly like the accurate
-/// kernels' dequant.
-#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))] // fast kernels bind on NEON only
+/// (Q14 scale, keeping the `ifast` 2-bit headroom). Values are positive and
+/// fit in `i16`; they are stored as `[u16; 64]` and reinterpreted as `i16`
+/// lanes at multiply time.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 pub fn derive_fast_quant(quant: &[u16; 64]) -> [u16; 64] {
     let mut out = [0u16; 64];
     for (o, (&q, &s)) in out.iter_mut().zip(quant.iter().zip(AANSCALES.iter())) {
@@ -63,9 +55,8 @@ pub fn derive_fast_quant(quant: &[u16; 64]) -> [u16; 64] {
 }
 
 /// Scalar mirror of `vqdmulhq_n_s16`: `(2·a·b) >> 16` with saturation of the
-/// doubling (only reachable at `a = b = i16::MIN`, which the Q15 constants
-/// above never are).
-#[cfg_attr(not(test), allow(dead_code))] // reference impl, exercised by the parity tests
+/// doubling.
+#[cfg_attr(not(test), allow(dead_code))]
 #[inline(always)]
 fn qdmulh(a: i16, b: i16) -> i16 {
     (((a as i32) * (b as i32) * 2) >> 16) as i16
@@ -74,7 +65,7 @@ fn qdmulh(a: i16, b: i16) -> i16 {
 /// One 8-point AAN butterfly on `i16` values, wrapping adds. `MULTIPLY(x, m)`
 /// is expressed as `x + qdmulh(x, frac(m))` (or `2x + …` for m > 2), the same
 /// shape the NEON kernel uses.
-#[cfg_attr(not(test), allow(dead_code))] // reference impl, exercised by the parity tests
+#[cfg_attr(not(test), allow(dead_code))]
 #[inline(always)]
 fn butterfly8_fast(s: [i16; 8]) -> [i16; 8] {
     let mul_1_414 = |x: i16| x.wrapping_add(qdmulh(x, F_0_414));
@@ -123,7 +114,7 @@ fn butterfly8_fast(s: [i16; 8]) -> [i16; 8] {
 
 /// Scalar fast 8×8 IDCT on quantised coefficients with an AAN-prescaled
 /// dequant table (from [`derive_fast_quant`]). Reference for the NEON kernel.
-#[cfg_attr(not(test), allow(dead_code))] // reference impl, exercised by the parity tests
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn idct_8x8_scalar_fast(
     coeffs: &[i16; 64],
     fast_quant: &[u16; 64],
@@ -158,7 +149,7 @@ pub fn idct_8x8_scalar_fast(
 
 /// Scalar fast DC-only fill: both AAN passes broadcast the (prescaled)
 /// dequantised DC, so the block is `clamp(((dc + 16) >> 5) + 128)`.
-#[cfg_attr(not(test), allow(dead_code))] // reference impl, exercised by the parity tests
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn idct_dc_only_fast_scalar(dc_value: i32, output: &mut [u8], stride: usize) {
     let v = ((dc_value.wrapping_add(16) >> 5) + 128).clamp(0, 255) as u8;
     for row in output.chunks_mut(stride).take(8) {
@@ -175,9 +166,7 @@ mod neon {
 
     use super::{F_0_082, F_0_414, F_0_613, F_0_847};
 
-    /// Full-width 8-lane AAN butterfly (all eight columns at once — the
-    /// 16-bit-only math is what lets the fast kernel skip the accurate
-    /// kernel's 4-lane widening halves).
+    /// Full-width 8-lane AAN butterfly (all eight columns at once).
     #[inline(always)]
     unsafe fn butterfly8_fast_q(s: [int16x8_t; 8]) -> [int16x8_t; 8] {
         let mul_1_414 = |x: int16x8_t| vaddq_s16(x, vqdmulhq_n_s16(x, F_0_414));
@@ -222,10 +211,8 @@ mod neon {
         ]
     }
 
-    /// NEON fast 8×8 IDCT. Signature matches the accurate `idct_8x8_neon_k`
-    /// so the MCU loop binds either as the same fn-item shape; the `last_k`
-    /// sparsity hint is unused here — the AAN butterfly is cheap enough that
-    /// tiering it has not been worth the branches so far.
+    /// NEON fast 8×8 IDCT, with the signature of the accurate
+    /// `idct_8x8_neon_k`; the `last_k` sparsity hint is unused.
     #[inline(always)]
     pub fn idct_8x8_neon_fast_k(
         coeffs: &[i16; 64],
@@ -304,7 +291,7 @@ mod neon {
 mod tests {
     use super::*;
 
-    /// The literal AANSCALES table must equal `2^14·f(r)·f(c)` rounded.
+    /// The AANSCALES table equals `2^14·f(r)·f(c)` rounded.
     #[test]
     fn aanscales_matches_closed_form() {
         let f = |k: usize| -> f64 {
@@ -322,11 +309,7 @@ mod tests {
         }
     }
 
-    /// Forward-DCT an 8×8 pixel block and quantise — the only way to get
-    /// *valid* spectra. Random coefficient arrays are not valid DCT spectra:
-    /// they decode to out-of-range "pixels" and legitimately overflow the
-    /// fast kernel's 16-bit lanes (the documented `ifast` contract), so they
-    /// cannot be used to judge its accuracy.
+    /// Forward-DCT an 8×8 pixel block and quantise: a valid spectrum.
     fn quantised_spectrum(pixels: &[[u8; 8]; 8], quant: &[u16; 64]) -> [i16; 64] {
         let mut coeffs = [0i16; 64];
         for u in 0..8 {
@@ -356,8 +339,8 @@ mod tests {
         coeffs
     }
 
-    /// Fast scalar output must stay close to the accurate scalar reference on
-    /// in-contract blocks (the whole point of `ifast`-class accuracy).
+    /// Fast scalar output stays close to the accurate scalar reference on
+    /// in-contract blocks.
     #[test]
     fn fast_scalar_close_to_accurate() {
         use super::super::scalar::idct_8x8_scalar;
@@ -403,7 +386,7 @@ mod tests {
         }
     }
 
-    /// NEON fast kernel must be bit-identical to the fast scalar reference.
+    /// The NEON fast kernel is bit-identical to the fast scalar reference.
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn fast_neon_matches_fast_scalar_exactly() {

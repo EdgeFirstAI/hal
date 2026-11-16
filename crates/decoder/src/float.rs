@@ -3,19 +3,18 @@
 
 //! Float-domain NMS and box geometry.
 //!
-//! Two groups of primitives, both reusable outside the decoder:
+//! Two groups of primitives:
 //!
 //! - **Suppression** — [`nms_float`], [`nms_class_aware_float`], and the
 //!   `_extra` variants that carry a per-box payload (mask coefficients, say)
-//!   through suppression so the survivors stay paired with their data.
+//!   through suppression.
 //! - **Geometry** — [`intersection_area`], [`box_area`], [`iou_value`], and
-//!   [`ios_value`]. The tiled-inference merge in [`crate::tiling`] shares
-//!   these, which is what keeps its IoS metric numerically identical to the
-//!   IoU used by ordinary NMS.
+//!   [`ios_value`], shared with the tiled-inference merge in
+//!   [`crate::tiling`].
 //!
-//! [`jaccard`] is the threshold test the suppression loops use: it answers "do
-//! these overlap past `iou`?" without materializing the ratio. [`jaccard_batch4`]
-//! is the public batch form of it, one box against four.
+//! [`jaccard`] is the threshold test the suppression loops use: whether two
+//! boxes overlap past `iou`. [`jaccard_batch4`] is its batch form, one box
+//! against four.
 
 use crate::neon_dispatch::{
     column_argmax, column_hits, ge_indices_kernel, jaccard4_kernel, keep_unflagged, nms_dead,
@@ -200,18 +199,8 @@ pub(crate) fn decode_candidates<
 /// Multi-label variant of [`postprocess_boxes_index_float`].
 ///
 /// For each anchor row, emits one `(DetectBox, anchor_idx)` per class whose
-/// score meets `threshold` — every class, not just the argmax.  The same
-/// `anchor_idx` is returned for all per-class entries of a given anchor so
-/// that downstream mask-coefficient lookup can reuse the shared coefficient
-/// row.
-///
-/// The bbox is computed once per anchor (via `B::ndarray_to_xyxy_float`) and
-/// reused across all emitted classes, avoiding redundant work.
-///
-/// Intended for **validation/mAP evaluation only** (the Ultralytics `val`
-/// convention).  Deployment must use the argmax variant
-/// [`postprocess_boxes_index_float`] so trackers see at most one box per
-/// anchor.
+/// score meets `threshold`. All per-class entries of an anchor carry the
+/// same `anchor_idx` and the same bbox.
 ///
 /// An unavailable or unknown tier forced by `EDGEFIRST_DECODER_FORCE_KERNEL` runs the scalar
 /// code, which gives the same result.
@@ -278,7 +267,7 @@ pub(crate) fn multilabel_candidates<
     if !isa.is_scalar() && nc > 0 && n * nc < PAR_MIN_ROW_SCORES {
         if let Some(flat) = scores.as_slice() {
             let mut out = Vec::with_capacity(n.min(MULTILABEL_RESERVE));
-            // Hits ascend, so the anchor advances by whole rows instead of a division per hit.
+            // Hits ascend; the anchor advances by whole rows to reach each one.
             let (mut anchor, mut row_end) = (0usize, nc);
             let mut current: Option<(usize, BoundingBox)> = None;
             let flat_boxes = boxes.as_slice();
@@ -384,9 +373,7 @@ pub fn postprocess_boxes_multilabel_float<
 /// then greedily selects a subset of boxes in descending order of score.
 ///
 /// If `max_det` is `Some(n)`, the greedy loop stops as soon as `n` survivors
-/// have been confirmed. Because the input is sorted descending, the first `n`
-/// survivors are the highest-scoring `n`, so the post-NMS top-`n` is preserved
-/// without iterating the full O(N²) suppression loop.
+/// have been confirmed: the `n` highest-scoring survivors are returned.
 ///
 /// An unavailable or unknown tier forced by `EDGEFIRST_DECODER_FORCE_KERNEL` runs the scalar
 /// code, which gives the same result.
@@ -403,12 +390,10 @@ pub(crate) fn nms_float_on(
     max_det: Option<usize>,
     mut boxes: Vec<DetectBox>,
 ) -> Vec<DetectBox> {
-    // Boxes get sorted by score in descending order so we know based on the
-    // index the scoring of the boxes and can skip parts of the loop.
     sort_by_score_desc(&mut boxes, |b| b.score);
 
-    // When the iou is 1.0 or larger, no boxes will be filtered so we just return
-    // immediately
+    // An iou of 1.0 or larger suppresses nothing: return the boxes, capped
+    // at `max_det`.
     if iou >= 1.0 {
         return match max_det {
             Some(n) => {
@@ -438,18 +423,17 @@ pub(crate) fn nms_float_on(
     // Outer loop over all boxes.
     for i in 0..boxes.len() {
         if boxes[i].score < 0.0 {
-            // this box was merged with a different box earlier
+            // this box is suppressed
             continue;
         }
         for j in (i + 1)..boxes.len() {
             // Inner loop over boxes with lower score (later in the list).
 
             if boxes[j].score < 0.0 {
-                // this box was suppressed by different box earlier
+                // this box is suppressed
                 continue;
             }
             if jaccard(&boxes[j].bbox, &boxes[i].bbox, iou) {
-                // max_box(boxes[j].bbox, &mut boxes[i].bbox);
                 boxes[j].score = -1.0;
             }
         }
@@ -459,8 +443,7 @@ pub(crate) fn nms_float_on(
             break;
         }
     }
-    // Filter out suppressed boxes; cap at `max_det` because boxes after the
-    // break may still hold positive scores but score lower than every survivor.
+    // Filter out suppressed boxes and cap at `max_det`.
     boxes
         .into_iter()
         .filter(|b| b.score >= 0.0)
@@ -493,12 +476,10 @@ pub(crate) fn nms_extra_float_on<E: Send + Sync>(
     max_det: Option<usize>,
     mut boxes: Vec<(DetectBox, E)>,
 ) -> Vec<(DetectBox, E)> {
-    // Boxes get sorted by score in descending order so we know based on the
-    // index the scoring of the boxes and can skip parts of the loop.
     sort_by_score_desc(&mut boxes, |b| b.0.score);
 
-    // When the iou is 1.0 or larger, no boxes will be filtered so we just return
-    // immediately
+    // An iou of 1.0 or larger suppresses nothing: return the boxes, capped
+    // at `max_det`.
     if iou >= 1.0 {
         return match max_det {
             Some(n) => {
@@ -528,18 +509,17 @@ pub(crate) fn nms_extra_float_on<E: Send + Sync>(
     // Outer loop over all boxes.
     for i in 0..boxes.len() {
         if boxes[i].0.score < 0.0 {
-            // this box was merged with a different box earlier
+            // this box is suppressed
             continue;
         }
         for j in (i + 1)..boxes.len() {
             // Inner loop over boxes with lower score (later in the list).
 
             if boxes[j].0.score < 0.0 {
-                // this box was suppressed by different box earlier
+                // this box is suppressed
                 continue;
             }
             if jaccard(&boxes[j].0.bbox, &boxes[i].0.bbox, iou) {
-                // max_box(boxes[j].bbox, &mut boxes[i].bbox);
                 boxes[j].0.score = -1.0;
             }
         }
@@ -549,8 +529,7 @@ pub(crate) fn nms_extra_float_on<E: Send + Sync>(
         }
     }
 
-    // Filter out suppressed boxes; cap at `max_det` for the same reason as
-    // `nms_float`.
+    // Filter out suppressed boxes and cap at `max_det`.
     boxes
         .into_iter()
         .filter(|b| b.0.score >= 0.0)
@@ -561,8 +540,8 @@ pub(crate) fn nms_extra_float_on<E: Send + Sync>(
 /// Class-aware NMS: only suppress boxes with the same label.
 ///
 /// Sorts boxes by score, then greedily selects a subset of boxes in descending
-/// order of score. Unlike class-agnostic NMS, boxes are only suppressed if they
-/// have the same class label AND overlap above the IoU threshold.
+/// order of score. Boxes are only suppressed if they have the same class label
+/// and overlap above the IoU threshold.
 ///
 /// # Example
 /// ```
@@ -639,7 +618,6 @@ pub(crate) fn nms_class_aware_float_on(
             if boxes[j].score < 0.0 {
                 continue;
             }
-            // Only suppress if same class AND overlapping
             if boxes[j].label == boxes[i].label && jaccard(&boxes[j].bbox, &boxes[i].bbox, iou) {
                 boxes[j].score = -1.0;
             }
@@ -682,8 +660,8 @@ pub(crate) fn nms_extra_class_aware_float_on<E: Send + Sync>(
 ) -> Vec<(DetectBox, E)> {
     sort_by_score_desc(&mut boxes, |b| b.0.score);
 
-    // When the iou is 1.0 or larger, no boxes will be filtered so we just return
-    // immediately
+    // An iou of 1.0 or larger suppresses nothing: return the boxes, capped
+    // at `max_det`.
     if iou >= 1.0 {
         return match max_det {
             Some(n) => {
@@ -718,7 +696,6 @@ pub(crate) fn nms_extra_class_aware_float_on<E: Send + Sync>(
             if boxes[j].0.score < 0.0 {
                 continue;
             }
-            // Only suppress if same class AND overlapping
             if boxes[j].0.label == boxes[i].0.label
                 && jaccard(&boxes[j].0.bbox, &boxes[i].0.bbox, iou)
             {
@@ -738,7 +715,7 @@ pub(crate) fn nms_extra_class_aware_float_on<E: Send + Sync>(
 }
 
 /// Area of the axis-aligned intersection of two boxes, clamped to `>= 0` per
-/// side. Mirrors the `inter` term in ModelPack `metrics/tiled.py::_match`.
+/// side.
 #[must_use]
 #[inline]
 pub fn intersection_area(a: &BoundingBox, b: &BoundingBox) -> f32 {
@@ -749,15 +726,15 @@ pub fn intersection_area(a: &BoundingBox, b: &BoundingBox) -> f32 {
     (right - left).max(0.0) * (bottom - top).max(0.0)
 }
 
-/// Area of a box, clamped to `>= 0` per side. Mirrors ModelPack `_areas`.
+/// Area of a box, clamped to `>= 0` per side.
 #[must_use]
 #[inline]
 pub fn box_area(b: &BoundingBox) -> f32 {
     (b.xmax - b.xmin).max(0.0) * (b.ymax - b.ymin).max(0.0)
 }
 
-/// Intersection-over-Union value in `[0, 1]`. Mirrors ModelPack
-/// `_match(metric='iou')`: `inter / max(area_a + area_b - inter, 1e-9)`.
+/// Intersection-over-Union value in `[0, 1]`:
+/// `inter / max(area_a + area_b - inter, 1e-9)`.
 #[must_use]
 #[inline]
 pub fn iou_value(a: &BoundingBox, b: &BoundingBox) -> f32 {
@@ -766,9 +743,8 @@ pub fn iou_value(a: &BoundingBox, b: &BoundingBox) -> f32 {
     inter / union
 }
 
-/// Intersection-over-Smaller value in `[0, 1]`. Mirrors ModelPack
-/// `_match(metric='ios')`: `inter / max(min(area_a, area_b), 1e-9)`. Used by the
-/// tiled-detection merge: a seam-split object has low IoU but high IoS.
+/// Intersection-over-Smaller value in `[0, 1]`:
+/// `inter / max(min(area_a, area_b), 1e-9)`.
 #[must_use]
 #[inline]
 pub fn ios_value(a: &BoundingBox, b: &BoundingBox) -> f32 {
@@ -779,11 +755,6 @@ pub fn ios_value(a: &BoundingBox, b: &BoundingBox) -> f32 {
 
 /// Returns true if the IOU of the given bounding boxes is greater than the iou
 /// threshold
-///
-/// Kept as a standalone inline (NOT routed through [`iou_value`]) so this hot
-/// NMS primitive stays bit-identical to the NEON NMS kernel and
-/// [`jaccard_batch4`]; the value helpers above are additive and used by the
-/// tiled-detection merge.
 ///
 /// # Example
 /// ```
@@ -804,7 +775,6 @@ pub fn jaccard(a: &BoundingBox, b: &BoundingBox, iou: f32) -> bool {
     let area_a = (a.xmax - a.xmin) * (a.ymax - a.ymin);
     let area_b = (b.xmax - b.xmin) * (b.ymax - b.ymin);
 
-    // need to make sure we are not dividing by zero
     let union = area_a + area_b - intersection;
 
     intersection > iou * union
@@ -882,10 +852,7 @@ mod tests {
             .collect()
     }
 
-    /// Two boxes at the same place with the same score. Sorting is stable
-    /// enough that the first stays and the second is suppressed; a score of
-    /// exactly 0.0 must not be mistaken for the `-1.0` suppression marker at
-    /// either end of the comparison.
+    /// Two boxes at the same place with the same score.
     fn overlapping_pair(score: f32) -> Vec<DetectBox> {
         vec![
             DetectBox {
@@ -911,9 +878,7 @@ mod tests {
         ]
     }
 
-    /// A box scoring exactly 0.0 is a real detection that passed the
-    /// threshold, not a suppressed one. Treating `< 0.0` as `<= 0.0` would
-    /// skip it and leave its overlapping neighbour unsuppressed.
+    /// Overlapping boxes scoring exactly 0.0 are suppressed like any other.
     #[test]
     fn nms_float_suppresses_overlapping_zero_score_boxes() {
         let result = nms_float(0.5, None, overlapping_pair(0.0));
@@ -922,15 +887,9 @@ mod tests {
     }
 
     /// Three boxes in a chain: A overlaps B, B overlaps C, A does not reach
-    /// C. Once B is suppressed it must take no further part, or it suppresses
-    /// C on behalf of a box that is not in the output.
-    ///
-    /// The offsets carry the whole test. At 10 wide and stepping 2, A-B and
-    /// B-C are both 8/12 = 0.667 and A-C is 6/14 = 0.429, so only the
-    /// adjacent pairs clear the 0.5 threshold. Step further apart -- 0, 1 and
-    /// 9.5, say -- and B-C falls to 0.081, B cannot reach C whatever the
-    /// implementation does, and all three tests below pass with the bug they
-    /// exist to catch.
+    /// C. At 10 wide and stepping 2, A-B and B-C are both 8/12 = 0.667 and
+    /// A-C is 6/14 = 0.429, so only the adjacent pairs clear the 0.5
+    /// threshold.
     fn suppression_chain() -> Vec<DetectBox> {
         let mk = |xmin: f32, xmax: f32, score: f32| DetectBox {
             bbox: BoundingBox {
@@ -962,9 +921,8 @@ mod tests {
             .collect();
         let result = nms_extra_float(0.5, None, boxes);
         assert_eq!(result.len(), 1, "{result:?}");
-        // Both boxes score 0.0 and par_sort_by is an unstable sort, so which
-        // of the two survives is not fixed; that it carries its own payload
-        // is.
+        // Both boxes score 0.0 and the sort is unstable: either may survive,
+        // with its own payload.
         assert!(result[0].1 == 0 || result[0].1 == 1, "{result:?}");
     }
 
@@ -981,9 +939,7 @@ mod tests {
         assert_eq!(result[1].1, 2);
     }
 
-    /// Class-aware NMS with no cap still has to run the whole suppression
-    /// loop. Breaking out of it early leaves overlapping same-class boxes in
-    /// the output.
+    /// Class-aware NMS with no cap suppresses overlapping same-class boxes.
     #[test]
     fn nms_class_aware_float_suppresses_same_class_without_a_cap() {
         let mut boxes = overlapping_pair(0.9);
@@ -993,8 +949,7 @@ mod tests {
         assert_eq!(result[0].score, 0.9);
     }
 
-    /// The same two boxes with different labels are both kept: class-aware
-    /// NMS suppresses within a class, never across.
+    /// The same two boxes with different labels are both kept.
     #[test]
     fn nms_class_aware_float_keeps_overlapping_boxes_of_other_classes() {
         let mut boxes = overlapping_pair(0.9);
@@ -1017,11 +972,7 @@ mod tests {
         assert_eq!(result[1].score, 0.7);
     }
 
-    /// A box that overlaps nothing, then a pair that overlaps each other. The
-    /// first box confirms a survivor without suppressing anything, so a loop
-    /// that stops at the first survivor leaves the pair un-deduplicated while
-    /// the three-box chain above, where the first box does the suppressing,
-    /// looks identical either way.
+    /// A box that overlaps nothing, then a pair that overlaps each other.
     fn isolated_then_overlapping_pair() -> Vec<DetectBox> {
         let mk = |xmin: f32, xmax: f32, score: f32| DetectBox {
             bbox: BoundingBox {
@@ -1092,7 +1043,7 @@ mod tests {
         assert_eq!(result[1].1, 2);
     }
 
-    /// The threshold is a floor, not a cut: a score equal to it is kept.
+    /// A score equal to the threshold is kept.
     #[test]
     fn postprocess_boxes_float_keeps_a_score_equal_to_the_threshold() {
         let boxes = ndarray::array![[0.0_f32, 0.0, 10.0, 10.0], [0.0, 0.0, 10.0, 10.0]];
@@ -1145,7 +1096,6 @@ mod tests {
         assert_eq!(full.len(), capped.len());
     }
 
-    // Parity literals from ModelPack metrics/tiled.py::_match for
     // A=[100,100,400,300], B=[350,100,400,300] (B fully inside A):
     // inter=10000, area_a=60000, area_b=10000 => IoS=1.0, IoU=0.16667.
     #[test]
@@ -1180,7 +1130,7 @@ mod tests {
 
     #[test]
     fn ios_high_where_iou_low_for_contained_box() {
-        // The SAHI seam case: a small box fully inside a large one.
+        // A small box fully inside a large one.
         let big = BoundingBox::new(0.0, 0.0, 100.0, 100.0);
         let small = BoundingBox::new(10.0, 10.0, 20.0, 20.0);
         assert!((ios_value(&big, &small) - 1.0).abs() < 1e-6); // fully contained

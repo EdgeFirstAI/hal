@@ -1,14 +1,9 @@
-# SBOM and license compliance, via the org's single policy copy.
+# SBOM and license compliance, using the policy scripts and allowlist in
+# EdgeFirstAI/.github.
 #
-# The policy scripts and the allowlist live in EdgeFirstAI/.github. hal used to
-# carry its own generate_sbom.sh and check_license_policy.py, which meant the
-# same repository enforced two different policies: the org copy through the
-# Quick tier and the local copy here. They disagreed.
-#
-# Dependency-mode SBOM and license policy run in Quick (inside rust-quick).
-# This workflow is the full scancode source scan, called from release.yml (the
-# release-branch build) and available on demand. publish.yml downloads its
-# artifact rather than re-running it.
+# The full scancode source scan, called from release.yml and available on
+# demand. Dependency-mode SBOM and license policy run in Quick (inside
+# rust-quick).
 #
 # Shared workflows: EdgeFirstAI/.github, pinned in the `uses:` lines below.
 
@@ -27,13 +22,7 @@ jobs:
     uses: EdgeFirstAI/.github/.github/workflows/sbom.yml@c7876194b9fe9f7f72daf0efadaf32d7dff1b257
     with:
       mode: full
-      # A graph is resolved per target, so this Linux runner would otherwise miss
-      # every target-conditional dependency, such as the `windows-*` crates.
-      # These are the targets reaching a distributed artifact; keep in step with
-      # the Makefile's SBOM_TARGETS.
-      #
-      # Not cargo-cyclonedx's `all`, which disables platform filtering and so
-      # pulls in `[target."cfg(...)"]` blocks for cfgs no build sets.
+      # The targets reaching a distributed artifact.
       targets: >-
         x86_64-unknown-linux-gnu
         aarch64-unknown-linux-gnu
@@ -44,8 +33,7 @@ jobs:
         aarch64-apple-ios-sim
         aarch64-linux-android
         x86_64-linux-android
-      # The C-API leaves are excluded from the workspace, so `--all` never reaches
-      # them, yet they are the libraries the C archive consists of.
+      # The C-API leaf manifests.
       extra-manifests: >-
         crates/tensor-capi/Cargo.toml
         crates/image-capi/Cargo.toml
@@ -58,12 +46,6 @@ jobs:
       version-file: Cargo.toml
       source-dirs: crates tests
       timeout-minutes: 20
-      # publish.yml downloads this name to attach the SBOM to the release. It
-      # is fixed, not sbom-<sha>: the build runs on the release branch head and
-      # publish runs at the tag, which after a squash merge is a different
-      # commit, so a sha-keyed name would never be found.
+      # publish.yml downloads the artifact by this name.
       upload-name: sbom
-      # publish.yml consumes this after the release PR merges, which is
-      # human-paced; the 7-day full-mode default would expire a release held
-      # for a week and there is no rebuild to fall back on.
       retention-days: "30"

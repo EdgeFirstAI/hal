@@ -4,13 +4,13 @@
 //! Parity tests: HAL per-scale decoder vs. the Python reference at
 //! `scripts/per_scale_decode_reference.py`.
 //!
-//! Strategy: for each fixture, run both decoders on identical inputs
-//! and compare outputs at three levels:
+//! For each fixture, both decoders run on identical inputs and the outputs
+//! are compared by:
 //!   1. Per-anchor box / score / mc/proto agreement.
 //!   2. Post-NMS DetectBox list agreement under IoU/class tolerances.
 //!
-//! Tests gracefully skip when `tflite_runtime` is not available or the
-//! fixture model files are missing.
+//! Tests skip when `tflite_runtime` is not available or the fixture model
+//! files are missing.
 
 #[macro_use]
 mod common;
@@ -22,9 +22,7 @@ use common::testdata_root;
 
 const REFERENCE_SCRIPT: &str = "scripts/per_scale_decode_reference.py";
 
-/// Workspace root, resolved from this crate's manifest dir.
-/// `cargo test` sets CWD = `<workspace>/crates/decoder`, so we walk up two
-/// levels to reach the repo root where `scripts/` and `testdata/` live.
+/// Workspace root, two levels up from this crate's manifest dir.
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
@@ -43,7 +41,7 @@ fn fixtures_dir_path() -> PathBuf {
 }
 
 /// Returns true when the Python reference is runnable in this env.
-#[allow(dead_code)] // Used by Task 28 fixture tests.
+#[allow(dead_code)]
 fn python_reference_available() -> bool {
     // Prefer the project's venv if available.
     let pythons = ["./venv/bin/python", "venv/bin/python", "python", "python3"];
@@ -83,7 +81,6 @@ fn python_cmd() -> Option<PathBuf> {
 fn run_python_reference(model: &Path, image: Option<&Path>) -> Option<serde_json::Value> {
     let py = python_cmd()?;
     let mut cmd = Command::new(py);
-    // Run from the workspace root so the script's relative paths resolve.
     cmd.current_dir(workspace_root());
     cmd.arg(REFERENCE_SCRIPT).arg(model).arg("--json-out");
     if let Some(img) = image {
@@ -111,23 +108,13 @@ fn close_within_ulp(a: f32, b: f32, ulps: u32) -> bool {
     diff < f32::EPSILON * scale * (ulps as f32)
 }
 
-/// Sentinel test that documents the harness's purpose. Always passes.
+/// Gives the test binary one test that always runs.
 #[test]
 fn per_scale_parity_harness_compiles() {
-    // The harness's real value is the helpers above, exercised by tests
-    // added in Task 28 (synthetic fixtures) and Task 29 (real models).
-    // This test exists so the parity test binary always has at least one
-    // test to compile/link, even when `tflite_runtime` is unavailable.
-    // Touch a helper so it isn't dead-code-flagged on this build.
     assert!(close_within_ulp(1.0_f32, 1.0_f32, 1));
 }
 
 /// True only when the source repo is present at the compiled-in path.
-///
-/// These two tests assert *repo layout*, so they are meaningless for a
-/// cross-compiled binary deployed to a board, where only the test binary and
-/// `testdata/` exist. Without this guard they fail on every target — an
-/// assertion about the build host masquerading as a product defect.
 fn repo_is_present() -> bool {
     workspace_root().join("Cargo.toml").exists()
 }
@@ -151,17 +138,15 @@ fn fixtures_dir_exists_in_repo() {
         return;
     }
     let p = fixtures_dir_path();
-    assert!(p.exists(), "expected {p:?} to exist; created in Task 13");
+    assert!(p.exists(), "expected {p:?} to exist");
 }
 
 // ────────────────────────────────────────────────────────────────────
 // Synthetic-fixture HAL parity tests
 // ────────────────────────────────────────────────────────────────────
 //
-// These tests exercise the full per-scale decoder pipeline (build →
-// run → NMS → DetectBox) against hand-computed golden values for
-// synthetic int8 inputs. They are independent of the Python reference;
-// the Python parity oracle covers real models in Task 29.
+// These tests run the full per-scale decoder pipeline (build → run → NMS →
+// DetectBox) against hand-computed golden values for synthetic int8 inputs.
 
 use edgefirst_decoder::per_scale::DecodeDtype;
 use edgefirst_decoder::{schema::SchemaV2, DecoderBuilder, DetectBox, Nms};
@@ -169,10 +154,8 @@ use edgefirst_tensor::{
     Quantization as TQ, Tensor, TensorDyn, TensorMapTrait, TensorMemory, TensorTrait,
 };
 
-/// Construct a minimal LTRB-detection-only per-scale schema with one
-/// FPN level (stride=8, h=w=1, NC=2). Used as a deterministic golden
-/// test where we know exactly what the decoder should output for any
-/// given input.
+/// A minimal LTRB-detection-only per-scale schema with one FPN level
+/// (stride=8, h=w=1, NC=2).
 fn minimal_ltrb_schema_one_level() -> &'static str {
     r#"{
         "schema_version": 2,
@@ -229,7 +212,7 @@ fn synthetic_ltrb_one_anchor_zero_input_gives_zero_box_at_centre() {
         .with_schema(schema)
         .with_decode_dtype(DecodeDtype::F32)
         .with_iou_threshold(0.7)
-        .with_score_threshold(0.0001) // low so 0.5 sigmoid passes
+        .with_score_threshold(0.0001)
         .with_nms(Some(Nms::ClassAgnostic))
         .build()
         .expect("build");
@@ -239,7 +222,6 @@ fn synthetic_ltrb_one_anchor_zero_input_gives_zero_box_at_centre() {
     box_t.set_quantization(TQ::per_tensor(0.1, 0)).unwrap();
     let mut score_t = Tensor::<i8>::new(&[1, 1, 1, 2], Some(TensorMemory::Mem), None).unwrap();
     score_t.set_quantization(TQ::per_tensor(0.1, 0)).unwrap();
-    // Set score logit slightly positive so post-sigmoid > 0.5 and survives NMS.
     {
         let mut m = score_t.map().unwrap();
         m.as_mut_slice()[0] = 50; // dequant: 5.0 → sigmoid: ~0.99
@@ -255,7 +237,6 @@ fn synthetic_ltrb_one_anchor_zero_input_gives_zero_box_at_centre() {
         .decode(&inputs, &mut output_boxes, &mut masks)
         .expect("decode");
 
-    // Expect exactly one detection (only one anchor, with score above threshold).
     assert_eq!(
         output_boxes.len(),
         1,
@@ -264,12 +245,8 @@ fn synthetic_ltrb_one_anchor_zero_input_gives_zero_box_at_centre() {
     );
     let det = &output_boxes[0];
 
-    // Box at centre (4, 4), zero-size after dist2bbox.
-    // The bridge feeds XYWH (xc, yc, w, h) into impl_yolo_segdet_get_boxes which
-    // converts to XYXY: xmin=xc-w/2, ymin=yc-h/2, xmax=xc+w/2, ymax=yc+h/2.
-    // For zero w/h pixel-space: xmin = xmax = 4, ymin = ymax = 4.
-    // EDGEAI-1303: per_scale path normalizes by input dims (8x8 here),
-    // so the user-facing bbox is 4/8 = 0.5 across all corners.
+    // Pixel-space box (4, 4, 4, 4), normalized by the 8x8 input: 0.5 at every
+    // corner.
     assert!(
         (det.bbox.xmin - 0.5).abs() < 1e-3,
         "xmin = {}",
@@ -344,10 +321,7 @@ fn synthetic_ltrb_distances_produce_expected_box() {
 
     assert_eq!(output_boxes.len(), 1);
     let det = &output_boxes[0];
-    // EDGEAI-1303: per_scale path normalizes by input dims (8x8 here).
     // Pixel-space (-4, -4, 28, 28) → normalized (-0.5, -0.5, 3.5, 3.5).
-    // YOLO can predict boxes outside the canvas for objects near the
-    // border; the normalization preserves that out-of-range information.
     assert!(
         (det.bbox.xmin - (-0.5)).abs() < 1e-2,
         "xmin = {}",
@@ -375,20 +349,12 @@ fn synthetic_ltrb_distances_produce_expected_box() {
 // NCHW layout coverage
 // ────────────────────────────────────────────────────────────────────
 //
-// HAL added per-level NCHW support via a transpose-to-scratch
-// path (NHWC kernels stay unmodified; the pipeline transposes NCHW
-// children into a per-dtype scratch before dispatching). These tests
-// build paired NHWC and NCHW schemas with the same logical content,
-// feed bit-equivalent tensor data in both layouts, and assert the
-// decoded `DetectBox` lists match exactly. A regression here points at
-// either the transpose helper, the layout detection in `plan.rs`, or
-// the scratch-buffer plumbing in `pipeline.rs`.
+// These tests build paired NHWC and NCHW schemas with the same logical
+// content, feed equivalent tensor data in both layouts, and assert the
+// decoded `DetectBox` lists match exactly.
 
-/// LTRB schema with one stride-8 level, h=w=2, NC=2, NCHW children.
-///
-/// Children dshape `[batch, box_coords, height, width]` (NCHW) instead of
-/// the canonical `[batch, height, width, box_coords]` (NHWC). Same
-/// quantization, same logical content; only the byte layout differs.
+/// LTRB schema with one stride-8 level, h=w=2, NC=2, NCHW children:
+/// dshape `[batch, box_coords, height, width]`.
 fn minimal_ltrb_schema_one_level_2x2_nchw() -> &'static str {
     r#"{
         "schema_version": 2,
@@ -432,8 +398,8 @@ fn minimal_ltrb_schema_one_level_2x2_nchw() -> &'static str {
     }"#
 }
 
-/// NHWC pair of the schema above. Identical logical content; only the
-/// children's `shape` and `dshape` ordering differ.
+/// NHWC pair of the schema above: only the children's `shape` and `dshape`
+/// ordering differ.
 fn minimal_ltrb_schema_one_level_2x2_nhwc() -> &'static str {
     r#"{
         "schema_version": 2,
@@ -477,9 +443,8 @@ fn minimal_ltrb_schema_one_level_2x2_nhwc() -> &'static str {
     }"#
 }
 
-/// Per-anchor logical box int8s (NHWC anchor-major, channel-contiguous).
-/// 4 anchors × 4 LTRB channels = 16 elements. Each anchor has a distinct
-/// box so we can confirm the binding stays intact under transpose.
+/// Per-anchor logical box int8s (NHWC anchor-major, channel-contiguous):
+/// 4 anchors × 4 LTRB channels, a distinct box per anchor.
 const NCHW_BOX_DATA_BY_ANCHOR: [[i8; 4]; 4] = [
     [10, 10, 30, 30], // anchor 0: L=1, T=1, R=3, B=3
     [5, 5, 15, 15],   // anchor 1: L=0.5, T=0.5, R=1.5, B=1.5
@@ -595,7 +560,6 @@ fn synthetic_ltrb_nchw_and_nhwc_produce_identical_detections() {
         &nchw_score,
     );
 
-    // Same number of detections, same labels, same scores, same boxes.
     assert_eq!(
         nhwc_dets.len(),
         nchw_dets.len(),
@@ -628,7 +592,6 @@ fn synthetic_ltrb_nchw_and_nhwc_produce_identical_detections() {
             "det[{i}] ymax mismatch"
         );
     }
-    // Sanity: anchor 0 had the only winning class-1 score and produces a box.
     assert!(!nhwc_dets.is_empty(), "expected at least one detection");
 }
 
@@ -636,19 +599,9 @@ fn synthetic_ltrb_nchw_and_nhwc_produce_identical_detections() {
 // Real-model Python smoke (skip-capable)
 // ────────────────────────────────────────────────────────────────────
 //
-// These tests load real TFLite fixtures when present at
-// `testdata/per_scale/<model>.tflite`. They run the Python reference
-// on the model as an environment smoke check only.
-//
-// Fixtures are NOT committed (large binaries; see README in
-// testdata/per_scale/). The validator team supplies them; tests
-// skip cleanly when absent.
-//
-// NOTE: the HAL doesn't load TFLite models directly. This
-// test invokes the Python reference (which DOES load TFLite) for both
-// the inference and the decode steps; the HAL comparison piece is a
-// TODO marker that requires the inference layer to extract raw int8
-// outputs and hand them to the HAL via `apply_schema_quant`.
+// These tests load TFLite fixtures when present at
+// `testdata/per_scale/<model>.tflite` and run the Python reference on the
+// model. They skip when the fixtures are absent.
 
 #[test]
 #[ignore = "external real-model fixture; this is Python-only smoke and does not exercise HAL decode"]
@@ -679,10 +632,7 @@ fn parity_yolov8n_seg_per_scale_int8() {
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
     skip_note!("python reference detected {n} boxes on synthetic input");
-    // TODO: after the inference layer is integrated, run
-    // HAL on the same synthetic input and compare detection counts +
-    // per-detection scores within ~2 ulp f32. Currently we just
-    // verify the Python side runs cleanly.
+    // TODO: run HAL on the same input and compare with the Python reference.
 }
 
 #[test]
@@ -1133,8 +1083,7 @@ fn greedy_match_detections(
             );
         }
     }
-    // Order fixture detections by their best IoU descending so confident
-    // pairs claim their HAL counterpart first.
+    // Fixture detections in descending order of their best IoU.
     let mut order: Vec<usize> = (0..n).collect();
     order.sort_by(|&a, &b| {
         let ma = iou[a].iter().cloned().fold(0.0f32, f32::max);
@@ -1175,25 +1124,13 @@ fn greedy_match_detections(
     (matched, mean_iou, class_match)
 }
 
-/// End-to-end parity assertion: HAL `decode_proto` output should agree
-/// with the fixture's reference detections within tolerances that
-/// account for ULP-level NMS-survivor differences between the Rust and
-/// NumPy implementations.
-///
-/// Tolerances:
-/// - Detection count within ±25% of the fixture's count (HAL may keep
-///   slightly more or fewer survivors at the post-NMS cap).
-/// - At least 80% of fixture detections must have a HAL match at IoU ≥
-///   0.5 (greedy pairing).
-/// - Mean IoU on matched pairs ≥ 0.85 (the per-scale kernels are
-///   numerically equivalent; only NMS-survivor selection drifts).
-/// - Class agreement on matched pairs ≥ 90%.
-///
-/// These tolerances are looser than the synthetic-fixture parity tests
-/// because Rust's f32 NMS and NumPy's f32 NMS occasionally pick
-/// different survivors at the score-tie boundary; the underlying
-/// per-scale kernel output is verified strictly by
-/// `*_pre_nms_parity` tests.
+/// Asserts that HAL `decode_proto` output agrees with the fixture's
+/// reference detections:
+/// - detection count within ±25% of the fixture's count;
+/// - at least 80% of fixture detections have a HAL match at IoU ≥ 0.5
+///   (greedy pairing);
+/// - mean IoU on matched pairs ≥ 0.85;
+/// - class agreement on matched pairs ≥ 90%.
 fn assert_end_to_end_parity(fix: &common::per_scale_fixture::PerScaleFixture, model_label: &str) {
     let hal_boxes = decode_with_nms(fix, model_label, Nms::ClassAgnostic);
 
@@ -1201,8 +1138,7 @@ fn assert_end_to_end_parity(fix: &common::per_scale_fixture::PerScaleFixture, mo
     let n_fix = dec.boxes_xyxy.shape()[0];
     let n_hal = hal_boxes.len();
 
-    // Detection-count tolerance: ±25% of the fixture count, with a
-    // floor of 8 to handle small fixtures.
+    // Detection-count tolerance: ±25% of the fixture count, with a floor of 8.
     let lo = ((n_fix as f32) * 0.75).floor() as usize;
     let hi = (((n_fix as f32) * 1.25).ceil() as usize).max(n_fix + 8);
     assert!(
@@ -1243,13 +1179,8 @@ fn decode_with_nms(
     let schema: SchemaV2 = serde_json::from_str(fix.schema_json())
         .expect("fixture schema_json must parse as SchemaV2");
     let nms = fix.nms_config();
-    // The fixtures were generated by the Python reference, which does
-    // not apply a pre-NMS top-K cap — it runs NMS over the entire
-    // candidate pool above `score_threshold`. PR #59/#60 added
-    // `pre_nms_top_k` (default 300) to HAL's NMS path; replicating the
-    // fixture's regime requires lifting that cap. Use a very large
-    // value (effectively unbounded) and set `max_det` to the fixture's
-    // declared max_detections so the post-NMS survivor count matches.
+    // An effectively unbounded pre-NMS cap, and the fixture's max_detections
+    // as `max_det`.
     let pre_nms_cap = 100_000_usize;
     let max_det = nms.max_detections as usize;
     let decoder = DecoderBuilder::default()
@@ -1270,14 +1201,8 @@ fn decode_with_nms(
     decoder
         .decode_proto(&inputs, &mut boxes)
         .unwrap_or_else(|e| panic!("{model_label}: decode_proto: {e}"));
-    // EDGEAI-1303: HAL now emits normalized [0, 1] bboxes from the
-    // per-scale path (per `per_scale_to_proto_data`'s
-    // `maybe_normalize_boxes_in_place` call). The existing
-    // safetensors fixtures store *pixel-space* reference coords from
-    // the pre-fix Python pipeline, so convert HAL output back to
-    // pixel space here for the IoU comparison. The HAL output is
-    // semantically correct; only the parity test needs unit
-    // alignment.
+    // Converts HAL's normalized boxes to pixel space, the space of the
+    // fixture's reference coordinates.
     if let Some((w, h)) = decoder.input_dims() {
         let (w, h) = (w as f32, h as f32);
         for b in &mut boxes {
@@ -1493,13 +1418,8 @@ fn yolov8n_seg_per_scale_smoke_detection_count() {
     );
 }
 
-/// Per-scale `decode()` (the fused mask-materialisation entrypoint)
-/// must succeed end-to-end for a real-model fixture and emit one
-/// `Segmentation` per `DetectBox`. Regression test for the missing
-/// `maybe_normalize_boxes_in_place` step in `per_scale_to_masks`
-/// flagged by Copilot's review of PR #63 — the per-scale path emits
-/// pixel-space coords by design, and `protobox` would reject them
-/// with `InvalidShape("…un-normalized…")` without normalization.
+/// Asserts that per-scale `decode()` succeeds for a real-model fixture and
+/// emits one `Segmentation` per `DetectBox`.
 fn assert_per_scale_decode_with_masks_succeeds(model_label: &str, fixture_filename: &str) {
     use edgefirst_decoder::per_scale::DecodeDtype;
     use edgefirst_decoder::{schema::SchemaV2, DecoderBuilder, DetectBox, Nms, Segmentation};
@@ -1525,17 +1445,11 @@ fn assert_per_scale_decode_with_masks_succeeds(model_label: &str, fixture_filena
         .build()
         .expect("build decoder");
 
-    // Sanity: schema-derived input_dims must be present for normalization
-    // to take effect (per-scale builder forces the internal normalized
-    // policy to Some(false) so the in-place divisor runs). With both
-    // pieces in place, the public accessor reports the post-decode
-    // contract: Some(true), i.e. boxes already in [0, 1] when the
-    // caller receives them.
     assert_eq!(decoder.normalized_boxes(), Some(true));
     assert!(
         decoder.input_dims().is_some(),
         "{model_label} fixture schema must declare input dims so the \
-         per-scale bridge can normalize pixel-space boxes (EDGEAI-1303)"
+         per-scale bridge can normalize pixel-space boxes"
     );
 
     let owned_tensors = fix.build_tensors_with_quant().expect("build tensors");
@@ -1559,13 +1473,7 @@ fn assert_per_scale_decode_with_masks_succeeds(model_label: &str, fixture_filena
         fix.expected_count_min
     );
 
-    // Boxes must be in normalized range — proves the bridge's
-    // EDGEAI-1303 normalization step ran. The check distinguishes
-    // "normalized" (≈[0, 1], with YOLO occasionally predicting slightly
-    // past the image edge) from "pixel-space" (≈[0, 640] for typical
-    // YOLO input dims). A loose ±2.0 envelope is more than enough for
-    // edge-of-image detections while still rejecting any pixel-space
-    // value (which would be > 100).
+    // Every box coordinate lies in the normalized range, within ±2.0.
     let in_norm_range = |v: f32| (-2.0..=2.0).contains(&v);
     for b in &output_boxes {
         assert!(
@@ -1627,18 +1535,7 @@ fn yolov8n_seg_per_scale_pre_nms_parity() {
     assert_pre_nms_parity(&fix, "yolov8n-seg");
 }
 
-/// Verify that `pre_nms_top_k` settings don't silently destroy
-/// detection quality.  The default of 300 was introduced for O(N²)
-/// NMS performance (PR #59/#60), but with low score thresholds
-/// (0.001) used for mAP validation it truncates valid candidates and
-/// depresses recall.
-///
-/// This test decodes the fixture with several `pre_nms_top_k` values
-/// and asserts that the detection count doesn't collapse at settings
-/// that should be "safe".  The unbounded baseline (100 000) is the
-/// ground truth; 3000 should retain ≥ 99% and even 1000 should keep
-/// the majority (≥ 50%).  The default of 300 is expected to lose
-/// significant detections.
+/// Detection counts at several `pre_nms_top_k` values: 0 and 8400 match the unbounded count, 3000 keeps ≥ 99%, 1000 keeps ≥ 50% and 300 keeps < 50%.
 #[test]
 fn yolov8n_seg_pre_nms_top_k_sensitivity() {
     use edgefirst_decoder::per_scale::DecodeDtype;
@@ -1667,7 +1564,7 @@ fn yolov8n_seg_pre_nms_top_k_sensitivity() {
             .with_score_threshold(nms_config.score_threshold)
             .with_nms(Some(Nms::ClassAgnostic))
             .with_pre_nms_top_k(top_k)
-            .with_max_det(100_000) // uncapped so we measure pre_nms_top_k, not max_det
+            .with_max_det(100_000) // uncapped
             .build()
             .unwrap_or_else(|e| panic!("build decoder (top_k={top_k}): {e}"));
         let owned_tensors = fix.build_tensors_with_quant().expect("build tensors");
@@ -1692,27 +1589,21 @@ fn yolov8n_seg_pre_nms_top_k_sensitivity() {
          1000={n_1000}, 300={n_300}"
     );
 
-    // Unbounded must produce meaningful detections.
     assert!(
         n_unbounded >= fix.expected_count_min as usize,
         "unbounded pre_nms_top_k produced only {n_unbounded} detections"
     );
 
-    // pre_nms_top_k=0 means no limit and must match unbounded.
     assert_eq!(
         n_zero, n_unbounded,
         "pre_nms_top_k=0 (no limit) should match unbounded ({n_unbounded}), got {n_zero}"
     );
 
-    // 8400 (all anchors) should match unbounded exactly.
     assert_eq!(
         n_8400, n_unbounded,
         "pre_nms_top_k=8400 should match unbounded ({n_unbounded}), got {n_8400}"
     );
 
-    // 3000 should retain nearly all detections (≥ 99%).
-    // 1000 may lose some candidates since the fixture produces > 1000
-    // score-passing anchors, but should keep the majority (≥ 50%).
     let ratio_3000 = n_3000 as f32 / n_unbounded as f32;
     let ratio_1000 = n_1000 as f32 / n_unbounded as f32;
     assert!(
@@ -1726,7 +1617,6 @@ fn yolov8n_seg_pre_nms_top_k_sensitivity() {
         ratio_1000 * 100.0
     );
 
-    // The default 300 loses significant detections (the known issue).
     let ratio_300 = n_300 as f32 / n_unbounded as f32;
     assert!(
         ratio_300 < 0.50,
@@ -1837,9 +1727,7 @@ fn yolo11n_seg_per_scale_decode_with_masks_succeeds() {
 // yolo26n-seg per-scale parity (LTRB-encoded, fixture-backed)
 // ────────────────────────────────────────────────────────────────────
 //
-// yolo26 uses LTRB box encoding (no DFL stage). The fixture's
-// intermediates omit the `boxes_<lvl>.ltrb` key — only `dequant` and
-// `xywh` exist for LTRB. The tests below are encoding-agnostic.
+// yolo26 uses LTRB box encoding (no DFL stage).
 
 #[test]
 fn yolo26n_seg_per_scale_smoke_detection_count() {
@@ -1924,10 +1812,7 @@ fn yolo26n_seg_per_scale_pre_nms_parity() {
     assert_pre_nms_parity(&fix, "yolo26n-seg");
 }
 
-/// LTRB-encoded model exercising the same `Decoder::decode` path through
-/// `per_scale_to_masks`. yolo26's LTRB box-decode kernels differ from
-/// the yolov8 / yolo11 DFL path, so this guards the alternate encoding
-/// against regressions in mask materialization specifically.
+/// `Decoder::decode` with masks succeeds for the LTRB-encoded model.
 #[test]
 fn yolo26n_seg_per_scale_decode_with_masks_succeeds() {
     assert_per_scale_decode_with_masks_succeeds("yolo26n-seg", "yolo26n-seg.safetensors");
@@ -1937,11 +1822,10 @@ fn yolo26n_seg_per_scale_decode_with_masks_succeeds() {
 // Multi-label decode tests
 // ────────────────────────────────────────────────────────────────────
 //
-// These tests use the same NHWC 2×2 fixture
-// (`minimal_ltrb_schema_one_level_2x2_nhwc`) so they run without any
-// external model files.
+// These tests use the NHWC 2×2 fixture
+// (`minimal_ltrb_schema_one_level_2x2_nhwc`).
 
-/// Helper: build an argmax or multi-label decoder from the 2×2 NHWC schema.
+/// Build an argmax or multi-label decoder from the 2×2 NHWC schema.
 fn build_2x2_decoder(multi_label: bool) -> edgefirst_decoder::Decoder {
     use edgefirst_decoder::per_scale::DecodeDtype;
     let schema: SchemaV2 = serde_json::from_str(minimal_ltrb_schema_one_level_2x2_nhwc()).unwrap();
@@ -1949,7 +1833,6 @@ fn build_2x2_decoder(multi_label: bool) -> edgefirst_decoder::Decoder {
         .with_schema(schema)
         .with_decode_dtype(DecodeDtype::F32)
         .with_iou_threshold(0.7)
-        // Low threshold so both classes of anchor 0 survive
         .with_score_threshold(0.01)
         .with_nms(Some(Nms::ClassAware))
         .with_pre_nms_top_k(0) // unbounded
@@ -1964,11 +1847,8 @@ fn build_2x2_decoder(multi_label: bool) -> edgefirst_decoder::Decoder {
 /// Score layout NHWC [1,2,2,2] (anchors row-major, NC=2):
 ///   anchor 0: class 0 logit = 50 → sigmoid≈0.99, class 1 logit = 40 → sigmoid≈0.98
 ///   anchor 1: class 0 logit = 30 → sigmoid≈0.95, class 1 logit = 0  → sigmoid=0.5
-///   anchor 2: all 0 (sigmoid=0.5 > 0.01 too — but boxes will overlap so NMS may drop)
+///   anchor 2: all 0 (sigmoid=0.5)
 ///   anchor 3: all 0
-///
-/// The test asserts argmax → 2 candidates, multi-label → ≥ 3 candidates
-/// (the ≥ accounts for anchor 2/3's 0.5-score entries also passing the low threshold).
 fn make_multi_label_score_tensor() -> TensorDyn {
     // NHWC [1, 2, 2, 2]: row-major over h×w, then NC per cell
     let data: Vec<i8> = vec![
@@ -1990,21 +1870,10 @@ fn make_multi_label_score_tensor() -> TensorDyn {
 fn make_zero_box_tensor() -> TensorDyn {
     let mut t = Tensor::<i8>::new(&[1, 2, 2, 4], Some(TensorMemory::Mem), None).unwrap();
     t.set_quantization(TQ::per_tensor(0.1, 0)).unwrap();
-    // Already zeroed by default
     TensorDyn::I8(t)
 }
 
-/// Multi-label emits more candidates than argmax when multiple classes exceed
-/// the threshold for the same anchor.
-///
-/// Scores are dequantized and sigmoid-activated before the `0.01` threshold,
-/// so even a logit of 0 (sigmoid 0.5) clears it — the threshold excludes
-/// nothing in this fixture. Anchor 0 has two classes above threshold (logits
-/// 50 and 40); multi-label emits one entry per (anchor, class) above threshold,
-/// so anchor 0 contributes two candidates where argmax (top class per anchor)
-/// contributes one. Hence multi-label yields strictly more candidates — the
-/// only property asserted here; exact totals depend on class-aware NMS over the
-/// overlapping zero-boxes (see `make_multi_label_score_tensor`).
+/// Multi-label emits more candidates than argmax when several classes of one anchor exceed the threshold.
 #[test]
 fn multi_label_count_exceeds_argmax() {
     let box_t = make_zero_box_tensor();
@@ -2025,17 +1894,13 @@ fn multi_label_count_exceeds_argmax() {
         .decode(&inputs, &mut ml_boxes, &mut masks)
         .expect("multilabel decode");
 
-    // Multi-label emits one candidate per (anchor, class) above threshold, so
-    // anchor 0 alone contributes both class 0 and class 1 — strictly more than
-    // argmax's one-per-anchor. (Exact totals depend on NMS; this test only
-    // asserts multi-label > argmax.)
     assert!(
         ml_boxes.len() > argmax_boxes.len(),
         "multi-label ({}) should yield more candidates than argmax ({})",
         ml_boxes.len(),
         argmax_boxes.len()
     );
-    // Sanity: argmax anchor 0 takes class 0 (highest logit = 50)
+    // Argmax takes class 0 for anchor 0.
     let argmax_anchor0 = argmax_boxes
         .iter()
         .find(|b| b.score > 0.98)
@@ -2044,26 +1909,14 @@ fn multi_label_count_exceeds_argmax() {
         argmax_anchor0.label, 0,
         "argmax should pick class 0 (highest logit)"
     );
-    // Multi-label should include both class 0 and class 1 for anchor 0
+    // Multi-label includes both class 0 and class 1 for anchor 0.
     let has_class0 = ml_boxes.iter().any(|b| b.label == 0 && b.score > 0.98);
     let has_class1 = ml_boxes.iter().any(|b| b.label == 1 && b.score > 0.95);
     assert!(has_class0, "multi-label must include class 0 from anchor 0");
     assert!(has_class1, "multi-label must include class 1 from anchor 0");
 }
 
-/// Tracker safety: documents why deployment must stay on argmax.
-///
-/// Simulates 3 frames of a single object.  With argmax each frame produces
-/// exactly 1 detection → ByteTrack creates exactly 1 track that is matched
-/// across all 3 frames (stable UUID, count ≥ 3).
-///
-/// With multi-label the same anchor emits 2 detections (class 0 and class 1)
-/// per frame.  ByteTrack matches IoU-only (it ignores label) so the second
-/// box for the same anchor still occupies the same pixel region and spawns an
-/// additional phantom track.
-///
-/// Why `decode_tracked` forces argmax regardless of the decoder's
-/// `multi_label` setting.
+/// Over 3 frames of one object, argmax detections give one track and multi-label detections give more.
 #[cfg(feature = "tracker")]
 #[test]
 fn tracker_regression_argmax_one_track_multilabel_spawns_extra() {
@@ -2076,8 +1929,6 @@ fn tracker_regression_argmax_one_track_multilabel_spawns_extra() {
     let argmax_dets: Vec<MockDetection> = vec![MockDetection::new(bbox, 0.9, 0)];
 
     // Multi-label: two detections per frame — same bbox, labels 0 and 1.
-    // This mirrors what `postprocess_boxes_multilabel_index_float` produces
-    // for an anchor where both class 0 and class 1 score above threshold.
     let multilabel_dets: Vec<MockDetection> = vec![
         MockDetection::new(bbox, 0.9, 0),
         MockDetection::new(bbox, 0.85, 1), // second class, same anchor region
@@ -2117,16 +1968,6 @@ fn tracker_regression_argmax_one_track_multilabel_spawns_extra() {
     }
 
     let ml_tracks = ml_tracker.get_active_tracks();
-    // Multi-label produces 2 boxes per frame for the same anchor region.
-    // ByteTrack matches IoU-only: the first-pass match absorbs one box;
-    // the second (overlapping) box creates a second track. Both survive
-    // because the anchor region is identical and the IoU between them is 1.0
-    // — but tracklet management means one absorbs the other's box via
-    // first-pass matching while the other goes unmatched and eventually
-    // either stays as a second live track or is absorbed. Either way the
-    // count of *ever-created* tracks exceeds 1.  We test live tracks here:
-    // in practice, the second overlapping box keeps re-seeding a phantom
-    // track every frame so `get_active_tracks` will return > 1.
     assert!(
         ml_tracks.len() > argmax_tracks.len(),
         "multi-label should produce more phantom tracks ({}) than argmax ({}); \
@@ -2136,10 +1977,7 @@ fn tracker_regression_argmax_one_track_multilabel_spawns_extra() {
     );
 }
 
-/// Argmax decode (multi_label=false, the default) must be bit-identical to
-/// the same decoder built without calling `with_multi_label` at all.
-///
-/// Guards that adding the field does not change any default behaviour.
+/// Argmax decode with `with_multi_label(false)` is bit-identical to a decoder built without the call.
 #[test]
 fn argmax_regression_bit_identical_with_and_without_flag() {
     use edgefirst_decoder::per_scale::DecodeDtype;
@@ -2173,8 +2011,8 @@ fn argmax_regression_bit_identical_with_and_without_flag() {
     };
     let inputs: Vec<&TensorDyn> = vec![&box_t, &score_t];
 
-    let default_dec = make(None); // never calls with_multi_label — the pure default path
-    let explicit_argmax = make(Some(false)); // explicitly exercises with_multi_label(false)
+    let default_dec = make(None); // never calls with_multi_label
+    let explicit_argmax = make(Some(false)); // calls with_multi_label(false)
 
     let mut boxes_default: Vec<DetectBox> = Vec::with_capacity(10);
     let mut boxes_explicit: Vec<DetectBox> = Vec::with_capacity(10);
@@ -2203,15 +2041,14 @@ fn argmax_regression_bit_identical_with_and_without_flag() {
 }
 
 // ────────────────────────────────────────────────────────────────────
-// WS2: per-channel DFL dequantization tests
+// Per-channel DFL dequantization tests
 // ────────────────────────────────────────────────────────────────────
 
 /// Minimal DFL schema: 1 level (stride=8, h=1, w=1, reg_max=4, NC=1).
 /// Box channels = 4 * 4 = 16. Per-channel scales: scale[i] = 0.01*(i+1).
 ///
-/// Parent logical uses `box_coords: 4` (the decoded coord count) and
-/// child uses `num_features: 16` (the raw DFL bin count) — matching the
-/// synthetic_yolov8n_schema.json fixture convention.
+/// The parent logical uses `box_coords: 4` (the decoded coord count) and the
+/// child uses `num_features: 16` (the raw DFL bin count).
 fn minimal_dfl_schema_per_channel() -> String {
     // Build the 16-element scale array: [0.01, 0.02, ..., 0.16]
     let scales: Vec<String> = (1..=16)
@@ -2305,8 +2142,7 @@ fn compute_per_channel_golden(input: &[i8], scales: &[f32]) -> [f32; 4] {
     [xc, yc, w, h]
 }
 
-/// Verify that per-channel DFL decode matches a hand-rolled golden, and
-/// that per-tensor decode diverges measurably when scales are non-uniform.
+/// Per-channel DFL decode matches a hand-computed golden, and per-tensor decode of the same data diverges.
 #[test]
 fn dfl_per_channel_dequant_matches_golden_and_per_tensor_diverges() {
     use edgefirst_tensor::Quantization as TQ;
@@ -2319,11 +2155,8 @@ fn dfl_per_channel_dequant_matches_golden_and_per_tensor_diverges() {
     // Input int8 values: input[i] = i as i8 (0..15)
     let input_data: Vec<i8> = (0i8..16).collect();
 
-    // Hand-compute the expected per-channel golden.
     let golden = compute_per_channel_golden(&input_data, &scales);
 
-    // Per-channel quant is honored automatically from the box tensor's
-    // metadata — no flag, it is never optional.
     let schema_pc: SchemaV2 = serde_json::from_str(&schema_json).unwrap();
     let decoder_pc = DecoderBuilder::default()
         .with_schema(schema_pc)
@@ -2349,7 +2182,7 @@ fn dfl_per_channel_dequant_matches_golden_and_per_tensor_diverges() {
     score_t.set_quantization(TQ::per_tensor(0.1, 0)).unwrap();
     {
         let mut m = score_t.map().unwrap();
-        m.as_mut_slice()[0] = 50i8; // sigmoid(5.0) ≈ 0.993 — survives threshold
+        m.as_mut_slice()[0] = 50i8; // sigmoid(5.0) ≈ 0.993
     }
 
     let dyn_box_pc = TensorDyn::I8(box_t_pc);
@@ -2387,9 +2220,7 @@ fn dfl_per_channel_dequant_matches_golden_and_per_tensor_diverges() {
         golden[3]
     );
 
-    // Run a per-tensor-quantized box tensor (single scale=0.01); the pipeline
-    // selects the scalar fast path automatically because the metadata is
-    // per-tensor. This demonstrates the two paths diverge on the same raw data.
+    // The same schema with a per-tensor-quantized box tensor (single scale 0.01).
     let schema_pt: SchemaV2 = serde_json::from_str(&schema_json).unwrap();
     let decoder_pt = DecoderBuilder::default()
         .with_schema(schema_pt)
@@ -2400,14 +2231,13 @@ fn dfl_per_channel_dequant_matches_golden_and_per_tensor_diverges() {
         .build()
         .expect("build per-tensor decoder");
 
-    // Same box tensor but with per-tensor quantization (scale=0.01, the first element).
     let mut box_t_pt = Tensor::<i8>::new(&[1, 1, 1, 16], Some(TensorMemory::Mem), None).unwrap();
     box_t_pt.set_quantization(TQ::per_tensor(0.01, 0)).unwrap();
     {
         let mut m = box_t_pt.map().unwrap();
         m.as_mut_slice().copy_from_slice(&input_data);
     }
-    // Build a fresh score tensor for the per-tensor run (score_t was moved above).
+    // The score tensor for the per-tensor run.
     let mut score_t2 = Tensor::<i8>::new(&[1, 1, 1, 1], Some(TensorMemory::Mem), None).unwrap();
     score_t2.set_quantization(TQ::per_tensor(0.1, 0)).unwrap();
     {
@@ -2427,8 +2257,6 @@ fn dfl_per_channel_dequant_matches_golden_and_per_tensor_diverges() {
     let w_pt = pre_pt.boxes_xywh[[0, 2]];
     let h_pt = pre_pt.boxes_xywh[[0, 3]];
 
-    // The per-tensor path uses a single uniform scale (0.01) for all bins;
-    // when scales differ across bins the results must diverge measurably.
     let max_diff = [
         (xc_pc - xc_pt).abs(),
         (yc_pc - yc_pt).abs(),
@@ -2447,9 +2275,7 @@ fn dfl_per_channel_dequant_matches_golden_and_per_tensor_diverges() {
     );
 }
 
-/// Regression: the per-tensor scalar fast path is used for per-tensor-quantized
-/// tensors. Uses the same LTRB schema as
-/// `synthetic_ltrb_one_anchor_zero_input_gives_zero_box_at_centre`.
+/// A per-tensor-quantized box tensor decodes through the per-tensor path.
 #[test]
 fn dfl_per_tensor_path_uses_scalar_fast_path() {
     let schema_json = minimal_ltrb_schema_one_level();
@@ -2483,7 +2309,7 @@ fn dfl_per_tensor_path_uses_scalar_fast_path() {
         .decode(&inputs, &mut output_boxes, &mut masks)
         .expect("decode");
 
-    // Exactly one detection, centered at (0.5, 0.5) normalized (same as baseline test).
+    // One detection, centered at (0.5, 0.5) normalized.
     assert_eq!(output_boxes.len(), 1, "expected 1 detection");
     let det = &output_boxes[0];
     assert!(
@@ -2652,8 +2478,7 @@ fn yolo26n_f16_decode_tracks_f32() {
     assert_f16_tracks_f32("yolo26n-seg");
 }
 
-/// A builder given no dtype decodes in `DecodeDtype::native`, and `with_decode_dtype` overrides
-/// it either way.
+/// A builder given no dtype decodes in `DecodeDtype::native`; `with_decode_dtype` overrides it.
 #[test]
 fn decode_dtype_defaults_to_native_and_can_be_overridden() {
     let path = fixture_path("yolo26n-seg.safetensors");

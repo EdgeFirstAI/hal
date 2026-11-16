@@ -91,13 +91,8 @@ def get_model_outputs(tflite_path):
 def generate_synthetic_outputs():
     """Generate synthetic int8 outputs matching yolov8n-seg shape.
 
-    Box values are constrained so that dequantized coordinates stay within
-    [0, 1] (the decoder rejects un-normalized boxes).  With the fallback
-    quantization params (scale=0.004, zp=-125), the dequantized value is
-    (int8 + 125) * 0.004.  Boxes are in cxcywh format, so xmax = cx + w/2
-    can exceed 1.0 if cx and w are both large.  Constraining box int8 values
-    to [-125, 0] keeps all dequantized coordinates in [0, 0.5], ensuring
-    xyxy stays within [0, 1].
+    Box values are drawn from [-125, 0], which the fallback quantization (scale=0.004,
+    zp=-125) dequantizes to [0, 0.5].
     """
     results = []
     for i, spec in enumerate(SYNTHETIC_OUTPUTS):
@@ -145,9 +140,6 @@ def get_target_info():
             info["egl_display"] = str(displays[0].kind)
             info["egl_description"] = displays[0].description
     except (RuntimeError, OSError) as e:
-        # Best-effort: this is a benchmark banner, not an assertion. Narrowed
-        # from `except Exception` so a genuine bug in probe_egl_displays()
-        # surfaces instead of silently degrading the banner.
         info["egl_display"] = f"probe failed: {e}"
     return info
 

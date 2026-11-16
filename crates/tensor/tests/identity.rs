@@ -12,7 +12,7 @@ use edgefirst_tensor::{Tensor, TensorMemory, TensorTrait};
 #[allow(dead_code)]
 mod outcome;
 
-/// The DMA require gate: a skip here fails under `HAL_TEST_REQUIRE_DMA=1`.
+/// The DMA-heap skip policy: a skip under `HAL_TEST_REQUIRE_DMA=1` fails.
 #[cfg(target_os = "linux")]
 #[path = "support/dma_require.rs"]
 mod dma_require;
@@ -30,9 +30,7 @@ fn dma_tensor_or_skip(what: &str) -> Option<Tensor<u8>> {
 #[test]
 #[cfg(target_os = "linux")]
 fn a_dup_of_the_same_dma_buf_has_the_same_identity() {
-    // `from_fd` on a dup'd fd is what a cross-library import does. If dup
-    // changed the identity, every such import would miss the GL cache --
-    // the measured blocker this derivation exists to fix.
+    // `from_fd` on a dup'd fd.
     let Some(t) = dma_tensor_or_skip("a_dup_of_the_same_dma_buf_has_the_same_identity") else {
         return;
     };
@@ -45,9 +43,7 @@ fn a_dup_of_the_same_dma_buf_has_the_same_identity() {
     );
 }
 
-/// Allocates a small IOSurface-backed tensor, or reports why it could not and
-/// returns `None` — a loud skip rather than a silently vacuous pass on a host
-/// with no IOSurface support.
+/// Allocates a small IOSurface-backed tensor, or reports why it could not and returns `None`.
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 fn iosurface_tensor_or_skip() -> Option<Tensor<u8>> {
     let expect = if edgefirst_tensor::is_iosurface_available() {
@@ -62,9 +58,7 @@ fn iosurface_tensor_or_skip() -> Option<Tensor<u8>> {
     )
 }
 
-/// Re-wrap `t`'s underlying IOSurface as a second, independent tensor — the
-/// cross-process/cross-library recovery path (`IOSurfaceLookup`'s in-process
-/// analog: wrapping the same `IOSurfaceRef` a second time).
+/// Re-wraps `t`'s underlying IOSurface as a second, independent tensor.
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 fn wrap_same_surface(t: &Tensor<u8>) -> Tensor<u8> {
     let ptr = t.iosurface_ref().expect("iosurface-backed tensor");
@@ -74,9 +68,6 @@ fn wrap_same_surface(t: &Tensor<u8>) -> Tensor<u8> {
 #[test]
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 fn two_wraps_of_one_iosurface_share_an_identity() {
-    // If two wraps of the same surface minted separate ids, the GL backend's
-    // EGLImage import cache would miss (and re-import) on every wrap instead
-    // of reusing the one already bound for this surface.
     let Some(t) = iosurface_tensor_or_skip() else {
         return;
     };
@@ -90,8 +81,6 @@ fn two_wraps_of_one_iosurface_share_an_identity() {
 
 #[test]
 fn the_same_system_key_yields_the_same_identity() {
-    // The whole modular design rests on this: two independently-linked copies
-    // of this crate must agree on a buffer's identity without sharing state.
     let a = BufferIdentity::derived(IdentityKind::DmaBuf, 4242);
     let b = BufferIdentity::derived(IdentityKind::DmaBuf, 4242);
     assert_eq!(a.id(), b.id(), "same key must give the same id");
@@ -106,9 +95,7 @@ fn different_kinds_with_the_same_key_do_not_collide() {
 
 #[test]
 fn no_two_kinds_collapse_to_a_shared_constant() {
-    // `derived` is `(kind << 56) ^ key`, so any kind used with a fixed key
-    // yields a fixed id. This asserts the API cannot be used that way by
-    // accident: distinct keys must give distinct ids for every kind.
+    // `derived` is `(kind << 56) ^ key`: distinct keys give distinct ids for every kind.
     for k in [
         IdentityKind::DmaBuf,
         IdentityKind::Shm,

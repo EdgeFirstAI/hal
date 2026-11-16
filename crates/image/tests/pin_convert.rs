@@ -1,44 +1,17 @@
 // SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! Issue #134, criterion 1 — the `convert()` half.
+//! A host pin stays valid across `convert()` into the pinned buffer.
 //!
-//! `crates/tensor/tests/pin.rs` proves a host pin survives every *map guard*
-//! drop and that a subview's pin is offset-adjusted. Neither touches the case
-//! the issue was actually filed for: a pin handed to an inference runtime while
-//! the HAL keeps converting camera frames into the same buffer. That path goes
-//! through a **different** owner — `ImageProcessor::convert` imports the
-//! destination as an `EGLImage` (Linux DMA-BUF via
-//! `EGL_EXT_image_dma_buf_import`, macOS IOSurface via
-//! `EGL_ANGLE_iosurface_client_buffer`), renders into it, and releases the
-//! import. If any of that re-created the mapping, re-allocated the buffer, or
-//! wrote somewhere other than where the pin points, a runtime holding the
-//! pointer would read a stale or dead frame forever and never fault.
+//! Asserted per convert:
 //!
-//! Three things are asserted per convert, and the third is the one that makes
-//! the first two mean anything:
+//! 1. The pin's address does not move.
+//! 2. The pin and a fresh map guard agree byte-for-byte.
+//! 3. The pixels are the ones the convert was asked for.
 //!
-//! 1. **The address does not move.** Captured before the first convert and
-//!    re-checked after each.
-//! 2. **The pin and a fresh map guard agree byte-for-byte**, so the pin is
-//!    looking at the buffer the converter actually wrote — not a copy that
-//!    happens to hold the right bytes.
-//! 3. **The pixels are the ones the convert was asked for.** Without this a
-//!    convert that silently did nothing passes (1) and (2) trivially. A second
-//!    convert with a horizontal flip follows, because "the address survived one
-//!    convert" and "the address survives a steady-state loop" are different
-//!    claims — and the flip's output differs from the first frame's everywhere
-//!    except the centre column, so a convert that no-ops the second time is
-//!    caught rather than confirmed.
-//!
-//! **`TensorMemory::DmaBuf` is the portable spelling of "platform zero-copy
-//! buffer"** — DMA-BUF on Linux, IOSurface on macOS — so this file covers both
-//! without a cfg. It skips where no such buffer can be allocated.
-//!
-//! A board with no GL backend still runs every assertion; `convert` falls back
-//! to CPU, which cannot exercise the EGL import at all. That is a weaker run,
-//! not a failing one, so the fallback count is reported rather than asserted —
-//! a vacuous pass is visible in the log instead of silent.
+//! The destination is a `TensorMemory::DmaBuf` image (DMA-BUF on Linux,
+//! IOSurface on macOS); the file skips where none can be allocated. The
+//! CPU-fallback count is reported in a note.
 
 use edgefirst_image::{Flip, ImageProcessor, ImageProcessorTrait};
 use edgefirst_tensor::{
@@ -48,10 +21,7 @@ use edgefirst_tensor::{
 const W: usize = 64;
 const H: usize = 48;
 
-/// TFLite's `kDefaultTensorAlignment`. Checked here because the convert
-/// destination *is* the buffer criterion 3 hands to
-/// `set_custom_allocation_for_input`, and upstream warns that a misaligned
-/// custom allocation can crash inside `Invoke()` rather than being rejected.
+/// TFLite's `kDefaultTensorAlignment`.
 const TFLITE_ALIGNMENT: usize = 64;
 
 #[path = "../../tensor/tests/support/dma_require.rs"]
@@ -64,15 +34,13 @@ mod outcome;
 #[allow(dead_code)]
 mod zero_copy;
 
-/// Emit a note that must survive a *passing* test, whose captured output libtest discards.
+/// Write a note to stderr, bypassing libtest's output capture.
 fn note(what: &str) {
     use std::io::Write;
     let _ = writeln!(&mut std::io::stderr(), "NOTE: {what}");
 }
 
-/// The analytic source ramp — a distinct value per pixel per channel, so a
-/// convert that lands the wrong region, the wrong row, or nothing at all cannot
-/// coincidentally match the right answer.
+/// The analytic source ramp: a distinct value per pixel per channel.
 fn want(x: usize, y: usize) -> [u8; 3] {
     [x as u8, y as u8, ((x + y) / 2) as u8]
 }
@@ -109,20 +77,16 @@ fn ramp_src() -> TensorDyn {
     src
 }
 
-/// Read the pinned window, bracketed for CPU read as the coherency contract
-/// requires. On a coherent backend both syncs are documented no-ops; on a
-/// cached DMA heap they are the invalidate that makes the GPU's writes visible.
+/// Read the pinned window, bracketed with `sync_for_cpu` and `sync_for_device`.
 fn read_through_pin(t: &TensorDyn, pin: &HostPin<'static>) -> Vec<u8> {
     t.sync_for_cpu(CpuAccess::Read).expect("sync_for_cpu");
-    // SAFETY: the convert has completed (`convert` is blocking; the fenced
-    // variant is a separate entry point), and the read is bracketed above.
+    // SAFETY: the convert has completed and the read is bracketed above.
     let bytes = unsafe { pin.as_slice() }.to_vec();
     t.sync_for_device(CpuAccess::Read).expect("sync_for_device");
     bytes
 }
 
-/// Read the same tensor through a conventional map guard, which brackets
-/// itself and exposes the padded extent.
+/// Read the same tensor through a map guard, which exposes the padded extent.
 fn read_through_map(t: &TensorDyn) -> Vec<u8> {
     let u8t = t.as_u8().expect("u8 tensor");
     let map = u8t.map_read().expect("map for read");
@@ -130,13 +94,8 @@ fn read_through_map(t: &TensorDyn) -> Vec<u8> {
 }
 
 /// Assert every RGB pixel reachable within the pinned window equals
-/// `expect(x, y)`. Returns the number of rows actually checked.
-///
-/// The pin covers the tensor's **logical** extent (`W * H * 3`), which for a
-/// pitch-padded destination is shorter than `row_stride * H` — so the tail rows
-/// fall outside it. Skipping those is correct rather than a gap: the pinned
-/// window is exactly what a consumer is allowed to read, and a padded row that
-/// the pin cannot reach is not part of the contract under test.
+/// `expect(x, y)`. Returns the number of rows checked; rows past the end of
+/// the window are skipped.
 fn assert_pixels(
     label: &str,
     bytes: &[u8],
@@ -175,8 +134,7 @@ fn pin_survives_convert_into_the_pinned_destination() {
     let mut dst = image(PixelFormat::Rgb);
     let stride = dst.effective_row_stride().expect("dst row stride");
 
-    // Pin BEFORE the first convert and hold it across everything below: that is
-    // the lifetime an inference runtime's custom allocation has.
+    // Pinned before the first convert and held across both.
     let pin = dst.pin_host(CpuAccess::ReadWrite).expect("pin destination");
     let addr = pin.as_ptr();
     assert!(!addr.is_null(), "pin handed back a null address");
@@ -218,8 +176,6 @@ fn pin_survives_convert_into_the_pinned_destination() {
     assert!(rows > 0, "no row fitted inside the pinned window");
 
     // ── Frame 2: same destination, same pin, different content ───────────
-    // A horizontal flip differs from frame 1 at every column but the centre, so
-    // a second convert that silently no-ops fails here instead of passing.
     processor
         .convert(
             &src,
@@ -254,9 +210,6 @@ fn pin_survives_convert_into_the_pinned_destination() {
 
 #[test]
 fn pin_taken_after_convert_sees_the_converted_frame() {
-    // The mirror case: a runtime that pins *late*, after the pipeline has
-    // already been running. The pin must expose the current frame rather than
-    // a fresh mapping of stale or zeroed pages.
     if !zero_copy::served_or_skip() {
         return;
     }

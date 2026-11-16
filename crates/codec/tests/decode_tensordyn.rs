@@ -4,8 +4,8 @@
 //! Integration test: TensorDyn decode path.
 //!
 //! Colour JPEGs decode to NV12 (u8 only). Non-u8 dtypes are rejected for JPEG
-//! with [`CodecError::UnsupportedDtype`]. PNG still supports the wide types, so
-//! the wide-dtype decode coverage uses a PNG fixture.
+//! with [`CodecError::UnsupportedDtype`]. PNG supports the wide types, so the
+//! wide-dtype decode coverage uses a PNG fixture.
 
 use edgefirst_codec::{CodecError, ImageDecoder, ImageLoad};
 use edgefirst_tensor::{DType, PixelFormat, TensorDyn, TensorMemory};
@@ -86,7 +86,7 @@ fn decode_tensordyn_unsupported_dtype() {
 #[cfg(feature = "png")]
 #[test]
 fn decode_tensordyn_png_f32() {
-    // PNG still supports wide dtypes; exercise the TensorDyn F32 PNG decode.
+    // PNG supports wide dtypes: decode into an F32 TensorDyn.
     let png = testdata("zidane.png");
     let mut tensor = TensorDyn::image(
         1280,
@@ -153,8 +153,7 @@ fn decode_file_path() {
     assert_eq!(info.format, PixelFormat::Nv12);
 }
 
-/// A CPU decode into a destination declared without writes is refused with
-/// the declaration, not a map error from inside the decoder.
+/// A CPU decode into a destination declared without writes is refused.
 #[test]
 fn decode_into_a_destination_declared_without_writes_is_refused() {
     use edgefirst_tensor::CpuAccess;

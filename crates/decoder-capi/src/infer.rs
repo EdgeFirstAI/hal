@@ -142,11 +142,8 @@ pub unsafe extern "C" fn ef_infer_signals_add_input(
 /// quantization.
 ///
 /// A `quant_len` above `1` describes per-channel quantization, which this
-/// setter accepts but [`ef_infer_ultralytics_schema`] then refuses: the
-/// decoder consumes per-tensor quantization only, so such a schema would
-/// build a decoder that fails. The refusal is deferred to inference so the
-/// error arrives on the call that reports errors, with a message naming
-/// the offending tensor.
+/// setter accepts and [`ef_infer_ultralytics_schema`] then refuses with a
+/// message naming the tensor.
 ///
 /// @return 0 on success, `EINVAL` for a null/invalid argument (including a
 ///         nonzero `quant_len` with a `NULL` `scale`).
@@ -239,9 +236,8 @@ pub unsafe extern "C" fn ef_infer_signals_add_metadata(
 }
 
 /// Writes `msg` into `*err_out` when `err_out` is non-NULL, freed by the
-/// caller with [`crate::decode::ef_decoder_string_free`]. Best-effort: an
-/// embedded NUL (never produced by [`edgefirst_decoder::InferError`]'s
-/// `Display`) silently leaves `*err_out` untouched rather than panicking.
+/// caller with [`crate::decode::ef_decoder_string_free`]. A message with an
+/// embedded NUL leaves `*err_out` untouched.
 ///
 /// # Safety
 /// `err_out` must be `NULL` or writable.
@@ -261,11 +257,10 @@ pub(crate) unsafe fn set_err(err_out: *mut *mut c_char, msg: &str) {
 /// `NULL` on failure. When `err_out` is non-NULL, `*err_out` is set to a
 /// message the caller frees with `ef_decoder_string_free`.
 ///
-/// **Initialize your `char *` to `NULL` before calling.** `*err_out` is
-/// left untouched on success, and while every failure path writes a
-/// message, the write itself can still fail (a message carrying an
-/// embedded NUL, or the allocation behind it). Detect failure from the
-/// returned handle, and test `*err_out` separately before reading it:
+/// Initialize the `char *` to `NULL` before calling: `*err_out` is left
+/// untouched on success and when the message cannot be written. Detect
+/// failure from the returned handle, and test `*err_out` separately before
+/// reading it:
 ///
 /// ```c
 /// char *err = NULL;
@@ -299,11 +294,6 @@ pub unsafe extern "C" fn ef_infer_ultralytics_schema(
             }
         }))
         .unwrap_or_else(|_| {
-            // The one entry point where catch_unwind is load-bearing: an
-            // unwind escaping `extern "C"` aborts the process. Write a
-            // message here too, or a caught panic would be the single
-            // failure that returns NULL with `*err_out` untouched --
-            // exactly the case a caller trusting the contract would print.
             set_err(err_out, "internal error: panic during schema inference");
             std::ptr::null_mut()
         })
@@ -398,9 +388,8 @@ mod tests {
     use super::*;
     use crate::codes::EfModelSource;
 
-    /// Builds a synthetic 80-class Ultralytics `names` dict-repr string,
-    /// matching the format real ONNX/TFLite exports carry (see
-    /// `edgefirst-decoder`'s own `synthetic_metadata` test helper).
+    /// Builds a synthetic Ultralytics `names` dict-repr string with `nc`
+    /// classes.
     fn names_dict(nc: usize) -> CString {
         let body = (0..nc)
             .map(|i| format!("{i}: 'c{i}'"))
@@ -411,8 +400,8 @@ mod tests {
 
     /// Builds signals for the `yolov8n` fixture's shapes (see
     /// `crates/decoder/testdata/infer/yolov8n.signals.json`) through the
-    /// extern "C" entry points, with a minimal (not the full captured)
-    /// metadata set: `names`, `task`, `end2end`.
+    /// extern "C" entry points, with the metadata keys `names`, `task` and
+    /// `end2end`.
     unsafe fn yolov8n_signals() -> *mut EfInferSignals {
         unsafe {
             let s = ef_infer_signals_new(0); // onnx
@@ -595,9 +584,6 @@ mod tests {
 
     #[test]
     fn the_dtype_code_is_the_tensor_dtype_code() {
-        // One numbering for dtype across the stack: a caller passes the
-        // `EF_DTYPE_*` it already holds. Model I/O carries no `u64` or
-        // `f64`, so those are refused rather than narrowed.
         unsafe {
             let s = ef_infer_signals_new(EfModelSource::Onnx as u32);
             let name = CString::new("x").unwrap();

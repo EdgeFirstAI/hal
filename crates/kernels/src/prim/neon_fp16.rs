@@ -3,26 +3,21 @@
 
 //! FP16-arithmetic NEON kernels (ARMv8.2 FEAT_FP16), eight half-precision lanes per vector.
 //!
-//! Stable Rust has no f16 intrinsics, so the arithmetic is inline asm with `.arch_extension
-//! fp16` on `uint16x8_t` carriers. Every kernel here needs `CpuFeatures::neon_fp16` and
-//! `is_aarch64_feature_detected!("fp16")`; CPUs without FEAT_FP16 fault on these instructions.
+//! The arithmetic is inline asm with `.arch_extension fp16` on `uint16x8_t` carriers. Every
+//! kernel here needs `CpuFeatures::neon_fp16` and `is_aarch64_feature_detected!("fp16")`; CPUs
+//! without FEAT_FP16 fault on these instructions.
 //!
 //! The sigmoid kernels compute `exp(−|x|)` as `2^k · p(r)` with `r = −|x| − k·ln2`, a degree-4
-//! polynomial `p`, then `s = e / (1 + e)` in f16 and `1 − s` for `x ≥ 0`. Integer and f32 inputs are
-//! dequantized and range-reduced in f32 first, because rounding `x` itself to f16 costs up to
-//! `|x|` ulps in the negative tail; f16 inputs are reduced in f16, where `x` is exact. The tests
-//! hold every result within 2 f16 ulps of the float64 sigmoid rounded to f16, over every 8- and
-//! 16-bit value and every f16 at fixed quantizations; `tests/sigmoid_lut.rs` adds a seeded sweep
-//! of random quantizations for the integer inputs.
+//! polynomial `p`, then `s = e / (1 + e)` in f16 and `1 − s` for `x ≥ 0`. Integer and f32 inputs
+//! are dequantized and range-reduced in f32; f16 inputs are reduced in f16. Results are within
+//! 2 f16 ulps of the float64 sigmoid rounded to f16.
 //!
 //! The decode kernels compute DFL distances and boxes into f16. A side's softmax weights are
 //! `exp(x − max)`, the same `2^k · p(r)` reduced in f16 from the f32 difference; eight bins per
 //! vector are summed with their bin-weighted sum in two alternating f16 sets, and each side's
-//! lanes are reduced and divided in f32, which keeps an f16 reduction tree's rounding out of the
-//! distances.
-//! dist2bbox runs eight anchors per vector in f16, on the f16-rounded grid and stride.
-//! `scale_bias` converts integers to f16 (`SCVTF`/`UCVTF`) and multiplies and adds in f16, each
-//! step correctly rounded, so it equals `half` arithmetic bit for bit.
+//! lanes are reduced and divided in f32. dist2bbox runs eight anchors per vector in f16, on the
+//! f16-rounded grid and stride. `scale_bias` converts integers to f16 (`SCVTF`/`UCVTF`) and
+//! multiplies and adds in f16, each step correctly rounded.
 
 #![cfg(target_arch = "aarch64")]
 
@@ -75,8 +70,7 @@ fn pow2_f16(k: int16x8_t) -> uint16x8_t {
 
 /// `2^k · exp(r)` for `k` in [−25, 0] and `|r|` about ln2/2 or less.
 ///
-/// `2^k` is applied as `2^max(k, −13)` then `2^(k − max(k, −13))`: the first product stays
-/// normal and exact, so a subnormal result is rounded once.
+/// `2^k` is applied as `2^max(k, −13)` then `2^(k − max(k, −13))`.
 ///
 /// # Safety
 /// The CPU must support FEAT_FP16.
@@ -100,9 +94,6 @@ unsafe fn exp_reduced(r: uint16x8_t, k: int16x8_t) -> uint16x8_t {
 }
 
 /// `s = e / (1 + e)` where `negative` is set, `1 − s` elsewhere; `e = exp(−|x|)`.
-///
-/// `s` is small and accurate, so near 1 the only rounding is that of `1 − s`, which reaches
-/// every f16 below 1; `1 / (1 + e)` would round `1 + e` first and skip them.
 ///
 /// # Safety
 /// The CPU must support FEAT_FP16.
@@ -203,7 +194,7 @@ macro_rules! dequant_sigmoid_kernel {
     ($(#[$doc:meta])* $name:ident, $t:ty) => {
         $(#[$doc])*
         ///
-        /// Tested within 2 f16 ulps of the float64 sigmoid rounded to f16; NaN stays NaN. Writes
+        /// Within 2 f16 ulps of the float64 sigmoid rounded to f16; NaN stays NaN. Writes
         /// nothing when the slices differ in length.
         ///
         /// # Safety
@@ -245,7 +236,7 @@ dequant_sigmoid_kernel!(
 
 /// `sigmoid((x − zero_point) · scale)` of f16 into f16; `Quant::IDENTITY` runs entirely in f16.
 ///
-/// Tested within 2 f16 ulps of the float64 sigmoid rounded to f16; NaN stays NaN. Writes nothing
+/// Within 2 f16 ulps of the float64 sigmoid rounded to f16; NaN stays NaN. Writes nothing
 /// when the slices differ in length.
 ///
 /// # Safety
@@ -284,7 +275,7 @@ unsafe fn exp_nonpositive_f16x8(t: uint16x8_t) -> uint16x8_t {
 }
 
 /// Eight-bin f16 accumulators of one side: the weight sums and bin-weighted sums, in two sets
-/// that alternate by step so no lane adds more than every other step in f16.
+/// that alternate by step.
 #[derive(Clone, Copy)]
 struct SideSums {
     sum: [uint16x8_t; 2],
@@ -327,8 +318,7 @@ impl SideSums {
 }
 
 /// `Σ ws / Σ sum` of the four sides, rounded to f16: lane `s` is side `s`'s distance. The f16
-/// lanes of both sets are widened and reduced in f32, which keeps the rounding of an f16
-/// reduction tree out of the distances.
+/// lanes of both sets are widened and reduced in f32.
 ///
 /// # Safety
 /// The CPU must support FEAT_FP16.
@@ -380,7 +370,7 @@ fn max_f32(side: &[f32]) -> f32 {
 }
 
 /// The f16 sums of one anchor's four sides of f32 logits, weighed by `exp(x − max)`; the
-/// sides advance together so an in-order core overlaps their exps.
+/// sides advance together.
 ///
 /// # Safety
 /// The CPU must support FEAT_FP16.
@@ -442,7 +432,7 @@ unsafe fn softmax_sides(sides: [&[f32]; 4]) -> [SideSums; 4] {
             if rest.is_empty() {
                 continue;
             }
-            // Padding with the max keeps every lane at t = 0, inside the exp's range.
+            // The rest, padded with the max.
             let mut x = [vgetq_lane_f32::<0>(m); 8];
             for (d, &v) in x.iter_mut().zip(rest) {
                 *d = v;
@@ -461,8 +451,6 @@ unsafe fn softmax_sides(sides: [&[f32]; 4]) -> [SideSums; 4] {
 /// the difference taken in f32 and rounded to f16, the exp and eight-bin sums in f16, then
 /// reduced across lanes and divided in f32. Writes nothing unless `dst` holds four values per
 /// anchor of `logits`.
-///
-/// Tested against the float64 softmax within the bound `tests/decode_ops.rs` states.
 ///
 /// # Safety
 /// The CPU must support FEAT_FP16 (`CpuFeatures::neon_fp16`).
@@ -613,8 +601,6 @@ pub(crate) unsafe fn dist2bbox_f16<L: Ltrb8>(
 /// `[(gx − l)·s, (gy − t)·s, (gx + r)·s, (gy + b)·s]` when `xyxy`. Writes nothing unless `ltrb`
 /// and `dst` have the same length, a multiple of 4, and the grids cover every anchor.
 ///
-/// Tested against the float64 boxes within the bound `tests/decode_ops.rs` states.
-///
 /// # Safety
 /// The CPU must support FEAT_FP16 (`CpuFeatures::neon_fp16`).
 #[inline]
@@ -740,8 +726,7 @@ macro_rules! scale_bias_kernel {
 }
 
 scale_bias_kernel!(
-    /// `neon_convert::scale_bias_i8_to_f16_neon` with FP16 arithmetic, bit for bit: every step
-    /// there is a correctly rounded f16 operation.
+    /// `neon_convert::scale_bias_i8_to_f16_neon` with FP16 arithmetic, bit for bit.
     scale_bias_i8_to_f16_neon_fp16,
     i8
 );
@@ -819,7 +804,7 @@ mod tests {
         assert_eq!(bits::T_MIN, h(f64::from(T_MIN_F32)));
         assert_eq!(bits::EIGHT, h(8.0));
         assert_eq!(bits::IOTA, core::array::from_fn(|i| h(i as f64)));
-        // Every reachable `k` stays in [−25, 0], so both injected exponents are in range.
+        // The smallest reachable `k` is −25.
         assert_eq!(
             (T_MIN_F32 * core::f32::consts::LOG2_E).round_ties_even(),
             -25.0
@@ -851,8 +836,7 @@ mod tests {
         check(&got, &xs, "f16 with a quant");
     }
 
-    /// Every f16 in [0.999, 1] (0.99902, 0.99951 and 1) is produced where the float64 sigmoid
-    /// rounds to it, and each result there is within the bound, for f32, f16 and i16 inputs.
+    /// Every f16 in [0.999, 1] is produced where the float64 sigmoid rounds to it.
     #[test]
     fn sigmoid_fp16_reaches_every_value_near_one() {
         if !fp16() {

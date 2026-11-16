@@ -1,10 +1,7 @@
-# Host build artefacts must not reach a build context: the benchmark image
-# compiles the TurboJPEG arm itself, and a host-built binary would be linked
-# against the wrong glibc.
+# Host build artefacts.
 benchmarks/modules/turbojpeg/build/
 
-# Cargo build trees, results, fetched single-file deps, and git history are
-# gigabytes the image build never reads (all binaries build in-container).
+# Cargo build trees, results, fetched single-file deps, and git history.
 target/
 benchmarks/target/
 benchmarks/results/

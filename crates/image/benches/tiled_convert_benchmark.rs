@@ -3,32 +3,19 @@
 
 //! Tiled-convert proportionality benchmark (CPU backend).
 //!
-//! Demonstrates the crop-contract claim from the 2026-08 crop-contract work:
-//! per-convert CPU cost scales with the *tile* (crop/destination) area, not
-//! the *frame* (source) area. A single 4032x2268 NV12 source (a common
-//! 12MP-sensor 4:3-ish capture size, deliberately not a "round" resolution)
-//! is converted three ways:
+//! A single 4032x2268 NV12 source is converted three ways:
 //!
-//!   (i)   full-frame  -> 640x640 PlanarRgb   (general resize path, scans
-//!                                              the whole 4032x2268 frame)
+//!   (i)   full-frame  -> 640x640 PlanarRgb   (general resize path)
 //!   (ii)  640x640 crop -> 640x640 PlanarRgb  (scale-identity crop, fused
 //!                                              NV->planar region path)
 //!   (iii) 640x640 crop -> 320x320 PlanarRgb  (2x downscale crop, general
-//!                                              resize path with a halo
-//!                                              sized to the crop, not the
-//!                                              frame)
+//!                                              resize path)
 //!
-//! If (ii) and (iii) are proportional to tile area rather than frame area,
-//! their per-convert times should sit far below (i) despite converting the
-//! same pixel format pair. Self-contained: the source is synthesized (Y luma
-//! gradient + neutral chroma), so NO testdata files are required on the
-//! target.
+//! The source is synthesized (Y luma gradient + neutral chroma), so no
+//! testdata files are required.
 //!
-//! A fourth, purely informational `gl/` group repeats the same three cells
-//! on the OpenGL backend (via `ImageProcessorConfig::backend`, independent
-//! of `EDGEFIRST_FORCE_BACKEND`) now that GL renders `PlanarRgb` into heap
-//! destinations directly. It is not part of the CPU proportionality claim
-//! and is skipped silently if GL initialization fails on the host.
+//! A `gl/` group repeats the same three cells on the OpenGL backend (via
+//! `ImageProcessorConfig::backend`) and is skipped if GL initialization fails.
 //!
 //! ```bash
 //! cargo bench -p edgefirst-image --bench tiled_convert_benchmark
@@ -48,14 +35,11 @@ use edgefirst_tensor::{CpuAccess, DType, PixelFormat, TensorDyn, TensorMapTrait,
 const WARMUP: usize = 10;
 const ITERATIONS: usize = 100;
 
-// A 12MP-class capture, deliberately not a "round" resolution, so the
-// frame-area/tile-area contrast can't be mistaken for a coincidence of
-// convenient numbers. Both dimensions are even (chroma-aligned for 4:2:0).
+// Source dimensions: a 12MP-class capture, both dimensions even.
 const SRC_W: usize = 4032;
 const SRC_H: usize = 2268;
 
-// The crop is centered and origin-aligned to an even pixel so it qualifies
-// for the fused NV->planar region path (scale-identity, chroma-aligned).
+// The crop is centered and origin-aligned to an even pixel.
 const CROP_W: usize = 640;
 const CROP_H: usize = 640;
 const CROP_X: usize = (SRC_W - CROP_W) / 2;
@@ -79,10 +63,8 @@ fn fill_nv12(buf: &mut [u8], w: usize, h: usize) {
 }
 
 fn main() {
-    // This bench characterises the CPU convert path specifically — pin the
-    // backend before anything that could spawn a thread.
-    // SAFETY: set_var runs at the very top of main(), before env_logger,
-    // argument parsing, or any worker threads — the process is single-threaded.
+    // Pins the CPU backend when `EDGEFIRST_FORCE_BACKEND` is unset.
+    // SAFETY: the process is single-threaded at the top of main().
     if std::env::var("EDGEFIRST_FORCE_BACKEND").is_err() {
         unsafe { std::env::set_var("EDGEFIRST_FORCE_BACKEND", "cpu") };
     }
@@ -130,11 +112,9 @@ fn main() {
 
     let crop_identity = Crop::new().with_source(Some(Region::new(CROP_X, CROP_Y, CROP_W, CROP_H)));
 
-    // Each cell: (name, out dims, crop, throughput bytes for the printed
-    // summary). Throughput is reported against each cell's own input bytes
-    // (frame for (i), tile for (ii)/(iii)) so the printed MiB/s columns stay
-    // meaningful per cell; the proportionality claim itself is read off the
-    // absolute per-convert times, not the throughput column.
+    // Each cell: (name, out dims, crop, throughput bytes). Throughput is
+    // reported against each cell's own input bytes (frame for (i), tile for
+    // (ii)/(iii)).
     let cells: &[(&str, usize, usize, Crop, u64)] = &[
         (
             "full_frame_4032x2268_to_640x640",
@@ -161,15 +141,8 @@ fn main() {
 
     run_group(&mut proc, &src, cells, &mut suite);
 
-    // Fourth, informational-only group: the same three cells on the OpenGL
-    // backend, now that GL renders PlanarRgb into heap destinations directly
-    // (rather than declining to CPU). Selected via `ImageProcessorConfig`
-    // rather than `EDGEFIRST_FORCE_BACKEND` so it does not disturb the CPU
-    // group above. Not part of the CPU proportionality claim.
+    // The same three cells on the OpenGL backend, selected via `ImageProcessorConfig`.
     println!();
-    // `..Default::default()` is a real update on Linux (extra GL/G2D fields)
-    // but covers no remaining fields on macOS where `backend` is the only
-    // field — allow needless_update for cross-platform parity.
     #[allow(clippy::needless_update)]
     let gl_config = ImageProcessorConfig {
         backend: ComputeBackend::OpenGl,
@@ -220,8 +193,7 @@ fn run_group(
                 continue;
             }
         };
-        // Probe once: an unsupported cell is reported and skipped instead of
-        // panicking inside the timing loop.
+        // Probe once: an unsupported cell is reported and skipped.
         if let Err(e) = proc.convert(
             src,
             &mut dst,

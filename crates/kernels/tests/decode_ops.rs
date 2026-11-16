@@ -39,8 +39,8 @@ fn yolov8n_640() -> Vec<Level> {
     vec![level(80, 80, 8.0), level(40, 40, 16.0), level(20, 20, 32.0)]
 }
 
-/// t-1297 at 1344×768: 21168 anchors.
-fn t1297_1344x768() -> Vec<Level> {
+/// A 1344×768 input: 21168 anchors.
+fn levels_1344x768() -> Vec<Level> {
     vec![
         level(168, 96, 8.0),
         level(84, 48, 16.0),
@@ -53,8 +53,8 @@ fn yolov8n_small() -> Vec<Level> {
     vec![level(13, 13, 8.0), level(7, 7, 16.0), level(3, 3, 32.0)]
 }
 
-/// The t-1297 strides and aspect on small grids.
-fn t1297_small() -> Vec<Level> {
+/// The 1344×768 strides and aspect on small grids.
+fn levels_small() -> Vec<Level> {
     vec![level(28, 16, 8.0), level(14, 8, 16.0), level(7, 4, 32.0)]
 }
 
@@ -292,7 +292,7 @@ enum Out {
 }
 
 impl Out {
-    /// A buffer filled with a sentinel, so unwritten elements show up.
+    /// A buffer filled with a sentinel.
     fn new(d: DType, len: usize) -> Self {
         match d {
             DType::I8 => Self::I8(vec![0x55; len]),
@@ -396,14 +396,11 @@ fn ulp_f16(v: f64) -> f64 {
 /// How far a float result may sit from the f64 reference, per value.
 #[derive(Clone, Copy, Debug)]
 enum Bar {
-    /// f32 kernels: the decoder's DFL bar of 2e-4 px at stride 16, scaled by stride, plus 4 f32
-    /// ulps of the value (this test's coordinates reach 1800 px, the decoder's stay under 150).
+    /// f32 kernels: 2e-4 px at stride 16, scaled by stride, plus 4 f32 ulps of the value.
     F32,
-    /// The fp16-exp kernel: 2% relative error per exp weight (the primitive's test bar) moves
-    /// a side by at most `0.02 · (reg_max − 1)` grid units.
+    /// The fp16-exp kernel: `2 · 0.02 · (reg_max − 1)` grid units.
     Fp16Exp { reg_max: usize },
-    /// f16 outputs: one f16 ulp of the value, plus 3% of a grid unit for the FP16 kernels'
-    /// roundings (the f16 exp weights and sums, each distance, and the box arithmetic).
+    /// f16 outputs: one f16 ulp of the value, plus 3% of a grid unit.
     F16,
 }
 
@@ -584,12 +581,12 @@ fn dfl_box_matches_f64_reference() {
     let mut env = Envelope::default();
     for feats in common::tiers() {
         for &(out, input, format, layout, v8) in &full {
-            let levels = if v8 { yolov8n_640() } else { t1297_1344x768() };
+            let levels = if v8 { yolov8n_640() } else { levels_1344x768() };
             let case = DflCase::new(input, &levels, 41);
             run_dfl_box_case(feats, &case, &levels, input, out, format, layout, &mut env);
         }
         // Every combination on small grids with the same strides.
-        for (li, levels) in [yolov8n_small(), t1297_small()].iter().enumerate() {
+        for (li, levels) in [yolov8n_small(), levels_small()].iter().enumerate() {
             for (di, &input) in IN_DTYPES.iter().enumerate() {
                 let case = DflCase::new(input, levels, 7 + (li * 8 + di) as u64);
                 for &out in &OUT_DTYPES {
@@ -716,7 +713,7 @@ fn run_dist2bbox_case(
 fn dist2bbox_matches_f64_reference() {
     let mut env = Envelope::default();
     for feats in common::tiers() {
-        for (li, levels) in [yolov8n_small(), t1297_small()].iter().enumerate() {
+        for (li, levels) in [yolov8n_small(), levels_small()].iter().enumerate() {
             for (di, &input_dtype) in IN_DTYPES.iter().enumerate() {
                 let q = ltrb_quant(input_dtype);
                 let data = Data::quantize(
@@ -749,7 +746,7 @@ fn dist2bbox_matches_f64_reference() {
 
 #[test]
 fn dist2bbox_yolo26_reg_max_1() {
-    let levels = t1297_1344x768();
+    let levels = levels_1344x768();
     assert_eq!(total(&levels), 21168);
     let q = Quant::new(0.08, -128);
     let data = Data::quantize(&ltrb_distances(21168, 26), DType::I8, q);
@@ -782,7 +779,7 @@ fn dfl_and_dist2bbox_compose_to_dfl_box() {
         for (input_dtype, levels) in [
             (DType::I8, yolov8n_640()),
             (DType::I16, yolov8n_small()),
-            (DType::F32, t1297_small()),
+            (DType::F32, levels_small()),
         ] {
             let rows = total(&levels);
             let q = logit_quant(input_dtype);
@@ -906,7 +903,7 @@ fn single_level_call_matches_decoder_level_path() {
                 plan.run(view, out.contiguous(n), None).unwrap();
                 match &out {
                     Out::F32(v) => assert_eq!(v, &want, "{input_dtype:?} tier {:?}", plan.tier()),
-                    // The FP16 tier's f16 kernel is checked against its bound instead.
+                    // Skips the FP16 tier's f16 kernel.
                     Out::F16(_) if plan.tier() == Tier::NeonFp16 => {}
                     Out::F16(v) => {
                         assert_eq!(v, &want16, "{input_dtype:?} f16 tier {:?}", plan.tier())
@@ -1237,7 +1234,7 @@ fn new_rejects_bad_params() {
         })
         .map(|_| ())
     };
-    assert!(d2b(t1297_1344x768(), Quant::new(0.1, 0)).is_ok());
+    assert!(d2b(levels_1344x768(), Quant::new(0.1, 0)).is_ok());
     invalid(
         d2b(vec![level(0, 4, 8.0)], Quant::new(0.1, 0)),
         "d2b grid_w 0",
@@ -1254,11 +1251,11 @@ fn new_rejects_bad_params() {
         "d2b anchors % grid_w",
     );
     invalid(
-        d2b(t1297_1344x768(), Quant::new(f32::NAN, 0)),
+        d2b(levels_1344x768(), Quant::new(f32::NAN, 0)),
         "d2b out scale NaN",
     );
     invalid(
-        d2b(t1297_1344x768(), Quant::new(0.1, -1)),
+        d2b(levels_1344x768(), Quant::new(0.1, -1)),
         "d2b out zero point",
     );
 }
@@ -1897,9 +1894,7 @@ fn random_quant_cases() -> Vec<OpCase> {
 /// Random quantizations per op and integer input type in the FP16 bound test.
 const RANDOM_QUANTS: usize = 24;
 
-/// An `f16` output that runs no FP16 kernel is the same tier's `f32` output rounded once,
-/// nearest even, bit for bit: every case on the scalar tier and the NEON tiers without FP16
-/// arithmetic, and `DflPlan`'s 8-bit table path on the FP16 tier.
+/// An `f16` output that runs no FP16 kernel is the same tier's `f32` output rounded once, bit for bit.
 #[test]
 fn decode_f16_output_is_narrowed_f32_path() {
     let cases = f16_output_cases();
@@ -1927,8 +1922,7 @@ fn decode_f16_output_is_narrowed_f32_path() {
 
 /// The FP16 kernels' bound for `f16` outputs, in f16 ulps of the value or of the output's
 /// full scale (640 px for boxes, `reg_max − 1` grid units for distances), whichever is larger:
-/// 1 up to `reg_max` 32; at 64, where each lane sums four f16 steps, 2 for distances and 3 for
-/// boxes, whose distances reach 63 grid units.
+/// 1 up to `reg_max` 32; at 64, 2 for distances and 3 for boxes.
 fn fp16_ulp_bound(op: Op) -> f64 {
     match op {
         Op::Dfl { reg_max } if reg_max > 32 => 2.0,
@@ -1937,10 +1931,7 @@ fn fp16_ulp_bound(op: Op) -> f64 {
     }
 }
 
-/// On the FP16 tier, `f16` outputs run the FP16 kernels (`DflPlan`'s 8-bit table path and
-/// `Dist2BboxPlan` excepted, whose f32 results are rounded once) and stay within
-/// [`fp16_ulp_bound`] of the float64 result rounded to f16, at fixed and seeded random
-/// quantizations.
+/// On the FP16 tier, `f16` outputs stay within [`fp16_ulp_bound`] of the float64 result rounded to f16.
 #[test]
 fn decode_f16_output_fp16_within_bound() {
     let Ok(feats) = CpuFeatures::from_forced_tier(Some("neon_fp16")) else {
@@ -2015,7 +2006,7 @@ mod neon {
                 let q = logit_quant(input_dtype);
                 let data = Data::quantize(&dfl_logits(rows, reg_max, 51), input_dtype, q);
                 for output_dtype in [DType::F32, DType::F16, DType::I16] {
-                    // The FP16 tier's f16 outputs run the FP16 kernels, checked against their bound.
+                    // Skips the FP16 tier's f16 outputs.
                     if feats.neon_fp16 && output_dtype == DType::F16 {
                         continue;
                     }
@@ -2099,7 +2090,7 @@ mod neon {
     fn neon_ltrb_path_within_envelope_of_scalar() {
         let scalar = CpuFeatures::from_forced_tier(Some("scalar")).unwrap();
         let Some(feats) = forced("neon") else { return };
-        let levels = t1297_small();
+        let levels = levels_small();
         let rows = total(&levels);
         let scale: Vec<f64> = anchor_geometry(&levels).iter().map(|g| g.2).collect();
         for input_dtype in [DType::I8, DType::U8, DType::I16, DType::U16] {
@@ -2139,8 +2130,7 @@ mod neon {
         }
     }
 
-    /// Float inputs to `f32` and `i8` run the f32 NEON kernels on every NEON tier, within the
-    /// integer inputs' bound of the scalar tier: the f32 bar for `f32`, ±1 LSB for `i8`.
+    /// Float inputs to `f32` and `i8` run the f32 NEON kernels within the scalar tier's bound.
     #[test]
     fn neon_float_input_paths_within_envelope_of_scalar() {
         let scalar = CpuFeatures::from_forced_tier(Some("scalar")).unwrap();
@@ -2190,9 +2180,7 @@ mod neon {
         }
     }
 
-    /// Every input/output pair runs a NEON kernel under NEON features: on the FP16 tier,
-    /// `NeonFp16` for `f16` outputs (but `DflPlan`'s table path and `Dist2BboxPlan`) and the
-    /// decoder's fp16-exp DFL for 16-bit inputs to `f32`; `Neon` otherwise.
+    /// Every input/output pair runs a NEON kernel under NEON features.
     #[test]
     fn every_decode_path_is_neon_under_neon_features() {
         let all = [
@@ -2218,7 +2206,7 @@ mod neon {
                         (true, DType::I16 | DType::U16, DType::F32) => Tier::NeonFp16,
                         _ => Tier::Neon,
                     };
-                    // `DflPlan`'s table path has no box math to run in f16.
+                    // `DflPlan`'s 8-bit table path reports `Tier::Neon`.
                     let dfl_want = match i {
                         DType::I8 | DType::U8 => Tier::Neon,
                         _ => box_want,

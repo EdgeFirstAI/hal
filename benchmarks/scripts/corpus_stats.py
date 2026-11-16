@@ -3,18 +3,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """JPEG corpus statistics for benchmark reporting (stdlib only).
 
-Walks a directory of JPEGs and reports the distribution facts a published
-benchmark must state about its corpus: image count, dimensions/megapixels,
-file sizes, chroma subsampling histogram, baseline-vs-progressive split,
-greyscale count, and restart-interval (DRI) presence.
+Walks a directory of JPEGs and reports image count, dimensions/megapixels, file sizes,
+chroma subsampling histogram, baseline-vs-progressive split, greyscale count, and
+restart-interval (DRI) presence.
 
-The DRI count is what turns "COCO has no restart-marker files" from an
-assumption into a measurement: libjpeg-turbo documents that its fast Huffman
-decoder is disabled for DRI streams (up to ~20% slower), so whether a corpus
-carries DRI markers changes which turbo code path a benchmark exercises.
-
-Markers are parsed structurally up to the first SOS (where cjpeg/jpegtran
-place DRI), not text-searched, so EXIF thumbnails cannot false-positive.
+Markers are parsed structurally up to the first SOS.
 
 Usage:
     python3 corpus_stats.py DIR [DIR ...]
@@ -69,9 +62,7 @@ def parse_jpeg(path):
         if marker == 0xD9:  # EOI
             break
         seglen = struct.unpack(">H", data[i + 2 : i + 4])[0]
-        # A truncated/corrupt file can declare a segment running past EOF (or
-        # an impossible <2 length); stop parsing and let the caller count the
-        # file as unparsed rather than raising out of the whole run.
+        # Stop at a segment with an impossible length or one that runs past EOF.
         if seglen < 2 or i + 2 + seglen > n:
             break
         seg = data[i + 4 : i + 2 + seglen]

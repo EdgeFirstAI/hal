@@ -292,9 +292,8 @@ pub struct Capability {
 }
 
 /// What the codec engines on this machine can do, engine by engine, in the
-/// order [`Engine::Auto`] tries them. Probing opens no stream, but it does
-/// open device nodes and enumerate (on Windows, activate) transforms, so
-/// it is not free: call it once.
+/// order [`Engine::Auto`] tries them. Probing opens no stream; it opens
+/// device nodes and enumerates (on Windows, activates) transforms.
 pub fn capabilities() -> Vec<Capability> {
     let mut found = Vec::new();
     #[cfg(all(target_os = "linux", feature = "v4l2"))]

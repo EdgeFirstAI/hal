@@ -1,15 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! The mapped CPU-access direction.
-//!
-//! `map()` owns its coherency bracket in both directions, and the direction
-//! decides how much cache maintenance the release performs. The direction is
-//! not observable from the data -- the bracket is a side effect -- so what is
-//! asserted here is the property a binding can actually build on:
-//! [`TensorMapTrait::is_writable`] reports the direction the mapping was
-//! taken with. The Python buffer protocol's `readonly` flag is derived from
-//! it, so a regression here surfaces as a writable view over a read-only map.
+//! The mapped CPU-access direction: [`TensorMapTrait::is_writable`] reports
+//! the direction the mapping was taken with, and a map outside the tensor's
+//! declared access is refused.
 
 use edgefirst_tensor::{
     CpuAccess, DType, Error, ImageDesc, PixelFormat, Tensor, TensorDyn, TensorMapTrait,
@@ -46,8 +40,7 @@ fn map_with_reports_the_direction_it_was_taken_with() {
 
 #[test]
 fn plain_map_is_readwrite() {
-    // `map()` is documented as `map_with(ReadWrite)`. Bindings default to it,
-    // so this is the behaviour existing callers depend on.
+    // `map()` is `map_with(ReadWrite)`.
     assert!(image().map().expect("map").is_writable());
 }
 
@@ -59,8 +52,6 @@ fn map_read_matches_map_with_read() {
 
 #[test]
 fn a_read_map_still_reads() {
-    // The direction restricts writes, not reads -- a read-only map is only
-    // useful if it can actually be read.
     let t = image();
     {
         let mut m = t.map_with(CpuAccess::ReadWrite).expect("rw");
@@ -77,15 +68,6 @@ fn none_is_not_a_mappable_direction() {
         "CpuAccess::None is not a direction a mapping can be taken in"
     );
 }
-
-// The two tests below are the only coverage of `assert_map_writable`
-// (crates/tensor/src/lib.rs), which since the per-backend map types collapsed
-// into `HostView` is the single point enforcing the read-only contract for all
-// six backends. Without them, deleting that assertion leaves the whole suite
-// green: every other test here checks that `is_writable()` *reports* the
-// direction, not that acting against it is refused. On Android the assertion is
-// what stands between a `map_read()` misuse and writing through a read-only
-// AHardwareBuffer lock, which the NDK documents as undefined behaviour.
 
 #[test]
 #[should_panic(expected = "read-only")]
@@ -131,8 +113,6 @@ fn assert_denied<T>(r: edgefirst_tensor::Result<T>, declared_as: CpuAccess, requ
     }
 }
 
-// Runs on both backends (map_access is a dynamic test target), so the error
-// kind is the same whichever side refuses.
 #[test]
 fn a_map_outside_the_declaration_is_refused_in_both_directions() {
     for (decl, req) in [
@@ -198,8 +178,7 @@ fn the_default_declaration_is_readwrite() {
     );
 }
 
-// An alias imported from a descriptor keeps its producer's declaration, so
-// the refusal does not depend on which handle the CPU maps through.
+// An alias imported from a descriptor keeps its producer's declaration.
 #[test]
 fn an_imported_alias_keeps_the_producer_declaration() {
     let t = declared(CpuAccess::Read);
@@ -255,7 +234,7 @@ fn map_for_write_takes_write_on_write_only_and_refuses_read_and_none() {
     );
 }
 
-// A write of part of a buffer must invalidate, so it needs `ReadWrite`.
+// A write map of part of a buffer needs `ReadWrite`.
 #[test]
 fn a_partial_write_map_needs_readwrite() {
     let write_only = declared(CpuAccess::Write);
@@ -346,8 +325,7 @@ fn an_undeclared_descriptor_imports_readwrite() {
     assert_eq!(alias.cpu_access(), CpuAccess::ReadWrite);
 }
 
-// A view's descriptor reports `VIEW` at any offset, and its import maps a write
-// `ReadWrite` as the view itself does; a whole tensor's does neither.
+// A view's descriptor reports `VIEW` at any offset and its import maps a write as `ReadWrite`.
 #[test]
 fn an_imported_view_keeps_its_write_access() {
     use edgefirst_tensor::protocol::flags;

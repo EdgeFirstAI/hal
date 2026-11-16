@@ -1,23 +1,7 @@
 """Shipped Mach-O images must have an 8-byte-aligned LINKEDIT string pool.
 
-`[profile.release] strip = true` makes rustc strip Apple binaries with its own
-in-process Mach-O writer, which places the string table immediately after the
-indirect symbol table with no padding. Indirect symbol entries are four bytes,
-so a binary whose ``nindirectsyms`` is odd ends up with a 4-byte-aligned
-``stroff``, and dyld on macOS 26+ refuses to load it with "mis-aligned LINKEDIT
-string pool". `.cargo/config.toml` works around it by handing the strip back to
-Apple's linker (``-C strip=none -C link-arg=-Wl,-x``), which pads correctly.
-
-These cases synthesise Mach-O headers rather than compiling anything, so the
-checker's logic is gated on every platform's CI lane, not only macOS -- the
-whole point of a file-parsing gate is that the runner does not have to be able
-to load the image. The final case additionally scans real build output when it
-happens to be present.
-
-The checker is imported and called in-process. Driving it only as a subprocess
-would leave it invisible to coverage, which instruments this interpreter and
-not its children. One case still goes through the command line, because the
-exit status the Makefile branches on is its own contract.
+The cases run the checker on synthesised Mach-O headers, and on real build output when
+it is present.
 """
 
 from __future__ import annotations
@@ -57,9 +41,7 @@ checker = _load()
 def _macho64(stroff: int, *, big_endian: bool = False, cmd: int = LC_SYMTAB) -> bytes:
     """A minimal 64-bit Mach-O carrying one load command.
 
-    Only the fields the checker reads have to be truthful: the magic, ncmds,
-    and the symtab_command itself. Everything else is plausible filler -- this
-    is a parser fixture, not a loadable image.
+    Only the magic, ncmds and the symtab_command are meaningful.
     """
     endian = ">" if big_endian else "<"
     magic = MH_CIGAM_64 if big_endian else MH_MAGIC_64
@@ -83,12 +65,11 @@ def _macho64(stroff: int, *, big_endian: bool = False, cmd: int = LC_SYMTAB) -> 
         0,  # flags
         0,  # reserved
     )
-    # The magic is written in the byte order the loader reads it in, so a
-    # big-endian fixture has to carry the swapped magic literally.
+    # A big-endian fixture carries the byte-swapped magic.
     if big_endian:
         header = struct.pack("<I", magic) + header[4:]
     body = header + command
-    # Pad out past the offsets named above so nothing reads off the end.
+    # Pad out past the offsets named above.
     return body + b"\0" * (0x2000 - len(body))
 
 
@@ -132,7 +113,7 @@ def _run_cli(*paths: pathlib.Path) -> subprocess.CompletedProcess:
 
 @pytest.mark.parametrize("stroff", [0x1004, 0x100C, 0x1F04])
 def test_misaligned_string_pool_is_rejected(stroff):
-    """The failure this gate exists for. Must be red, or the gate is theatre."""
+    """A misaligned string pool is rejected."""
     errors, checked = checker.check_bytes(_macho64(stroff), "libbad.dylib")
 
     assert checked == 1
@@ -150,7 +131,7 @@ def test_aligned_string_pool_is_accepted(stroff):
 
 
 def test_byte_swapped_image_is_parsed():
-    """A big-endian header must be read, not skipped as unrecognised."""
+    """A big-endian header is parsed."""
     errors, checked = checker.check_bytes(
         _macho64(0x100C, big_endian=True), "libswapped.dylib"
     )
@@ -160,7 +141,7 @@ def test_byte_swapped_image_is_parsed():
 
 
 def test_image_without_symtab_has_nothing_to_check():
-    """A fully stripped object is legitimate and must not be a violation."""
+    """A fully stripped object is not a violation."""
     assert checker.check_bytes(_macho64_no_commands(), "libnosym.dylib") == ([], 0)
     assert checker.check_bytes(_macho64(0x100C, cmd=LC_UUID), "libuuid.dylib") == (
         [],
@@ -169,7 +150,7 @@ def test_image_without_symtab_has_nothing_to_check():
 
 
 def test_zero_length_load_command_stops_the_walk():
-    """A cmdsize of zero would otherwise walk the header forever."""
+    """A zero-length load command stops the walk."""
     blob = bytearray(_macho64(0x100C))
     struct.pack_into("<I", blob, 32 + 4, 0)  # load_command.cmdsize
 
@@ -177,7 +158,7 @@ def test_zero_length_load_command_stops_the_walk():
 
 
 def test_wheel_member_is_checked(tmp_path):
-    """A wheel is a zip; the extension inside it is what dyld will open."""
+    """The extension inside a wheel is checked."""
     wheel = tmp_path / "edgefirst_tensor-0.0.0-cp314-cp314-macosx_11_0_arm64.whl"
     with zipfile.ZipFile(wheel, "w") as zf:
         zf.writestr("edgefirst/tensor/", "")
@@ -203,7 +184,7 @@ def test_unreadable_archive_is_reported(tmp_path):
 
 @pytest.mark.parametrize("magic", [FAT_MAGIC, FAT_MAGIC_64])
 def test_fat_binary_slices_are_checked_individually(magic):
-    """A universal binary hides a bad slice behind a good one."""
+    """Each slice of a universal binary is checked."""
     blob = _fat([_macho64(0x1000), _macho64(0x100C)], magic=magic)
 
     errors, checked = checker.check_bytes(blob, "libfat.dylib")
@@ -214,7 +195,7 @@ def test_fat_binary_slices_are_checked_individually(magic):
 
 
 def test_fat_slice_offset_past_end_is_reported():
-    """A truncated universal binary must name the problem, not index off it."""
+    """A fat slice offset past the end of the file is reported."""
     blob = bytearray(_fat([_macho64(0x1000)]))
     struct.pack_into(">I", blob, 8 + 8, 0xFFFF0000)  # fat_arch.offset
 
@@ -225,7 +206,7 @@ def test_fat_slice_offset_past_end_is_reported():
 
 
 def test_non_macho_files_are_ignored(tmp_path):
-    """An ELF or a text file must not be mistaken for a violation."""
+    """An ELF or a text file is not reported as a violation."""
     (tmp_path / "libelf.so").write_bytes(b"\x7fELF" + b"\0" * 1024)
     (tmp_path / "README.txt").write_text("not a binary")
 
@@ -246,8 +227,8 @@ def test_directory_walk_reaches_nested_artifacts(tmp_path):
 
 
 def test_truncated_macho_is_reported_not_raised(tmp_path):
-    """A partial write in a build tree must fail loudly, not traceback."""
-    # Mach-O magic and a cputype, then nothing -- the header runs off the end.
+    """A truncated Mach-O is reported instead of raising."""
+    # Mach-O magic and a cputype, then nothing.
     truncated = tmp_path / "libtrunc.dylib"
     truncated.write_bytes(struct.pack("<Ii", MH_MAGIC_64, CPU_TYPE_ARM64))
 
@@ -272,7 +253,7 @@ def test_main_reports_a_violation(tmp_path, capsys):
 
 
 def test_main_says_so_when_it_found_nothing(tmp_path, capsys):
-    """A silently empty run must never read as a passing one."""
+    """main() reports when it found no symbol tables."""
     (tmp_path / "notes.txt").write_text("no binaries here")
 
     assert checker.main(str(tmp_path)) == 0
@@ -286,12 +267,11 @@ def test_main_defaults_to_the_wheel_directory(tmp_path, monkeypatch, capsys):
     monkeypatch.chdir(tmp_path)
 
     assert checker.main() == 1
-    # Separator-agnostic: the default target is a relative path.
     assert "wheels" in capsys.readouterr().out
 
 
 def test_command_line_exit_status(tmp_path):
-    """`make` branches on the exit status, so the CLI plumbing is a contract."""
+    """The command line exits 0 for an aligned image and 1 for a misaligned one."""
     good, bad = tmp_path / "libgood.dylib", tmp_path / "libbad.dylib"
     good.write_bytes(_macho64(0x1000))
     bad.write_bytes(_macho64(0x100C))

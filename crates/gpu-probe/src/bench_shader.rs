@@ -108,10 +108,7 @@ pub fn run(_ctx: &GpuContext) -> Vec<BenchResult> {
         let frag_cstr =
             CString::new(frag_src).expect("fragment shader source contains interior null byte");
 
-        // Verify the shader pair compiles and links at least once before
-        // benchmarking. The YUV external shader requires
-        // GL_OES_EGL_image_external_essl3 which may not be available on all
-        // drivers.
+        // Verify the shader pair compiles and links before benchmarking.
         let links = unsafe {
             let vs = edgefirst_gl::gl::CreateShader(edgefirst_gl::gl::VERTEX_SHADER);
             let vs_ptr = vert_cstr.as_ptr();

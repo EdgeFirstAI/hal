@@ -1,12 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! Input-handling contract of the legacy decode path: model outputs are
-//! mapped read-only, and a padded row pitch is honoured rather than read as
-//! data.
-//!
-//! A map outside a tensor's declared `CpuAccess` is refused, so decoding a
-//! `CpuAccess::Read` input at all proves it is never mapped for writing.
+//! Input handling of the legacy decode path: model outputs are mapped
+//! read-only, and a padded row pitch is honoured.
 
 use edgefirst_decoder::{configs, ConfigOutput, DecoderBuilder, DetectBox, Nms};
 use edgefirst_tensor::{

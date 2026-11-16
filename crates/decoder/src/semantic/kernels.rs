@@ -3,10 +3,9 @@
 
 //! CPU kernels for the semantic segmentation decoder.
 //!
-//! Scores are read in their stored type. A positive per-tensor quantization
-//! scale preserves both the argmax and bilinear interpolation (the weights
-//! sum to 1), so integer inputs are never dequantized except where a real
-//! value is needed: the single-channel threshold and the confidence map.
+//! Scores are read in their stored type. Integer inputs are dequantized
+//! only where a real value is needed: the single-channel threshold and the
+//! confidence map.
 //!
 //! Each kernel takes the decode's [`Isa`]: on the NEON tiers rows run the shared kernels in
 //! `edgefirst_kernels::prim::neon_semantic` (through `neon_dispatch::semantic`), bit-identical to
@@ -135,8 +134,7 @@ pub(super) struct Tap {
 /// Bilinear taps for `out` samples of the source span `[roi0, roi0 + roi_len)`
 /// on an axis of `len` pixels, following PyTorch `interpolate` semantics.
 ///
-/// `hi == lo` whenever the upper tap has no weight, so the corners a pixel
-/// actually reads are the only ones compared by the early-out.
+/// `hi == lo` whenever the upper tap has no weight.
 pub(super) fn bilinear_taps(
     out: usize,
     len: usize,
@@ -171,7 +169,7 @@ pub(super) fn bilinear_taps(
 }
 
 /// Nearest source index for `out` samples of `[roi0, roi0 + roi_len)`, using
-/// pixel centres so the class map stays aligned with the bilinear path.
+/// pixel centres.
 pub(super) fn nearest_taps(out: usize, len: usize, roi0: f32, roi_len: f32) -> Vec<u32> {
     let last = len.saturating_sub(1) as f32;
     (0..out)
@@ -569,16 +567,14 @@ pub(super) fn upsample_threshold<T: Score, O: ClassOut>(
 
 /// Bilinear upsample of every class channel followed by argmax.
 ///
-/// Bilinear interpolation is a convex combination, so where the low-resolution
-/// argmax agrees at every corner a pixel reads, that class is the result.
-/// Pixels whose corners disagree interpolate only the candidate classes of
-/// their cell: a class whose largest corner score is below the best smallest
-/// corner score of any class cannot win anywhere in the cell.
+/// Where the low-resolution argmax agrees at every corner a pixel reads,
+/// that class is the result. Pixels whose corners disagree interpolate only
+/// the candidate classes of their cell: those whose largest corner score
+/// reaches the best smallest corner score of any class.
 ///
 /// Output rows are processed in bands that read the same pair of source rows.
-/// Each band gathers the corner scores of its boundary cells once, streaming
-/// one class plane at a time, since gathering a class vector across planes of
-/// a power-of-two-like stride thrashes the cache.
+/// Each band gathers the corner scores of its boundary cells once, one class
+/// plane at a time.
 pub(super) fn upsample_argmax<T: Score, O: ClassOut>(
     isa: Isa,
     data: &[T],

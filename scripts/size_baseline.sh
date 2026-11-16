@@ -1,9 +1,5 @@
 #!/usr/bin/env bash
-# Size baseline for the packaging split (A3: self-contained wheels).
-#
-# Under A3 the meaningful unit is the shipped extension module, not the crate:
-# each module statically links only the slice of its dependencies it calls, so
-# per-crate rlib sizes do not predict wheel size. This measures artifacts.
+# Size baseline: records the sizes of the release C libraries and of the wheels.
 #
 # Usage: scripts/size_baseline.sh [output.json]
 set -euo pipefail
@@ -12,7 +8,7 @@ mkdir -p "$(dirname "$OUT")"
 
 py() { command -v python3 >/dev/null && python3 "$@"; }
 
-deflate() {  # compressed size, i.e. what a user downloads
+deflate() {  # compressed size
     local file="$1"
     python3 -c "import sys,zlib;print(len(zlib.compress(open(sys.argv[1],'rb').read(),9)))" "$file"
 }

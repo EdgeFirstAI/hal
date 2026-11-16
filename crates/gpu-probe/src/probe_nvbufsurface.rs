@@ -2,48 +2,36 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #![allow(dead_code)]
-//! NvBufSurface dma-buf interop probe — Jetson only (O1–O3).
+//! NvBufSurface dma-buf interop probe (Jetson only).
 //!
-//! Validates the hypothesis that on Jetson we can keep the existing
-//! `TensorMemory::DmaBuf` contract by swapping the allocator from `/dev/dma_heap`
-//! (absent on this L4T R36.4 image) to **NvBufSurface** (dlopen'd at runtime).
+//! When `libnvbufsurface.so` cannot be dlopen'd the module reports SKIP and
+//! does nothing else.
 //!
-//! The probe is fully **gated**: if `libnvbufsurface.so` cannot be dlopen'd
-//! (i.e. we are not on a Jetson) the whole module reports SKIP and is a no-op,
-//! so cross-platform / non-Jetson runs are unaffected.
-//!
-//! Objectives:
-//! * **O1 — alloc + fd:** `NvBufSurfaceCreate` a pitch-linear SURFACE_ARRAY
-//!   surface sized for our packed RGBA16F `(W/4, 3H)` layout; read the
+//! Steps:
+//! * **Alloc + fd:** `NvBufSurfaceCreate` a pitch-linear SURFACE_ARRAY
+//!   surface sized for the packed RGBA16F `(W/4, 3H)` layout; read the
 //!   `surfaceList[0].bufferDesc` dma-buf fd and `fstat` it.
-//! * **O2 — GL import + render:** import that fd as an `EGLImage`
+//! * **GL import + render:** import that fd as an `EGLImage`
 //!   (`DRM_FORMAT_ABGR16161616F`), bind as an EGLImage-backed renderbuffer,
-//!   render a known color, read it back and verify — the decisive test that
-//!   orin-nano OpenGL accepts an NvBufSurface-created dma-buf.
-//! * **O3 — fd round-trip:** `NvBufSurfaceFromFd(fd, &out)` to prove the
-//!   `clone_fd`-style sharing interops with NvBufSurface.
+//!   render a known color, read it back and verify.
+//! * **fd round-trip:** `NvBufSurfaceFromFd(fd, &out)`.
 //!
-//! ## ABI note
+//! ## ABI
 //! The structs below mirror `/usr/src/jetson_multimedia_api/include/nvbufsurface.h`
-//! exactly (`#[repr(C)]`). We only mirror enough of `NvBufSurfaceParams` to
-//! reach `bufferDesc` (offset 24); the trailing fields are padded out with a
-//! reserved tail so the parent `NvBufSurface.surfaceList[0]` indexing and the
-//! library's own writes land at the right offsets. A runtime offset assertion
-//! guards the critical `bufferDesc` position.
+//! (`#[repr(C)]`). `NvBufSurfaceParams` is mirrored up to `bufferDesc`
+//! (offset 24) and padded with a reserved tail. A runtime assertion checks
+//! the `bufferDesc` offset.
 
 use crate::egl_context::GpuContext;
 use libloading::{Library, Symbol};
 use std::ffi::c_void;
 use std::os::raw::c_int;
 
-/// `DRM_FORMAT_ABGR16161616F` — packed little-endian R,G,B,A half-floats; the
-/// only float DRM fourcc usable as a renderable RGBA16F dma-buf. Matches
-/// `probe_float_render`.
+/// `DRM_FORMAT_ABGR16161616F`: packed little-endian R,G,B,A half-floats.
 const DRM_FORMAT_ABGR16161616F: u32 = 0x4834_4241;
 
-/// `DRM_FORMAT_ABGR8888` (`'AB24'`) — matches the 8-bit RGBA NvBufSurface the
-/// fallback allocator produces; used to prove the EGLImage import path works at
-/// all when the fourcc agrees with the driver-allocated surface format.
+/// `DRM_FORMAT_ABGR8888` (`'AB24'`): the 8-bit RGBA format of the fallback
+/// allocation.
 const DRM_FORMAT_ABGR8888: u32 = 0x3432_4241;
 
 // ---------------------------------------------------------------------------
@@ -52,17 +40,15 @@ const DRM_FORMAT_ABGR8888: u32 = 0x3432_4241;
 
 const NVBUF_MEM_SURFACE_ARRAY: u32 = 4;
 const NVBUF_LAYOUT_PITCH: u32 = 0;
-/// `NVBUF_COLOR_FORMAT_RGBA` — index 19 in the color-format enum (counted from
-/// INVALID=0). `NvBufSurfaceCreate` validates colorFormat even when `size` is
-/// set (a 0 colorFormat returns rc=-1), so a valid format is always supplied.
+/// `NVBUF_COLOR_FORMAT_RGBA`: index 19 in the color-format enum (counted from
+/// INVALID=0).
 const NVBUF_COLOR_FORMAT_RGBA: u32 = 19;
 
 // ---------------------------------------------------------------------------
 // #[repr(C)] ABI mirror of nvbufsurface.h
 // ---------------------------------------------------------------------------
 
-/// Mirror of `NvBufSurfaceCreateParams` (flat params — simpler than the nested
-/// `NvBufSurfaceAllocateParams`). All enums are C `int`/`u32` (4 bytes).
+/// Mirror of `NvBufSurfaceCreateParams`. All enums are C `int`/`u32` (4 bytes).
 #[repr(C)]
 struct NvBufSurfaceCreateParams {
     gpu_id: u32,
@@ -75,12 +61,9 @@ struct NvBufSurfaceCreateParams {
     mem_type: u32,     // NvBufSurfaceMemType
 }
 
-/// Partial mirror of `NvBufSurfaceParams`. We mirror the leading fields up to
-/// and including `bufferDesc` (the dma-buf fd) exactly, then pad the remainder
-/// out to the real struct size so `surfaceList[0]` indexing is correct and the
-/// library writes into valid memory. The real struct's tail is
-/// `dataSize(u32) + pad + dataPtr(ptr) + planeParams + mappedAddr + paramex(ptr)
-/// + _reserved[3]`; we over-reserve generously and never read it.
+/// Partial mirror of `NvBufSurfaceParams`: the leading fields up to and
+/// including `bufferDesc` (the dma-buf fd), then padding for the remainder of
+/// the struct.
 #[repr(C)]
 struct NvBufSurfaceParams {
     width: u32,
@@ -90,18 +73,14 @@ struct NvBufSurfaceParams {
     layout: u32,       // NvBufSurfaceLayout
     // 5 * u32 = 20 bytes, then 4 bytes pad → bufferDesc at offset 24 (8-aligned).
     buffer_desc: u64,
-    // Opaque tail. The real NvBufSurfaceParams continues with dataSize, dataPtr,
-    // NvBufSurfacePlaneParams, NvBufSurfaceMappedAddr, paramex, _reserved[3].
-    // NvBufSurfacePlaneParams: u32 num_planes + 4*NVBUF_MAX_PLANES of
-    // {u32 width,height,pitch,offset,psize,bytesPerPix} + 4*u64 offset
-    // + 4*u64 pitch ... — large. Reserve a comfortable 512 bytes so the
-    // allocator never scribbles past our backing store.
+    // Opaque tail covering dataSize, dataPtr, NvBufSurfacePlaneParams,
+    // NvBufSurfaceMappedAddr, paramex and _reserved[3].
     _tail: [u8; 512],
 }
 
 /// Mirror of `NvBufSurface`. `surfaceList` is an 8-byte aligned pointer; the
 /// 3 preceding u32 + bool(1)+3pad + u32 memType = 20 bytes → 4 bytes pad →
-/// surfaceList at offset 24, matching the C layout.
+/// surfaceList at offset 24.
 #[repr(C)]
 struct NvBufSurface {
     gpu_id: u32,
@@ -139,8 +118,7 @@ fn open_lib() -> Option<Library> {
 
 /// fstat a raw fd and return its size in bytes, or an error string.
 ///
-/// Borrows the fd without taking ownership so we never close it out from under
-/// the live NvBufSurface that owns it.
+/// Borrows the fd without taking ownership.
 fn fstat_size(fd: c_int) -> Result<u64, String> {
     use std::os::fd::BorrowedFd;
     if fd < 0 {
@@ -158,9 +136,7 @@ fn fstat_size(fd: c_int) -> Result<u64, String> {
 struct AllocResult {
     surf: *mut NvBufSurface,
     fd: c_int,
-    /// The surface's reported width/height/colorFormat — the driver may pick
-    /// its own geometry regardless of what we requested, so import must use
-    /// these, not the requested dimensions.
+    /// The surface's reported width, height and colorFormat.
     width: u32,
     height: u32,
     color_format: u32,
@@ -242,12 +218,10 @@ unsafe fn render_and_verify(case: &ImportCase) -> bool {
     buf.iter().any(|&b| b != 0)
 }
 
-/// O2 inner: import `fd` as an EGLImage under `case`'s fourcc/geometry, then try
-/// to make it an FBO color attachment two ways — first as a **renderbuffer**
+/// Import `fd` as an EGLImage under `case`'s fourcc/geometry, then try to make
+/// it an FBO color attachment two ways: first as a renderbuffer
 /// (`EGLImageTargetRenderbufferStorageOES`), then, if that fails, as a
-/// **TEXTURE_2D** (`EGLImageTargetTexture2DOES`). On Tegra the renderbuffer
-/// route is frequently rejected for imported EGLImages while the texture route
-/// works, so reporting both disambiguates the HAL import strategy.
+/// TEXTURE_2D (`EGLImageTargetTexture2DOES`). Reports both.
 unsafe fn gl_try_import(ctx: &GpuContext, fd: c_int, pitch: u32, case: &ImportCase) -> String {
     let egl_image =
         match ctx.create_egl_image_dma(fd, case.w as i32, case.h as i32, case.fourcc, pitch as i32)
@@ -373,15 +347,12 @@ fn fbo_status_name(status: u32) -> &'static str {
     }
 }
 
-/// O2: try several DRM-fourcc tags against the same NvBufSurface fd and report
+/// Try several DRM-fourcc tags against the same NvBufSurface fd and report
 /// each, returning a one-line summary plus the best outcome.
 ///
-/// Geometry is derived from the surface's *actual* reported width/height/pitch
-/// (the driver picks its own, ignoring our requested size), so the EGLImage
-/// import stays self-consistent:
-///   * ABGR8888  at (surface_w, surface_h)        — matches the allocated RGBA8.
-///   * ABGR16161616F at (pitch/8, surface_h)      — our packed HAL layout
-///     reinterpreting the same bytes as half-float RGBA (only when pitch%8==0).
+/// Geometry comes from the surface's reported width/height/pitch:
+///   * ABGR8888 at (surface_w, surface_h).
+///   * ABGR16161616F at (pitch/8, surface_h), only when pitch%8==0.
 unsafe fn gl_import_render(ctx: &GpuContext, a: &AllocResult) -> String {
     if !ctx.has_rgb8_renderbuffer() {
         return "N/A (no glEGLImageTargetRenderbufferStorageOES)".into();
@@ -427,11 +398,11 @@ unsafe fn gl_import_render(ctx: &GpuContext, a: &AllocResult) -> String {
     best
 }
 
-/// Run the NvBufSurface probe (O1–O3). Gated: SKIP if not on a Jetson.
+/// Run the NvBufSurface probe. Reports SKIP when not on a Jetson.
 pub fn run(ctx: &GpuContext) {
-    println!("=== NvBufSurface dma-buf Probe (Jetson O1-O3) ===");
+    println!("=== NvBufSurface dma-buf Probe (Jetson) ===");
 
-    // Compile-time-ish ABI sanity: bufferDesc must sit at offset 24.
+    // ABI check: `bufferDesc` sits at offset 24.
     let dummy = std::mem::MaybeUninit::<NvBufSurfaceParams>::uninit();
     let base = dummy.as_ptr() as usize;
     let bd_off = unsafe { std::ptr::addr_of!((*dummy.as_ptr()).buffer_desc) as usize } - base;
@@ -467,7 +438,7 @@ pub fn run(ctx: &GpuContext) {
     let from_fd: Option<Symbol<FnFromFd>> = unsafe { lib.get(b"NvBufSurfaceFromFd\0") }.ok();
 
     // -------------------------------------------------------------------
-    // O1 — allocate + extract fd
+    // Allocate + extract fd
     // -------------------------------------------------------------------
     // Packed RGBA16F for a 256x256-equivalent: (W/4, 3H) = (64, 768),
     // pitch = 64 * 8 = 512, byte_count = 512 * 768 = 393216.
@@ -475,10 +446,7 @@ pub fn run(ctx: &GpuContext) {
     let pitch_expect = pw * 8;
     let byte_count = pitch_expect * ph;
 
-    // NOTE: the header claims a non-zero `size` makes all other params ignored,
-    // but empirically NvBufSurfaceCreate still validates colorFormat (rc=-1 +
-    // "invalid colorFormat 0" when set to 0). So set a valid colorFormat even
-    // on the size-based path.
+    // Size-based allocation with a valid colorFormat.
     let size_params = NvBufSurfaceCreateParams {
         gpu_id: 0,
         width: pw,
@@ -490,12 +458,12 @@ pub fn run(ctx: &GpuContext) {
         mem_type: NVBUF_MEM_SURFACE_ARRAY,
     };
 
-    println!("  -- O1: NvBufSurfaceCreate (size-based, {byte_count} bytes) --");
+    println!("  -- NvBufSurfaceCreate (size-based, {byte_count} bytes) --");
     let alloc = match unsafe { try_alloc(&create, &size_params, "size-raw") } {
         Ok(a) => Some(a),
         Err(e) => {
             println!("     size-based alloc failed: {e}; trying RGBA color format");
-            // Fallback: real RGBA color format at width=128,height=768 → pitch 512.
+            // Fallback: RGBA color format at width=128, height=768 → pitch 512.
             let rgba_params = NvBufSurfaceCreateParams {
                 gpu_id: 0,
                 width: 128,
@@ -518,7 +486,7 @@ pub fn run(ctx: &GpuContext) {
 
     let (o1_pass, o2_report, o3_report) = match alloc {
         None => {
-            println!("  O1 FAIL: no allocation strategy succeeded");
+            println!("  FAIL: no allocation strategy succeeded");
             (
                 false,
                 "SKIP (no fd)".to_string(),
@@ -527,21 +495,21 @@ pub fn run(ctx: &GpuContext) {
         }
         Some(a) => {
             println!(
-                "  O1 PASS: strategy={} fd={} surface={}x{} colorFmt={} pitch={} size={} (requested {} bytes)",
+                "  PASS: strategy={} fd={} surface={}x{} colorFmt={} pitch={} size={} (requested {} bytes)",
                 a.strategy, a.fd, a.width, a.height, a.color_format, a.pitch, a.size, byte_count
             );
 
             // ---------------------------------------------------------------
-            // O2 — GL import + render + readback (the core test)
+            // GL import + render + readback
             // ---------------------------------------------------------------
-            println!("  -- O2: GL import of NvBufSurface fd + render --");
+            println!("  -- GL import of NvBufSurface fd + render --");
             let o2 = unsafe { gl_import_render(ctx, &a) };
-            println!("  O2: {o2}");
+            println!("  {o2}");
 
             // ---------------------------------------------------------------
-            // O3 — fd round-trip via NvBufSurfaceFromFd
+            // fd round-trip via NvBufSurfaceFromFd
             // ---------------------------------------------------------------
-            println!("  -- O3: NvBufSurfaceFromFd round-trip --");
+            println!("  -- NvBufSurfaceFromFd round-trip --");
             let o3 = match &from_fd {
                 None => "FAIL (NvBufSurfaceFromFd symbol absent)".to_string(),
                 Some(f) => {
@@ -554,9 +522,9 @@ pub fn run(ctx: &GpuContext) {
                     }
                 }
             };
-            println!("  O3: {o3}");
+            println!("  {o3}");
 
-            // Cleanup the surface.
+            // Destroy the surface.
             if let Some(d) = &destroy {
                 let rc = unsafe { d(a.surf) };
                 log::debug!("NvBufSurfaceDestroy rc={rc}");

@@ -12,7 +12,7 @@ and are pinned by commit SHA in `uses:`.
 | **Quick** | every non-draft PR push, and push to `main` | fmt (hard gate), clippy, nextest `-j 1`, ruff, dependency license — one Linux job, ~20 min budget |
 | **Full** | reviewer adds `ci:full` (sticky on later pushes), `workflow_dispatch`, or merge queue | host matrix, HAL extras (iOS/Android/software-GL/C-API/Python), coverage, scancode, Sonar |
 | **Hardware** | `ci:hardware` (or `ci:full`) on a same-repo PR | on-target i.MX 8M Plus via the shared three-phase pattern |
-| **Nightly** | 03:17 UTC if `main` moved since the last nightly that reached a verdict | Full + G13 differential + Sonar `main` baseline |
+| **Nightly** | 03:17 UTC if `main` moved since the last nightly that reached a verdict | Full + differential + Sonar `main` baseline |
 | **Advisories** | 03:17 UTC, every night, gated or not | `cargo audit`. Ungated on purpose: the RustSec database moves whether the code does or not |
 | **Mutation** | 04:47 UTC, every night | one rotating slice of the mutant corpus on four legs (Linux x86_64/arm64, macOS, Windows), fanned across free runners; red on any legitimate survivor |
 | **Release build** | push to `release/X.Y.Z` | wheels, C-API, SBOM, provenance — built and uploaded, nothing published |
@@ -22,7 +22,7 @@ Draft PRs run nothing. Open as draft, mark ready when you want Quick.
 
 Add **`ci:full`** before approving when the PR touches the build system, `unsafe`, FFI/C-API, GL/G2D/DMA, platform `cfg`, dependencies, or public API. Skip it for docs and comment-only changes. Release PRs (`release/X.Y.Z` → `main`) must carry `ci:full`.
 
-`ci-gate` is the only required status check (org `protect-main-ci` ruleset). Docs-only PRs skip Quick/Full; the gate still passes. hal is in the org `protect-main` / `protect-main-ci` / `protect-release-tags` rulesets; the hand-made repo-level duplicates are retired.
+`ci-gate` is the only required status check (org `protect-main-ci` ruleset). Docs-only PRs skip Quick/Full; the gate still passes. hal is in the org `protect-main` / `protect-main-ci` / `protect-release-tags` rulesets.
 
 ## Workflows
 
@@ -32,7 +32,7 @@ Add **`ci:full`** before approving when the PR touches the build system, `unsafe
 | `hal-full.yml` | HAL-only Full lanes (`workflow_call`) |
 | `nightly.yml` | Change-gated nightly. Also calls the ungated shared `advisories.yml` |
 | `mutants.yml` | Mutation testing. Own schedule, sharded across parallel free runners, gates nothing else |
-| `differential.yml` | G13; nightly and manual only |
+| `differential.yml` | static vs. dynamic backend comparison; nightly and manual only |
 | `release.yml` | Release **build**, on push to `release/X.Y.Z`. Wheels, C-API archives, SBOM, provenance. Publishes nothing. |
 | `tag-release.yml` | Shared caller: merged `release/X.Y.Z` → annotated `vX.Y.Z`, and only if `release.yml` is green for the release-branch head being merged (`require-build`). |
 | `publish.yml` | Release **deploy**, on a `vX.Y.Z` tag. Resolves the `release.yml` run, binds it by tree SHA, and publishes to PyPI, crates.io and GitHub Releases. Compiles nothing. Filename and `pypi` environment stay here — PyPI Trusted Publishing cannot use a reusable workflow in another repo. |
@@ -41,9 +41,9 @@ Add **`ci:full`** before approving when the PR touches the build system, `unsafe
 | `hardware-test.yml` | `workflow_dispatch` only. HAL's whole on-target suite plus the C-API gates on the boards named, one job per board entry; see [On-demand hardware runs](#on-demand-hardware-runs) |
 | `hardware-bench.yml` | `workflow_dispatch` only. Every benchmark case on the boards named, summarised across boards |
 
-**A tag deploys; it never builds.** Five of hal's nine release tags failed, and every one of those was a build failure reached only at deploy time. Under this split those are red release PRs. Rehearse `publish.yml` with its `workflow_dispatch` before the first tag after any change to it — it verifies everything and publishes nothing.
+**A tag deploys; it never builds.** A build failure shows as a red release PR, before any tag exists. Rehearse `publish.yml` with its `workflow_dispatch` before the first tag after any change to it — it verifies everything and publishes nothing.
 
-Mutation testing lives in its own workflow rather than the nightly. The corpus is ~6,900 mutants and roughly 39 hours of work, so it cannot finish in one sitting; as a nightly job it capped at 120 minutes, got through 5%, never once completed, and held the run open for two hours after every other lane had finished. It now tests a rotating window of shards each night across parallel free runners, sweeping the corpus and rolling over. Parallelism is a matrix of runners, not cargo-mutants' `--jobs`, which is incompatible with `--in-place` because each parallel job needs its own tree and target directory.
+Mutation testing lives in its own workflow rather than the nightly. The corpus is ~6,900 mutants and roughly 39 hours of work, so it cannot finish in one sitting; the workflow tests a rotating window of shards each night across parallel free runners, sweeping the corpus and rolling over. Parallelism is a matrix of runners, not cargo-mutants' `--jobs`, which is incompatible with `--in-place` because each parallel job needs its own tree and target directory.
 
 The sweep has four legs, because a mutant in code a target does not compile passes there by construction: `ubuntu-24.04`, `ubuntu-24.04-arm`, `macos-latest` and `windows-latest`. `edgefirst-tensor` (16 shards, 2 a night) runs on all four; decoder + tracker + kernels (48 shards, 6 a night) have no `target_os` code and run on the Linux legs only. The plan job emits one `include` matrix of `{corpus, shard, total, runner, packages, timeout}`, and every leg runs the same shard indices of a corpus on the same night, so the roll-up can merge legs by mutant name. `timeout-minutes` is per runner (120 x86_64, 180 arm64, 150 macOS, 240 Windows); the macOS and Windows values are starting points to tune from measured shard wall times. The Linux legs run `.github/scripts/dma-heap-setup.sh` first, which arms `HAL_TEST_REQUIRE_DMA=1` when the runner's heap allocates, so a lost heap fails the baseline instead of turning DMA-only mutants into silent survivors. The Windows leg pins the D3D11 WARP adapter.
 
@@ -53,7 +53,7 @@ Never tag by hand. Do not introduce `-xlarge` / `-8core` labels unless a Full la
 
 ## Shared pin
 
-Callers pin one commit of `EdgeFirstAI/.github`. The SHA appears **only** in `uses:` lines, which is what Dependabot bumps — neither the file headers nor this sentence repeat it, deliberately, so a bump cannot leave a stale second copy behind. This paragraph used to quote the value and was itself stale within one re-pin. The shared workflows find their own composite actions through `job.workflow_repository` / `job.workflow_sha`, so there is no second value to keep in sync there either.
+Callers pin one commit of `EdgeFirstAI/.github`. The SHA appears only in `uses:` lines, which is what Dependabot bumps; neither the file headers nor this document repeat it, so a bump cannot leave a stale second copy behind. The shared workflows find their own composite actions through `job.workflow_repository` / `job.workflow_sha`, so there is no second value to keep in sync there either.
 
 The license policy lives in `EdgeFirstAI/.github` and is the only copy. `make sbom` fetches it at the pinned commit (`.github/scripts/fetch-ci-scripts.sh`), so local runs and CI enforce the same policy.
 
@@ -65,14 +65,14 @@ What each tier optimises for differs, so the runner class differs with it.
 |------|--------------|---------|
 | **Quick** | cost **and** speed | free standard (`ubuntu-24.04`). Never bills — this is the per-push path |
 | **Full** | speed, cost accepted | `ubuntu-24.04-xlarge` / `-arm-xlarge`, `macos-latest-xlarge` |
-| **Nightly** | speed, cost accepted | same as Full, including the G13 differential |
+| **Nightly** | speed, cost accepted | same as Full, including the differential |
 | **Advisories** | cost, absolutely | free standard, hard-coded. It runs every night, so it must never land on a billed class |
 | **Mutation** | cost, absolutely | free standard. Nothing waits on it, so speed buys nothing worth billing for |
 | **Release** | speed, cost accepted | xlarge build matrices; publish/verify stay standard (registry I/O, not CPU) |
 
-Full and Release run once per PR or per tag, so spend follows review cadence, not typing. Phase 2 moves the Linux lanes to the self-hosted `build-x86` fleet and these go to zero; macOS stays billed because there is no free equivalent.
+Full and Release run once per PR or per tag, so spend follows review cadence, not typing. macOS stays billed because there is no free equivalent.
 
-**Windows stays on `windows-latest`.** The organisation has no Windows larger runner provisioned (`orgs/EdgeFirstAI/actions/hosted-runners` lists Linux images only), so `windows-latest-8-cores` would queue until the job timed out. Provisioning one is the remaining lever on hal's wall-clock floor, which the design page measured at 55-63 job-minutes.
+**Windows stays on `windows-latest`.** The organisation has no Windows larger runner provisioned (`orgs/EdgeFirstAI/actions/hosted-runners` lists Linux images only), so `windows-latest-8-cores` would queue until the job timed out. Provisioning one is the remaining lever on hal's wall-clock floor.
 
 The on-target lane runs one job per board identity: `imx8mp-evk` (Vivante, G2D), `imx95-evk` (Mali, G2D), `rpi5` (V3D) and `orin-nano` (Tegra, Ubuntu 22.04). An identity runs on that board every time, where a bare family label such as `imx8mp` can land on a carrier without the vendor BSP the tests expect. `rpi5` is the family label, which is the whole board: the Hailo-8L on the fleet's Pi carries the equipment label `rpi5-hailo8l`, and HAL does not use the NPU. orin-nano's glibc is 2.35, so Full and Nightly pass `archive-glibc: "2.35"` and the archive is linked against that floor. `BOARD=1` in the board pre-command arms `HAL_TEST_REQUIRE_GL` on any board with a render node and `EDGEFIRST_SKIP_VIVANTE_KNOWN_BUGS` on galcore, as `scripts/on-target-test.sh` does. Do not put a Quick lane on a billed runner; the org runner audit exists to catch exactly that.
 

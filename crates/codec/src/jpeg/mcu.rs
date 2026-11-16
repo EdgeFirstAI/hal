@@ -6,9 +6,8 @@
 //! Orchestrates: Huffman decode → IDCT → output written at strided offsets
 //! into the destination buffer. The default target is the source's native
 //! semi-planar format (or GREY); opt-in fused targets convert at the write
-//! stage: `Rgb` (4:4:4 sources, YCbCr→RGB per row) and `Nv12` (chroma
-//! box-average from any subsampling). Anything else is
-//! `ImageProcessor::convert()`'s job.
+//! stage: `Rgb` (4:4:4 and 4:2:0 sources, YCbCr→RGB per row) and `Nv12`
+//! (chroma box-average from any subsampling).
 
 use crate::error::CodecError;
 use crate::jpeg::bitstream::BitStream;
@@ -23,8 +22,8 @@ pub struct McuScratch {
     /// component, each `mcus_x * sampling.h * 8` wide × `sampling.v * 8` tall.
     component_bufs: Vec<Vec<u8>>,
     /// Full-width horizontally-upsampled Cb/Cr rows for the fused 4:2:0→RGB
-    /// write (see `write_rgb_rows_420`). Allocated to `img_w` by `new`;
-    /// `ensure_capacity` grows (never shrinks) them for a later, wider image.
+    /// write. Allocated to `img_w` by `new`; `ensure_capacity` grows them for a
+    /// wider image.
     upsample_cb: Vec<u8>,
     upsample_cr: Vec<u8>,
 }
@@ -48,7 +47,7 @@ impl McuScratch {
         }
     }
 
-    /// Grow buffers if needed (for a larger image than previously seen).
+    /// Grow the buffers for a larger image.
     pub fn ensure_capacity(&mut self, headers: &JpegHeaders) {
         let hdr = &headers.header;
         for (i, comp) in hdr.components.iter().enumerate() {
@@ -69,11 +68,7 @@ impl McuScratch {
 }
 
 /// True for the canonical 4:2:0 shape: 3 components, luma sampled 2×2, both
-/// chroma components sampled 1×1 (i.e. chroma is exactly half resolution on
-/// both axes). This is the dominant real-world JPEG subsampling and the one
-/// [`write_rgb_rows_420`] targets; anything else (4:2:2, 4:1:1, non-standard
-/// factors) cannot honour an `Rgb` request — see `resolve_output_format` in
-/// `jpeg/mod.rs`.
+/// chroma components sampled 1×1.
 pub(crate) fn is_native_420(hdr: &crate::jpeg::types::ImageHeader) -> bool {
     hdr.components.len() == 3
         && hdr.max_h_samp == 2
@@ -84,18 +79,14 @@ pub(crate) fn is_native_420(hdr: &crate::jpeg::types::ImageHeader) -> bool {
         && hdr.components[2].sampling == crate::jpeg::types::SamplingFactor { h: 1, v: 1 }
 }
 
-/// Decode all MCUs and write output pixels into `dst` on a fixed **physical
-/// grid** whose row pitch is `grid_row_stride` bytes.
+/// Decode all MCUs and write output pixels into `dst` on a fixed physical
+/// grid whose row pitch is `grid_row_stride` bytes.
 ///
-/// `grid_row_stride` is the destination's physical row stride — the IOSurface
-/// `bytesPerRow` / allocator pitch for a reused pool, which is `>=` the format's
-/// natural row width (`even_width = ceil(img_w/2)*2` for semi-planar). The
-/// logical image wraps on its natural width while every row is *placed* at
-/// `grid_row_stride`, so the same byte layout is produced for a tightly-packed
-/// buffer and a padded pool surface. This is the identical split the GPU R8
-/// sampling shader applies (logical wrap vs. physical placement), keeping the
-/// codec and shader provably in agreement. `output_format` must be `Grey`,
-/// `Nv12`, `Nv16`, or `Nv24`.
+/// `grid_row_stride` is the destination's physical row stride, `>=` the
+/// format's natural row width (`even_width = ceil(img_w/2)*2` for
+/// semi-planar). The logical image wraps on its natural width while every
+/// row is placed at `grid_row_stride`. `output_format` must be `Grey`,
+/// `Nv12`, `Nv16`, `Nv24` or `Rgb`.
 #[allow(clippy::too_many_arguments)]
 pub fn decode_image(
     data: &[u8],
@@ -111,28 +102,10 @@ pub fn decode_image(
     let img_h = hdr.height as usize;
     let num_components = hdr.components.len();
 
-    // The physical grid must be wide enough to place a full natural row, and
-    // `dst` must hold every row. A luma-only output (greyscale JPEG, or an
-    // explicit `Grey` target) writes exactly `img_w` bytes per row, so a
-    // tightly-packed odd-width buffer (stride == odd `img_w`) is valid;
-    // semi-planar colour formats interleave full-width UV pairs and need
-    // `even(img_w)` to keep chroma columns byte-aligned. These are runtime
-    // checks (not `debug_assert!`) because `decode_image` is public and takes a
-    // caller-supplied `dst`/`grid_row_stride`: malformed/untrusted dimensions
-    // must return an error, not panic or write out of bounds in release builds.
-    // Fused RGB output: offered for two source shapes. 4:4:4-equivalent
-    // (every component full resolution — sampling == max on both axes, e.g.
-    // 1×1 everywhere, or the 1×2-everywhere variant) needs a straight per-row
-    // YCbCr→RGB conversion with no chroma resampling. Native 4:2:0 (luma 2×2,
-    // chroma 1×1 — the dominant real-world subsampling) needs a 2×2 nearest
-    // chroma upsample folded into the same write (see `write_rgb_rows_420`).
-    // Anything else (4:2:2, 4:1:1, ...) errors rather than silently
-    // substituting a different format — this function's caller
-    // (`resolve_output_format` in `jpeg/mod.rs`) already resolves an `Rgb`
-    // preference on those sources to the native format before ever calling
-    // `decode_image` with `Rgb`, so this check exists to reject a caller who
-    // invokes `decode_image` directly (as this module's own tests do) rather
-    // than through `ImageDecoder`.
+    // Fused RGB output is offered for 4:4:4-equivalent sources (every
+    // component at the maximum sampling) and native 4:2:0. The grid must hold
+    // a full natural row (`img_w` bytes for luma-only output, `even(img_w)`
+    // for semi-planar formats) and `dst` must hold every row.
     let is_rgb = output_format == PixelFormat::Rgb;
     if is_rgb {
         let all_match_max = num_components == 3
@@ -177,15 +150,8 @@ pub fn decode_image(
         )));
     }
 
-    // Bind the IDCT as a fn-item (not a `fn` pointer). An indirect call per
-    // block is cheap on OoO cores and not on in-order A53/A55 (~20k blocks
-    // on a 640×640 4:4:4 frame). The NEON entry is `#[target_feature]` so a
-    // direct `bl` is legal; the 8×8 kernel stays outlined (one I-cache copy).
-    //
-    // The opt-in fast (AAN) kernel exists on the NEON path only; elsewhere
-    // `fast_dct` is advisory and the accurate path runs (see `DctMethod`).
-    // The dequant tables must match the kernel class: the fast kernels take
-    // AAN-prescaled tables, so both are resolved here, together.
+    // Select the IDCT kernel and its dequant tables: the fast (AAN) kernel
+    // exists on the NEON path only and takes AAN-prescaled tables.
     #[cfg(target_arch = "aarch64")]
     {
         use crate::jpeg::cpu::{neon_tier, NeonTier};
@@ -224,7 +190,7 @@ pub fn decode_image(
             };
         }
     }
-    let _ = fast_dct; // advisory: no fast kernels outside the NEON path
+    let _ = fast_dct; // no fast kernels outside the NEON path
     let quants: [[u16; 64]; 4] = core::array::from_fn(|i| headers.quant_tables[i].values);
     // Non-NEON kernels ignore the entropy-derived `last_k` sparsity hint.
     let idct_fn = idct::select_idct();
@@ -295,19 +261,8 @@ unsafe fn decode_image_neon_fast(
     )
 }
 
-/// Dedicated decode loop for the dominant colour shape: 3 components, all
-/// 1×1 sampling (4:4:4), writing NV24 or fused RGB directly per MCU.
-///
-/// The generic loop's sampling-factor machinery (per-component block loops,
-/// `Option` table lookups, planar scratch strides) forces a stack frame past
-/// the register file, and `perf annotate` on Cortex-A53/A55 showed the block
-/// loop reloading spilled state per block (`ldr/str [sp, #448..784]`). This
-/// shape — every COCO image, most camera 4:4:4 streams — needs none of it:
-/// one Y, one Cb, one Cr block per MCU, tables and quant pointers resolved
-/// once into plain locals.
-///
-/// Behaviour is bit-identical to the generic loop's `direct_444` arms, which
-/// dispatch here instead.
+/// Decode loop for 3 components at 1×1 sampling (4:4:4), writing NV24 or
+/// fused RGB per MCU: one Y, one Cb and one Cr block per MCU.
 #[allow(clippy::too_many_arguments)]
 fn decode_image_444_direct<Idct, IdctDc>(
     data: &[u8],
@@ -328,8 +283,7 @@ where
     let img_h = hdr.height as usize;
     let is_rgb = output_format == PixelFormat::Rgb;
 
-    // Resolve per-component tables once into plain references — no per-block
-    // Option indexing in the loop.
+    // Resolve the per-component tables.
     let comp_tables = |i: usize| -> crate::Result<(&HuffmanTable, &HuffmanTable, &[u16; 64])> {
         let c = &hdr.components[i];
         let dc = headers.dc_tables[c.dc_table_id as usize]
@@ -348,7 +302,7 @@ where
     let (dc_cb, ac_cb, q_cb) = comp_tables(1)?;
     let (dc_cr, ac_cr, q_cr) = comp_tables(2)?;
 
-    // Same per-tier monomorphisation as the generic loop.
+    // Select the block decoder for the CPU tier.
     type DecodeBlockFn = for<'d> fn(
         &mut BitStream<'d>,
         &HuffmanTable,
@@ -478,7 +432,7 @@ where
                 idct_dc_fn,
             );
 
-            // Write stage — identical to the generic loop's direct_444 tail.
+            // Write stage.
             let x = x_offset;
             let cols = img_w.saturating_sub(x).min(8);
             let rows = num_rows;
@@ -574,8 +528,7 @@ where
 
     let is_greyscale = num_components == 1;
 
-    // Standard 4:4:4 (1×1 sampling on every component) with per-MCU NV24 UV /
-    // fused RGB writes: dedicated tight loop (see decode_image_444_direct).
+    // 4:4:4 (1×1 sampling on every component) to NV24 or fused RGB: dedicated loop.
     if num_components == 3
         && hdr.max_h_samp == 1
         && hdr.max_v_samp == 1
@@ -593,9 +546,7 @@ where
         );
     }
 
-    // Fixed-size per-component state — no heap allocation per decode. JPEG
-    // baseline allows at most 4 components (we only emit 1- and 3-component
-    // images, but the cap keeps the arrays sound for any parsed header).
+    // Fixed-size per-component state, for at most 4 components.
     if num_components > 4 {
         return Err(CodecError::InvalidData(format!(
             "unsupported component count {num_components}"
@@ -620,10 +571,7 @@ where
         );
     }
 
-    // Paired-coefficient probe: a per-tier choice (OoO cores win, in-order
-    // cores lose — see cpu::entropy_pair_decode). Monomorphised, selected
-    // once per decode: one indirect call per block costs less than keeping a
-    // second live call site in the loop (which cost ~7% on the A53).
+    // Select the block decoder for the CPU tier (see cpu::entropy_pair_decode).
     type DecodeBlockFn = for<'d> fn(
         &mut BitStream<'d>,
         &HuffmanTable,
@@ -657,11 +605,8 @@ where
         let mcu_pixel_h = max_v * 8;
         let y_start = mcu_row * mcu_pixel_h;
         let num_rows = mcu_pixel_h.min(img_h - y_start);
-        // Direct Y→dst for full MCU-row bands (avoids planar scratch + memcpy).
-        // Partial bottom bands still go through scratch + clipped copy.
-        // 4:4:4 1×1 (COCO + fused RGB) writes chroma per MCU instead — see
-        // `direct_444`. Other chroma still uses planar scratch + full-row
-        // NEON `vst2` interleave.
+        // Full MCU-row bands write Y straight into dst; partial bottom bands
+        // go through scratch and a clipped copy.
         let y_direct = !is_greyscale
             && output_format != PixelFormat::Grey
             && !is_rgb
@@ -723,30 +668,10 @@ where
                                         idct_dc_fn,
                                     );
                                 } else {
-                                    // Right-edge MCU whose 8-wide block spills past the
-                                    // physical row (MCU-aligned width > grid width, e.g.
-                                    // 307-wide image → 312-wide MCU grid on a 308 grid).
-                                    // IDCT to a local block, then copy the columns that
-                                    // fit — writing through would corrupt the next
-                                    // row's left edge.
-                                    //
-                                    // `cols` saturates to 0 instead of underflowing when
-                                    // the block starts at or past `grid_row_stride`
-                                    // (`x_offset >= grid_row_stride`). That is not a
-                                    // caller error: `decode_image`'s own upfront check
-                                    // (above) only requires `grid_row_stride` to cover the
-                                    // image's even-rounded *logical* width, not the wider
-                                    // MCU-aligned width this loop iterates over — any width
-                                    // not a multiple of the MCU pixel width (16 for 4:2:0)
-                                    // hits this by design, on a perfectly
-                                    // legitimate, upfront-validated buffer. A block wholly
-                                    // past the edge carries no pixels that belong in `dst`
-                                    // at all (pure MCU padding), so it is simply not
-                                    // written — the same clip this branch already applies
-                                    // to a *partial* spill, generalised to zero columns
-                                    // instead of underflowing into a huge value that wraps
-                                    // back into an in-range-looking but inverted slice
-                                    // range (the panic this originally guarded against).
+                                    // Right-edge MCU whose 8-wide block extends past the
+                                    // physical row: IDCT to a local block, then copy the
+                                    // columns that fit. A block wholly past the edge is MCU
+                                    // padding and is not written.
                                     let cols = grid_row_stride.saturating_sub(x_offset); // 0..8
                                     if cols > 0 {
                                         let mut tmp = [0u8; 64];
@@ -758,14 +683,8 @@ where
                                             let d = dst_off + r * grid_row_stride;
                                             let end = d + cols;
                                             if end > dst.len() {
-                                                // Unlike the horizontal MCU-padding overshoot
-                                                // clipped above, this IS a genuine
-                                                // destination-size fault: `dst` doesn't hold
-                                                // as many rows as the image needs at this
-                                                // stride. Blame the destination, not the
-                                                // JPEG -- reuse the tensor crate's own
-                                                // capacity vocabulary rather than
-                                                // `InvalidData`.
+                                                // `dst` holds fewer rows than the image
+                                                // needs at this stride.
                                                 return Err(CodecError::Tensor(
                                                     edgefirst_tensor::Error::InsufficientCapacity {
                                                         needed: end,
@@ -808,8 +727,7 @@ where
                 tracing::trace_span!("codec.decode_jpeg.write_rgb_420", row = mcu_row).entered();
             let y_stride = mcus_x * hdr.max_h_samp as usize * 8;
             let c_stride = mcus_x * hdr.components[1].sampling.h as usize * 8;
-            // Chroma-row offset of the component buffer's local row 0, same
-            // addressing as `write_nv12_rows`'s native-4:2:0 passthrough.
+            // Chroma-row offset of the component buffer's local row 0.
             let band_src0 = y_start / 2;
             write_rgb_rows_420(
                 &scratch.component_bufs,
@@ -826,7 +744,7 @@ where
             );
         } else if is_rgb {
             let _w = tracing::trace_span!("codec.decode_jpeg.write_rgb", row = mcu_row).entered();
-            // All components sample at max rate (checked above) → one shared
+            // All components sample at the maximum rate: one shared
             // full-resolution buffer stride.
             let stride = mcus_x * hdr.max_h_samp as usize * 8;
             write_rgb_rows(
@@ -899,10 +817,7 @@ where
         }
     }
 
-    // The entropy buffer zero-pads past end-of-data, and zero is both a valid
-    // DC code and a valid EOB, so a scan that stops early decodes as clean
-    // zero blocks and reaches here without any per-block check firing. Only
-    // the stream itself knows the difference.
+    // Reject a scan that read past the end of its data.
     if bs.overran() {
         return Err(CodecError::InvalidData(
             "truncated entropy-coded scan".into(),
@@ -912,13 +827,8 @@ where
     Ok(())
 }
 
-/// Dequantise the DC coefficient for the DC-only IDCT shortcut.
-///
-/// In `i16`, wrapping, because that is what the kernels do when they dequantise
-/// a whole block: the shortcut has to produce what the full path would, and on
-/// a corrupt stream the full path wraps here (see [`idct::IdctFn`]). Widening
-/// to `i32` instead would both disagree with it and hand the DC-only kernels a
-/// value large enough to overflow their fixed-point scaling.
+/// Dequantise the DC coefficient for the DC-only IDCT shortcut, in wrapping
+/// `i16` arithmetic as the full kernels do.
 #[inline(always)]
 fn dc_only_coefficient(coeff: i16, quant: u16) -> i32 {
     coeff.wrapping_mul(quant as i16) as i32
@@ -950,9 +860,7 @@ fn idct_into<Idct, IdctDc>(
 /// Interleave one 8×8 Cb/Cr block into the NV24 UV plane (4:4:4 1×1).
 ///
 /// UV for luma row `y` starts at `img_h * stride + y * 2 * stride` and is
-/// `2*img_w` contiguous bytes — the same linear layout as
-/// [`write_nv16_nv24_rows`]. 8-wide `vst2` keeps a SIMD store without the
-/// planar scratch + full-row second pass.
+/// `2*img_w` contiguous bytes.
 #[allow(clippy::too_many_arguments)]
 #[inline]
 fn write_nv24_uv_block(
@@ -1021,9 +929,8 @@ fn write_nv24_uv_block(
     }
 }
 
-/// Write interleaved RGB rows from the 4:4:4 planar band scratch (fused
-/// colour conversion — no NV24 intermediate, no downstream `convert()` pass).
-/// All three component buffers share `stride` (full-resolution 4:4:4).
+/// Write interleaved RGB rows from the 4:4:4 planar band scratch. All three
+/// component buffers share `stride`.
 #[allow(clippy::too_many_arguments)]
 fn write_rgb_rows(
     comp_bufs: &[Vec<u8>],
@@ -1065,24 +972,14 @@ fn expand_row_2x(src: &[u8], dst: &mut [u8]) {
 }
 
 /// Write interleaved RGB rows for a native 4:2:0 source (see
-/// [`is_native_420`]): a 2×2 nearest-neighbour chroma upsample fused into the
-/// YCbCr→RGB write, reusing [`crate::jpeg::color::ycbcr_to_rgb_row`]'s SIMD
-/// kernels on the upsampled row rather than hand-writing a subsampled colour
-/// kernel. Luma is full resolution (`y_stride`-wide band); Cb/Cr are half
-/// resolution on both axes (`c_stride`-wide, one chroma row serves 2 luma
-/// rows) — nearest-neighbour vertical upsampling means the same expanded
-/// chroma row is reused for both, halving the upsample work versus expanding
-/// every luma row independently.
+/// [`is_native_420`]): a 2×2 nearest-neighbour chroma upsample followed by
+/// [`crate::jpeg::color::ycbcr_to_rgb_row`]. Luma is full resolution
+/// (`y_stride`-wide band); Cb/Cr are half resolution on both axes
+/// (`c_stride`-wide), and one expanded chroma row serves two luma rows.
 ///
-/// This is a *box* upsample (replicate, matching the existing chroma
-/// *downsample* kernels' box-average philosophy), not libjpeg's fancy
-/// (triangle-filtered) upsampling — a deliberate accuracy/speed tradeoff
-/// documented in BENCHMARKS.md alongside its measured cost.
-///
-/// `upsample_cb`/`upsample_cr` are reused scratch rows (`McuScratch`), each
-/// at least `img_w` bytes. `band_src0` is the chroma-row offset of the
-/// component buffers' local row 0 in the full-image chroma grid (`y_start /
-/// 2`, matching `write_nv12_rows`'s native-4:2:0 addressing).
+/// `upsample_cb`/`upsample_cr` are scratch rows, each at least `img_w`
+/// bytes. `band_src0` is the chroma-row offset of the component buffers'
+/// local row 0 in the full-image chroma grid (`y_start / 2`).
 #[allow(clippy::too_many_arguments)]
 fn write_rgb_rows_420(
     comp_bufs: &[Vec<u8>],
@@ -1153,7 +1050,7 @@ fn write_grey_rows(
 
 /// Average an `xs`×`ys` block of a chroma component plane (row stride
 /// `stride`) whose top-left source sample is `(x0, y0)`. Out-of-range samples
-/// are skipped so edge blocks remain correct.
+/// are skipped.
 fn avg_block(plane: &[u8], stride: usize, x0: usize, y0: usize, xs: usize, ys: usize) -> u8 {
     let mut sum = 0u32;
     let mut n = 0u32;
@@ -1170,7 +1067,7 @@ fn avg_block(plane: &[u8], stride: usize, x0: usize, y0: usize, xs: usize, ys: u
 }
 
 /// Write NV12 output: full-resolution Y plane + interleaved Cb/Cr downsampled
-/// to 4:2:0. Correct for any source subsampling (4:2:0 → passthrough, 4:2:2 →
+/// to 4:2:0 from any source subsampling (4:2:0 → passthrough, 4:2:2 →
 /// vertical average, 4:4:4 → 2×2 average).
 ///
 /// NV12 layout: `img_h` rows of `img_w` luma bytes at offset 0, then
@@ -1211,19 +1108,14 @@ fn write_nv12_rows(
     // UV plane (4:2:0). The component buffer's local row 0 corresponds to the
     // global source-chroma row `band_src0`.
     let uv_plane_offset = img_h * grid_row_stride;
-    // `ceil(img_w/2)` UV pairs per chroma row keeps the rightmost column for odd
-    // widths. The destination buffer width is rounded up to even, so the extra
-    // pair (`img_w + 1` bytes for odd `img_w`) stays within `grid_row_stride`.
+    // `ceil(img_w/2)` UV pairs per chroma row.
     let chroma_w = img_w.div_ceil(2);
     let band_src0 = (y_start * cb.sampling.v as usize) / max_v;
     let out_cy_start = y_start / 2;
-    // Round up so an odd `img_h` keeps its final chroma row (e.g. a 483-tall
-    // image needs ceil(483/2) = 242 chroma rows, not 241). Only the last band
-    // reaches an odd boundary; intermediate bands end on even MCU heights where
-    // `div_ceil(2)` equals `/2`, so this never overlaps the next band.
+    // Rounded up: an odd `img_h` keeps its final chroma row.
     let out_cy_end = (y_start + num_rows).div_ceil(2);
 
-    // Native 4:2:0 → 1×1 avg (passthrough): SIMD interleave instead of avg_block.
+    // Native 4:2:0 (1×1): interleave without averaging.
     if x_samples == 1 && y_samples == 1 {
         for ocy in out_cy_start..out_cy_end {
             let uv_off = uv_plane_offset + ocy * grid_row_stride;
@@ -1239,10 +1131,8 @@ fn write_nv12_rows(
         return;
     }
 
-    // Structured downsamples (fused NV12 output): every source sample is
-    // in-bounds of the MCU-padded band buffer, so the row kernels can average
-    // blindly — bit-exact with `avg_block`'s truncating division.
-    //   4:4:4 → 2×2 box average; 4:2:2 → 1×2 vertical average.
+    // Structured downsamples: 4:4:4 → 2×2 box average; 4:2:2 → 1×2 vertical
+    // average.
     if (x_samples == 2 || x_samples == 1) && y_samples == 2 {
         for ocy in out_cy_start..out_cy_end {
             let uv_off = uv_plane_offset + ocy * grid_row_stride;
@@ -1326,8 +1216,7 @@ fn downsample_uv_row_2x2(cb0: &[u8], cb1: &[u8], cr0: &[u8], cr1: &[u8], dst: &m
             use core::arch::aarch64::*; // NOSONAR
             while i + 8 <= n {
                 let s = i * 2;
-                // Pairwise-add within each row (u8→u16), add rows, then a
-                // truncating >>2 to match `avg_block`'s integer division.
+                // Pairwise-add within each row (u8→u16), add rows, then a truncating >>2.
                 let b = vaddq_u16(
                     vpaddlq_u8(vld1q_u8(cb0.as_ptr().add(s))),
                     vpaddlq_u8(vld1q_u8(cb1.as_ptr().add(s))),
@@ -1380,7 +1269,7 @@ fn downsample_uv_row_v2(cb0: &[u8], cb1: &[u8], cr0: &[u8], cr1: &[u8], dst: &mu
         unsafe {
             use core::arch::aarch64::*; // NOSONAR
             while i + 16 <= n {
-                // vhaddq: truncating halving add — matches (a+b)/2.
+                // vhaddq: truncating halving add, (a+b)/2.
                 let b = vhaddq_u8(vld1q_u8(cb0.as_ptr().add(i)), vld1q_u8(cb1.as_ptr().add(i)));
                 let r = vhaddq_u8(vld1q_u8(cr0.as_ptr().add(i)), vld1q_u8(cr1.as_ptr().add(i)));
                 vst2q_u8(dst.as_mut_ptr().add(i * 2), uint8x16x2_t(b, r));
@@ -1467,7 +1356,7 @@ unsafe fn downsample_uv_row_v2_sse2(
         let b1 = _mm_loadu_si128(cb1.as_ptr().add(*i) as *const __m128i);
         let r0 = _mm_loadu_si128(cr0.as_ptr().add(*i) as *const __m128i);
         let r1 = _mm_loadu_si128(cr1.as_ptr().add(*i) as *const __m128i);
-        // Truncating (a+b)/2: avg_epu8 is rounded; use widen+add+shift instead.
+        // Truncating (a+b)/2 by widen, add and shift.
         let zero = _mm_setzero_si128();
         let avg16 = |a: __m128i, b: __m128i| {
             let alo = _mm_unpacklo_epi8(a, zero);
@@ -1489,18 +1378,14 @@ unsafe fn downsample_uv_row_v2_sse2(
 }
 
 /// Write NV16 (4:2:2) or NV24 (4:4:4) output: full-resolution Y plane plus an
-/// interleaved Cb/Cr plane at the source's NATIVE chroma resolution — a direct
-/// copy, no averaging. The codec only selects these formats when the JPEG's
-/// chroma matches (NV16 ⇔ 4:2:2, NV24 ⇔ 4:4:4), so the source chroma buffers
-/// are already at the output resolution.
+/// interleaved Cb/Cr plane copied at the source's native chroma resolution.
 ///
 /// The destination uses the `[total_h, even_width]` grid (even_width =
-/// `ceil(img_w/2)*2`), where each grid row is `grid_row_stride` bytes (≥ even_width;
-/// padded for IOSurface). The interleaved UV plane starts after the `img_h`
-/// luma rows. A chroma row is `even_width` bytes for NV16 (one grid row) and
+/// `ceil(img_w/2)*2`), where each grid row is `grid_row_stride` bytes (≥
+/// even_width). The interleaved UV plane starts after the `img_h` luma rows.
+/// A chroma row is `even_width` bytes for NV16 (one grid row) and
 /// `2*even_width` bytes for NV24 (two grid rows). Each UV byte is placed by
-/// mapping its linear offset to a `(grid_row, col)` cell, so NV24's two-row
-/// wrap is correct for any `grid_row_stride` (matches the GPU R8 sampling shader).
+/// mapping its linear offset to a `(grid_row, col)` cell.
 #[allow(clippy::too_many_arguments)]
 fn write_nv16_nv24_rows(
     hdr: &crate::jpeg::types::ImageHeader,
@@ -1528,9 +1413,7 @@ fn write_nv16_nv24_rows(
         }
     }
 
-    // Both keep full-height chroma (one chroma row per luma row); they differ in
-    // horizontal resolution. The per-format geometry comes from the shared
-    // `chroma_layout` (single source of truth with the CPU readers + GL shaders):
+    // Both keep full-height chroma (one chroma row per luma row):
     //   NV16 (4:2:2): shift_x=1 → ceil(W/2) pairs, uv_rows_per_luma=1.
     //   NV24 (4:4:4): shift_x=0 → W pairs (2W bytes), uv_rows_per_luma=2.
     let layout = output_format
@@ -1544,9 +1427,8 @@ fn write_nv16_nv24_rows(
     for row in 0..num_rows {
         let oy = y_start + row; // chroma row == luma row (full-height chroma)
         let src = row * c_stride;
-        // Contiguous UV plane: luma row `oy` starts at
-        // `uv_rows_per_luma * stride` into the plane; NV24 wraps across two
-        // grid rows when `ocx*2` crosses `grid_row_stride`.
+        // The UV row of luma row `oy` starts `oy * uv_rows_per_luma` grid rows
+        // into the plane.
         let base = uv_plane_offset + oy * layout.uv_rows_per_luma * grid_row_stride;
         interleave_uv_row(
             &cb_buf[src..src + chroma_cols],
@@ -1558,9 +1440,7 @@ fn write_nv16_nv24_rows(
 }
 
 /// Interleave planar Cb/Cr sample rows into packed UV (`Cb,Cr,Cb,Cr,…`).
-///
-/// Hot path for native NV16/NV24 (and for native 4:2:0 NV12 when averaging is
-/// 1×1). Uses NEON `vst2` / SSE2 unpack on supported targets.
+/// Uses NEON `vst2` / SSE2 unpack on supported targets.
 #[inline]
 fn interleave_uv_row(cb: &[u8], cr: &[u8], dst: &mut [u8], n: usize) {
     debug_assert!(cb.len() >= n && cr.len() >= n && dst.len() >= n * 2);
@@ -1672,9 +1552,7 @@ mod tests {
     }
 
     fn test_jpeg(name: &str) -> Vec<u8> {
-        // Honour EDGEFIRST_TESTDATA_DIR for on-target runs (the compile-time
-        // manifest path does not exist on the board); fall back to the source
-        // tree for local runs.
+        // Read from EDGEFIRST_TESTDATA_DIR when set, else from the source tree.
         let path = std::env::var_os("EDGEFIRST_TESTDATA_DIR")
             .map(|d| std::path::PathBuf::from(d).join(name))
             .unwrap_or_else(|| {
@@ -1688,30 +1566,8 @@ mod tests {
         std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
     }
 
-    /// Task 10b, defect B: `grid_row_stride` need only cover the *logical*
-    /// even-rounded width (the public `decode_image`'s own upfront check,
-    /// above) to be accepted -- it does not have to cover the *MCU-aligned*
-    /// width the block loop actually writes to. 500 is not a multiple of 16
-    /// (the 4:2:0 MCU pixel width: 2 luma blocks × 8px), so the right-edge
-    /// MCU at column 496 spills a block whose columns run to 504 — 4 bytes
-    /// past a `grid_row_stride=500` buffer. This exact width×format
-    /// (coco_420_odd.jpg, 500×375 NV12) is what the reported bug panicked
-    /// on: `dst[504..500]` (`cols` underflowed, then wrapped back into a
-    /// deceptively small-looking but inverted range) -- reachable from
-    /// Python via `decode_into` on a host-memory import whose capacity/stride
-    /// didn't survive the cross-package round trip (the other half of
-    /// defect B, fixed in `edgefirst_tensor::protocol`/`import_descriptor`).
-    ///
-    /// A `grid_row_stride` that only covers the logical width is not caller
-    /// error -- `decode_image`'s own upfront check accepts exactly this, and
-    /// it is the normal case for any 4:2:0 width not a multiple of 16 -- so
-    /// the fix clips the out-of-range MCU padding (the same clip this
-    /// function's sibling branch already applies to a *partial* spill,
-    /// generalised to zero columns) rather than erroring. Verified two ways:
-    /// the call must succeed (not panic, not error), and every real pixel
-    /// column of every luma row must match a reference decode into a
-    /// generously-padded buffer, proving the clip drops only MCU padding,
-    /// never image data.
+    /// A `grid_row_stride` that covers the even-rounded logical width but not
+    /// the MCU-aligned width decodes and matches a padded reference decode.
     #[test]
     fn undersized_row_stride_clips_padding_instead_of_panicking() {
         let jpeg = test_jpeg("coco_420_odd.jpg");
@@ -1733,9 +1589,7 @@ mod tests {
 
         let total_rows = fmt.combined_plane_height(img_h).unwrap();
 
-        // Reference: a stride with room well past the MCU-aligned width, so
-        // every block (including the right-edge one) writes through the
-        // direct (non-clipping) path.
+        // Reference: a stride past the MCU-aligned width.
         let ref_stride = img_w.next_multiple_of(64);
         let mut ref_scratch = McuScratch::new(&headers);
         let mut reference = vec![0u8; ref_stride * total_rows];
@@ -1750,18 +1604,13 @@ mod tests {
         )
         .unwrap();
 
-        // Under test: the logical (even-rounded), NOT MCU-aligned, stride --
-        // exactly what `decode_image`'s own upfront `grid_row_stride <
-        // min_stride` check accepts as sufficient. This is what previously
-        // panicked.
+        // Under test: the even-rounded logical stride.
         let stride = img_w.next_multiple_of(2);
         let mut scratch = McuScratch::new(&headers);
         let mut dst = vec![0u8; stride * total_rows]; // exactly `needed`, no slack
         decode_image(&jpeg, &headers, &mut scratch, &mut dst, stride, fmt, false)
             .expect("an MCU-unaligned row stride must clip the padding, not panic or error");
 
-        // Every real luma column of every luma row (the direct-write path
-        // this fix touches) must match the reference exactly.
         for row in 0..img_h {
             let got = &dst[row * stride..row * stride + img_w];
             let want = &reference[row * ref_stride..row * ref_stride + img_w];
@@ -1772,8 +1621,7 @@ mod tests {
         }
     }
 
-    /// Kernel parity: the structured NV12 downsample rows must match
-    /// `avg_block` exactly (truncating division, pad columns included).
+    /// The structured NV12 downsample rows match `avg_block` exactly.
     #[test]
     fn downsample_rows_match_avg_block() {
         let stride = 48;
@@ -1786,7 +1634,7 @@ mod tests {
         let cb: Vec<u8> = (0..stride * rows).map(|_| next()).collect();
         let cr: Vec<u8> = (0..stride * rows).map(|_| next()).collect();
 
-        // 2×2 (4:4:4 → NV12), including an "odd width" style last pair.
+        // 2×2 (4:4:4 → NV12).
         let n = 23;
         let mut got = vec![0u8; n * 2];
         downsample_uv_row_2x2(
@@ -1835,12 +1683,7 @@ mod tests {
         }
     }
 
-    /// Fused RGB output must equal the NV24 decode followed by the same
-    /// row-conversion kernel — byte-for-byte.
-    /// A scan that stops early must be an error, not a grey image. Zero is a
-    /// valid DC code and a valid EOB, so the zero padding past end-of-data
-    /// decodes as well-formed empty blocks and no per-block check fires; only
-    /// the bit stream knows it was asked for bits the file never held.
+    /// A scan that stops early is an error.
     #[test]
     fn truncated_scan_is_rejected() {
         let jpeg = test_jpeg("zidane.jpg");
@@ -1937,8 +1780,6 @@ mod tests {
 
     /// Fused NV12 from a 4:4:4 source: luma identical to the NV24 decode;
     /// interior chroma equals the truncating 2×2 average of the NV24 chroma.
-    /// (Edge output columns/rows on odd dimensions average MCU pad samples
-    /// that the NV24 output doesn't expose, so they're excluded.)
     #[test]
     fn fused_nv12_from_444_averages_chroma() {
         let jpeg = test_jpeg("coco_444_odd.jpg");
@@ -1997,11 +1838,8 @@ mod tests {
         }
     }
 
-    /// Regression: on images whose MCU-aligned luma width exceeds the grid
-    /// width (e.g. 307 px → 312 px MCU grid on a 308-byte grid), the direct
-    /// luma path must clip the right-edge block instead of spilling into the
-    /// next row's left edge. The Grey decode always goes through the scratch
-    /// copy, so its luma is the reference.
+    /// When the MCU-aligned luma width exceeds the grid width, the direct luma
+    /// path clips the right-edge block; the Grey decode is the reference.
     #[test]
     fn y_direct_edge_mcu_does_not_spill() {
         let jpeg = test_jpeg("coco_444_odd.jpg");
@@ -2044,7 +1882,7 @@ mod tests {
     }
 
     /// Fused RGB is refused for sources that are neither 4:4:4-equivalent nor
-    /// native 4:2:0 — e.g. true 4:2:2 (horizontal-only chroma subsampling).
+    /// native 4:2:0.
     #[test]
     fn fused_rgb_rejects_non_420_subsampled_sources() {
         let jpeg = test_jpeg("jaguar_422.jpg"); // luma 2x2, chroma 1x2 (4:2:2)
@@ -2078,12 +1916,9 @@ mod tests {
         assert_eq!(dst_odd, [10, 10, 20, 20, 30]);
     }
 
-    /// Reference oracle for [`write_rgb_rows_420`]: expand chroma via
-    /// [`expand_row_2x`] (both axes) and convert with
-    /// [`crate::jpeg::color::ycbcr_to_rgb_row`], row by row — the same
-    /// composition `write_rgb_rows_420` performs internally, but computed
-    /// independently (no shared addressing arithmetic) so the two can be
-    /// checked against each other.
+    /// Reference for [`write_rgb_rows_420`]: expand chroma via
+    /// [`expand_row_2x`] on both axes and convert with
+    /// [`crate::jpeg::color::ycbcr_to_rgb_row`], row by row.
     fn reference_rgb_420(y: &[u8], cb: &[u8], cr: &[u8], img_w: usize, img_h: usize) -> Vec<u8> {
         let chroma_w = img_w.div_ceil(2);
         let mut out = vec![0u8; img_w * 3 * img_h];
@@ -2110,13 +1945,9 @@ mod tests {
         out
     }
 
-    /// Deterministic, non-constant synthetic Y/Cb/Cr planes for a given
-    /// `img_w x img_h`, sized exactly to what [`write_rgb_rows_420`] expects
-    /// (`y_stride == img_w`, chroma planes `ceil(w/2) x ceil(h/2)` — the
-    /// review's "final replicated column/row has no second source sample"
-    /// edge case). Distinct per-pixel values (rather than a flat fill) so a
-    /// transposed or off-by-one row/column bug shows up as a mismatch rather
-    /// than accidentally cancelling out.
+    /// Synthetic Y/Cb/Cr planes with distinct per-pixel values for
+    /// `img_w x img_h` (`y_stride == img_w`, chroma planes
+    /// `ceil(w/2) x ceil(h/2)`).
     fn synthetic_420_planes(img_w: usize, img_h: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
         let chroma_w = img_w.div_ceil(2);
         let chroma_h = img_h.div_ceil(2);
@@ -2130,12 +1961,8 @@ mod tests {
         (y, cb, cr)
     }
 
-    /// `write_rgb_rows_420`/`expand_row_2x` at the odd-dimension edges the
-    /// review flagged: `1x1`, odd-width x even-height, even-width x
-    /// odd-height, and odd x odd. For a 4:2:0 source the chroma planes are
-    /// `ceil(w/2) x ceil(h/2)`, so the final replicated column and/or row has
-    /// no second source sample on every one of these shapes — exactly what
-    /// throughput benchmarks (even-dimensioned COCO/CLIC) never exercise.
+    /// `write_rgb_rows_420` matches the reference at `1x1`, odd-width,
+    /// odd-height and odd x odd sizes.
     #[test]
     fn write_rgb_rows_420_odd_dimensions() {
         for (img_w, img_h) in [(1, 1), (3, 2), (2, 3), (3, 3), (5, 4), (4, 5), (7, 9)] {
@@ -2163,9 +1990,8 @@ mod tests {
         }
     }
 
-    /// Fused RGB from a native 4:2:0 source must equal the NV12 decode's
-    /// chroma, box-upsampled 2×2 nearest-neighbour, run through the same
-    /// `ycbcr_to_rgb_row` kernel the 4:4:4 fused path uses.
+    /// Fused RGB from a native 4:2:0 source equals the NV12 decode's chroma,
+    /// box-upsampled 2×2, run through `ycbcr_to_rgb_row`.
     #[test]
     fn fused_rgb_420_matches_nv12_plus_box_upsample() {
         let jpeg = test_jpeg("zidane.jpg"); // 1280x720, native 4:2:0
@@ -2226,10 +2052,8 @@ mod tests {
         }
     }
 
-    /// The fixed-grid contract: decoding into a buffer whose physical row pitch
-    /// is padded beyond the natural width must place the same pixel bytes,
-    /// row-for-row, as a tightly-packed decode. This is what lets the profiler
-    /// reuse one oversized pool surface (padded `bytesPerRow`) for every frame.
+    /// Decoding into a buffer whose row pitch is padded beyond the natural width
+    /// places the same pixel bytes, row for row, as a tightly-packed decode.
     #[test]
     fn decode_padded_grid_matches_tight() {
         let jpeg = test_jpeg("zidane.jpg"); // 1280×720, NV12 (4:2:0), even dims
@@ -2240,8 +2064,7 @@ mod tests {
         assert_eq!(fmt, PixelFormat::Nv12);
 
         let even_w = img_w.next_multiple_of(2);
-        // NV12 combined plane height = luma + ceil(h/2) chroma rows; over-size to
-        // 2·h rows so both the tight and padded buffers hold the full grid.
+        // 2·h rows hold the NV12 luma and chroma rows in both buffers.
         let rows = img_h * 2;
         let tight = even_w;
         let padded = even_w + 64; // physical pitch > natural width
@@ -2272,9 +2095,6 @@ mod tests {
         )
         .unwrap();
 
-        // Luma (img_h rows) + chroma (ceil(img_h/2) rows) live on the same grid,
-        // each placed at its stride. The natural-width content of every used row
-        // must be byte-identical.
         let used_rows = img_h + img_h.div_ceil(2);
         for gr in 0..used_rows {
             let t = &buf_tight[gr * tight..gr * tight + even_w];

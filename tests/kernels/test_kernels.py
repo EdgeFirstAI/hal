@@ -57,7 +57,7 @@ def test_softmax_i8_matches_fixture(name):
     plan = kernels.SoftmaxI8Plan(in_s, in_z, out_s, out_z, float(meta["beta"]))
     out = np.zeros_like(expected)
     plan.run(x, out)
-    # The NEON tiers sum a row in a different order, so they may differ by one LSB.
+    # The NEON tiers may differ by one LSB.
     diff = np.abs(out.astype(np.int32) - expected.astype(np.int32))
     assert diff.max() <= (0 if plan.tier == "scalar" else 1)
 
@@ -318,12 +318,6 @@ def test_tier_is_a_known_string():
 
 
 # int8 arithmetic, matrix products and fused chains.
-#
-# The fixtures come from the x86 LiteRT wheel. Its optimized int8 ADD and MUL
-# run TFLite's NEON blocks (through NEON_2_SSE), so a fixture from the
-# optimized resolver is reproduced by ``kernels="neon_gemmlowp"``, whose
-# BATCH_MATMUL and CONV_2D round as the reference kernels do, so the reference
-# resolver's matrix fixtures are reproduced by ``kernels="reference"`` too.
 
 I8_PROBS = (1 / 256, -128)
 
@@ -781,10 +775,7 @@ def attention_chain(meta, mul, q, k, v):
     return out
 
 
-# NEON tiers run TFLite's softmax within one LSB per probability, so the fused output
-# may move by one LSB; the Rust suite (crates/kernels/tests/attention.rs) holds the
-# same bar, and on the Cortex-A53 and Cortex-A55 boards no output of these fixtures
-# moves at all.
+# The fused output of a NEON tier may differ by one LSB.
 ATTENTION_NEON_MAX_LSB = 1
 ATTENTION_NEON_MAX_SHARE = 0.02
 

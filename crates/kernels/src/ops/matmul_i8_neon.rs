@@ -4,10 +4,9 @@
 //! NEON int8 matrix multiplication.
 //!
 //! Each task computes up to four output rows against every column in 4×4 tiles of dot
-//! products along `K`: `sdot` on dotprod CPUs, `smull` + `sadalp` (two products summed in
-//! i16 lanes would overflow at −128·−128) otherwise. Operands not contiguous along `K` are
-//! packed into stack panels first. Zero points enter through row and column sums:
-//! `Σ (l − zl)(r − zr) = Σ l·r − zr·Σ l − zl·Σ r + K·zl·zr`, all exact in i32.
+//! products along `K`: `sdot` on dotprod CPUs, `smull` + `sadalp` otherwise. Operands not
+//! contiguous along `K` are packed into stack panels first. Zero points enter through row and
+//! column sums: `Σ (l − zl)(r − zr) = Σ l·r − zr·Σ l − zl·Σ r + K·zl·zr`, all exact in i32.
 
 #![cfg(target_arch = "aarch64")]
 
@@ -179,8 +178,7 @@ pub(super) unsafe fn tile<const DOT: bool>(
     out
 }
 
-/// Packing buffers for one task, reused across its row blocks: a block only reads what it
-/// packed, so they start uninitialized.
+/// Packing buffers for one task, reused across its row blocks; they start uninitialized.
 pub(super) struct Panels {
     a: [MaybeUninit<i8>; TILE * MATMUL_MAX_K],
     b: [MaybeUninit<i8>; TILE * MATMUL_MAX_K],

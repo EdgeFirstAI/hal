@@ -2,10 +2,9 @@
 # SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 # SPDX-License-Identifier: Apache-2.0
 #
-# Rsync any benchmark corpus directory to boards, mirroring sync-coco.sh's
-# host handling. Made for the control corpora (val2017-yuv420, val2017-dri,
-# CLIC2025 jpeg-yuv420/yuv444/-dri): each lands at /data/corpora/<basename>
-# (fallback ~/corpora/<basename>), and a sweep is pointed at it with
+# Rsync a benchmark corpus directory to boards. Each lands at
+# /data/corpora/<basename> (fallback ~/corpora/<basename>), and a sweep is
+# pointed at it with
 #   EDGEFIRST_BENCH_COCO_REMOTE=/data/corpora/<basename> ./decode-ab-sweep.sh …
 #
 # Usage:
@@ -81,9 +80,8 @@ echo "\$HOME/corpora/${NAME}"
 EOS
 )"
   echo "  remote: ${host}:${remote_dir}"
-  # Minimal Yocto images ship without rsync; stream a tar instead (corpora are
-  # immutable, so losing incremental transfer costs nothing on a re-sync of an
-  # already-complete directory — the JPEG count check below short-circuits it).
+  # Skip when the JPEG counts already match; otherwise rsync, or stream a tar
+  # when the board has no rsync.
   src_count="$(find "${SRC}" -maxdepth 1 \( -iname '*.jpg' -o -iname '*.jpeg' \) | wc -l | tr -d ' ')"
   remote_count() {
     ssh "${host}" "find '${remote_dir}' -maxdepth 1 \\( -iname '*.jpg' -o -iname '*.jpeg' \\) | wc -l" | tr -d ' '

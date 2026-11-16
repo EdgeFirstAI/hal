@@ -3,8 +3,8 @@
 //
 // S2: YUV coverage. Native DXGI_FORMAT_NV12 through the plane import, the
 // HAL's combined-plane R8 layout (NV12 / NV16 / NV24 as one R8 texture,
-// decoded by the HAL's Path B shader verbatim), packed YUYV / VYUY as an
-// RG8 texture, odd geometry, and the EGLStream route Chromium uses.
+// decoded by the HAL's Path B shader), packed YUYV / VYUY as an RG8 texture,
+// odd geometry, and the EGLStream route.
 #include "probe.h"
 
 #include <algorithm>
@@ -305,8 +305,7 @@ void run_s2(GlSession& s) {
   if (p_nv) {
     for (const NvCase& c : nv_cases) {
       for (uint32_t w : {256u, 254u}) {
-        // Odd logical widths need the HAL's stride rules; the probe keeps
-        // even widths and varies the height instead.
+        // Even widths; the height varies.
         for (uint32_t h : {128u, 126u}) {
           YuvImage im;
           im.init(w, h, c.sx, c.sy);
@@ -355,7 +354,7 @@ void run_s2(GlSession& s) {
             size_t first;
             size_t bad = rgb_mismatch(got, im.reference_rgba(), kTol, &first);
             report("S2.6", bad == 0 ? Verdict::Pass : Verdict::Fail,
-                   "%s combined-plane R8 %ux%u via %-8s + HAL Path B shader: %zu pixels off", c.name, w, h,
+                   "%s combined-plane R8 %ux%u via %-8s + HAL R8 shader: %zu pixels off", c.name, w, h,
                    route_name(route), bad);
             import_destroy(s, ri);
           }
@@ -381,8 +380,6 @@ void run_s2(GlSession& s) {
             packed[o] = V; packed[o + 1] = Y0; packed[o + 2] = U; packed[o + 3] = Y1;
           }
         }
-      // RENDER_TARGET is included because the pbuffer route refuses
-      // textures without it (S1.7), even when only sampled.
       ComPtr<ID3D11Texture2D> tex = create_tex(s.d3d, W, H, DXGI_FORMAT_R8G8_UNORM,
                                                D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET, 0, &hr);
       upload_tex(s.d3d, tex.Get(), packed);
@@ -402,10 +399,7 @@ void run_s2(GlSession& s) {
         glUseProgram(prog);
         set_colorimetry(prog);
         glUniform2f(glGetUniformLocation(prog, "src_size"), (float)W, (float)H);
-        // The HAL sets a sample clamp alongside src_size (render::sample_clamp_rect).
-        // This texture is exactly the logical image, so the clamp is the whole
-        // texture inset half a texel. The swizzled VYUY variant has no such
-        // uniform; its location is -1 and the call is a no-op.
+        // The sample clamp is the whole texture inset half a texel.
         glUniform4f(glGetUniformLocation(prog, "src_extent"), 0.5f / W, 0.5f / H,
                     (W - 0.5f) / W, (H - 0.5f) / H);
         glActiveTexture(GL_TEXTURE0);

@@ -4,26 +4,20 @@
 //! Binding of the tensors passed to `decode` to the decoder's output roles.
 //!
 //! The decode functions find each role's tensor by shape, taking the first
-//! that fits. That is exact while every configured output has its own shape
-//! and wrong when two share one: a split detector with four classes has
-//! scores shaped like its boxes, a segmentation model with as many classes
-//! as protos has scores shaped like its mask coefficients.
-//!
-//! [`OutputBinding`] exists only for such a model. It picks each role's
-//! tensor by the rule the semantic decoder uses
-//! ([`select_output`](crate::semantic::select_output)): the tensor named
-//! like the output, else the only one with its shape, else the one at the
-//! output's configured position when every model output was passed. The
-//! tensors are then handed on in the order the decode functions look roles
-//! up, so each first-fit lookup lands on the tensor bound here.
+//! that fits. [`OutputBinding`] covers a model in which two configured
+//! outputs share a shape. It picks each role's tensor by the rule the
+//! semantic decoder uses ([`select_output`](crate::semantic::select_output)):
+//! the tensor named like the output, else the only one with its shape, else
+//! the one at the output's configured position when every model output was
+//! passed. The tensors are then handed on in the order the decode functions
+//! look roles up.
 
 use super::config::ConfigOutput;
 use crate::DecoderError;
 use edgefirst_tensor::TensorDyn;
 
 /// A decoded output's role, declared in the order the decode functions look
-/// roles up. Every function that reads two roles reads them in this order,
-/// which is what lets a reordered tensor list stand in for a binding.
+/// roles up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Role {
     Detection,
@@ -165,9 +159,8 @@ impl OutputBinding {
         outputs: &[&'a TensorDyn],
     ) -> Result<Vec<&'a TensorDyn>, DecoderError> {
         let mut taken = vec![false; outputs.len()];
-        // Names are settled for every output before any falls back to shape
-        // or position, so a fallback never takes a tensor another output
-        // names.
+        // Binds every named output before any output falls back to shape or
+        // position.
         let mut bound: Vec<Option<usize>> = Vec::with_capacity(self.slots.len());
         for slot in &self.slots {
             let index = slot.named(outputs, &taken);
@@ -234,10 +227,8 @@ impl Slot {
 }
 
 /// The order in which merged logical outputs, produced in schema order, are
-/// handed to the decode functions: by role, so that two of one shape are
-/// looked up as their roles and not as the schema happens to list them. An
-/// output no function reads goes last, behind any decoded output of its
-/// shape. `None` when the schema already lists them that way.
+/// handed to the decode functions: by role, with an output no function reads
+/// last. `None` when the schema already lists them that way.
 pub(crate) fn lookup_order(outputs: &[ConfigOutput]) -> Option<Vec<usize>> {
     let mut order: Vec<usize> = (0..outputs.len()).collect();
     order.sort_by_key(|&index| {
@@ -269,8 +260,7 @@ mod tests {
         assert_eq!(OutputBinding::new(&outputs), None);
     }
 
-    /// An output the decoder does not read still makes a decoded output of
-    /// its shape ambiguous.
+    /// An output the decoder does not read makes a decoded output of its shape ambiguous.
     #[test]
     fn an_undecoded_output_of_the_same_shape_needs_a_binding() {
         let outputs = [
@@ -283,8 +273,7 @@ mod tests {
         assert_eq!(binding.slots[0].shared_with, "`aux`");
     }
 
-    /// A `masks` output is read by no decode function, so it has no slot and
-    /// its tensor is never asked for.
+    /// A `masks` output has no slot and its tensor is never asked for.
     #[test]
     fn a_masks_output_has_no_slot() {
         let shape = vec![1, 8, 8, 4];
@@ -304,8 +293,7 @@ mod tests {
         assert_eq!(binding.count, 2);
     }
 
-    /// Merged outputs are looked up first-fit, so an unread `masks` output
-    /// goes behind the segmentation whose shape it may share.
+    /// An unread `masks` output is ordered behind the segmentation whose shape it may share.
     #[test]
     fn an_unread_merged_output_is_ordered_last() {
         let outputs = [

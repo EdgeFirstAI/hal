@@ -85,8 +85,7 @@ fn softmax_dot_plans_are_send_and_sync() {
     assert_send_sync::<SoftmaxDotI8Params>();
 }
 
-/// The fixture is TFLite's `SOFTMAX` then `CONV_2D`: the crate's two single-op plans give its
-/// bytes on the scalar tier.
+/// The crate's two single-op plans give the fixture's bytes on the scalar tier.
 #[test]
 fn the_pair_of_plans_reproduces_the_fixture() {
     let g = common::load_graph("dfl_head_i8");
@@ -115,9 +114,7 @@ fn the_pair_of_plans_reproduces_the_fixture() {
     assert_eq!(common::diff_i8(&out, &g.i8("output")), (0, 0));
 }
 
-/// The fused plan does not round the probabilities to bytes, so it is not TFLite-exact: every
-/// tier is within one LSB of the float definition, within one LSB of TFLite plus TFLite's own
-/// error, and closer to the float result than TFLite in total.
+/// Every tier is within one LSB of the float definition and closer to it than TFLite in total.
 #[test]
 fn every_tier_is_within_its_bar_of_float_and_tflite() {
     let g = common::load_graph("dfl_head_i8");
@@ -294,8 +291,7 @@ fn run_rejects_aliasing_output_rows() {
     assert!(out.iter().all(|&v| v == 0x55));
 }
 
-/// Rows with a gap after each (NHWC-like), a padded and a transposed output, and row counts
-/// that do not fill the NEON kernel's groups of 16: every tier equals its dense result.
+/// Gapped rows and padded or transposed outputs equal the dense result on every tier.
 #[test]
 fn strided_views_match_contiguous() {
     let g = common::load_graph("dfl_head_i8");

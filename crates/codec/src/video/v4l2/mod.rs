@@ -3,8 +3,7 @@
 
 //! V4L2 stateful memory-to-memory video codecs.
 //!
-//! Devices are found by capability, never by node or driver name: some
-//! drivers (i.MX 8M Plus `vsi_v4l2`) leave the sysfs name empty.
+//! Devices are found by capability, not by node or driver name.
 
 pub(crate) mod decoder;
 pub(crate) mod encoder;

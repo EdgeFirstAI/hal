@@ -163,7 +163,8 @@ macro_rules! int_lanes {
             }
             #[inline(always)]
             fn merge(a: $c, b: $c) -> $c {
-                // SAFETY: as above; `BSL` with `a` as its own mask is `a | b`.
+                // `BSL` with `a` as its own mask is `a | b`.
+                // SAFETY: as above.
                 unsafe { $cbsl(a, a, b) }
             }
             #[inline(always)]
@@ -297,8 +298,6 @@ impl Lanes for F32 {
     }
     #[inline(always)]
     fn merge(a: uint32x4_t, b: uint32x4_t) -> uint32x4_t {
-        // An add, not an OR: LLVM folds the OR of two float compares into one compare of
-        // `FMAXNM`, which is NaN for a signalling NaN and loses the other lane's flag.
         // SAFETY: as above.
         unsafe { vaddq_u32(a, b) }
     }
@@ -395,7 +394,6 @@ impl Lanes for F16Widened {
     }
     #[inline(always)]
     fn reduce_max(v: Self::V) -> Option<(Self::V, f16)> {
-        // The largest of widened f16 values narrows back exactly.
         F32::reduce_max(F32::max(v[0], v[1])).map(|(m, s)| ([m, m], f16::from_f32(s)))
     }
     #[inline(always)]
@@ -613,7 +611,7 @@ fn row_argmax<L: Lanes>(row: &[L::T]) -> Option<(L::T, usize)> {
         m
     };
     let (best, best_score) = L::reduce_max(best)?;
-    // Real rows mostly end in a tie at their maximum, which a scalar compare finds soonest.
+    // The trailing positions are checked in scalar first.
     for i in (n - LAST_IN_SCALAR..n).rev() {
         if let Some(&s) = row.get(i).filter(|&&s| s == best_score) {
             return Some((s, i));
@@ -640,8 +638,7 @@ fn row_argmax<L: Lanes>(row: &[L::T]) -> Option<(L::T, usize)> {
 fn ge_indices<L: Lanes>(src: &[L::T], threshold: L::T, mut hit: impl FnMut(usize)) {
     let thr = L::splat(threshold);
     let width = (64 / L::N) as u32;
-    // Four vectors share one test: moving flags to a general register costs more than the
-    // compare, and most blocks hold no hit.
+    // Four vectors share one test.
     let mut blocks = src.chunks_exact(4 * L::N);
     for (k, block) in (&mut blocks).enumerate() {
         let p = block.as_ptr();

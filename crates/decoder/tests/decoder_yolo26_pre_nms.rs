@@ -2,9 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! A model tagged `decoder_version: yolo26` is end-to-end only when its head
-//! is. An export made without the embedded NMS keeps the YOLOv8 head
-//! (`[1, 4 + classes + protos, anchors]`), which the decoder has to run
-//! through its own NMS instead of rejecting.
+//! is. A head of shape `[1, 4 + classes + protos, anchors]` is run through
+//! the decoder's own NMS.
 
 use edgefirst_decoder::{DecoderBuilder, DetectBox, Segmentation};
 use edgefirst_tensor::{Tensor, TensorDyn, TensorMapTrait, TensorMemory, TensorTrait};
@@ -80,8 +79,7 @@ fn pre_nms_outputs() -> Vec<TensorDyn> {
     ]
 }
 
-/// The boxes `pre_nms_outputs` plants, decoded from centre and size: a head
-/// misread as end-to-end rows would return the raw values as corners.
+/// Asserts the boxes `pre_nms_outputs` plants, decoded from centre and size.
 fn assert_pre_nms_boxes(mut boxes: Vec<DetectBox>) {
     assert_eq!(boxes.len(), TARGETS);
     boxes.sort_by(|a, b| a.bbox.xmin.total_cmp(&b.bbox.xmin));
@@ -117,8 +115,7 @@ fn yolo26_with_end2end_false_decodes_the_pre_nms_head() {
     assert_pre_nms_boxes(decode(&json, &pre_nms_outputs()));
 }
 
-/// Older exports carry the tag but no `end2end` flag. A head whose feature
-/// count is not the end-to-end `6 + protos` cannot be end-to-end.
+/// With the tag and no `end2end` flag, a head whose feature count is not the end-to-end `6 + protos` decodes as a pre-NMS head.
 #[test]
 fn yolo26_without_the_flag_decodes_a_head_that_cannot_be_end_to_end() {
     let json = schema_json("", &pre_nms_head());
@@ -136,8 +133,7 @@ fn yolo26_with_end2end_true_rejects_the_pre_nms_head() {
     assert!(err.to_string().contains("6 + num_protos"), "{err}");
 }
 
-/// The embedded-NMS head, `[1, detections, 6 + protos]`, still takes the
-/// end-to-end path, with the flag set or left out.
+/// The embedded-NMS head, `[1, detections, 6 + protos]`, takes the end-to-end path with the flag set or left out.
 #[test]
 fn yolo26_end_to_end_head_is_unchanged() {
     const DETS: usize = 100;

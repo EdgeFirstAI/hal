@@ -15,8 +15,7 @@
 //!   various (resize)
 //!
 //! Operations OpenCV cannot natively express (PlanarRgb output, i8
-//! quantized outputs, VYUY/Nv16 input) are deliberately omitted — the
-//! hal-side `pipeline_benchmark` covers those.
+//! quantized outputs, VYUY/Nv16 input) are omitted.
 //!
 //! Requires the `opencv` feature flag:
 //! ```bash
@@ -48,7 +47,7 @@ const ITERATIONS: usize = 100;
 // =============================================================================
 
 /// Map a hal `PixelFormat` to (OpenCV Mat type, bytes-per-pixel) for a packed
-/// or 2-channel layout. NV12 is handled separately — see `make_src_mat`.
+/// or 2-channel layout. NV12 is handled in `make_src_mat`.
 fn cv_type_bpp(fmt: PixelFormat) -> Option<(i32, usize)> {
     match fmt {
         YUYV => Some((CV_8UC2, 2)),
@@ -63,8 +62,7 @@ fn cv_type_bpp(fmt: PixelFormat) -> Option<(i32, usize)> {
 ///
 /// NV12 is laid out as a single-channel Mat with rows = h × 3/2: the first
 /// `h` rows hold the Y plane, the remaining `h/2` rows hold interleaved UV
-/// at half horizontal resolution. This is the standard OpenCV convention
-/// for `COLOR_YUV2*_NV12`.
+/// at half horizontal resolution, the layout `COLOR_YUV2*_NV12` takes.
 fn make_src_mat(data: &[u8], w: usize, h: usize, fmt: PixelFormat) -> Mat {
     match fmt {
         NV12 => unsafe {
@@ -333,8 +331,8 @@ fn main() {
     println!("OpenCV Benchmark — edgefirst-bench harness");
     println!("  warmup={WARMUP}  iterations={ITERATIONS}");
 
-    // Letterbox: standard pipeline targets are 640×640 and 1280×1280.
-    // Cover the three camera input resolutions × YUYV/NV12 × RGBA/RGB/GREY.
+    // Letterbox: three camera input resolutions × YUYV/NV12 × RGBA/RGB/GREY
+    // into 640×640 and 1280×1280.
     let letterbox_configs = vec![
         // 720p inputs → 640×640
         BenchConfig::new(1280, 720, 640, 640, YUYV, RGBA),
@@ -357,7 +355,7 @@ fn main() {
         BenchConfig::new(3840, 2160, 640, 640, NV12, RGBA),
         BenchConfig::new(3840, 2160, 640, 640, NV12, RGB),
         BenchConfig::new(3840, 2160, 640, 640, NV12, GREY),
-        // 4K → 1280×1280 (larger letterbox target for high-res models)
+        // 4K → 1280×1280
         BenchConfig::new(3840, 2160, 1280, 1280, YUYV, RGBA),
         BenchConfig::new(3840, 2160, 1280, 1280, NV12, RGBA),
     ];

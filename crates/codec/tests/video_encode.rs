@@ -112,8 +112,7 @@ fn parameter_sets_and_idr(au: &[u8]) -> (bool, bool) {
     (types.contains(&7) && types.contains(&8), types.contains(&5))
 }
 
-/// `profile_idc` and `level_idc` of the first SPS in `au`. Neither byte can
-/// carry an emulation-prevention byte: `profile_idc` is never 0.
+/// `profile_idc` and `level_idc` of the first SPS in `au`.
 fn sps_profile_and_level(au: &[u8]) -> Option<(u8, u8)> {
     (0..au.len().saturating_sub(6))
         .find(|&i| au[i..i + 3] == [0, 0, 1] && au[i + 3] & 0x1f == 7)
@@ -253,8 +252,7 @@ fn encodes_a_crop_of_a_larger_source() {
     assert!(out[0].keyframe);
 }
 
-/// A source in host memory: Media Foundation encoders copy it into a texture
-/// of their own, while a V4L2 encoder imports DMA-BUFs only and refuses it.
+/// A host-memory source is encoded by Media Foundation and refused by V4L2.
 #[test]
 fn encodes_a_host_memory_source_where_the_encoder_copies() {
     let Some(mut enc) = open(
@@ -345,8 +343,7 @@ fn rejects_a_16_bit_source() {
     ) else {
         return;
     };
-    // Any memory: the element type is checked first. D3D11 has no 16-bit
-    // NV12 texture.
+    // The element type is checked first, for any memory.
     let src = TensorDyn::image(
         640,
         480,

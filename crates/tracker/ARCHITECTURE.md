@@ -140,7 +140,7 @@ depends on the model decoder.
 It is consumed by:
 
 - [`edgefirst-decoder`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/) (feature `tracker`) — exposes `decode_tracked()` which accepts any `Tracker<DetectBox>` implementation.
-- [`edgefirst-image`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/) (feature `tracker`) — adds `draw_masks_tracked()` for rendering masks for tracked detections and returning track info. `ColorMode::Track` is the planned per-UUID palette mode, but currently aliases `ColorMode::Instance` (detection-order colouring) until the per-track palette lands.
+- [`edgefirst-image`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/) (feature `tracker`) — adds `draw_masks_tracked()` for rendering masks for tracked detections and returning track info. `ColorMode::Track` aliases `ColorMode::Instance` (detection-order colouring); a per-UUID palette is not implemented.
 - [`edgefirst-tracker-capi`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tracker-capi/) — `libedgefirst_tracker`, which takes plain `ef_detect_box` values (`--no-default-features`, so neither tensor nor decoder is linked).
 - [`crates/python-tracker`](https://github.com/EdgeFirstAI/hal/blob/main/crates/python-tracker/) — the standalone `edgefirst-tracker` wheel, the one of the five that links no `libedgefirst_tensor.so`.
 

@@ -3,17 +3,9 @@
 
 //! Serialization: a `(blob, handles)` pair.
 //!
-//! A struct with an `fd` field is meaningless across a process boundary. File
-//! descriptors travel out of band — `SCM_RIGHTS` on a unix socket, or
-//! `pidfd_getfd` — and the receiver is handed *different numbers* than the
-//! sender used. So export is a pair, exactly as Wayland, D-Bus and
-//! `CameraFrame` are: a self-describing byte blob, plus the handles it refers
-//! to by index.
-//!
-//! Use the opaque handle in-process and this across processes. Using the
-//! blob in-process would force a `dup` per plane per call; passing the
-//! handle itself (any EdgeFirst library reads it directly -- there is only
-//! one implementation) avoids that entirely.
+//! Export produces a self-describing byte blob, plus the handles it refers
+//! to by index. File descriptors travel out of band (`SCM_RIGHTS` on a unix
+//! socket, or `pidfd_getfd`).
 
 use std::ffi::c_int;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -24,30 +16,26 @@ use crate::handle::EfTensor;
 
 /// Serialize a tensor into a caller-provided blob buffer and handle table.
 ///
-/// Follows the standard two-call C pattern: pass `blob_cap`/`fds_cap` of 0 (or
-/// `NULL` buffers) to learn the sizes required, then call again with buffers
-/// that large. `blob_len` and `fds_len` are always written when non-`NULL`, so
-/// a caller learns the requirement even from a failed call.
+/// Two-call pattern: pass `blob_cap`/`fds_cap` of 0 (or `NULL` buffers) to
+/// learn the sizes required, then call again with buffers that large.
+/// `*blob_len` and `*fds_len` are written even when the call fails with
+/// `ENOSPC`.
 ///
-/// A `NULL` `fds_out` is a zero-capacity handle table, not an error: it is
-/// refused only when the export actually produced handles. An export that
-/// produces none — every inline export, and every export on a platform that
-/// shares by handle value inside the blob rather than out of band, which is
-/// all of them on Windows — therefore succeeds with `fds_out, fds_cap` of
-/// `NULL, 0` and reports `*fds_len == 0`.
+/// A `NULL` `fds_out` is a zero-capacity handle table: it is refused only
+/// when the export produced handles. An inline export, and every export on
+/// a platform that shares by handle value inside the blob (Windows),
+/// produces none: it succeeds with `fds_out, fds_cap` of `NULL, 0` and
+/// reports `*fds_len == 0`.
 ///
 /// The transport mode is chosen from the tensor's storage: a backing with a
-/// shareable handle is exported by reference, and one without — `mem`, `pbo` —
-/// is inlined, because there is nothing to refer to. A caller that needs bytes
-/// from a shareable tensor (sending over a network, where a handle is
-/// meaningless off-host) should copy into a `mem` tensor first; a mode-selecting
-/// variant can be appended later without breaking this signature.
+/// shareable handle is exported by reference, and one without (`mem`, `pbo`)
+/// is inlined.
 ///
-/// @return 0 on success, `ENOSPC` when a buffer is too small (with the
-///         required lengths written) -- a `NULL` `fds_out` on an export that
-///         produced handles is that case, not a pointer refusal -- `EINVAL`
-///         on a null tensor, a null `blob_len` or a null `fds_len`, `EIO` if
-///         the tensor cannot be serialized.
+/// @return 0 on success; `ENOSPC` when a buffer is too small (with the
+///         required lengths written), including a `NULL` `fds_out` on an
+///         export that produced handles; `EINVAL` on a null tensor, a null
+///         `blob_len` or a null `fds_len`; `EIO` if the tensor cannot be
+///         serialized.
 ///
 /// # Safety
 /// `blob` must be writable for `blob_cap` bytes and `fds` for `fds_cap` ints.
@@ -69,8 +57,8 @@ pub unsafe extern "C" fn ef_tensor_export(
             let Some(inner) = crate::handle::tensor_of(t) else {
                 return libc::EINVAL;
             };
-            // `mem` and `pbo` have no shareable handle at all, so transmitting one
-            // means copying its bytes. Everything else refers.
+            // `mem` and `pbo` are inlined; every other storage is exported by
+            // reference.
             let mode = match inner.memory() {
                 TensorMemory::Mem | TensorMemory::Pbo => blob::TransportMode::Inline,
                 _ => blob::TransportMode::Reference,
@@ -79,15 +67,11 @@ pub unsafe extern "C" fn ef_tensor_export(
                 return libc::EIO;
             };
 
-            // Written before the capacity check, so a caller that deliberately
-            // passes zero capacity learns the requirement rather than an error
-            // with no size.
+            // Written before the capacity check.
             *blob_len = bytes.len();
             *fds_len = fds.len();
 
-            // A null handle table is zero capacity rather than a separate
-            // refusal, so an export with no handles is served by the one
-            // `fds_cap < fds.len()` check instead of failing on the pointer.
+            // A null handle table is zero capacity.
             let fds_cap = if fds_out.is_null() { 0 } else { fds_cap };
             if blob_out.is_null() || blob_cap < bytes.len() || fds_cap < fds.len() {
                 return libc::ENOSPC;
@@ -104,13 +88,11 @@ pub unsafe extern "C" fn ef_tensor_export(
 
 /// Reconstruct a tensor from a blob and its handle table.
 ///
-/// **Import dups** every handle it retains, so the result is independent and
-/// the sender may close its own copies as soon as this returns. There is no
-/// keepalive protocol.
+/// Import dups every handle it retains: the result is independent and the
+/// sender may close its own copies as soon as this returns.
 ///
-/// `blob` is untrusted — it may have arrived from another library, another
-/// process, or a network — so every length and index inside it is validated
-/// against the buffer and against `fds_len` before use.
+/// Every length and index inside `blob` is validated against the buffer and
+/// against `fds_len` before use.
 ///
 /// @return a new tensor the caller must free with `ef_tensor_free`, or `NULL`.
 ///
@@ -159,7 +141,6 @@ mod tests {
 
     #[test]
     fn a_zero_capacity_call_reports_the_sizes_required() {
-        // The standard two-call C pattern: ask, allocate, ask again.
         let t = mem_tensor();
         let (mut bl, mut fl) = (0usize, 0usize);
         let rc = unsafe {
@@ -218,10 +199,6 @@ mod tests {
 
     #[test]
     fn an_export_with_no_handles_accepts_a_null_handle_table() {
-        // An inline export produces no handles, and neither does any export
-        // on Windows, where the shareable handle travels inside the blob.
-        // `NULL, 0` for the table is the ordinary call in that case and must
-        // not be refused for a table there was nothing to write into.
         let t = mem_tensor();
         let (mut bl, mut fl) = (0usize, 0usize);
         unsafe {

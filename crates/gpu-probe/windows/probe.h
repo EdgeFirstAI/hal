@@ -2,11 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // Windows D3D11 texture / ANGLE / CUDA / D3D12 interop probe: shared
-// declarations. The probe answers the spike questions in
-// docs/superpowers/specs/2026-09-02-windows-d3d11-exploration-plan.md
-// (S0-S9) with PASS / FAIL / SKIP lines and timing tables. It links only
-// the inbox D3D libraries; ANGLE, CUDA and DirectML are loaded at runtime
-// so a box without them reports SKIP instead of failing to start.
+// declarations. The probe runs sections S0-S9 and reports PASS / FAIL /
+// SKIP lines and timing tables. It links only the inbox D3D libraries;
+// ANGLE, CUDA and DirectML are loaded at runtime and reported as SKIP when
+// absent.
 #pragma once
 
 #define NOMINMAX
@@ -128,7 +127,7 @@ struct D3D {
   // Wrap an existing device (ANGLE's, or one created by create_device).
   bool wrap(ID3D11Device* device);
 };
-// HAL-style device creation for injection and for the second-device tests.
+// Device creation for injection and for the second-device tests.
 bool create_device(const AdapterInfo* adapter, bool warp, UINT flags, D3D* out, HRESULT* hr);
 
 ComPtr<ID3D11Texture2D> create_tex(D3D& d, uint32_t w, uint32_t h, DXGI_FORMAT fmt, UINT bind,
@@ -144,10 +143,7 @@ bool readback_tex(D3D& d, ID3D11Texture2D* tex, std::vector<uint8_t>& tight,
 HANDLE create_shared_handle(ID3D11Texture2D* tex, const wchar_t* name, HRESULT* hr);
 
 // Holds key 0 of a D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX texture for the
-// scope. Commands issued while nobody holds the mutex are dropped by the
-// runtime, and ANGLE does not acquire it on the caller's behalf, so the
-// owner must hold it across upload, GL work and readback alike. Nested
-// locks on the same resource from one thread are no-ops.
+// scope. Nested locks on the same resource from one thread are no-ops.
 struct KeyedLock {
   ComPtr<IDXGIKeyedMutex> km;
   ID3D11Resource* res = nullptr;

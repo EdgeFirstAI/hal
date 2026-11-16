@@ -334,15 +334,7 @@ flood control, and the merged score gate belongs after fragments have been
 joined.
 
 > [!NOTE]
-> `MergeMode::KeepBest` suppresses: the best box of each matched group comes
-> back unchanged, never grown, so an object larger than a single tile is reported
-> as its best fragment. `MergeMode::Union` (the original GREEDYNMM behaviour)
-> grows that box to the group's enclosing union instead, but it measured about
-> 0.05 AP50 worse on every frame of the Ocean Cleanup ADIS 4K validation
-> (whole frame: 0.491 AP50 with plain NMS, 0.437 after the union, 0.490 with
-> keep-best), so it is opt-in. For mixed-scale datasets, add a full-frame
-> downscaled pass as one more `push_tile` at `origin=(0, 0)`,
-> `crop_size=frame_dims`.
+> `MergeMode::KeepBest` suppresses: the best box of each matched group comes back unchanged, never grown, so an object larger than a single tile is reported as its best fragment. `MergeMode::Union` (the GREEDYNMM behaviour) grows that box to the group's enclosing union instead and is opt-in. For mixed-scale datasets, add a full-frame downscaled pass as one more `push_tile` at `origin=(0, 0)`, `crop_size=frame_dims`.
 
 The C API mirrors the same split (`ef_image_processor_plan_tiles` /
 `ef_image_processor_tile_into` / `ef_image_processor_tile_one` on the input side, `ef_tiled_frame_accumulator_*`
@@ -615,7 +607,7 @@ RUSTFLAGS="-C target-cpu=cortex-a78ae" cargo build --release \
   --exclude edgefirst-python-codec --exclude edgefirst-python-image \
   --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-kernels
 
-# Generic aarch64 with FEAT_FP16 (do NOT use on Cortex-A53 / imx8mp)
+# Generic aarch64 with FEAT_FP16 (do not use on Cortex-A53 / imx8mp)
 RUSTFLAGS="-C target-feature=+fp16" cargo build --release \
   --target aarch64-unknown-linux-gnu -p edgefirst-image
 
@@ -653,14 +645,13 @@ paths based on the source array's layout:
 | Strided with contiguous inner rows (column slice, sub-volume, negative stride) | Per-row memcpy iterating outer dimensions | ≈ same as contiguous |
 | Fully strided (transposed view, every-other-element) | Internal `np.ascontiguousarray()` materialization, then Path 1 memcpy | ≈ 4× contiguous |
 
-The fully-strided case is the one that bites users in practice: HailoRT's
+The fully-strided case is the common one in practice: HailoRT's
 natural output is `arr.transpose(0, 2, 1)` over a `(1, anchors,
-channels)` buffer. PR #58 replaced the legacy element-wise loop with
-internal `np.ascontiguousarray` materialization (≈ 4× faster than the
-legacy loop, within ≈ 1.5× of the manual workaround).
+channels)` buffer. HAL materializes it internally with `np.ascontiguousarray`, within
+≈ 1.5× of the manual workaround.
 
 ```python
-# Wrong (post-PR #58): adds an extra copy above HAL.
+# Wrong: adds an extra copy above HAL.
 tensor.from_numpy(np.ascontiguousarray(arr_strided))
 
 # Right: HAL detects the strided layout and materializes internally.
@@ -700,7 +691,7 @@ for tile, box in zip(tiles, boxes):
     canvas[y:y+h, x:x+w] = (tile[:, :, 0] > 127).astype(np.uint8)
 ```
 
-The `Scaled` path uses the batched-GEMM materializer (PR #54). At N ≥ 16
+The `Scaled` path uses the batched-GEMM materializer. At N ≥ 16
 detections it amortizes a single GEMM at proto resolution and upsamples
 per-detection in rayon-parallel — both more accurate than
 threshold-then-resize *and* faster than per-detection scalar work in
@@ -739,9 +730,7 @@ Raising the MSRV is therefore a user-visible change, not just a build
 detail — bump it here, in `rust-toolchain.toml`, and in the
 CHANGELOG together.
 
-No source change was needed to support 1.94.0; it records the floor the
-code already met. Verified against a real 1.94.0 toolchain across the
-combinations that compile genuinely different code:
+The floor is verified against a 1.94.0 toolchain across the combinations that compile different code:
 
 | Checked on 1.94.0 | Covers |
 |---|---|
@@ -933,7 +922,7 @@ warning and falls back to the CPU backend.
 
 `ImageProcessor::create_image()` allocates a texture first, then a PBO, then
 heap memory, so a GPU destination reports `TensorMemory.DMABUF` on Windows
-the way it does on Linux and macOS. Sources are uploaded by GL as before.
+the way it does on Linux and macOS. Sources are uploaded by GL.
 `map()` on a texture goes through a staging copy whose pitch becomes the
 tensor's `row_stride()`, so a padded destination must be read row by row (or
 through the buffer protocol) rather than as one flat run. `try_map()` returns
@@ -1182,10 +1171,7 @@ What is **not** covered here, because it belongs to `mobile-sdk`:
 - **Link-closure validation against the ANGLE xcframeworks + Apple system
   frameworks** (`IOSurface`, `CoreFoundation`, `Metal`) — that is a
   property of whatever `mobile-sdk` ships, not of this crate's `.rlib`.
-- **Runtime validation** — actual EGL initialization on a device or
-  simulator requires the app shell. The internal `hal-mobile` assessment
-  already proved the ANGLE-over-Metal + IOSurface path works on iPhone 17
-  Pro (`GL_EXT_color_buffer_half_float` present).
+- **Runtime validation** — actual EGL initialization on a device or simulator requires the app shell. The ANGLE-over-Metal + IOSurface path runs on iPhone 17 Pro (`GL_EXT_color_buffer_half_float` present).
 
 ### fp16 / target features
 
@@ -1254,8 +1240,8 @@ What is **not** covered here, because it belongs elsewhere:
   via the internal `hal-mobile` AWS Device Farm harness, which drives
   the real `ImageProcessor` through JNI (see TESTING.md § Android
   On-Device Validation);
-  the Phase-1 assessment already proved the native-GLES + AHardwareBuffer
-  path on a Galaxy S26 Ultra (`GL_EXT_color_buffer_half_float` present,
+  the native-GLES + AHardwareBuffer
+  path runs on a Galaxy S26 Ultra (`GL_EXT_color_buffer_half_float` present,
   letterbox 720p→640×640 F16 in 741 µs).
 - **Deferred zero-copy paths** — YUV camera buffers (external-OES
   sampling) and single-channel Grey/NV imports (`R8_UNORM` needs
@@ -1273,7 +1259,7 @@ consume it directly — no `map()`, no CPU readback:
 ef_tensor *dst = ef_image_processor_create_image(
     proc, 640, 640, "rgb8_planar", EF_DTYPE_F16, EF_STORAGE_KIND_DMA_BUF, EF_CPU_ACCESS_NONE);
 
-// One-time: hand the SAME buffer to the NPU runtime.
+// One-time: hand the same buffer to the NPU runtime.
 AHardwareBuffer* ahb = ef_tensor_hardware_buffer_ptr(dst);
 ANeuralNetworksMemory* mem;
 ANeuralNetworksMemory_createFromAHardwareBuffer(ahb, &mem);   // NNAPI
@@ -1295,11 +1281,8 @@ the work already synced on drivers without fence support.
 the S26 Ultra: 640-px planar F16 → 1536-byte rows, natural 1280). Check
 `ef_tensor_row_stride(dst)`:
 
-- `0` — the buffer IS the flat `[1, C, H, W]` stream; hand it off as-is.
-- nonzero — describe the pitch to the runtime, pick a width whose pitch
-  the device does not pad, or fall back to
-  `ef_tensor_copy_to(dst, buf, len)` (~0.3 ms at 2.4 MB — still
-  cheaper than a full CPU convert, but no longer zero-copy; profile).
+- `0` — the buffer is the flat `[1, C, H, W]` stream; hand it off as-is.
+- nonzero — describe the pitch to the runtime, pick a width whose pitch the device does not pad, or fall back to `ef_tensor_copy_to(dst, buf, len)` (~0.3 ms at 2.4 MB — cheaper than a full CPU convert, but not zero-copy; profile).
 
 **INT8 NPUs**: allocate the destination as `"rgb8"` /
 `"rgba8"` with `EF_DTYPE_U8` or `EF_DTYPE_I8` (NHWC,
@@ -1394,7 +1377,7 @@ and the sibling `*-capi` READMEs.
 | `EDGEFIRST_CODEC_V4L2_DEVICE` | Probe a specific V4L2 device node for hardware JPEG decode instead of auto-discovery |
 | `EDGEFIRST_ANGLE_PATH` | macOS and Windows: directory containing `libEGL.dylib` / `libGLESv2.dylib` (macOS) or `libEGL.dll` / `libGLESv2.dll` (Windows). Overrides the default search (macOS: Homebrew → `@loader_path` → `@executable_path` → `libEGL.dylib` on dyld; Windows: next to the loading module → next to the executable → the default DLL search path). Set this when deploying a bundled or custom-signed ANGLE alongside the binary. |
 | `EDGEFIRST_D3D11_ADAPTER` | Windows only: which Direct3D 11 adapter the HAL creates its device on, and therefore the one ANGLE renders with — `hardware` (default), `warp` (software; needs `EDGEFIRST_ALLOW_SOFTWARE_GL=1`), `discrete`, an adapter LUID `<high>:<low>`, or a substring of the adapter description (see [Windows GPU Acceleration](#windows-gpu-acceleration)) |
-| `EDGEFIRST_ANGLE_ADAPTER` | Windows only: alias of `EDGEFIRST_D3D11_ADAPTER`, kept from before the device moved into the tensor crate. Both names are read; if both are set and differ, `EDGEFIRST_D3D11_ADAPTER` wins and the disagreement is logged once |
+| `EDGEFIRST_ANGLE_ADAPTER` | Windows only: alias of `EDGEFIRST_D3D11_ADAPTER`. Both names are read; if both are set and differ, `EDGEFIRST_D3D11_ADAPTER` wins and the disagreement is logged once |
 | `EDGEFIRST_KERNELS_FORCE_TIER` | Force the CPU tier every `edgefirst-kernels` plan is built for: `scalar`, `neon` (alias `neon_baseline`), `neon_fp16` or `neon_dotprod`. A tier the CPU lacks, or an unknown name, makes plan creation fail rather than fall back. Does not affect the decoder, which reads `EDGEFIRST_DECODER_FORCE_KERNEL` |
 | `EDGEFIRST_DECODER_FORCE_KERNEL` | Force the CPU tier of every `edgefirst-decoder` kernel (per-scale plans, YOLO, ModelPack, semantic segmentation, instance masks, NMS): `scalar`, `neon` (alias `neon_baseline`), `neon_fp16` or `neon_dotprod`. A tier the CPU lacks, or an unknown name, makes `Decoder::decode*` (and building a per-scale decoder) fail with `ForcedKernelUnavailable`; the public helper functions (`dequantize_cpu*`, `postprocess_boxes_*`, `nms_*`, `jaccard_batch4`, `segmentation_to_mask`) run the scalar code instead |
 | `EDGEFIRST_TESTDATA_DIR` | Override testdata location (used by benches and CI) |

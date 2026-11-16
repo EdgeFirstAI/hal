@@ -16,7 +16,7 @@ thread_local! {
 
 pub(crate) fn set_last(msg: &str) {
     let c = CString::new(msg.replace('\0', "?")).unwrap_or_default();
-    // A destroyed thread-local at thread exit means nobody is left to read it.
+    // Ignored when the thread-local is already destroyed.
     let _ = LAST.try_with(|l| *l.borrow_mut() = Some(c));
 }
 
@@ -24,11 +24,9 @@ fn clear_last() {
     let _ = LAST.try_with(|l| *l.borrow_mut() = None);
 }
 
-/// The errno for a codec error.
-///
-/// `ENOSPC` for a destination too small and `EACCES` for a tensor whose
-/// declared CPU access does not cover the work are specific because a caller
-/// can act on them; `EAGAIN` says the caller holds every decoded frame.
+/// The errno for a codec error: `EACCES` for a tensor whose declared CPU
+/// access does not cover the work, `ENOSPC` for a destination too small,
+/// `EAGAIN` when the caller holds every decoded frame.
 pub(crate) fn errno_for(e: &CodecError) -> c_int {
     if e.cpu_access_denied().is_some() {
         return libc::EACCES;
@@ -65,8 +63,7 @@ pub(crate) fn invalid(what: &str) -> c_int {
     refuse(libc::EINVAL, what)
 }
 
-/// Gives a failure that recorded no reason a generic one, so a nonzero
-/// result always comes with a message.
+/// Gives a failure that recorded no reason a generic one.
 fn ensure_message(rc: c_int) {
     let missing = LAST.try_with(|l| l.borrow().is_none()).unwrap_or(false);
     if rc != 0 && missing {

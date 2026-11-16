@@ -12,9 +12,7 @@ homepage.workspace = true
 repository.workspace = true
 license.workspace = true
 
-# NO dependencies, ever. This crate is pure layout; anything it depended on
-# would be dragged into every consumer, including the future dynamic backend
-# whose whole point is linking no implementation.
+# This crate has no dependencies.
 [lints]
 workspace = true
 

@@ -2,10 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //! `(PixelFormat, DType, width, height) -> D3D11 texture layout`.
 //!
-//! Compiled on every platform so the table is unit-tested on every CI lane;
-//! only the allocator that consumes it is Windows-only. Single source of
-//! truth for which DXGI format and texture geometry back each HAL image
-//! format; the image crate reads `gl_internal_format` when it builds the
+//! The table of which DXGI format and texture geometry back each HAL image
+//! format. Compiled on every platform; the allocator that consumes it is
+//! Windows-only. The image crate reads `gl_internal_format` when it builds the
 //! `EGL_ANGLE_image_d3d11_texture` attribute list.
 
 use crate::{DType, PixelFormat};
@@ -28,7 +27,7 @@ pub const GL_RG_EXT: u32 = 0x8227;
 /// One texture's format and geometry for a HAL image. `texture_width` and
 /// `texture_height` are texels and rows, not image pixels: the packed rows
 /// fold several pixels or several planes into one texel, and a combined
-/// semi-planar row is the image's row *stride* rather than its width.
+/// semi-planar row is the image's row stride rather than its width.
 ///
 /// A native NV12 texture (`DXGI_FORMAT_NV12`) is the exception: its grid is
 /// the image's luma grid, and the chroma plane is a second plane of the same
@@ -45,14 +44,12 @@ pub struct D3d11ImageLayout {
 }
 
 impl D3d11ImageLayout {
-    /// Bytes in one texture row, with no driver padding: the row a copy into
-    /// or out of the texture moves.
+    /// Bytes in one texture row, with no driver padding: the row a copy into or
+    /// out of the texture moves.
     ///
     /// This is the image's own row for every format except a semi-planar one,
     /// whose texture row is the stride and can exceed the image width (see
-    /// [`image_d3d11_layout`]). The image footprint of such a tensor is the
-    /// storage's business, not this table's, because only the storage still
-    /// knows the image width.
+    /// [`image_d3d11_layout`]).
     pub fn tight_row_bytes(&self) -> usize {
         self.texture_width * self.bytes_per_texel
     }
@@ -80,17 +77,8 @@ impl D3d11ImageLayout {
         }
     }
 
-    /// This layout with its rows widened to `texture_width` texels.
-    ///
-    /// The one sanctioned edit of a table entry, and only for a semi-planar
-    /// row: its texture must be as wide as the row pitch the driver hands a
-    /// CPU map, and a pitch is a property of a created texture rather than of
-    /// the format, so the allocator probes for one and widens the entry here
-    /// (see `D3d11TextureTensor::new_image`). A wrapped external texture is
-    /// widened the same way, to the width its host chose.
-    ///
-    /// A width below the entry's own is not a widening and leaves it alone:
-    /// the table's width is the floor every consumer of the layout may assume.
+    /// This layout with its rows widened to `texture_width` texels. A width
+    /// below the entry's own leaves it unchanged.
     pub fn widened_to(&self, texture_width: usize) -> Self {
         Self {
             texture_width: texture_width.max(self.texture_width),
@@ -99,9 +87,7 @@ impl D3d11ImageLayout {
     }
 }
 
-/// Every caller has already rejected a zero `width` or `height`, and each
-/// arm's texel width and row count are then non-zero, so this cannot build an
-/// empty texture.
+/// Build a layout entry from its five fields.
 fn lay(dxgi_format: u32, w: usize, h: usize, bpt: usize, gl: u32) -> Option<D3d11ImageLayout> {
     Some(D3d11ImageLayout {
         dxgi_format,
@@ -113,8 +99,7 @@ fn lay(dxgi_format: u32, w: usize, h: usize, bpt: usize, gl: u32) -> Option<D3d1
 }
 
 /// The D3D11 texture that backs `format`/`dtype` at `width` x `height`, or
-/// `None` when the format has no zero-copy texture layout (it then falls to
-/// PBO or Mem in the allocation chain).
+/// `None` when the format has no zero-copy texture layout.
 pub fn image_d3d11_layout(
     format: PixelFormat,
     dtype: DType,
@@ -125,10 +110,9 @@ pub fn image_d3d11_layout(
         return None;
     }
     match (format, dtype) {
-        // NV12 at an even size is the native two-plane texture video encoders
-        // and decoders read and write. D3D11 refuses an NV12 texture with an
-        // odd width or height, so those keep the combined plane.
-        // `gl_internal_format` is plane 0's; plane 1 is `GL_RG_EXT`.
+        // NV12 at an even size is the native two-plane texture; an odd width or
+        // height uses the combined plane. `gl_internal_format` is plane 0's;
+        // plane 1 is `GL_RG_EXT`.
         (PixelFormat::Nv12, DType::U8) if width.is_multiple_of(2) && height.is_multiple_of(2) => {
             lay(DXGI_FORMAT_NV12, width, height, 1, GL_RED_EXT)
         }
@@ -139,18 +123,12 @@ pub fn image_d3d11_layout(
     }
 }
 
-/// The HAL's combined luma + interleaved chroma plane as one `R8` texture,
-/// the layout the Path B shader decodes on every GL platform: every NV16 and
-/// NV24 image, and NV12 at an odd size. An externally created texture in
-/// this layout is still accepted for an even NV12 image.
+/// The HAL's combined luma + interleaved chroma plane as one `R8` texture:
+/// every NV16 and NV24 image, and NV12 at an odd size.
 ///
-/// The texture row is the plane's row *stride*, not the image width:
-/// producers write luma and chroma lines at the stride and the shader wraps
-/// chroma addressing at the sampled texture's width, so the two have to be
-/// one number or a chroma line lands on the wrong row. The even rounding is
-/// the floor -- an interleaved chroma pair cannot straddle a row edge -- and
-/// the Windows allocator widens it further to the driver's row pitch through
-/// [`D3d11ImageLayout::widened_to`].
+/// The texture row is the plane's row stride: the image width rounded up to
+/// even. The Windows allocator widens it further to the driver's row pitch
+/// through [`D3d11ImageLayout::widened_to`].
 pub fn combined_semi_planar_layout(
     format: PixelFormat,
     width: usize,
@@ -177,8 +155,8 @@ fn other_layout(
     height: usize,
 ) -> Option<D3d11ImageLayout> {
     use PixelFormat::*;
-    // Four contiguous values per texel: three RGB bytes or floats per pixel
-    // and four planar values per texel both need a width divisible by 4.
+    // A quarter of `n`, for the layouts that hold four contiguous values per
+    // texel; `None` unless `n` is divisible by 4.
     let quarter = |n: usize| {
         if n.is_multiple_of(4) {
             Some(n / 4)
@@ -300,7 +278,6 @@ mod tests {
         assert!(l.is_native_nv12());
         assert_eq!(l.mapped_rows(), 96, "luma rows, then chroma rows");
         assert_eq!(l.tight_bytes(), 128 * 96);
-        // An odd width or height has no NV12 texture.
         for (w, h) in [(127, 64), (128, 63)] {
             let l = image_d3d11_layout(PixelFormat::Nv12, DType::U8, w, h).unwrap();
             assert_eq!(l.dxgi_format, DXGI_FORMAT_R8_UNORM, "{w}x{h}");
@@ -337,9 +314,7 @@ mod tests {
         );
     }
 
-    /// An odd image width rounds the texture row up to the next even texel,
-    /// because a chroma pair that straddles the row edge is unaddressable by
-    /// the shader that decodes the combined plane.
+    /// An odd image width rounds the texture row up to the next even texel.
     #[test]
     fn semi_planar_rounds_an_odd_width_up_to_an_even_texture_row() {
         for (fmt, rows) in [
@@ -354,24 +329,18 @@ mod tests {
                 "{fmt:?} 321x241"
             );
         }
-        // An even width is untouched, so nothing that already fit changes.
         let l = image_d3d11_layout(PixelFormat::Nv16, DType::U8, 640, 480).unwrap();
         assert_eq!((l.texture_width, l.texture_height), (640, 960));
     }
 
-    /// The allocator widens a semi-planar entry to the driver's row pitch and
-    /// a wrap widens it to the host's texture width, so `widened_to` has to
-    /// widen and never narrow: the table's width is the floor every consumer
-    /// of a layout may assume.
+    /// `widened_to` widens and never narrows.
     #[test]
     fn widened_to_widens_and_never_narrows() {
         let l = image_d3d11_layout(PixelFormat::Nv12, DType::U8, 321, 241).unwrap();
         assert_eq!(l.texture_width, 322, "an odd width already rounds up");
 
-        // Below the entry's own width: not a widening, so it is ignored.
         assert_eq!(l.widened_to(64).texture_width, 322);
         assert_eq!(l.widened_to(321).texture_width, 322);
-        // Equal, and above.
         assert_eq!(l.widened_to(322).texture_width, 322);
         assert_eq!(l.widened_to(384).texture_width, 384);
         assert_eq!(
@@ -379,7 +348,6 @@ mod tests {
             384,
             "R8 rows are texels"
         );
-        // Every other field is the entry's.
         let w = l.widened_to(384);
         assert_eq!(
             (

@@ -4,11 +4,9 @@
 //! SAHI-style input tiling: cover a high-resolution frame with a uniform
 //! overlapping grid of model-input-sized tiles and preprocess them zero-copy.
 //!
-//! The grid uses the **EvenDist** spacing (ported from the adis-uav-model
-//! `sahi()` reference): `overlap_ratio` is treated as a *minimum*; the actual
-//! overlap is redistributed evenly so every tile is full-size and the last tile
-//! lands exactly on the far edge. This is the single spacing method — there is
-//! no flush-to-edge/clip configurability.
+//! The grid uses EvenDist spacing: `overlap_ratio` is treated as a
+//! minimum; the actual overlap is redistributed evenly so every tile is
+//! full-size and the last tile lands exactly on the far edge.
 //!
 //! The per-tile detections produced downstream are lifted to full-frame
 //! coordinates and merged by `edgefirst_decoder::tiling`; the shared
@@ -49,8 +47,7 @@ pub struct TilingConfig {
 
 impl TilingConfig {
     /// Tile size = model input; overlap 0.2, tiles stretched to the model
-    /// input (identity for the full-size tiles the grid produces) with the
-    /// default pixel mapping.
+    /// input with the default pixel mapping.
     pub fn new(tile_w: usize, tile_h: usize) -> Self {
         Self {
             tile_w,
@@ -69,8 +66,7 @@ impl TilingConfig {
     /// Set the options every tile is converted with: fit, letterbox
     /// placement and pad, normalization and interpolation, e.g. from
     /// [`ConvertOptions::from_spec`]. Each tile replaces the source crop
-    /// with its own. Rotation and flip are refused by [`validate`](Self::validate),
-    /// since tiles could not be lifted back to the frame.
+    /// with its own. Rotation and flip are refused by [`validate`](Self::validate).
     pub fn with_options(mut self, options: ConvertOptions) -> Self {
         self.options = options;
         self
@@ -83,8 +79,7 @@ impl TilingConfig {
 
     /// Validate the config: `overlap_ratio` in `[0.0, 1.0)`, non-zero tile
     /// size, and options without rotation or flip. Called by every tiling
-    /// method, and exposed so callers (e.g. the language bindings) can reject
-    /// bad input before generating a grid.
+    /// method.
     ///
     /// # Errors
     /// Returns [`Error::CropInvalid`] if the overlap is out of range or a tile
@@ -110,9 +105,9 @@ impl TilingConfig {
     }
 }
 
-/// EvenDist 1-D tile origins along one axis. Mirrors adis-uav-model `sahi()`:
-/// `overlap` is the *minimum*; origins are redistributed evenly so the first
-/// is `0`, the last is `frame - tile`, and the realized step is
+/// EvenDist 1-D tile origins along one axis: `overlap` is the minimum;
+/// origins are redistributed evenly so the first is `0`, the last is
+/// `frame - tile`, and the realized step is
 /// `<= floor(tile * (1 - overlap))` (realized overlap `>=` requested).
 /// Returns `[0]` when the frame is no larger than the tile.
 fn axis_origins(frame: usize, tile: usize, overlap: f64) -> Vec<usize> {
@@ -120,11 +115,7 @@ fn axis_origins(frame: usize, tile: usize, overlap: f64) -> Vec<usize> {
         return vec![0];
     }
     let last = frame - tile;
-    // Use floor(tile*(1-overlap)), not tile-floor(overlap*tile): the latter can
-    // be 1px larger than tile*(1-overlap) for non-integer ratios (e.g. 0.333),
-    // which would under-count tiles and realize less than the requested overlap.
-    // Clamp to >= 1 so a pathological overlap never div_ceil(0) (config
-    // validation already rejects overlap >= 1.0 up front).
+    // The largest step is floor(tile * (1 - overlap)), at least 1.
     let max_step = ((1.0 - overlap) * tile as f64).floor().max(1.0) as usize;
     let total = last.div_ceil(max_step);
     (0..=total)
@@ -168,10 +159,10 @@ pub fn tile_grid(
 }
 
 impl ImageProcessor {
-    /// Allocate the tall packed batch destination `[tile_w, n*tile_h]` — a
-    /// single GL-importable parent that stacks `n` tiles vertically. Uses
-    /// [`ImageProcessor::create_image`] so DMA pitch alignment and
-    /// `Dma>Pbo>Mem` selection apply. Caller-owned for pool reuse.
+    /// Allocate the tall packed batch destination `[tile_w, n*tile_h]`: a
+    /// single parent that stacks `n` tiles vertically. Uses
+    /// [`ImageProcessor::create_image`], so DMA pitch alignment and
+    /// `Dma>Pbo>Mem` selection apply.
     ///
     /// `access` declares planned CPU involvement (see
     /// [`edgefirst_tensor::CpuAccess`]); use `None` for NPU-bound tile
@@ -205,12 +196,10 @@ impl ImageProcessor {
     }
 
     /// Compute the tile grid and per-tile [`TilePlacement`] metadata for a
-    /// `src_w`×`src_h` frame **without touching the GPU**. A pipelined runtime
-    /// calls this once per frame to size pools and drive its tile stream.
+    /// `src_w`×`src_h` frame without touching the GPU.
     ///
-    /// The realized tile count can exceed the naive `ceil(frame / tile)`: the
-    /// grid treats `cfg.overlap_ratio` as a *minimum* and redistributes the
-    /// surplus evenly, so allocate from `len()` rather than estimating.
+    /// The realized tile count can exceed `ceil(frame / tile)`: the grid treats
+    /// `cfg.overlap_ratio` as a minimum and redistributes the surplus evenly.
     ///
     /// The returned placements are consumed by
     /// `edgefirst_decoder::tiling` to lift per-tile detections back to
@@ -258,9 +247,8 @@ impl ImageProcessor {
     /// `flush`. Returns the per-tile [`TilePlacement`] in tile-index order.
     ///
     /// The source crop is selected via [`ConvertOptions::source`] (a sampled
-    /// sub-rect of the whole-frame `src`) — **not** `src.view()` — so all tiles
-    /// share one source import. Each destination tile is a `view` row-band of
-    /// the shared parent.
+    /// sub-rect of the whole-frame `src`), so all tiles share one source
+    /// import. Each destination tile is a `view` row-band of the shared parent.
     ///
     /// # Examples
     ///
@@ -286,11 +274,9 @@ impl ImageProcessor {
     ///
     /// # Backend note
     ///
-    /// The GL band lowering covers single-pass geometry only. A zero-copy
-    /// (DMA) `dst_batched` in packed `Rgb` or a planar layout reinterprets the
-    /// render-target shape, which the band path does not yet compute, so GL
-    /// declines and each tile falls back to CPU. `Rgba`, `Bgra`, and `Grey`
-    /// batches stay on the batched GPU path.
+    /// With a zero-copy (DMA) `dst_batched` in packed `Rgb` or a planar layout,
+    /// GL declines and each tile is converted on the CPU. `Rgba`, `Bgra`, and
+    /// `Grey` batches stay on the batched GPU path.
     ///
     /// # Errors
     /// Returns an error if `cfg` is invalid, if `src`/`dst_batched` are not
@@ -329,13 +315,11 @@ impl ImageProcessor {
     }
 
     /// Render exactly one tile of `src` into `dst_slot` (a single model-input
-    /// sized destination, e.g. a slot of a caller-owned ring). Deferred — the
-    /// caller flushes on its own cadence so tiles overlap with inference. Holds
-    /// no frame-wide state; all geometry rides in `placement` (from
+    /// sized destination, e.g. a slot of a caller-owned ring). The convert is
+    /// deferred; the caller flushes. All geometry is in `placement` (from
     /// [`Self::plan_tiles`]).
     ///
-    /// A deferred tile is not CPU/CUDA-readable until [`ImageProcessorTrait::flush`]
-    /// (mirrors [`ImageProcessorTrait::convert_deferred`]).
+    /// A deferred tile is not CPU/CUDA-readable until [`ImageProcessorTrait::flush`].
     ///
     /// # Errors
     /// Returns an error if `cfg` is invalid or the tile convert fails.
@@ -369,10 +353,8 @@ impl ImageProcessor {
             .options
             .source(Some(placement_to_source_region(placement)?));
 
-        // Destination is a row-band of the tall parent (packed) or the slot
-        // itself. Decide batched vs slot from capacity vs. `placement.count`,
-        // not merely `dst_h > tile_h` — a padded `tile_one` slot can be taller
-        // than `tile_h` without being a tall parent.
+        // The destination is a row-band of the tall parent when it can hold
+        // `placement.count` tiles, else the slot itself.
         let dst_h = dst.height().ok_or(Error::NotAnImage)?;
         let batched = dst_h >= placement.count.saturating_mul(cfg.tile_h);
         if batched {
@@ -391,10 +373,7 @@ impl ImageProcessor {
 }
 
 /// Validate a [`TilePlacement`]'s origin/crop and convert to a pixel [`Region`].
-///
-/// Rejects negative, non-finite, or non-integral (after truncation) geometry
-/// that Python/C callers could otherwise smuggle in via the public placement
-/// constructors.
+/// Rejects negative, non-finite, or non-integral geometry.
 fn placement_to_source_region(placement: &TilePlacement) -> Result<Region> {
     let (ox, oy) = placement.origin;
     let (cw, ch) = placement.crop_size;
@@ -411,7 +390,7 @@ fn placement_to_source_region(placement: &TilePlacement) -> Result<Region> {
         }
     }
     let (ox_i, oy_i, cw_i, ch_i) = (ox as usize, oy as usize, cw as usize, ch as usize);
-    // Reject fractional values that would silently truncate (e.g. origin.x=1.5).
+    // Rejects fractional values.
     for (name, f, i) in [
         ("origin.x", ox, ox_i),
         ("origin.y", oy, oy_i),
@@ -440,7 +419,6 @@ mod tests {
 
     #[test]
     fn axis_origins_matches_adis_worked_example() {
-        // adis-uav-model sahi(1920, 640, 0.1) => [0, 427, 853, 1280]
         assert_eq!(axis_origins(1920, 640, 0.1), vec![0, 427, 853, 1280]);
     }
 
@@ -477,7 +455,7 @@ mod tests {
 
     #[test]
     fn axis_origins_overlap_near_one_no_panic() {
-        // overlap 0.99 must not panic (max_step clamps to >= 1).
+        // overlap 0.99: max_step clamps to 1.
         let xs = axis_origins(1920, 640, 0.99);
         assert_eq!(xs[0], 0);
         assert_eq!(*xs.last().unwrap(), 1280);
@@ -488,7 +466,7 @@ mod tests {
 
     #[test]
     fn axis_origins_8k_no_overflow() {
-        // Large frame: f32 rounding path, no overflow.
+        // Large frame.
         let xs = axis_origins(7680, 640, 0.2);
         assert_eq!(xs[0], 0);
         assert_eq!(*xs.last().unwrap(), 7680 - 640);
@@ -531,9 +509,7 @@ mod tests {
 
     #[test]
     fn rounding_uses_f32_path() {
-        // overlap 0.333 on a large frame: exercise the f32 round() path AND
-        // the floor(tile*(1-overlap)) minimum-overlap contract (max_step must
-        // be 426, not 427 — tile - floor(overlap*tile) would under-count).
+        // overlap 0.333 on a large frame: max_step is 426.
         let xs = axis_origins(4000, 640, 0.333);
         assert_eq!(xs[0], 0);
         assert_eq!(*xs.last().unwrap(), 4000 - 640);
@@ -564,8 +540,7 @@ mod tests {
         .unwrap()
     }
 
-    /// A frame shorter than the tile letterboxes every tile; tiles away from
-    /// the frame origin carry the same content region as the first.
+    /// A frame shorter than the tile letterboxes every tile with the same content region.
     #[test]
     fn plan_tiles_content_region_on_every_tile() {
         let options = ConvertOptions::new()
@@ -589,8 +564,7 @@ mod tests {
             .all(|p| p.content_region == Some([0.0, 0.1875, 1.0, 0.8125])));
     }
 
-    /// Lifting a box over a tile's whole content region gives back the
-    /// tile's crop in frame pixels.
+    /// Lifting a box over a tile's whole content region gives back the tile's crop in frame pixels.
     #[test]
     fn top_left_tile_boxes_lift_exactly() {
         use edgefirst_tensor::{BoundingBox, DetectBox};
@@ -694,8 +668,7 @@ mod tests {
         assert!(a.iter().any(|v| *v < 0.0), "imagenet normalization applied");
     }
 
-    /// A tile resamples with the base options' interpolation, not the
-    /// processor's.
+    /// A tile resamples with the base options' interpolation.
     #[test]
     fn tile_render_applies_interpolation() {
         use edgefirst_tensor::{TensorMapTrait, TensorTrait};
@@ -794,9 +767,7 @@ mod tests {
     // --- span instrumentation ----------------------------------------------
 
     /// Minimal `tracing::Subscriber` that records every span's name, in
-    /// creation order, into a shared `Vec`. Enough to assert *which* spans
-    /// fired without pulling in `tracing-subscriber` (not a dependency of
-    /// this crate) or `tracing-test`.
+    /// creation order, into a shared `Vec`.
     struct SpanNameCapture {
         names: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
         next_id: std::sync::atomic::AtomicU64,

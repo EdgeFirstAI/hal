@@ -18,9 +18,8 @@ const BATCH_MATMUL: &[&str] = &[
 ];
 const CONV: &[&str] = &["conv1x1_i8", "conv1x1_i8_ref"];
 
-/// The fixtures come from LiteRT's x86_64 wheel, whose optimized int8 matrix products run
-/// through gemmlowp and requantize like its reference kernels (`MultiplyByQuantizedMultiplier`,
-/// two roundings), not with the single rounding of ruy's aarch64 kernels.
+/// The kernels the fixtures' resolver ran: LiteRT's x86_64 wheel, whose optimized int8 matrix
+/// products run through gemmlowp.
 const HOST: TfliteKernels = TfliteKernels::NeonGemmlowp;
 
 fn activation(g: &Graph) -> Activation {
@@ -162,8 +161,7 @@ fn conv_1x1_every_tier_matches_tflite_bit_exact() {
     }
 }
 
-/// The fixtures separate the two roundings: ruy's single rounding (`TfliteKernels::NeonRuy`)
-/// gives other bytes, so the host's optimized products round like the reference kernels.
+/// Ruy's single rounding (`TfliteKernels::NeonRuy`) does not reproduce the fixtures.
 #[test]
 fn fixtures_distinguish_ruy_rounding_from_the_reference() {
     for name in BATCH_MATMUL.iter().chain(CONV) {
@@ -246,8 +244,7 @@ fn new_rejects_bad_params() {
             "{r:?}"
         );
     }
-    // A multiplier of 0.5 or more (shift ≥ 0) is valid TFLite arithmetic, but ruy's NEON
-    // kernels truncate there, so only the reference rounding takes it.
+    // A multiplier of 0.5 or more (shift ≥ 0) is taken by the reference rounding only.
     let half = Requant::from_real(0.75).unwrap();
     assert_eq!(half.shift, 0);
     assert!(unsupported(MatMulI8Params {
@@ -383,8 +380,7 @@ fn run_rejects_aliasing_output_rows() {
     }
 }
 
-/// `Σ_k (l − zl)(r − zr) + bias`, requantized in f64 and rounded half up: within one of the
-/// plan, which must equal itself on every tier and layout.
+/// `Σ_k (l − zl)(r − zr) + bias`, requantized in f64 and rounded half up.
 fn definition(p: &MatMulI8Params, l: &[i8], r: &[i8], m: usize, k: usize, n: usize) -> Vec<f64> {
     let mut o = vec![0.0; m * n];
     for i in 0..m {
@@ -408,9 +404,7 @@ fn definition(p: &MatMulI8Params, l: &[i8], r: &[i8], m: usize, k: usize, n: usi
     o
 }
 
-/// Transposed operands, a padded output, a broadcast batch, per-column requantization with a
-/// bias, `n` below the tile width and `k` past the packing width give the dense result on
-/// every tier, and output padding is never written.
+/// Transposed, padded, broadcast, narrow and long operands give the dense result on every tier.
 #[test]
 fn strided_views_match_contiguous() {
     let rng = |seed: u32, n: usize| -> Vec<i8> {

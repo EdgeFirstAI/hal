@@ -89,9 +89,9 @@ enum Path {
 /// 3. Any input to `f32`: dequantize and sigmoid in f32, with the f32 exp on every tier.
 ///    Integer inputs run the decoder's fused NEON kernel on every NEON tier; f16 and f32
 ///    inputs run the NEON f32 sigmoid.
-/// 4. Any input to `f16`: on the FP16 tier, an FP16-arithmetic sigmoid, tested within 2 f16
-///    ulps of the float64 sigmoid rounded to f16; on the other tiers, path 3's f32 result
-///    rounded to f16 once (nearest even).
+/// 4. Any input to `f16`: on the FP16 tier, an FP16-arithmetic sigmoid, within 2 f16 ulps of
+///    the float64 sigmoid rounded to f16; on the other tiers, path 3's f32 result rounded to
+///    f16 once (nearest even).
 /// 5. Anything else: dequantize to f32 as `(x − zp) · scale`, the f32 sigmoid of path 3, then
 ///    [`quantize`] once (round half away from zero, clamp). Within one LSB of a float64
 ///    sigmoid.
@@ -717,7 +717,7 @@ mod tests {
             };
             assert_eq!(p.tier(), want, "neon_fp16 {i:?} -> {o:?}");
         }
-        // The probed features of an FP16 CPU, dotprod included, still pick the FP16 kernels.
+        // The probed features of an FP16 CPU, dotprod included, pick the FP16 kernels.
         let probed = CpuFeatures::probe();
         let q = Quant::new(0.1, 0);
         assert_eq!(

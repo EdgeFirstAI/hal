@@ -65,10 +65,9 @@ fn lookup8(v: int16x8_t, lut: &[i16; 513]) -> int16x8_t {
     let mut ix = [0u16; 8];
     // SAFETY: `ix` is 8 writable u16s.
     unsafe { vst1q_u16(ix.as_mut_ptr(), index) };
-    // Each lane's `(lut[i], lut[i + 1])` as one u32, which LLVM reads with a single load.
+    // Each lane's `(lut[i], lut[i + 1])` as one u32.
     let mut pairs = [0u32; 8];
     for (p, &i) in pairs.iter_mut().zip(&ix) {
-        // Indices are already 0..=511; the mask lets the bounds checks fold away.
         let i = usize::from(i & 0x1ff);
         *p = u32::from(lut[i] as u16) | (u32::from(lut[i + 1] as u16) << 16);
     }
@@ -81,7 +80,7 @@ fn lookup8(v: int16x8_t, lut: &[i16; 513]) -> int16x8_t {
     };
     let (base, next) = (vuzp1q_s16(a, b), vuzp2q_s16(a, b));
     let slope = vsubq_s16(next, base);
-    // `(slope * offset + 64) >> 7` fits in an i16, so the narrowing keeps it exactly.
+    // `(slope * offset + 64) >> 7`, narrowed to i16.
     let lo = vrshrn_n_s32::<7>(vmull_s16(vget_low_s16(slope), vget_low_s16(offset)));
     let delta = vrshrn_high_n_s32::<7>(lo, vmull_high_s16(slope, offset));
     vaddq_s16(base, delta)
@@ -127,7 +126,6 @@ fn exp_pass(c: &RowConsts, max: i16, src: &[i16], dst: &mut [i16]) -> i32 {
 #[target_feature(enable = "neon")]
 fn rescale_pass(recip: i16, shift: u32, dst: &mut [i16]) {
     let r = vdupq_n_s16(recip);
-    // `shift` is at most 31, so the negation cannot wrap.
     let sh = vdupq_n_s32(-(shift.min(31) as i32));
     let zero = vdupq_n_s16(0);
     let (chunks, tail) = dst.as_chunks_mut::<8>();

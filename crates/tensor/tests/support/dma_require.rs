@@ -1,19 +1,14 @@
 // SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! DMA-BUF test policy: a skip must not be able to masquerade as coverage.
+//! DMA-BUF test policy.
 //!
-//! Tests that need a DMA heap return early when `is_dma_available()` is
-//! false and report `ok`. On a host whose heap node exists but is not
-//! openable by the test user (GitHub's hosted runners ship
-//! `/dev/dma_heap/system` as `root:video 0660`), that is indistinguishable
-//! from real coverage. `HAL_TEST_REQUIRE_DMA=1` turns the skip into a
-//! failure naming the test and the reason, so a lane that is meant to have
-//! a heap cannot silently stop testing it.
+//! Tests that need a DMA heap return early when `is_dma_available()` is false.
+//! `HAL_TEST_REQUIRE_DMA=1` turns that skip into a failure naming the test and
+//! the reason.
 //!
-//! This file has no crate references so it can be `#[path]`-included from
-//! both the library's `test_support` module and the integration tests; each
-//! compilation unit supplies its own `is_dma_available()` to [`decide`].
+//! This file has no crate references; each compilation unit that includes it
+//! passes its own `is_dma_available()` result in.
 
 /// `true` when `HAL_TEST_REQUIRE_DMA=1` is set.
 pub fn required() -> bool {
@@ -40,8 +35,7 @@ pub fn decide(satisfied: bool, require: bool, what: &str, why: &str) -> bool {
 }
 
 /// `true` when the caller should run; `false` when it should return early,
-/// after writing `SKIPPED: {what} - {why}` straight to stderr so libtest's
-/// output capture cannot hide it.
+/// after writing `SKIPPED: {what} - {why}` straight to stderr.
 ///
 /// # Panics
 ///

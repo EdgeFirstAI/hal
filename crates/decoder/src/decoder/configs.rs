@@ -10,21 +10,18 @@
 //! [`DecoderType`], [`DecoderVersion`], [`Nms`], and the resolved
 //! [`ModelType`].
 //!
-//! [`Nms`] is worth a note: it has no `None` variant. Bypassing suppression is
-//! expressed as `Option<Nms>::None` on the decoder configuration, and
-//! [`Nms::Auto`] means "take the mode from the config document", falling back
-//! to [`Nms::ClassAware`] when the document is silent.
+//! [`Nms`] has no `None` variant. Bypassing suppression is expressed as
+//! `Option<Nms>::None` on the decoder configuration, and [`Nms::Auto`] takes
+//! the mode from the config document, falling back to [`Nms::ClassAware`]
+//! when the document names none.
 
 use std::collections::HashMap;
 use std::fmt::Display;
 
 use serde::{Deserialize, Serialize};
 
-/// Deserialize dshape from either array-of-tuples or array-of-single-key-dicts.
-///
-/// The metadata spec produces `[{"batch": 1}, {"num_features": 84}]` (dict format),
-/// while serde's default `Vec<(A, B)>` expects `[["batch", 1]]` (tuple format).
-/// This deserializer accepts both.
+/// Deserialize dshape from either array-of-tuples (`[["batch", 1]]`) or
+/// array-of-single-key-dicts (`[{"batch": 1}, {"num_features": 84}]`).
 pub fn deserialize_dshape<'de, D>(deserializer: D) -> Result<Vec<(DimName, usize)>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -212,11 +209,9 @@ edgefirst_tensor::ef_vocabulary! {
         #[serde(rename = "num_queries")]
         NumQueries = 11, "num_queries", NUM_QUERIES,
         /// Any axis name the HAL does not recognise (e.g. a producer's
-        /// `channels` on the input dshape). Preserved so the dshape length still
-        /// matches the shape and the axis sorts to the canonical tail in
-        /// `swap_axes_if_needed`, but it never satisfies a required-dimension
-        /// check. Keeps metadata parsing tolerant of unknown axis names instead
-        /// of failing the whole decoder build.
+        /// `channels` on the input dshape). It sorts to the canonical tail in
+        /// `swap_axes_if_needed` and never satisfies a required-dimension
+        /// check.
         #[serde(other)]
         Unknown = 10, "unknown", UNKNOWN,
     }
@@ -317,13 +312,11 @@ edgefirst_tensor::ef_vocabulary! {
     #[serde(rename_all = "snake_case")]
     pub enum Nms {
         /// Let the builder resolve NMS mode from the model config (e.g.
-        /// `edgefirst.json`).  Falls back to [`Nms::ClassAware`] when no
-        /// config specifies a mode.  This is the builder default — callers
-        /// should only use an explicit variant when they need to override
-        /// the config.
+        /// `edgefirst.json`). Falls back to [`Nms::ClassAware`] when no
+        /// config specifies a mode. This is the builder default.
         Auto = 1, "auto", AUTO,
-        /// Only suppress boxes with the same class label that overlap (default
-        /// concrete behavior; matches trainer and COCO evaluation).
+        /// Only suppress boxes with the same class label that overlap (the
+        /// default concrete mode).
         #[default]
         ClassAware = 2, "class_aware", CLASS_AWARE,
         /// Suppress overlapping boxes regardless of class label.
@@ -453,11 +446,8 @@ pub enum ModelType {
         mask_coeff: MaskCoefficients,
         protos: Protos,
     },
-    /// Per-scale (physical-output-decomposition) YOLO model. The
-    /// per-scale subsystem (`crates/decoder/src/per_scale/`) owns
-    /// model decoding entirely; this variant exists as a marker so the
-    /// `Decoder::model_type` field has a sensible value for per-scale
-    /// Decoders that bypass the legacy `ModelType`-driven dispatch.
+    /// Per-scale (physical-output-decomposition) YOLO model. The per-scale
+    /// subsystem decodes it; this variant is a marker.
     PerScale,
     /// Semantic segmentation model (`decoder: semantic`). Decoded only by
     /// `Decoder::decode_semantic`; the box and mask entry points reject it.
@@ -509,9 +499,7 @@ pub(crate) fn validate_dshape(
         }
     }
 
-    // Duplicate-axis check: duplicates map to the same canonical slot
-    // and would break `swap_axes_if_needed` by producing a
-    // non-permutation ordering.
+    // Duplicate-axis check.
     for i in 0..dshape.len() {
         for j in (i + 1)..dshape.len() {
             if dshape[i].0 == dshape[j].0 {

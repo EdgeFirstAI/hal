@@ -4,48 +4,27 @@
 //! macOS and iOS platform helpers for the OpenGL backend.
 //!
 //! Uses Google ANGLE (translating OpenGL ES 3.0 to Metal) as the libEGL
-//! provider, and Apple IOSurface as the zero-copy buffer interchange.
-//! The buffer import path is structurally different from Linux: Linux
-//! creates an `EGLImage` from a DMA-BUF fd and binds it to a texture via
-//! `glEGLImageTargetTexture2DOES`; macOS/iOS creates an EGL pbuffer from an
-//! IOSurface via `EGL_ANGLE_iosurface_client_buffer` and binds it as a
-//! texture source via `eglBindTexImage`.
+//! provider, and Apple IOSurface as the zero-copy buffer interchange: an EGL
+//! pbuffer is created from an IOSurface via
+//! `EGL_ANGLE_iosurface_client_buffer` and bound as a texture source via
+//! `eglBindTexImage`.
 //!
-//! The macOS and iOS bring-up flows are identical except for how the
-//! libEGL handle is obtained (see [`ApplePlatform::load_egl_lib`]):
-//! macOS `dlopen`s a `libEGL.dylib` from Homebrew / a bundled framework;
-//! iOS resolves EGL/GLES from the main image via `Library::this()`
-//! because the ANGLE xcframeworks are statically linked into the app
-//! binary. Both paths feed the same `Dynamic` EGL loader.
+//! The macOS and iOS bring-up flows differ in how the libEGL handle is
+//! obtained (see [`ApplePlatform::load_egl_lib`]): macOS `dlopen`s a
+//! `libEGL.dylib` from the search paths; iOS `dlopen`s the `libEGL` image
+//! dyld has loaded.
 //!
-//! ## Seam shape
+//! * [`ApplePlatform::load_egl_lib`]: locate and dlopen ANGLE's libEGL.
+//! * [`ApplePlatform::create_display`]: bring up an ANGLE Metal display via
+//!   `eglGetPlatformDisplayEXT`.
 //!
-//! Only two operations need a platform-specific spelling at the macOS GL
-//! backend layer today:
-//!
-//! 1. [`ApplePlatform::load_egl_lib`] — locate and dlopen ANGLE's
-//!    `libEGL.dylib`.
-//! 2. [`ApplePlatform::create_display`] — bring up an ANGLE Metal
-//!    display via `eglGetPlatformDisplayEXT`.
-//!
-//! Everything downstream (pbuffer import, texture binding, FBO setup,
-//! shader compilation, lifetime management) lives in the shared GL engine
-//! (`processor`, `threaded`, `resources`, `shaders`) and in
-//! [`super::super::iosurface_import`]. The engine reaches IOSurface-backed
-//! buffers through the `GlPlatform` trait, implemented for macOS/iOS by
-//! `AngleClientBuffer` in the sibling `angle` module.
-//!
-//! `WindowsPlatform` (`platform/windows.rs`, ANGLE over Direct3D 11) slots
-//! in the same way: the same two bring-up functions plus a `GlPlatform`
-//! leaf, and the shared engine runs unchanged (with PBO transfers until a
-//! D3D11 shared-texture import lands).
+//! Pbuffer import lives in [`super::super::iosurface_import`], and the
+//! `GlPlatform` implementation for macOS/iOS is `AngleClientBuffer` in the
+//! sibling `angle` module.
 
 use super::super::Egl;
 use crate::Error;
 use edgefirst_egl as egl;
-// `debug!` is used by both Apple `load_egl_lib_inner` branches; `warn!`
-// only by the macOS one. Gate the `warn` import so iOS builds don't warn
-// about unused items.
 use log::debug;
 #[cfg(target_os = "macos")]
 use log::warn;
@@ -59,21 +38,16 @@ const EGL_PLATFORM_ANGLE_ANGLE: u32 = 0x3202;
 const EGL_PLATFORM_ANGLE_TYPE_ANGLE: i32 = 0x3203;
 const EGL_PLATFORM_ANGLE_TYPE_METAL_ANGLE: i32 = 0x3489;
 
-/// Cached libEGL handle. Leaked at first load to avoid dlclose-during-
-/// shutdown SIGBUS issues (same pattern as Linux's EGL_LIB in
-/// context.rs).
+/// Cached libEGL handle. Leaked at first load.
 static EGL_LIB: OnceLock<&'static libloading::Library> = OnceLock::new();
 
-/// Default search paths for `libEGL.dylib`. Order matters:
+/// Default search paths for `libEGL.dylib`, in order:
 ///
 /// 1. Homebrew installs (Apple Silicon, then Intel).
-/// 2. `@loader_path` — alongside the loading binary. Lets bundled
-///    distributions ship ANGLE in `Frameworks/` or beside the
-///    executable without needing `EDGEFIRST_ANGLE_PATH`.
-/// 3. `@executable_path` — alongside the main executable when the
-///    loader isn't itself the executable.
-/// 4. Bare `libEGL.dylib` — last-resort fallback through the dyld
-///    search path (`DYLD_LIBRARY_PATH`, etc.).
+/// 2. `@loader_path` — alongside the loading binary.
+/// 3. `@executable_path` — alongside the main executable.
+/// 4. Bare `libEGL.dylib` — the dyld search path (`DYLD_LIBRARY_PATH`,
+///    etc.).
 ///
 /// `EDGEFIRST_ANGLE_PATH` (env var) is prepended at runtime — see
 /// [`load_egl_lib`].
@@ -87,22 +61,18 @@ const ANGLE_SEARCH_PATHS: &[&str] = &[
     "libEGL.dylib",
 ];
 
-/// Apple-platform (macOS + iOS) helpers. Exposes two associated functions;
-/// see the module docstring for the rationale.
+/// Apple-platform (macOS + iOS) helpers.
 pub(in super::super) struct ApplePlatform;
 
 impl ApplePlatform {
     /// Obtain the ANGLE libEGL handle, cached for the process lifetime.
     /// Returns a leaked `&'static` reference on first successful load; the
-    /// handle is never closed (avoids dlclose-during-shutdown crashes —
-    /// same pattern as Linux's `EGL_LIB` in `context.rs`).
+    /// handle is never closed.
     ///
-    /// The actual acquisition is OS-specific ([`Self::load_egl_lib_inner`]):
-    /// macOS `dlopen`s a `libEGL.dylib` from the search paths; iOS locates
-    /// the already-loaded `libEGL` image in dyld's image list and `dlopen`s
-    /// it by exact path (the ANGLE xcframeworks are dynamic frameworks the
-    /// app or test bundle links against and embeds, so dyld loads them
-    /// before any Rust code runs).
+    /// The acquisition is OS-specific ([`Self::load_egl_lib_inner`]): macOS
+    /// `dlopen`s a `libEGL.dylib` from the search paths; iOS locates the
+    /// loaded `libEGL` image in dyld's image list and `dlopen`s it by exact
+    /// path.
     pub(in super::super) fn load_egl_lib() -> Result<&'static libloading::Library, Error> {
         if let Some(lib) = EGL_LIB.get() {
             return Ok(lib);
@@ -112,26 +82,9 @@ impl ApplePlatform {
         Ok(EGL_LIB.get_or_init(|| leaked))
     }
 
-    /// iOS: ANGLE EGL/GLES symbols come from the `EGL.xcframework` +
-    /// `GLESv2.xcframework` dynamic frameworks that the consuming app (or
-    /// test bundle) links against and embeds. Because they are linked (not
-    /// merely bundled), dyld loads them into the process before any Rust code
-    /// runs — so locate the already-loaded `libEGL` image in dyld's image
-    /// list and `dlopen` it by its exact path.
-    ///
-    /// Deliberately NOT `Library::this()` (`dlopen(NULL)`): that handle only
-    /// searches the main executable and its launch-time dependents. When
-    /// ANGLE is linked by a *plugin* image instead (an XCTest bundle inside a
-    /// test runner — the Device Farm / device-test topology), `dlsym` on the
-    /// main-executable handle returns NULL for every EGL symbol WITHOUT
-    /// setting `dlerror`, which libloading reports as success — the
-    /// `edgefirst-egl` strict loader then builds a dispatch table of NULLs
-    /// and the first EGL call crashes at address 0 (found on a physical
-    /// iPhone 17 Pro; the same lookup succeeds in a plain app because there
-    /// ANGLE *is* a launch dependent of the main executable). Resolving the
-    /// image path first gives a real dlopen handle with honest dlerror
-    /// semantics in both topologies, and a clean `Err` (→ CPU-preprocess
-    /// fallback) when ANGLE is not linked at all.
+    /// iOS: locate the loaded `libEGL` image in dyld's image list and
+    /// `dlopen` it by its exact path. Returns an error when ANGLE is not
+    /// linked.
     #[cfg(target_os = "ios")]
     fn load_egl_lib_inner() -> Result<libloading::Library, Error> {
         unsafe extern "C" {
@@ -139,14 +92,11 @@ impl ApplePlatform {
             fn _dyld_get_image_name(image_index: u32) -> *const std::os::raw::c_char;
         }
         // SAFETY: `_dyld_image_count` / `_dyld_get_image_name` take no
-        // pointers in and return either an index bound or a NUL-terminated
-        // string owned by dyld that lives for the image's lifetime (the
-        // image cannot unload between the calls and the copy below because
-        // we never dlclose ANGLE and the process is single-shot).
+        // pointers in and return an index bound or a NUL-terminated string
+        // owned by dyld.
         let count = unsafe { _dyld_image_count() };
         for index in 0..count {
-            // SAFETY: index < count per the bound above; a NULL return (image
-            // unloaded concurrently) is skipped.
+            // SAFETY: `index < count`; a NULL return is skipped.
             let name = unsafe { _dyld_get_image_name(index) };
             if name.is_null() {
                 continue;
@@ -155,9 +105,7 @@ impl ApplePlatform {
             let path = unsafe { std::ffi::CStr::from_ptr(name) }.to_string_lossy();
             if path.ends_with("/libEGL.framework/libEGL") || path.ends_with("/libEGL.dylib") {
                 debug!("ApplePlatform: dlopen already-loaded ANGLE libEGL at {path}");
-                // SAFETY: dlopen is unsafe because the loaded library can run
-                // initializers; this image is already loaded (dyld list), so
-                // this only bumps its reference count.
+                // SAFETY: the image is loaded; this dlopen bumps its reference count.
                 return unsafe { libloading::Library::new(path.as_ref()) }.map_err(|e| {
                     Error::Io(std::io::Error::other(format!(
                         "dlopen of loaded ANGLE libEGL image {path} failed: {e}"
@@ -179,21 +127,14 @@ impl ApplePlatform {
     /// bare name).
     ///
     /// `EDGEFIRST_ANGLE_PATH` points at a directory containing flat
-    /// `libEGL.dylib` + `libGLESv2.dylib` siblings. ANGLE's libEGL
-    /// internally `dlopen`s `libGLESv2.dylib` from its own directory
-    /// (located via `dladdr`) to resolve GL entry points, so the two MUST
-    /// be siblings in a flat layout — the framework bundle layout does
-    /// not work for the macOS runtime dlopen path. The
-    /// `scripts/fetch-angle.sh` helper stages such a flat dir from the
-    /// signed `angle-package` release xcframeworks.
+    /// `libEGL.dylib` + `libGLESv2.dylib` siblings.
     #[cfg(target_os = "macos")]
     fn load_egl_lib_inner() -> Result<libloading::Library, Error> {
         // Try the user override first.
         let candidates: Vec<String> = std::env::var("EDGEFIRST_ANGLE_PATH")
             .ok()
             .map(|p| {
-                // EDGEFIRST_ANGLE_PATH points at the dir containing the
-                // dylibs; build the full path.
+                // EDGEFIRST_ANGLE_PATH names the directory containing the dylibs.
                 vec![format!("{p}/libEGL.dylib")]
             })
             .unwrap_or_default()
@@ -203,8 +144,7 @@ impl ApplePlatform {
 
         let mut last_err: Option<libloading::Error> = None;
         for path in &candidates {
-            // SAFETY: dlopen is unsafe because the loaded library can
-            // run initializers. ANGLE's libEGL is well-behaved.
+            // SAFETY: ANGLE's libEGL initializers are sound to run.
             match unsafe { libloading::Library::new(path) } {
                 Ok(lib) => {
                     debug!("ApplePlatform: loaded ANGLE libEGL from {path}");
@@ -228,15 +168,11 @@ impl ApplePlatform {
 
     /// Bring up an ANGLE Metal-backed EGL display.
     ///
-    /// `egl` must wrap a libEGL handle obtained from [`load_egl_lib`]
-    /// — the call goes through ANGLE's `EGL_EXT_platform_base` client
-    /// extension, which is not present in Apple's system EGL (Apple
-    /// ships none).
+    /// `egl` must wrap a libEGL handle obtained from [`load_egl_lib`].
     pub(in super::super) fn create_display(egl: &Egl) -> Result<egl::Display, Error> {
-        // ANGLE's libEGL exposes EGL_EXT_platform_base as a client
-        // extension. We must call eglGetPlatformDisplayEXT explicitly
-        // with platform = EGL_PLATFORM_ANGLE_ANGLE and a type attrib
-        // selecting the Metal backend.
+        // Call eglGetPlatformDisplayEXT with platform =
+        // EGL_PLATFORM_ANGLE_ANGLE and a type attrib selecting the Metal
+        // backend.
         type FnGetPlatformDisplayEXT = unsafe extern "C" fn(
             platform: u32,
             native: *mut std::ffi::c_void,
@@ -284,20 +220,7 @@ impl ApplePlatform {
 mod tests {
     use super::*;
 
-    /// Confirms `load_egl_lib` can locate ANGLE's libEGL.dylib on this
-    /// host. Skips silently if the Homebrew ANGLE tap is not installed
-    /// — CI runs without ANGLE should not fail this test.
-    ///
-    /// The optional dlopen probe (which also catches missing/broken
-    /// signatures) only runs when the harness sets
-    /// `HAL_TEST_ALLOW_DLOPEN_ANGLE=1` — without that opt-in, plain
-    /// `cargo test` on macOS 26 hardened-runtime hosts would SIGKILL
-    /// the test process at dylib-load time and the failure would
-    /// surface as a silent crash with no stdout. `scripts/test-macos.sh`
-    /// signs the test binary with the library-validation entitlement
-    /// and exports the env var; the broader signature-validation path
-    /// also runs as part of the `test_yuyv_to_rgba_opengl_macos`
-    /// integration test in `crates/image/src/lib.rs`.
+    /// `load_egl_lib` locates ANGLE's libEGL.dylib on this host, or the test skips.
     #[test]
     fn load_egl_lib_finds_homebrew_angle_or_skips() {
         let exists_at_any = ANGLE_SEARCH_PATHS
@@ -311,11 +234,7 @@ mod tests {
             return;
         }
 
-        // Only attempt the actual dlopen when the harness has signed
-        // this binary with `disable-library-validation`. Outside that
-        // path we still report a successful test — the file-existence
-        // check above is the portable smoke-test, and the integration
-        // test exercises the real load path.
+        // The dlopen runs only when `HAL_TEST_ALLOW_DLOPEN_ANGLE` is set.
         if std::env::var_os("HAL_TEST_ALLOW_DLOPEN_ANGLE").is_none() {
             crate::test_support::report_skip(
                 "HAL_TEST_ALLOW_DLOPEN_ANGLE unset — run via \

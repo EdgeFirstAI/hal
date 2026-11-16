@@ -24,15 +24,6 @@ use edgefirst_tensor::DType;
 /// | `i8` | `XOR 0x80` | `(>> 8) XOR 0x80` | unsigned-to-signed via sign-bit flip |
 /// | `i16` | `* 257 XOR 0x8000` | `XOR 0x8000` | unsigned-to-signed via sign-bit flip |
 /// | `f32` | `/ 255.0` | `/ 65535.0` | normalised to `[0.0, 1.0]` |
-///
-/// `edgefirst_tensor::Element` is a supertrait: under the `dynamic` tensor
-/// backend, `Tensor<T>`'s own constructors need `T::DTYPE` at compile time
-/// (there is no per-variant enum to allocate through instead), so any `T`
-/// this crate builds a `Tensor<T>` over must already be one of the eleven
-/// element types `Element` is sealed to. Every `ImagePixel` impl below is
-/// one of those types, so this costs nothing real -- it just makes the
-/// existing constraint visible at the trait level instead of failing much
-/// later at a `Tensor<T>` call site.
 pub trait ImagePixel: edgefirst_tensor::Element {
     /// Convert a `[0, 255]` byte value to this pixel type.
     fn from_u8(v: u8) -> Self;
@@ -135,30 +126,10 @@ impl ImagePixel for f32 {
 
 /// Map a pooled decode destination for CPU fill.
 ///
-/// [`crate::ImageLoad::load_image`] first `configure_image`s the tensor to
-/// the current frame, so the mapped window is often shorter than the backing
-/// (a max-size pool). `map_write()` is tried first: it is the cheap,
-/// correct call everywhere except one case — a `CpuAccess::ReadWrite`
-/// -declared D3D11 texture tensor (`edgefirst-profiler`'s own decode pool is
-/// declared this way; see `orchestrator/buffers.rs::create_decode_source_pool`)
-/// has a staging texture, and unmapping a write-only *partial* window through
-/// it would publish the whole staging copy — including rows the caller never
-/// touched — back onto the real texture, so the tensor crate refuses it.
-///
-/// The tensor crate signals exactly that refusal, and no other, with
-/// [`Error::PartialWriteRequiresReadWrite`] — retrying only on that variant
-/// (not on any `map_write()` failure) means every other failure is reported
-/// as itself: an access declaration too narrow to write at all, a tensor
-/// already mapped elsewhere, or a D3D11 device/map error the retry could not
-/// somehow fix, all surface as `map_mut()`'s own error rather than the
-/// unrelated (and by then stale) "try `CpuAccess::ReadWrite`" advice.
-///
-/// Falling back only on that refusal, rather than requesting `ReadWrite`
-/// unconditionally, is also what keeps every other platform's cheap path
-/// cheap: a `CpuAccess::Write`-declared D3D11 tensor (no staging) and every
-/// Linux dma-buf decode succeed on the first try, so they never pay for the
-/// `ReadWrite` map's extra cache-invalidate work that the destination's own
-/// decoder-only write never needed.
+/// `map_write()` is tried first. When the tensor crate refuses it with
+/// [`Error::PartialWriteRequiresReadWrite`] (a partial window of a
+/// `CpuAccess::ReadWrite` D3D11 texture tensor), the tensor is mapped with
+/// `map_mut()` instead. Any other failure is returned as it is.
 pub(crate) fn map_decode_dst<'a, T: ImagePixel>(
     dst: &edgefirst_tensor::Tensor<T>,
 ) -> Result<edgefirst_tensor::view::HostView<'a, T>, edgefirst_tensor::Error> {

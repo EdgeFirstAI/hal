@@ -1,23 +1,14 @@
 // SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! Portable `PixelFormat` → DRM FourCC mapping.
-//!
-//! Uses the platform-neutral [`drm_fourcc`] crate (the same `DrmFourcc` enum
-//! `gbm` re-exports) so this mapping — and the shader/format code that depends
-//! on it — carries no `gbm`/Linux coupling. `gbm` is a buffer *allocator* and
-//! is needed only where real DMA-BUF/DRM buffers or GBM EGL displays are
-//! created (`gl::context`), not for naming a FourCC.
+//! `PixelFormat` → DRM FourCC mapping through the [`drm_fourcc`] crate.
 
 use crate::Error;
 use drm_fourcc::DrmFourcc;
 use edgefirst_tensor::PixelFormat;
 
-/// Map a [`PixelFormat`] to its DRM FourCC code.
-///
-/// The returned [`DrmFourcc`] is a `#[repr(u32)]` industry-standard FourCC
-/// constant; at the EGL boundary it is consumed as its raw `u32` value
-/// (`EGL_LINUX_DRM_FOURCC`). This is a pure, platform-neutral mapping.
+/// Map a [`PixelFormat`] to its DRM FourCC code. At the EGL boundary the
+/// [`DrmFourcc`] is consumed as its raw `u32` value (`EGL_LINUX_DRM_FOURCC`).
 pub(super) fn pixel_format_to_drm(fmt: PixelFormat) -> Result<DrmFourcc, Error> {
     match fmt {
         PixelFormat::Rgba => Ok(DrmFourcc::Abgr8888),

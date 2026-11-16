@@ -5,12 +5,9 @@
 //! encode) and video (H.264 and MJPEG encode and decode), with tensors as the
 //! pictures throughout.
 //!
-//! Image decoding writes **into** a tensor the caller already has rather than
-//! allocating one. That is what lets a decode target be a DMA buffer the GPU
-//! will read next, with no copy in between — and it is why the tensor may have
-//! been minted by any EdgeFirst library, not only this one. Video decoders
-//! hand out frames whose tensors stay in the decoder's pool until the frame
-//! is freed.
+//! Image decoding writes into a tensor the caller already has, which may come
+//! from any EdgeFirst library. Video decoders hand out frames whose tensors
+//! stay in the decoder's pool until the frame is freed.
 
 #[cfg(not(edgefirst_tensor_dynamic))]
 compile_error!(
@@ -25,24 +22,12 @@ pub mod error;
 pub mod video;
 
 /// ABI version of this library's C surface.
-///
-/// 2: `ef_codec_colorimetry_from_v4l2` takes an `is_rgb_or_hsv` argument
-/// before `out`.
-///
-/// 3: engines, capabilities, `ef_image_encoder`, `ef_video_encoder` and
-/// `ef_video_decoder`; `ef_codec_last_error`; image decoding answers
-/// `EBADMSG` for undecodable data and `ENOTSUP` for unsupported features,
-/// which were `EIO`.
 #[no_mangle]
 pub extern "C" fn ef_codec_abi_version() -> u32 {
     3
 }
 
-// Test support shared with the other C-API leaves, which lives in the tensor
-// leaf. Included here, relative to `src/`: a `#[path]` inside an inline
-// module resolves relative to `src/tests/`, which Linux and macOS refuse to
-// walk `..` through.
-// This leaf uses part of each; the other leaves use the rest.
+// Test support shared with the other C-API leaves, which lives in the tensor leaf.
 #[cfg(test)]
 #[path = "../../tensor-capi/tests/support/artifacts.rs"]
 #[allow(dead_code)]
@@ -62,11 +47,7 @@ mod tests {
         .expect("cbindgen wrote include/edgefirst/codec.h")
     }
 
-    /// Syntax-check a C translation unit against the shipped headers.
-    ///
-    /// `-Werror`: a header that merely parses is not enough — the vtable once
-    /// declared `struct ef_tensor *` before the type existed and warned on
-    /// every dispatch while still exiting 0.
+    /// Syntax-check a C translation unit against the shipped headers, with `-Werror`.
     fn cc_syntax_check(src: &str) -> Option<std::process::Output> {
         let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
         match std::process::Command::new(&cc)
@@ -125,10 +106,6 @@ mod tests {
 
     #[test]
     fn no_two_libraries_export_the_same_symbol() {
-        // With five libraries the interposition hazard is at its sharpest: any
-        // symbol two of them export would be resolved to one for every caller,
-        // and a tensor from the other would then be handled by the wrong code.
-        // Checked pairwise across all three rather than against tensor alone.
         let mut dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         dir.pop();
         dir.pop();
@@ -165,8 +142,7 @@ mod tests {
                 );
             }
         }
-        // Sharper still: only the tensor library defines the tensor API. The
-        // others mint and consume tensors but export none of its entry points.
+        // Only the tensor library exports `ef_tensor_*` symbols.
         for (name, syms) in &sets {
             if *name == "tensor" {
                 continue;
@@ -187,22 +163,20 @@ mod tests {
     }
 
     #[test]
-    fn the_abi_probe_is_generation_3() {
+    fn the_abi_probe_reports_the_current_version() {
         assert_eq!(super::ef_codec_abi_version(), 3);
     }
 
     #[test]
-    fn the_header_carries_none_of_the_monoliths_symbols() {
+    fn the_header_carries_no_hal_symbols() {
         assert!(
             !header_text().contains("hal_"),
-            "codec.h must not carry the monolith's hal_* symbols"
+            "codec.h must not carry hal_* symbols"
         );
     }
 
     #[test]
     fn codec_h_includes_the_tensor_header() {
-        // Decoding targets a tensor, so codec.h must bring the tensor API with
-        // it rather than leaving a caller to find the missing include.
         assert!(
             header_text().contains(r#"#include "edgefirst/tensor.h""#),
             "codec.h must include edgefirst/tensor.h"
@@ -244,8 +218,7 @@ mod tests {
 
     #[test]
     fn the_shipped_artifact_is_libedgefirst_codec_not_capi() {
-        // Consumers link `-ledgefirst-codec`. The `-capi` suffix names the
-        // source crate only and must never reach a filename.
+        // The library file is named for `edgefirst-codec`, without the `-capi` suffix.
         let mut dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         dir.pop();
         dir.pop();
@@ -288,8 +261,7 @@ mod tests {
     #[cfg(windows)]
     const STATICLIB: &str = "edgefirst_codec.lib";
 
-    /// Runs a built C program. Failing to start one linked a moment ago is
-    /// a missing library or a broken image, not a skip.
+    /// Runs a built C program. A failure to start is an error, not a skip.
     fn run_program(
         exe: &std::path::Path,
         mut cmd: std::process::Command,
@@ -320,11 +292,8 @@ mod tests {
         }
     }
 
-    /// Compiles `src`, links it against the staticlibs, and runs it.
-    ///
-    /// The toolchain is probed with a trivial program first, so a link
-    /// failure of this library is a failure and never mistaken for a host
-    /// without a compiler.
+    /// Compiles `src`, links it against the staticlibs, and runs it. The
+    /// toolchain is probed with a trivial program first.
     #[cfg(not(windows))]
     fn cc_build_and_run(src: &str, bin_name: &str) -> Option<std::process::Output> {
         let (lib, tensor_lib) = libraries(src, "libedgefirst_tensor.a")?;
@@ -455,8 +424,7 @@ mod tests {
         Some(crate::msvc::require(src)?.syntax_check(&includes, &["/TP", "/std:c++17"], src))
     }
 
-    /// C++ callers include the same header: each enum's name must be one
-    /// type in C++, where the enum tag is already a type name.
+    /// The header compiles as C++17.
     #[test]
     fn the_header_compiles_as_cpp17() {
         let src = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/c/test_cpp_include.cpp");
@@ -471,9 +439,9 @@ mod tests {
         );
     }
 
-    /// The whole C surface from a C program: capabilities, a JPEG encoded
-    /// and decoded back, refusals, and an H.264 stream encoded from tensors
-    /// and decoded into frames where this machine has hardware for it.
+    /// The C surface from a C program: capabilities, a JPEG encoded and decoded
+    /// back, refusals, and an H.264 stream encoded and decoded where this
+    /// machine has hardware for it.
     #[test]
     fn the_codec_api_works_from_c() {
         let src = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/c/test_codec_api.c");

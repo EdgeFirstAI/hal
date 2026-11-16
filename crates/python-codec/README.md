@@ -171,14 +171,14 @@ JPEG decoding covers baseline DCT, 8-bit precision, 1 or 3 components. Progressi
 
 ## Interoperability
 
-`decode_into` / `decode_file_into` accept a tensor from *any* `edgefirst.*` package because each extension module registers its own `Tensor` type object ([PyO3 issue #1444](https://github.com/PyO3/pyo3/issues/1444) — `isinstance` across packages is always `False`, even for two objects wrapping the same Rust type). Acceptance goes through the `__edgefirst_tensor__` capsule protocol every `Tensor` implements:
+`decode_into` / `decode_file_into` accept a tensor from *any* `edgefirst.*` package because each extension module registers its own `Tensor` type object (a [known PyO3 limitation](https://github.com/PyO3/pyo3/issues/1444) — `isinstance` across packages is always `False`, even for two objects wrapping the same Rust type). Acceptance goes through the `__edgefirst_tensor__` capsule protocol every `Tensor` implements:
 
 ```python
-# CORRECT — works regardless of which edgefirst.* package produced obj
+# Correct — works regardless of which edgefirst.* package produced obj
 if hasattr(obj, "__edgefirst_tensor__"):
     ...
 
-# WRONG — always False for a tensor from a sibling package
+# Wrong — always False for a tensor from a sibling package
 if isinstance(obj, edgefirst.image.Tensor):
     ...
 ```

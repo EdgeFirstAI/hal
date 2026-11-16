@@ -1,11 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 //
-// `ef_tensor_image_desc` is minted and read entirely by libedgefirst-tensor;
-// `ef_image_processor_create_image_desc` (libedgefirst-image) only ever sees
-// it through `ef_tensor_image_desc_get`'s scalar view -- never a dereference
-// of tensor-capi's private layout. A single library cannot demonstrate that
-// the handle stays opaque across the boundary; this links both.
+// An `ef_tensor_image_desc` created by libedgefirst-tensor is passed to
+// `ef_image_processor_create_image_desc` in libedgefirst-image.
 
 #include <stdio.h>
 #include <string.h>
@@ -24,7 +21,7 @@ int main(void) {
     return 0;
   }
 
-  // Minted entirely by libedgefirst-tensor.
+  // Created by libedgefirst-tensor.
   ef_tensor_image_desc *d =
       ef_tensor_image_desc_new(64, 48, "NV12", /* U8 */ 0);
   if (d == NULL) {
@@ -36,8 +33,7 @@ int main(void) {
     fprintf(stderr, "set_memory(Mem) unexpectedly failed\n");
     failures++;
   }
-  // A compression request requires hardware-only access; the default is
-  // ReadWrite, so `None` is declared explicitly.
+  // A compression request requires `EF_CPU_ACCESS_NONE`.
   if (ef_tensor_image_desc_set_access(d, EF_CPU_ACCESS_NONE) != 0) {
     fprintf(stderr, "set_access(None) unexpectedly failed\n");
     failures++;
@@ -47,8 +43,6 @@ int main(void) {
     failures++;
   }
 
-  // The load-bearing crossing: image reads the request through
-  // `ef_tensor_image_desc_get`'s view, never through the pointer itself.
   ef_tensor *t = ef_image_processor_create_image_desc(p, d);
   if (t == NULL) {
     fprintf(stderr, "create_image_desc returned NULL\n");
@@ -63,13 +57,10 @@ int main(void) {
               ef_tensor_plane_count(t));
       failures++;
     }
-    // There is one real implementation (`libedgefirst_tensor.so`); freeing
-    // this tensor just needs to link and run, exactly as
-    // `test_cross_library.c`'s header comment explains for `create_image`.
     ef_tensor_free(t);
   }
 
-  // Not consumed by allocation: the same request fills a pool.
+  // The request is not consumed: it allocates three more tensors.
   for (int i = 0; i < 3; i++) {
     ef_tensor *pooled = ef_image_processor_create_image_desc(p, d);
     if (pooled == NULL) {
@@ -80,10 +71,8 @@ int main(void) {
     ef_tensor_free(pooled);
   }
 
-  // A contiguous request crosses the boundary through its own getter, not
-  // the fixed-size view: a tensor it yields is from CMA, and without a CMA
-  // heap it fails where the same request without the flag would succeed.
-  // A CMA heap whose pool is full fails it too, so NULL is valid there.
+  // A contiguous request yields a tensor from the CMA heap, or NULL when
+  // there is no CMA heap or its pool is full.
   ef_tensor_image_desc *cd =
       ef_tensor_image_desc_new(64, 48, "NV12", /* U8 */ 0);
   if (cd == NULL || ef_tensor_image_desc_set_contiguous(cd, 1) != 0) {
@@ -118,11 +107,7 @@ int main(void) {
     failures++;
   }
 
-  // A rejected setter leaves the request at tensor-capi's 1x1 grey
-  // placeholder (see `desc::tests::a_rejected_setter_leaves_the_request_usable`
-  // there) -- not the caller's original fields, but still a request image can
-  // mint from, since "usable" is the property this library actually depends
-  // on.
+  // A rejected setter leaves the request usable.
   if (ef_tensor_image_desc_set_memory(d, 9999) == 0) {
     fprintf(stderr, "an unknown memory code must be refused\n");
     failures++;

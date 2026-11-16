@@ -1,8 +1,4 @@
-"""Type stubs for ``edgefirst.decoder``.
-
-Split from the pre-0.29 monolithic ``edgefirst_hal.pyi``; assignment
-mirrors the pymodule registrations in crates/python-decoder/src/lib.rs.
-"""
+"""Type stubs for ``edgefirst.decoder``."""
 
 import dataclasses
 import enum
@@ -12,22 +8,16 @@ from typing import Any, NamedTuple, Protocol, Sequence
 import numpy as np
 import numpy.typing as npt
 
-# Re-exported from `edgefirst.tensor` (a hard dependency of this package). The
-# redundant `as` form is what marks it a public re-export to type checkers.
-# TensorMemory/PixelFormat/Region/Colorimetry and the colour axis enums are
-# registered directly in this module too (see
-# crates/python-decoder/src/lib.rs), so callers building a value tensor for
-# draw_masks()/materialize_masks() can name them without also depending on
-# edgefirst.tensor.
+# Re-exported from `edgefirst.tensor`. TensorMemory, PixelFormat, Region,
+# Colorimetry and the colour axis enums are also registered in this module.
 from edgefirst.tensor import ColorEncoding as ColorEncoding
 from edgefirst.tensor import Colorimetry as Colorimetry
 from edgefirst.tensor import ColorRange as ColorRange
 from edgefirst.tensor import ColorSpace as ColorSpace
 from edgefirst.tensor import ColorTransfer as ColorTransfer
 
-# The cross-package capsule protocol -- see crates/python-common/INTEROP.md.
-# `decode`/`decode_proto`/`decode_tracked` accept any object implementing
-# this, not just `edgefirst.tensor.Tensor`.
+# The cross-package capsule protocol accepted by `decode`, `decode_proto`
+# and `decode_tracked`.
 from edgefirst.tensor import EdgeFirstTensorExportable as EdgeFirstTensorExportable
 from edgefirst.tensor import PixelFormat as PixelFormat
 from edgefirst.tensor import Region as Region
@@ -35,7 +25,7 @@ from edgefirst.tensor import Tensor as Tensor
 from edgefirst.tensor import TensorMemory as TensorMemory
 from typing_extensions import TypeAlias
 
-# "dynamic" in every wheel; "static" only in the G13 comparison build.
+# "dynamic" in every wheel; "static" only in the comparison build.
 __tensor_backend__: str
 
 def version() -> str:
@@ -218,7 +208,7 @@ class Output:
     Use the static factory methods (``detection``, ``boxes``, ``scores``, etc.)
     to create outputs, then pass them to ``Decoder.new_from_outputs()``.
 
-    **Shape specification** — provide one of:
+    Shape specification, one of:
 
     - ``shape``: anonymous integer dimensions, e.g. ``[1, 25200, 85]``
     - ``dshape``: named dimensions, e.g. ``[(DimName.Batch, 1), (DimName.NumFeatures, 85), ...]``
@@ -443,9 +433,7 @@ class ProtoData:
     ) -> tuple[object, object, str]:
         """Producer half of the cross-package ``ProtoData`` protocol.
 
-        Composes the existing ``__edgefirst_tensor__`` capsule protocol
-        rather than describing its own layout: returns the
-        ``mask_coefficients`` and ``protos`` tensors as
+        Returns the ``mask_coefficients`` and ``protos`` tensors as
         ``edgefirst_tensor_v2`` capsules, plus the prototype layout as a
         string (``"nhwc"`` or ``"nchw"``). See
         :class:`EdgeFirstProtoDataExportable` and
@@ -546,13 +534,6 @@ class Decoder:
     ) -> Decoder:
         """Create a new Decoder from a list of Output objects.
 
-        This provides a Pythonic way to configure the decoder programmatically
-        without JSON/YAML configuration strings or dictionaries.
-
-        The default thresholds (0.25 / 0.45) are tuned for typical YOLO models.
-        The dict/JSON/YAML constructors use lower defaults (0.1 / 0.7) for
-        backward compatibility.
-
         Example::
 
             decoder = Decoder.new_from_outputs(
@@ -568,16 +549,15 @@ class Decoder:
             outputs: List of Output objects describing the model outputs.
             score_threshold: Minimum confidence score for detections.
             iou_threshold: IoU threshold for non-maximum suppression.
-            nms: NMS mode - Nms.Auto (default; resolves to Nms.ClassAware, since
-                outputs carry no config-level mode), Nms.ClassAgnostic,
-                Nms.ClassAware, or None to bypass NMS.
+            nms: NMS mode - Nms.Auto (default; resolves to Nms.ClassAware),
+                Nms.ClassAgnostic, Nms.ClassAware, or None to bypass NMS.
             decoder_version: Optional decoder version for Ultralytics models.
                 Set to DecoderVersion.Yolo26 for end-to-end models.
             input_dims: Optional ``(width, height)`` model input, used to
                 normalize pixel-space boxes when the config has no input shape.
             multi_label: Emit one box per class above ``score_threshold``
                 instead of one per anchor (validation decode). None (default)
-                leaves it off, since outputs carry no ``nms_multi_label``.
+                leaves it off.
                 :meth:`decode_tracked` always uses one label per box.
         """
 
@@ -678,14 +658,6 @@ class Decoder:
         For detection-only models, returns ``None`` for proto_data but still
         populates detection boxes.
 
-        .. note::
-
-            Calling ``decode_proto`` + ``materialize_masks`` +
-            ``draw_decoded_masks`` separately prevents the HAL from using its
-            internal fused optimization. For render-only use cases, prefer
-            :meth:`Decoder.draw_onto` which is 1.6--27x faster on
-            tested platforms.
-
         Args:
             model_output: List of HAL Tensor objects from model inference,
                 from this or another ``edgefirst.*`` package.
@@ -717,10 +689,9 @@ class Decoder:
         parameters must be specified in the Decoder configuration when the
         tensors contain quantized data.
 
-        Always decodes one label per box, regardless of :attr:`multi_label`:
-        the tracker matches on IoU only, so per-class duplicates of one anchor
-        would become phantom tracks. Logs a warning once per decoder when the
-        decoder has multi-label enabled.
+        Always decodes one label per box, regardless of :attr:`multi_label`.
+        Logs a warning once per decoder when the decoder has multi-label
+        enabled.
 
         Masks are returned at prototype resolution as 3D arrays of shape
         ``(H, W, C)``. For instance segmentation models (e.g. YOLO) ``C=1``
@@ -778,7 +749,7 @@ class Decoder:
     def pre_nms_top_k(self) -> int:
         """
         Maximum candidates fed into NMS after score filtering; ``0`` means
-        no limit. Uses O(N) partial sort to cap O(N²) NMS cost.
+        no limit.
 
         Reading it returns the cap `decode` uses. Unset, that is 300, or
         30000 (Ultralytics' ``max_nms``) when `multi_label` is on, and
@@ -787,31 +758,16 @@ class Decoder:
         even if it equals a default. Assigning ``None`` returns to the
         defaults.
 
-        .. warning::
+        Deployment::
 
-           The default of 300 is tuned for **deployment**
-           (``score_threshold >= 0.25``) where few anchors pass the score
-           filter.  For **COCO mAP evaluation** (``score_threshold = 0.001``),
-           set this to ``0`` (no limit) to avoid discarding ~74% of valid
-           candidates before NMS, which causes **~9 pp box mAP loss**. Under
-           argmax decode the anchor count (8400 for 640×640 YOLO models)
-           also suffices; multi-label decode emits up to anchors × classes
-           candidates.
+            decoder.score_threshold = 0.25
+            # decoder.pre_nms_top_k = 300  (default, appropriate)
 
-           Deployment::
+        COCO mAP evaluation::
 
-               decoder.score_threshold = 0.25
-               # decoder.pre_nms_top_k = 300  (default, appropriate)
-
-           COCO mAP evaluation::
-
-               decoder.score_threshold = 0.001
-               decoder.pre_nms_top_k = 0      # no limit
-               decoder.max_det = 300
-
-           Post-processing latency scales with candidate count.  At deployment
-           thresholds the cost difference is negligible; at validation
-           thresholds it is measurable but necessary for correct recall.
+            decoder.score_threshold = 0.001
+            decoder.pre_nms_top_k = 0      # no limit
+            decoder.max_det = 300
         """
 
     @pre_nms_top_k.setter
@@ -832,13 +788,12 @@ class Decoder:
         unknown.
 
         Segmentation decoders (combined, split, and two-way) and the
-        per-scale path divide by :attr:`input_dims` before returning, so
-        they report ``True`` once ``input_dims`` is known. Detection-only,
-        end-to-end YOLO, and ModelPack decoders report the raw schema
-        annotation; if one of those returns ``False`` and you need
-        ``[0, 1]`` boxes, divide by :attr:`input_dims` yourself. Never
-        re-normalize when this returns ``True`` — dividing already-normalized
-        coordinates collapses every detection to roughly zero.
+        per-scale path divide by :attr:`input_dims` before returning and
+        report ``True`` once ``input_dims`` is known. Detection-only,
+        end-to-end YOLO, and ModelPack decoders report the schema
+        annotation; for ``False`` from those, divide by :attr:`input_dims`
+        to obtain ``[0, 1]`` boxes. Do not re-normalize when this returns
+        ``True``.
         """
 
     def draw_onto(
@@ -853,8 +808,8 @@ class Decoder:
     ) -> DetectionOutput:
         """Decode and draw onto an ``edgefirst.image.ImageProcessor``.
 
-        Prefers ``draw_proto_masks`` when the model yields prototype data;
-        otherwise ``draw_decoded_masks``. This extension does not link image.
+        Calls ``draw_proto_masks`` when the model yields prototype data,
+        otherwise ``draw_decoded_masks``.
         """
 
     @property
@@ -866,8 +821,7 @@ class Decoder:
         v2 schema's ``input.shape`` / ``input.dshape``. The decode paths
         listed under :attr:`normalized_boxes` use it to convert pixel-space
         boxes to ``[0, 1]`` before mask cropping. When it is ``None`` those
-        paths skip the division, and pixel-space boxes will trip the
-        prototype-mask safety guard.
+        paths skip the division.
         """
 
     def __edgefirst_decoder__(self) -> object:
@@ -877,9 +831,7 @@ class Decoder:
         borrows this decoder: it is valid only for the duration of the call
         it is passed into and must not be stored. See
         :class:`EdgeFirstDecoderExportable` and
-        ``crates/python-common/INTEROP.md`` -- in particular the layout-guard
-        caveat, since a ``Decoder`` cannot be decomposed the way a
-        :class:`ProtoData` or a tensor can.
+        ``crates/python-common/INTEROP.md``.
         """
 
 class MatchMetric(enum.Enum):
@@ -891,9 +843,7 @@ class MergeMode(enum.Enum):
 
     ``KeepBest`` (default) keeps the group's highest-scoring box exactly as
     decoded and drops the boxes it matched. ``Union`` replaces the group with
-    its enclosing union carrying the max score -- the original GREEDYNMM
-    merge, opt-in because it measured about 0.05 AP50 worse on every frame
-    of the Ocean Cleanup ADIS 4K validation (TOP2-836).
+    its enclosing union carrying the max score.
     """
 
     KeepBest: MergeMode
@@ -958,8 +908,8 @@ def merge_tiled_detections(
 class InferredSchema(NamedTuple):
     """What :func:`infer_ultralytics_schema` derived from a model's signals.
 
-    A ``NamedTuple``, so it unpacks positionally like a plain tuple while
-    giving the three fields names.
+    A ``NamedTuple``: it unpacks positionally and its three fields have
+    names.
     """
 
     schema: dict[str, Any]
@@ -981,31 +931,22 @@ def infer_ultralytics_schema(
     """Infer an Ultralytics YOLO schema from raw model I/O signals.
 
     Detection and segmentation are both supported, for Ultralytics v8/v11
-    pre-NMS heads and YOLO26 end-to-end heads alike. This lets a caller build
-    a decoder for an Ultralytics export straight from the shapes/dtypes/
-    metadata its inference runtime reports, without a hand-written
-    ``edgefirst.json``.
+    pre-NMS heads and YOLO26 end-to-end heads.
 
     Args:
         source: Container format the signals were read from: ``"onnx"``,
             ``"tflite"``, or ``"coreml"``. CoreML resolves pixel-space box
-            coordinates the same way ONNX does, but only for the no-NMS
-            anchor-grid export; a ``nms=True`` CoreML export produces
-            Apple's NMS-pipeline artifact, which is refused rather than
-            resolved. ``"other"`` is accepted but rejected by inference:
-            whether boxes are pixel-space or ``[0, 1]`` follows the exporter
-            and is not derivable from shapes, so an uncharacterized
-            container is refused rather than guessed at.
+            coordinates as ONNX does, for the no-NMS anchor-grid export
+            only; a ``nms=True`` CoreML export is refused. ``"other"`` is
+            accepted as an argument and refused by inference.
         inputs: Input tensors as ``(name, shape, dtype)``, or with a 4th
-            ``quantization`` element -- an input's quantization is accepted
-            for symmetry with ``outputs`` and ignored.
+            ``quantization`` element; an input's quantization is accepted
+            and ignored.
         outputs: Output tensors as ``(name, shape, dtype)`` for an
             unquantized tensor, or ``(name, shape, dtype, quantization)``
             where ``quantization`` is ``(scales, zero_points)`` or ``None``.
             Only per-tensor quantization (one scale, one zero point) is
-            usable -- the decoder consumes per-tensor only, so more than one
-            scale is rejected rather than turned into a schema that cannot
-            build.
+            accepted; more than one scale is rejected.
         metadata: Raw model metadata key/values, passed through verbatim
             (ONNX ``metadata_props``, the TFLite ``metadata.json``
             envelope under whichever key it was captured, or CoreML's own
@@ -1014,15 +955,14 @@ def infer_ultralytics_schema(
     Note:
         Supported dtype strings are the tensor dtype names ``"i8"``,
         ``"u8"``, ``"i16"``, ``"u16"``, ``"i32"``, ``"u32"``, ``"f16"``,
-        ``"f32"`` and ``"i64"``. The older spellings ``"int8"``, ``"uint8"``,
+        ``"f32"`` and ``"i64"``, and the spellings ``"int8"``, ``"uint8"``,
         ``"int16"``, ``"uint16"``, ``"int32"``, ``"uint32"``, ``"float16"``,
-        ``"float32"`` and ``"int64"`` are still accepted.
+        ``"float32"`` and ``"int64"``.
 
         Shapes must be concrete. A model exported with ``dynamic=True``
         reports a symbolic dimension (``'batch'`` from ONNX, ``-1`` from
         TFLite); those are accepted as arguments and refused with a
-        ``ValueError`` naming the tensor and axis, since the layout rules
-        need real sizes.
+        ``ValueError`` naming the tensor and axis.
 
     Returns:
         An :class:`InferredSchema` of ``(schema, labels, description)``: the
@@ -1145,8 +1085,8 @@ class ModelOverrides:
     - ``labels``: a list of non-empty class names or one comma-separated
       string. Resolution raises :class:`LabelCountMismatchError` when their
       number differs from a class count the model's outputs state;
-      end-to-end detections and class maps state none, so any number is
-      accepted there and the caller checks it.
+      end-to-end detections and class maps state none, and any number is
+      accepted there.
 
     :meth:`ResolvedModelConfig.describe` prints these keys in the same
     grammar.

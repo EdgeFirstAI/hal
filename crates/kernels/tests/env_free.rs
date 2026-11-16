@@ -4,7 +4,7 @@
 //! The `*_with_features` constructors read no environment.
 //!
 //! These tests set `EDGEFIRST_KERNELS_FORCE_TIER` to an unknown tier, which makes every
-//! env-reading constructor fail, so they live in their own test binary (process).
+//! env-reading constructor fail.
 
 use std::sync::{Mutex, MutexGuard};
 

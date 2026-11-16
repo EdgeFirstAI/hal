@@ -13,7 +13,7 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 
 /// Maps a Python dtype string to `schema::DType`: the tensor dtype names
-/// (`"u8"`, `"f32"`, ...) or the older `"uint8"`, `"float32"`, ... spellings.
+/// (`"u8"`, `"f32"`, ...) or the `"uint8"`, `"float32"`, ... spellings.
 fn dtype_from_str(s: &str) -> PyResult<DType> {
     DType::from_str_code(s).ok_or_else(|| {
         let expected: Vec<&str> = DType::accepted_names().collect();
@@ -39,14 +39,9 @@ fn source_from_str(s: &str) -> PyResult<ModelSource> {
 /// zero_points)`.
 type QuantArg = (Vec<f32>, Vec<i32>);
 
-/// One reported shape dimension.
-///
-/// A dynamic export does not report an integer for every axis: ONNX
-/// exported with `dynamic=True` reports the *symbolic name* (the string
-/// `"batch"`) and TFLite reports `-1`. Both are accepted into this enum
-/// so the refusal is a `ValueError` naming the tensor and the axis,
-/// rather than the `TypeError`/`OverflowError` a bare `Vec<usize>`
-/// parameter produced from inside PyO3's extraction machinery.
+/// One reported shape dimension: an integer, or the symbolic name a dynamic
+/// export reports. A symbolic or negative dimension is refused with a
+/// `ValueError` naming the tensor and the axis.
 #[derive(FromPyObject)]
 pub enum Dim {
     Concrete(i64),
@@ -84,16 +79,9 @@ fn concrete_shape(name: &str, shape: Vec<Dim>) -> PyResult<Vec<usize>> {
         .collect()
 }
 
-/// A tensor spec, accepted as either a 3-tuple `(name, shape, dtype)` or a
-/// 4-tuple with an explicit quantization slot. Both `inputs` and `outputs`
-/// take this shape, so a caller can build them from the same runtime
-/// description without remembering which argument allows which arity. `#[pyo3
-/// (transparent)]` extracts each variant's tuple field directly from the
-/// Python object rather than treating the variant itself as a 1-tuple; Rust's
-/// built-in tuple `FromPyObject` impl then requires an exact arity match, so
-/// a 3-element Python tuple fails `WithQuant` (needs 4) and falls through to
-/// `Bare` -- a plain 3-tuple and an explicit `None` 4th element both mean
-/// "unquantized".
+/// A tensor spec: a 3-tuple `(name, shape, dtype)` or a 4-tuple with a
+/// quantization slot. A 3-tuple and a 4-tuple whose last element is `None`
+/// both mean "unquantized".
 #[derive(FromPyObject)]
 pub enum TensorArg {
     #[pyo3(transparent)]
@@ -147,11 +135,7 @@ pub(crate) fn model_signals(
     let inputs = inputs
         .into_iter()
         .map(|t| {
-            // A model input's own quantization plays no part in
-            // output-layout inference, so the slot is accepted and ignored
-            // rather than rejected -- callers build input and output specs
-            // from the same runtime dict, and an arity difference between
-            // the two arguments is a trap, not a safeguard.
+            // An input's quantization slot is accepted and ignored.
             let (name, shape, dtype, _) = t.into_parts();
             tensor_info(name, shape, &dtype, None)
         })
@@ -190,19 +174,16 @@ pub(crate) fn model_signals_from_object(obj: &Bound<'_, PyAny>) -> PyResult<Mode
 ///
 /// :param source: Container format the signals were read from: ``"onnx"``,
 ///     ``"tflite"``, ``"coreml"``, or ``"other"``. CoreML resolves
-///     pixel-space box coordinates the same way ONNX does, but only for the
-///     no-NMS anchor-grid export; a ``nms=True`` CoreML export produces
-///     Apple's NMS-pipeline artifact, which this function refuses rather
-///     than resolves.
+///     pixel-space box coordinates as ONNX does, for the no-NMS anchor-grid
+///     export only; a ``nms=True`` CoreML export is refused.
 /// :param inputs: Input tensors as ``(name, shape, dtype)``, or
-///     ``(name, shape, dtype, quantization)`` -- an input's quantization is
-///     accepted for symmetry with ``outputs`` and ignored.
+///     ``(name, shape, dtype, quantization)``; an input's quantization is
+///     accepted and ignored.
 /// :param outputs: Output tensors as ``(name, shape, dtype)`` for an
 ///     unquantized tensor, or ``(name, shape, dtype, quantization)`` where
 ///     ``quantization`` is ``(scales, zero_points)`` or ``None``. Only
-///     per-tensor quantization (one scale, one zero point) is usable: the
-///     decoder consumes per-tensor only, so more than one scale is
-///     rejected rather than turned into a schema that cannot build.
+///     per-tensor quantization (one scale, one zero point) is accepted; more
+///     than one scale is rejected.
 /// :param metadata: Raw model metadata key/values, passed through verbatim
 ///     (ONNX ``metadata_props``, the TFLite ``metadata.json`` envelope
 ///     under whichever key it was captured, or CoreML's own metadata
@@ -230,9 +211,6 @@ pub fn py_infer_ultralytics_schema(
     let result =
         infer_ultralytics_schema(&signals).map_err(|e| PyValueError::new_err(e.to_string()))?;
 
-    // The schema crosses as a dict, not a JSON string: `Decoder(config)`
-    // takes a dict directly, so a string would only be re-parsed by every
-    // caller. The C binding still renders JSON, because C has no dict.
     Python::attach(|py| {
         let schema = pythonize::pythonize(py, &result.schema).map_err(|e| {
             PyRuntimeError::new_err(format!("failed to convert inferred schema: {e}"))

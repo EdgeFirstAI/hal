@@ -23,7 +23,7 @@ fn header_text() -> String {
     .expect("cbindgen wrote include/edgefirst/kernels.h")
 }
 
-/// Syntax-checks `src` against the header with `-Werror`, so a warning fails too.
+/// Syntax-checks `src` against the header with `-Werror`.
 fn cc_syntax_check(src: &str) -> Option<std::process::Output> {
     let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
     match std::process::Command::new(&cc)
@@ -55,10 +55,10 @@ fn the_generated_header_exists_and_declares_the_abi_probe() {
 }
 
 #[test]
-fn the_header_carries_none_of_the_monoliths_symbols() {
+fn the_header_carries_no_hal_symbols() {
     assert!(
         !header_text().contains("hal_"),
-        "kernels.h must not carry the monolith's hal_* symbols"
+        "kernels.h must not carry hal_* symbols"
     );
 }
 

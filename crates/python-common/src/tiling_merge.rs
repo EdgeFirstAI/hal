@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Output-side tiled-detection merge: lift, greedy merge, streaming accumulator.
-//! Registered on `edgefirst.decoder`. TilePlacement is accepted by attribute
-//! so an `edgefirst.image.TilePlacement` works without sharing a PyO3 type.
+//! Registered on `edgefirst.decoder`. A tile placement is read by attribute,
+//! so an `edgefirst.image.TilePlacement` is accepted.
 
 use crate::detect_boxes::{convert_detect_box, numpy_to_detect_boxes, PyDetOutput};
 use edgefirst_decoder::tiling::{
@@ -19,8 +19,7 @@ use pyo3::prelude::*;
 /// Overlap metric used by the tiled-detection merge.
 ///
 /// - ``Iou`` — Intersection-over-Union (standard NMS metric).
-/// - ``Ios`` — Intersection-over-Smaller (default): merges a seam-split
-///   fragment into the whole object where IoU would leave duplicates.
+/// - ``Ios`` — Intersection-over-Smaller (default).
 #[pyclass(
     name = "MatchMetric",
     eq,
@@ -70,10 +69,7 @@ impl From<MatchMetric> for PyMatchMetric {
 /// - ``KeepBest`` (default) — keep the group's highest-scoring box exactly
 ///   as decoded, coordinates and score, and drop the boxes it matched.
 /// - ``Union`` — replace the group with its enclosing union carrying the
-///   max score (the original GREEDYNMM merge). Opt-in: it measured about
-///   0.05 AP50 worse on every frame of the Ocean Cleanup ADIS 4K validation
-///   (whole frame 0.491 AP50 with plain NMS, 0.437 after the union, 0.490
-///   with keep-best; TOP2-836).
+///   max score.
 #[pyclass(
     name = "MergeMode",
     eq,
@@ -165,8 +161,7 @@ fn flat_to_detect_boxes(bbox: &[f32], scores: &[f32], classes: &[usize]) -> Vec<
 /// Configuration for the tiled-detection merge.
 ///
 /// Defaults: ``MatchMetric.Ios`` at ``threshold`` 0.5, class-aware,
-/// ``max_det`` 300, no ``score_threshold``, and ``MergeMode.KeepBest`` --
-/// suppression rather than the enclosing union, see :class:`MergeMode`.
+/// ``max_det`` 300, no ``score_threshold``, and ``MergeMode.KeepBest``.
 #[pyclass(name = "MergeConfig", from_py_object, module = "edgefirst.decoder")]
 #[derive(Debug, Clone, Copy)]
 pub struct PyMergeConfig(pub(crate) MergeConfig);
@@ -271,10 +266,8 @@ impl PyTiledFrameAccumulator {
                 "bbox, scores, classes must have the same length",
             ));
         }
-        // Memcpy out of the caller's numpy buffers (contiguous fast path)
-        // so DetectBox construction and lift_tile_boxes run with the GIL
-        // released. `to_owned()` on a numpy view iterates under the GIL
-        // and is what kept `test_push_tile_releases_the_gil` at 68%.
+        // Copy out of the numpy buffers; the lift then runs with the GIL
+        // released.
         let bbox = match bbox.as_array().as_slice() {
             Some(s) => s.to_vec(),
             None => bbox.as_array().iter().copied().collect(),
@@ -333,8 +326,8 @@ impl PyTiledFrameAccumulator {
     }
 }
 
-/// Lift tile-local **normalized** ``[0,1]`` xyxy detections (over the model
-/// input) to full-frame **pixel** xyxy, mapping through the tile's content
+/// Lift tile-local normalized ``[0,1]`` xyxy detections (over the model
+/// input) to full-frame pixel xyxy, mapping through the tile's content
 /// region when it was letterboxed.
 #[pyfunction]
 #[pyo3(name = "lift_tile_boxes")]

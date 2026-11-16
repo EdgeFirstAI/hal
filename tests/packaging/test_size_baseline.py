@@ -1,19 +1,11 @@
-"""Baseline guards for the packaging split.
-
-Under A3 each wheel is self-contained, so the meaningful unit is the shipped
-extension module. Per-crate rlib sizes do not predict wheel size, because a
-statically linked consumer keeps only what it calls.
-"""
+"""Tests of the size baseline script and the locally recorded baseline."""
 
 import json
-import pathlib
 import shutil
 import subprocess
 import sys
 
 import pytest
-
-BASELINE = pathlib.Path("docs/baselines/2026-08-15-phase1-baseline.json")
 
 
 @pytest.mark.skipif(
@@ -33,19 +25,3 @@ def test_baseline_script_emits_required_keys(tmp_path):
     assert "wheels" in data
     assert data["commit"]
     assert data["rustc"]
-
-
-@pytest.mark.skipif(
-    not BASELINE.exists(),
-    reason="baselines are local measurement artifacts; this repo keeps "
-    "benchmark output untracked (benchmarks/results/ is .gitkeep only). "
-    "Run scripts/size_baseline.sh to generate.",
-)
-def test_local_baseline_records_the_monolith():
-    """The number Phase 1 is measured against, when a baseline has been taken."""
-    data = json.loads(BASELINE.read_text())
-    wheels = data["wheels"]
-    assert wheels, "baseline must record at least the pre-split wheel"
-    mono = next(iter(wheels.values()))
-    assert mono["on_disk"] > 4_000_000, "pre-split wheel was 4.32 MB on disk"
-    assert mono["uncompressed_so"] > 17_000_000

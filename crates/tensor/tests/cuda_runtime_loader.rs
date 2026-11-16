@@ -4,12 +4,9 @@
 //! The CUDA runtime loader against a real libcudart.
 //!
 //! Without a runtime this skips; under `HAL_TEST_REQUIRE_CUDA=1` that skip is
-//! a failure, so a lane meant to have CUDA cannot report the loader as tested
-//! when it never loaded. The no-runtime half (every primitive degrades to
-//! `None`/`false`) is a unit test in `src/cuda.rs`.
+//! a failure.
 
-/// Only `decide` is used: `cuda_available_or_skip` words its reason for the
-/// Windows DLL probe.
+/// Only `decide` is used.
 #[path = "support/cuda_require.rs"]
 #[allow(dead_code)]
 mod cuda_require;
@@ -45,14 +42,13 @@ fn a_loaded_cuda_runtime_names_its_library_and_creates_a_stream() {
         !path.as_os_str().is_empty(),
         "runtime_path must name the library the loader opened"
     );
-    // Straight to stderr so libtest's capture keeps it for a passing test.
+    // Written straight to stderr.
     let _ = std::io::Write::write_fmt(
         &mut std::io::stderr(),
         format_args!("[cuda] runtime_path = {}\n", path.display()),
     );
 
-    // A library without a usable device fails stream creation, so demand a
-    // stream only where CUDA is required (the lane has a GPU).
+    // A stream is required only under `HAL_TEST_REQUIRE_CUDA=1`.
     match edgefirst_tensor::stream_create() {
         Some(stream) => {
             assert!(!stream.is_null(), "a created stream is a real handle");

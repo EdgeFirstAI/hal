@@ -3,24 +3,14 @@
 
 //! SIMD row kernels for the CPU packed↔planar conversions.
 //!
-//! The packed-RGB → planar-RGB scatter (`pack_to_planar`) is the dominant cost
-//! of the Jetson Orin CPU preprocessing path: profiling NV12 → PlanarRgb showed
-//! ~72% of the cell in the scalar stride-3 gather (each of three rayon
-//! plane-tasks re-reads the whole source). A NEON deinterleaving load reads the
-//! packed source **once** and splits R/G/B (and A) into separate registers in a
-//! single instruction (`vld3q_u8` / `vld4q_u8`), so one pass writes every plane.
+//! A NEON deinterleaving load (`vld3q_u8` / `vld4q_u8`) reads the packed
+//! source once and splits R/G/B (and A) into separate registers, so one pass
+//! writes every plane.
 //!
-//! NEON/ASIMD is baseline-mandatory on AArch64, so the deinterleave and the
-//! u8→f32 widen need no runtime feature probe and no `target-feature` flag
-//! beyond the architecture default (only fp16/dotprod/i8mm are non-baseline —
-//! see the workspace `.cargo/config.toml`). The u8→f16 widen is the exception:
-//! native half-precision arithmetic (FEAT_FP16) is *not* baseline, so it is
-//! gated behind a cached runtime probe ([`has_fp16`]) and reached via inline
-//! `asm!` with `.arch_extension fp16` (stable Rust still gates the
-//! `float16x8_t` intrinsics), mirroring the decoder's per-scale FP16 kernels.
-//! Non-aarch64 targets use the scalar fallback, which for the deinterleave is
-//! still a single pass over the source (one read, contiguous plane writes that
-//! LLVM can autovectorise).
+//! The deinterleave and the u8→f32 widen use baseline AArch64 NEON. The
+//! u8→f16 widen uses native half-precision arithmetic (FEAT_FP16) behind a
+//! cached runtime probe ([`has_fp16`]), through inline `asm!` with
+//! `.arch_extension fp16`. Non-aarch64 targets use the scalar fallback.
 
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::uint16x8_t;
@@ -30,7 +20,7 @@ use std::arch::aarch64::uint16x8_t;
 /// `src_ch` must be 3 (RGB) or 4 (RGBA). The R, G, B planes are always written
 /// from source channels 0, 1, 2. `a` is written from source channel 3 when
 /// `Some` (requires `src_ch == 4`); a constant alpha plane is the caller's
-/// responsibility (fill once, outside the row loop).
+/// responsibility.
 ///
 /// Only the first `w` pixels of each plane and the first `w * src_ch` bytes of
 /// `src` are touched; callers pass full row slices (stride length) and the
@@ -49,18 +39,14 @@ pub(super) fn deinterleave_row(
     debug_assert!(src.len() >= w * src_ch);
     debug_assert!(r.len() >= w && g.len() >= w && b.len() >= w);
     debug_assert!(a.as_ref().is_none_or(|a| a.len() >= w));
-    // An alpha plane can only be sourced from a 4-channel input (`src[..+3]`);
-    // a 3-channel source has no alpha byte. The kernels below also guard the
-    // alpha write on `src_ch == 4`, so a misuse can never read out of bounds —
-    // this assert just surfaces the logic error in debug builds.
+    // An alpha plane is sourced from a 4-channel input only.
     debug_assert!(
         a.is_none() || src_ch == 4,
         "alpha output plane requires a 4-channel source"
     );
 
     #[cfg(target_arch = "aarch64")]
-    // SAFETY: NEON is baseline on aarch64; the debug_asserts above document the
-    // length preconditions the kernel relies on (caller-validated in release).
+    // SAFETY: NEON is baseline on aarch64; the caller provides the lengths asserted above.
     unsafe {
         deinterleave_row_neon(src, r, g, b, a, w, src_ch);
     }
@@ -68,9 +54,8 @@ pub(super) fn deinterleave_row(
     deinterleave_row_scalar(src, r, g, b, a, w, src_ch);
 }
 
-/// Portable single-pass scalar deinterleave. One source read; contiguous plane
-/// stores. Used on non-aarch64 and as the documented reference for the NEON
-/// kernel's tail.
+/// Portable single-pass scalar deinterleave: one source read, contiguous plane
+/// stores. Used on non-aarch64.
 #[cfg(not(target_arch = "aarch64"))]
 fn deinterleave_row_scalar(
     src: &[u8],
@@ -82,9 +67,7 @@ fn deinterleave_row_scalar(
     src_ch: usize,
 ) {
     match a {
-        // Alpha is only sourced when the input has a 4th channel; the
-        // `src_ch == 4` guard keeps `p[3]` in bounds even if a caller wrongly
-        // pairs `Some(a)` with a 3-channel source (the debug_assert flags it).
+        // Alpha is sourced only when the input has a 4th channel.
         Some(a) if src_ch == 4 => {
             for x in 0..w {
                 let p = &src[x * src_ch..];
@@ -105,15 +88,11 @@ fn deinterleave_row_scalar(
     }
 }
 
-/// Widen a `u8` buffer into an `f32` buffer, dividing each value by 255.0
-/// (the U8→F32 image-normalisation the model-input path performs after the
-/// format/resize pipeline).
+/// Widen a `u8` buffer into an `f32` buffer, dividing each value by 255.0.
 ///
-/// This is the difference between the u8 and f32 preprocess cells (~1.2 ms at
-/// 640²×3 on Orin); the scalar iterator widen did not vectorise, so it was
-/// compute-bound. The NEON path converts 16 lanes/iteration and uses a true
-/// division (`vdivq_f32` by 255.0) so the result is bit-identical to the scalar
-/// `b as f32 / 255.0` — exact for every `u8` input.
+/// The NEON path converts 16 lanes per iteration with a true division
+/// (`vdivq_f32` by 255.0); the result is bit-identical to the scalar
+/// `b as f32 / 255.0`.
 ///
 /// # Panics (debug)
 /// Panics in debug mode if `src.len() != dst.len()`.
@@ -121,8 +100,7 @@ fn deinterleave_row_scalar(
 pub(super) fn widen_u8_to_f32_norm(src: &[u8], dst: &mut [f32]) {
     debug_assert_eq!(src.len(), dst.len());
     #[cfg(target_arch = "aarch64")]
-    // SAFETY: NEON is baseline on aarch64; the length precondition is asserted
-    // above and the kernel walks the shared length in lockstep.
+    // SAFETY: NEON is baseline on aarch64; the lengths are asserted equal above.
     unsafe {
         widen_u8_to_f32_norm_neon(src, dst);
     }
@@ -173,8 +151,7 @@ unsafe fn widen_u8_to_f32_norm_neon(src: &[u8], dst: &mut [f32]) {
 
 /// Runtime FEAT_FP16 (native half-precision arithmetic, `asimdhp`) availability,
 /// probed once and cached. Setting `EDGEFIRST_IMAGE_NO_FP16` forces the scalar
-/// fallback — used to A/B the native path against scalar on FP16 hardware and to
-/// check output parity. Mirrors the decoder's `CpuFeatures` runtime probe.
+/// fallback.
 #[cfg(target_arch = "aarch64")]
 fn has_fp16() -> bool {
     use std::sync::OnceLock;
@@ -187,17 +164,15 @@ fn has_fp16() -> bool {
     })
 }
 
-/// Widen a `u8` buffer into an `f16` buffer, dividing each value by 255.0 (the
-/// U8→F16 model-input normalisation after the format/resize pipeline).
+/// Widen a `u8` buffer into an `f16` buffer, dividing each value by 255.0.
 ///
-/// On AArch64 CPUs with the FP16 extension (FEAT_FP16 / `asimdhp` — e.g. the
-/// Orin's Cortex-A78AE) this dispatches at runtime to a native half-precision
-/// kernel (`ucvtf.8h` + `fdiv.8h`, 8 lanes/instruction). On other CPUs (incl.
-/// non-FP16 aarch64 and non-aarch64) it uses the scalar `half::f16::from_f32`.
+/// On AArch64 CPUs with the FP16 extension (FEAT_FP16 / `asimdhp`) this
+/// dispatches at runtime to a native half-precision kernel (`ucvtf.8h` +
+/// `fdiv.8h`, 8 lanes/instruction). Other CPUs use the scalar
+/// `half::f16::from_f32`.
 ///
 /// The native path divides in the f16 domain, which differs from the scalar
-/// f32-then-narrow result by at most ~1 f16 ULP — far inside the model-input
-/// tolerance, consistent with the perf-over-exactness default.
+/// f32-then-narrow result by at most ~1 f16 ULP.
 ///
 /// # Panics (debug)
 /// Panics in debug mode if `src.len() != dst.len()`.
@@ -206,8 +181,7 @@ pub(super) fn widen_u8_to_f16_norm(src: &[u8], dst: &mut [half::f16]) {
     debug_assert_eq!(src.len(), dst.len());
     #[cfg(target_arch = "aarch64")]
     if has_fp16() {
-        // SAFETY: FEAT_FP16 detected at runtime; lengths asserted equal above
-        // and the kernel walks the shared length in lockstep.
+        // SAFETY: FEAT_FP16 was detected at runtime; the lengths are asserted equal above.
         unsafe {
             widen_u8_to_f16_norm_fp16(src, dst);
         }
@@ -253,10 +227,9 @@ unsafe fn widen_u8_to_f16_norm_fp16(src: &[u8], dst: &mut [half::f16]) {
 
 /// `f16(lane) / divisor` on 8 lanes via native FP16: `ucvtf.8h` converts the
 /// unsigned-int u16 lanes (0..=255 from the widened u8) to f16, then `fdiv.8h`
-/// divides by the broadcast f16 divisor. Inline `asm!` with `.arch_extension
-/// fp16` because stable Rust gates the `float16x8_t` intrinsics; the f16 vectors
-/// are carried as opaque `uint16x8_t` bit-patterns (same approach as the
-/// decoder's per-scale FP16 kernels).
+/// divides by the broadcast f16 divisor. Uses inline `asm!` with
+/// `.arch_extension fp16`; the f16 vectors are carried as `uint16x8_t`
+/// bit-patterns.
 ///
 /// # Safety
 /// Requires FEAT_FP16 (caller gates on [`has_fp16`]).
@@ -304,8 +277,7 @@ unsafe fn deinterleave_row_neon(
         let rp = r.as_mut_ptr();
         let gp = g.as_mut_ptr();
         let bp = b.as_mut_ptr();
-        // Collapse the alpha plane to a raw pointer once; the loop uses the (Copy)
-        // pointer so the borrow on `a` does not need to persist.
+        // The alpha plane as a raw pointer.
         let ap: Option<*mut u8> = a.map(|s| s.as_mut_ptr());
 
         let mut x = 0usize;
@@ -331,9 +303,7 @@ unsafe fn deinterleave_row_neon(
         }
 
         // Scalar tail for the remaining < 16 pixels. The alpha write is gated on
-        // `src_ch == 4` (an alpha byte only exists in a 4-channel source), so
-        // `sp.add(x * src_ch + 3)` can never read past the row even if a caller
-        // wrongly pairs `Some(a)` with a 3-channel source.
+        // `src_ch == 4`.
         let write_alpha = src_ch == 4;
         while x < w {
             *rp.add(x) = *sp.add(x * src_ch);
@@ -353,8 +323,7 @@ unsafe fn deinterleave_row_neon(
 mod tests {
     use super::*;
 
-    /// Deinterleave matches the scalar reference for widths that straddle the
-    /// 16-pixel vector boundary (exercises both the SIMD body and scalar tail).
+    /// Deinterleave matches the scalar reference for widths that straddle the 16-pixel vector boundary.
     #[test]
     fn deinterleave_rgb_matches_scalar() {
         for w in [1usize, 7, 16, 17, 31, 64, 100] {
@@ -397,9 +366,7 @@ mod tests {
         }
     }
 
-    /// The u8→f16 widen (native FP16 on capable hosts, scalar otherwise) is
-    /// within ~1 f16 ULP of the scalar f32-then-narrow reference. On FP16
-    /// hardware (e.g. Apple Silicon / Orin) this exercises the native path.
+    /// The u8→f16 widen is within ~1 f16 ULP of the scalar f32-then-narrow reference.
     #[test]
     fn widen_f16_within_tolerance() {
         let src: Vec<u8> = (0..=255u8).collect();
@@ -407,7 +374,6 @@ mod tests {
         widen_u8_to_f16_norm(&src, &mut dst);
         for (i, &v) in dst.iter().enumerate() {
             let expected = half::f16::from_f32(i as f32 / 255.0).to_f32();
-            // 1 f16 ULP near 1.0 is ~5e-4; allow a small absolute slack.
             assert!(
                 (v.to_f32() - expected).abs() <= 1e-3,
                 "byte {i}: got {} expected {expected}",

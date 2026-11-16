@@ -4,11 +4,10 @@
 //! Optional CUDA Runtime interop, loaded via dlopen (no link-time dependency).
 //! Absent libcudart ⇒ every CUDA path degrades to `None`.
 //!
-//! The intended client pattern is a fast-fail + host fallback: call
-//! [`Tensor::cuda_map`](crate::Tensor::cuda_map) (or [`TensorDyn::cuda_map`](crate::TensorDyn::cuda_map))
-//! first; if it returns `None` (no CUDA handle attached or libcudart absent),
-//! fall back to the host mapping via `Tensor::map`. This keeps hot paths
-//! zero-copy on CUDA-capable hardware while remaining correct on CPU-only targets.
+//! Client pattern: call [`Tensor::cuda_map`](crate::Tensor::cuda_map) (or
+//! [`TensorDyn::cuda_map`](crate::TensorDyn::cuda_map)) first; if it returns
+//! `None` (no CUDA handle attached or libcudart absent), fall back to the host
+//! mapping via `Tensor::map`.
 use edgefirst_tensor_abi::{EfClientState, EfCudaMapFn, EfCudaUnmapFn, EfCudaUnregisterFn};
 use libloading::Library;
 #[cfg(target_os = "windows")]
@@ -36,18 +35,14 @@ pub(crate) type ExternalSemaphore = *mut c_void; // cudaExternalSemaphore_t
 
 #[allow(non_snake_case, dead_code)]
 pub(crate) struct CudaTable {
-    // Owns the loaded module so it stays mapped for as long as the function
-    // pointers below are callable. `CudaTable` only ever lives inside the
-    // `'static TABLE` OnceLock (never dropped for the life of the process),
-    // so this need not be leaked separately.
+    // Owns the loaded module so it stays mapped while the function pointers
+    // below are callable.
     _lib: Library,
-    /// The runtime `load()` actually opened: a `CUDA_PATH\bin\...` candidate
-    /// is recorded verbatim (loading a full path is unambiguous); a bare
-    /// name (Windows) is resolved to the absolute path Windows mapped via
-    /// `GetModuleHandleW`/`GetModuleFileNameW`, falling back to the bare
-    /// name if that resolution fails. On Linux this is the soname that
-    /// opened. Several toolkits on a dev box can share a bare DLL/soname, so
-    /// this is what makes "which runtime is CUDA actually using" answerable.
+    /// The runtime `load()` opened: a `CUDA_PATH\bin\...` candidate is
+    /// recorded verbatim; a bare name (Windows) is resolved to the absolute
+    /// path Windows mapped via `GetModuleHandleW`/`GetModuleFileNameW`,
+    /// falling back to the bare name if that resolution fails. On Linux this
+    /// is the soname that opened.
     pub runtime_path: std::path::PathBuf,
     pub graphics_gl_register_buffer:
         unsafe extern "C" fn(*mut GraphicsResource, c_uint, c_uint) -> CudaError,
@@ -68,8 +63,7 @@ pub(crate) struct CudaTable {
     pub stream_create: unsafe extern "C" fn(*mut CudaStream) -> CudaError,
     pub stream_synchronize: unsafe extern "C" fn(CudaStream) -> CudaError,
     pub stream_destroy: unsafe extern "C" fn(CudaStream) -> CudaError,
-    // D3D11 texture interop (Task C2 consumes these; only meaningful where D3D11
-    // exists, so Windows-only both here and in `load_table`).
+    // D3D11 texture interop, Windows-only.
     #[cfg(target_os = "windows")]
     pub d3d11_get_device: unsafe extern "C" fn(*mut c_int, *mut c_void) -> CudaError,
     #[cfg(target_os = "windows")]
@@ -88,12 +82,7 @@ pub(crate) struct CudaTable {
     #[cfg(target_os = "windows")]
     pub array_get_plane:
         Option<unsafe extern "C" fn(*mut CudaArray, CudaArray, c_uint) -> CudaError>,
-    // The async spellings, not the plain ones: a device-to-device
-    // `cudaMemcpy2D*` runs on the legacy default stream, and synchronising
-    // that is a device-wide barrier that also waits behind every other stream
-    // this crate hands out (the codec's, for one). These take the handle's own
-    // stream, so the wait, the copy and the synchronisation are one sequence
-    // on one stream.
+    // The async spellings, which take the handle's own stream.
     #[cfg(target_os = "windows")]
     pub memcpy_2d_from_array_async: unsafe extern "C" fn(
         *mut c_void,
@@ -138,16 +127,7 @@ pub(crate) struct CudaTable {
 
 static TABLE: OnceLock<Option<CudaTable>> = OnceLock::new();
 
-// Miri cannot execute `dlopen` -- it is a foreign function Miri's
-// interpreter refuses outright ("can't call foreign function `dlopen`"),
-// not merely a syscall it emulates differently. `Tensor::new` calls
-// `try_init_dma_cuda` unconditionally on Linux (`lib.rs`), which calls
-// `is_cuda_available` -> `table` -> `load` before it even checks whether
-// the tensor is DMA-backed, so this fires on every tensor construction
-// under Miri, DMA or not. Reporting "unavailable" here is not suppressing
-// a finding: this module's own contract is "absent libcudart => every CUDA
-// path degrades to `None`" (see the module doc), and under Miri libcudart
-// is, honestly, never going to be found.
+// Under Miri no runtime is loaded.
 #[cfg(miri)]
 fn load() -> Option<CudaTable> {
     None
@@ -161,19 +141,12 @@ fn load() -> Option<CudaTable> {
         "libcudart.so.12",
         "libcudart.so.11.0",
     ] {
-        // SAFETY: `name` is one of the fixed soname literals above. Loading
-        // a shared object runs its init routines, an unavoidable side effect
-        // of dynamic loading that this whole module's design accepts (see
-        // the module doc: "absent libcudart => every CUDA path degrades to
-        // `None`" is the only contract offered).
+        // SAFETY: `name` is one of the fixed soname literals above.
         let Ok(lib) = (unsafe { Library::new(name) }) else {
             continue;
         };
-        // `load_table` takes ownership of `lib`; if a required symbol is
-        // missing it returns `None` and its local `lib` parameter drops
-        // (unloading this soname), so the next candidate is tried rather
-        // than disabling CUDA outright for a stale library earlier in the
-        // search order.
+        // `load_table` takes ownership of `lib` and unloads it when a required
+        // symbol is missing; the next candidate is then tried.
         if let Some(table) = load_table(lib, std::path::PathBuf::from(name)) {
             log::debug!("CUDA runtime loaded from {}", table.runtime_path.display());
             return Some(table);
@@ -184,14 +157,10 @@ fn load() -> Option<CudaTable> {
 
 #[cfg(all(not(miri), target_os = "windows"))]
 fn load() -> Option<CudaTable> {
-    // Newest runtime first; consumers ship their own, the HAL only needs one
-    // that resolves the interop entry points. `cudart64_110.dll` is not on
-    // PATH/System32 by default, so also try CUDA_PATH\bin (where the
-    // installer puts it) for each candidate name. `is_full_path` marks the
-    // `CUDA_PATH\bin` entries: loading a full path is unambiguous, so their
-    // `runtime_path` is the candidate itself; a bare name resolves through
-    // the OS's DLL search order and needs `resolve_loaded_module_path` to
-    // learn which physical file actually opened.
+    // Newest runtime first. Each name is also tried under CUDA_PATH\bin;
+    // `is_full_path` marks those entries, whose `runtime_path` is the
+    // candidate itself. A bare name is resolved with
+    // `resolve_loaded_module_path`.
     let names = ["cudart64_13.dll", "cudart64_12.dll", "cudart64_110.dll"];
     let mut candidates: Vec<(std::path::PathBuf, bool)> = names
         .iter()
@@ -205,10 +174,6 @@ fn load() -> Option<CudaTable> {
     }
     for (candidate, is_full_path) in &candidates {
         // SAFETY: `candidate` is a `.dll` filename or full path built above.
-        // Loading a module runs its init routines, an unavoidable side
-        // effect of dynamic loading that this whole module's design accepts
-        // (see the module doc: "absent libcudart => every CUDA path
-        // degrades to `None`" is the only contract offered).
         let Ok(lib) = (unsafe { Library::new(candidate) }) else {
             continue;
         };
@@ -217,10 +182,8 @@ fn load() -> Option<CudaTable> {
         } else {
             resolve_loaded_module_path(candidate.as_os_str()).unwrap_or_else(|| candidate.clone())
         };
-        // `load_table` takes ownership of `lib`; if a required symbol is
-        // missing it returns `None` and its local `lib` parameter drops
-        // (unloading this candidate), so the next one is tried rather than
-        // disabling CUDA outright for a stale toolkit earlier on PATH.
+        // `load_table` takes ownership of `lib` and unloads it when a required
+        // symbol is missing; the next candidate is then tried.
         if let Some(table) = load_table(lib, runtime_path) {
             log::debug!("CUDA runtime loaded from {}", table.runtime_path.display());
             return Some(table);
@@ -230,46 +193,34 @@ fn load() -> Option<CudaTable> {
 }
 
 /// Resolves a bare DLL name (no directory) to the absolute path Windows
-/// actually mapped, via `GetModuleHandleW` + `GetModuleFileNameW`. Callers
-/// only use this immediately after `Library::new` already succeeded for the
-/// same name, so the module is already loaded: `GetModuleHandleW` looks up
-/// its existing handle, it does not load a second copy or re-run init
-/// routines. Returns `None` on any resolution failure; the caller falls back
-/// to the bare name it tried.
+/// mapped, via `GetModuleHandleW` + `GetModuleFileNameW`. The module must be
+/// loaded. Returns `None` on any resolution failure.
 #[cfg(target_os = "windows")]
 fn resolve_loaded_module_path(name: &std::ffi::OsStr) -> Option<std::path::PathBuf> {
     use std::os::windows::ffi::{OsStrExt, OsStringExt};
     let wide: Vec<u16> = name.encode_wide().chain(std::iter::once(0)).collect();
-    // SAFETY: `wide` is a NUL-terminated UTF-16 buffer kept alive for the
-    // call. `GetModuleHandleW` only resolves an already-loaded module's
-    // handle by name -- it neither loads nor initializes anything.
+    // SAFETY: `wide` is a NUL-terminated UTF-16 buffer kept alive for the call.
     let handle = unsafe { GetModuleHandleW(PCWSTR(wide.as_ptr())) }.ok()?;
     let mut buf = [0u16; 1024];
-    // SAFETY: `handle` was just returned by a successful `GetModuleHandleW`
-    // for a module already loaded in this process; `buf` is a correctly
-    // sized mutable out-buffer for `GetModuleFileNameW` to write into.
+    // SAFETY: `handle` is a loaded module's handle and `buf` is a correctly
+    // sized mutable out-buffer.
     let len = unsafe { GetModuleFileNameW(Some(handle), &mut buf) } as usize;
-    // `len == buf.len()` is truncation: the path did not fit and Windows did
-    // not terminate it, so the prefix would name a different file.
+    // `len == buf.len()` is truncation.
     (len > 0 && len < buf.len())
         .then(|| std::path::PathBuf::from(std::ffi::OsString::from_wide(&buf[..len])))
 }
 
 /// Resolves every interop symbol shared by both platforms' `load()`. Returns
 /// `None` and logs the missing symbol's name if any required entry point is
-/// absent from `lib` -- including the D3D11 entries on Windows, where they
-/// are not optional. Takes ownership of `lib`: on success it is stored in
-/// the returned `CudaTable`; on failure it is simply dropped here (unloading
-/// the module), so the caller is free to try its next candidate.
+/// absent from `lib`, including the D3D11 entries on Windows. Takes ownership
+/// of `lib`: on success it is stored in the returned `CudaTable`; on failure
+/// it is dropped, unloading the module.
 #[cfg(not(miri))]
 fn load_table(lib: Library, runtime_path: std::path::PathBuf) -> Option<CudaTable> {
     macro_rules! sym {
         ($n:literal) => {{
             // SAFETY: `$n` is one of the fixed `cuda*` symbol-name literals
-            // below; `lib` is the module `load()` just opened, and the
-            // resulting function pointer is only ever called through the
-            // `unsafe extern "C" fn` field type it is stored into, at each
-            // call site's own risk.
+            // below and `lib` is the module `load()` opened.
             match unsafe { lib.get(concat!($n, "\0").as_bytes()) } {
                 Ok(s) => *s,
                 Err(_) => {
@@ -279,23 +230,12 @@ fn load_table(lib: Library, runtime_path: std::path::PathBuf) -> Option<CudaTabl
             }
         }};
     }
-    // `cudaWaitExternalSemaphoresAsync` gained a `_v2` export when the ABI of
-    // `cudaExternalSemaphoreWaitParams` changed (the `reserved` tail this
-    // module's `CudaExternalSemaphoreWaitParams` already carries); prefer it
-    // and fall back to the unsuffixed name for older runtimes that only have
-    // the v1 ABI symbol under the original name. The unsuffixed symbol on a
-    // pre-11.2 runtime expects the shorter v1 params layout
-    // (`cudaExternalSemaphoreWaitParams_v1`), whose `flags` sits at offset 32
-    // where v2 has `params_reserved[0]`. A v1 runtime therefore reads a
-    // different zeroed word as `flags` rather than omitting a field, and both
-    // words are zero here: `fence.value` is at offset 0 in either layout and
-    // is the only field this module sets.
+    // Resolves the `_v2` export and falls back to the unsuffixed name.
     #[cfg(target_os = "windows")]
     macro_rules! sym_versioned {
         ($v2:literal, $v1:literal) => {{
             // SAFETY: `$v2`/`$v1` are fixed symbol-name literals; `lib` is
-            // the module `load()` just opened. Same call-site-risk contract
-            // as `sym!` above.
+            // the module `load()` opened.
             let found = unsafe { lib.get(concat!($v2, "\0").as_bytes()) }
                 .or_else(|_| unsafe { lib.get(concat!($v1, "\0").as_bytes()) });
             match found {
@@ -355,17 +295,12 @@ fn load_table(lib: Library, runtime_path: std::path::PathBuf) -> Option<CudaTabl
         destroy_external_semaphore: sym!("cudaDestroyExternalSemaphore"),
         #[cfg(target_os = "windows")]
         get_error_string: sym!("cudaGetErrorString"),
-        // Moved last: every `sym!`/`sym_versioned!` call above borrows
-        // `lib`, so the field that takes ownership of it must come after
-        // all of them in the struct literal (fields evaluate in the order
-        // written, not declaration order).
         _lib: lib,
     })
 }
 
-/// `cudaGetErrorString(rc)` with the numeric code kept alongside it, for the
-/// D3D11 arm's diagnostics. Falls back to the bare code if the runtime hands
-/// back no string.
+/// `cudaGetErrorString(rc)` with the numeric code kept alongside it. Falls
+/// back to the bare code if the runtime hands back no string.
 #[cfg(all(target_os = "windows", not(edgefirst_tensor_dynamic)))]
 fn err_str(t: &CudaTable, rc: CudaError) -> String {
     // SAFETY: `cudaGetErrorString` returns a pointer to a NUL-terminated
@@ -384,13 +319,13 @@ pub(crate) fn table() -> Option<&'static CudaTable> {
     TABLE.get_or_init(load).as_ref()
 }
 
-/// True iff libcudart loaded and all interop symbols resolved. Cached, cheap.
+/// True iff libcudart loaded and all interop symbols resolved. Cached.
 pub fn is_cuda_available() -> bool {
     table().is_some()
 }
 
-/// The runtime `load()` opened, if any -- see `CudaTable::runtime_path` for
-/// what this points to on each platform. `None` iff no runtime loaded.
+/// The runtime `load()` opened, if any; see `CudaTable::runtime_path`.
+/// `None` iff no runtime loaded.
 pub fn runtime_path() -> Option<&'static std::path::Path> {
     table().map(|t| t.runtime_path.as_path())
 }
@@ -446,8 +381,7 @@ pub unsafe fn memcpy_host_to_device(
 
 /// Create a CUDA stream. Returns `None` if libcudart is unavailable or stream
 /// creation fails. The returned stream must be released with
-/// [`stream_destroy`]. Intended for clients (e.g. the codec's nvJPEG backend)
-/// that submit async device work and synchronise on it.
+/// [`stream_destroy`].
 pub fn stream_create() -> Option<CudaStream> {
     let t = table()?;
     let mut stream: CudaStream = std::ptr::null_mut();
@@ -484,7 +418,7 @@ pub unsafe fn stream_destroy(stream: CudaStream) {
 }
 
 /// Register a GL buffer (PBO) with CUDA. Returns the resource as `usize`
-/// (pointer) or `None`. MUST be called on the thread where the GL context is
+/// (pointer) or `None`. Must be called on the thread where the GL context is
 /// current.
 pub fn gl_register_buffer(buffer_id: u32) -> Option<usize> {
     let t = table()?;
@@ -536,17 +470,11 @@ pub fn gl_unregister_resource(resource: usize) {
 
 // =============================================================================
 // DMA-BUF → CUDA external memory import (thread-independent; no GL context).
-//
-// ABI verified against CUDA 12.6 driver_types.h, LP64, stable across CUDA
-// 11/12.  The structs are layout-asserted in the `ext_mem_layout` test module
-// below — no host with both /dev/dma_heap and CUDA is available in CI, so
-// runtime validation is deferred to on-target testing (orin-nano, gpu-probe O5
-// already confirmed cudaImportExternalMemory(OpaqueFd) works on Orin).
 // =============================================================================
 
-/// `cudaExternalMemoryHandleTypeOpaqueFd` — the only handle type used for
-/// Linux DMA-BUF fds. Value verified vs. driver_types.h for CUDA 11/12.
-#[allow(dead_code)] // only reached on Linux DMA tensors; kept cross-platform + ABI-tested
+/// `cudaExternalMemoryHandleTypeOpaqueFd`: the handle type used for Linux
+/// DMA-BUF fds.
+#[allow(dead_code)]
 pub(crate) const CUDA_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD: c_uint = 1;
 
 /// FFI mirror of `cudaExternalMemoryHandleDesc` (driver_types.h, LP64).
@@ -559,7 +487,7 @@ pub(crate) const CUDA_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD: c_uint = 1;
 /// - `size`        → u64       @ 24
 /// - `flags`       → c_uint    @ 32
 /// - `_tail`       → u32       @ 36 (struct size 40)
-#[allow(dead_code)] // only reached on Linux DMA tensors; kept cross-platform + ABI-tested
+#[allow(dead_code)]
 #[repr(C)]
 pub(crate) struct CudaExternalMemoryHandleDesc {
     pub type_: c_int,
@@ -578,7 +506,7 @@ pub(crate) struct CudaExternalMemoryHandleDesc {
 /// - `size`   → u64    @ 8
 /// - `flags`  → c_uint @ 16
 /// - `_tail`  → u32    @ 20 (struct size 24)
-#[allow(dead_code)] // only reached on Linux DMA tensors; kept cross-platform + ABI-tested
+#[allow(dead_code)]
 #[repr(C)]
 pub(crate) struct CudaExternalMemoryBufferDesc {
     pub offset: u64,
@@ -589,36 +517,17 @@ pub(crate) struct CudaExternalMemoryBufferDesc {
 
 /// Import a DMA-BUF fd as CUDA external memory and map it to a device pointer.
 ///
-/// Thread-independent — no GL context is required. `cudaImportExternalMemory`
-/// with OpaqueFd takes ownership of the fd it is given, so this function dups
-/// the caller's `fd` and hands CUDA the dup; the caller's `fd` is therefore
-/// untouched and remains owned by the caller. Returns `(ext_mem_handle,
-/// device_ptr)` on success, or `None` on any failure (missing libcudart,
-/// unsupported platform, dup failure, or driver error). The returned handle
-/// must be destroyed via `cudaDestroyExternalMemory` (done by [`CudaHandle`]
-/// drop), which also closes the dup'd fd.
-///
-/// # RUNTIME-UNVALIDATED
-/// No test platform has both `/dev/dma_heap` and a CUDA device. ABI is
-/// layout-asserted vs. CUDA 12.6 `driver_types.h`; the mechanism is proven
-/// by gpu-probe O5 on Orin. Best-effort: returns `None` on failure.
-// `static`-only: the sole caller, `Tensor::try_init_dma_cuda` (`lib.rs`), is
-// itself `#[cfg(not(edgefirst_tensor_dynamic))]` (it reads `self.storage:
-// TensorStorage`, a `static`-only field). The rest of this module
-// (`CudaHandle`, `CudaMap`, `gl_register_buffer`, ...) stays available under
-// `dynamic` -- `dynamic_tensor::Tensor::cuda`/`cuda_map` return their types.
+/// No GL context is required. This function dups the caller's `fd` and hands
+/// CUDA the dup; the caller's `fd` remains owned by the caller. Returns
+/// `(ext_mem_handle, device_ptr)` on success, or `None` on any failure
+/// (missing libcudart, unsupported platform, dup failure, or driver error).
+/// The returned handle must be destroyed via `cudaDestroyExternalMemory`
+/// (done by [`CudaHandle`] drop), which also closes the dup'd fd.
 #[cfg(all(target_os = "linux", not(edgefirst_tensor_dynamic)))]
 pub(crate) fn import_dma_fd(fd: i32, size: usize) -> Option<(ExternalMemory, *mut c_void)> {
     use std::os::fd::{AsRawFd, BorrowedFd, IntoRawFd};
     let t = table()?;
-    // cudaExternalMemoryHandleTypeOpaqueFd TAKES OWNERSHIP of the fd on a
-    // successful import (CUDA closes it at cudaDestroyExternalMemory). The
-    // caller's fd is owned by TensorStorage::Dma and closed on tensor drop,
-    // so hand CUDA a dup to avoid a double-close.
-    // Keep the dup as OwnedFd until CUDA tells us whether it consumed it.
-    // `into_raw_fd` before the call left a window where a failed import that
-    // still closed the fd (observed on discrete NVIDIA + /dev/dma_heap) made
-    // `OwnedFd::from_raw_fd` + drop trip Rust's IO-safety abort.
+    // Hands CUDA a dup of `fd`, kept as `OwnedFd` until the import returns.
     let dup = unsafe { BorrowedFd::borrow_raw(fd) }
         .try_clone_to_owned()
         .ok()?;
@@ -630,9 +539,7 @@ pub(crate) fn import_dma_fd(fd: i32, size: usize) -> Option<(ExternalMemory, *mu
     let rc = unsafe { (t.import_external_memory)(&mut ext, &desc as *const _ as *const c_void) };
     if rc != 0 {
         log::debug!("cudaImportExternalMemory(OpaqueFd, size={size}) failed: cudaError {rc}");
-        // CUDA docs: a failed import does not consume the fd. Discrete NVIDIA
-        // drivers have been observed to close it anyway; reclaim via libc so
-        // an already-closed dup does not trip Rust's IO-safety abort.
+        // Closes the dup through libc; a dup the driver closed is tolerated.
         let raw = dup.into_raw_fd();
         if unsafe { libc::close(raw) } != 0 {
             log::debug!(
@@ -642,7 +549,7 @@ pub(crate) fn import_dma_fd(fd: i32, size: usize) -> Option<(ExternalMemory, *mu
         }
         return None;
     }
-    // Success: CUDA now owns the dup; it is closed by cudaDestroyExternalMemory.
+    // CUDA owns the dup; it is closed by cudaDestroyExternalMemory.
     let _ = dup.into_raw_fd();
     let bdesc = CudaExternalMemoryBufferDesc {
         offset: 0,
@@ -662,45 +569,34 @@ pub(crate) fn import_dma_fd(fd: i32, size: usize) -> Option<(ExternalMemory, *mu
 }
 
 // =============================================================================
-// D3D11 texture → CUDA external memory import (Windows only; Task C2 is the
-// consumer -- `import_d3d11_texture`, the fence wait, and the array copies).
+// D3D11 texture → CUDA external memory import (Windows only), used by
+// `import_d3d11_texture`, the fence wait, and the array copies.
 //
-// Field offsets verified against this box's CUDA 11.8 `driver_types.h` by a
-// compiled offsetof program (`cl /nologo /I"%CUDA_PATH%\include" layouts.c`,
-// MSVC/VS 2026, x64); see the `d3d11_desc_layout` test module below for the
-// printed numbers.
-//
-// Layout rule: the three structs below (all but `cudaExternalSemaphoreWaitParams`,
-// which already matches 11.8) are laid out as the newest known toolkit
-// defines them, not as 11.8 defines them, because `load()` tries
-// `cudart64_13.dll` and `cudart64_12.dll` before `cudart64_110.dll` and a
-// newer runtime reads the struct size and trailing fields it expects, not
-// the ones 11.8 has. Each struct's own doc comment gives its exact offsets,
-// size and padding.
+// The structs below, except `cudaExternalSemaphoreWaitParams`, are laid out
+// as CUDA 12.x/13.x define them.
 // =============================================================================
 
 /// `cudaExternalMemoryHandleTypeD3D11Resource`.
-#[allow(dead_code)] // unused under the dynamic backend (the D3D11 arm is static-only)
+#[allow(dead_code)]
 #[cfg(target_os = "windows")]
 pub(crate) const CUDA_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_RESOURCE: c_int = 5;
 /// `cudaExternalSemaphoreHandleTypeD3D11Fence`.
-#[allow(dead_code)] // unused under the dynamic backend (the D3D11 arm is static-only)
+#[allow(dead_code)]
 #[cfg(target_os = "windows")]
 pub(crate) const CUDA_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D11_FENCE: c_int = 4;
-/// `cudaExternalMemoryDedicated` — the imported resource is a dedicated
-/// allocation (required for D3D11 textures, as opposed to a suballocated
-/// buffer region).
-#[allow(dead_code)] // unused under the dynamic backend (the D3D11 arm is static-only)
+/// `cudaExternalMemoryDedicated`: the imported resource is a dedicated
+/// allocation.
+#[allow(dead_code)]
 pub(crate) const CUDA_EXTERNAL_MEMORY_DEDICATED: c_uint = 1;
 /// `cudaMemcpyDeviceToDevice` — both endpoints of the copy are CUDA device
 /// memory (the imported array and the tensor's linear device buffer).
-#[allow(dead_code)] // unused under the dynamic backend (the D3D11 arm is static-only)
+#[allow(dead_code)]
 pub(crate) const CUDA_MEMCPY_DEVICE_TO_DEVICE: c_int = 3;
 /// `cudaChannelFormatKindUnsigned` — integer texture formats (RGBA8, R8).
-#[allow(dead_code)] // unused under the dynamic backend (the D3D11 arm is static-only)
+#[allow(dead_code)]
 pub(crate) const CUDA_CHANNEL_FORMAT_KIND_UNSIGNED: c_int = 1;
 /// `cudaChannelFormatKindFloat` — float texture formats (F16, F32).
-#[allow(dead_code)] // unused under the dynamic backend (the D3D11 arm is static-only)
+#[allow(dead_code)]
 pub(crate) const CUDA_CHANNEL_FORMAT_KIND_FLOAT: c_int = 2;
 /// `cudaChannelFormatKindNV12`: an 8-bit 4:2:0 array of two planes.
 #[cfg(all(target_os = "windows", not(edgefirst_tensor_dynamic)))]
@@ -708,16 +604,11 @@ pub(crate) const CUDA_CHANNEL_FORMAT_KIND_NV12: c_int = 4;
 
 /// `cudaExternalMemoryHandleDesc` with the `win32` arm of the handle union
 /// populated (`type_`, `win32_handle`/`win32_name`, `size`, `flags`), laid
-/// out as CUDA 12.x/13.x's `driver_types.h` defines it (see the section
-/// comment above).
+/// out as CUDA 12.x/13.x's `driver_types.h` defines it.
 ///
-/// Field offsets `type_` @0, `win32_handle` @8, `win32_name` @16, `size`
-/// @24, `flags` @32 are measured against this box's CUDA 11.8
-/// `driver_types.h` (identical in 12.x/13.x, which only append `reserved`).
-/// Total size 104, align 8: `reserved[16]` @36..100, tail padding to 104
-/// (12.x/13.x add this trailing array; 11.8 does not, but ignores it since
-/// 11.8 only reads its own 40-byte prefix).
-#[allow(dead_code)] // unused under the dynamic backend (the D3D11 arm is static-only)
+/// Field offsets: `type_` @0, `win32_handle` @8, `win32_name` @16, `size`
+/// @24, `flags` @32, `reserved[16]` @36..100. Total size 104, align 8.
+#[allow(dead_code)]
 #[cfg(target_os = "windows")]
 #[repr(C)]
 pub(crate) struct CudaExternalMemoryHandleDescWin32 {
@@ -731,9 +622,8 @@ pub(crate) struct CudaExternalMemoryHandleDescWin32 {
     pub _tail: u32,
 }
 
-/// `cudaChannelFormatDesc` (driver_types.h; size 20, align 4). Generic across
-/// platforms; only reached via the Windows mipmapped-array desc for now.
-#[allow(dead_code)] // unused under the dynamic backend (the D3D11 arm is static-only)
+/// `cudaChannelFormatDesc` (driver_types.h; size 20, align 4).
+#[allow(dead_code)]
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub(crate) struct CudaChannelFormatDesc {
@@ -744,9 +634,8 @@ pub(crate) struct CudaChannelFormatDesc {
     pub f: c_int,
 }
 
-/// `cudaExtent` (driver_types.h; size 24, align 8). Generic across platforms;
-/// only reached via the Windows mipmapped-array desc for now.
-#[allow(dead_code)] // unused under the dynamic backend (the D3D11 arm is static-only)
+/// `cudaExtent` (driver_types.h; size 24, align 8).
+#[allow(dead_code)]
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub(crate) struct CudaExtent {
@@ -756,15 +645,11 @@ pub(crate) struct CudaExtent {
 }
 
 /// `cudaExternalMemoryMipmappedArrayDesc`, laid out as CUDA 12.x/13.x's
-/// `driver_types.h` defines it (see the section comment above).
+/// `driver_types.h` defines it.
 ///
-/// Field offsets `offset` @0, `format_desc` @8, `extent` @32, `flags` @56,
-/// `num_levels` @60 are measured against this box's CUDA 11.8
-/// `driver_types.h` (identical in 12.x/13.x, which only append `reserved`).
-/// Total size 128, align 8: `reserved[16]` @64..128, no further padding
-/// needed (12.x/13.x add this trailing array; 11.8 does not, but ignores it
-/// since 11.8 only reads its own 64-byte prefix).
-#[allow(dead_code)] // unused under the dynamic backend (the D3D11 arm is static-only)
+/// Field offsets: `offset` @0, `format_desc` @8, `extent` @32, `flags` @56,
+/// `num_levels` @60, `reserved[16]` @64..128. Total size 128, align 8.
+#[allow(dead_code)]
 #[cfg(target_os = "windows")]
 #[repr(C)]
 pub(crate) struct CudaExternalMemoryMipmappedArrayDesc {
@@ -778,16 +663,11 @@ pub(crate) struct CudaExternalMemoryMipmappedArrayDesc {
 }
 
 /// `cudaExternalSemaphoreHandleDesc` with the `win32` arm of the handle
-/// union populated, laid out as CUDA 12.x/13.x's `driver_types.h` defines it
-/// (see the section comment above).
+/// union populated, laid out as CUDA 12.x/13.x's `driver_types.h` defines it.
 ///
-/// Field offsets `type_` @0, `win32_handle` @8, `win32_name` @16, `flags`
-/// @24 are measured against this box's CUDA 11.8 `driver_types.h` (identical
-/// in 12.x/13.x, which only append `reserved`). Total size 96, align 8:
-/// `reserved[16]` @28..92, tail padding to 96 (12.x/13.x add this trailing
-/// array; 11.8 does not, but ignores it since 11.8 only reads its own
-/// 32-byte prefix).
-#[allow(dead_code)] // unused under the dynamic backend (the D3D11 arm is static-only)
+/// Field offsets: `type_` @0, `win32_handle` @8, `win32_name` @16, `flags`
+/// @24, `reserved[16]` @28..92. Total size 96, align 8.
+#[allow(dead_code)]
 #[cfg(target_os = "windows")]
 #[repr(C)]
 pub(crate) struct CudaExternalSemaphoreHandleDesc {
@@ -802,13 +682,11 @@ pub(crate) struct CudaExternalSemaphoreHandleDesc {
 
 /// `cudaExternalSemaphoreWaitParams`.
 ///
-/// Layout verified against CUDA 11.8 `driver_types.h` (size 144, align 8):
-/// `params.fence.value` @0, `params.nvSciSync` @8, `params.keyedMutex.key`
-/// @16, `params.keyedMutex.timeoutMs` @24, `params.reserved[10]` @32,
-/// `flags` @72, `reserved[16]` @76, tail padding to 144. This struct already
-/// carries the reserved arrays in CUDA 11.8, so its size and offsets match
-/// the task brief's guess exactly (unlike the three structs above).
-#[allow(dead_code)] // unused under the dynamic backend (the D3D11 arm is static-only)
+/// Layout (size 144, align 8): `params.fence.value` @0, `params.nvSciSync`
+/// @8, `params.keyedMutex.key` @16, `params.keyedMutex.timeoutMs` @24,
+/// `params.reserved[10]` @32, `flags` @72, `reserved[16]` @76, tail padding
+/// to 144.
+#[allow(dead_code)]
 #[cfg(target_os = "windows")]
 #[repr(C)]
 pub(crate) struct CudaExternalSemaphoreWaitParams {
@@ -823,19 +701,6 @@ pub(crate) struct CudaExternalSemaphoreWaitParams {
     pub _tail: u32,
 }
 
-/// The CUDA side of one D3D11 texture tensor: the imported external memory,
-/// the level-0 array it maps to, and the linear device buffer every map copies
-/// through.
-///
-/// A CUDA array is opaque, tiled memory -- no consumer can index it as a
-/// device pointer -- so a map turns it into the tensor's tight rows with one
-/// `cudaMemcpy2DFromArray`, and a writable map's release turns them back with
-/// one `cudaMemcpy2DToArray`. The linear buffer is allocated on the first map
-/// and then reused, so a per-frame consumer pays one `cudaMalloc` in total.
-///
-/// `static`-only for the same reason `d3d11::texture` is: `dynamic` forwards
-/// every tensor call to the C ABI and never constructs a texture storage, so
-/// nothing there can produce this backing.
 #[cfg(all(target_os = "windows", not(edgefirst_tensor_dynamic)))]
 /// One CUDA array the linear buffer is copied from and back to: the level-0
 /// array of a single-plane texture, or one plane of a native NV12 one.
@@ -868,31 +733,32 @@ impl ArrayPlanes {
     }
 }
 
+/// The CUDA side of one D3D11 texture tensor: the imported external memory,
+/// the arrays it maps to, and the linear device buffer every map copies
+/// through.
+///
+/// A map copies the arrays into the linear buffer as the tensor's tight rows,
+/// and a writable map's release copies them back. The linear buffer is
+/// allocated on the first map and then reused.
 #[cfg(all(target_os = "windows", not(edgefirst_tensor_dynamic)))]
 struct D3d11External {
     ext_mem: ExternalMemory,
     mipmapped: MipmappedArray,
     planes: ArrayPlanes,
-    /// The linear buffer, allocated on first use: `map` takes `&self`, so the
-    /// slot is behind a lock, which also serialises two concurrent maps that
-    /// would otherwise copy into one buffer at once.
+    /// The linear buffer, allocated on first use, behind a lock that
+    /// serialises concurrent maps.
     linear: std::sync::Mutex<Option<*mut c_void>>,
     bytes: usize,
     stream: CudaStream,
     /// The CUDA device the D3D11 adapter maps to. Set again before every copy
-    /// and before the release: `cudaSetDevice` is per-thread state, so a
-    /// consumer thread that last used another GPU would otherwise allocate the
-    /// linear buffer on it and fail to use this handle's stream.
+    /// and before the release.
     device: c_int,
     /// The process fence imported as an external semaphore, shared by every
     /// D3D11 import in this copy of the crate (see [`shared_semaphore`]).
     ///
     /// `None` when the device has no shared fence or the import failed. A map
-    /// of a tensor with **no** recorded write then copies without waiting,
-    /// which is correct -- there is nothing to wait for. A map of a tensor
-    /// that *does* carry a recorded write declines instead: it has something
-    /// to wait for and no way to, and the caller's host-map fallback is
-    /// ordered by the D3D11 immediate context.
+    /// of a tensor with no recorded write then copies without waiting; a map
+    /// of a tensor that carries a recorded write declines.
     semaphore: Option<&'static SharedSemaphore>,
     /// The newest D3D11 fence value recorded on the tensor, shared with the
     /// storage's own slot: a map waits for it before reading the array.
@@ -903,14 +769,12 @@ struct D3d11External {
 /// its level-0 array and imports `fence_handle` as an external semaphore so
 /// maps can order their copies after the D3D11 work a producer signalled.
 ///
-/// `handle` stays owned by the caller: CUDA duplicates a Win32 handle it
-/// imports rather than taking it over, unlike the OpaqueFd path in
-/// `import_dma_fd`. `fence_handle` is a duplicate this backing takes over and
-/// closes on drop, for the same reason -- nothing else holds it.
+/// `handle` stays owned by the caller. `fence_handle` is a duplicate this
+/// backing takes over.
 ///
 /// Returns `None` on any failure (no CUDA device for the adapter, as on WARP;
 /// a DXGI format with no channel description; a driver error), releasing
-/// everything it had already created. The tensor is then simply CUDA-less.
+/// everything it had already created.
 #[cfg(all(target_os = "windows", not(edgefirst_tensor_dynamic)))]
 pub(crate) fn import_d3d11_texture(
     handle: RawHandle,
@@ -920,11 +784,8 @@ pub(crate) fn import_d3d11_texture(
     last_write: Arc<std::sync::atomic::AtomicU64>,
 ) -> Option<CudaHandle> {
     let t = table()?;
-    // Every texture tensor is created on the one process D3D11 device, so
-    // every import resolves the same ordinal and selects the same CUDA
-    // device; caching it keeps `cudaD3D11GetDevice` off the allocation path.
-    // The ordinal itself is cached, not just the verdict, because every map
-    // and every release sets it again on its own thread.
+    // The CUDA device ordinal for the process D3D11 device, resolved once and
+    // cached.
     static CUDA_DEVICE_SELECTED: OnceLock<Option<c_int>> = OnceLock::new();
     let device = (*CUDA_DEVICE_SELECTED.get_or_init(|| {
         let mut dev = -1;
@@ -948,9 +809,8 @@ pub(crate) fn import_d3d11_texture(
         Some(dev)
     }))?;
     // The channel description of the texture's DXGI format: one component's
-    // width in bits and how many components a texel carries. Only the formats
-    // `crate::d3d11_layout` allocates are listed; anything else declines the
-    // import rather than guessing a description the driver would reject.
+    // width in bits and how many components a texel carries. A format
+    // `crate::d3d11_layout` does not allocate declines the import.
     let (bits, kind, channels) = match layout.dxgi_format {
         // An NV12 array is described as three 8-bit channels of kind NV12;
         // its planes are split out below.
@@ -976,9 +836,7 @@ pub(crate) fn import_d3d11_texture(
     };
     let ch = |i: c_int| if i < channels { bits } else { 0 };
     // SAFETY: every field is an integer, a nested POD struct or an array of
-    // those, so all-zero is a valid bit pattern; the named fields below are
-    // then set. Zeroing is what makes the 12.x/13.x `reserved` tail
-    // well-defined when an 11.8 runtime is the one loaded.
+    // those, so all-zero is a valid bit pattern.
     let mut md: CudaExternalMemoryMipmappedArrayDesc = unsafe { std::mem::zeroed() };
     md.format_desc = CudaChannelFormatDesc {
         x: ch(0),
@@ -1108,32 +966,20 @@ fn array_planes(
 #[cfg(all(target_os = "windows", not(edgefirst_tensor_dynamic)))]
 struct SharedSemaphore {
     sem: ExternalSemaphore,
-    /// CUDA duplicates a Win32 handle it imports rather than taking it over,
-    /// but the source handle must stay valid for the import; held for the
-    /// process lifetime because the semaphore is.
+    /// The source handle of the import, held for the process lifetime.
     _handle: OwnedHandle,
 }
 
-// SAFETY: a CUDA external-semaphore handle is an opaque runtime object bound
-// to a device, not to a thread, and every use here passes it to a runtime call
-// that is itself thread-safe. `OwnedHandle` is `Send + Sync`. The struct is
-// written once inside a `OnceLock` initialiser and only read afterwards.
+// SAFETY: a CUDA external-semaphore handle is bound to a device, not to a
+// thread, and is only passed to thread-safe runtime calls. `OwnedHandle` is
+// `Send + Sync`. The struct is written once inside a `OnceLock` initialiser.
 #[cfg(all(target_os = "windows", not(edgefirst_tensor_dynamic)))]
 unsafe impl Send for SharedSemaphore {}
 #[cfg(all(target_os = "windows", not(edgefirst_tensor_dynamic)))]
 unsafe impl Sync for SharedSemaphore {}
 
-/// Imports the process D3D11 fence as an external semaphore, once.
-///
-/// Every texture tensor in this copy of the crate records its completions on
-/// the one process fence, so importing per tensor would duplicate the same NT
-/// handle and import the same object again for every allocation -- a 30-frame
-/// pool pays 30 of each for no benefit. The semaphore and its handle live for
-/// the process, like the device and the fence they name, so neither is
-/// destroyed on a handle's drop.
-///
-/// The CUDA *stream* is deliberately not hoisted with it: it stays per handle
-/// so a map never waits behind another consumer's unrelated work.
+/// Imports the process D3D11 fence as an external semaphore, once. The
+/// semaphore and its handle live for the process.
 ///
 /// `fence_handle` is consumed by the first caller and dropped by the rest.
 #[cfg(all(target_os = "windows", not(edgefirst_tensor_dynamic)))]
@@ -1141,7 +987,7 @@ fn shared_semaphore(t: &CudaTable, fence_handle: OwnedHandle) -> Option<&'static
     static IMPORTED: OnceLock<Option<SharedSemaphore>> = OnceLock::new();
     IMPORTED
         .get_or_init(move || {
-            // SAFETY: same all-zero reasoning as the descriptors above.
+            // SAFETY: all-zero is a valid bit pattern for this descriptor.
             let mut sd: CudaExternalSemaphoreHandleDesc = unsafe { std::mem::zeroed() };
             sd.type_ = CUDA_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D11_FENCE;
             sd.win32_handle = fence_handle.as_raw_handle();
@@ -1152,9 +998,7 @@ fn shared_semaphore(t: &CudaTable, fence_handle: OwnedHandle) -> Option<&'static
                 (t.import_external_semaphore)(&mut sem, &sd as *const _ as *const c_void)
             };
             if rc != 0 {
-                // The duplicate closes with `fence_handle` here. Tensors that
-                // carry a recorded write then decline their CUDA map rather
-                // than copy unordered; see `D3d11External::semaphore`.
+                // The duplicate closes with `fence_handle` here.
                 log::debug!(
                     "cudaImportExternalSemaphore(D3D11Fence): {}",
                     err_str(t, rc)
@@ -1172,22 +1016,14 @@ fn shared_semaphore(t: &CudaTable, fence_handle: OwnedHandle) -> Option<&'static
 /// Whether a copy issued now would be ordered behind the producer's recorded
 /// D3D11 write: either nothing is recorded, or a wait for it was queued on the
 /// same stream.
-///
-/// A recorded write with no wait behind it is the one case that must not
-/// proceed. The copy would run against a texture the producer's GPU work is
-/// still writing -- timing-dependent, silent, and invisible below `warn`. It is
-/// the hazard `validate_descriptor` refuses a descriptor for, so a map declines
-/// here for the same reason: the documented fallback is the host map, which
-/// goes through the D3D11 immediate context and *is* ordered.
 #[cfg(all(target_os = "windows", not(edgefirst_tensor_dynamic)))]
 fn d3d11_copy_is_ordered(recorded: u64, wait_queued: bool) -> bool {
     recorded == 0 || wait_queued
 }
 
-/// Set once a D3D11 allocation has proved that this adapter's driver pads its
-/// textures past their padding-free size, so later imports skip the tight rung
-/// of [`import_and_map_array`]'s ladder instead of paying a doomed import each
-/// time.
+/// Set once a D3D11 allocation has found that this adapter's driver pads its
+/// textures past their padding-free size; later imports then skip the tight
+/// rung of [`import_and_map_array`]'s ladder.
 #[cfg(all(target_os = "windows", not(edgefirst_tensor_dynamic)))]
 static CUDA_IMPORT_SIZE_PADDED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -1195,32 +1031,9 @@ static CUDA_IMPORT_SIZE_PADDED: std::sync::atomic::AtomicBool =
 /// Imports the texture as external memory and maps `md` out of it, returning
 /// the pair on success.
 ///
-/// The declared size is the one thing here that cannot be read off the
-/// texture: D3D11 has no allocation-size query, and the driver pads a
-/// texture's rows and its row count for tiling, so a texture's real
-/// allocation is larger than its padding-free bytes at most geometries. This
-/// box's RTX 3070 maps a 256x128 RGBA8 texture from the tight 131072 bytes but
-/// rejects a 1920x1080 one (`cudaErrorInvalidValue` from
-/// `cudaExternalMemoryGetMappedMipmappedArray`, not from the import, which
-/// accepts any non-zero size) until the declaration covers the padding.
-///
-/// So the declaration climbs a short ladder -- the exact bytes, then 2x, then
-/// 4x -- and stops at the first rung the driver maps. Over-declaring is what
-/// the probe's S5.4 measured as harmless (a 2x declaration of a 256x128
-/// texture mapped and copied the same 0-mismatch bytes as the tight one), and
-/// it is safe by construction: with `cudaExternalMemoryDedicated` the mapping
-/// covers the whole resource, no address is derived from this number, and the
-/// array's own extent bounds every copy.
-///
-/// The first rung is floored at one 4 KiB page: no GPU allocation is smaller
-/// than a page, so a 1x1 RGBA texture's four bytes are provably too few to
-/// describe one, and 4x of too few is still too few. Measured on this box --
-/// 1x1 and 4x4 RGBA and 7x3 R8 map at the floor or its doublings and at
-/// nothing the unfloored ladder reaches; every image-sized texture is far
-/// above the floor and unaffected by it.
-///
-/// Whether the tight rung works is a property of the adapter, not of the
-/// texture, so the first allocation that has to climb records it in
+/// The declared size climbs a ladder (the exact bytes, then 2x, then 4x) and
+/// stops at the first rung the driver maps. The first rung is floored at one
+/// 4 KiB page. The first allocation that has to climb records it in
 /// [`CUDA_IMPORT_SIZE_PADDED`] and later ones start one rung up.
 #[cfg(all(target_os = "windows", not(edgefirst_tensor_dynamic)))]
 fn import_and_map_array(
@@ -1296,20 +1109,20 @@ pub trait CudaGlOps: Send + Sync {
 }
 
 enum CudaBacking {
-    #[allow(dead_code)] // consumed by C3/C4
+    #[allow(dead_code)]
     GlBuffer {
         resource: GraphicsResource,
         ops: Arc<dyn CudaGlOps>,
     },
-    #[allow(dead_code)] // consumed by C3/C4
+    #[allow(dead_code)]
     ExternalMem {
         ext_mem: ExternalMemory,
         dptr: *mut c_void,
     },
     #[cfg(all(target_os = "windows", not(edgefirst_tensor_dynamic)))]
     D3d11(D3d11External),
-    /// After [`CudaHandle::into_client_parts`] moved a GL registration across
-    /// the ABI; Drop must not unregister a resource the library now owns.
+    /// State after [`CudaHandle::into_client_parts`] moved a GL registration
+    /// across the ABI; Drop does not unregister.
     Detached,
 }
 
@@ -1388,7 +1201,7 @@ impl CudaHandle {
         }
     }
 
-    #[allow(dead_code)] // consumed by C3/C4
+    #[allow(dead_code)]
     pub(crate) fn new_external(ext_mem: ExternalMemory, dptr: *mut c_void, size: usize) -> Self {
         Self {
             kind: CudaBacking::ExternalMem { ext_mem, dptr },
@@ -1401,27 +1214,20 @@ impl CudaHandle {
     /// texture's array into its linear buffer, after waiting for the newest
     /// fence value recorded on the tensor.
     ///
-    /// The `D3d11` mapping is the texture's *tight* rows: `len()` is
+    /// The `D3d11` mapping is the texture's tight rows: `len()` is
     /// `width * bytes_per_texel * height` and row `n` starts at
-    /// `n * width * bytes_per_texel`, whatever the tensor's
-    /// [`row_stride`](crate::Tensor::row_stride) reports -- that is the D3D11
-    /// staging pitch a CPU map sees, a different number on a padded backing.
-    /// A consumer that strides the device pointer by `row_stride()` walks off
-    /// the end of the mapping.
+    /// `n * width * bytes_per_texel`, not at the tensor's
+    /// [`row_stride`](crate::Tensor::row_stride), which is the D3D11 staging
+    /// pitch a CPU map sees.
     ///
-    /// Semi-planar textures (NV12, NV16, NV24) are the exception: the texture
-    /// is as wide as its pitch by construction, so the mapping equals
-    /// `row_stride() x combined_height` bytes and striding by `row_stride()`
-    /// is exactly right.
+    /// For semi-planar textures (NV12, NV16, NV24) the texture is as wide as
+    /// its pitch, so the mapping equals `row_stride() x combined_height`
+    /// bytes.
     ///
-    /// One `D3d11` handle has one linear buffer, so two live maps of the same
+    /// One `D3d11` handle has one linear buffer: two live maps of the same
     /// tensor hand out the same device pointer and the second map's copy
-    /// refreshes what the first is reading. That is the same aliasing the GL
-    /// and external-memory backings have always had -- one buffer per handle,
-    /// not one per map. A `map()` taken while a [`map_mut`](Self::map_mut)
-    /// guard is live is the case that also loses data: it refreshes the buffer
-    /// under the writer, and the writer's release then publishes the array's
-    /// pre-write contents back into the texture. Callers serialise the two.
+    /// refreshes what the first is reading. Callers serialise a `map()` with
+    /// a live [`map_mut`](Self::map_mut) guard.
     pub fn map(&self) -> Option<CudaMap<'_>> {
         match &self.kind {
             CudaBacking::GlBuffer { resource, ops } => {
@@ -1452,27 +1258,11 @@ impl CudaHandle {
 
     /// Map to a device pointer for writing.
     ///
-    /// The GL and external-memory backings alias the same device memory for
-    /// reads and writes -- a GL buffer's CUDA mapping and an imported
-    /// external-memory allocation are each one address the caller may write
-    /// through -- so for them this is [`map`](Self::map). A `D3d11` texture is
-    /// the backing that does distinguish the two: its linear buffer is a copy
-    /// of an opaque array, so the map's release copies it back into the
-    /// texture and synchronises, and later D3D11 and GL work on the immediate
-    /// context is ordered after that write.
+    /// For the GL and external-memory backings this is [`map`](Self::map).
+    /// For a `D3d11` texture the map's release copies the linear buffer back
+    /// into the texture and synchronises.
     ///
-    /// The `D3d11` mapping is the texture's *tight* rows: `len()` is
-    /// `width * bytes_per_texel * height` and row `n` starts at
-    /// `n * width * bytes_per_texel`, whatever the tensor's
-    /// [`row_stride`](crate::Tensor::row_stride) reports -- that is the D3D11
-    /// staging pitch a CPU map sees, a different number on a padded backing.
-    /// A consumer that strides the device pointer by `row_stride()` walks off
-    /// the end of the mapping.
-    ///
-    /// Semi-planar textures (NV12, NV16, NV24) are the exception: the texture
-    /// is as wide as its pitch by construction, so the mapping equals
-    /// `row_stride() x combined_height` bytes and striding by `row_stride()`
-    /// is exactly right.
+    /// The `D3d11` mapping layout is the one [`map`](Self::map) describes.
     pub fn map_mut(&self) -> Option<CudaMap<'_>> {
         #[cfg(all(target_os = "windows", not(edgefirst_tensor_dynamic)))]
         if let CudaBacking::D3d11(x) = &self.kind {
@@ -1494,23 +1284,14 @@ impl CudaHandle {
     /// linear buffer from the texture's array and returns its device pointer.
     ///
     /// The wait, the copy and the synchronisation all run on this backing's
-    /// own stream, so the copy is ordered behind the D3D11 signal (the
-    /// sequence gpu-probe S5.6 measured as the one that never reads a stale
-    /// frame) without a device-wide barrier: a legacy-stream synchronisation
-    /// would also wait behind streams this crate hands to other consumers.
+    /// own stream. A recorded fence value the producer never signals blocks
+    /// the synchronisation.
     ///
-    /// A recorded fence value the producer never signals blocks the
-    /// synchronisation below until it is. That is inherent to waiting on a
-    /// fence: a value is a promise of work, and `set_gpu_write` is the
-    /// producer's statement that it queued it.
-    ///
-    /// Answers `None` when the wait cannot be issued at all
-    /// ([`d3d11_copy_is_ordered`]), like every other failure here.
+    /// Answers `None` when the wait cannot be issued
+    /// ([`d3d11_copy_is_ordered`]) and on every other failure.
     #[cfg(all(target_os = "windows", not(edgefirst_tensor_dynamic)))]
     fn d3d11_copy_in(&self, x: &D3d11External) -> Option<*mut c_void> {
         let t = table()?;
-        // Per-thread state: a consumer thread that last used another GPU would
-        // otherwise allocate on it and be unable to use this handle's stream.
         // SAFETY: `x.device` is the ordinal `import_d3d11_texture` cached for
         // the process D3D11 adapter.
         let rc = unsafe { (t.set_device)(x.device) };
@@ -1570,9 +1351,7 @@ impl CudaHandle {
             );
             return None;
         }
-        // One device copy per plane turns the tiled arrays into the tensor's
-        // tight rows, on the same stream as the wait above so they run
-        // behind it.
+        // One device copy per plane, on the same stream as the wait above.
         for plane in x.planes.iter() {
             // SAFETY: `dptr` holds `x.bytes` bytes, which covers every plane's
             // `offset + rows * row_bytes`; `plane.array` is a live array of the
@@ -1615,28 +1394,19 @@ impl Drop for CudaHandle {
             CudaBacking::Detached => {}
             CudaBacking::GlBuffer { resource, ops } => ops.unregister(*resource),
             CudaBacking::ExternalMem { ext_mem, dptr: _ } => {
-                // The device pointer comes from `cudaExternalMemoryGetMappedBuffer`,
-                // which CUDA frees together with the external-memory object. Calling
-                // `cudaFree` on such a pointer is explicitly disallowed and corrupts
-                // the driver's bookkeeping (risking a double-free when the handle is
-                // destroyed), so only destroy the external-memory object here.
+                // Destroys the external-memory object, which frees the mapped device
+                // pointer.
                 if let Some(t) = table() {
                     unsafe {
                         (t.destroy_external_memory)(*ext_mem);
                     }
                 }
             }
-            // Everything `import_d3d11_texture` created for *this* handle,
-            // released in reverse: the linear buffer (this one IS a
-            // `cudaMalloc` pointer, unlike `ExternalMem`'s), then the stream,
-            // then the array before the external memory it was mapped from.
-            // The external semaphore is not here: it is the process import
-            // (`shared_semaphore`) and outlives every handle.
+            // Releases the linear buffer, the stream, the array and the external
+            // memory, in that order.
             #[cfg(all(target_os = "windows", not(edgefirst_tensor_dynamic)))]
             CudaBacking::D3d11(x) => {
                 let Some(t) = table() else { return };
-                // The handle can be dropped on any thread; the objects below
-                // all belong to the D3D11 adapter's device.
                 // SAFETY: `x.device` is the ordinal `import_d3d11_texture`
                 // cached for that adapter.
                 let rc = unsafe { (t.set_device)(x.device) };
@@ -1806,16 +1576,14 @@ enum Release {
     },
 }
 
-/// Scoped CUDA device-pointer mapping. `Drop` unmaps a `GlBuffer` (so GL may
-/// reuse the PBO for the next `convert()` call) and copies a writable `D3d11`
-/// mapping back into the texture. `ExternalMem` mappings are persistent —
-/// `Drop` is a no-op.
+/// Scoped CUDA device-pointer mapping. `Drop` unmaps a `GlBuffer` and copies a
+/// writable `D3d11` mapping back into the texture. `ExternalMem` mappings are
+/// persistent: `Drop` is a no-op.
 ///
 /// A `D3d11` mapping is the texture's tight rows: [`len`](Self::len) is
 /// `width * bytes_per_texel * height` and rows are `width * bytes_per_texel`
-/// apart, which is *not* the tensor's `row_stride()` (the D3D11 staging pitch
-/// a CPU map sees) on a padded backing. A semi-planar texture is as wide as
-/// its own pitch, so there the two numbers agree and the mapping is
+/// apart, not the tensor's `row_stride()`. A semi-planar texture is as wide
+/// as its own pitch, so there the mapping is
 /// `row_stride() x combined_height` bytes.
 pub struct CudaMap<'a> {
     ptr: *mut c_void,
@@ -1826,12 +1594,8 @@ pub struct CudaMap<'a> {
 
 // SAFETY: the mapped device pointer is process-global and valid cross-thread
 // via the per-device CUDA primary context; the routed CudaGlOps is Send+Sync.
-// A `Release::FfiUnmap` handle is likewise cross-thread: it owns a retain on a
-// refcounted `ef_tensor`, whose retain and free are atomic and whose accessors
-// are documented safe to call from any thread (`crates/tensor-capi/src/
-// handle.rs`, `ef_tensor_retain` and `ef_tensor_set_colorimetry`'s
-// Concurrency note). Required so callers can hold the guard on a separate
-// inference thread.
+// A `Release::FfiUnmap` handle owns a retain on a refcounted `ef_tensor`, whose
+// retain and free are atomic.
 unsafe impl Send for CudaMap<'_> {}
 unsafe impl Sync for CudaMap<'_> {}
 
@@ -1853,23 +1617,17 @@ impl CudaMap<'_> {
 
     /// Adopt the opaque map `ef_tensor_cuda_map`/`_map_mut` returned.
     ///
-    /// The `dynamic` backend's tensors are allocated inside
-    /// `libedgefirst_tensor`, which attaches their [`CudaHandle`] to its own
-    /// `Tensor` -- an object the Rust-side wrapper does not hold -- so the
-    /// mapping is taken and released across the ABI instead. The C map holds
-    /// its own retain on the tensor handle, so this guard stays valid for as
-    /// long as it lives, and dropping it releases both.
+    /// The C map holds its own retain on the tensor handle; dropping this
+    /// guard releases both.
     ///
     /// Returns `None` (having released `raw`) when the map carries no device
-    /// pointer, so a caller never sees a mapping it cannot read.
+    /// pointer.
     ///
     /// # Safety
     /// `raw` must be a live, non-NULL map from `ef_tensor_cuda_map` or
     /// `ef_tensor_cuda_map_mut` that no one else will release: ownership
     /// passes to the guard returned here, which calls `ef_tensor_cuda_unmap`
-    /// on it exactly once -- immediately when there is no device pointer,
-    /// otherwise on drop. A second release is a double free of the map and of
-    /// the tensor retain it holds.
+    /// on it exactly once.
     #[cfg(edgefirst_tensor_dynamic)]
     pub(crate) unsafe fn from_ffi(raw: *mut c_void) -> Option<Self> {
         let mut len = 0usize;
@@ -1877,8 +1635,7 @@ impl CudaMap<'_> {
         // is a live local; the accessor takes either kind of map.
         let ptr = unsafe { edgefirst_tensor_ffi::ef_tensor_cuda_device_ptr(raw, &mut len) };
         if ptr.is_null() {
-            // SAFETY: as above -- releasing, exactly once, a map whose pointer
-            // is unusable, before ownership reaches any caller.
+            // SAFETY: as above; the map is released exactly once.
             unsafe { edgefirst_tensor_ffi::ef_tensor_cuda_unmap(raw) };
             return None;
         }
@@ -1893,13 +1650,11 @@ impl CudaMap<'_> {
 
 impl Drop for CudaMap<'_> {
     fn drop(&mut self) {
-        // Taken, not borrowed, so the release happens exactly once even if a
-        // future `CudaMap` gains a way to be released early.
+        // Takes the release so it runs exactly once.
         match std::mem::replace(&mut self.release, Release::None) {
             Release::None => {}
             Release::GlUnmap(ops, r) => ops.unmap(r),
-            // The write-back a writable D3D11 map owes happens inside the C
-            // library, on the `CudaMap` this handle wraps there.
+            // The write-back of a writable D3D11 map happens inside the C library.
             #[cfg(edgefirst_tensor_dynamic)]
             Release::FfiUnmap(h) => {
                 // SAFETY: the handle came from `ef_tensor_cuda_map`/`_map_mut`
@@ -1913,15 +1668,10 @@ impl Drop for CudaMap<'_> {
                 device,
             } => {
                 let Some(t) = table() else { return };
-                // The guard can be dropped on any thread; the stream and the
-                // array belong to the D3D11 adapter's device.
                 // SAFETY: `device` is the ordinal `import_d3d11_texture`
                 // cached for that adapter.
                 let rc = unsafe { (t.set_device)(device) };
                 if rc != 0 {
-                    // The write-back is what publishes `cuda_map_mut`'s
-                    // buffer; `Drop` cannot propagate, so this line is the
-                    // whole report that the caller's writes were lost.
                     log::warn!(
                         "cudaSetDevice({device}) before the D3D11 write-back: {}",
                         err_str(t, rc)
@@ -1951,9 +1701,7 @@ impl Drop for CudaMap<'_> {
                         log::warn!("cudaMemcpy2DToArrayAsync: {}", err_str(t, rc));
                     }
                 }
-                // Synchronised here, not left in flight: the copy above is
-                // asynchronous, and later D3D11 and GL work on the immediate
-                // context has no other ordering against this write.
+                // Synchronises the asynchronous copy above.
                 // SAFETY: `stream` is the backing's live stream.
                 let rc = unsafe { (t.stream_synchronize)(stream) };
                 if rc != 0 {
@@ -1974,7 +1722,7 @@ mod ext_mem_layout {
     fn external_memory_desc_abi() {
         assert_eq!(std::mem::size_of::<CudaExternalMemoryHandleDesc>(), 40);
         assert_eq!(std::mem::align_of::<CudaExternalMemoryHandleDesc>(), 8);
-        // size field at offset 24, flags at 32 (verified vs driver_types.h)
+        // size field at offset 24, flags at 32
         let d: CudaExternalMemoryHandleDesc = unsafe { std::mem::zeroed() };
         let base = &d as *const _ as usize;
         assert_eq!((&d.size as *const _ as usize) - base, 24);
@@ -1990,11 +1738,7 @@ mod ext_mem_layout {
 mod d3d11_ordering {
     use super::d3d11_copy_is_ordered;
 
-    /// The rule the D2D copy is gated on. A recorded write with no wait behind
-    /// it is the one combination that must decline: copying would read a
-    /// texture the producer is still writing, silently and only sometimes,
-    /// while `None` sends the caller to the host map the immediate context
-    /// orders.
+    /// A recorded write with no wait behind it declines the copy.
     #[test]
     fn a_recorded_write_with_no_wait_behind_it_declines_the_copy() {
         assert!(d3d11_copy_is_ordered(0, false), "nothing to wait for");
@@ -2014,42 +1758,16 @@ mod d3d11_desc_layout {
         (field as *const F as usize) - (base as *const T as usize)
     }
 
-    // Field offsets measured against this box's CUDA 11.8 driver_types.h
-    // with a compiled offsetof program (`cl /nologo /I"%CUDA_PATH%\include"
-    // layouts.c`, MSVC from VS 2026's dev shell, x64):
-    //   handle_desc 40 handle@8 size@24 flags@32
-    //   mip_desc 64 format@8 extent@32 flags@56 levels@60
-    //   sem_desc 32 handle@8 flags@24
-    //   wait_params 144 value@0 flags@72
-    // These offsets are asserted below and hold in both 11.8 and 12.x/13.x
-    // (the newer headers only append fields after them).
-    //
-    // The sizes asserted below (104/128/96/144) are the CUDA 12.x/13.x
-    // sizes, not the 11.8 sizes just measured (40/64/32/144) -- see the
-    // struct docs and the section comment above `CudaExternalMemoryHandleDescWin32`
-    // for why: the loader prefers a 12.x/13.x runtime when present, and that
-    // runtime reads `unsigned int reserved[16]` fields these three structs
-    // don't have in 11.8's header. No 12.x/13.x driver_types.h exists on this
-    // box to run the offsetof program against, so 104/128/96 are derived
-    // arithmetically here: each struct's measured 11.8 layout, plus 64 bytes
-    // for `reserved[16]`, plus padding to the next multiple of 8 (this
-    // module's structs are all 8-aligned, from their `u64`/pointer fields):
-    //   handle_desc: 36 (fields end) + 64 (reserved) = 100 -> pad to 104
-    //   mip_desc:    64 (fields end) + 64 (reserved) = 128 -> already aligned
-    //   sem_desc:    28 (fields end) + 64 (reserved) = 92  -> pad to 96
-    // `cudaExternalSemaphoreWaitParams` already carries its reserved arrays
-    // in 11.8, so 144 is both the 11.8 and the 12.x/13.x size.
+    /// The D3D11 descriptor structs have the CUDA 12.x/13.x field offsets and
+    /// sizes.
     #[test]
     fn external_memory_and_semaphore_descs_match_driver_types_h() {
         assert_eq!(
             std::mem::size_of::<CudaExternalMemoryHandleDescWin32>(),
             104
         );
-        // SAFETY: every field of `CudaExternalMemoryHandleDescWin32` is an
-        // integer, raw pointer or fixed-size array of those -- all-zero is a
-        // valid bit pattern for each, so a zeroed instance is well-defined;
-        // this test only reads field offsets and the struct's size, never
-        // dereferences the null `win32_handle`/`win32_name` pointers.
+        // SAFETY: every field is an integer, raw pointer or fixed-size array of
+        // those, so all-zero is a valid bit pattern.
         let d: CudaExternalMemoryHandleDescWin32 = unsafe { std::mem::zeroed() };
         assert_eq!(off(&d, &d.win32_handle), 8);
         assert_eq!(off(&d, &d.size), 24);
@@ -2058,22 +1776,22 @@ mod d3d11_desc_layout {
             std::mem::size_of::<CudaExternalMemoryMipmappedArrayDesc>(),
             128
         );
-        // SAFETY: same reasoning as `d` above -- every field is an integer,
-        // nested POD struct or array of those, so all-zero is valid.
+        // SAFETY: every field is an integer, nested POD struct or array of those,
+        // so all-zero is valid.
         let m: CudaExternalMemoryMipmappedArrayDesc = unsafe { std::mem::zeroed() };
         assert_eq!(off(&m, &m.format_desc), 8);
         assert_eq!(off(&m, &m.extent), 32);
         assert_eq!(off(&m, &m.flags), 56);
         assert_eq!(off(&m, &m.num_levels), 60);
         assert_eq!(std::mem::size_of::<CudaExternalSemaphoreHandleDesc>(), 96);
-        // SAFETY: same reasoning as `d` above; the null `win32_handle`/
-        // `win32_name` pointers are never dereferenced.
+        // SAFETY: every field is an integer, raw pointer or array of integers, so
+        // all-zero is valid.
         let s: CudaExternalSemaphoreHandleDesc = unsafe { std::mem::zeroed() };
         assert_eq!(off(&s, &s.win32_handle), 8);
         assert_eq!(off(&s, &s.flags), 24);
         assert_eq!(std::mem::size_of::<CudaExternalSemaphoreWaitParams>(), 144);
-        // SAFETY: same reasoning as `d` above -- every field is an integer
-        // or fixed-size array of integers, so all-zero is valid.
+        // SAFETY: every field is an integer or fixed-size array of integers, so
+        // all-zero is valid.
         let w: CudaExternalSemaphoreWaitParams = unsafe { std::mem::zeroed() };
         assert_eq!(off(&w, &w.fence_value), 0);
         assert_eq!(off(&w, &w.flags), 72);
@@ -2084,14 +1802,8 @@ mod d3d11_desc_layout {
 mod tests {
     use super::*;
 
-    // The loaded-runtime half (a table, a runtime path, a working stream) is
-    // `tests/cuda_runtime_loader.rs`, behind `HAL_TEST_REQUIRE_CUDA`.
     #[test]
     fn pub_primitives_degrade_without_libcudart() {
-        // On hosts without libcudart (all CI coverage lanes), the public CUDA
-        // primitives must degrade cleanly — None / false / no-op, never panic.
-        // Skip on a CUDA host, where these would touch the real driver without
-        // a current GL context.
         if is_cuda_available() {
             crate::test_support::report_skip(
                 "pub_primitives_degrade_without_libcudart - a CUDA runtime is loaded",
@@ -2103,10 +1815,10 @@ mod tests {
         assert!(stream_create().is_none());
         assert!(gl_register_buffer(0).is_none());
         assert!(gl_map_resource(0).is_none());
-        gl_unmap_resource(0); // no-op without a table — must not panic
-        gl_unregister_resource(0); // no-op without a table — must not panic
+        gl_unmap_resource(0); // no-op without a table
+        gl_unregister_resource(0); // no-op without a table
                                    // SAFETY: with no libcudart, memcpy_device_to_host returns false before
-                                   // touching the pointers, so null/zero args are sound here.
+                                   // touching the pointers.
         assert!(!unsafe { memcpy_device_to_host(std::ptr::null_mut(), std::ptr::null(), 0) });
     }
 }
@@ -2168,8 +1880,7 @@ mod handle_tests {
         );
     }
 
-    /// Off D3D11, a writable mapping is the same mapping as a read one, with
-    /// the same unmap on drop.
+    /// A writable mapping of a GlBuffer maps and unmaps like a read one.
     #[test]
     fn map_mut_of_a_glbuffer_maps_and_unmaps_like_map() {
         let unmaps = Arc::new(AtomicUsize::new(0));
@@ -2229,8 +1940,7 @@ mod handle_tests {
 
     #[test]
     fn external_mem_map_is_persistent_and_debug_names_kind() {
-        // ExternalMem handle: map() returns the persistent device ptr directly
-        // (no GL routing, unmap is a no-op). Construct with a synthetic ptr.
+        // ExternalMem handle: map() returns the persistent device ptr directly.
         let dptr = 0xCAFE_0000usize as *mut std::ffi::c_void;
         let h = CudaHandle::new_external(std::ptr::null_mut(), dptr, 8192);
         let dbg = format!("{h:?}");
@@ -2240,10 +1950,10 @@ mod handle_tests {
             assert_eq!(m.device_ptr(), dptr, "persistent device ptr passthrough");
             assert_eq!(m.len(), 8192);
             assert!(!m.is_empty());
-            // CudaMap drops here: ExternalMem mapping has unmap=None → no-op, safe.
+            // CudaMap drops here; an ExternalMem mapping has no unmap.
         }
-        // HOST-SAFETY: dropping `h` would call the real cudaDestroyExternalMemory
-        // on this synthetic handle (libcudart is present on dev hosts). Forget it.
+        // Forgets `h`, whose drop would call cudaDestroyExternalMemory on the
+        // synthetic handle.
         std::mem::forget(h);
     }
 
@@ -2297,9 +2007,8 @@ mod handle_tests {
         calls(ctx).unregisters.fetch_add(1, Ordering::SeqCst);
     }
 
-    /// A client channel's ops forward each call through its function
-    /// pointers once, map a non-zero return code to `None`, and hold one
-    /// reference on the channel for their lifetime.
+    /// A client channel's ops forward each call through its function pointers
+    /// and hold one reference on the channel.
     #[test]
     fn client_channel_ops_forward_through_the_clients_functions() {
         let log = ClientCalls::default();
@@ -2369,6 +2078,6 @@ mod handle_tests {
             assert!(m.is_empty(), "zero-length mapping is empty");
             assert!(m.device_ptr().is_null());
         }
-        std::mem::forget(h); // HOST-SAFETY: avoid real cudaDestroyExternalMemory
+        std::mem::forget(h); // skips cudaDestroyExternalMemory
     }
 }

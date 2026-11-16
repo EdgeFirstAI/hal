@@ -360,7 +360,7 @@ delegate's buffer:
 ```rust,ignore
 use edgefirst_tensor::PlaneDescriptor;
 
-// UC1: Render into VxDelegate's DMA-BUF — zero copies
+// Render into VxDelegate's DMA-BUF — zero copies
 let pd = PlaneDescriptor::new(vx_fd.as_fd())?;  // dups fd — caller keeps ownership
 let mut dst = processor.import_image(
     pd,
@@ -371,7 +371,7 @@ let mut dst = processor.import_image(
     None,               // colorimetry: supply the producer's signalling for YUV sources
 )?;
 processor.convert(&src, &mut dst, Some(ConvertOptions::new().letterbox([114, 114, 114, 255])))?;
-// dst's backing memory IS vx_fd — no memcpy needed
+// dst's backing memory is vx_fd — no memcpy needed
 ```
 
 For the reverse direction (HAL allocates, consumer imports):

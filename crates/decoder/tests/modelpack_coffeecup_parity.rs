@@ -1,9 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! Parity tests: HAL ModelPack anchor-grid decoder vs the canonical
-//! ModelPack Python reference (``deepview/modelpack/demos/models/
-//! inference_no_decoder.py``) on the coffeecup detection model.
+//! Parity tests: HAL ModelPack anchor-grid decoder vs the ModelPack Python
+//! reference on the coffeecup detection model.
 //!
 //! Two fixtures:
 //! * ``coffeecup-mpk-det-relu-t-27d6_quant-u8-i8_smart.safetensors`` —
@@ -12,9 +11,7 @@
 //!   outputs from the pre-quantization export.
 //!
 //! Both fixtures embed the ``edgefirst.json`` schema, the raw model
-//! outputs, and the post-NMS reference detections produced by running
-//! ModelPack's reference decode formula in NumPy. The HAL decoder
-//! must reproduce those detections within a small tolerance.
+//! outputs, and the post-NMS reference detections.
 //!
 //! Fixtures are regenerated with
 //! ``scripts/decoder_generate_modelpack_fixture.py``.
@@ -88,9 +85,7 @@ fn assert_coffeecup_parity(fixture_filename: &str, score_tol: f32, iou_floor: f3
         hal_boxes.len()
     );
 
-    // Greedy IoU match each reference detection to a HAL detection.
-    // With ref_n == 1 (single coffeecup) the match is unambiguous;
-    // the loop generalises for future multi-object fixtures.
+    // Greedy IoU match of each reference detection to a HAL detection.
     let mut consumed = vec![false; hal_boxes.len()];
     for i in 0..ref_n {
         let ref_box: [f32; 4] = [
@@ -139,9 +134,6 @@ fn assert_coffeecup_parity(fixture_filename: &str, score_tol: f32, iou_floor: f3
 
 #[test]
 fn coffeecup_modelpack_int8_smart_parity() {
-    // Same fixture as the float ONNX path, just routed through the int8
-    // dequant→sigmoid kernel. Tolerance is looser because the per-scale
-    // quantization round-trip drifts a few percent at sigmoid boundaries.
     assert_coffeecup_parity(
         "coffeecup-mpk-det-relu-t-27d6_quant-u8-i8_smart.safetensors",
         /* score_tol = */ 0.02,
@@ -151,8 +143,6 @@ fn coffeecup_modelpack_int8_smart_parity() {
 
 #[test]
 fn coffeecup_modelpack_float_onnx_parity() {
-    // Float-to-float: HAL and the NumPy reference should agree to within
-    // floating-point round-off on a single coffeecup detection.
     assert_coffeecup_parity(
         "coffeecup-mpk-det-relu-t-27d6.safetensors",
         /* score_tol = */ 0.001,

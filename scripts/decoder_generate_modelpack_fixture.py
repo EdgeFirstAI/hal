@@ -12,11 +12,6 @@ Supports both TFLite (int8 quantized, zip-wrapped with embedded
 ``metadata_props``) models produced by ModelPack 4.0+ exports with
 ``decoder: modelpack`` and ``encoding: anchor`` per output.
 
-The fixture lets HAL Rust tests load the raw tensors and the embedded
-``edgefirst.json`` schema, run the HAL ModelPack decoder, and assert
-parity against the reference detections — without pulling any inference
-runtime into the Rust test.
-
 REFERENCE DECODE FORMULA
 ------------------------
 Per FPN scale with shape ``[1, H, W, num_anchors * (5 + nc)]``::
@@ -29,8 +24,6 @@ Per FPN scale with shape ``[1, H, W, num_anchors * (5 + nc)]``::
     cls  = g[..., 5:]
     scores = obj                  if nc == 1 else obj * cls
     boxes_xyxy = concat([xy - wh, xy + wh], axis=-1)
-
-Mirrors ``deepview/modelpack/demos/models/inference_no_decoder.py``.
 
 USAGE
 -----
@@ -163,10 +156,7 @@ def preprocess_image(image_path: Path, in_h: int, in_w: int) -> np.ndarray:
 def infer_tflite(model_path: Path, image_uint8_nhwc: np.ndarray) -> dict[tuple[int, ...], np.ndarray]:
     """Run TFLite inference; return {shape: raw_int8_tensor}.
 
-    Binds outputs by shape (TFLite output names like ``PartitionedCall:0``
-    don't map to schema names like ``output_0``). Per-tensor quantization
-    parameters travel via the embedded ``edgefirst.json`` instead of being
-    threaded out of this function.
+    Outputs are keyed by shape.
     """
     try:
         from tflite_runtime.interpreter import Interpreter
@@ -397,9 +387,7 @@ def main() -> None:
     else:
         raise SystemExit(f"unsupported model suffix {suffix!r}; expect .tflite or .onnx")
 
-    # 2. Preprocess (always feed inference an NHWC uint8 tensor — infer_onnx
-    # transposes to NCHW where needed; in_h/in_w come from whichever layout
-    # the schema declares).
+    # 2. Preprocess to an NHWC uint8 tensor.
     in_h, in_w, layout = detect_input_hw(schema["input"]["shape"])
     image_uint8 = preprocess_image(image_path, in_h, in_w)
 
@@ -432,21 +420,16 @@ def main() -> None:
         tensors[f"intermediate.{name}.dequant"] = np.ascontiguousarray(t)
     tensors["decoded.boxes_xyxy"] = np.ascontiguousarray(boxes_xyxy.astype(np.float32))
     tensors["decoded.scores"] = np.ascontiguousarray(scores.astype(np.float32))
-    # Use uint32 so PerScaleFixture::decoded() reads it as the u32 it expects.
+    # Classes are stored as uint32.
     tensors["decoded.classes"] = np.ascontiguousarray(classes.astype(np.uint32))
 
-    # 6. Metadata — keys match testdata/decoder/common/per_scale_fixture.rs
-    # so the existing PerScaleFixture loader can consume modelpack fixtures
-    # without code duplication. For the float ONNX path we emit an empty
-    # ``quantization_json`` map so the loader skips quant attachment.
+    # 6. Metadata, with the keys testdata/decoder/common/per_scale_fixture.rs
+    # reads. The float ONNX path writes an empty ``quantization_json`` map.
     quant_meta = {
         spec["name"]: spec["quantization"]
         for spec in schema["outputs"]
         if spec.get("quantization") is not None
     }
-    # Key name ``max_detections`` matches PerScaleFixture::load() so the
-    # Rust test reads the actual fixture-time cap instead of falling back
-    # to the loader's default.
     nms_cfg = {
         "mode": "class_agnostic",
         "score_threshold": cfg.score_threshold,
@@ -464,7 +447,7 @@ def main() -> None:
         "generator_git_sha": git_sha(),
         "reference_script_sha256": sha256_file(Path(__file__).resolve()),
         "schema_json": json.dumps(schema, separators=(",", ":")),
-        "edgefirst_json": json.dumps(schema, separators=(",", ":")),  # alias for layout-fixture parity
+        "edgefirst_json": json.dumps(schema, separators=(",", ":")),  # alias
         "quantization_json": json.dumps(quant_meta, separators=(",", ":")),
         "nms_config_json": json.dumps(nms_cfg, separators=(",", ":")),
         "expected_count_min": str(len(boxes_xyxy)),

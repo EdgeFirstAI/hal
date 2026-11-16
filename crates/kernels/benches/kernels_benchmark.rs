@@ -53,7 +53,7 @@ fn report(suite: &mut BenchSuite, result: &edgefirst_bench::BenchResult) {
     suite.record(result);
 }
 
-/// A straightforward per-element float-table int8 softmax, the stock-speed reference.
+/// A per-element float-table int8 softmax, the reference timing.
 fn scalar_tflite_loop(
     input: &[i8],
     output: &mut [i8],

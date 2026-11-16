@@ -68,25 +68,11 @@ impl Texture {
     ///
     /// `required` is how many bytes GL will read: `(height - 1)` row strides
     /// plus the last row's own pixels, where the stride is whatever
-    /// `UNPACK_ROW_LENGTH` the caller has set (`UNPACK_ALIGNMENT` is 1 from
-    /// `new`, so rows carry no extra padding). GL reads through a raw
-    /// pointer and cannot see a slice's length, so [`UploadSource::Bytes`]
-    /// shorter than that would have the driver read past the mapping --
-    /// which is not a hypothetical: a tensor's map is clamped to what its
-    /// window actually covers (`HostView::len_elems`), so a plane offset
-    /// restored from an untrusted descriptor shortens the map while width
-    /// and height stay whole. Refusing here turns that into a fallback to
-    /// the CPU converter instead of an out-of-bounds read. See
-    /// `crates/tensor/src/d3d11/texture.rs::check_view_offset` and
-    /// `IoSurfaceTensor::check_view_offset`, which refuse the same window at
-    /// the source; this is the check that does not depend on which backing
-    /// produced the map. An [`UploadSource::Pbo`] read past its buffer is
-    /// refused by GL itself (`GL_INVALID_OPERATION`), which the caller's
-    /// `check_gl_error` reports.
+    /// `UNPACK_ROW_LENGTH` the caller has set. An [`UploadSource::Bytes`]
+    /// shorter than that is refused with `NotSupported`.
     ///
     /// `format` is also the internal format, except that `RED` and `RG` are
-    /// allocated as the sized `R8` and `RG8`: OpenGL ES 3.0 has no unsized
-    /// internal format for either.
+    /// allocated as the sized `R8` and `RG8`.
     pub(super) fn upload(
         &mut self,
         target: edgefirst_gl::gl::types::GLenum,
@@ -110,7 +96,7 @@ impl Texture {
                 (data.as_ptr() as *const c_void, None)
             }
             // With a buffer bound to `PIXEL_UNPACK_BUFFER`, the `pixels`
-            // argument is a byte offset into it rather than an address.
+            // argument is a byte offset into it.
             UploadSource::Pbo { buffer_id, offset } => (offset as *const c_void, Some(buffer_id)),
         };
         let internal_format = match format {
@@ -164,23 +150,21 @@ impl Texture {
         Ok(())
     }
 
-    /// Forget the recorded storage so the next [`Self::upload`] allocates
-    /// afresh with `TexImage2D` instead of writing into whatever the texture
-    /// holds now -- which, after an attach, is a client buffer.
+    /// Forget the recorded storage: the next [`Self::upload`] allocates
+    /// afresh with `TexImage2D`.
     pub(super) fn forget_storage(&mut self) {
         self.target = 0;
     }
 
     /// Attach a platform import to this GL_TEXTURE_2D texture if the key
     /// differs from what's already bound. Returns `true` if the attach was
-    /// performed, `false` if skipped (already bound). The binding-skip
-    /// cache applies only where attachments persist
-    /// (`GlPlatform::PERSISTENT_TEX_BINDINGS`) — on macOS every call
-    /// attaches and the platform releases at its sync point.
+    /// performed, `false` if skipped (already bound). The skip applies only
+    /// where attachments persist (`GlPlatform::PERSISTENT_TEX_BINDINGS`);
+    /// elsewhere every call attaches.
     ///
     /// # Safety
     /// Caller must ensure the texture is bound to the active texture unit
-    /// and `handle`'s import is alive (cache-owned).
+    /// and `handle`'s import is alive.
     pub(super) unsafe fn bind_egl_image(
         &mut self,
         display: &<Platform as GlPlatform>::Display,
@@ -200,8 +184,7 @@ impl Texture {
     /// Attach a platform import to this GL_TEXTURE_EXTERNAL_OES texture if
     /// the key differs from what's already bound. Returns `true` if the
     /// attach was performed, `false` if skipped. Errors on platforms
-    /// without the OES extension (`PlatformCaps::external_oes` gates the
-    /// path before it gets here).
+    /// without the OES extension.
     ///
     /// # Safety
     /// As [`Self::bind_egl_image`].
@@ -317,8 +300,6 @@ pub(super) struct GlProgram {
 
 impl GlProgram {
     pub(super) fn new(vertex_shader: &str, fragment_shader: &str) -> Result<Self, crate::Error> {
-        // Shared compile+link (deletes the shaders after a successful link) —
-        // see `gl::core::compile_program`.
         let id = unsafe { super::core::compile_program(vertex_shader, fragment_shader)? };
         unsafe { edgefirst_gl::gl::UseProgram(id) };
         Ok(Self { id })

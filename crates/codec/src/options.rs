@@ -23,11 +23,11 @@ pub struct ImageInfo {
     pub format: PixelFormat,
     /// Row stride in bytes used when writing into the tensor.
     pub row_stride: usize,
-    /// EXIF orientation: clockwise rotation in degrees (0/90/180/270) the
-    /// consumer should apply downstream (e.g. via `convert()`). The codec does
-    /// **not** rotate. `0` when there is no EXIF orientation.
+    /// EXIF orientation: clockwise rotation in degrees (0/90/180/270) for the
+    /// consumer to apply. The codec does not rotate. `0` when there is no EXIF
+    /// orientation.
     pub rotation_degrees: u16,
-    /// EXIF horizontal flip the consumer should apply downstream. `false` when
-    /// there is no EXIF orientation.
+    /// EXIF horizontal flip for the consumer to apply. `false` when there is
+    /// no EXIF orientation.
     pub flip_horizontal: bool,
 }

@@ -3,22 +3,18 @@
 
 //! The tensor blob: a size-prefixed, append-only serialization of a tensor.
 //!
-//! # Why a blob and not the descriptor
-//!
 //! [`TensorDesc`](crate::TensorDesc) is a fixed C struct with one handle and no
 //! plane table. The blob carries every plane explicitly, in either of two
-//! transport modes, and survives being appended to.
+//! transport modes.
 //!
 //! # Layout
 //!
-//! **Region order is permanent from first publication.** The format is
-//! size-prefixed and append-only: a new field may only be appended, never
-//! inserted, and `required_mask` covers the one case appending cannot — an
-//! addition that changes how existing fields are *interpreted*, where an
-//! unaware consumer must refuse rather than proceed.
+//! The format is size-prefixed and append-only: a new field is appended, not
+//! inserted. `required_mask` marks an addition that changes how existing fields
+//! are interpreted; a consumer that does not recognise a bit refuses the blob.
 //!
-//! The fixed header is 64 bytes, laid out widest-first so every scalar is
-//! naturally aligned and no reader performs an unaligned access:
+//! The fixed header ([`HEADER_LEN`] bytes) is laid out widest-first so every
+//! scalar is naturally aligned:
 //!
 //! | Offset | Type | Field |
 //! |---|---|---|
@@ -38,67 +34,38 @@
 //! | 64 | `u32` | `strides_len` — `ndim` entries, or 0 for densely packed |
 //! | 68 | `u32` | *reserved, must be zero* — keeps the tail 8-aligned |
 //!
-//! `strides_len` is carried rather than assumed because empty strides are a
-//! distinct, meaningful value: `Tensor.msg` defines an empty array as "densely
-//! packed C-order". Always writing `ndim` strides would be simpler but would
-//! turn a message with empty strides into a blob with explicit ones, so the
-//! reference-mode round-trip would no longer be the identity.
-//!
-//! Because every variable region's length lives in the fixed header, each
-//! region's offset is a constant-time arithmetic derivation. This is the one
-//! thing CDR cannot do — it has no offset table, so a message's variable
-//! fields must be walked sequentially — and it is why the blob is worth having
-//! alongside the message rather than simply reusing it.
+//! Each variable region's length lives in the fixed header, so each region's
+//! offset is derived by arithmetic.
 //!
 //! Every integer is little-endian on every host, read and written explicitly.
-//! The blob is never `transmute`d from a struct: that would bake in host byte
-//! order and padding, and this format crosses hosts.
 
 /// Bytes in the fixed header. See the module docs for the field table.
 pub const HEADER_LEN: usize = 72;
 
-/// Bytes in a plane record's scalar block, before its variable payloads.
-///
-/// Matches the schemas spec's independently-stated `TensorPlane` minimum: a
+/// Bytes in a plane record's scalar block, before its variable payloads: a
 /// 48-byte scalar block (six 8-byte fields) plus two 4-byte counts.
 pub const PLANE_RECORD_LEN: usize = 56;
 
-/// `required_mask` bits this build understands. Zero: no interpretation-changing
-/// field has been added yet, so *any* bit set means a producer needs something
-/// from us that we cannot provide, and we must refuse.
+/// `required_mask` bits this build understands. Zero: any bit set is refused.
 pub const SUPPORTED_REQUIRED_MASK: u64 = 0;
 
-/// Byte offset of [`BlobHeader::pid`] inside the fixed header, as the table
-/// in the module docs assigns it. Named so nothing re-derives the layout by
-/// hand; `pid_offset_matches_the_writer` pins it to what
-/// [`BlobHeader::write_to`] actually emits.
+/// Byte offset of [`BlobHeader::pid`] inside the fixed header.
 pub const HEADER_PID_OFFSET: usize = 28;
 
 /// Bytes a Windows D3D11 reference plane carries in
 /// [`BlobPlane::handle_bytes`]: three little-endian `u64`s, in order the
 /// texture NT handle value, the fence NT handle value and the fence value of
 /// the last recorded GPU write.
-///
-/// Not a `required_mask` bit: a plane's `handle_bytes` length is already part
-/// of its record, and a consumer that does not understand a D3D11 reference
-/// refuses it on the storage kind rather than on the byte count.
 pub const D3D11_HANDLE_BYTES: usize = 24;
 
-/// File-descriptor slot in the blob's accompanying table.
-///
-/// `std::os::fd` exists only on Unix. Windows still type-checks `export` /
-/// `import` so the crate builds; the table is unused there (no dma-buf / SHM).
+/// File-descriptor slot in the blob's accompanying table. The table is unused
+/// on non-Unix targets.
 #[cfg(unix)]
 type BlobFd = std::os::fd::RawFd;
 #[cfg(not(unix))]
 type BlobFd = i32;
 
-/// What went wrong parsing a blob.
-///
-/// Every variant is a *refusal*, never a best-effort recovery: a blob arrives
-/// from another wheel, another process, or a network, so every count and length
-/// in its header is attacker-controlled. Recovering from a bad one means acting
-/// on a value an attacker chose.
+/// What went wrong parsing a blob. Every variant is a refusal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BlobError {
     /// The buffer is shorter than the structure it claims to contain.
@@ -108,9 +75,7 @@ pub enum BlobError {
         /// Bytes actually available.
         have: usize,
     },
-    /// `required_mask` carries a bit this build does not understand. The
-    /// producer needs an interpretation we cannot provide, so proceeding would
-    /// silently misread the data.
+    /// `required_mask` carries a bit this build does not understand.
     UnsupportedRequirement(u64),
     /// A count or length would overflow when multiplied out, or derives an
     /// offset past the end of the blob.
@@ -150,14 +115,11 @@ impl std::error::Error for BlobError {}
 
 /// The blob's fixed header. See the module docs for the byte layout.
 ///
-/// Field order here mirrors the byte layout so the two can be read side by
-/// side, but this struct is never cast to or from bytes — see [`Self::write_to`]
-/// and [`parse_header`], which go field by field in explicit little-endian.
+/// Field order mirrors the byte layout. [`Self::write_to`] and
+/// [`parse_header`] convert field by field in explicit little-endian.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct BlobHeader {
-    /// Total bytes of this blob, header included. The size prefix that makes
-    /// the format append-only: an older consumer reads the prefix it knows and
-    /// skips to `size`.
+    /// Total bytes of this blob, header included.
     pub size: u64,
     /// Bits describing additions that change interpretation rather than adding
     /// information. Any bit a consumer does not recognise means refuse.
@@ -167,17 +129,13 @@ pub struct BlobHeader {
     /// Backing store for the whole tensor; the shared `TensorMemory` code.
     pub storage_kind: u32,
     /// Producer pid, for `pidfd_open`/`pidfd_getfd` and, on Windows, for
-    /// `OpenProcess(PROCESS_DUP_HANDLE)`. Zero when all planes are inlined,
-    /// where there is no handle to reopen.
+    /// `OpenProcess(PROCESS_DUP_HANDLE)`. Zero when all planes are inlined.
     ///
-    /// **Trust boundary.** This value and the handle values beside it come
-    /// out of the blob, so a hostile one makes an importer probe a pid it
-    /// chose and a handle slot in that process. That is the whole of what it
-    /// buys: the import asks for `PROCESS_DUP_HANDLE` alone, and hands the
-    /// duplicate only to `OpenSharedResource1` / `OpenSharedFence`, which
-    /// refuse anything that is not a shareable D3D11 object. Nothing here
-    /// makes a blob safe to accept from an untrusted peer -- import blobs
-    /// from peers you would already hand a texture to.
+    /// This value and the handle values beside it come out of the blob: an
+    /// importer probes the pid and the handle slot the blob names. The import
+    /// asks for `PROCESS_DUP_HANDLE` alone, and hands the duplicate only to
+    /// `OpenSharedResource1` / `OpenSharedFence`. Import blobs only from
+    /// trusted peers.
     pub pid: u32,
     /// Acquire fence, or `-1` for none. Per-tensor, never per-plane.
     pub fence_fd: i32,
@@ -196,16 +154,11 @@ pub struct BlobHeader {
     /// Byte length of the five-string region.
     pub strings_bytes: u32,
     /// Number of stride entries: `ndim`, or 0 meaning densely packed C-order.
-    ///
-    /// Carried rather than assumed — an empty stride array is a distinct value
-    /// per `Tensor.msg`, not an absent one, and flattening the two would break
-    /// the reference-mode round-trip identity.
     pub strides_len: u32,
 }
 
 impl BlobHeader {
     /// An all-zero header, for tests and for `..` update syntax.
-    // Its body is `Default::default()`, the one replacement cargo-mutants tries.
     #[cfg_attr(test, mutants::skip)]
     pub fn empty() -> Self {
         Self::default()
@@ -252,11 +205,10 @@ fn rd_u32(buf: &[u8], off: usize) -> u32 {
 /// Parse and validate a blob's fixed header.
 ///
 /// `buf` is the blob, which need not start at offset 0 of its containing
-/// allocation — a `CameraFrame` embeds a `Tensor` at an 8-aligned offset
-/// precisely so a consumer can subslice and parse in place.
+/// allocation.
 ///
-/// Validates only what the header alone can prove: that the buffer holds a
-/// header at all, that this build understands every required bit, and that
+/// Validates what the header alone can prove: that the buffer holds a
+/// header, that this build understands every required bit, and that
 /// `size` is self-consistent. Region bounds are checked when regions are
 /// derived, against this `size`.
 pub fn parse_header(buf: &[u8]) -> Result<BlobHeader, BlobError> {
@@ -267,9 +219,6 @@ pub fn parse_header(buf: &[u8]) -> Result<BlobHeader, BlobError> {
         });
     }
     let required_mask = rd_u64(buf, 8);
-    // Checked before anything else is trusted: an unknown required bit means
-    // the producer changed what some field *means*, so every value below is
-    // suspect, not merely incomplete.
     if required_mask & !SUPPORTED_REQUIRED_MASK != 0 {
         return Err(BlobError::UnsupportedRequirement(required_mask));
     }
@@ -280,16 +229,13 @@ pub fn parse_header(buf: &[u8]) -> Result<BlobHeader, BlobError> {
             value: size,
         });
     }
-    // `size` may legitimately exceed `buf.len()` only if the caller handed us a
-    // short read; treat that as truncation rather than trusting the claim.
+    // A `size` beyond the buffer is truncation.
     if size > buf.len() as u64 {
         return Err(BlobError::Truncated {
             need: size as usize,
             have: buf.len(),
         });
     }
-    // A non-zero reserved word means a producer used it for something this
-    // build cannot see. Same reasoning as `required_mask`: refuse, do not guess.
     if rd_u32(buf, 68) != 0 {
         return Err(BlobError::Malformed("reserved header word is not zero"));
     }
@@ -313,8 +259,8 @@ pub fn parse_header(buf: &[u8]) -> Result<BlobHeader, BlobError> {
 
 /// Byte offsets of every variable region, derived from the fixed header.
 ///
-/// All offsets are absolute within the blob and already validated against the
-/// header's `size`, so a caller may slice with them directly.
+/// All offsets are absolute within the blob and validated against the
+/// header's `size`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Regions {
     /// `shape[ndim]: u64`.
@@ -334,11 +280,7 @@ pub struct Regions {
 }
 
 /// Bounds-check a count against an element size, then advance an offset.
-///
-/// Every step is checked: these counts are attacker-controlled, and a wrapped
-/// multiply produces a small-looking length that passes a comparison it should
-/// fail. `field` names the header field so a refusal says which value was
-/// implausible.
+/// Every step is checked. `field` names the header field in a refusal.
 fn advance(
     off: usize,
     count: u32,
@@ -365,13 +307,8 @@ fn advance(
     Ok(next)
 }
 
-/// Derive every variable region's offset from the fixed header.
-///
-/// This is the blob's reason for existing: because the header carries the
-/// length of every region, each offset is constant-time arithmetic rather than
-/// a sequential walk. It is also the point where attacker-controlled counts
-/// become dangerous, so every derivation is checked against `size` before it
-/// is returned.
+/// Derive every variable region's offset from the fixed header. Every
+/// derivation is checked against `size`.
 pub fn region_offsets(h: &BlobHeader) -> Result<Regions, BlobError> {
     let limit = h.size as usize;
     if limit < HEADER_LEN {
@@ -380,8 +317,7 @@ pub fn region_offsets(h: &BlobHeader) -> Result<Regions, BlobError> {
             value: h.size,
         });
     }
-    // Strides are all-or-nothing: `ndim` entries, or none. A partial array has
-    // no meaning, so treat any other count as forged rather than truncating.
+    // Strides are all-or-nothing: `ndim` entries, or none.
     if h.strides_len != 0 && h.strides_len != h.ndim {
         return Err(BlobError::ForgedLength {
             field: "strides_len",
@@ -406,9 +342,7 @@ pub fn region_offsets(h: &BlobHeader) -> Result<Regions, BlobError> {
         "quant_zero_points_len",
     )?;
     let planes = advance(strings, h.strings_bytes, 1, limit, "strings_bytes")?;
-    // Plane records are read as u64s. The strings region is written padded so
-    // this holds; a blob claiming otherwise would make every plane read
-    // unaligned, so refuse it rather than reading byte-at-a-time.
+    // The planes region must start 8-aligned.
     if !planes.is_multiple_of(8) {
         return Err(BlobError::Malformed(
             "planes region is not 8-aligned; strings_bytes must include padding",
@@ -430,9 +364,8 @@ pub fn region_offsets(h: &BlobHeader) -> Result<Regions, BlobError> {
             value: h.planes_bytes,
         });
     }
-    // Bound the plane count against the bytes actually present rather than
-    // against a constant: a forged count is a denial-of-service, and the real
-    // ceiling is how many minimum-size records could possibly fit.
+    // Bounds the plane count by how many minimum-size records fit in the bytes
+    // present.
     let max_planes = planes_bytes / PLANE_RECORD_LEN;
     if h.plane_count as usize > max_planes {
         return Err(BlobError::ForgedLength {
@@ -453,12 +386,8 @@ pub fn region_offsets(h: &BlobHeader) -> Result<Regions, BlobError> {
 
 /// The blob's five strings, borrowed from the buffer.
 ///
-/// Strings rather than enum codes, matching `Tensor.msg` exactly: a string
-/// cannot be silently reinterpreted by a consumer that disagrees about
-/// numbering.
-///
-/// `edgefirst-tensor` *carries* these; it never parses `"NV12"`.
-/// `edgefirst-image` interprets them.
+/// `edgefirst-tensor` carries these without parsing them; `edgefirst-image`
+/// interprets them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct BlobStrings<'a> {
     /// Format descriptor (`"NV12"`, `"rgb8"`, `"h264"`); `""` = not an image.
@@ -473,14 +402,11 @@ pub struct BlobStrings<'a> {
     pub color_range: &'a str,
 }
 
-/// Number of strings in the region. Fixed by the format, not by the header.
+/// Number of strings in the region.
 const STRING_COUNT: usize = 5;
 
 /// Encoded length of a strings region that begins `start` bytes into its
 /// blob, padded so the planes region that follows starts 8-aligned.
-///
-/// The padding depends on `start` because the quantization regions before this
-/// one are 4-byte-element arrays and can leave it merely 4-aligned.
 pub fn strings_encoded_len(s: &BlobStrings<'_>, start: usize) -> usize {
     let raw: usize = STRING_COUNT * 4
         + s.format.len()
@@ -493,11 +419,6 @@ pub fn strings_encoded_len(s: &BlobStrings<'_>, start: usize) -> usize {
 
 /// Append the strings region to `out`, which holds the blob from its first
 /// byte, padded until `out` is a whole number of 8-byte words.
-///
-/// The padding is not cosmetic: plane records are read as `u64`s, so the
-/// planes region must begin 8-aligned *within the blob*. The quantization
-/// regions before this one are 4-byte-element arrays and can leave the offset
-/// merely 4-aligned, which makes this region the place alignment is restored.
 pub fn write_strings(s: &BlobStrings<'_>, out: &mut Vec<u8>) {
     for part in [
         s.format,
@@ -550,8 +471,6 @@ pub fn parse_strings(buf: &[u8]) -> Result<BlobStrings<'_>, BlobError> {
                 value: len as u64,
             });
         }
-        // `from_utf8`, never `from_utf8_lossy`: a silent replacement character
-        // on a hostile buffer hides the malformed input instead of reporting it.
         out[i] = std::str::from_utf8(&buf[off..stop]).map_err(|_| BlobError::InvalidUtf8(name))?;
         off = stop;
     }
@@ -566,39 +485,25 @@ pub fn parse_strings(buf: &[u8]) -> Result<BlobStrings<'_>, BlobError> {
 
 /// One plane record, borrowed from the buffer.
 ///
-/// Field names and widths mirror `TensorPlane.msg` so the two map 1:1. All
-/// scalars are 64-bit, and `handle` is `i64` rather than an fd-sized `i32`:
-/// cheap now, and the alternative breaks the round-trip property, since a
-/// `u32` `size` would cap a plane at 4 GiB — which camera frames never reach
-/// but a tensor carrying model weights plausibly does.
+/// Field names and widths mirror `TensorPlane.msg`. All scalars are 64-bit.
 ///
 /// The two transport modes are distinguished by `handle`:
 ///
-/// * `handle >= 0` — **reference**: the bytes live behind the handle, and
+/// * `handle >= 0` — reference: the bytes live behind the handle, and
 ///   `data` is empty.
-/// * `handle == -1` — **inline**: the bytes are in `data`, `offset` is ignored,
+/// * `handle == -1` — inline: the bytes are in `data`, `offset` is ignored,
 ///   `size` describes `data`, and `modifier` must be 0.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlobPlane<'a> {
-    /// **In reference mode, an INDEX into the accompanying fd table** — not a
-    /// raw file descriptor. `-1` when inline.
+    /// In reference mode, an index into the accompanying fd table, not a raw
+    /// file descriptor. `-1` when inline.
     ///
-    /// This is an ABI decision, not an implementation detail. A raw fd is
-    /// meaningless in the receiving process: fds travel out of band via
-    /// `SCM_RIGHTS` or `pidfd_getfd`, and the receiver is handed different
-    /// numbers than the sender used. Wayland, D-Bus and `CameraFrame` all carry
-    /// the same (payload, fds) split for the same reason.
+    /// Planes may share a descriptor: NV12's luma and chroma in one dma-buf
+    /// at different offsets both carry index 0 while the table holds a single
+    /// fd.
     ///
-    /// Indices also let planes share a descriptor: NV12's luma and chroma
-    /// commonly live in one dma-buf at different offsets, and both planes then
-    /// carry index 0 while the table holds a single fd.
-    ///
-    /// Windows has no fd table: a D3D11 texture is shared by NT handle, which
-    /// is a value in the *exporting process's* handle table rather than a
-    /// descriptor an out-of-band table can carry. Such a plane carries index
-    /// `0` over an empty table — non-negative, so the record is still a
-    /// reference and not an inline one — and its handles live in
-    /// [`Self::handle_bytes`].
+    /// Windows has no fd table: a D3D11 plane carries index `0` over an empty
+    /// table and its handles live in [`Self::handle_bytes`].
     pub handle: i64,
     /// Byte offset of this plane within the handle; ignored when inline.
     pub offset: u64,
@@ -613,15 +518,13 @@ pub struct BlobPlane<'a> {
     pub modifier: u64,
     /// Opaque handle for backends whose handle is not an integer (a
     /// `cudaIpcMemHandle_t` is 64 bytes), or whose handle does not travel in
-    /// the fd table at all.
+    /// the fd table.
     ///
-    /// Windows D3D11 textures are the one storage kind that fills this in
-    /// today: [`D3D11_HANDLE_BYTES`] bytes holding the texture's NT handle
-    /// value, the process device fence's NT handle value and the fence value
-    /// of the producer's last recorded GPU write, each a little-endian `u64`.
-    /// All three are values in the exporting process's handle table, which is
-    /// why the header's [`BlobHeader::pid`] is what makes them reachable --
-    /// and why that field documents the trust boundary they share.
+    /// For a Windows D3D11 texture: [`D3D11_HANDLE_BYTES`] bytes holding the
+    /// texture's NT handle value, the process device fence's NT handle value
+    /// and the fence value of the producer's last recorded GPU write, each a
+    /// little-endian `u64`. The handle values belong to the exporting
+    /// process's handle table, named by [`BlobHeader::pid`].
     pub handle_bytes: &'a [u8],
     /// Inlined plane bytes; non-empty only when `handle == -1`.
     pub data: &'a [u8],
@@ -667,10 +570,8 @@ fn rd_i64(buf: &[u8], off: usize) -> i64 {
 
 /// Parse `count` plane records from a planes region.
 ///
-/// `buf` is exactly the region — `blob[regions.planes..regions.end]`. `count`
-/// has already been bounded by [`region_offsets`] against the bytes present,
-/// but every per-record length is re-checked here because those live inside
-/// the region rather than in the header.
+/// `buf` is exactly the region — `blob[regions.planes..regions.end]`. Every
+/// per-record length is checked here.
 pub fn parse_planes(buf: &[u8], count: u32) -> Result<Vec<BlobPlane<'_>>, BlobError> {
     let mut planes = Vec::with_capacity(count as usize);
     let mut off = 0usize;
@@ -724,24 +625,20 @@ pub fn parse_planes(buf: &[u8], count: u32) -> Result<Vec<BlobPlane<'_>>, BlobEr
 }
 
 /// How a plane's bytes cross a boundary.
-///
-/// Both modes are first-class; the choice is the application's, not the HAL's.
-/// The HAL's job is to make it *expressible*, which is why `handle == -1` plus
-/// carried bytes is part of the format rather than a convention layered on top.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportMode {
     /// Carry handles. Requires the same host and an IPC-capable storage kind.
     /// Export borrows: the handles are valid only while the source tensor lives.
     Reference,
-    /// Carry the bytes. Always available, and *required* for `mem` and `pbo`
+    /// Carry the bytes. Always available, and required for `mem` and `pbo`
     /// (which have no shareable handle) and for any storage kind travelling
-    /// over a network, where an fd and a pid are meaningless.
+    /// over a network.
     Inline,
 }
 
 /// A parsed, validated view over a blob.
 ///
-/// Borrows the buffer; every accessor is a constant-time slice, not a walk.
+/// Borrows the buffer; every accessor is a constant-time slice.
 #[derive(Debug, Clone, Copy)]
 pub struct BlobView<'a> {
     buf: &'a [u8],
@@ -752,9 +649,7 @@ pub struct BlobView<'a> {
 impl<'a> BlobView<'a> {
     /// Parse and validate a blob.
     ///
-    /// `buf` need not start at offset 0 of its allocation — a `CameraFrame`
-    /// embeds a `Tensor` 8-aligned so a consumer can subslice and parse in
-    /// place, so this takes a slice and never requires ownership.
+    /// `buf` need not start at offset 0 of its allocation.
     pub fn parse(buf: &'a [u8]) -> Result<Self, BlobError> {
         let header = parse_header(buf)?;
         let regions = region_offsets(&header)?;
@@ -800,24 +695,21 @@ impl<'a> BlobView<'a> {
 
 /// Serialize a tensor to a blob in the requested transport mode.
 ///
-/// Returns the blob **and its fd table**. The two travel together and are
-/// meaningless apart: a plane's `handle` is an index into the table, because a
-/// raw fd number does not survive a process boundary.
+/// Returns the blob and its fd table: a plane's `handle` is an index into
+/// the table.
 ///
-/// **Export borrows and performs no syscalls.** In [`TransportMode::Reference`]
+/// Export borrows and performs no syscalls. In [`TransportMode::Reference`]
 /// the fds in the table are the source tensor's own, valid only while it lives;
-/// `dup` happens on import, never here. That is what makes export cheap and
-/// removes any keepalive protocol between producer and consumer.
+/// `dup` happens on import.
 ///
 /// On Windows the table is empty and each plane carries
 /// [`D3D11_HANDLE_BYTES`] instead: the texture's NT handle value, the process
-/// device fence's, and the last recorded GPU write. Those are borrowed on the
-/// same terms -- they are handle-table entries of *this* process, which the
-/// header's [`pid`](BlobHeader::pid) is what lets an importer reach.
+/// device fence's, and the last recorded GPU write. Those are handle-table
+/// entries of this process, borrowed on the same terms; the header's
+/// [`pid`](BlobHeader::pid) names the process.
 pub fn export(t: &crate::TensorDyn, mode: TransportMode) -> crate::Result<(Vec<u8>, Vec<BlobFd>)> {
     let fmt = t.format();
-    // The addressing grid, not the allocation: for a subsampled format these
-    // differ, and the blob carries the grid because extent comes from planes.
+    // The addressing grid, not the allocation shape.
     let shape = export_addressing_shape(t, fmt)?;
     let esz = t.dtype().size() as i64;
     let strides =
@@ -846,8 +738,7 @@ pub fn export(t: &crate::TensorDyn, mode: TransportMode) -> crate::Result<(Vec<u
     // a single plane spanning the whole allocation.
     let geoms = export_plane_geoms(t, fmt)?;
 
-    // Bytes, only when inlining. `pin_host` is the one read here; reference
-    // mode performs no syscalls at all.
+    // Bytes, only when inlining.
     let pin = match mode {
         TransportMode::Inline => Some(t.pin_host(crate::CpuAccess::Read)?),
         TransportMode::Reference => None,
@@ -857,19 +748,14 @@ pub fn export(t: &crate::TensorDyn, mode: TransportMode) -> crate::Result<(Vec<u
         None => &[],
     };
 
-    // The fd table. Planes sharing one descriptor (NV12 luma + chroma in a
-    // single dma-buf) must share one entry, or the receiver would dup the same
-    // buffer twice and the offsets would no longer refer to one allocation.
+    // The fd table. Planes sharing one descriptor share one entry.
     let (handle, handle_bytes, fds): (i64, Vec<u8>, Vec<BlobFd>) = match mode {
         TransportMode::Inline => (-1, Vec::new(), Vec::new()),
         TransportMode::Reference => {
             let raw = reference_handle(t)?;
             #[cfg(target_os = "windows")]
             {
-                // The table stays empty: an NT handle is not a file
-                // descriptor and does not travel out of band, so the handle
-                // values ride in the record and the importer duplicates them
-                // out of the pid the header carries.
+                // The table stays empty; the handle values ride in the record.
                 (0, reference_handle_bytes(t, raw), Vec::new())
             }
             #[cfg(not(target_os = "windows"))]
@@ -877,7 +763,7 @@ pub fn export(t: &crate::TensorDyn, mode: TransportMode) -> crate::Result<(Vec<u
                 let raw = i32::try_from(raw).map_err(|_| {
                     crate::Error::InvalidOperation("handle is not representable as an fd".into())
                 })?;
-                // `handle` is an index into `fds`, never the fd itself.
+                // `handle` is an index into `fds`.
                 (0, Vec::new(), vec![raw])
             }
         }
@@ -898,13 +784,10 @@ pub fn export(t: &crate::TensorDyn, mode: TransportMode) -> crate::Result<(Vec<u
         required_mask: 0,
         planes_bytes: planes_buf.len() as u64,
         storage_kind: t.memory().code(),
-        // No handle to reopen once the bytes travel, so no pid to reopen it with.
         pid: match mode {
             TransportMode::Inline => 0,
             TransportMode::Reference => std::process::id(),
         },
-        // Reserved in this build, and meaningless inline in any case: inlining
-        // means the producer already read the bytes, so it already waited.
         fence_fd: -1,
         dtype: t.dtype().code(),
         quant_axis,
@@ -1003,15 +886,13 @@ fn write_export_planes(
         write_plane(
             &BlobPlane {
                 handle,
-                // Ignored when inline, and zeroed so the record cannot be
-                // misread as pointing into a handle it does not have.
                 offset: if mode == TransportMode::Inline {
                     0
                 } else {
                     g.offset
                 },
                 stride: g.stride,
-                // Inline: `size` describes `data`, per the schema's own rule.
+                // Inline: `size` describes `data`.
                 size: if mode == TransportMode::Inline {
                     data.len() as u64
                 } else {
@@ -1023,10 +904,7 @@ fn write_export_planes(
                     g.size
                 },
                 modifier: 0,
-                // Every plane carries the same bytes, for the same reason
-                // every plane carries the same fd index: they name one
-                // allocation, and the plane table already says where each
-                // one starts inside it.
+                // Every plane carries the same bytes.
                 handle_bytes,
                 data,
             },
@@ -1037,21 +915,16 @@ fn write_export_planes(
 }
 
 /// Recover an image's logical width and height from its allocation shape.
-///
-/// The tensor stores its allocation geometry; the blob needs the logical
-/// dimensions to ask the format for a grid and a plane table.
 fn image_dims(t: &crate::TensorDyn, f: crate::PixelFormat) -> crate::Result<(usize, usize)> {
     let shape = t.shape();
     let bad = || crate::Error::InvalidShape(format!("shape {shape:?} is not an image for {f:?}"));
-    // Exact image ranks only: a batched `[N, ...]` tensor is several images,
-    // which one image header cannot describe.
+    // Exact image ranks only; a batched `[N, ...]` tensor does not match.
     match (f.layout(), shape) {
         (crate::PixelLayout::Packed, [h, w, _]) => Ok((*w, *h)),
         (crate::PixelLayout::Planar, [_, h, w]) => Ok((*w, *h)),
         (crate::PixelLayout::SemiPlanar, [total, w]) => {
-            // The stored shape is the combined-plane allocation; invert it to
-            // recover the luma height rather than assuming h*2/3, which is
-            // wrong for odd heights and for NV16/NV24.
+            // The stored shape is the combined-plane allocation; inverts it to
+            // recover the luma height.
             let h = (0..=*total)
                 .find(|&h| f.combined_plane_height(h) == Some(*total))
                 .ok_or_else(bad)?;
@@ -1061,11 +934,8 @@ fn image_dims(t: &crate::TensorDyn, f: crate::PixelFormat) -> crate::Result<(usi
     }
 }
 
-/// The row pitch an image's plane table is built from.
-///
-/// A formatted tensor always reports one -- recorded, or derived from its
-/// width -- so a `None` means the tensor is not the image its format claims,
-/// and is refused rather than papered over with a guessed pitch.
+/// The row pitch an image's plane table is built from. Errors when the tensor
+/// reports none.
 fn image_row_stride(t: &crate::TensorDyn, f: crate::PixelFormat) -> crate::Result<usize> {
     t.effective_row_stride().ok_or_else(|| {
         crate::Error::InvalidShape(format!(
@@ -1082,8 +952,6 @@ fn reference_handle(t: &crate::TensorDyn) -> crate::Result<i64> {
         #[cfg(target_os = "linux")]
         crate::TensorMemory::DmaBuf => {
             use std::os::fd::AsRawFd;
-            // `dmabuf()` is fallible rather than optional on Linux, so this
-            // maps the error instead of an absent value.
             t.dmabuf().map(|fd| fd.as_raw_fd() as i64).map_err(|e| {
                 crate::Error::InvalidOperation(format!("dma-buf tensor has no fd: {e}"))
             })
@@ -1093,10 +961,7 @@ fn reference_handle(t: &crate::TensorDyn) -> crate::Result<i64> {
             .iosurface_id()
             .map(|id| id as i64)
             .ok_or_else(|| crate::Error::InvalidOperation("IOSurface tensor has no id".into())),
-        // The tensor's own NT handle value, not a duplicate: export borrows,
-        // so the value is valid exactly as long as the source tensor is, and
-        // a duplicate made here would have nowhere to be closed. The importer
-        // duplicates instead -- out of this process, by pid.
+        // The tensor's own NT handle value, not a duplicate.
         #[cfg(target_os = "windows")]
         crate::TensorMemory::DmaBuf => {
             t.d3d11_shared_handle_value()
@@ -1107,9 +972,7 @@ fn reference_handle(t: &crate::TensorDyn) -> crate::Result<i64> {
                     )
                 })
         }
-        // `mem` and `pbo` have no shareable handle at all. Refusing beats
-        // silently inlining: the caller asked for a reference and would
-        // otherwise receive a copy without being told.
+        // `mem` and `pbo` have no shareable handle.
         other => Err(crate::Error::InvalidOperation(format!(
             "{other:?} has no shareable handle; export it with TransportMode::Inline"
         ))),
@@ -1120,16 +983,8 @@ fn reference_handle(t: &crate::TensorDyn) -> crate::Result<i64> {
 /// texture's NT handle value (`raw`), the process device fence's, and the
 /// fence value of the last recorded GPU write.
 ///
-/// A device with no fence -- or one whose fence is private to this copy
-/// rather than the process-shared one, whose values another copy's recorded
-/// write is not comparable with -- contributes a zero handle **and a zero
-/// value**, so the import builds no completion. That is the same answer a
-/// tensor with no recorded write gives: nothing to wait on.
-///
-/// The value has to go with the handle. `import` refuses a value with no
-/// fence beside it -- a completion nobody can wait on -- so exporting the
-/// recorded value on its own would make a degraded copy's blobs unimportable
-/// rather than completion-less.
+/// A device with no fence, or one whose fence is private to this copy,
+/// contributes a zero handle and a zero value.
 #[cfg(target_os = "windows")]
 fn reference_handle_bytes(t: &crate::TensorDyn, raw: i64) -> Vec<u8> {
     let fence = crate::d3d11::device()
@@ -1144,13 +999,8 @@ fn reference_handle_bytes(t: &crate::TensorDyn, raw: i64) -> Vec<u8> {
 }
 
 /// The `(fence handle, fence value)` pair a reference plane carries, given
-/// what the device is willing to export and what the tensor recorded.
-///
-/// One rule, in one place, because the importer enforces its other half: a
-/// value with no fence beside it is refused outright (a completion nobody can
-/// wait on), so a copy that exports no handle -- no fence at all, or a private
-/// one whose values no other copy can compare with -- must drop the value with
-/// it. A handle with a zero value is fine and means "nothing recorded yet".
+/// what the device exports and what the tensor recorded. With no fence
+/// handle the value is dropped too.
 #[cfg(target_os = "windows")]
 fn reference_completion(fence: usize, recorded: u64) -> (u64, u64) {
     if fence == 0 {
@@ -1162,9 +1012,9 @@ fn reference_completion(fence: usize, recorded: u64) -> (u64, u64) {
 
 /// Reconstruct a tensor from a blob.
 ///
-/// **Import dups every fd it retains**, so the result is fully independent and
-/// the source tensor may die immediately. In inline mode the result is a new
-/// allocation holding a copy of the carried bytes.
+/// Import dups every fd it retains, so the result is independent of the
+/// source tensor. In inline mode the result is a new allocation holding a
+/// copy of the carried bytes.
 ///
 /// `fds` is the table that travelled beside the blob; a reference-mode plane's
 /// `handle` indexes into it. Pass an empty slice for an inline blob, and on
@@ -1172,15 +1022,12 @@ fn reference_completion(fence: usize, recorded: u64) -> (u64, u64) {
 /// handle values in the plane's [`BlobPlane::handle_bytes`], and this
 /// duplicates them out of the exporting process (the header's
 /// [`pid`](BlobHeader::pid)) with `OpenProcess(PROCESS_DUP_HANDLE)` when that
-/// is not this process. The duplication is what makes the import independent
-/// there, exactly as `dup` does on Unix. Both the pid and the handle values
-/// are blob fields, so a hostile blob can steer that probe -- see
-/// [`BlobHeader::pid`] for what it can and cannot reach.
+/// is not this process. Both the pid and the handle values are blob fields;
+/// see [`BlobHeader::pid`].
 ///
-/// `blob` is untrusted: it may come from another wheel, another process, or a
-/// network. Every length has already been bounded by [`BlobView::parse`]; this
-/// function adds the *semantic* checks that parsing alone cannot make, and
-/// every index is bounded against `fds` before use.
+/// `blob` is untrusted. Every length is bounded by [`BlobView::parse`]; this
+/// function adds the semantic checks, and every index is bounded against
+/// `fds` before use.
 pub fn import(blob: &[u8], fds: &[BlobFd]) -> crate::Result<crate::TensorDyn> {
     #[cfg(not(unix))]
     let _ = fds;
@@ -1190,9 +1037,7 @@ pub fn import(blob: &[u8], fds: &[BlobFd]) -> crate::Result<crate::TensorDyn> {
         .planes()
         .map_err(|e| crate::Error::InvalidArgument(e.to_string()))?;
 
-    // All planes inline, or none. A frame mixing transport modes has no
-    // coherent meaning: one storage_kind, pid and fence_fd cover every plane,
-    // so half of them cannot be somewhere else.
+    // All planes inline, or none.
     let inline = planes.first().map(BlobPlane::is_inline).unwrap_or(true);
     validate_import_planes(&planes, inline)?;
 
@@ -1226,9 +1071,7 @@ pub fn import(blob: &[u8], fds: &[BlobFd]) -> crate::Result<crate::TensorDyn> {
         }
     }
 
-    // Allocate the ALLOCATION geometry, not the grid. The grid is what the blob
-    // carries; the buffer that backs it is larger for a subsampled format, and
-    // sizing from the grid would undersize NV12 by a third.
+    // Allocates the allocation geometry, not the grid.
     let grid: Vec<usize> = v.shape().iter().map(|d| *d as usize).collect();
     let alloc_shape = alloc_shape_from_grid(format, &grid)?;
 
@@ -1237,10 +1080,7 @@ pub fn import(blob: &[u8], fds: &[BlobFd]) -> crate::Result<crate::TensorDyn> {
         t.set_format(f)?;
     }
 
-    // Copy each plane back to where the format says it belongs. The exporter
-    // zeroes `offset` on an inline plane (it names a position inside a handle
-    // that is not being carried), so the layout is rebuilt from the plane
-    // table rather than trusted from the wire.
+    // Copies each plane to where the format's plane table places it.
     blit_inline_planes(&mut t, &planes, format, &grid)?;
 
     t.set_colorimetry(colorimetry_from(&strings));
@@ -1258,7 +1098,6 @@ fn validate_import_planes(planes: &[BlobPlane<'_>], inline: bool) -> crate::Resu
     }
     for p in planes {
         if p.is_inline() {
-            // The schemas validator's own rules, enforced on the way in too.
             if p.size as usize != p.data.len() {
                 return Err(crate::Error::InvalidArgument(format!(
                     "inline plane declares size {} but carries {} bytes",
@@ -1304,10 +1143,8 @@ fn import_referenced_blob(
     strings: &BlobStrings<'_>,
     dtype: crate::DType,
 ) -> crate::Result<crate::TensorDyn> {
-    // Reference mode. Every plane's `handle` is an index into `fds`, and
-    // the index is bounded before use: it arrived from an untrusted blob,
-    // and an out-of-range read here would hand an arbitrary descriptor to
-    // `dup`.
+    // Reference mode. Every plane's `handle` is an index into `fds`, bounded
+    // before use.
     let first = planes
         .first()
         .ok_or_else(|| crate::Error::InvalidArgument("referenced blob carries no planes".into()))?;
@@ -1335,10 +1172,7 @@ fn import_referenced_blob(
     let mut t = open_referenced_tensor(h.storage_kind, raw, &alloc_shape, dtype)?;
     if let Some(f) = format {
         t.set_format(f)?;
-        // The producer's pitch, which the shape alone cannot express. Zero
-        // means the producer recorded none. A pitch the format refuses is a
-        // malformed blob, not one to import at a pitch the producer never
-        // used. A tensor without a format has no rows, so no pitch applies.
+        // The producer's pitch; zero means the producer recorded none.
         if first.stride > 0 {
             t.set_row_stride(first.stride as usize)?;
         }
@@ -1357,11 +1191,8 @@ fn open_referenced_tensor(
     alloc_shape: &[usize],
     dtype: crate::DType,
 ) -> crate::Result<crate::TensorDyn> {
-    // The table entry is a PLATFORM handle, not universally a file
-    // descriptor: on Linux it is a dma-buf fd, on macOS an IOSurface ID.
-    // Dispatching on `storage_kind` rather than assuming an fd is required
-    // -- treating an IOSurface ID as an fd yields EBADF, which is how this
-    // gap was found.
+    // The table entry is a platform handle: a dma-buf fd on Linux, an IOSurface
+    // ID on macOS.
     match crate::TensorMemory::from_code(storage_kind) {
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         Some(crate::TensorMemory::DmaBuf) | Some(crate::TensorMemory::IoSurface) => {
@@ -1373,10 +1204,8 @@ fn open_referenced_tensor(
         #[cfg(all(unix, not(any(target_os = "macos", target_os = "ios"))))]
         Some(crate::TensorMemory::DmaBuf) | Some(crate::TensorMemory::Shm) => {
             use std::os::fd::{BorrowedFd, OwnedFd};
-            // Import dups: the result is independent and the producer may
-            // die immediately, which is what removes the keepalive protocol.
-            // SAFETY: `raw` is live for this call -- the caller owns it and
-            // has not yet closed its own copy. Borrow, never adopt.
+            // SAFETY: `raw` is live for this call; the caller owns it. It is
+            // borrowed, not adopted.
             let borrowed = unsafe { BorrowedFd::borrow_raw(raw) };
             let owned: OwnedFd = borrowed
                 .try_clone_to_owned()
@@ -1393,10 +1222,6 @@ fn open_referenced_tensor(
 /// the NT handle values in the first plane's
 /// [`handle_bytes`](BlobPlane::handle_bytes), reachable through the header's
 /// pid.
-///
-/// No fd table is consulted -- there is none on Windows -- so the plane
-/// `handle` is only ever read as "this record is a reference", which
-/// [`BlobPlane::is_inline`] has already decided.
 #[cfg(target_os = "windows")]
 fn import_referenced_d3d11_blob(
     v: &BlobView<'_>,
@@ -1409,12 +1234,7 @@ fn import_referenced_d3d11_blob(
     let first = planes
         .first()
         .ok_or_else(|| crate::Error::InvalidArgument("referenced blob carries no planes".into()))?;
-    // Every plane must name the same texture, exactly as every Unix plane
-    // must index the same fd: the planes describe one allocation and the
-    // plane table already says where each starts inside it, so a blob whose
-    // planes disagree about which object that is has no coherent reading.
-    // Checked over all of them, not just the one the open uses, because the
-    // disagreement is the corruption.
+    // Every plane must name the same texture.
     for p in planes {
         if p.handle != 0 || p.handle_bytes != first.handle_bytes {
             return Err(crate::Error::InvalidArgument(
@@ -1424,19 +1244,9 @@ fn import_referenced_d3d11_blob(
             ));
         }
     }
-    // The blob's own grid, not an allocation shape derived from it: this is
-    // the shape hint the geometry check wants, and a semi-planar texture's
-    // image width can only come from a shape (the texture is as wide as the
-    // driver's row pitch).
+    // The blob's own grid is the shape hint for the geometry check.
     let grid: Vec<usize> = v.shape().iter().map(|d| *d as usize).collect();
     let mut t = open_referenced_texture(h.storage_kind, first, h.pid, &grid, dtype, format)?;
-    // The producer's `stride` is deliberately not restored. A texture import
-    // has a pitch of its own -- `from_d3d11_shared_handle` records the one
-    // this device's staging copy reports -- and the producer's is a fact
-    // about the producer's driver, not about the texture as this process
-    // sees it. The descriptor path makes the same exclusion for the same
-    // reason (`restore_imported_row_stride` excludes `D3D11_TEXTURE` for
-    // the same reason).
     t.set_colorimetry(colorimetry_from(strings));
     if let Some(q) = import_quantization(v)? {
         t.set_quantization(q)?;
@@ -1447,17 +1257,7 @@ fn import_referenced_d3d11_blob(
 /// Open the D3D11 texture a reference-mode plane names, duplicating both NT
 /// handles out of the exporting process when that is not this one.
 ///
-/// The handle values are the exporting process's, so in the same process (a
-/// second module of one wheel, or the export-then-import round trip a test
-/// makes) they are usable as they stand -- one handle table. Across processes
-/// they are duplicated through a `PROCESS_DUP_HANDLE` handle on the exporter,
-/// which is what the header's pid is carried for.
-///
-/// The tensor lands on the format's *allocation* shape, exactly as the Unix
-/// arm does: [`export`] writes the addressing shape for every image, so the
-/// producer's own `shape()` is not recoverable from the blob and picking the
-/// addressing spelling here would make one blob import at two different
-/// shapes depending on the platform.
+/// The tensor has the format's allocation shape.
 #[cfg(target_os = "windows")]
 fn open_referenced_texture(
     storage_kind: u32,
@@ -1497,11 +1297,8 @@ fn open_referenced_texture(
             "D3D11 reference plane carries no texture handle".into(),
         ));
     }
-    // The same refusal the descriptor path makes: a fence value with no fence
-    // to read it on names a completion nobody can wait on, and importing
-    // anyway would alias a texture the producer's device may still be writing.
-    // The other way round is not an error -- a zero value means nothing was
-    // recorded, so a fence handle beside it is simply unused.
+    // A fence value with no fence handle is refused. A zero value with a fence
+    // handle is accepted.
     if fence.is_invalid() && value != 0 {
         return Err(crate::Error::InvalidArgument(format!(
             "D3D11 reference plane names fence value {value} with no fence handle; \
@@ -1509,14 +1306,11 @@ fn open_referenced_texture(
         )));
     }
 
-    // Duplicates this import owns, closed by `OwnedHandle` on every path --
-    // including a panic between the duplication and the constructor. Empty in
-    // the same process, where the values are already this process's own.
+    // Duplicates this import owns; empty in the same process.
     let mut duplicates: Vec<OwnedHandle> = Vec::new();
     if std::process::id() != pid {
-        // SAFETY: documented call. `pid` came out of the blob, so it may name
-        // a process this token cannot reach or one that no longer exists;
-        // both fail rather than returning a handle.
+        // SAFETY: documented call; it fails for a pid this token cannot reach or
+        // that does not exist.
         let src = unsafe { OpenProcess(PROCESS_DUP_HANDLE, false, pid) }
             .map_err(|e| open_process_error(pid, &e))?;
         // SAFETY: `OpenProcess` returned a live handle this scope owns; the
@@ -1536,8 +1330,7 @@ fn open_referenced_texture(
     // the exporter's own value in the same process, a duplicate otherwise.
     // The helper opens its own texture and drops it on return.
     let geometry = unsafe { crate::protocol::d3d11_geometry_checked(format, tex.0, grid) };
-    // A fence value of 0 is "nothing recorded", so there is nothing to wait on
-    // even when the device published a fence handle.
+    // A fence value of 0 is "nothing recorded".
     let completion = (value != 0).then_some((fence.0, value));
     let opened = match geometry {
         // SAFETY: both handles are valid in this process, as above, and the
@@ -1556,20 +1349,14 @@ fn open_referenced_texture(
         },
         Err(e) => Err(e),
     };
-    // The constructor duplicated what it keeps, so whatever was duplicated
-    // here is a temporary; this is where it closes.
+    // Closes the temporary duplicates.
     drop(duplicates);
     opened
 }
 
 /// The `ErrorKind` a Win32 failure maps to, by the code the call itself
-/// reported rather than a re-read of the thread's last error that any cleanup
-/// call in between can overwrite.
-///
-/// Spec section 8 names `EACCES` for the cross-process import, and both halves
-/// of it can be denied: the `OpenProcess` that reaches the exporting process,
-/// and the `DuplicateHandle` that takes a handle out of it.
-/// `PermissionDenied` is what the C ABI turns into that errno.
+/// reported: access denied is `PermissionDenied`, an invalid parameter is
+/// `NotFound`, anything else `Other`.
 #[cfg(target_os = "windows")]
 fn win32_error_kind(e: &windows::core::Error) -> std::io::ErrorKind {
     use std::io::ErrorKind;
@@ -1580,10 +1367,7 @@ fn win32_error_kind(e: &windows::core::Error) -> std::io::ErrorKind {
     if code == HRESULT::from_win32(ERROR_ACCESS_DENIED.0) {
         ErrorKind::PermissionDenied
     } else if code == HRESULT::from_win32(ERROR_INVALID_PARAMETER.0) {
-        // What Windows answers for a pid no process holds: the blob outlived
-        // its producer, or never named a real one. A handle value the named
-        // process does not have answers `ERROR_INVALID_HANDLE` instead, which
-        // falls to `Other` below -- the message carries the code either way.
+        // The code Windows returns for a pid no process holds.
         ErrorKind::NotFound
     } else {
         ErrorKind::Other
@@ -1612,8 +1396,7 @@ fn open_process_error(pid: u32, e: &windows::core::Error) -> crate::Error {
 }
 
 /// One `DuplicateHandle` out of `src`, as an owned handle. `which` names the
-/// handle in the error: a blob carries two, and they fail for different
-/// reasons.
+/// handle in the error.
 #[cfg(target_os = "windows")]
 fn duplicate_out_of(
     src: &std::os::windows::io::OwnedHandle,
@@ -1640,9 +1423,6 @@ fn duplicate_out_of(
         )
     }
     .map_err(|e| {
-        // The same mapping `open_process_error` uses: this is the other half
-        // of one operation, and a denied duplication is as much the `EACCES`
-        // case spec section 8 names as a denied `OpenProcess` is.
         crate::Error::IoError(std::io::Error::new(
             win32_error_kind(&e),
             format!(
@@ -1700,9 +1480,8 @@ fn blit_inline_planes(
     Ok(())
 }
 
-/// Rebuild `Colorimetry` from the carried strings. An unrecognised value is
-/// dropped to `None` rather than refused: colorimetry is descriptive metadata,
-/// and a consumer that does not know one axis can still use the pixels.
+/// Rebuild `Colorimetry` from the carried strings. An unrecognised value
+/// becomes `None`.
 fn colorimetry_from(s: &BlobStrings<'_>) -> Option<crate::Colorimetry> {
     let c = crate::Colorimetry {
         space: crate::ColorSpace::from_str_code(s.color_space),
@@ -1718,18 +1497,13 @@ fn colorimetry_from(s: &BlobStrings<'_>) -> Option<crate::Colorimetry> {
 }
 
 /// The quantization a blob carries, or `None` when its header declares none
-/// (`quant_axis == -2`).
-///
-/// Declared-but-unreadable quantization is an error, never a silent `None`:
-/// a tensor that arrives unquantized surfaces much later as a consumer's own
-/// "requires quantization metadata", which names the symptom and not the
-/// cause.
+/// (`quant_axis == -2`). Declared quantization that cannot be read is an
+/// error.
 fn import_quantization(v: &BlobView<'_>) -> crate::Result<Option<crate::Quantization>> {
     let h = v.header;
     if h.quant_axis == -2 {
         return Ok(None);
     }
-    // Both regions were bounded against `size` by `region_offsets`.
     let scales: Vec<f32> = (0..h.quant_scales_len as usize)
         .map(|i| f32::from_bits(rd_u32(v.buf, v.regions.quant_scales + i * 4)))
         .collect();
@@ -1793,24 +1567,19 @@ fn dims_from_grid(f: crate::PixelFormat, grid: &[usize]) -> crate::Result<(usize
 mod tests {
     use super::*;
 
-    /// The half of the completion contract the exporter owns: a copy that
-    /// exports no fence handle must export no value either, because `import`
-    /// refuses that pair outright -- a degraded copy's blobs would be
-    /// unimportable rather than merely completion-less.
+    /// A reference plane with no fence handle exports no fence value.
     #[cfg(target_os = "windows")]
     #[test]
     fn a_reference_plane_drops_the_value_with_the_fence() {
         assert_eq!(super::reference_completion(0, 42), (0, 0));
         assert_eq!(super::reference_completion(0, 0), (0, 0));
-        // A handle with nothing recorded is a legitimate pair: the importer
-        // reads a zero value as "nothing to wait on".
+        // A handle with nothing recorded keeps its zero value.
         assert_eq!(super::reference_completion(0x1234, 0), (0x1234, 0));
         assert_eq!(super::reference_completion(0x1234, 42), (0x1234, 42));
     }
 
     #[test]
     fn every_region_offset_is_constant_time_arithmetic() {
-        // The property that distinguishes the blob from CDR: no sequential walk.
         let h = BlobHeader {
             size: 4096,
             ndim: 3,
@@ -1850,7 +1619,6 @@ mod tests {
 
     #[test]
     fn strides_must_be_ndim_entries_or_none() {
-        // A partial stride array has no meaning; it is a forged length.
         let h = BlobHeader {
             size: 4096,
             ndim: 3,
@@ -1882,8 +1650,6 @@ mod tests {
 
     #[test]
     fn regions_that_overrun_size_are_refused() {
-        // Every derived offset is validated against `size`, which parse_header
-        // has already bounded by the real buffer length.
         let h = BlobHeader {
             size: 80,
             ndim: 2,
@@ -1897,8 +1663,6 @@ mod tests {
 
     #[test]
     fn plane_count_is_bounded_by_the_planes_region_not_by_a_constant() {
-        // A forged plane_count is a denial-of-service: it must be refused
-        // against the bytes actually present, before any allocation.
         let h = BlobHeader {
             size: 4096,
             plane_count: u32::MAX,
@@ -1914,19 +1678,12 @@ mod tests {
         ));
     }
 
-    /// Fill a tensor's bytes with a recognisable ramp so a content comparison
-    /// can actually fail. An all-zero buffer round-trips through almost any bug.
-    ///
-    /// Bracketed with the coherency pair, which is free on `Mem` and one ioctl
-    /// on a dma-buf but load-bearing for a D3D11 texture: the pin is a host
-    /// shadow buffer there, so nothing written through it reaches the texture
-    /// until the upload.
+    /// Fill a tensor's bytes with a ramp, bracketed with the coherency pair.
     fn fill_ramp(t: &TensorDyn) {
         let pin = t.pin_host(CpuAccess::ReadWrite).expect("pin");
         t.sync_for_cpu(CpuAccess::ReadWrite).expect("sync for cpu");
         // SAFETY: the pin holds `pin.len()` writable bytes live for its own
-        // lifetime, and this test is their only holder -- no map guard is
-        // open and no device work is in flight across the two syncs.
+        // lifetime, and this test is their only holder.
         let s = unsafe { std::slice::from_raw_parts_mut(pin.as_mut_ptr(), pin.len()) };
         for (i, b) in s.iter_mut().enumerate() {
             *b = (i % 251) as u8;
@@ -1938,8 +1695,7 @@ mod tests {
     fn bytes_of(t: &TensorDyn) -> Vec<u8> {
         let pin = t.pin_host(CpuAccess::Read).expect("pin");
         t.sync_for_cpu(CpuAccess::Read).expect("sync for cpu");
-        // SAFETY: as in `fill_ramp`; the pin holds `pin.len()` readable bytes
-        // live and `sync_for_cpu` has just refreshed them.
+        // SAFETY: the pin holds `pin.len()` readable bytes live for its lifetime.
         let bytes = unsafe { std::slice::from_raw_parts(pin.as_mut_ptr(), pin.len()) }.to_vec();
         t.sync_for_device(CpuAccess::Read).expect("sync for device");
         bytes
@@ -1947,11 +1703,6 @@ mod tests {
 
     /// A reference-capable tensor, or `None` on a host that has no shareable
     /// backing.
-    ///
-    /// On Linux that backing is a dma-buf, so the skip goes through the DMA
-    /// require gate: under `HAL_TEST_REQUIRE_DMA=1` a host without a usable
-    /// heap fails `what` instead of skipping it, and a heap that is usable
-    /// but cannot allocate the image is a failure either way.
     fn reference_capable(w: usize, h: usize, what: &str) -> Option<TensorDyn> {
         if cfg!(target_os = "linux") && !crate::test_support::dma_or_skip(what) {
             return None;
@@ -1993,10 +1744,8 @@ mod tests {
             assert!(!p.is_inline());
         }
         if cfg!(target_os = "windows") {
-            // A D3D11 texture is shared by NT handle, a value in this
-            // process's handle table rather than a descriptor an out-of-band
-            // table can carry, so the table is empty and every plane carries
-            // the same handle bytes.
+            // On Windows the table is empty and every plane carries the same
+            // handle bytes.
             assert!(fds.is_empty(), "an NT handle does not travel out of band");
             assert!(planes
                 .iter()
@@ -2011,9 +1760,7 @@ mod tests {
                     fds.len()
                 );
             }
-            // NV12's two planes share one allocation, so they share one table
-            // entry -- duplicating it would make the receiver dup the same
-            // buffer twice and the offsets would stop referring to one buffer.
+            // NV12's two planes share one allocation and one table entry.
             assert_eq!(fds.len(), 1, "planes sharing a buffer share a table entry");
         }
         assert!(planes.iter().all(|p| p.handle == 0));
@@ -2034,19 +1781,9 @@ mod tests {
         let src_id = src.buffer_identity().id();
         let got = import(&blob, &fds).unwrap();
 
-        // The property that makes reference mode worth having: this is the
-        // SAME buffer, not a copy that happens to hold equal bytes. `dup`
-        // preserves the underlying object, so derived identity survives the
-        // round trip -- which is also what lets the GL import cache hit on a
-        // tensor that arrived from another process.
-        //
-        // Windows shares the same buffer but cannot say so through the
-        // identity: every texture tensor keys on its own `ID3D11Texture2D*`,
-        // and `OpenSharedResource1` mints a fresh object per open, so an
-        // import never compares equal to what it was exported from
-        // (`IdentityKind::D3d11Texture` says why a handle value would be the
-        // unsound alternative). The byte comparison below is what carries the
-        // property there.
+        // The import is the same buffer: derived identity survives the round trip.
+        // On Windows an import's identity differs; the byte comparison below covers
+        // it.
         if !cfg!(target_os = "windows") {
             assert_eq!(
                 got.buffer_identity().id(),
@@ -2055,7 +1792,7 @@ mod tests {
             );
         }
 
-        // Import dups, so dropping the producer must not invalidate the import.
+        // Dropping the producer does not invalidate the import.
         drop(src);
         assert_eq!(
             bytes_of(&got),
@@ -2067,17 +1804,12 @@ mod tests {
 
     #[test]
     fn an_fd_index_past_the_table_is_refused() {
-        // The index arrives from an untrusted blob. An unbounded read here
-        // would hand an arbitrary descriptor to dup.
         let Some(src) = reference_capable(64, 48, "an_fd_index_past_the_table_is_refused") else {
             return;
         };
         let (blob, fds) = export(&src, TransportMode::Reference).unwrap();
         if cfg!(target_os = "windows") {
-            // There is no fd table to index there. What arrives untrusted
-            // instead is the pid and the two handle values, and neither may
-            // be taken on faith: one names a process whose handle table this
-            // import reaches into, the other is opened as a texture.
+            // On Windows the untrusted values are the pid and the two handle values.
             let err = import(&patch_handle_word(&blob, 0, 0), &[])
                 .expect_err("a null texture handle must be refused, not opened");
             assert!(
@@ -2085,11 +1817,7 @@ mod tests {
                 "expected InvalidArgument, got {err:?}"
             );
 
-            // A fence value with no fence handle to read it on: the same
-            // refusal the descriptor path makes for a completion nobody can
-            // wait on. Both words are patched, since an exported tensor with
-            // no recorded write carries value 0, where a missing fence handle
-            // is simply unused.
+            // A fence value with no fence handle to read it on.
             let named = patch_handle_word(&patch_handle_word(&blob, 1, 0), 2, 7);
             let err = import(&named, &[])
                 .expect_err("a fence value with no fence handle must be refused");
@@ -2100,8 +1828,7 @@ mod tests {
                 "expected the unwaitable-completion refusal, got {err:?}"
             );
 
-            // A pid that does not exist: the import must fail to open it
-            // rather than falling back on this process's handle table.
+            // A pid that does not exist.
             let mut tampered = blob.clone();
             tampered[HEADER_PID_OFFSET..HEADER_PID_OFFSET + 4]
                 .copy_from_slice(&u32::MAX.to_le_bytes());
@@ -2130,16 +1857,8 @@ mod tests {
         );
     }
 
-    /// A copy of `blob` with one of the three handle words rewritten in
-    /// *every* plane, so the tampering under test is the refusal that fires
-    /// rather than the planes-disagree one.
-    ///
-    /// Every reference plane record is the same length -- the scalar block
-    /// plus [`D3D11_HANDLE_BYTES`], padded to 8 -- which is what makes the
-    /// stride computable without re-parsing.
-    ///
-    /// Compiled everywhere, because the Windows branch that calls it is a
-    /// `cfg!` arm rather than a `#[cfg]` one.
+    /// A copy of `blob` with one of the three handle words rewritten in every
+    /// plane.
     fn patch_handle_word(blob: &[u8], word: usize, value: u64) -> Vec<u8> {
         let v = BlobView::parse(blob).unwrap();
         let r = region_offsets(&v.header()).unwrap();
@@ -2152,10 +1871,8 @@ mod tests {
         out
     }
 
-    /// A handle value that is neither null nor a shared texture. The
-    /// constructor must refuse it: the blob is untrusted input, and the one
-    /// thing this import may not do is hand an arbitrary handle to the driver
-    /// and carry on.
+    /// A handle value that is neither null nor a shared texture is refused by
+    /// the constructor.
     #[test]
     #[cfg(target_os = "windows")]
     fn a_garbage_texture_handle_is_refused_by_the_constructor() {
@@ -2176,8 +1893,7 @@ mod tests {
         );
     }
 
-    /// The planes of one reference blob name one texture. A blob whose planes
-    /// disagree is refused rather than read through the first of them.
+    /// A blob whose planes disagree about the texture is refused.
     #[test]
     #[cfg(target_os = "windows")]
     fn planes_that_disagree_about_the_texture_are_refused() {
@@ -2274,12 +1990,6 @@ mod tests {
     }
 
     /// Assemble a minimal valid blob around a hand-written plane set.
-    ///
-    /// Tampering an exported blob is not good enough for the mode-mix test:
-    /// flipping a plane's `handle` also leaves its bytes attached, which trips
-    /// the separate "a referenced plane must not carry bytes" check, so the
-    /// test would pass with the mode-mix guard removed entirely. Building the
-    /// plane set directly isolates the one property under test.
     fn build_blob(planes: &[BlobPlane<'_>]) -> Vec<u8> {
         build(&BlobSpec::new(planes))
     }
@@ -2349,18 +2059,13 @@ mod tests {
 
     #[test]
     fn no_corrupted_header_value_can_panic_the_parser() {
-        // The blanket property behind every individual forged-field test: a
-        // panic on hostile input is a denial-of-service, so the parser must
-        // return Err for anything it cannot handle. Walks every 4-byte word of
-        // the header through several hostile values rather than checking the
-        // handful of fields someone thought to name.
+        // Walks every 4-byte word of the header through several hostile values.
         let good = export(&nv12_mem(64, 48), TransportMode::Inline).unwrap().0;
         for word in 0..HEADER_LEN / 4 {
             for pattern in [u32::MAX, u32::MAX / 2, 1, 0x8000_0000] {
                 let mut bad = good.clone();
                 bad[word * 4..word * 4 + 4].copy_from_slice(&pattern.to_le_bytes());
-                // Either it parses (the value happened to be benign) or it
-                // errors. It must never panic, and `import` must not either.
+                // Parses or errors, without panicking.
                 if let Ok(v) = BlobView::parse(&bad) {
                     let _ = v.shape();
                     let _ = v.strides();
@@ -2391,13 +2096,8 @@ mod tests {
 
     #[test]
     fn a_mixed_inline_and_referenced_plane_set_is_refused() {
-        // The schemas validator's rule: all planes inline, or none. A frame
-        // mixing modes has no coherent meaning, since one storage_kind, pid
-        // and fence_fd cover every plane.
-        //
-        // Both planes here are individually well-formed -- the referenced one
-        // carries no bytes, the inline one's size matches its data -- so the
-        // ONLY thing wrong is that they disagree about transport mode.
+        // Both planes are individually well-formed; they disagree about transport
+        // mode.
         let payload = [1u8, 2, 3, 4];
         let referenced = BlobPlane {
             handle: 7,
@@ -2430,10 +2130,6 @@ mod tests {
 
     #[test]
     fn a_uniformly_referenced_plane_set_is_not_rejected_as_mixed() {
-        // The control for the test above: two referenced planes must get past
-        // the mode check (and then fail later, on unimplemented reference
-        // import). Without this, a guard that rejected everything would look
-        // correct.
         let referenced = BlobPlane {
             handle: 7,
             offset: 0,
@@ -2446,10 +2142,7 @@ mod tests {
         };
         let blob = build_blob(&[referenced, referenced]);
         let err = import(&blob, &[]).expect_err("an index into nothing cannot be opened");
-        // Refused by the reference import itself, which runs after every
-        // plane check: proof the set cleared both the mode check and the rule
-        // that a referenced plane carries no bytes. Windows has no fd table
-        // and refuses the non-zero handle instead.
+        // The reference import's refusal; Windows refuses the non-zero handle.
         let expected = if cfg!(target_os = "windows") {
             "must all carry handle 0"
         } else {
@@ -2504,7 +2197,7 @@ mod tests {
             .unwrap()
             .0;
         let v = BlobView::parse(&blob).unwrap();
-        // The grid, matching the schemas golden's shape for a 640x480 NV12.
+        // The grid of a 640x480 NV12.
         assert_eq!(v.shape(), &[480, 640]);
         assert_eq!(v.header().dtype, crate::DType::U8.code());
         assert_eq!(v.strings().format, "NV12");
@@ -2518,20 +2211,18 @@ mod tests {
         let v = BlobView::parse(&blob).unwrap();
         let planes = v.planes().unwrap();
         assert_eq!(planes.len(), 2, "NV12 is two planes");
-        // Inline: `size` describes `data`, per the schemas validator's rule.
+        // Inline: `size` describes `data`.
         assert_eq!(planes[0].size as usize, planes[0].data.len());
         assert_eq!(planes[1].size as usize, planes[1].data.len());
         assert_eq!(planes[0].size, 307_200);
         assert_eq!(planes[1].size, 153_600);
-        // The chroma plane sits 307 200 bytes into the allocation, but an
-        // inline plane names no position inside a handle it does not have.
+        // The chroma plane sits 307 200 bytes into the allocation; an inline plane
+        // carries offset 0.
         assert_eq!(planes[1].offset, 0, "an inline plane carries no offset");
     }
 
     #[test]
     fn inline_export_clears_pid_and_fence_fd() {
-        // Both are meaningless once the bytes travel: there is no handle to
-        // reopen and nothing to wait on, because the producer already read it.
         let blob = export(&nv12_mem(64, 48), TransportMode::Inline).unwrap().0;
         let h = BlobView::parse(&blob).unwrap().header();
         assert_eq!(h.pid, 0, "no handle to reopen");
@@ -2540,7 +2231,6 @@ mod tests {
 
     #[test]
     fn inline_planes_carry_no_modifier_and_no_handle_bytes() {
-        // The schemas validator's rule for an inline plane.
         let blob = export(&nv12_mem(64, 48), TransportMode::Inline).unwrap().0;
         for p in BlobView::parse(&blob).unwrap().planes().unwrap() {
             assert!(p.is_inline());
@@ -2552,16 +2242,11 @@ mod tests {
 
     #[test]
     fn reference_export_of_a_mem_tensor_is_refused() {
-        // `mem` has no shareable handle at all, so reference mode is not
-        // expressible for it. Refusing beats silently inlining: the caller
-        // asked for a reference and would otherwise get a copy without knowing.
         assert!(export(&nv12_mem(64, 48), TransportMode::Reference).is_err());
     }
 
     #[test]
     fn a_blob_parses_correctly_from_a_non_zero_offset() {
-        // CameraFrame embeds a Tensor 8-aligned precisely so a consumer can
-        // subslice and parse in place, without owning the containing buffer.
         let blob = export(&nv12_mem(64, 48), TransportMode::Inline).unwrap().0;
         let mut framed = vec![0xAAu8; 16];
         framed.extend_from_slice(&blob);
@@ -2619,8 +2304,7 @@ mod tests {
 
     #[test]
     fn a_plane_scalar_block_is_56_bytes() {
-        // Matches the schemas spec's independently-stated TensorPlane minimum:
-        // a 48-byte scalar block plus two 4-byte counts.
+        // A 48-byte scalar block plus two 4-byte counts.
         let mut out = Vec::new();
         write_plane(&ref_plane(), &mut out);
         assert_eq!(out.len(), PLANE_RECORD_LEN);
@@ -2629,8 +2313,6 @@ mod tests {
 
     #[test]
     fn every_plane_record_starts_8_aligned_whatever_the_payload() {
-        // Records are read as u64s, so a payload of any length must be padded
-        // before the next record begins.
         for n in 0..17usize {
             let payload: Vec<u8> = (0..n as u8).collect();
             let mut out = Vec::new();
@@ -2661,8 +2343,6 @@ mod tests {
 
     #[test]
     fn plane_payloads_round_trip_independently() {
-        // handle_bytes and data are separate regions; a length applied to the
-        // wrong one would be invisible if either were empty.
         let hb = [0xDEu8, 0xAD, 0xBE, 0xEF];
         let data = [1u8, 2, 3];
         let mut out = Vec::new();
@@ -2719,9 +2399,8 @@ mod tests {
 
     #[test]
     fn string_order_is_positional_and_matches_the_message() {
-        // Order is Tensor.msg's: format, then the four colour axes. Five
-        // distinct values prove nothing is transposed -- with equal values a
-        // swap would be invisible.
+        // Five distinct values in Tensor.msg's order: format, then the four colour
+        // axes.
         let s = BlobStrings {
             format: "a",
             color_space: "bb",
@@ -2736,7 +2415,6 @@ mod tests {
 
     #[test]
     fn empty_strings_are_legal_and_distinct_from_absent() {
-        // "" means "not an image" / "unspecified" -- a real value, not a null.
         let s = BlobStrings::default();
         let mut out = Vec::new();
         write_strings(&s, &mut out);
@@ -2749,8 +2427,6 @@ mod tests {
 
     #[test]
     fn the_strings_region_is_padded_so_planes_start_8_aligned() {
-        // Plane records are read as u64s; an unaligned record would fault or
-        // force byte-at-a-time reads on every consumer.
         for f in ["", "a", "ab", "abc", "NV12", "rgb8_planar"] {
             let mut out = Vec::new();
             write_strings(
@@ -2766,8 +2442,6 @@ mod tests {
 
     #[test]
     fn a_non_utf8_string_is_refused() {
-        // Strings come from a hostile buffer. A lossy substitution would hide
-        // the malformed input rather than reporting it.
         let mut out = Vec::new();
         out.extend_from_slice(&2u32.to_le_bytes());
         out.extend_from_slice(&[0xff, 0xfe]);
@@ -2804,11 +2478,6 @@ mod tests {
 
     #[test]
     fn an_overrunning_region_is_attributed_to_its_own_field() {
-        // Offsets increase monotonically, so the final `end <= size` check
-        // already makes over-long regions *safe*. The per-step check exists for
-        // a different reason: it names the field that was actually implausible.
-        // Without it every overrun is reported as `planes_bytes`, and a caller
-        // debugging a forged blob is sent to the wrong field.
         let h = BlobHeader {
             size: 4096,
             ndim: 2,
@@ -2964,8 +2633,6 @@ mod tests {
 
     #[test]
     fn bytes_after_the_blob_are_not_part_of_it() {
-        // `size` bounds the blob, not the buffer: a consumer may hand over a
-        // larger read, or a frame with more fields after the tensor.
         let blob = export(&nv12_mem(64, 48), TransportMode::Inline).unwrap().0;
         let mut framed = blob.clone();
         framed.extend_from_slice(&[0xAA; 16]);
@@ -3033,14 +2700,11 @@ mod tests {
 
     #[test]
     fn the_strings_region_ends_8_aligned_in_the_blob_wherever_it_starts() {
-        // The quantization arrays before it are 4-byte elements, so the
-        // region may start 4-aligned; the planes after it may not.
         let formats = ["", "a", "abc", "NV12", "rgb8_planar"].map(|format| BlobStrings {
             format,
             ..Default::default()
         });
-        // Every string non-empty and of a distinct length, so each one's
-        // length counts toward the total on its own.
+        // Every string non-empty and of a distinct length.
         let all_five = BlobStrings {
             format: "a",
             color_space: "bb",
@@ -3064,7 +2728,7 @@ mod tests {
     }
 
     /// One scale and no zero points leave the quantization regions ending
-    /// 4-aligned, which the strings region must absorb.
+    /// 4-aligned.
     #[test]
     fn an_export_whose_quantization_ends_4_aligned_still_parses() {
         let mut src =
@@ -3087,7 +2751,7 @@ mod tests {
                     data: &data,
                     ..ref_plane()
                 };
-                // A non-aligned start: the padding is relative to the record.
+                // A non-aligned start.
                 let mut out = vec![0xAAu8; 3];
                 write_plane(&plane, &mut out);
                 assert_eq!(
@@ -3117,9 +2781,7 @@ mod tests {
         .is_inline());
     }
 
-    /// A reference plane records where its bytes live inside the handle; an
-    /// inline one (see `export_emits_one_plane_per_plane_table_entry`) does
-    /// not.
+    /// A reference plane records where its bytes live inside the handle.
     #[test]
     fn a_reference_plane_keeps_its_offset_and_extent() {
         let geoms = [crate::PlaneGeometry {
@@ -3182,7 +2844,6 @@ mod tests {
 
     #[test]
     fn a_well_formed_hand_built_inline_blob_imports() {
-        // The control for the refusals below: the same builder, nothing wrong.
         let got = import(&build_blob(&[inline_plane(&[7])]), &[]).expect("well-formed");
         assert_eq!(got.shape(), &[1]);
         assert_eq!(bytes_of(&got), vec![7]);
@@ -3300,8 +2961,7 @@ mod tests {
         assert_eq!(q.axis(), Some(2));
     }
 
-    /// Declared quantization that cannot be rebuilt is refused, never
-    /// imported as "unquantized".
+    /// Declared quantization that cannot be rebuilt is refused.
     #[test]
     fn declared_but_malformed_quantization_is_refused() {
         let data = [0u8; 3];
@@ -3337,8 +2997,7 @@ mod tests {
         }
     }
 
-    /// Reference import opens a `Shm` fd the way it opens a dma-buf, so these
-    /// run on a host with no DMA heap.
+    /// Reference-import tests over a `Shm` fd.
     #[cfg(all(unix, not(any(target_os = "macos", target_os = "ios"))))]
     mod shm_reference {
         use super::*;
@@ -3495,9 +3154,7 @@ mod tests {
         }
     }
 
-    /// A padded planar image's plane stride is the pitch times the height:
-    /// its planes are `C * H` rows of one pitch, which is where the plane
-    /// table puts them.
+    /// A padded planar image's plane stride is the pitch times the height.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_padded_planar_reference_export_steps_planes_by_the_pitch() {

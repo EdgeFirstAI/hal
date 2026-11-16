@@ -2,8 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // S3: CPU access through a staging texture. Read and write latency by
-// size and format, DO_NOT_WAIT behaviour, and the staging row pitch table
-// that decides whether a stride can be a constant or must be queried.
+// size and format, DO_NOT_WAIT behaviour, and the staging row pitch table.
 #include "probe.h"
 
 #include <cstring>
@@ -48,8 +47,7 @@ void run_s3(GlSession& s) {
       snprintf(what, sizeof what, "%s %-8s read: CopyResource+Map+memcpy (GPU idle)", fmt_name(fmt), sz.name);
       report_stats("S3.1", what, st);
 
-      // Read right after a GL render into the texture (EGLImage route), so
-      // the Map stalls on the GPU work the way a map() after convert() would.
+      // Read right after a GL render into the texture (EGLImage route).
       Import im = import_texture(s, Route::EglImage, tex.Get(), gl_internal_format_for(fmt));
       GLuint fbo = 0;
       if (im.ok && p_grad) {
@@ -79,8 +77,7 @@ void run_s3(GlSession& s) {
         });
         snprintf(what, sizeof what, "%s %-8s GL draw + glFinish alone", fmt_name(fmt), sz.name);
         report_stats("S3.2", what, st3);
-        // Baseline: what the HAL does today on Windows, glReadPixels into a
-        // PBO and a CPU map of that PBO.
+        // Baseline: glReadPixels into a PBO and a CPU map of that PBO.
         {
           GLint read_type = 0;
           glGetIntegerv(GL_IMPLEMENTATION_COLOR_READ_TYPE, &read_type);
@@ -157,7 +154,7 @@ void run_s3(GlSession& s) {
       snprintf(what, sizeof what, "%s %-8s write + read back (full round trip)", fmt_name(fmt), sz.name);
       report_stats("S3.3", what, st);
 
-      // DO_NOT_WAIT: how often is the copy still in flight right after issue?
+      // DO_NOT_WAIT: count how often the copy is still in flight right after issue.
       if (fmt == DXGI_FORMAT_R8G8B8A8_UNORM) {
         int still_drawing = 0, polls_total = 0;
         const int N = 50;

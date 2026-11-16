@@ -231,8 +231,8 @@ pub enum LabelsArg {
 /// - ``labels``: a list of non-empty class names, or one comma-separated
 ///   string. Resolution raises :class:`LabelCountMismatchError` when their
 ///   number differs from a class count the model's outputs state;
-///   end-to-end detections and class maps state none, so any number is
-///   accepted there and the caller checks it.
+///   end-to-end detections and class maps state none, and any number is
+///   accepted there.
 ///
 /// :meth:`ResolvedModelConfig.describe` prints these keys in the same
 /// grammar.
@@ -396,8 +396,8 @@ impl PyModelOverrides {
     }
 }
 
-/// `x` as the `f64` its shortest decimal form names, so `123.675_f32`
-/// reads back as `123.675` rather than `123.67500305175781`.
+/// `x` as the `f64` its shortest decimal form names (`123.675_f32` gives
+/// `123.675`).
 fn shortest(x: f32) -> f64 {
     x.to_string().parse().unwrap_or(f64::from(x))
 }

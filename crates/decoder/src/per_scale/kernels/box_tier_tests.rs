@@ -4,8 +4,8 @@
 //! Every per-scale box cell (DFL per-tensor and per-channel, LTRB) on every tier this CPU has.
 //!
 //! Cells whose arithmetic the NEON tiers keep are compared bit for bit: the 8-bit exp-table
-//! cells with the scalar tier, integer LTRB and 16-bit DFL into f32 with the decoder's earlier
-//! NEON composition, float LTRB into f32 with the scalar tier, and `f16` outputs of the f32 path
+//! cells with the scalar tier, integer LTRB and 16-bit DFL into f32 with the NEON composition
+//! in `earlier`, float LTRB into f32 with the scalar tier, and `f16` outputs of the f32 path
 //! with that tier's f32 cell rounded once. The rest are held to the float64 reference: f32
 //! outputs to [`f32_bar`], `f16` outputs to [`F16_ULPS`] (native FP16 cells
 //! [`fp16_ulps`]) f16 ulps of the value or of 640 px.
@@ -23,8 +23,7 @@ use half::f16;
 /// f16 outputs of the f32 path rounded once, in f16 ulps of `max(|value|, 640 px)`.
 const F16_ULPS: f64 = 1.0;
 
-/// f16 outputs of the native FP16 cells: the kernels crate's DFL box bound, 1 ulp up to `reg_max`
-/// 32 and 3 at 64, where each lane sums four f16 steps and distances reach 63 grid units.
+/// f16 outputs of the native FP16 cells: 1 ulp up to `reg_max` 32 and 3 at 64.
 fn fp16_ulps(reg_max: usize) -> f64 {
     if reg_max > 32 {
         3.0
@@ -116,9 +115,7 @@ fn select(kind: Kind, input: DType, output: DecodeDtype, f: &CpuFeatures) -> Cel
     }
 }
 
-/// On NEON tiers no box cell is scalar. On FP16 tiers `f16` outputs take a native FP16 cell,
-/// except the 8-bit exp-table cells and LTRB, whose f32 results are rounded once, and 16-bit
-/// per-tensor DFL into f32 keeps its fp16 exp; no other cell is FP16.
+/// On NEON tiers no box cell is scalar, and only the cells with a native FP16 kernel are FP16.
 #[test]
 fn every_box_cell_runs_neon_on_neon_tiers() {
     for (tier, f) in tiers() {
@@ -520,7 +517,7 @@ fn check_f16(case: &Case, got: &[f16], bound: Option<f64>, label: &str) -> f64 {
     worst
 }
 
-/// The decoder's earlier NEON compositions, rebuilt from the same `prim` calls.
+/// NEON compositions of `prim` calls that the cells are compared with.
 #[cfg(target_arch = "aarch64")]
 mod earlier {
     use super::*;
@@ -600,7 +597,7 @@ mod earlier {
 enum F32Check {
     /// Bit for bit against the scalar tier.
     Scalar,
-    /// Bit for bit against the decoder's earlier NEON composition.
+    /// Bit for bit against the NEON composition in `earlier`.
     Earlier,
     /// Within [`f32_bar`] of the float64 reference.
     Bar,
@@ -617,8 +614,7 @@ fn f32_check(kind: Kind, input: DType) -> F32Check {
     }
 }
 
-/// Every box cell on every tier, at `reg_max` 16, 8, 17, 32 and 64. Prints the worst error per
-/// cell.
+/// Every box cell on every tier, at `reg_max` 16, 8, 17, 32 and 64.
 #[test]
 fn every_box_cell_matches_its_reference_on_every_tier() {
     let scalar = CpuFeatures::default();
@@ -817,8 +813,7 @@ fn assert_untouched(d32: &[f32], d16: &[f16], label: &str) {
     assert!(d16.iter().all(|&v| v == s16), "{label}: f16 output written");
 }
 
-/// A box level call whose input, output or grids do not hold `h · w` anchors, or whose DFL
-/// `reg_max` is out of range, is `InvalidShape` on every tier and cell, before any write.
+/// A box level call with mismatched lengths or an out-of-range DFL `reg_max` is `InvalidShape` on every tier and cell, before any write.
 #[test]
 fn box_cells_reject_length_mismatches_before_writing() {
     let n = 21;

@@ -7,8 +7,7 @@
 //! - the schema, quantization, NMS config, and a Markdown narrative,
 //!   all in the safetensors `__metadata__` table.
 //!
-//! See `.claude/plans/2026-04-29-per-scale-fixture-framework-design.md`
-//! and `testdata/decoder/README.md` for the format.
+//! See `testdata/decoder/README.md` for the format.
 //!
 //! Fixture keys map 1:1 to HAL kernels under
 //! `crates/decoder/src/per_scale/`:
@@ -73,10 +72,7 @@ pub struct NmsConfig {
 
 /// Loaded reference fixture for one model + image pair.
 ///
-/// Owns the file bytes. Tensor accessors lazily re-deserialize the
-/// safetensors view (cheap — header-only parse plus offset bookkeeping)
-/// because safetensors v0.7's `SafeTensors` borrows from the byte slice
-/// and would otherwise tangle this struct in lifetime parameters.
+/// Owns the file bytes. Tensor accessors re-deserialize the safetensors view.
 pub struct PerScaleFixture {
     pub path: PathBuf,
     pub format_version: String,
@@ -108,9 +104,8 @@ impl PerScaleFixture {
         }
         let raw_bytes = fs::read(path).map_err(FixtureError::Io)?;
 
-        // safetensors v0.7: read_metadata is a static method that returns
-        // (header_size, Metadata). The user's __metadata__ dict lives at
-        // Metadata::metadata() -> &Option<HashMap<String, String>>.
+        // `read_metadata` returns `(header_size, Metadata)`; the `__metadata__`
+        // dict is `Metadata::metadata()`.
         let (_n, parsed) = SafeTensors::read_metadata(&raw_bytes)
             .map_err(|e| FixtureError::Parse(format!("read_metadata: {e}")))?;
         let user_meta: &HashMap<String, String> = parsed
@@ -223,13 +218,8 @@ impl RawDtype {
     }
 }
 
-/// Owned tensor view from a fixture.
-///
-/// Carries a copy of the safetensors-stored bytes plus dtype and shape.
-/// Owned because `safetensors::SafeTensors` borrows from the fixture's
-/// `raw_bytes` and goes out of scope between accessor calls; copying a
-/// few MB per test run is cheaper than threading lifetimes through
-/// every test.
+/// Owned tensor view from a fixture: a copy of the safetensors-stored bytes
+/// plus dtype and shape.
 pub struct RawTensor {
     pub dtype: RawDtype,
     pub shape: Vec<usize>,
@@ -283,9 +273,6 @@ pub struct DecodedRef {
 }
 
 /// Borrowed accessor for per-stage f32 intermediate arrays.
-///
-/// Borrows `&PerScaleFixture` so the safetensors blob is only
-/// re-deserialized once per `raw_tensor` call, not at construction.
 pub struct Intermediates<'a> {
     fix: &'a PerScaleFixture,
 }
@@ -424,18 +411,12 @@ impl PerScaleFixture {
     /// Walks every `raw.*` key (including `raw.protos`), allocates a
     /// `TensorDyn` of the matching dtype + shape, copies the bytes, and
     /// attaches the per-tensor `Quantization` parsed from
-    /// `quantization_json`. The HAL per-scale pipeline reads
-    /// quantization off the tensor object via `quant_from_tensor`
-    /// (`crates/decoder/src/per_scale/pipeline.rs`), so attaching here
-    /// is mandatory.
+    /// `quantization_json`.
     pub fn build_tensors_with_quant(&self) -> Result<Vec<TensorDyn>, FixtureError> {
         let st = SafeTensors::deserialize(&self.raw_bytes)
             .map_err(|e| FixtureError::Parse(format!("deserialize: {e}")))?;
 
-        // Sort names for deterministic ordering across runs (HashMap iter
-        // order is unspecified; HAL doesn't care about input ordering
-        // because resolve_bindings uses shape-match, but determinism
-        // makes test failures easier to reason about).
+        // Sorted names, for a deterministic order.
         let mut names: Vec<String> = st
             .names()
             .iter()
@@ -524,9 +505,7 @@ fn build_one_tensor(raw: &RawTensor, qp: Option<&QuantParams>) -> Result<TensorD
         }
     };
     if let Some(qp) = qp {
-        // set_quantization returns Result; floats reject quantization,
-        // but a quant entry on a float tensor is a fixture-build bug we
-        // surface explicitly rather than silently ignore.
+        // `set_quantization` rejects a float tensor.
         t.set_quantization(Quantization::per_tensor(qp.scale, qp.zero_point))
             .map_err(|e| FixtureError::Parse(format!("set_quantization: {e}")))?;
     }

@@ -1,8 +1,4 @@
-"""Type stubs for ``edgefirst.tensor``.
-
-Split from the pre-0.29 monolithic ``edgefirst_hal.pyi``; assignment
-mirrors the pymodule registrations in crates/python-tensor/src/lib.rs.
-"""
+"""Type stubs for ``edgefirst.tensor``."""
 
 import enum
 import sys
@@ -13,7 +9,7 @@ from typing_extensions import Self, TypeAlias
 
 """EdgeFirst HAL Python bindings."""
 
-# "dynamic" in every wheel; "static" only in the G13 comparison build.
+# "dynamic" in every wheel; "static" only in the comparison build.
 __tensor_backend__: str
 
 def version() -> str:
@@ -38,8 +34,8 @@ def is_gpu_buffer_available() -> bool:
 
     A DMA-BUF on Linux, an IOSurface on macOS and iOS, an AHardwareBuffer on
     Android, a D3D11 texture on Windows. Declared and answered on every
-    platform. Use this when you only care whether ``TensorMemory.DMABUF``
-    will succeed without caring which primitive backs it.
+    platform. Reports whether ``TensorMemory.DMABUF`` allocation can succeed,
+    whichever primitive backs it.
     """
 
 def is_shm_available() -> bool:
@@ -67,9 +63,8 @@ if sys.platform == "win32":
         ``ctypes.c_void_p`` for native callers; no reference is
         transferred, so never ``Release`` this pointer.
 
-        This is the device the tensors this wheel allocates live on, which
-        is the one inside ``libedgefirst_tensor`` -- not a second one in the
-        wheel's own linked copy.
+        This is the device inside ``libedgefirst_tensor``, on which the
+        tensors this wheel allocates live.
 
         Raises:
             RuntimeError: If no device could be created.
@@ -81,15 +76,12 @@ if sys.platform == "win32":
         Platforms:
             Windows.
 
-        Tensors the HAL allocates then live on the caller's device instead
-        of a second one. The reference stays the caller's. Must run before
-        anything that creates the device as a side effect:
-        :func:`d3d11_device`, :func:`is_gpu_buffer_available`, or any
-        texture allocation.
+        Tensors the HAL allocates then live on the caller's device. The
+        reference stays the caller's. Must run before anything that creates
+        the device as a side effect: :func:`d3d11_device`,
+        :func:`is_gpu_buffer_available`, or any texture allocation.
 
-        The pointer is installed into ``libedgefirst_tensor``, which is
-        where the allocations happen, so it takes effect with no intervening
-        call.
+        The pointer is installed into ``libedgefirst_tensor``.
 
         Raises:
             RuntimeError: If the device is already initialized, or ``ptr``
@@ -146,12 +138,9 @@ class Quantization:
     def is_symmetric(self) -> bool: ...
 
 class TensorMemory(enum.Enum):
-    """Every member is defined on every platform -- this is a namespace of
-    codes, not a list of what the current platform can allocate. A tensor
-    recorded on one platform names the same member when read back on
-    another, even where that platform cannot materialise it.
-    ``TensorMemory.is_available()`` (not shown here -- see the Rust
-    ``TensorMemory::is_available`` docs) answers the runtime question.
+    """Every member is defined on every platform. A tensor recorded on one
+    platform names the same member when read back on another, even where
+    that platform cannot materialise it.
     """
 
     MEM: TensorMemory
@@ -174,8 +163,7 @@ class TensorMemory(enum.Enum):
 
     IOSURFACE: TensorMemory
     """
-    Apple IOSurface, named specifically rather than through the portable
-    ``DMABUF`` spelling. No backend produces or accepts it yet -- macOS/iOS
+    Apple IOSurface. No backend produces or accepts it; macOS and iOS
     allocate and report ``DMABUF``.
     """
 
@@ -186,13 +174,12 @@ class TensorMemory(enum.Enum):
     """
 
     CUDA: TensorMemory
-    """CUDA device memory. No backend produces or accepts it yet."""
+    """CUDA device memory. No backend produces or accepts it."""
 
     D3D11_TEXTURE: TensorMemory
     """
-    Windows D3D11 texture, named specifically rather than through the
-    portable ``DMABUF`` spelling. No backend produces or accepts it yet --
-    Windows allocates and reports ``DMABUF``.
+    Windows D3D11 texture. No backend produces or accepts it; Windows
+    allocates and reports ``DMABUF``.
     """
 
 class EdgeFirstTensorExportable(Protocol):
@@ -202,11 +189,9 @@ class EdgeFirstTensorExportable(Protocol):
 
     See ``crates/python-common/INTEROP.md`` in the
     `hal <https://github.com/EdgeFirstAI/hal>`_ repository for the full
-    protocol. Consumers should duck type
-    (``hasattr(obj, "__edgefirst_tensor__")``) rather than ``isinstance``
-    against this protocol or against a concrete ``Tensor`` type -- every
-    ``edgefirst.*`` package registers its own ``Tensor`` type object (see
-    `PyO3 #1444 <https://github.com/PyO3/pyo3/issues/1444>`_).
+    protocol. Each ``edgefirst.*`` package registers its own ``Tensor`` type
+    object, so consumers duck type
+    (``hasattr(obj, "__edgefirst_tensor__")``) and do not use ``isinstance``.
     """
 
     def __edgefirst_tensor__(self, access: str | None = None) -> object: ...
@@ -264,8 +249,8 @@ class Tensor:
             Platforms:
                 Linux, macOS.
 
-            The buffer type is **detected, not chosen**. On Linux it is
-            determined by the file descriptor's filesystem magic:
+            The buffer type is detected. On Linux it is determined by the
+            file descriptor's filesystem magic:
 
             =========================================  =========================
             File descriptor                            ``Tensor.memory``
@@ -277,30 +262,19 @@ class Tensor:
 
             On macOS the fd is always imported as ``TensorMemory.SHM``.
 
-            Both supported types are identified positively; an unrecognized
-            filesystem raises rather than silently falling back to shared
-            memory. That fallback would not fail loudly — a DMA-BUF is
-            mmap-able, so it would import as a working tensor that merely
-            isn't DMA, and the lost zero-copy would only surface later as
-            ``ImageProcessor.import_image`` refusing the buffer.
-
             The fd is ``dup()``'d immediately — the caller retains ownership
             of the original fd and must close it when done.
 
             Raises:
-                RuntimeError: The fd could not be imported. Most commonly its
-                    buffer type could not be determined because it is neither
-                    a DMA-BUF nor tmpfs-backed (a regular file, a pipe or
-                    socket, or a ``MFD_HUGETLB`` memfd) — the message reports
-                    the observed filesystem magic, e.g. ``Tensor error:
-                    UnknownBufferType: fd is on an unrecognized filesystem
-                    (magic 0x50495045)``. Also raised for a negative ``fd``,
-                    an unsupported ``dtype``, a shape larger than the buffer,
-                    or a failed syscall.
+                RuntimeError: The fd could not be imported: its buffer type is
+                    neither a DMA-BUF nor tmpfs-backed (a regular file, a pipe
+                    or socket, or a ``MFD_HUGETLB`` memfd; the message reports
+                    the observed filesystem magic), ``fd`` is negative,
+                    ``dtype`` is unsupported, the shape is larger than the
+                    buffer, or a syscall failed.
 
             Note:
-                Check ``tensor.memory`` if you require zero-copy — a
-                successful import is not by itself proof of DMA backing.
+                ``tensor.memory`` reports the detected type.
             """
 
         @property
@@ -345,8 +319,8 @@ class Tensor:
 
         ``"none"``, ``"read"``, ``"write"`` or ``"readwrite"``: the maps,
         pins and syncs this tensor accepts. Set at allocation; a tensor
-        imported from another package carries its producer's declaration. See :meth:`cpu_access` for the
-        coherency bracket itself.
+        imported from another package carries its producer's declaration.
+        See :meth:`cpu_access` for the coherency bracket.
         """
 
     @property
@@ -359,17 +333,17 @@ class Tensor:
 
     @property
     def shape(self) -> list[int]:
-        """The shape of the tensor. A property, not a method."""
+        """The shape of the tensor."""
 
     def reshape(self, shape: list[int]) -> None:
         """Reshape the tensor. The total element count must stay the same."""
 
     def view(self, region: Region) -> Tensor:
-        """Zero-copy rectangular sub-region view — the source/destination crop.
+        """Zero-copy rectangular sub-region view of an image tensor.
 
         ``region`` is in pixels of the image's leading frame. The view shares
-        the parent's buffer (and ``BufferIdentity``) with no copy, addressing
-        the sub-rectangle by offset + the parent's row pitch.
+        the parent's buffer and addresses the sub-rectangle by offset and the
+        parent's row pitch.
         ``convert(src, dst.view(region), ...)`` renders into that sub-rectangle.
         The parent must be a packed-format image tensor.
 
@@ -401,8 +375,7 @@ class Tensor:
         """Attach pixel format metadata to this tensor.
 
         Validates that the tensor's shape is compatible with the format's
-        layout (packed, planar, or semi-planar). This enables ``from_fd()``
-        tensors to be used as image conversion destinations.
+        layout (packed, planar, or semi-planar).
 
         Args:
             format: Pixel format to attach.
@@ -415,13 +388,8 @@ class Tensor:
         """Set this tensor's logical dimensions and pixel format to a decoded
         image, reusing the existing allocation.
 
-        Unlike :meth:`set_format` (which only validates the *current* shape
-        against a format) and :meth:`reshape` (which requires the same
-        element count), this can shrink or grow the logical shape within the
-        tensor's allocated capacity -- exactly what a JPEG/PNG decode does to
-        its destination. ``edgefirst.codec``'s cross-package
-        ``decode_into``/``decode_file_into`` write-back uses this to leave a
-        foreign destination in the same state a same-module decode would.
+        The logical shape can shrink or grow within the tensor's allocated
+        capacity.
 
         Args:
             width: Decoded image width in pixels.
@@ -439,8 +407,6 @@ class Tensor:
 
             Platforms:
                 Linux.
-
-            Returns a new file descriptor that the caller must close.
 
             Returns:
                 A new file descriptor (int) that the caller must close.
@@ -474,8 +440,7 @@ class Tensor:
                 shape: Tensor shape. The product of all dimensions times
                     the element size must fit within
                     ``IOSurfaceGetAllocSize(surface_ref)``; a mismatched
-                    shape raises ``RuntimeError`` instead of risking
-                    out-of-bounds access at map time.
+                    shape raises ``RuntimeError``.
                 dtype: Element type; defaults to ``"uint8"`` for image data.
                 name: Optional tensor name for debugging.
 
@@ -514,13 +479,11 @@ class Tensor:
             raw pointer — wrap it with ``ctypes.c_void_p(...)`` before
             passing to a ctypes-bound function.
 
-            The pointer's lifetime is tied to this tensor — the HAL holds
-            the only retain count. If the surface must outlive this
-            tensor, call ``CFRetain`` (via ctypes) on the pointer and
-            pair it with a matching ``CFRelease``. Do *not* call
-            ``CFRelease`` on the borrowed pointer without first
-            ``CFRetain``-ing — that would drop HAL's retain and produce
-            a use-after-free.
+            The pointer's lifetime is tied to this tensor. If the surface
+            must outlive this tensor, call ``CFRetain`` (via ctypes) on the
+            pointer and pair it with a matching ``CFRelease``. Do not call
+            ``CFRelease`` on the borrowed pointer without a prior
+            ``CFRetain``.
 
             Returns ``None`` when the tensor is not IOSurface-backed.
 
@@ -598,10 +561,9 @@ class Tensor:
             Platforms:
                 Windows.
 
-            The same number :meth:`gpu_completion` returns as ``value``,
-            with no fence handle to close: for a consumer that already holds
-            the process fence and needs only the value to wait for. 0 when
-            no write has been recorded, or when the tensor is not a texture.
+            The same number :meth:`gpu_completion` returns as ``value``. 0
+            when no write has been recorded, or when the tensor is not a
+            texture.
             """
 
         def set_gpu_write(self, value: int) -> None:
@@ -610,8 +572,7 @@ class Tensor:
             Platforms:
                 Windows.
 
-            The recorded value is a maximum, so a producer may record on a
-            tensor its consumers already hold.
+            The recorded value is the maximum of the values set.
 
             Raises:
                 RuntimeError: If the tensor is not a D3D11 texture.
@@ -632,15 +593,13 @@ class Tensor:
                 Windows.
 
             The width and height are read from the texture's own
-            description, so ``shape`` describes it rather than defining it:
-            it must be either the allocation shape or the addressing shape
-            ``format`` gives those dimensions.
+            description. ``shape`` must be either the allocation shape or
+            the addressing shape ``format`` gives those dimensions.
 
             A semi-planar texture (``Nv12``, ``Nv16``, ``Nv24``) carries the
-            image's row stride as its width, so it is accepted only when
-            that width is even and equal to the staging row pitch the driver
-            gives a texture of that width. Allocate through the HAL, or
-            match the pitch.
+            image's row stride as its width. It is accepted only when that
+            width is even and equal to the staging row pitch the driver
+            gives a texture of that width.
 
             Raises:
                 ValueError: If ``shape`` is neither shape of this texture;
@@ -664,13 +623,12 @@ class Tensor:
             Platforms:
                 Windows.
 
-            ``handle`` and ``completion``'s fence handle stay the caller's:
-            this duplicates what it keeps. The width and height are read
-            from the opened texture's own description, so ``shape``
-            describes it rather than defining it: it must be either the
-            allocation shape or the addressing shape ``format`` gives those
-            dimensions. The semi-planar width rule of
-            :meth:`from_d3d11_texture` applies here too.
+            ``handle`` and ``completion``'s fence handle stay the caller's;
+            the tensor duplicates what it keeps. The width and height are
+            read from the opened texture's own description. ``shape`` must
+            be either the allocation shape or the addressing shape
+            ``format`` gives those dimensions. The semi-planar width rule of
+            :meth:`from_d3d11_texture` applies.
 
             Args:
                 completion: ``(fence_handle, value)`` from
@@ -692,23 +650,18 @@ class Tensor:
         Returns a ``HostView`` context manager that exposes the raw buffer.
         Use with a ``with`` statement to ensure the mapping is released.
 
-        The map owns its cache-coherency bracket in both directions, unlike
-        :meth:`pin_host`, which is decoupled and pairs with
-        :meth:`cpu_access`.
+        The map owns its cache-coherency bracket in both directions.
 
-        ``access`` selects that bracket's direction and is worth setting.
-        The default ``"readwrite"`` pays a full-buffer cache writeback when
-        the map is released; a reader does not need it. On a non-coherent
-        DMA-BUF backing that is a per-frame cost, and on macOS ``"read"``
-        takes the read-only IOSurface lock, skipping the unlock flush::
+        ``access`` selects that bracket's direction. ``"read"`` skips the
+        cache writeback when the map is released and, on macOS, takes the
+        read-only IOSurface lock::
 
             with tensor.map("read") as view:
                 frame = np.asarray(view)   # read-only, zero-copy
 
-        A ``"read"`` view is advertised to the buffer protocol as read-only,
-        so ``np.asarray`` of it is not writable and asking for a writable
-        buffer raises ``BufferError`` rather than silently handing back
-        writes that the release would discard.
+        A ``"read"`` view is advertised to the buffer protocol as read-only:
+        ``np.asarray`` of it is not writable and asking for a writable
+        buffer raises ``BufferError``.
 
         Example — write a numpy array into a tensor::
 
@@ -751,8 +704,7 @@ class Tensor:
         flight; identical to :meth:`map` on backings without such a copy.
 
         A caller that retries after ``BlockingIOError`` must yield or sleep
-        between attempts: on the WARP software adapter the CPU threads are
-        the GPU, so a tight retry loop starves the copy it is waiting for.
+        between attempts.
 
         Args:
             access: as :meth:`map`.
@@ -768,11 +720,9 @@ class Tensor:
 
         Returns a :class:`CudaMap` context manager, or ``None`` if CUDA is
         unavailable for this tensor (libcudart not found, or the tensor was
-        not registered with CUDA). Fast-fails to ``None`` without GL-thread
-        routing.
+        not registered with CUDA).
 
-        The recommended pattern is to try ``cuda_map()`` first and fall back
-        to ``map()`` when it returns ``None``::
+        Fall back to ``map()`` when it returns ``None``::
 
             cm = tensor.cuda_map()
             if cm is not None:
@@ -783,14 +733,12 @@ class Tensor:
                     run_cpu_path(host)                    # CPU fallback
 
         On Windows the mapping of a D3D11 texture tensor is tight rows of
-        ``width * bytes_per_texel``, and ``size`` is their sum, whatever
-        :attr:`row_stride` reports -- that is the D3D11 staging pitch a CPU
-        map sees, a larger number on a padded backing. A consumer must not
-        stride the device pointer by :attr:`row_stride`.
+        ``width * bytes_per_texel``, and ``size`` is their sum, independent of
+        :attr:`row_stride`. A consumer must not stride the device pointer by
+        :attr:`row_stride`.
 
-        A semi-planar texture (NV12, NV16, NV24) is as wide as its own pitch,
-        so there the mapping is :attr:`row_stride` times the combined height
-        and striding by it is correct.
+        A semi-planar texture (NV12, NV16, NV24) is as wide as its own pitch;
+        its mapping is :attr:`row_stride` times the combined height.
 
         Returns:
             A :class:`CudaMap` context manager, or ``None``.
@@ -800,21 +748,17 @@ class Tensor:
         """Writable counterpart of :meth:`cuda_map`.
 
         Changes are written back to the tensor when the mapping is released.
-        The same object as :meth:`cuda_map` where the mapping aliases the
-        tensor's memory, and ``None`` on the same terms. A Windows D3D11
-        texture is the backing that does not alias: its release copies the
-        device buffer back into the texture.
+        Returns ``None`` on the same terms as :meth:`cuda_map`. For a Windows
+        D3D11 texture the release copies the device buffer back into the
+        texture.
 
         On Windows the mapping of a D3D11 texture tensor is tight rows of
-        ``width * bytes_per_texel``, and ``size`` is their sum, whatever
-        :attr:`row_stride` reports -- that is the D3D11 staging pitch a CPU
-        map sees, a larger number on a padded backing. A consumer must not
-        stride the device pointer by :attr:`row_stride`; writing at that
-        pitch scrambles the image rather than failing.
+        ``width * bytes_per_texel``, and ``size`` is their sum, independent of
+        :attr:`row_stride`. A consumer must not stride the device pointer by
+        :attr:`row_stride`.
 
-        A semi-planar texture (NV12, NV16, NV24) is as wide as its own pitch,
-        so there the mapping is :attr:`row_stride` times the combined height
-        and striding by it is correct.
+        A semi-planar texture (NV12, NV16, NV24) is as wide as its own pitch;
+        its mapping is :attr:`row_stride` times the combined height.
         """
 
     @staticmethod
@@ -834,7 +778,7 @@ class Tensor:
             format: Pixel format for the image data.
             mem: Optional memory type override. If None, the best available
                 memory type is chosen automatically.
-            access: Declared CPU access — ``"readwrite"`` (default),
+            access: Declared CPU access: ``"readwrite"`` (default),
                 ``"read"``, ``"write"`` (whole-buffer writes only), or
                 ``"none"`` (hardware-only). Hardware access is always
                 implied. A CPU map, pin or sync outside the declaration
@@ -842,37 +786,27 @@ class Tensor:
                 convert or draw, a decode) the declaration does not cover.
                 ``"readwrite"`` and ``"read"`` use cached memory; on Linux a
                 ``"none"`` or ``"write"`` DMA-BUF comes from the uncached CMA
-                heap where available, which devices map without CPU cache
-                maintenance.
+                heap where available.
             contiguous: Require physically contiguous memory: a DMA-BUF from
-                the Linux CMA heap, or an error naming the heap, never a
-                fallback. ``mem`` must be ``None`` or ``TensorMemory.DMABUF``.
+                the Linux CMA heap, or an error naming the heap. ``mem``
+                must be ``None`` or ``TensorMemory.DMABUF``.
         """
-
-    # `save_jpeg` and `normalize_to_numpy` are NOT on this class. They were
-    # inherited from the pre-0.29 monolithic stub and belong to the encoders
-    # and normalisers that ship with `edgefirst.codec` and `edgefirst.image`
-    # respectively — importing `edgefirst.tensor` alone links neither.
 
     def __edgefirst_tensor__(self, access: str | None = None) -> object:
         """Producer half of the cross-package tensor protocol.
 
-        Returns a ``PyCapsule`` named ``edgefirst_tensor_v2``. Consumers in
-        other ``edgefirst.*`` packages read this instead of type-checking --
-        see :class:`EdgeFirstTensorExportable` and
+        Returns a ``PyCapsule`` named ``edgefirst_tensor_v2``. See
+        :class:`EdgeFirstTensorExportable` and
         ``crates/python-common/INTEROP.md``.
 
-        May be called more than once per operation (e.g. a caller retrying
-        with a different ``access`` after an ``access=None`` descriptor
-        turns out to need a host address); implementations must be
-        side-effect free.
+        The call has no side effects and may be repeated with the same or a
+        different ``access``.
 
         Args:
-            access: ``None`` (default) requests no pin -- the descriptor
-                still carries shape, format and the native handle, which is
-                all a zero-copy consumer needs. ``"read"``, ``"write"`` or
-                ``"readwrite"`` pins host memory with the matching access
-                and fills in the descriptor's address.
+            access: ``None`` (default) requests no pin; the descriptor
+                carries shape, format and the native handle. ``"read"``,
+                ``"write"`` or ``"readwrite"`` pins host memory with the
+                matching access and fills in the descriptor's address.
 
         Raises:
             ValueError: if ``access`` is not one of the values above.
@@ -883,13 +817,11 @@ class Tensor:
     def pin_host(self, access: Literal["read", "write", "readwrite"]) -> HostPin:
         """Pin a stable host address that outlives every map guard.
 
-        The returned :class:`HostPin` borrows nothing, so the tensor stays
-        free to be mutated — that is the point. Hand the address to an
-        external runtime and keep converting into the tensor underneath it.
+        The returned :class:`HostPin` carries no borrow of the tensor: the
+        tensor can still be converted into while the address is held.
 
         Args:
-            access: The CPU access to pin for. ``"none"`` is not valid: a
-                pinned mapping is CPU access by definition.
+            access: The CPU access to pin for. ``"none"`` is not valid.
 
         Raises:
             RuntimeError: on a backend that cannot separate addressing from
@@ -904,8 +836,7 @@ class Tensor:
     ) -> CpuAccessGuard:
         """Bracket CPU access to this tensor for cache coherency.
 
-        A no-op on coherent backends, so portable code can bracket
-        unconditionally::
+        A no-op on coherent backends::
 
             with tensor.cpu_access("read"):
                 ...  # read through a pin or a raw address
@@ -922,10 +853,10 @@ class Tensor:
         The total number of elements must match. Both contiguous and
         non-contiguous (strided) arrays are supported:
 
-        - **Contiguous arrays** use a direct memcpy (fastest).
-        - **Non-contiguous arrays** (slices, transposes) are copied
+        - Contiguous arrays use a direct memcpy.
+        - Non-contiguous arrays (slices, transposes) are copied
           element-wise via the array's stride metadata.
-        - **Large copies** (≥256 KiB) are parallelized automatically.
+        - Large copies (≥256 KiB) are parallelized automatically.
 
         Example::
 
@@ -1030,8 +961,6 @@ class HostView:
     """Mapped-memory guard returned by :meth:`Tensor.map`.
 
     Not constructible from Python — obtain instances from ``Tensor.map()``.
-    Replaced the former ``TensorMap`` in 0.29: one view type now covers every
-    backend, so the mapped extent no longer depends on which one you have.
     """
 
     def unmap(self) -> None: ...
@@ -1047,19 +976,16 @@ class HostView:
 class HostPin:
     """A stable host address for a tensor's data, valid until released.
 
-    Unlike :class:`HostView` this carries **no borrow of the tensor**, so the
-    address survives every map guard and stays put across calls that mutate
-    the tensor — including ``ImageProcessor.convert()`` rendering into it.
-    That is what lets a pinned buffer back an external runtime's tensor (a
-    TFLite custom allocation, an ONNX Runtime external tensor) while a frame
-    loop keeps writing it.
+    Carries no borrow of the tensor: the address stays valid across calls
+    that mutate the tensor, including ``ImageProcessor.convert()`` rendering
+    into it.
 
     Not constructible from Python — obtain instances from
     ``Tensor.pin_host()``. Usable as a context manager, which releases on
     exit; reading :attr:`ptr` after release raises ``RuntimeError``.
 
-    The address is not a coherency guarantee: bracket CPU access with
-    :meth:`Tensor.cpu_access`, which is a no-op where nothing is owed.
+    The address gives no coherency guarantee: bracket CPU access with
+    :meth:`Tensor.cpu_access`.
     """
 
     @property
@@ -1076,15 +1002,10 @@ class HostPin:
 
     @property
     def alignment(self) -> int:
-        """Alignment of the pinned address in bytes.
-
-        TFLite requires 64 (``kDefaultTensorAlignment``) for a custom
-        allocation, so check rather than assume.
-        """
+        """Alignment of the pinned address in bytes."""
 
     def release(self) -> None:
-        """Release the pin. Any consumer still holding the address is now
-        holding a dangling pointer."""
+        """Release the pin. The address is invalid afterwards."""
 
     def __enter__(self) -> Self: ...
     def __exit__(self, _exc_type, _exc_value, _traceback) -> None: ...
@@ -1104,8 +1025,7 @@ class CudaMap:
     """Scoped zero-copy CUDA device-pointer mapping for a tensor.
 
     Obtain via :meth:`Tensor.cuda_map`. Use as a context manager; the
-    mapping is released on ``__exit__`` so the GPU buffer can be reused
-    by the next ``convert()`` call.
+    mapping is released on ``__exit__``.
 
     Example::
 
@@ -1134,8 +1054,7 @@ class CudaMap:
     def release(self) -> None:
         """Release the CUDA mapping (idempotent).
 
-        Called automatically on ``with`` exit. May also be called explicitly
-        when early release is needed before the ``with`` block exits.
+        Called automatically on ``with`` exit. May also be called explicitly.
         """
 
     def __enter__(self) -> Self: ...
@@ -1201,11 +1120,10 @@ class Colorimetry:
         for an RGB/HSV format, whatever the colorspace, and for
         ``V4L2_COLORSPACE_JPEG``; limited for a YUV format in any other
         recognised colorspace; and ``None`` for a YUV format in a
-        ``DEFAULT`` or unrecognised colorspace, so the at-use height
-        heuristic decides. ``ycbcr_enc`` follows the colorspace (e.g.
-        ``V4L2_COLORSPACE_JPEG`` → BT.601) and is likewise ``None`` for a
-        ``DEFAULT`` or unrecognised one. An unrecognised value maps to
-        ``None``.
+        ``DEFAULT`` or unrecognised colorspace. ``ycbcr_enc`` follows the
+        colorspace (e.g. ``V4L2_COLORSPACE_JPEG`` → BT.601) and is likewise
+        ``None`` for a ``DEFAULT`` or unrecognised one. An unrecognised value
+        maps to ``None``.
         """
 
     @property
@@ -1234,16 +1152,9 @@ class Tracing:
     proto extraction, etc.) to a Chrome JSON file viewable at
     https://ui.perfetto.dev/.
 
-    Only one trace session per process lifetime is supported.  The tracing
-    spans are always compiled into the library but have near-zero overhead
-    (a single atomic load) until a session is started via this API.
+    Only one trace session per process lifetime is supported.
 
-    The ``tracing`` feature is enabled by default in all builds.  It can be
-    removed with ``--no-default-features`` if the capture infrastructure is
-    not needed (span sites remain compiled at near-zero overhead but cannot
-    be activated for capture).
-
-    Usage as context manager (recommended):
+    Usage as context manager:
 
     .. code-block:: python
 
@@ -1262,10 +1173,6 @@ class Tracing:
         guard.start()
         # ... inference pipeline ...
         guard.stop()  # flushes trace file
-
-    The resulting JSON file can be dragged into https://ui.perfetto.dev/ to
-    visualize the timeline of decode and mask operations with per-span metadata
-    (detection counts, proto dimensions, layout, etc.).
     """
 
     def __init__(self, path: str) -> None:
@@ -1302,7 +1209,7 @@ class Tracing:
     def __exit__(self, *args: object) -> bool: ...
 
 # ---------------------------------------------------------------------------
-# SAHI-style tiled inference
+# Pixel formats and regions
 # ---------------------------------------------------------------------------
 
 class PixelFormat(enum.Enum):

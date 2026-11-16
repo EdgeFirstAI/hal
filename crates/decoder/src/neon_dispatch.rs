@@ -36,17 +36,13 @@ pub(crate) mod semantic;
 pub(crate) use modelpack::{channel_argmax, seg_normalize_array, seg_to_u8_array, SplitDecode};
 pub(crate) use nms::{jaccard4_kernel, keep_unflagged, nms_dead, nms_isa, sort_by_score_desc};
 
-/// Candidate filters over fewer score elements than this run on the calling thread: handing a
-/// few hundred rows to rayon costs more CPU, in waking and then spinning workers, than filtering
-/// them.
+/// Candidate filters over fewer score elements than this run on the calling thread.
 pub(crate) const PAR_MIN_SCORES: usize = 1 << 16;
 
-/// [`PAR_MIN_SCORES`] of the row-major float candidate filters on a NEON tier, where a row
-/// costs tens of nanoseconds and only a dense frame repays the pool.
+/// [`PAR_MIN_SCORES`] of the row-major float candidate filters on a NEON tier.
 pub(crate) const PAR_MIN_ROW_SCORES: usize = 1 << 19;
 
-/// Score rows per rayon task in the row-major candidate scans: one row's argmax is too little
-/// work to split further.
+/// Score rows per rayon task in the row-major candidate scans.
 pub(crate) const ROWS_PER_TASK: usize = 64;
 
 /// Anchor ranges of the parallel column argmax start on multiples of this, a whole number of
@@ -133,8 +129,7 @@ impl Isa {
     }
 }
 
-/// `x` as f32, exactly. An f16 takes one `FCVT` (half to single is part of the aarch64 baseline,
-/// unlike FP16 arithmetic) in place of a call into `half`.
+/// `x` as f32, exactly; on aarch64 an f16 takes one `FCVT`.
 #[inline(always)]
 pub(crate) fn widen<T: AsPrimitive<f32>>(x: T) -> f32 {
     #[cfg(target_arch = "aarch64")]

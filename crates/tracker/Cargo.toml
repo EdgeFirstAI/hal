@@ -18,13 +18,11 @@ workspace = true
 
 [features]
 default = ["tensor-boxes"]
-# The `impl DetectionBox for DetectBox` (orphan-rule home). Optional so
-# libedgefirst_tracker.so does not link tensor.
+# Enables `impl DetectionBox for DetectBox`.
 tensor-boxes = ["dep:edgefirst-tensor"]
 
 [dependencies]
-# Optional: only the DetectBox type for `impl DetectionBox`. The C API
-# converts `ef_detect_box` into a local type instead.
+# Optional: provides the `DetectBox` type for `impl DetectionBox`.
 edgefirst-tensor = { workspace = true, default-features = false, optional = true }
 enum_dispatch = { workspace = true }
 lapjv = { workspace = true }

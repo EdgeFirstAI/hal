@@ -3,13 +3,9 @@
 
 //! Lightweight micro-benchmark harness for EdgeFirst crates.
 //!
-//! Runs all benchmarks sequentially in a single process with no forking,
-//! making it safe for GPU hardware that cannot survive `fork()` (EGL, G2D,
-//! Vulkan).
+//! Runs all benchmarks sequentially in a single process with no forking.
 //!
-//! The [`testdata`] module provides runtime testdata resolution so that
-//! tests and benches can load fixtures from disk instead of embedding them
-//! into binaries with `include_bytes!` / `include_str!`.
+//! The [`testdata`] module resolves testdata paths at runtime.
 //!
 //! # Usage
 //!
@@ -111,9 +107,7 @@ impl BenchResult {
     /// A JSON object with fields: `name`, `median_us`, `mean_us`, `min_us`,
     /// `max_us`, `p95_us`, `p99_us`, `iterations`.
     pub fn to_json(&self) -> serde_json::Value {
-        // as_micros() returns u128; JSON numbers top out at u64 (serde_json
-        // does not implement PartialEq<u128>).  Benchmark durations never
-        // exceed u64::MAX microseconds (~584,542 years), so the cast is safe.
+        // The u128 microsecond counts are cast to u64.
         serde_json::json!({
             "name":       self.name,
             "median_us":  self.median().as_micros() as u64,
@@ -152,8 +146,7 @@ pub struct BenchSuite {
 impl BenchSuite {
     /// Build a `BenchSuite` by scanning `std::env::args()` for `--json <path>`.
     ///
-    /// If `--json` is absent the suite is a no-op: `record` and `finish` do
-    /// nothing observable beyond collecting data in memory.
+    /// Without `--json`, `finish` writes nothing.
     pub fn from_args() -> Self {
         let args: Vec<String> = std::env::args().collect();
         let json_path = args
@@ -181,14 +174,11 @@ impl BenchSuite {
     /// }
     /// ```
     ///
-    /// Uses [`std::time::SystemTime`] for the timestamp; no external
-    /// time-keeping dependencies are required.
+    /// The timestamp comes from [`std::time::SystemTime`].
     ///
     /// # Panics
     ///
-    /// Panics if the file cannot be created or written.  Benchmark runners are
-    /// short-lived processes — a hard failure is preferable to silently losing
-    /// data.
+    /// Panics if the file cannot be created or written.
     pub fn finish(&self) {
         let Some(path) = &self.json_path else {
             return;
@@ -327,7 +317,6 @@ mod tests {
 
     #[test]
     fn test_format_throughput_gib() {
-        // 2 GiB in 1 second → should report ~2.0 GiB/s
         let result = format_throughput(2 * 1024 * 1024 * 1024, Duration::from_secs(1));
         assert!(result.contains("GiB/s"), "expected GiB/s, got: {result}");
         assert!(result.contains("2.0"), "expected 2.0, got: {result}");
@@ -335,7 +324,6 @@ mod tests {
 
     #[test]
     fn test_format_throughput_mib() {
-        // 100 MiB in 1 second → should report ~100.0 MiB/s
         let result = format_throughput(100 * 1024 * 1024, Duration::from_secs(1));
         assert!(result.contains("MiB/s"), "expected MiB/s, got: {result}");
         assert!(result.contains("100.0"), "expected 100.0, got: {result}");
@@ -390,7 +378,6 @@ mod tests {
 
     #[test]
     fn test_bench_suite_record_and_finish_no_path() {
-        // When no --json flag is present, finish() is a no-op.
         let mut suite = BenchSuite {
             json_path: None,
             results: Vec::new(),
@@ -402,7 +389,6 @@ mod tests {
         };
         suite.record(&result);
         assert_eq!(suite.results.len(), 1);
-        // finish() must not panic or create any file
         suite.finish();
     }
 
@@ -450,7 +436,6 @@ mod tests {
         assert_eq!(benchmarks[0]["name"], "write_test");
         assert_eq!(benchmarks[0]["iterations"], 3);
 
-        // Clean up
         let _ = fs::remove_file(&tmp_path);
     }
 }

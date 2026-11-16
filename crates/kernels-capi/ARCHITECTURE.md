@@ -7,7 +7,7 @@ SPDX-License-Identifier: Apache-2.0
 
 C ABI for `edgefirst-kernels`. Ships as **`libedgefirst_kernels`** with `edgefirst/kernels.h`.
 
-Tensors cross as caller-owned `ef_kernel_view`s, so this library has **no** `DT_NEEDED` on tensor or any other sibling; `scripts/check-single-home.sh` gate G2t checks the built library for it.
+Tensors cross as caller-owned `ef_kernel_view`s, so this library has **no** `DT_NEEDED` on tensor or any other sibling; `scripts/check-single-home.sh` checks the built library for it.
 
 Source layout: `types.rs` (the `#[repr(C)]` values), `view.rs` (view to tensor conversion), `pool.rs` (C pool to `Pool` trampoline), `error.rs` (errno plus thread-local last error, `catch_unwind` guard), `plans.rs` (entry points).
 

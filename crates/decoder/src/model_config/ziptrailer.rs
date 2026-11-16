@@ -53,8 +53,8 @@ fn u64_at(b: &[u8], at: usize) -> Option<u64> {
 
 /// Where the archive starts in a `len`-byte file whose last `tail.len()`
 /// bytes are `tail`: found from an EOCD record that ends exactly at the end
-/// of the file and a central directory that starts with its signature, so
-/// nothing else of the file is read. `None` when there is no such archive.
+/// of the file and a central directory that starts with its signature.
+/// `None` when there is no such archive.
 fn archive_start<R: Read + Seek>(r: &mut R, len: u64, tail: &[u8]) -> Option<u64> {
     let tail_start = len - tail.len() as u64;
     let at = (0..=tail.len().checked_sub(EOCD_LEN)?).rev().find(|&i| {
@@ -125,9 +125,8 @@ impl<R: Read + Seek> Seek for Window<R> {
 }
 
 /// The ZIP trailer of `r` (`len` bytes long), or `None` when it has none.
-/// A malformed trailer is treated as none: model bytes may contain the
-/// signature by chance. Only the last 64 KiB, the central directory and the
-/// text entries are read.
+/// A malformed trailer is treated as none. Only the last 64 KiB, the
+/// central directory and the text entries are read.
 pub(crate) fn read_trailer<R: Read + Seek>(
     r: &mut R,
     len: u64,
@@ -178,7 +177,7 @@ pub(crate) fn read_trailer<R: Read + Seek>(
             log::debug!("ZIP entry {name} skipped");
             continue;
         }
-        // The declared size is not trusted: inflation stops past the limit.
+        // Inflation stops past the limit, whatever size the entry declares.
         let mut bytes = Vec::new();
         let read = (&mut file).take(MAX_TEXT_ENTRY + 1).read_to_end(&mut bytes);
         if read.is_err() || bytes.len() as u64 > MAX_TEXT_ENTRY {

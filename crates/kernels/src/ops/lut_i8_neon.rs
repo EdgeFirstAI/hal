@@ -103,7 +103,7 @@ fn window_lookup<const B: usize>(w: &Window) -> impl Fn(uint8x16_t) -> uint8x16_
 }
 
 /// Looks up `min(src.len(), dst.len())` elements through `w`: each value clamped into the
-/// window and mapped through `B` 64-byte blocks instead of four.
+/// window and mapped through `B` 64-byte blocks.
 ///
 /// # Safety
 /// The CPU must support NEON, which every aarch64 CPU does; `B` must be `w.blocks()` (1 to 3).

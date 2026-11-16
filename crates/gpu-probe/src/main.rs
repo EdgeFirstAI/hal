@@ -42,7 +42,7 @@ fn main() {
         Err(e) => {
             eprintln!("ERROR: GPU context creation failed: {e}");
             if !bench_only {
-                // Still report DMA availability even without GPU
+                // Report DMA availability without a GPU.
                 println!("== DMA-buf Availability (no GPU) ==");
                 bench_dma::run();
             }
@@ -60,15 +60,11 @@ fn main() {
         probe::run_probes(&ctx);
         probe_int_textures::run(&ctx);
         probe_min_sizes::run(&ctx);
-        // NV12/NV16/NV24 DMA-buf import + render-surface ground-truth probe
-        // (rule #4): proves the real HAL allocations are GPU-importable for
-        // Path A (native YUV) and Path B (R8) at odd-logical/even-stride dims,
-        // with 64-aligned vs packed destination strides.
+        // NV12/NV16/NV24 and packed RGB DMA-buf import + render-surface probes.
         probe_nv_dmabuf::run(&ctx);
         probe_rgb_dmabuf::run(&ctx);
         probe_float_render::run(&ctx);
-        // Jetson NvBufSurface dma-buf probe (O1-O3). Gated: SKIPs cleanly when
-        // libnvbufsurface.so is absent, so non-Jetson runs are unaffected.
+        // Jetson NvBufSurface dma-buf probe; skips when libnvbufsurface.so is absent.
         probe_nvbufsurface::run(&ctx);
         probe_rgb_fbo::run(&ctx)
     } else {
@@ -94,13 +90,11 @@ fn main() {
         bench_texture::run(&ctx);
         bench_shader::run(&ctx);
 
-        // Tier 2-a mask pool POC: adds ~10s of warmup/timing across the
-        // N ∈ {2,5,10,20,40,80} sweep, so gate it behind `--skip-mask-pool`
-        // for users who only want the existing probes/benches.
+        // Mask pool benchmark, skipped by `--skip-mask-pool`.
         if !skip_mask_pool {
             bench_mask_pool::run(&ctx);
         } else {
-            println!("== Benchmark: Mask Pool POC (Tier 2-a) == SKIP (--skip-mask-pool)");
+            println!("== Benchmark: Mask Pool == SKIP (--skip-mask-pool)");
             println!();
         }
 

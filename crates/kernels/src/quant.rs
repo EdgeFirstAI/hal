@@ -83,7 +83,7 @@ impl TfliteKernels {
 pub(crate) enum Rounding {
     /// TFLite's optimized int8 matrix kernels (ruy): one rounding, ties toward +∞,
     /// `(acc·multiplier + 2^(30 − shift)) >> (31 − shift)`. Only negative shifts (multipliers
-    /// below 0.5) are accepted: ruy's NEON kernels truncate instead of rounding otherwise.
+    /// below 0.5) are accepted.
     Ruy,
     /// TFLite's reference kernels and gemmlowp: `MultiplyByQuantizedMultiplier`, two roundings
     /// (`vqrdmulh`, then a rounding shift with ties away from zero).
@@ -146,7 +146,7 @@ impl_quant_int!(u16, DType::U16);
 #[inline(always)]
 pub fn quantize<T: QuantInt>(x: f32, inv_scale: f32, zero_point: i32) -> T {
     let v = x * inv_scale;
-    // `as i32` saturates; NaN is handled explicitly rather than relying on that cast.
+    // `as i32` saturates; NaN maps to 0.
     let q = if v.is_nan() { 0 } else { v.round() as i32 };
     T::from_i32_clamped(q.saturating_add(zero_point))
 }

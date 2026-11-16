@@ -69,8 +69,7 @@ pub struct ModelFiles {
     /// Every ONNX metadata prop and ZIP text entry, by key or entry name.
     /// Ultralytics metadata reaches schema inference through it.
     pub metadata: BTreeMap<String, String>,
-    /// Model bytes before an appended ZIP trailer, which runtimes that check
-    /// the blob length need stripped.
+    /// Length of the model bytes before an appended ZIP trailer.
     pub payload_len: Option<u64>,
 }
 
@@ -137,7 +136,7 @@ pub fn read_embedded(path: impl AsRef<Path>) -> Result<ModelFiles, ModelConfigEr
         path: path.to_owned(),
         source,
     };
-    // Windows refuses to open a directory rather than reporting one.
+    // A failed open of a directory is reported as `IsADirectory`.
     let mut file = File::open(path).map_err(|e| {
         io(if path.is_dir() {
             std::io::ErrorKind::IsADirectory.into()
@@ -240,8 +239,7 @@ fn read_capped(path: &Path) -> std::io::Result<String> {
     Ok(text)
 }
 
-/// Non-empty trimmed lines of a `labels.txt`. Blank lines are skipped, so a
-/// `labels.txt` cannot name an empty class.
+/// Non-empty trimmed lines of a `labels.txt`.
 pub(crate) fn parse_labels(text: &str) -> Vec<String> {
     text.lines()
         .map(str::trim)

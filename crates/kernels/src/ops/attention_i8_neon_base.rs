@@ -2,20 +2,18 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! NEON attention for CPUs without FEAT_DotProd (Cortex-A53 class), built on widening
-//! multiply-accumulates, which issue one per cycle there.
+//! multiply-accumulates.
 //!
 //! The scores use `smlal` by element. Keys are packed as `[8-token group][dim][8 tokens]` and
 //! queries as `[4-row block][dim][4 rows]`, so each sign-extended key vector (eight tokens of one
 //! dim) meets one query value per row; the accumulators start at the zero-point terms.
 //!
 //! The outputs use `umlal` on bytes offset to unsigned, `P = p + 128` and `V = v + 128`, with
-//! values packed as `[16-dim group][token][16 dims]`. The 16-bit accumulators wrap, but
-//! `Σ_j P_j·V_j ≤ 255·Σ_j P_j`, so they stay exact while every row's `Σ_j P_j` is at most 257:
-//! tokens run in chunks under that bound, each widened into 32-bit sums. Tokens whose
-//! probability is zero in all four rows add nothing and are dropped first.
+//! values packed as `[16-dim group][token][16 dims]`. Tokens run in chunks whose per-row
+//! `Σ_j P_j` is at most 257, which keeps the 16-bit accumulators exact, each chunk widened into
+//! 32-bit sums. Tokens whose probability is zero in all four rows are dropped first.
 //!
-//! Every accumulator ends as the same exact integer as in [`super::attention_i8_neon`], and the
-//! softmax rows are the same, so the outputs match that kernel's byte for byte.
+//! The outputs match [`super::attention_i8_neon`]'s byte for byte.
 
 #![cfg(target_arch = "aarch64")]
 
@@ -35,8 +33,7 @@ use crate::prim::transpose::interleave4;
 use crate::quant::Rounding;
 use crate::view::View;
 
-/// `sxtl`, opaque to the compiler, which would otherwise narrow `smlal` of two sign-extended
-/// bytes into `smull` and `saddw`, slower on the A53.
+/// `sxtl` as inline asm, opaque to the compiler.
 #[inline(always)]
 fn sxtl(x: int8x8_t) -> int16x8_t {
     let r: int16x8_t;
@@ -133,7 +130,7 @@ unsafe fn widened_task(job: &PackJob<'_>, part: Part, h: usize, c: usize, rows: 
                 }
             }
             Part::Values => {
-                // Bytes past `dv` are staged as zero and flip to zero: padding adds nothing.
+                // Bytes past `dv` are staged as zero and flip to zero.
                 let flips: [int8x16_t; ATTENTION_MAX_HEAD_DIM / 16] = core::array::from_fn(|eg| {
                     let lanes: [i8; 16] =
                         core::array::from_fn(|c| if 16 * eg + c < dv { i8::MIN } else { 0 });
@@ -296,7 +293,7 @@ pub(super) unsafe fn block(
         bufs.p_sums[r] = sum_i8(&bufs.p8[r][..m]);
     }
 
-    // Each row's Σ P over all tokens, which the zero-point terms need.
+    // Each row's Σ P over all tokens.
     let total: [i32; TILE] = core::array::from_fn(|r| {
         if r < count {
             bufs.p_sums[r] + 128 * m as i32
@@ -439,9 +436,7 @@ macro_rules! dots4 {
 /// `a[r][t] += Σ_d k[d][4t..4t + 4] · q[r][d]` over 32 dims: the eight key bytes of dim `d` at
 /// `keys + 8d`, and row `r`'s dim `d` in lane `4·(d % 2) + r` of `q[d / 2]`.
 ///
-/// The queries stay in v0–v15 (`smlal` by 16-bit element only indexes those) and each step's
-/// keys load while the previous step's multiply: about 40 cycles per four dims on a
-/// Cortex-A53, against 44 with the queries streamed.
+/// The queries stay in v0–v15 and each step's keys load while the previous step's multiply.
 ///
 /// # Safety
 /// `keys` must be readable for 256 bytes, and for 32 more past them.
@@ -745,8 +740,7 @@ unsafe fn scores(
 
 /// Per-row `Σ P` of a run of tokens: four 16-bit lanes, row `r` in lane `r`.
 ///
-/// No lane passes `CHUNK_SUM + 16·255`, so lanes never carry into each other, and a lane passes
-/// [`CHUNK_SUM`] exactly when adding [`OVER_BIAS`] sets its top bit.
+/// A lane passes [`CHUNK_SUM`] exactly when adding [`OVER_BIAS`] sets its top bit.
 type Sums = u64;
 const OVER_BIAS: u64 = (0x8000 - (CHUNK_SUM as u64 + 1)) * 0x0001_0001_0001_0001;
 const OVER_TOP: u64 = 0x8000_8000_8000_8000;
@@ -774,7 +768,7 @@ struct Groups {
 
 /// The tokens where some row's probability is nonzero, as `P | j << 32`: `P` holds row `r`'s
 /// `p + 128` in byte `r` (zero past `count`), `j` is the token. Returns how many there are, and
-/// writes one zero entry past them, which the output loop may read ahead.
+/// writes one zero entry past them.
 #[target_feature(enable = "neon")]
 fn compact(
     bufs: &mut Buffers,
@@ -788,8 +782,7 @@ fn compact(
     let flip = vdupq_n_u8(0x80);
     let mut listed = [const { MaybeUninit::<u16>::uninit() }; ROW / 16];
     // The words of every group of 16 tokens with a nonzero probability, transposed with NEON
-    // into `bufs.p`, which this kernel has no other use for; they are read back only after all
-    // are stored, as the A53 forwards NEON stores to general-register loads slowly.
+    // into `bufs.p`; they are read back after all are stored.
     let wp = bufs.p.as_mut_ptr().cast::<u8>();
     let mut ng = 0;
     for g16 in 0..m.div_ceil(16) {
@@ -819,7 +812,7 @@ fn compact(
             vst1q_u8(o.add(48), b(vzip2q_u16(w(c), w(d))));
         }
         if want_sums {
-            // Tokens past `m` hold leftovers.
+            // Masks off tokens past `m`.
             let lanes: [u8; 16] = core::array::from_fn(|t| if first + t < m { 0xff } else { 0 });
             // SAFETY: 16 readable bytes.
             let keep = unsafe { vld1q_u8(lanes.as_ptr()) };
@@ -833,7 +826,7 @@ fn compact(
     }
     let ep = entries.as_mut_ptr().cast::<u64>();
     let mut live = 0;
-    // Branch-free: every token's entry is written, and only the nonzero ones are kept.
+    // Every token's entry is written, and only the nonzero ones are kept.
     let keep = |j: usize, live: &mut usize| {
         // SAFETY: word `j` of a listed group was written; `live <= j < ENTRIES`.
         unsafe {
@@ -1034,7 +1027,7 @@ macro_rules! token32 {
 /// `acc[r][2s + 1]` its high eight.
 ///
 /// Each token's values and probability broadcasts load while the previous token multiplies,
-/// alternating between two register sets: 24 cycles per token on a Cortex-A53.
+/// alternating between two register sets.
 ///
 /// # Safety
 /// `entries[..=n]` must be readable, with every token's 16 bytes readable in both streams.

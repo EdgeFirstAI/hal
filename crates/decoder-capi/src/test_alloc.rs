@@ -30,8 +30,7 @@ static ALLOC: Counting = Counting;
 
 /// Bytes the live heap grows by over `n` calls of `f`, after a warm-up.
 ///
-/// Runs on a one-thread rayon pool so the decoder's parallel work allocates
-/// and frees on the counted thread instead of the global pool's workers.
+/// Runs `f` on a one-thread rayon pool.
 pub(crate) fn growth_over(n: usize, f: impl FnMut()) -> isize {
     struct AssertSend<F>(F);
     // SAFETY: `install` blocks the caller until the closure returns, so the

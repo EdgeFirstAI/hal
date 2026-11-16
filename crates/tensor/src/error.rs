@@ -13,13 +13,11 @@ pub enum Error {
     ShapeMismatch(String),
     #[cfg(target_os = "linux")]
     UnknownDeviceType(u64, u64),
-    /// An imported fd sits on a filesystem we cannot classify as either a
-    /// DMA-BUF (`DMA_BUF_MAGIC`) or shared memory (`TMPFS_MAGIC`).
+    /// An imported fd sits on a filesystem that is neither a DMA-BUF
+    /// (`DMA_BUF_MAGIC`) nor shared memory (`TMPFS_MAGIC`).
     ///
     /// Carries the `f_type` magic reported by `fstatfs`, normalized to the
-    /// 32-bit unsigned value used by `include/uapi/linux/magic.h`, so it can
-    /// be cross-referenced against that header directly on both 32- and
-    /// 64-bit targets.
+    /// 32-bit unsigned value used by `include/uapi/linux/magic.h`.
     #[cfg(target_os = "linux")]
     UnknownBufferType(u32),
     InvalidMemoryType(String),
@@ -32,17 +30,10 @@ pub enum Error {
     InvalidShape(String),
     InvalidArgument(String),
     InvalidOperation(String),
-    /// A write-only map is refused only because it cannot express the
-    /// requested window; the identical window mapped `CpuAccess::ReadWrite`
-    /// is not refused (at whatever extra cost that backend's `ReadWrite`
-    /// costs — see the message). Distinct from [`Error::InvalidArgument`] so
-    /// a caller that wants to retry with `ReadWrite` can match on this
-    /// variant instead of a message, and knows the retry will not fail the
-    /// same way again.
+    /// A write-only map cannot express the requested window; the same window
+    /// mapped `CpuAccess::ReadWrite` is not refused.
     PartialWriteRequiresReadWrite(String),
-    /// Structured quantization-invariant failure. Round-trippable through
-    /// the C and Python boundaries so callers can diagnose which field
-    /// failed without parsing strings.
+    /// Structured quantization-invariant failure.
     QuantizationInvalid {
         /// Which invariant failed: `"scale.len"`, `"zero_point.len"`,
         /// `"axis"`, `"per_channel_requires_axis"`,

@@ -3,10 +3,7 @@
 
 """Extract model I/O signals + metadata from Ultralytics exports.
 
-Shared by `scripts/capture_infer_fixtures.py` (which freezes the result into
-`crates/decoder/testdata/infer/*.signals.json`) and by the on-demand
-`test_ultralytics_discovery.py`, so both see byte-identical signals for the
-same export.
+Shared by `scripts/capture_infer_fixtures.py` and `test_ultralytics_discovery.py`.
 """
 
 import zipfile
@@ -16,8 +13,7 @@ from pathlib import Path
 def onnx_signals(path):
     """Reads I/O signals from an ONNX export via onnxruntime.
 
-    Ultralytics ONNX exports are float32 throughout and carry no
-    quantization, so dtype/quantization are fixed rather than probed.
+    Every tensor is reported as float32 with no quantization.
     """
     import onnxruntime as ort
 
@@ -61,10 +57,7 @@ def tflite_signals(path):
         }
 
     # TFLite metadata associated files ride in a zip appended to the
-    # flatbuffer. An export without any (or a plain flatbuffer) simply has no
-    # such trailer, which `zipfile` reports as BadZipFile -- that is an
-    # absence of metadata, not a failure, so it yields an empty map. Any other
-    # error (unreadable file, corrupt member) still propagates.
+    # flatbuffer; an export without one yields an empty map.
     meta = {}
     try:
         with zipfile.ZipFile(path) as z:

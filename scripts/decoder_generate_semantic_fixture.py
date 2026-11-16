@@ -9,7 +9,7 @@ Runs a SegFormer ONNX export on a ``testdata`` image and writes
 - ``ref.accurate`` / ``ref.fast``: class maps at the image size from the
   reference decode of ``logits``;
 - ``ref.margin``: float16 gap between the two highest upsampled logits of the
-  accurate reference, which marks the near-ties where a fused resize may differ;
+  accurate reference;
 - ``ref.accurate_i8`` / ``ref.fast_i8``: the same from the dequantized
   ``logits_i8``.
 

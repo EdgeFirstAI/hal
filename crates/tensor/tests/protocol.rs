@@ -1,16 +1,12 @@
-//! The cross-package protocol contract.
-//!
-//! Layout here is not an implementation detail: independently-built packages
-//! read this struct, so a silent change breaks consumers compiled against an
-//! older version. Size, alignment and field meaning are pinned.
+//! The cross-package protocol contract: the size, alignment and field meaning
+//! of `TensorDesc`.
 
 use edgefirst_tensor::{
     format_from_code, tensor_dtype as dtype, tensor_format, tensor_kind, Colorimetry, CpuAccess,
     PixelFormat, Tensor, TensorDesc, TensorDyn, TensorMemory, ABI_VERSION,
 };
 
-/// The DMA-heap skip policy, shared with every DMA-gated test so a skip under
-/// `HAL_TEST_REQUIRE_DMA=1` fails instead. Linux-only, like its one caller.
+/// The DMA-heap skip policy: a skip under `HAL_TEST_REQUIRE_DMA=1` fails.
 #[cfg(target_os = "linux")]
 #[path = "support/dma_require.rs"]
 mod dma_require;
@@ -59,13 +55,10 @@ fn contiguous_strides_are_row_major_in_bytes() {
     )
     .expect("alloc");
     let d = TensorDyn::from(t).descriptor();
-    // shape [32, 64, 3] -> strides [192, 3, 1]. u8, so bytes and elements
-    // coincide -- which is exactly why this case alone cannot tell the two
-    // representations apart. The f32 case below is the discriminating one.
+    // shape [32, 64, 3] -> strides [192, 3, 1] for u8.
     assert_eq!(d.strides(), &[192i64, 3, 1]);
 
     // Same shape, 4-byte elements: every stride scales by sizeof(f32).
-    // Under the old ELEMENT strides this was [192, 3, 1] again.
     let t = Tensor::<f32>::new(&[32, 64, 3], Some(TensorMemory::Mem), None).expect("alloc f32");
     let d = TensorDyn::from(t).descriptor();
     assert_eq!(
@@ -77,58 +70,9 @@ fn contiguous_strides_are_row_major_in_bytes() {
 
 #[test]
 fn descriptor_layout_is_pinned() {
-    // The cross-package contract, and the reason this number is asserted
-    // rather than merely observed: two independently-compiled `.so` files
-    // read each other's payloads at their own `TensorDesc`, so this size
-    // IS the wire format.
-    //
-    // If it changes, the capsule name must move with it, in the same
-    // commit -- `edgefirst_tensor_v2` -> `_v3`, see INTEROP.md's Versioning
-    // section.
-    //
-    // This assertion covers only half of the wire format. `_v1` -> `_v2`
-    // was a `QuantDesc` field added to `TensorCapsulePayload`, which left
-    // this struct's size alone: the rule binds on the *payload's* layout,
-    // of which `TensorDesc` is only the first field. The rest -- the size
-    // and alignment of `QuantDesc`, and the offsets of both `#[repr(C)]`
-    // fields -- is pinned by a `const` assertion next to the struct in
-    // `crates/python-common/src/interop.rs`, because `cargo test` never
-    // reaches that crate (`make test-rust` excludes every
-    // `edgefirst-python-*` package by name).
-    //
-    // NOT `ABI_VERSION`: that field is checked by
-    // `TensorDyn::import_descriptor`, but only after the payload has been
-    // copied out at this build's size, so it cannot gate a mismatch it is
-    // itself read through. The capsule name is checked by
-    // `PyCapsule::pointer_checked` before any byte is touched, which is why
-    // it is the gate. (DLPack landed on the same split: a version field
-    // inside `DLManagedTensorVersioned` *and* a distinct
-    // `dltensor_versioned` capsule name, because the field alone cannot be
-    // trusted until the layout is already known.)
-    //
-    // Two traps worth stating explicitly, both of which this assertion
-    // exists to catch:
-    //
-    // 1. Size staying the same is NOT proof a change was ABI-safe. A field
-    //    added into existing padding -- as `dtype` was, into the 4-byte
-    //    hole after `ndim` -- leaves this number untouched while changing
-    //    what every byte means. Once a layout has shipped, its padding is
-    //    not spare room: an older producer leaves those bytes zero and a
-    //    newer consumer decodes a plausible-looking wrong answer (there,
-    //    every tensor as `U8`). Claiming padding needs a name bump exactly
-    //    like appending does.
-    //
-    // 2. The payload's *representation* counts, not just this struct's
-    //    fields. `TensorCapsulePayload` in `python-common` is `#[repr(C)]`
-    //    for that reason; it was briefly a bare Rust tuple, whose field
-    //    order and padding the language does not specify -- fine within one
-    //    compilation, not a guarantee across two `.so` files.
-    //
-    // The struct is now hole-free: `flags` claimed the 4 bytes that used to
-    // sit between `colorimetry` and the 8-aligned `capacity`, which is why
-    // adding it cost nothing while `sync` cost 8. That was deliberate --
-    // both were added before the first release, when growth is free. After
-    // release it is not: see the name-bump rule above.
+    // The size of `TensorDesc` is the wire format. The struct is hole-free:
+    // `flags` occupies the 4 bytes between `colorimetry` and the 8-aligned
+    // `capacity`.
     assert_eq!(
         std::mem::size_of::<TensorDesc>(),
         192,
@@ -139,8 +83,6 @@ fn descriptor_layout_is_pinned() {
 
 #[test]
 fn unknown_major_is_detectable() {
-    // A consumer's rejection path: it must be able to tell a version it does
-    // not know from one it does, before reading any other field.
     let t = Tensor::<u8>::new(&[4], None, None).expect("alloc");
     let mut d = TensorDyn::from(t).descriptor();
     assert_eq!(d.version, ABI_VERSION);
@@ -150,8 +92,7 @@ fn unknown_major_is_detectable() {
 
 #[test]
 fn bare_descriptor_carries_no_address() {
-    // Descriptive only: a consumer learns shape/format/kind but cannot reach
-    // the bytes. This is deliberate -- an unpinned host address is not durable.
+    // An unpinned descriptor carries shape, format and kind but no address.
     let t = Tensor::<u8>::image(
         16,
         16,
@@ -169,8 +110,7 @@ fn bare_descriptor_carries_no_address() {
 
 #[test]
 fn pinned_descriptor_reaches_the_bytes() {
-    // The Plan 1 unblock: with a pin, a consumer in another package can read
-    // the producer's buffer through the descriptor alone.
+    // With a pin, the descriptor carries the buffer's address.
     let t = Tensor::<u8>::image(
         16,
         16,
@@ -187,7 +127,7 @@ fn pinned_descriptor_reaches_the_bytes() {
     assert!(!d.ptr.is_null());
     assert_eq!(d.len(), 16 * 16);
 
-    // Read it back the way a foreign consumer would: address + length only.
+    // Reads it back through the address and length only.
     let seen = unsafe { std::slice::from_raw_parts(d.ptr.0 as *const u8, d.len() as usize) };
     assert!(
         seen.iter().all(|b| *b == 0x3C),
@@ -197,10 +137,8 @@ fn pinned_descriptor_reaches_the_bytes() {
 
 #[test]
 fn descriptor_reports_the_element_type() {
-    // `strides` is in BYTES, so a consumer can address the buffer without
-    // knowing the element size -- but it still needs `dtype` to interpret
-    // what it finds there. Two tensors of the same shape and different
-    // element type must not produce identical descriptors.
+    // Two tensors of the same shape and different element type produce
+    // different descriptors.
     let f = Tensor::<f32>::new(&[4], Some(TensorMemory::Mem), None).expect("alloc f32");
     let u = Tensor::<u8>::new(&[4], Some(TensorMemory::Mem), None).expect("alloc u8");
     let df = TensorDyn::from(f).descriptor();
@@ -216,9 +154,7 @@ fn descriptor_reports_the_element_type() {
 
 #[test]
 fn dtype_codes_are_abi() {
-    // These numbers cross a package boundary; a consumer compiled against an
-    // older version reads them by value. Reordering is a breaking change, so
-    // pin every one rather than trusting declaration order to stay put.
+    // Every code is pinned by value.
     assert_eq!(
         [
             dtype::U8,
@@ -239,9 +175,7 @@ fn dtype_codes_are_abi() {
 
 #[test]
 fn kind_codes_are_abi() {
-    // Same ABI concern as dtype_codes_are_abi, for the backing-store kind.
-    // These are the `TensorMemory` codes (ABI version 2); version 1 had its
-    // own numbering, in which 1 meant dma-buf.
+    // The `TensorMemory` codes (ABI version 2).
     assert_eq!(
         [
             tensor_kind::MEM,
@@ -273,13 +207,7 @@ fn only_mem_and_shm_kinds_are_host() {
 
 #[test]
 fn strides_follow_row_stride_not_shape() {
-    // A pitch-aligned image carries padding between rows that the shape
-    // alone cannot express: strides[0] must come from row_stride, not from
-    // width * channels. `set_row_stride` performs no buffer-size validation
-    // (see its doc on `Tensor::set_row_stride`) -- it is pure layout
-    // metadata -- so a padded pitch is reproducible on every platform
-    // without needing a backend (IOSurface, DMA-BUF) that actually pads the
-    // allocation.
+    // A padded row pitch: `strides[0]` comes from `row_stride`, not from width * channels.
     let mut t = Tensor::<u8>::image(
         100,
         4,
@@ -288,12 +216,11 @@ fn strides_follow_row_stride_not_shape() {
         CpuAccess::ReadWrite,
     )
     .expect("alloc");
-    let natural = 100 * 3; // width * channels * sizeof(u8), what the bug computed
-    let padded = 320; // > natural; u8, so this byte pitch is also an element count
+    let natural = 100 * 3; // width * channels * sizeof(u8)
+    let padded = 320; // > natural
     t.set_row_stride(padded).expect("set_row_stride");
 
-    // Precondition: without this, the buggy and fixed computations produce
-    // the same number and the test below cannot distinguish them.
+    // Precondition: the padded stride differs from the natural one.
     assert_ne!(
         t.row_stride(),
         Some(natural),
@@ -310,7 +237,7 @@ fn strides_follow_row_stride_not_shape() {
 
 #[test]
 fn descriptor_handle_defaults_to_unused() {
-    // HOST (Mem) tensors have no native handle to hand a consumer.
+    // Host (Mem) tensors have no native handle.
     let t = Tensor::<u8>::image(
         16,
         16,
@@ -326,8 +253,8 @@ fn descriptor_handle_defaults_to_unused() {
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 #[test]
 fn descriptor_carries_iosurface_id_as_handle() {
-    // On macOS/iOS, TensorMemory::DmaBuf is IOSurface-backed; the consumer
-    // re-imports zero-copy from the surface id carried in `handle`.
+    // On macOS/iOS, `TensorMemory::DmaBuf` is IOSurface-backed and `handle`
+    // carries the surface id.
     let t = Tensor::<u8>::image(
         16,
         16,
@@ -346,8 +273,7 @@ fn descriptor_carries_iosurface_id_as_handle() {
 #[test]
 fn descriptor_carries_dmabuf_fd_as_handle() {
     use std::os::fd::AsRawFd;
-    // On Linux, TensorMemory::DmaBuf is a dma-buf fd; the consumer re-imports
-    // zero-copy from the fd carried in `handle`.
+    // On Linux, `TensorMemory::DmaBuf` is a dma-buf and `handle` carries the fd.
     if !dma_require::available_or_skip(
         edgefirst_tensor::is_dma_available(),
         "descriptor_carries_dmabuf_fd_as_handle",
@@ -384,16 +310,8 @@ fn descriptor_colorimetry_defaults_to_zero() {
 
 #[test]
 fn planar_row_stride_does_not_clobber_the_plane_stride() {
-    // PlanarRgb.allocation_shape(640, 480) == [3, 480, 640]: dimension 0 is the
-    // channel/plane count, dimension 1 is the true row dimension. A padded
-    // per-row pitch must land on strides[1], not strides[0] -- overwriting
-    // strides[0] corrupts the plane stride while leaving the real row
-    // stride at strides[1] unfixed, and PlanarRgb@Dma is a live path.
-    //
-    // The plane stride still follows the pitch: a strided planar tensor is
-    // `C * H` rows of one pitch, so plane 1 starts `H * pitch` bytes in (where
-    // `Tensor::map` and `PixelFormat::plane_table` both put it), not at the
-    // tight `H * W`.
+    // `PlanarRgb.allocation_shape(640, 480)` is `[3, 480, 640]`. A padded row
+    // pitch is `strides[1]`, and the plane stride `strides[0]` is `H * pitch`.
     let mut t = Tensor::<u8>::image(
         640,
         480,
@@ -403,7 +321,7 @@ fn planar_row_stride_does_not_clobber_the_plane_stride() {
     )
     .expect("alloc");
     let natural_row = 640; // width * sizeof(u8), Planar's minimum row stride
-    let padded_row = 704; // > natural_row; u8, so bytes and elements coincide
+    let padded_row = 704; // > natural_row
     t.set_row_stride(padded_row).expect("set_row_stride");
 
     let d = TensorDyn::from(t).descriptor();
@@ -424,10 +342,8 @@ fn planar_row_stride_does_not_clobber_the_plane_stride() {
 
 #[test]
 fn planar_format_round_trips_through_the_descriptor() {
-    // fourcc alone cannot represent PlanarRgb: PlanarRgb.to_fourcc() == 0,
-    // the same sentinel a non-image tensor uses, so a consumer reading only
-    // `fourcc` would import this as a formatless rank-3 tensor and misread
-    // the layout. `format` exists precisely to make this identifiable.
+    // `PlanarRgb.to_fourcc()` is 0, the value a non-image tensor carries;
+    // `format` identifies it.
     let t = Tensor::<u8>::image(
         640,
         480,
@@ -469,14 +385,7 @@ fn descriptor_carries_colorimetry() {
 
 #[test]
 fn a_pitch_that_is_not_a_whole_number_of_elements_is_exact() {
-    // f32 (esz=4): `set_row_stride` validates only stride >= the packed
-    // minimum, not alignment to sizeof(T), so a caller can legally record a
-    // pitch that is not a whole number of elements.
-    //
-    // Under the old ELEMENT strides this value was unrepresentable: `rs / esz`
-    // would truncate 54 -> 13 in a release build, so the code fell back to the
-    // packed stride and reported a pitch the buffer does not have. Byte strides
-    // delete the failure mode -- 54 is simply 54.
+    // f32 (esz=4) with a recorded pitch that is not a whole number of elements.
     let mut t = Tensor::<f32>::image(
         4,
         4,
@@ -494,8 +403,7 @@ fn a_pitch_that_is_not_a_whole_number_of_elements_is_exact() {
         misaligned_bytes as i64,
         "a byte pitch is carried exactly, whatever its remainder mod sizeof(T)"
     );
-    // The innermost stride is one f32: proof the whole array is bytes, not
-    // elements. Under element strides this was 1.
+    // The innermost stride is one f32, in bytes.
     assert_eq!(
         d.strides()[2],
         4,
@@ -505,10 +413,7 @@ fn a_pitch_that_is_not_a_whole_number_of_elements_is_exact() {
 
 #[test]
 fn flags_and_sync_are_reserved_and_clear() {
-    // A host producer sets only the CPU access report in `flags`, and never
-    // `sync`. A consumer that waited on `sync` without first checking
-    // `SYNC_PRESENT` would be waiting on garbage, so the invariant asserted
-    // here is "clear unless explicitly set", not merely "the fields exist".
+    // A host producer sets only the CPU access report in `flags`, and never `sync`.
     let t = Tensor::<u8>::image(
         32,
         16,

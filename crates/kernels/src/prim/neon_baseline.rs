@@ -1,27 +1,13 @@
 // SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! Tier-1 NEON kernels for per-scale dequantization and decode.
+//! NEON kernels for per-scale dequantization and decode.
 //!
 //! Every function in this module is `#[cfg(target_arch = "aarch64")]`
-//! and `unsafe fn` annotated `#[target_feature(enable = "neon")]`.
-//! NEON is mandatory on aarch64, so the baseline kernels are sound to call
-//! there; the FP16 kernels additionally need the caller to have seen
-//! `neon_fp16` in [`CpuFeatures`](crate::CpuFeatures).
+//! and `unsafe fn` annotated `#[target_feature(enable = "neon")]`. The
+//! FP16 kernels require `neon_fp16` in [`CpuFeatures`](crate::CpuFeatures).
 //!
-//! On non-aarch64 builds the entire module is empty; callers gate their
-//! NEON arms on `cfg(target_arch = "aarch64")`.
-//!
-//! ## Why NEON helps these specific kernels
-//!
-//! Per-scale dequant is the bandwidth-bound bedrock of the per-anchor
-//! pipeline. For yolov8 at 640×640 the per-frame work is ~1.5 MB of
-//! quantized integer reads → ~6 MB of f32 writes. NEON 16-lane
-//! contiguous loads + fused multiply-adds (`vfmaq_n_f32`) push throughput
-//! to roughly the L2 cache bandwidth on Cortex-A53, which scalar code
-//! can't approach.
-//!
-//! This module covers Tier-1 NEON baseline and Tier-2 FP16.
+//! On non-aarch64 builds the module is empty.
 
 #![cfg(target_arch = "aarch64")]
 
@@ -32,29 +18,21 @@ use crate::Quant;
 use std::arch::aarch64::*; // NOSONAR
 
 // ────────────────────────────────────────────────────────────────────────
-// Affine dequant: out[i] = (in[i] - zp) * scale
-//
-// Algebraically: out = scale * in + (-zp * scale)
-// We precompute `bias = -zp * scale` once, then each lane is one fused
-// multiply-add: `vfmaq_n_f32(bias_v, in_f32, scale)`. This is faster
-// than the literal `(in - zp) * scale` form because vfma issues at
-// throughput 1/cycle on Cortex-A53; a separate vsub + vmul would
-// double the dependency chain.
+// Affine dequant: out[i] = (in[i] - zp) * scale, computed as
+// scale * in[i] + bias with bias = -zp * scale.
 // ────────────────────────────────────────────────────────────────────────
 
-/// Compute affine bias `(-zp * scale)` in f32. Caller-side scalar work,
-/// done once per kernel invocation.
+/// Computes the affine bias `-zp * scale` in f32.
 #[inline(always)]
 fn affine_bias(q: Quant) -> f32 {
     -(q.zero_point as f32) * q.scale
 }
 
-/// NEON i8 → f32 dequant. Processes 16 i8 lanes per inner-loop iteration.
+/// NEON i8 → f32 dequant, 16 lanes per iteration.
 ///
 /// # Safety
 /// Caller must ensure `input.len() == output.len()` and that the CPU
-/// supports NEON (always true on aarch64; the `target_feature` annotation
-/// is for the inner intrinsics, not a runtime guard).
+/// supports NEON.
 #[inline]
 #[target_feature(enable = "neon")]
 pub unsafe fn dequant_i8_to_f32_neon(input: &[i8], q: Quant, output: &mut [f32]) {
@@ -93,10 +71,7 @@ pub unsafe fn dequant_i8_to_f32_neon(input: &[i8], q: Quant, output: &mut [f32])
             i += 16;
         }
 
-        // Scalar tail. For typical per-scale tensor sizes the tail is small
-        // (channel counts of 4 / 32 / 64 / 80 are all multiples of 16 except
-        // 4 itself; LTRB-only-tail kernels handle that case at the level
-        // kernel layer).
+        // Scalar tail.
         let zp = q.zero_point as f32;
         while i < n {
             *out_ptr.add(i) = (*in_ptr.add(i) as f32 - zp) * scale;
@@ -105,8 +80,8 @@ pub unsafe fn dequant_i8_to_f32_neon(input: &[i8], q: Quant, output: &mut [f32])
     }
 }
 
-/// NEON u8 → f32 dequant. Same shape as `dequant_i8_to_f32_neon` but
-/// uses unsigned widening (`vmovl_u8` / `vcvtq_f32_u32`).
+/// NEON u8 → f32 dequant with unsigned widening (`vmovl_u8` /
+/// `vcvtq_f32_u32`).
 ///
 /// # Safety
 /// See `dequant_i8_to_f32_neon`.
@@ -151,8 +126,7 @@ pub unsafe fn dequant_u8_to_f32_neon(input: &[u8], q: Quant, output: &mut [f32])
     }
 }
 
-/// NEON i16 → f32 dequant. Processes 8 i16 lanes per iteration (one
-/// 128-bit vector).
+/// NEON i16 → f32 dequant, 8 lanes per iteration.
 ///
 /// # Safety
 /// See `dequant_i8_to_f32_neon`.
@@ -227,50 +201,33 @@ pub unsafe fn dequant_u16_to_f32_neon(input: &[u16], q: Quant, output: &mut [f32
 }
 
 // ────────────────────────────────────────────────────────────────────────
-// NEON polynomial expf (Cephes-style minimax)
-//
-// 4-lane vectorised expf approximation. Replaces lane-extract scalar
-// libm expf in sigmoid + softmax — those two paths together accounted
-// for ~58% of decode time on Cortex-A53 (`perf record` on an i.MX 8M Plus EVK).
+// NEON polynomial expf (Cephes-style minimax), 4 lanes
 //
 // Algorithm:
-//   1. Clamp input to [-88.376, 88.376] (avoids subnormal/inf).
+//   1. Clamp input to [-88.376, 88.376].
 //   2. Range-reduce: `x = k*ln2 + r`, |r| <= ln2/2.
-//      `fx = round_to_nearest(x * LOG2_E)`, `r = x - fx * ln2`.
-//      ln2 is split into hi+lo parts to preserve precision near r=0.
+//      `fx = round_to_nearest(x * LOG2_E)`, `r = x - fx * ln2`,
+//      with ln2 split into hi+lo parts.
 //   3. Approximate exp(r) on [-ln2/2, ln2/2] with a 5-degree minimax
 //      polynomial:
 //        exp(r) ≈ ((((p0*r + p1)*r + p2)*r + p3)*r + p4)*r + p5)*r² + r + 1
-//      Cephes coefficients (~3 ulp f32 envelope on the reduced range).
 //   4. Reconstruct 2^k via IEEE-754 exponent bit injection
 //      (`(k + 127) << 23`, reinterpret as f32).
 //   5. Result = exp(r) * 2^k.
 //
-// Cycle estimate on Cortex-A53 (single-issue in-order, 1 FMA/cycle):
-// ~18 cycles per 4-lane batch — vs ~80 cycles per scalar libm expf —
-// targeting ~18× speedup on the expf-bound math.
-//
-// Accuracy: 3 ulp f32 across |x| < 88. For our consumers (sigmoid,
-// softmax post-subtract-max) the input is typically in [-50, 0] where
-// the polynomial is well-conditioned.
+// Accuracy: 3 ulp f32 across |x| < 88.
 // ────────────────────────────────────────────────────────────────────────
 
 /// Vectorised expf on 4 f32 lanes, polynomial approximation.
 ///
 /// # Safety
 /// See `dequant_i8_to_f32_neon`. Inputs outside [-88.376, 88.376] are
-/// clamped (subnormal/inf inputs round to 0 / f32::INFINITY).
-//
-// Cephes coefficients carry more precision than f32 can hold; f32
-// rounds them deterministically and we keep the source-level digits
-// to document the literal Cephes minimax fit.
+/// clamped.
 #[allow(clippy::excessive_precision)]
 #[inline]
 #[target_feature(enable = "neon")]
 pub unsafe fn expf_neon_f32x4(x: float32x4_t) -> float32x4_t {
-    // Range and Cephes minimax constants. `_HI` + `_LO` split of ln2 is
-    // the standard trick for high-accuracy range reduction without
-    // losing low-order bits to the multiply with k.
+    // Range and Cephes minimax constants.
     let exp_hi = vdupq_n_f32(88.376_26);
     let exp_lo = vdupq_n_f32(-88.376_26);
     let log2_e = vdupq_n_f32(core::f32::consts::LOG2_E);
@@ -286,20 +243,15 @@ pub unsafe fn expf_neon_f32x4(x: float32x4_t) -> float32x4_t {
     let p4 = vdupq_n_f32(1.666_666_550e-1);
     let p5 = vdupq_n_f32(5.000_000_120e-1);
 
-    // Clamp to representable range. f32::INFINITY / 0 fall out of the
-    // bit-injection step; clamping is the simplest correct handling
-    // for the per-scale consumer (sigmoid saturates well inside this
-    // range; softmax post-subtract-max stays ≤ 0 by construction).
+    // Clamp to the representable range.
     let x = vminq_f32(vmaxq_f32(x, exp_lo), exp_hi);
 
-    // fx = round(x * LOG2_E). vcvtnq_s32_f32 rounds to nearest (the
-    // appropriate rounding for range-reducing exp; floor would bias).
+    // fx = round(x * LOG2_E), to nearest.
     let fx_f = vmulq_f32(x, log2_e);
     let fx_i = vcvtnq_s32_f32(fx_f);
     let fx = vcvtq_f32_s32(fx_i);
 
-    // r = x - fx * ln2, computed as (x - fx*ln2_hi) - fx*ln2_lo for
-    // accuracy. ln2_lo is signed so the second step is also a vfma.
+    // r = x - fx * ln2, computed as (x - fx*ln2_hi) - fx*ln2_lo.
     let z = vfmsq_f32(x, fx, ln2_hi);
     let r = vfmsq_f32(z, fx, ln2_lo);
 
@@ -316,8 +268,7 @@ pub unsafe fn expf_neon_f32x4(x: float32x4_t) -> float32x4_t {
     let exp_r = vaddq_f32(vaddq_f32(y_r2, r), one);
 
     // 2^k via IEEE-754 exponent injection: (k + 127) << 23 reinterpreted
-    // as f32. fx_i is bounded by ±127 thanks to the input clamp so
-    // (k + 127) stays in the valid biased-exponent range [0, 254].
+    // as f32.
     let bias = vdupq_n_s32(127);
     let pow2k_bits = vshlq_n_s32::<23>(vaddq_s32(fx_i, bias));
     let pow2k = vreinterpretq_f32_s32(pow2k_bits);
@@ -328,19 +279,10 @@ pub unsafe fn expf_neon_f32x4(x: float32x4_t) -> float32x4_t {
 // ────────────────────────────────────────────────────────────────────────
 // NEON sigmoid f32
 //
-// Numerically-stable formula matching the scalar `sigmoid_one_f32`:
 //   x >= 0:  1 / (1 + e^-x)
 //   x <  0:  e^x / (1 + e^x)
 //
-// Implementation: branchless via `vbslq_f32` blend. Uses scalar `f32::exp`
-// per lane (libm) — same expf as the scalar oracle, so the NEON output is
-// bit-equal to the scalar version. The NEON win comes from parallelising
-// the (1 + e), 1/(1+e), and e/(1+e) math across 4 lanes — about 1.5×
-// speedup on Cortex-A53 over the fully-scalar loop.
-//
-// A polynomial NEON expf approximation (Cephes / minimax) would push this
-// to ~3-4× but introduces ULP drift. Deferred to a follow-up if score
-// dequant turns out to be the bottleneck after this milestone lands.
+// The two branches are blended with `vbslq_f32`.
 // ────────────────────────────────────────────────────────────────────────
 
 /// NEON sigmoid f32, in-place.
@@ -362,20 +304,15 @@ pub unsafe fn sigmoid_slice_f32_neon(buf: &mut [f32]) {
             let x = vld1q_f32(ptr.add(i));
             // Mask: 0xFFFFFFFF for lanes where x >= 0, 0 otherwise.
             let mask = vcgeq_f32(x, zero);
-            // Pick the input to expf based on sign:
-            //   x >= 0  →  -x  (we want e^-x in the positive branch)
-            //   x <  0  →   x  (we want e^x  in the negative branch)
+            // Input to expf by sign:
+            //   x >= 0  →  -x
+            //   x <  0  →   x
             let neg_x = vnegq_f32(x);
             let exp_in = vbslq_f32(mask, neg_x, x);
 
-            // Polynomial NEON expf — 4 lanes computed together. ~18 cycles
-            // per chunk vs ~320 cycles for 4 lane-extract scalar libm calls.
             let e = expf_neon_f32x4(exp_in);
 
             let one_plus_e = vaddq_f32(one, e);
-            // 1/(1+e). NEON has vdivq_f32 on aarch64; fast and accurate enough
-            // (correctly-rounded divide). vrecpsq_f32 (refined reciprocal) is
-            // marginally faster but loses 1-2 ulp; not worth the drift.
             let recip = vdivq_f32(one, one_plus_e);
             let pos_branch = recip; // x >= 0 path: 1 / (1 + e^-x)
             let neg_branch = vmulq_f32(e, recip); // x < 0 path: e^x / (1 + e^x)
@@ -384,7 +321,7 @@ pub unsafe fn sigmoid_slice_f32_neon(buf: &mut [f32]) {
             i += 4;
         }
 
-        // Scalar tail. Mirrors the kernel's scalar oracle exactly.
+        // Scalar tail.
         while i < n {
             let x = *ptr.add(i);
             *ptr.add(i) = if x >= 0.0 {
@@ -402,17 +339,8 @@ pub unsafe fn sigmoid_slice_f32_neon(buf: &mut [f32]) {
 // ────────────────────────────────────────────────────────────────────────
 // NEON softmax f32
 //
-// Three-pass numerically-stable softmax with NEON for max-reduction,
-// subtract+exp+sum, and final normalize. Same lane-extract scalar expf
-// approach as sigmoid — bit-equal to the scalar oracle, ~1.3-1.5×
-// speedup on Cortex-A53 (limited by the scalar expf call rate; the
-// NEON wins are on the loads/stores and horizontal max/sum).
-//
-// Hot path is the DFL `reg_max = 16` case: exactly 4 NEON chunks of 4
-// f32 lanes, zero scalar tail. Reg_max < 16 falls through to the
-// chunked path with a tail; reg_max > 16 (up to MAX_REG_MAX = 64) is
-// handled by additional iterations. Empty buffer is a no-op (matches
-// scalar softmax semantics).
+// Three passes: max reduction, subtract + exp + sum, normalize. An empty
+// buffer is a no-op.
 // ────────────────────────────────────────────────────────────────────────
 
 /// NEON softmax f32, in-place.
@@ -454,8 +382,6 @@ pub unsafe fn softmax_inplace_f32_neon(buf: &mut [f32]) {
         }
 
         // Pass 2: subtract max, exp via polynomial NEON expf, sum.
-        // softmax-post-subtract-max guarantees the input to exp is ≤ 0,
-        // safely inside the polynomial's accuracy envelope.
         let m_v = vdupq_n_f32(m);
         let mut sum_v = vdupq_n_f32(0.0);
         {
@@ -480,10 +406,7 @@ pub unsafe fn softmax_inplace_f32_neon(buf: &mut [f32]) {
             }
         }
 
-        // Pass 3: normalize. The sum > 0 guard mirrors scalar softmax,
-        // protecting against the all-`-inf` input case (every exp is 0,
-        // sum is 0; we'd produce NaN otherwise). Practically unreachable
-        // post-subtract-max since at least one e == 1.0.
+        // Pass 3: normalize when the sum is positive.
         if sum > 0.0 {
             let inv = 1.0 / sum;
             let inv_v = vdupq_n_f32(inv);
@@ -504,21 +427,11 @@ pub unsafe fn softmax_inplace_f32_neon(buf: &mut [f32]) {
 }
 
 // ────────────────────────────────────────────────────────────────────────
-// NEON FP16 polynomial expf — 8-lane via inline-asm escape hatch
+// NEON FP16 polynomial expf, 8 lanes, via inline asm
 //
-// Cortex-A55+ has full FP16 NEON arithmetic (ARMv8.2-A optional FP16),
-// doubling math throughput vs f32 (8 lanes per 128-bit Q register
-// instead of 4). Rust 1.94 stable does NOT expose `vfmaq_f16` /
-// `float16x8_t` (gated behind unstable `stdarch_neon_f16`), so we use
-// the same `.arch_extension` inline-asm pattern that `image::cpu::masks`
-// uses to unlock `sdot` for the dotprod tier.
-//
-// Strategy:
+// Steps:
 //   1. Receive 8 f32 lanes (as 2× `float32x4_t`).
-//   2. Clamp to [-15, 15] in f32 (f16's max representable exp is 2^15
-//      ≈ 32768; clamping at ±15 keeps the exponent injection valid).
-//      For sigmoid/softmax this saturates cleanly: σ(±15) ≈ 0/1 within
-//      f16 precision (~1e-3) anyway.
+//   2. Clamp to [-10, 10] in f32.
 //   3. Pack to a single 8-lane f16 register via `fcvtn` / `fcvtn2`.
 //   4. Polynomial in f16:
 //        - Range reduction `x = k*ln2 + r` via `fcvtns` (round-to-nearest
@@ -526,18 +439,14 @@ pub unsafe fn softmax_inplace_f32_neon(buf: &mut [f32]) {
 //        - 5-degree minimax (Cephes coefficients rounded to f16).
 //        - 2^k via integer exponent injection: f16 has 5 exponent bits
 //          and bias 15, so the bit pattern of 2^k is `(k + 15) << 10`.
-//      Operates on `int16x8_t` / `uint16x8_t` opaque carriers — these
-//      are bit-equivalent to `float16x8_t` from the assembler's view.
+//      Operates on `int16x8_t` / `uint16x8_t` carriers holding f16 bit
+//      patterns.
 //   5. Unpack to 2× `float32x4_t` via `fcvtl` / `fcvtl2`.
 //
-// Accuracy: ~1% relative error in `exp(r)` (f16's 10-bit mantissa
-// limits Cephes precision). For sigmoid post-divide and softmax
-// post-normalize the absolute error stays under 1e-3 — invisible to
-// mAP at coco128 evaluation thresholds.
+// Accuracy: ~1% relative error in `exp(r)`.
 //
-// SAFETY: every fp16-using function is `unsafe` and only called when
-// `CpuFeatures::neon_fp16 == true`. On hardware without FP16 the
-// instructions SIGILL — the dispatch contract MUST gate this tier.
+// Every fp16-using function is `unsafe` and requires
+// `CpuFeatures::neon_fp16`.
 // ────────────────────────────────────────────────────────────────────────
 
 /// Pack 2× f32x4 into a single f16x8 (bit-equivalent uint16x8_t).
@@ -583,17 +492,15 @@ unsafe fn unpack_f16x8_to_f32x4_pair(p: uint16x8_t) -> (float32x4_t, float32x4_t
 
 /// 8-lane FP16 polynomial expf. Takes 2× f32x4, returns 2× f32x4.
 ///
-/// Internally:
-/// * Clamps inputs to [-15, 15] in f32 (f16-safe range).
+/// * Clamps inputs to [-10, 10] in f32.
 /// * Packs to f16x8.
 /// * Runs Cephes 5-degree minimax in f16.
 /// * Reconstructs `2^k` via int16 exponent-bit injection.
-/// * Unpacks back to f32x4 pair.
+/// * Unpacks back to an f32x4 pair.
 ///
 /// # Safety
-/// Caller must ensure ARMv8.2-A FP16 hardware. The inline-asm path
-/// uses `.arch_extension fp16` so the binary contains FP16
-/// instructions; executing on hardware without FP16 will SIGILL.
+/// Caller must ensure ARMv8.2-A FP16 hardware; executing on hardware
+/// without FP16 raises SIGILL.
 #[inline]
 #[target_feature(enable = "neon")]
 pub unsafe fn expf_neon_f32x8_via_f16(
@@ -602,8 +509,6 @@ pub unsafe fn expf_neon_f32x8_via_f16(
 ) -> (float32x4_t, float32x4_t) {
     unsafe {
         // Cephes constants as IEEE 754 binary16 bit patterns.
-        // f16 representable values; refitting won't help with f16's 10-bit
-        // mantissa — accept ~1% relative error in exp(r).
         const LOG2_E: u16 = 0x3DC5; // 1.4424
         const LN2_HI: u16 = 0x398C; // 0.693359375 (exact)
         const LN2_LO: u16 = 0x8AF4; // -2.122e-4
@@ -615,14 +520,7 @@ pub unsafe fn expf_neon_f32x8_via_f16(
         const P4: u16 = 0x3155; // 1.666e-1
         const P5: u16 = 0x3800; // 0.5
 
-        // Clamp inputs in f32 BEFORE conversion. Tight clamp at ±10 keeps
-        // k = round(x * log2_e) in [-14, 14], strictly inside f16's
-        // 5-bit-exponent + bias-15 range. A wider clamp would let k spill
-        // into the sign bit of the `(k + 15) << 10` injection, producing
-        // negative or infinite "2^k" — manifested as sigmoid > 1.0 in the
-        // initial implementation. exp(±10) saturates sigmoid to within
-        // 1e-4 of 0/1, well below f16's ~1e-3 precision, so the consumer
-        // can't tell the difference.
+        // Clamp inputs to [-10, 10] in f32 before conversion.
         let max_v = vdupq_n_f32(10.0);
         let min_v = vdupq_n_f32(-10.0);
         let lo_c = vminq_f32(vmaxq_f32(lo, min_v), max_v);
@@ -630,8 +528,7 @@ pub unsafe fn expf_neon_f32x8_via_f16(
 
         let x = pack_f16x8_from_f32x4_pair(lo_c, hi_c);
 
-        // Constants splatted across all 8 lanes. vdupq_n_u16 is a register
-        // dup; the bit pattern is f16 in disguise.
+        // Constants splatted across all 8 lanes as f16 bit patterns.
         let log2_e = vdupq_n_u16(LOG2_E);
         let ln2_hi = vdupq_n_u16(LN2_HI);
         let ln2_lo = vdupq_n_u16(LN2_LO);
@@ -648,8 +545,7 @@ pub unsafe fn expf_neon_f32x8_via_f16(
         let k_int = fcvtns_s16_from_f16x8(fx_f);
         let k_f = scvtf_f16_from_s16x8(k_int);
 
-        // r = x - k*ln2_hi - k*ln2_lo (precision split for the
-        // ln2 multiplication, same trick as the f32 path).
+        // r = x - k*ln2_hi - k*ln2_lo.
         let z = fmls_f16x8(x, k_f, ln2_hi);
         let r = fmls_f16x8(z, k_f, ln2_lo);
 
@@ -676,9 +572,8 @@ pub unsafe fn expf_neon_f32x8_via_f16(
     }
 }
 
-/// FP16 NEON sigmoid, in place. 8-lane chunks via the f16 path; 4-lane
-/// f32 + scalar tail for the remainder. Same numerical pattern as the
-/// f32 sigmoid (`x ≥ 0` branch / `x < 0` branch + blend).
+/// FP16 NEON sigmoid, in place. 8-lane chunks via the f16 path; scalar
+/// tail for the remainder.
 ///
 /// # Safety
 /// Caller must ensure ARMv8.2-A FP16 hardware.
@@ -715,8 +610,7 @@ pub unsafe fn sigmoid_slice_f32_neon_fp16(buf: &mut [f32]) {
             vst1q_f32(ptr.add(i + 4), r_hi);
         }
 
-        // Scalar tail for fewer than 8 remaining lanes — small (max 7) so
-        // the libm cost is negligible vs the savings on the bulk path.
+        // Scalar tail for fewer than 8 remaining lanes.
         let tail_start = chunks_8 * 8;
         for i in tail_start..n {
             let x = *ptr.add(i);
@@ -731,8 +625,8 @@ pub unsafe fn sigmoid_slice_f32_neon_fp16(buf: &mut [f32]) {
     }
 }
 
-/// FP16 NEON softmax, in place. 8-lane chunks via f16 expf; remainder
-/// via 4-lane f32 expf + scalar tail.
+/// FP16 NEON softmax, in place. 8-lane chunks via f16 expf; scalar tail
+/// for the remainder.
 ///
 /// # Safety
 /// Caller must ensure ARMv8.2-A FP16 hardware.
@@ -747,9 +641,7 @@ pub unsafe fn softmax_inplace_f32_neon_fp16(buf: &mut [f32]) {
         let chunks_8 = n / 8;
         let ptr = buf.as_mut_ptr();
 
-        // Pass 1: max via NEON horizontal reduce (f32 — keeps the max
-        // reduction precise). 4-lane chunks inside the 8-lane envelope so
-        // the same fold works for tails.
+        // Pass 1: max via NEON horizontal reduce in f32, 4-lane chunks.
         let chunks_4 = n / 4;
         let mut m = f32::NEG_INFINITY;
         if chunks_4 > 0 {
@@ -790,7 +682,7 @@ pub unsafe fn softmax_inplace_f32_neon_fp16(buf: &mut [f32]) {
         }
         let mut sum = vaddvq_f32(sum_v);
 
-        // Tail (< 8 lanes): use scalar libm — negligible vs the bulk.
+        // Tail (< 8 lanes): scalar.
         let tail_start = chunks_8 * 8;
         for i in tail_start..n {
             let e = (*ptr.add(i) - m).exp();
@@ -817,22 +709,16 @@ pub unsafe fn softmax_inplace_f32_neon_fp16(buf: &mut [f32]) {
 }
 
 // ────────────────────────────────────────────────────────────────────────
-// NEON weighted-sum for DFL (#3)
-//
-// Vectorizes `weighted_sum_4sides_f32` by processing 4 probability-bin
-// products per cycle via `vfmaq_n_f32`. For reg_max = 16 (the common
-// case) each side is exactly 4 NEON iterations, totalling 16 FMAs.
-// On Cortex-A53 (single-issue, 1 FMA/cycle) this replaces 16 scalar
-// multiply-add pairs with 4 NEON FMAs — a ~4× per-side speedup.
+// NEON weighted-sum for DFL
 // ────────────────────────────────────────────────────────────────────────
 
 /// NEON weighted-sum for 4 DFL sides.
 ///
 /// `probs.len() == 4 * reg_max`, side-major layout. Returns `[d_left,
-/// d_top, d_right, d_bottom]` — same contract as the scalar version.
+/// d_top, d_right, d_bottom]`.
 ///
 /// # Safety
-/// Caller must ensure NEON is available (always true on aarch64).
+/// Caller must ensure NEON is available.
 #[inline]
 #[target_feature(enable = "neon")]
 pub unsafe fn weighted_sum_4sides_f32_neon(probs: &[f32], reg_max: usize) -> [f32; 4] {
@@ -877,39 +763,23 @@ pub unsafe fn weighted_sum_4sides_f32_neon(probs: &[f32], reg_max: usize) -> [f3
 // ────────────────────────────────────────────────────────────────────────
 // NEON fused softmax + weighted_sum
 //
-// Online-softmax-inspired fusion: computes the DFL weighted sum directly
-// from the dequantized logits WITHOUT materializing the intermediate
-// probability vector. For each side:
+// For each side:
 //
 //   result = Σ(exp(x[i] - max) × i) / Σ(exp(x[i] - max))
 //
-// This is algebraically identical to softmax(x) · [0,1,...,reg_max-1],
-// but eliminates all intermediate memory traffic:
-//   - 16 stores (softmax writes exp values)
-//   - 16 loads  (softmax reads for normalize pass)
-//   - 16 stores (softmax writes normalized probs)
-//   - 16 loads  (weighted_sum reads probs)
-// = 64 memory ops eliminated per side × 4 sides = 256 per anchor.
-//
-// The kernel is 2-pass over the data instead of 5-pass:
+// in two passes:
 //   Pass 1: find max (NEON vmaxq_f32 reduction)
 //   Pass 2: exp(x-max) accumulated into sum + weighted_sum in-register
-//
-// For reg_max=16 (the common case), pass 2 processes 4 NEON vectors
-// with precomputed bin-index constants [0..3], [4..7], [8..11], [12..15].
-// Everything stays in registers — no store/reload between exp and the
-// final scalar divide.
 // ────────────────────────────────────────────────────────────────────────
 
 /// Fused softmax + weighted_sum for 4 DFL sides, NEON f32.
 ///
 /// `logits` is a dequantized buffer with layout `[side0..side3]`, each
 /// side containing `reg_max` contiguous f32 values. Returns `[d_left,
-/// d_top, d_right, d_bottom]` — same contract as calling
-/// `softmax_inplace` then `weighted_sum_4sides_f32_neon` but faster.
+/// d_top, d_right, d_bottom]`.
 ///
 /// # Safety
-/// Caller must ensure NEON is available (always true on aarch64).
+/// Caller must ensure NEON is available.
 #[inline]
 #[target_feature(enable = "neon")]
 pub unsafe fn softmax_weighted_sum_4sides_f32_neon(logits: &[f32], reg_max: usize) -> [f32; 4] {
@@ -974,7 +844,7 @@ pub unsafe fn softmax_weighted_sum_4sides_f32_neon(logits: &[f32], reg_max: usiz
                 bin_idx += 1;
             }
 
-            // Single divide instead of per-element normalize.
+            // One divide per side.
             *slot = if sum > 0.0 { ws / sum } else { 0.0 };
         }
         d
@@ -983,12 +853,11 @@ pub unsafe fn softmax_weighted_sum_4sides_f32_neon(logits: &[f32], reg_max: usiz
 
 /// Fused softmax + weighted_sum for 4 DFL sides, FP16 exp path.
 ///
-/// Same semantics as `softmax_weighted_sum_4sides_f32_neon` but uses the
-/// 8-lane FP16 exp approximation for ~2× exp throughput on Cortex-A55+.
-/// Max-finding and accumulation remain in f32 for precision.
+/// Same semantics as `softmax_weighted_sum_4sides_f32_neon` with the
+/// 8-lane FP16 exp approximation. Max-finding and accumulation are in f32.
 ///
 /// # Safety
-/// Caller must ensure FP16 NEON is available (Cortex-A55+).
+/// Caller must ensure FP16 NEON is available.
 #[inline]
 #[target_feature(enable = "neon")]
 pub unsafe fn softmax_weighted_sum_4sides_f32_neon_fp16(
@@ -1005,7 +874,7 @@ pub unsafe fn softmax_weighted_sum_4sides_f32_neon_fp16(
         for (side, slot) in d.iter_mut().enumerate() {
             let base = side * reg_max;
 
-            // ── Pass 1: find max (f32 for precision) ──
+            // ── Pass 1: find max in f32 ──
             let mut m = f32::NEG_INFINITY;
             if chunks_4 > 0 {
                 let mut max_v = vld1q_f32(ptr.add(base));
@@ -1090,12 +959,7 @@ pub unsafe fn softmax_weighted_sum_4sides_f32_neon_fp16(
 }
 
 // ────────────────────────────────────────────────────────────────────────
-// NEON dist2bbox — batch 4 anchors (#4)
-//
-// Processes 4 anchors simultaneously by loading their LTRB distances,
-// grid centres, and stride into float32x4_t lanes. Each lane computes
-// one anchor's xc/yc/w/h independently. For an 80×80 FPN level (6400
-// anchors), this reduces 6400 scalar iterations to 1600 NEON batches.
+// NEON dist2bbox, 4 anchors per batch
 // ────────────────────────────────────────────────────────────────────────
 
 /// Batch dist2bbox for 4 anchors. `ltrb` is `[l0,t0,r0,b0, l1,t1,r1,b1,
@@ -1122,9 +986,9 @@ pub unsafe fn dist2bbox_4anchors_f32_neon(
         let half = vdupq_n_f32(0.5);
         let stride_v = vdupq_n_f32(stride);
 
-        // Load LTRB for 4 anchors (each has 4 values, total 16 floats).
-        // Memory layout: [l0,t0,r0,b0, l1,t1,r1,b1, l2,t2,r2,b2, l3,t3,r3,b3]
-        // We need to transpose to get [l0,l1,l2,l3], [t0,...], [r0,...], [b0,...].
+        // Load LTRB for 4 anchors, laid out as
+        // [l0,t0,r0,b0, l1,t1,r1,b1, l2,t2,r2,b2, l3,t3,r3,b3], and
+        // transpose to [l0,l1,l2,l3], [t0,...], [r0,...], [b0,...].
         let a0 = vld1q_f32(ltrb.as_ptr()); // l0,t0,r0,b0
         let a1 = vld1q_f32(ltrb.as_ptr().add(4)); // l1,t1,r1,b1
         let a2 = vld1q_f32(ltrb.as_ptr().add(8)); // l2,t2,r2,b2
@@ -1166,7 +1030,7 @@ pub unsafe fn dist2bbox_4anchors_f32_neon(
         // h = (top + bottom) * stride
         let h = vmulq_f32(vaddq_f32(d_top, d_bottom), stride_v);
 
-        // Transpose back: [xc0,yc0,w0,h0, xc1,...] — reverse the 4×4 transpose.
+        // Transpose back to [xc0,yc0,w0,h0, xc1,...].
         let r01_lo = vtrn1q_f32(xc, yc); // xc0,yc0,xc2,yc2
         let r01_hi = vtrn2q_f32(xc, yc); // xc1,yc1,xc3,yc3
         let r23_lo = vtrn1q_f32(w, h); // w0,h0,w2,h2
@@ -1197,13 +1061,7 @@ pub unsafe fn dist2bbox_4anchors_f32_neon(
 }
 
 // ────────────────────────────────────────────────────────────────────────
-// Fused dequant+sigmoid (#5)
-//
-// The score-level pipeline currently runs two passes: dequant → sigmoid.
-// Each pass reads and writes the full score tensor (~80×80×80 = 512 KB
-// at level 0). Fusing into a single pass eliminates the intermediate
-// store→reload — saving ~10% decode time on bandwidth-bound Cortex-A53
-// where the L2→register round-trip dominates.
+// Fused dequant + sigmoid in one pass
 // ────────────────────────────────────────────────────────────────────────
 
 /// Fused NEON i8 dequant + sigmoid. Output is sigmoid((in - zp) * scale).
@@ -1464,13 +1322,9 @@ pub unsafe fn dequant_sigmoid_u16_to_f32_neon(input: &[u16], q: Quant, output: &
 }
 
 // ────────────────────────────────────────────────────────────────────────
-// Half-precision dequant output (#6)
+// Half-precision dequant output
 //
-// NEON dequant kernels that output f16 directly via `fcvtn`, halving
-// write bandwidth. The dequant math runs in f32 (preserving precision),
-// then narrows to f16 on the store path. Uses inline asm `.arch_extension
-// fp16` for the `fcvtn`/`fcvtn2` instructions since stable Rust doesn't
-// expose f16 intrinsics.
+// The dequant math runs in f32 and narrows to f16 on store via `fcvtn`.
 // ────────────────────────────────────────────────────────────────────────
 
 /// Convert 4 f32 lanes to 4 f16 lanes (lower half of a uint16x8_t).
@@ -1663,10 +1517,7 @@ mod tests {
     use crate::prim::sigmoid::sigmoid_slice_f32;
     use crate::prim::softmax::softmax_inplace_f32;
 
-    /// ULP envelope for FMA reordering. NEON FMA produces the same
-    /// fused-rounding result as scalar `(in - zp) * scale` only when the
-    /// operations associate identically; in practice for affine
-    /// `out = scale * in + bias` the rounding agrees within 1-2 ulp.
+    /// Whether `a` and `b` differ by less than 1e-7 or by less than `ulps` ulp.
     fn close_within_ulp(a: f32, b: f32, ulps: u32) -> bool {
         let diff = (a - b).abs();
         if diff < 1e-7 {
@@ -1678,10 +1529,7 @@ mod tests {
 
     #[test]
     fn dequant_i8_to_f32_neon_matches_scalar() {
-        // 200 elements: covers the full 16-lane chunked path plus an
-        // 8-element scalar tail (200 = 12*16 + 8). YOLO per-scale
-        // tensors are typically 4 / 32 / 64 channels → multiples of 16
-        // dominate but the tail path needs to be exercised too.
+        // 200 elements: twelve 16-lane chunks plus an 8-element scalar tail.
         let input: Vec<i8> = (-100..100).map(|i| i as i8).collect();
         let q = Quant {
             scale: 0.0326_f32,
@@ -1785,10 +1633,6 @@ mod tests {
 
     #[test]
     fn expf_neon_f32x4_matches_libm() {
-        // Cephes 5-degree minimax targets ~3 ulp on the reduced range.
-        // After the * 2^k step the ulp count is preserved (multiply by a
-        // power of 2 is exact). Test across [-50, 50] which spans the
-        // realistic input domain for sigmoid and softmax.
         let cases: Vec<f32> = (-100..=100).map(|i| i as f32 * 0.5).collect();
         for chunk in cases.chunks(4) {
             if chunk.len() < 4 {
@@ -1804,9 +1648,6 @@ mod tests {
             };
             for (i, &x) in arr.iter().enumerate() {
                 let oracle = x.exp();
-                // 8 ulp envelope. Cephes is ~3 ulp on the polynomial step,
-                // but we add a small allowance for FMA-vs-non-FMA reordering
-                // at scalar libm.
                 assert!(
                     close_within_ulp(neon[i], oracle, 8),
                     "expf NEON/libm mismatch at x={x}: neon={} libm={oracle}",
@@ -1818,8 +1659,7 @@ mod tests {
 
     #[test]
     fn sigmoid_slice_f32_neon_matches_scalar() {
-        // Mix positive, negative, large, small, zero — tests both branches
-        // of the vbslq_f32 blend plus the saturation tails.
+        // Covers both branches of the vbslq_f32 blend and the saturation tails.
         let cases: Vec<f32> = (-50..=50).map(|i| i as f32 * 0.5).collect();
         let mut neon_buf = cases.clone();
         let mut scalar_buf = cases;
@@ -1828,11 +1668,6 @@ mod tests {
         }
         sigmoid_slice_f32(&mut scalar_buf);
         for (i, (&n_v, &s_v)) in neon_buf.iter().zip(scalar_buf.iter()).enumerate() {
-            // Polynomial NEON expf adds ~3 ulp on the exp() step; the
-            // 1/(1+e) divide is well-conditioned (denominator ≥ 1) so
-            // total envelope stays ≤ ~5 ulp. For lanes where the output
-            // saturates near 0 or 1 the absolute value is what matters,
-            // not relative ulps — short-circuit on absolute < 1e-6.
             let abs_diff = (n_v - s_v).abs();
             assert!(
                 abs_diff < 1e-6 || close_within_ulp(n_v, s_v, 16),
@@ -1843,7 +1678,7 @@ mod tests {
 
     #[test]
     fn sigmoid_slice_f32_neon_short_input_under_chunk_size() {
-        // Tail-only path bypasses NEON expf, so result is bit-equal.
+        // Length 3: only the scalar tail runs.
         let mut neon_buf = [-2.0_f32, -1.0, 1.5];
         let mut scalar_buf = neon_buf;
         unsafe {
@@ -1869,10 +1704,7 @@ mod tests {
         }
     }
 
-    /// Softmax envelope helper. Polynomial NEON expf adds ~3 ulp per
-    /// exp() call; the sum-then-divide normalisation and the absolute
-    /// value at small probabilities make ulp counts noisy, so the test
-    /// accepts EITHER an absolute diff < 1e-5 OR a 32 ulp relative diff.
+    /// Whether `a` and `b` differ by less than 1e-5 or by less than 32 ulp.
     fn softmax_close(a: f32, b: f32) -> bool {
         let abs = (a - b).abs();
         abs < 1e-5 || close_within_ulp(a, b, 32)
@@ -1880,7 +1712,7 @@ mod tests {
 
     #[test]
     fn softmax_neon_matches_scalar_reg_max_16() {
-        // The DFL hot path: reg_max=16, exactly 4 NEON chunks, no tail.
+        // reg_max = 16: exactly 4 NEON chunks, no tail.
         let cases: Vec<f32> = (0..16).map(|i| (i as f32) * 0.5 - 4.0).collect();
         let mut neon_buf = cases.clone();
         let mut scalar_buf = cases;
@@ -1894,14 +1726,13 @@ mod tests {
                 "softmax NEON/scalar mismatch at {i}: neon={n_v} scalar={s_v}"
             );
         }
-        // Sums should both be 1.0 to within FP envelope.
         let sum: f32 = neon_buf.iter().sum();
         assert!((sum - 1.0).abs() < 1e-5, "softmax sum != 1.0: {sum}");
     }
 
     #[test]
     fn softmax_neon_matches_scalar_with_tail() {
-        // 18 elements: 4 chunks of 4 + 2-element tail. Exercises both paths.
+        // 18 elements: 4 chunks of 4 plus a 2-element tail.
         let cases: Vec<f32> = (0..18).map(|i| i as f32 * 0.3).collect();
         let mut neon_buf = cases.clone();
         let mut scalar_buf = cases;
@@ -1919,7 +1750,6 @@ mod tests {
 
     #[test]
     fn softmax_neon_overflow_safety() {
-        // Logits with large positive values; subtract-max protects against overflow.
         let mut neon_buf = [1000.0_f32, 1001.0, 1002.0, 1003.0];
         let mut scalar_buf = neon_buf;
         unsafe {
@@ -1942,12 +1772,11 @@ mod tests {
         unsafe {
             softmax_inplace_f32_neon(&mut buf);
         }
-        // No-op: just verify no crash. (Length 0 cases skip both passes.)
     }
 
     #[test]
     fn dequant_i8_to_f32_neon_handles_exact_chunk_boundary() {
-        // Length 64 = exactly 4 chunks of 16, no tail.
+        // Length 64: exactly 4 chunks of 16, no tail.
         let input: Vec<i8> = (-32..32).map(|i| i as i8).collect();
         let q = Quant {
             scale: 0.1_f32,
@@ -1968,9 +1797,7 @@ mod tests {
     }
 
     // ────────────────────────────────────────────────────────────────────
-    // FP16 polynomial expf parity tests. Gated on runtime probe of
-    // ARMv8.2-A FP16 — Cortex-A53 doesn't have it, so these tests
-    // skip gracefully on imx8mp and run on imx95 / RPi5 / A55+ hardware.
+    // FP16 polynomial expf parity tests, skipped without ARMv8.2-A FP16.
     // ────────────────────────────────────────────────────────────────────
 
     fn fp16_supported() -> bool {
@@ -1985,17 +1812,7 @@ mod tests {
             );
             return;
         }
-        // f16 polynomial expf has ~1% relative error in exp(r) — wider
-        // envelope than the 8 ulp f32 path, so we test relative diff
-        // instead of ulp count.
-        //
-        // The kernel clamps inputs to ±10 (see `expf_neon_f32x8_via_f16`'s
-        // own comment) to keep `k = round(x * log2_e)` in [-14, 14], strictly
-        // inside f16's 5-bit-exponent + bias-15 range. Inputs outside that
-        // envelope saturate to exp(±10). The oracle below mirrors that
-        // saturation so the test exercises the whole [-15, 15] input range
-        // (including the saturating boundary) without expecting precision
-        // the kernel never claimed.
+        // The oracle saturates at exp(±10) as the kernel does.
         let cases: Vec<f32> = (-30..=30).map(|i| i as f32 * 0.5).collect();
         for chunk in cases.chunks(8) {
             if chunk.len() < 8 {
@@ -2013,8 +1830,6 @@ mod tests {
                 let oracle = x.clamp(-10.0, 10.0).exp();
                 let abs_err = (out[i] - oracle).abs();
                 let rel_err = abs_err / oracle.max(1e-6);
-                // 2% relative or 1e-4 absolute — accommodates f16's 10-bit
-                // mantissa across the full range.
                 assert!(
                     rel_err < 0.02 || abs_err < 1e-4,
                     "f16 expf mismatch at x={x}: got={} oracle={oracle} rel_err={rel_err:.4}",
@@ -2039,9 +1854,6 @@ mod tests {
         }
         sigmoid_slice_f32(&mut scalar_buf);
         for (i, (&n_v, &s_v)) in neon_buf.iter().zip(scalar_buf.iter()).enumerate() {
-            // Sigmoid is bounded [0,1]; f16 polynomial accuracy means
-            // ~1% relative on exp(r) translates to ≤ 0.005 absolute on
-            // sigmoid output.
             let abs_err = (n_v - s_v).abs();
             assert!(
                 abs_err < 5e-3,
@@ -2056,7 +1868,7 @@ mod tests {
             crate::test_support::report_skip("fp16 not supported");
             return;
         }
-        // 16 elements: 2 chunks of 8, exact reg_max boundary.
+        // 16 elements: 2 chunks of 8.
         let cases: Vec<f32> = (0..16).map(|i| (i as f32) * 0.5 - 4.0).collect();
         let mut neon_buf = cases.clone();
         let mut scalar_buf = cases;
@@ -2065,7 +1877,6 @@ mod tests {
         }
         softmax_inplace_f32(&mut scalar_buf);
         for (i, (&n_v, &s_v)) in neon_buf.iter().zip(scalar_buf.iter()).enumerate() {
-            // Softmax post-normalize: same envelope as sigmoid.
             let abs_err = (n_v - s_v).abs();
             assert!(
                 abs_err < 5e-3,
@@ -2076,7 +1887,7 @@ mod tests {
         assert!((sum - 1.0).abs() < 1e-3, "fp16 softmax sum drift: {sum}");
     }
 
-    // ── Tests for #3: NEON weighted sum ──────────────────────────────
+    // ── NEON weighted sum ────────────────────────────────────────────
     use crate::prim::box_primitives::weighted_sum_4sides_f32;
 
     #[test]
@@ -2108,12 +1919,11 @@ mod tests {
         }
     }
 
-    // ── Tests for #4: NEON dist2bbox ─────────────────────────────────
+    // ── NEON dist2bbox ───────────────────────────────────────────────
     use crate::prim::box_primitives::dist2bbox_anchor_f32;
 
     #[test]
     fn dist2bbox_4anchors_matches_scalar() {
-        // 4 anchors with distinct LTRB values.
         let ltrb = [
             2.0_f32, 2.0, 2.0, 2.0, // anchor 0: symmetric
             1.0, 0.0, 3.0, 0.0, // anchor 1: l/r only
@@ -2146,7 +1956,7 @@ mod tests {
         }
     }
 
-    // ── Tests for #5: fused dequant+sigmoid ──────────────────────────
+    // ── Fused dequant+sigmoid ────────────────────────────────────────
 
     #[test]
     fn fused_dequant_sigmoid_i8_matches_two_pass() {
@@ -2192,7 +2002,7 @@ mod tests {
         }
     }
 
-    // ── Tests for #6: half-precision dequant output ──────────────────
+    // ── Half-precision dequant output ────────────────────────────────
 
     #[test]
     fn dequant_i8_to_f16_neon_matches_scalar() {
@@ -2252,10 +2062,8 @@ mod tests {
 
     #[test]
     fn fused_softmax_weighted_sum_matches_separate() {
-        // Verify that the fused kernel produces the same result as
-        // separate softmax_inplace + weighted_sum for reg_max=16.
         let reg_max = 16usize;
-        // Simulate 4 sides of dequantized DFL logits (typical range -3..3).
+        // 4 sides of DFL logits in [-3, 3].
         let logits: Vec<f32> = (0..(4 * reg_max))
             .map(|i| ((i as f32) * 0.37 - 2.5).sin() * 3.0)
             .collect();
@@ -2273,7 +2081,6 @@ mod tests {
             }
         }
 
-        // Fused NEON kernel.
         let fused_ws = unsafe { softmax_weighted_sum_4sides_f32_neon(&logits, reg_max) };
 
         for (side, (&fused, &reference)) in fused_ws.iter().zip(ref_ws.iter()).enumerate() {
@@ -2287,7 +2094,7 @@ mod tests {
 
     #[test]
     fn fused_softmax_weighted_sum_reg_max_32() {
-        // Test with reg_max=32 to exercise multi-chunk path.
+        // reg_max = 32: several chunks per side.
         let reg_max = 32usize;
         let logits: Vec<f32> = (0..(4 * reg_max))
             .map(|i| ((i as f32) * 0.23 - 1.8).cos() * 2.5)

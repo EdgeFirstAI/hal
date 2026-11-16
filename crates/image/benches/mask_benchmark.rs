@@ -6,9 +6,6 @@
 //! Benchmarks `draw_proto_masks` (fused proto→overlay) and `draw_decoded_masks`
 //! (pre-decoded mask overlay) for both CPU and OpenGL backends.
 //!
-//! Uses the same fork-free `edgefirst-bench` harness as `pipeline_benchmark.rs`
-//! to avoid GPU driver crashes on i.MX8/i.MX95 targets.
-//!
 //! ## Run benchmarks (host)
 //! ```bash
 //! cargo bench -p edgefirst-image --bench mask_benchmark
@@ -35,8 +32,6 @@ const WARMUP: usize = 10;
 const ITERATIONS: usize = 100;
 
 // Quantization parameters from the YOLOv8 segmentation test model.
-// Wired into the Decoder schema below; the int8 fixtures were exported with
-// these specific scale/zp values, so the bench must use them verbatim.
 const BOXES_SCALE: f32 = 0.019_484_945;
 const BOXES_ZP: i32 = 20;
 const PROTOS_SCALE: f32 = 0.020_889_873;
@@ -45,7 +40,7 @@ const PROTOS_ZP: i32 = -115;
 const SCORE_THRESHOLD: f32 = 0.45;
 const IOU_THRESHOLD: f32 = 0.45;
 
-// Output image dimensions (typical YOLO input size).
+// Output image dimensions.
 const OUTPUT_W: usize = 640;
 const OUTPUT_H: usize = 640;
 
@@ -72,9 +67,8 @@ fn load_protos_tensor() -> TensorDyn {
     TensorDyn::I8(t)
 }
 
-/// Build a YOLOv8-seg decoder wired to the embedded fixture's quant params,
-/// score/IoU thresholds, and class-agnostic NMS. Mirrors the decoder the
-/// production caller would build for this model.
+/// Build a YOLOv8-seg decoder with the fixture's quant params, score/IoU
+/// thresholds, and class-agnostic NMS.
 fn build_decoder() -> Decoder {
     let detection = configs::Detection {
         decoder: configs::DecoderType::Ultralytics,
@@ -114,14 +108,11 @@ fn decode_proto_data() -> (Vec<DetectBox>, ProtoData) {
     (output_boxes, proto_data)
 }
 
-/// Materialize `Segmentation` masks from `ProtoData` with clamped bounding
-/// boxes. This bypasses the decoder's NORM_LIMIT check (which rejects boxes
-/// whose coordinates exceed 1.01) so we always get valid pre-decoded masks
-/// for benchmarking `draw_decoded_masks`.
+/// Materialize `Segmentation` masks from `ProtoData` with bounding boxes
+/// clamped to `[0, 1]`.
 fn materialize_segmentations(detect: &[DetectBox], proto_data: &ProtoData) -> Vec<Segmentation> {
     use edgefirst_tensor::{TensorDyn, TensorMapTrait, TensorTrait};
-    // Dequantize protos once to f32 for this benchmark (production uses the
-    // native per-dtype kernels in CPUProcessor::materialize_segmentations).
+    // Dequantize protos to f32.
     let proto_shape = proto_data.protos.shape().to_vec();
     let (proto_h, proto_w, num_protos) = (proto_shape[0], proto_shape[1], proto_shape[2]);
     let proto_map = match &proto_data.protos {
@@ -182,7 +173,6 @@ fn materialize_segmentations(detect: &[DetectBox], proto_data: &ProtoData) -> Ve
         .iter()
         .zip(coeff_rows.iter())
         .map(|(det, coeff)| {
-            // Clamp bbox to [0, 1] to avoid NORM_LIMIT rejection
             let xmin = det.bbox.xmin.clamp(0.0, 1.0);
             let ymin = det.bbox.ymin.clamp(0.0, 1.0);
             let xmax = det.bbox.xmax.clamp(0.0, 1.0);
@@ -229,23 +219,10 @@ fn materialize_segmentations(detect: &[DetectBox], proto_data: &ProtoData) -> Ve
 
 // =============================================================================
 // dtype_dispatch: compare f32 vs f16 mask materialization paths
-//
-// Builds a `ProtoData` once from the i8 fixture (NMS produces ~30-50 detections
-// at our threshold), widens both `protos` and `mask_coefficients` into f32 and
-// f16 TensorDyn variants, and times `materialize_segmentations` (proto-res)
-// and `materialize_scaled_segmentations` (640×640) through each dispatch.
-//
-// On builds with `-C target-cpu=cortex-a78ae` (or `-C target-feature=+fp16`),
-// the f16 inner loop emits native ARMv8.2 `fcvt`/FMA instructions with single-
-// precision accumulators; on baseline aarch64 builds the same loop falls back
-// to soft-float `__extendhfsf2` calls per element. Comparing the two builds
-// quantifies the fp16 codegen win on Tegra Orin / Cortex-A78AE-class cores.
 // =============================================================================
 
 fn build_proto_dtypes(detect: &[DetectBox], proto_data_i8: &ProtoData) -> (ProtoData, ProtoData) {
-    // Widen the i8 protos and mask coefficients to f32 once (this matches what
-    // the i8 path does internally per-pixel; we hoist it so the f32/f16 bench
-    // measures only the materialize kernel, not the dequant).
+    // Widen the i8 protos and mask coefficients to f32.
     let proto_h: usize;
     let proto_w: usize;
     let num_protos: usize;
@@ -394,8 +371,7 @@ fn bench_materialize_dtype(suite: &mut BenchSuite) {
         suite.record(&result);
     }
 
-    // Scaled-resolution materialize (640×640 per detection — the COCO-validation
-    // critical path; this is where the f16 codegen difference shows up most).
+    // Scaled-resolution materialize (640×640 per detection).
     {
         let name = "materialize_masks/scaled_640x640/i8";
         let result = run_bench(name, WARMUP, ITERATIONS, || {
@@ -445,9 +421,6 @@ fn bench_materialize_dtype(suite: &mut BenchSuite) {
         }
     }
 
-    // Reference the unused MaskResolution import to avoid a warning when
-    // the helper above is rewritten — currently materialize_segmentations
-    // implies Proto and materialize_scaled_segmentations implies Scaled.
     let _ = MaskResolution::Proto;
 }
 
@@ -464,8 +437,6 @@ fn bench_decode_masks(suite: &mut BenchSuite) {
     let inputs: Vec<&TensorDyn> = vec![&boxes_t, &protos_t];
 
     // Proto-only decode: NMS + extract mask coefficients (no mask materialization).
-    // This is the decode cost paid by the fused draw_proto_masks
-    // paths which let the renderer compute mask_coeff @ protos.
     {
         let name = "decode_masks/proto";
         let result = run_bench(name, WARMUP, ITERATIONS, || {
@@ -477,7 +448,6 @@ fn bench_decode_masks(suite: &mut BenchSuite) {
     }
 
     // Full decode: NMS + extract proto data + materialize pixel masks on CPU.
-    // This is the decode cost paid by the draw_decoded_masks path.
     {
         let name = "decode_masks/materialize";
         let result = run_bench(name, WARMUP, ITERATIONS, || {
@@ -505,8 +475,7 @@ fn bench_proto_extraction(suite: &mut BenchSuite) {
     let protos_t = load_protos_tensor();
     let inputs: Vec<&TensorDyn> = vec![&boxes_t, &protos_t];
 
-    // Run NMS once to get detection indices, then measure only the proto
-    // extraction (the copy/dequant we plan to optimize).
+    // Run NMS once to get detection indices, then measure only the proto extraction.
     let mut warmup_boxes = Vec::with_capacity(50);
     let _ = decoder.decode_proto(&inputs, &mut warmup_boxes).unwrap();
     let n_detect = warmup_boxes.len();
@@ -528,8 +497,8 @@ fn bench_proto_extraction(suite: &mut BenchSuite) {
 fn bench_draw_proto_masks_forced_opengl(suite: &mut BenchSuite) {
     println!("\n== draw_proto_masks/forced_opengl: Pure GL Proto Path ==\n");
 
-    // Create a processor forced to OpenGL only (no hybrid fallback).
-    // SAFETY: set_var is not thread-safe, but benchmarks are single-threaded.
+    // Create a processor forced to OpenGL only.
+    // SAFETY: benchmarks are single-threaded.
     unsafe { std::env::set_var("EDGEFIRST_FORCE_BACKEND", "opengl") };
     let proc = ImageProcessor::new();
     unsafe { std::env::remove_var("EDGEFIRST_FORCE_BACKEND") };
@@ -571,21 +540,11 @@ fn bench_draw_proto_masks_forced_opengl(suite: &mut BenchSuite) {
 
 // =============================================================================
 // draw_proto_masks/gl/<dtype>: per-dtype GL proto-render cells
-//
-// One named cell per GL proto-render variant × detection count, so the dtype
-// fan-out collapse (proto_dispatch refactor) has a before/after number for
-// every lowering it touches: i8 (compute-transpose / CPU repack), the int8
-// interpolation-mode sweep (Nearest / Bilinear / TwoPass dequant), f32
-// (R32F upload, or the f16 fallback on GPUs without float-linear), and
-// f16-native (RGBA16F packing). Reuses `build_proto_dtypes` to widen the
-// embedded i8 fixture, so no new testdata is required.
 // =============================================================================
 
-/// Tile the decoded detections and coefficient rows out to `count`, so the
-/// per-detection quad cost is measured at realistic detection counts even
-/// though the fixture's NMS yields only a couple of boxes. Coefficient rows
-/// cycle the decoded rows (dtype and quantization preserved); protos are
-/// rebuilt verbatim.
+/// Tile the decoded detections and coefficient rows out to `count`.
+/// Coefficient rows cycle the decoded rows (dtype and quantization preserved);
+/// protos are rebuilt verbatim.
 fn tile_proto_data(
     detect: &[DetectBox],
     proto: &ProtoData,
@@ -594,8 +553,7 @@ fn tile_proto_data(
     let det: Vec<DetectBox> = detect.iter().copied().cycle().take(count).collect();
 
     // Cycle the leading (row) axis of a flat tensor buffer out to `count`
-    // rows, returning the new data + shape. Plain slices keep this free of
-    // `Tensor<T>`'s trait bounds.
+    // rows, returning the new data and shape.
     fn cycle_rows<T: Copy>(s: &[T], shape: &[usize], count: usize) -> (Vec<T>, Vec<usize>) {
         let row = shape[1..].iter().product::<usize>();
         let rows = shape[0];
@@ -668,7 +626,7 @@ fn tile_proto_data(
 fn bench_draw_proto_masks_gl_dtypes(suite: &mut BenchSuite) {
     println!("\n== draw_proto_masks/gl: per-dtype proto-render cells ==\n");
 
-    // SAFETY: set_var is not thread-safe, but benchmarks are single-threaded.
+    // SAFETY: benchmarks are single-threaded.
     unsafe { std::env::set_var("EDGEFIRST_FORCE_BACKEND", "opengl") };
     let proc = ImageProcessor::new();
     unsafe { std::env::remove_var("EDGEFIRST_FORCE_BACKEND") };
@@ -715,8 +673,6 @@ fn bench_draw_proto_masks_gl_dtypes(suite: &mut BenchSuite) {
     };
 
     for count in [8usize, 32] {
-        // Tile the fixture's detections/coefficients out to `count` so the
-        // per-detection quad loop is measured at realistic counts.
         let (det, proto_i8_n) = tile_proto_data(&detect, &proto_i8, count);
         let (_, proto_f32_n) = tile_proto_data(&detect, &proto_f32, count);
         let (_, proto_f16_n) = tile_proto_data(&detect, &proto_f16, count);
@@ -736,8 +692,7 @@ fn bench_draw_proto_masks_gl_dtypes(suite: &mut BenchSuite) {
             &proto_f16_n,
         );
 
-        // Int8 interpolation-mode sweep (Linux GL only — the mode setter is
-        // a Linux-GL API; macOS records the default-mode i8 cell below).
+        // Int8 interpolation-mode sweep (Linux GL only).
         #[cfg(all(target_os = "linux", feature = "opengl"))]
         {
             use edgefirst_image::Int8InterpolationMode;
@@ -757,7 +712,7 @@ fn bench_draw_proto_masks_gl_dtypes(suite: &mut BenchSuite) {
                     &proto_i8_n,
                 );
             }
-            // Restore the default for any later benchmark sections.
+            // Restore the default mode.
             let _ = proc.set_int8_interpolation_mode(Int8InterpolationMode::Bilinear);
         }
         #[cfg(not(all(target_os = "linux", feature = "opengl")))]
@@ -890,25 +845,15 @@ fn bench_hybrid_materialize_and_draw(proc: &mut ImageProcessor, suite: &mut Benc
 // Main
 // =============================================================================
 
-/// Diagnostic mode (enabled when `MASK_BENCH_DIAG=1`, `true`, or `yes`) —
+/// Diagnostic mode (enabled when `MASK_BENCH_DIAG=1`, `true`, or `yes`):
 /// bypass the timing loop, allocate a destination via
-/// `processor.create_image`, log its `dst.memory()` (so we know whether DMA
-/// actually worked), then call both `draw_decoded_masks` and
-/// `draw_proto_masks` once each and dump the rendered output to
-/// `/tmp/mask_decoded.rgba` and `/tmp/mask_proto.rgba` for visual
-/// verification. Any other value of the env var (including `0` and `false`)
-/// leaves the bench in normal timing-loop mode.
-///
-/// This is the diagnostic path for the "draw_decoded_masks doesn't modify
-/// the destination on i.MX 95" bug. It uses embedded test data so it
-/// doesn't need the NPU and runs on any target the bench binary
-/// cross-compiles to.
+/// `processor.create_image`, log its `dst.memory()`, then call
+/// `draw_decoded_masks` and `draw_proto_masks` once each and dump the rendered
+/// output to `/tmp/mask_decoded.rgba` and `/tmp/mask_proto.rgba`.
 fn run_diagnostic(proc: &mut ImageProcessor) {
     use edgefirst_tensor::{TensorMapTrait, TensorTrait};
 
-    // Diagnostic dst dims are configurable via env var so we can repro
-    // the imx95 Kinara example's setup which uses canvas = source image
-    // dimensions (e.g. 3004×1688 for crowd.png).
+    // Destination dimensions, from `MASK_BENCH_DST_W` and `MASK_BENCH_DST_H`.
     let dst_w: usize = std::env::var("MASK_BENCH_DST_W")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -940,10 +885,7 @@ fn run_diagnostic(proc: &mut ImageProcessor) {
             return;
         }
     };
-    // Log the actual tensor dimensions and stride, not just what we
-    // requested — `create_image` silently pads the DMA row stride for
-    // GPU pitch alignment, and the diagnostic is meant to surface that
-    // difference so a mismatch is visible.
+    // Log the actual tensor dimensions and stride.
     let actual_w = dst.width().unwrap_or(0);
     let actual_h = dst.height().unwrap_or(0);
     let actual_stride = dst.effective_row_stride().unwrap_or(0);
@@ -959,7 +901,7 @@ fn run_diagnostic(proc: &mut ImageProcessor) {
         }
     );
 
-    // Pre-fill dst with a known sentinel so we can detect "untouched" buffers.
+    // Pre-fill dst with a sentinel.
     {
         let t = dst.as_u8_mut().expect("u8 dst");
         let mut m = t.map().expect("map dst");

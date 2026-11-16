@@ -41,9 +41,7 @@ def numpy_to_tensor(arr, mem=None):
 
 
 def test_tracker():
-    """
-    Test basic tracking functionality.
-    """
+    """Test basic tracking functionality."""
     output0 = _t(
         np.fromfile("testdata/modelpack_split_17x30x18.bin", dtype=np.uint8).reshape(
             1, 17, 30, 18
@@ -57,7 +55,6 @@ def test_tracker():
 
     with open("testdata/modelpack_split.yaml") as fh:
         config = fh.read()
-    # default settings for tracker, but with 0.96 score threshold
     tracker = ByteTrack(high_conf=0.96)
     decoder = ef.Decoder.new_from_yaml_str(config, 0.45, 0.45)
     _boxes, _scores, _classes, _masks, tracks = decoder.decode_tracked(
@@ -70,9 +67,7 @@ def test_tracker():
 
 
 def test_external_tracker_update():
-    """
-    Test that external updates to the tracker correctly influence the track states.
-    """
+    """External updates to the tracker influence the track states."""
     output0 = _t(
         np.fromfile("testdata/modelpack_split_17x30x18.bin", dtype=np.uint8).reshape(
             1, 17, 30, 18
@@ -86,7 +81,6 @@ def test_external_tracker_update():
 
     with open("testdata/modelpack_split.yaml") as fh:
         config = fh.read()
-    # default settings for tracker, but with 0.96 score threshold
     tracker = ByteTrack(high_conf=0.96)
     decoder = ef.Decoder.new_from_yaml_str(config, 0.45, 0.45)
     _, _, _, _, tracks = decoder.decode_tracked(
@@ -104,10 +98,7 @@ def test_external_tracker_update():
 
 
 def test_yolo_seg():
-    """
-    Test end-to-end tracked decoding with YOLO segmentation data.
-    Verifies that masks are not generated for boxes that originate from tracker predictions
-    """
+    """Tracked YOLO-seg decode produces no masks for tracker-predicted boxes."""
     output0_np = np.fromfile(
         "testdata/yolov8_boxes_116x8400.bin", dtype=np.uint8
     ).reshape(1, 116, 8400)
@@ -125,10 +116,7 @@ def test_yolo_seg():
     )
     assert np.allclose(
         boxes,
-        # Post-NMS bbox values (un-snapped, EDGEAI-1304); pre-fix the
-        # decoder snapped these to multiples of 1/160. The Segmentation
-        # struct's xmin/ymin/xmax/ymax (separate from these `boxes`)
-        # still describe the proto-grid-aligned mask region.
+        # Post-NMS bbox values, not snapped to the proto grid.
         [
             [0.08515104, 0.7131401, 0.29802868, 0.8195788],
             [0.59605736, 0.2554531, 0.93666154, 0.72378385],
@@ -139,7 +127,6 @@ def test_yolo_seg():
     assert last_updates == [100_000_000, 100_000_000]
     assert len(masks) == 2
 
-    # clear boxes
     output0_cleared = _t(np.zeros_like(output0_np))
 
     # confirm no boxes when decoded normally
@@ -153,9 +140,7 @@ def test_yolo_seg():
         tracker, 200_000_000, [output0_cleared, output1]
     )
 
-    # we should have two boxes from the tracker, but no masks since the tracker doesn't know how to update masks coefficients.
-    # Tracker-predicted boxes inherit the un-snapped post-NMS values
-    # from the previous frame; atol=1e-2 absorbs the predicted drift.
+    # Two boxes from the tracker and no masks.
     assert np.allclose(
         boxes,
         [
@@ -173,10 +158,7 @@ def test_yolo_seg():
     )
     assert np.allclose(
         boxes,
-        # Post-NMS bbox values (un-snapped, EDGEAI-1304); pre-fix the
-        # decoder snapped these to multiples of 1/160. The Segmentation
-        # struct's xmin/ymin/xmax/ymax (separate from these `boxes`)
-        # still describe the proto-grid-aligned mask region.
+        # Post-NMS bbox values, not snapped to the proto grid.
         [
             [0.08515104, 0.7131401, 0.29802868, 0.8195788],
             [0.59605736, 0.2554531, 0.93666154, 0.72378385],
@@ -189,9 +171,7 @@ def test_yolo_seg():
 
 
 def test_new_track_info():
-    """
-    Test creating a new TrackInfo object and verify its fields are set correctly.
-    """
+    """Test creating a new TrackInfo object and verify its fields are set correctly."""
     track_info = TrackInfo(
         uuid="123e4567e89b12d3a456426614174000",
         tracked_location=(0.1, 0.2, 0.3, 0.4),
@@ -222,9 +202,7 @@ def test_new_active_track_info():
 
 
 def test_tracker_random_jitter():
-    """
-    Test tracking stability with random jitter on XY coordinates.
-    """
+    """Test tracking stability with random jitter on XY coordinates."""
     output = np.fromfile("testdata/yolov8s_80_classes.bin", dtype=np.int8).reshape(
         1, 84, 8400
     )
@@ -286,16 +264,13 @@ outputs:
             f"Frame {i}: box1 {boxes[1]} not close to expected {expected_box1}"
         )
 
-        # Check that boxes didn't jump too far from last frame
         assert np.allclose(boxes[0], last_boxes[0], atol=2e-3)
         assert np.allclose(boxes[1], last_boxes[1], atol=2e-3)
         last_boxes = boxes.copy()
 
 
 def test_tracker_segdet_no_detection_prediction():
-    """
-    Test that tracker predicts forward when no detections are present in segdet.
-    """
+    """The tracker predicts forward when a segdet frame has no detections."""
     output0 = np.fromfile("testdata/yolov8_boxes_116x8400.bin", dtype=np.uint8).reshape(
         1, 116, 8400
     )
@@ -321,13 +296,13 @@ def test_tracker_segdet_no_detection_prediction():
 
     # Clear scores to indicate no detections.
     output0_cleared = output0.copy()
-    output0_cleared[0, 4:84, :] = 0  # zero out scores
+    output0_cleared[0, 4:84, :] = 0
 
     boxes, _scores, _classes, masks, _tracks = decoder.decode_tracked(
         tracker, 100_000_000 // 3, [_t(output0_cleared), _t(output1)]
     )
 
-    # Tracker should predict forward with the last known boxes
+    # The tracker predicts forward from the last known boxes.
     assert len(boxes) == 2
     assert np.allclose(boxes[0], expected_box0, atol=1e-2)
     assert np.allclose(boxes[1], expected_box1, atol=1e-2)
@@ -337,9 +312,7 @@ def test_tracker_segdet_no_detection_prediction():
 
 
 def test_tracker_linear_motion():
-    """
-    Test that tracker correctly follows linear motion and predicts forward.
-    """
+    """The tracker follows linear motion and predicts forward."""
     output = np.fromfile("testdata/yolov8s_80_classes.bin", dtype=np.int8).reshape(
         1, 84, 8400
     )
@@ -361,7 +334,6 @@ outputs:
     decoder = ef.Decoder.new_from_yaml_str(config, 0.25, 0.1)
     tracker = ByteTrack(update=0.1, high_conf=0.3)
 
-    # First frame
     boxes, _scores, _classes, _masks, _tracks = decoder.decode_tracked(
         tracker, 0, [_t(output)]
     )
@@ -375,7 +347,6 @@ outputs:
     # Apply linear motion for 100 frames
     for i in range(1, 101):
         out = output.copy()
-        # Introduce linear movement into X coordinates
         out[0, 0, :] += round(i * 1e-3 / quant_scale)
 
         timestamp = 100_000_000 * i // 3
@@ -402,14 +373,12 @@ outputs:
     boxes, _scores, _classes, _masks, _tracks = decoder.decode_tracked(
         tracker, 100_000_000 * 101 // 3, [_t(output_cleared)]
     )
-    # Tracker should still produce boxes from prediction
+    # The tracker produces boxes from prediction.
     assert len(boxes) == 2
 
 
 def test_tracker_end_to_end_float_detection():
-    """
-    Test end-to-end tracked decoding with float detection data.
-    """
+    """Test end-to-end tracked decoding with float detection data."""
     config = """
 decoder_version: yolo26
 outputs:
@@ -435,7 +404,6 @@ outputs:
     decoder = ef.Decoder.new_from_yaml_str(config, 0.45, 0.45)
     tracker = ByteTrack(update=0.1, high_conf=0.7)
 
-    # First frame with detection
     boxes, scores, classes, _masks, _tracks = decoder.decode_tracked(
         tracker, 0, [_t(detect)]
     )
@@ -446,20 +414,18 @@ outputs:
 
     # Clear scores to simulate no detections
     detect_cleared = detect.copy()
-    detect_cleared[0, :, 4] = 0.0  # zero all scores
+    detect_cleared[0, :, 4] = 0.0
 
     boxes, scores, classes, _masks, _tracks = decoder.decode_tracked(
         tracker, 100_000_000 // 3, [_t(detect_cleared)]
     )
-    # Tracker should predict forward
+    # The tracker predicts forward.
     assert len(boxes) == 1
     assert np.allclose(boxes[0], [0.1234, 0.1234, 0.2345, 0.2345], atol=1e-3)
 
 
 def test_tracker_end_to_end_segdet():
-    """
-    Test end-to-end tracked decoding with segdet data (quantized path).
-    """
+    """Test end-to-end tracked decoding with segdet data (quantized path)."""
     config = """
 decoder_version: yolo26
 outputs:
@@ -482,10 +448,7 @@ outputs:
     - [width, 160]
     - [num_protos, 32]
 """
-    # Build detection tensor with one valid box
-    # Quantization: scale=2.0/255.0, zp=0
-    # For float values: boxes=[0.1234, 0.1234, 0.2345, 0.2345], score=0.9876, class=2
-    # Quantized: val = round(float_val / scale)
+    # One valid box, quantized as round(float_val / scale).
     scale = 2.0 / 255.0
     detect = np.zeros((1, 10, 38), dtype=np.uint8)
     detect[0, 0, 0] = round(0.1234 / scale)  # xmin
@@ -500,7 +463,6 @@ outputs:
     decoder = ef.Decoder.new_from_yaml_str(config, 0.45, 0.45)
     tracker = ByteTrack(update=0.1, high_conf=0.7)
 
-    # First frame
     boxes, _scores, _classes, masks, _tracks = decoder.decode_tracked(
         tracker, 0, [_t(detect), _t(protos)]
     )
@@ -530,9 +492,7 @@ outputs:
 
 
 def test_tracker_end_to_end_segdet_float():
-    """
-    Test end-to-end tracked decoding with segdet float data.
-    """
+    """Test end-to-end tracked decoding with segdet float data."""
     config = """
 decoder_version: yolo26
 outputs:
@@ -587,9 +547,7 @@ outputs:
 
 
 def test_tracker_end_to_end_split_segdet():
-    """
-    Test end-to-end tracked decoding with split segdet outputs.
-    """
+    """Test end-to-end tracked decoding with split segdet outputs."""
     config = """
 decoder_version: yolo26
 outputs:
@@ -692,9 +650,7 @@ outputs:
 
 
 def test_tracker_end_to_end_split_segdet_float():
-    """
-    Test end-to-end tracked decoding with split segdet float outputs.
-    """
+    """Test end-to-end tracked decoding with split segdet float outputs."""
     config = """
 decoder_version: yolo26
 outputs:
@@ -784,10 +740,7 @@ outputs:
 
 
 def test_tracker_segdet_split_with_testdata():
-    """Test tracked decoding with split segdet using real test data files.
-
-    Corresponds to Rust test: test_decoder_tracked_segdet_split
-    """
+    """Test tracked decoding with split segdet using real test data files."""
     raw_boxes = np.fromfile(
         "testdata/yolov8_boxes_116x8400.bin", dtype=np.uint8
     ).reshape(1, 116, 8400)

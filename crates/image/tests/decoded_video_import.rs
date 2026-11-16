@@ -1,12 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! Frames from the hardware video decoder convert on the GPU without a
-//! copy: the decoder cycles a fixed pool of DMA-BUF tensors, so after one
-//! pass over the pool every frame is an EGLImage cache hit. A decoded
-//! picture is an NV12 tensor over the device's padded buffer (coded height
-//! 1088 for a 1080 stream), so this also pins the plane offsets the decoder
-//! describes against what the GPU reads.
+//! Frames from the hardware video decoder convert on the GPU without a copy:
+//! after one pass over the decoder's pool of DMA-BUF tensors every frame is
+//! an EGLImage cache hit. Also compares the GPU's read of a decoded NV12
+//! frame (over the device's padded buffer) with a contiguous copy.
 //!
 //! Skips (prints `SKIPPED`) without a decoder or GL, and without a DMA-BUF
 //! heap unless `HAL_TEST_REQUIRE_DMA=1`.
@@ -100,7 +98,7 @@ struct Check {
     seen: BTreeSet<usize>,
     /// Frames whose buffer had carried an earlier frame.
     repeats: usize,
-    /// Source imports made for those frames; zero-copy reuse makes none.
+    /// Source imports made for those frames.
     reimports: u64,
     first_gl: Option<Vec<u8>>,
     first_copy: Option<Vec<u8>>,
@@ -130,8 +128,7 @@ impl Check {
         }
         if self.frames == 0 {
             self.first_gl = Some(self.dst.map_bytes(CpuAccess::Read).unwrap().to_vec());
-            // The same pixels in a plain contiguous NV12 image, through the
-            // same GPU path: any difference is the decoder's layout.
+            // The same pixels in a contiguous NV12 image, through the same GPU path.
             let copy = contiguous_copy(src);
             let mut copy_dst = rgba(src.width().unwrap(), src.height().unwrap());
             self.gl.convert(&copy, &mut copy_dst, None).unwrap();
@@ -151,9 +148,7 @@ fn decoded_frames_convert_on_the_gpu_without_new_imports() {
         Err(CodecError::NoDevice(why)) => return skip(&why),
         Err(e) => panic!("decoder open failed: {e}"),
     };
-    // Both sources on the external-sampler path: the shader path filters
-    // chroma differently at sharp edges, which would hide nothing about
-    // the layout but fail the comparison. The only test in this binary.
+    // Both sources take the external-sampler path.
     std::env::set_var("EDGEFIRST_NV_CONVERT_PATH", "sampler");
     let gl = match GLProcessorThreaded::new(None) {
         Ok(gl) => gl,
@@ -185,8 +180,6 @@ fn decoded_frames_convert_on_the_gpu_without_new_imports() {
         check.frames
     );
 
-    // A frame in a buffer that already carried one is a cache hit: decoded
-    // pictures are imported once per pool buffer, never once per frame.
     assert!(
         check.seen.len() <= buffers,
         "frames came from outside the pool"
@@ -204,8 +197,7 @@ fn decoded_frames_convert_on_the_gpu_without_new_imports() {
         check.gl.egl_cache_stats().unwrap()
     );
 
-    // The GPU read the same picture from the decoded frame as from its
-    // contiguous copy: plane offsets and strides are right.
+    // Compares the decoded frame's pixels with its contiguous copy's.
     let (gl_px, copy_px) = (check.first_gl.unwrap(), check.first_copy.unwrap());
     let stride = gl_px.len() / h;
     let mut worst = 0u8;

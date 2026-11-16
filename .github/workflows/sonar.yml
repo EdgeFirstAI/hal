@@ -1,7 +1,5 @@
 # SonarCloud coverage upload. Called by ci.yml on a Full run (decorates the PR)
-# and by nightly.yml (the `main` baseline). Both callers are required: without
-# the nightly call, `main` has no baseline, because Full never runs on push to
-# main in the label-driven model.
+# and by nightly.yml (the `main` baseline).
 #
 # Action Versions (hash-pinned):
 # - actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 (v7.0.1)

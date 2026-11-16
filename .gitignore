@@ -1,7 +1,6 @@
 /dist
 /target
-# A bare `cargo build` inside a standalone leaf (crates/*-capi et al.) drops
-# its own target/ there; the sanctioned invocation uses --target-dir target.
+# target/ directories inside the standalone leaf crates.
 /crates/*/target/
 /venv
 __pycache__
@@ -17,40 +16,30 @@ coverage.xml
 .DS_Store
 *.jpg
 
-# Test-output image dumps written into crate dirs by image comparison tests
-# (e.g. crates/image/test_*.png). Tracked PNG fixtures live under testdata/.
+# Test-output image dumps written into crate dirs by image comparison tests.
 /crates/image/*.png
 
-# `make sbom` writes a whole generated directory (OUTPUT_DIR=sbom), not one
-# file. `*sbom.json` caught sbom/sbom.json and missed its sibling
-# sbom-dependencies.json, so the mandatory pre-PR gate left an untracked file
-# behind on every run. Ignore the output directory itself and the next
-# artifact the generator adds is covered too. The two patterns below stay for
-# the root-level artifacts `make clean` still removes.
+# `make sbom` output.
 /sbom/
 *sbom.json
 *.cdx.json
 
 env.sh
 
-# Ignore Local Notes — local caches of JIRA-style issues/tasks that
-# avoid round-trips to the ticket system. Root-anchored so subcrates
-# are free to ship legitimate files with these prefixes.
+# Local notes: local caches of issues and tasks, at the repository root.
 /TODO*.md
 /BUG*.md
 /FIX*.md
 /FEATURE*.md
 /SPS/
 /WP1/
-# Local-only planning / dev notes directory (never committed; use
-# crate-level docs.rs comments or CHANGELOG.md for shipped docs).
+# Local-only planning / dev notes directory.
 /docs/
 *.profraw
 .remember
 .mcp.json
 
-# Benchmark harness sources under benchmarks/ are tracked.
-# Ignore run outputs, build artifacts, and legacy per-platform JSON dumps.
+# Benchmark run outputs, build artifacts, and per-platform JSON dumps.
 /benchmarks/results/**
 !/benchmarks/results/.gitkeep
 /benchmarks/**/target/
@@ -68,21 +57,16 @@ env.sh
 /benchmarks/*.txt
 /benchmarks/*.csv
 
-# Local-only proof-of-concept spike projects. Each lives outside the
-# workspace (its own Cargo.toml with `[workspace]` section) and gets
-# folded into the main code or deleted once the experiment concludes.
+# Local-only proof-of-concept spike projects.
 /spikes/
 
-# Large binary model artifacts kept outside the repo. Tracked fixtures
-# (testdata/decoder/*.safetensors) survive because gitignore only
-# affects untracked files; new vetted fixtures need `git add -f`.
+# Large binary model artifacts kept outside the repo.
 *.tflite
 *.onnx
 /benchmarks/docker/coco-smoke/
 
 # Locally exported .pt/.onnx/.tflite models used by the schema-inference
-# fixture capture script and its on-demand integration test. Developers
-# produce these with their own tooling; nothing here is committed.
+# fixture capture script and its integration test.
 /.ultralytics-exports/
 
 # maturin develop drops built extensions into the package source tree
@@ -91,17 +75,13 @@ crates/python-*/python/edgefirst/*/_*.pyd
 crates/python-*/python/edgefirst/*/_*.dylib
 
 # python-tensor/build.rs copies libedgefirst_tensor.so (+ its .so.0
-# symlink) into the package source tree too, so maturin bundles it beside
-# _tensor.cpython-*.so the same way it bundles the extension itself --
-# same reason as the underscore-prefixed extensions above, just without
-# the leading underscore this one crate's shared library carries.
+# symlink) into the package source tree.
 crates/python-tensor/python/edgefirst/tensor/libedgefirst_tensor.so*
 crates/python-tensor/python/edgefirst/tensor/libedgefirst_tensor.*.dylib
-# Windows counterpart of the two lines above: cargo names the DLL without
-# the `lib` prefix and there is no SONAME/version suffix.
+# Windows counterpart of the two lines above.
 crates/python-tensor/python/edgefirst/tensor/edgefirst_tensor.dll
-# python-image's Windows wheel bundles the ANGLE runtime DLLs beside
-# _image.pyd the same way (libEGL/libGLESv2 plus the D3D shader compiler).
+# The ANGLE runtime DLLs python-image's Windows wheel bundles beside
+# _image.pyd.
 crates/python-image/python/edgefirst/image/libEGL.dll
 crates/python-image/python/edgefirst/image/libGLESv2.dll
 crates/python-image/python/edgefirst/image/d3dcompiler_47.dll

@@ -1,13 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! Per-scale decode plan — built once at DecoderBuilder time.
+//! Per-scale decode plan, built once at DecoderBuilder time.
 //!
-//! Holds only what is invariant per build AND not already on the input
-//! tensors at frame time. Quantization parameters live on the
-//! `TensorDyn` itself; the plan does not cache them. Dtype is uniform
-//! per role across all FPN levels, so the plan stores one dispatch per
-//! role, not one per level. Dispatch fields are added in Task 15.
+//! Holds what is invariant per build and not carried by the input tensors
+//! at frame time. Quantization parameters are read from the `TensorDyn`;
+//! the plan does not cache them. The plan stores one dispatch per role.
 
 use super::kernels::CpuFeatures;
 use super::{Activation, DecodeDtype};
@@ -21,31 +19,25 @@ use edgefirst_kernels::prim::grids::make_anchor_grid;
 /// Memory layout of a per-scale child tensor, derived from its dshape.
 ///
 /// The per-scale level kernels (`level_box`, `level_score`, `level_mc`)
-/// operate on flat slices that assume **NHWC** memory order — each
-/// anchor's channel block is contiguous (`anchor * channels` indexing).
-/// When a child arrives in **NCHW** order, the pipeline transposes the
-/// tensor into a scratch buffer before invoking the kernel; the kernel
-/// itself stays NHWC. See [`pipeline::run`] for the routing.
+/// operate on flat slices in NHWC memory order: each anchor's channel block
+/// is contiguous (`anchor * channels` indexing). The pipeline transposes an
+/// NCHW child into a scratch buffer before invoking the kernel. See
+/// [`pipeline::run`] for the routing.
 ///
-/// Detection is name-based: the position of the channel-axis dimension
-/// (one of `BoxCoords` / `NumClasses` / `NumFeatures` / `NumProtos`) in
-/// the child's dshape determines the layout — last position is NHWC,
-/// second position (after `Batch`) is NCHW. Schemas without a named
-/// channel axis fall through to NHWC for back-compat with the existing
-/// positional-fallback contract in `extract_hw`.
+/// The position of the channel-axis dimension (one of `BoxCoords` /
+/// `NumClasses` / `NumFeatures` / `NumProtos`) in the child's dshape
+/// determines the layout: last position is NHWC, second position (after
+/// `Batch`) is NCHW. A schema without a named channel axis is NHWC.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Layout {
     /// `[batch, height, width, channel]` — channels contiguous in memory.
-    /// All HAL canonical fixtures and the TFLite-converter output use this.
     Nhwc,
     /// `[batch, channel, height, width]` — channels strided by `h*w`.
-    /// Produced by the ara2-converter (NCHW NPU output) and likely by
-    /// some Hailo / Neutron paths.
     Nchw,
 }
 
 #[derive(Debug)]
-#[allow(dead_code)] // Consumed by try_from_schema + run() in later tasks.
+#[allow(dead_code)]
 pub(crate) struct PerScalePlan {
     /// Per-FPN-level geometry, pre-computed grids, expected shapes.
     /// Sorted stride-ascending by `try_from_schema`.
@@ -65,17 +57,14 @@ pub(crate) struct PerScalePlan {
     /// LTRB / Direct: dequant → dist2bbox).
     pub(crate) box_encoding: BoxEncoding,
 
-    /// Activation declared on score logits. Uniform across levels in
-    /// every observed model; if a future schema breaks this we move it
-    /// back into LevelPlan.
+    /// Activation declared on score logits, uniform across levels.
     pub(crate) score_activation: Activation,
 
     /// Builder choice + probed CPU features, captured once.
     pub(crate) out_dtype: DecodeDtype,
     pub(crate) cpu_features: CpuFeatures,
 
-    // Pre-selected dispatch — one per role. Reused across all levels
-    // because dtype is uniform per role.
+    // Pre-selected dispatch, one per role.
     pub(crate) box_dispatch: super::kernels::dispatch::BoxLevelDispatch,
     /// The box kernel of levels whose box tensor carries per-channel quantization.
     pub(crate) box_per_channel: super::kernels::dispatch::DflPerChannelDispatch,
@@ -85,32 +74,24 @@ pub(crate) struct PerScalePlan {
     /// The transpose of NCHW inputs.
     pub(crate) transpose: super::kernels::dispatch::TransposeDispatch,
 
-    /// Protos: a single tensor (no per-scale structure). Only the
-    /// expected shape is retained — for binding by shape match. The
-    /// dtype is captured implicitly in the proto dispatch's variant
-    /// (added Task 15); quant comes live from the bound tensor.
-    ///
-    /// **Important**: this stores the *runtime binding* shape (the raw
-    /// schema shape used to match tensors), not the buffer layout.
-    /// When the model produces NCHW protos, the buffer is allocated in
-    /// NHWC order (`proto_nhwc_shape`) and the pipeline transposes at
-    /// decode time.
+    /// Expected shape of the protos tensor, used to bind it by shape match.
+    /// This is the raw schema shape, not the buffer layout: for NCHW protos
+    /// the buffer is allocated in NHWC order (`proto_nhwc_shape`) and the
+    /// pipeline transposes at decode time.
     pub(crate) proto_shape: Option<Box<[usize]>>,
 
     /// NHWC-normalised proto shape for buffer allocation. Identical to
-    /// `proto_shape` when the schema is already NHWC; transposed from
-    /// `[N,C,H,W]` to `[N,H,W,C]` when the schema declares NCHW.
-    /// The bridge and mask materializer assume NHWC.
+    /// `proto_shape` when the schema is NHWC; transposed from `[N,C,H,W]`
+    /// to `[N,H,W,C]` when the schema declares NCHW.
     pub(crate) proto_nhwc_shape: Option<Box<[usize]>>,
 
     /// Memory layout of the proto tensor, detected from the schema's
-    /// dshape. Used by the pipeline to decide whether to transpose the
-    /// raw proto data before writing it into the NHWC buffer.
+    /// dshape. The pipeline transposes NCHW proto data into the NHWC buffer.
     pub(crate) proto_layout: Option<Layout>,
 }
 
 #[derive(Debug)]
-#[allow(dead_code)] // Consumed by try_from_schema + level kernels.
+#[allow(dead_code)]
 pub(crate) struct LevelPlan {
     /// FPN spatial stride in pixels (8.0, 16.0, 32.0 typically).
     pub(crate) stride: f32,
@@ -121,25 +102,21 @@ pub(crate) struct LevelPlan {
 
     /// DFL: number of distribution bins (typically 16). Box channels
     /// are then `4 * reg_max`.
-    /// LTRB: 1 (degenerate; not consulted by the LTRB kernel). Box
-    /// channels are 4.
+    /// LTRB: 1 (not read by the LTRB kernel). Box channels are 4.
     pub(crate) reg_max: usize,
 
-    /// Cumulative sum of prior levels' `h * w`. Used to address into
-    /// flat output buffers without recomputing per frame.
+    /// Cumulative sum of prior levels' `h * w`: this level's offset into
+    /// the flat output buffers.
     pub(crate) anchor_offset: usize,
 
-    /// Pre-computed at plan time (saves per-frame allocation).
-    /// `len() == h * w` each, row-major.
+    /// Anchor grid coordinates, computed at plan time. `len() == h * w`
+    /// each, row-major.
     pub(crate) grid_x: Box<[f32]>,
     pub(crate) grid_y: Box<[f32]>,
 
-    /// Expected tensor shapes used at frame time to bind inputs via
-    /// shape-match (frames may arrive in any order). The shape is the
-    /// raw schema-declared shape; whether it represents NHWC or NCHW is
-    /// recorded in `layout`. The level kernel itself is NHWC-only — the
-    /// pipeline transposes NCHW children into a scratch buffer before
-    /// dispatch.
+    /// Expected tensor shapes used at frame time to bind inputs by shape
+    /// match. The shape is the raw schema-declared shape; `layout` records
+    /// whether it is NHWC or NCHW.
     ///
     /// DFL boxes  (NHWC): `[1, h, w, 4 * reg_max]`.
     /// DFL boxes  (NCHW): `[1, 4 * reg_max, h, w]`.
@@ -155,10 +132,10 @@ pub(crate) struct LevelPlan {
     /// `[1, num_mask_coefs, h, w]` (NCHW). None if detection-only model.
     pub(crate) mc_shape: Option<Box<[usize]>>,
 
-    /// Memory layout of this level's child tensors. Determined at plan
-    /// time from the box child's dshape (scores and mc are validated to
-    /// match in `try_from_schema`). NHWC is the canonical case;
-    /// NCHW triggers a per-frame transpose to scratch in `pipeline::run`.
+    /// Memory layout of this level's child tensors, taken from the box
+    /// child's dshape; `try_from_schema` checks that scores and mask
+    /// coefficients match. NCHW children are transposed to scratch per frame
+    /// in `pipeline::run`.
     pub(crate) layout: Layout,
 }
 
@@ -181,17 +158,10 @@ impl PerScalePlan {
     /// the schema describes a per-scale decomposition this subsystem
     /// can decode.
     ///
-    /// Returns `Ok(None)` for non-per-scale schemas (the caller falls
-    /// through to the legacy decode path). Returns an error for
+    /// Returns `Ok(None)` for non-per-scale schemas. Returns an error for
     /// per-scale schemas this subsystem cannot handle (reg_max > 64,
     /// unsupported encoding, etc.).
-    ///
-    /// Per-channel DFL dequantization is always honored: the pipeline reads
-    /// the box tensor's quantization metadata per frame and uses the
-    /// per-channel kernels whenever it is per-channel, falling back to the
-    /// per-tensor scalar fast path only when the tensor is genuinely
-    /// per-tensor (or float). It is never collapsed to per-tensor.
-    #[allow(dead_code)] // Wired into DecoderBuilder in Task 16.
+    #[allow(dead_code)]
     pub(crate) fn try_from_schema(
         schema: &SchemaV2,
         out_dtype: DecodeDtype,
@@ -209,10 +179,10 @@ impl PerScalePlan {
         let mc = find_logical_by_type(schema, LogicalType::MaskCoefs);
         let protos = find_logical_by_type(schema, LogicalType::Protos);
 
-        // Encoding sanity (only Dfl + Direct/Ltrb are in scope).
+        // Only the Dfl and Direct (LTRB) encodings get a plan.
         let box_encoding = boxes.encoding.unwrap_or(BoxEncoding::Dfl);
         if !matches!(box_encoding, BoxEncoding::Dfl | BoxEncoding::Direct) {
-            return Ok(None); // Anchor-encoded falls through to legacy.
+            return Ok(None);
         }
 
         let levels = build_levels(boxes, scores, mc, box_encoding)?;
@@ -238,26 +208,16 @@ impl PerScalePlan {
             .and_then(last_feature_axis)
             .unwrap_or(0);
 
-        // Activation declaration site, in priority order:
-        //   1. `scores` logical parent's `activation_required` — this is
-        //      where the EdgeFirst tflite-converter actually writes the
-        //      sigmoid annotation when stripping the score activation
-        //      from the per-scale graph (one entry, not duplicated per
-        //      physical child).
-        //   2. The first physical child's `activation_required` — kept as
-        //      a fallback for synthetic test fixtures and any future
-        //      converter that puts the annotation on the children.
-        // Per-scale physical children always inherit the parent's
-        // declaration; mixing per-child variants isn't a valid
-        // configuration.
+        // The score activation is the `scores` logical's `activation_required`,
+        // else its first physical child's.
         let score_activation = Activation::from_schema(
             scores
                 .activation_required
                 .or_else(|| scores.outputs.first().and_then(|s| s.activation_required)),
         );
 
-        // Protos shape: prefer the logical's own shape; if it has children,
-        // fall back to the first child's shape.
+        // Protos shape: the logical's own shape, or its first child's when it
+        // has children.
         let proto_shape = protos.map(|p| {
             if p.outputs.is_empty() {
                 p.shape.clone().into_boxed_slice()
@@ -266,11 +226,8 @@ impl PerScalePlan {
             }
         });
 
-        // Proto layout: detect NCHW vs NHWC from the dshape, then compute
-        // an NHWC-normalised shape for buffer allocation. The bridge and
-        // mask materializer assume NHWC data, so when the model produces
-        // NCHW protos, the pipeline transposes at decode time (same
-        // mechanism used for per-level NCHW tensors).
+        // Proto layout from the dshape, and the NHWC-normalised shape used for
+        // buffer allocation.
         let proto_layout = protos.map(|p| {
             let dshape = if p.outputs.is_empty() {
                 &p.dshape
@@ -289,8 +246,7 @@ impl PerScalePlan {
 
         let cpu_features = super::kernels::decoder_cpu_features()?;
 
-        // All children of a given role share dtype (by construction in the
-        // TFLite-converter). Read the first child to pre-select dispatches.
+        // The first child's dtype of each role pre-selects the dispatches.
         let box_dtype = boxes
             .outputs
             .first()
@@ -341,7 +297,7 @@ impl PerScalePlan {
                     )
                 })?;
             let mc_dtype = schema_dtype_to_tensor_dtype(mc_dtype)?;
-            // The mask kernels take f32, whatever the box and score dtype.
+            // Mask coefficients decode to f32, whatever the box and score dtype.
             Some(super::kernels::dispatch::MaskCoefDispatch::select(
                 mc_dtype,
                 DecodeDtype::F32,
@@ -397,12 +353,7 @@ impl PerScalePlan {
     }
 
     /// DFL `reg_max` for the boxes role, or `None` when boxes are not
-    /// DFL-encoded.
-    ///
-    /// `reg_max` is uniform across FPN levels (validated at plan time),
-    /// so the first level is authoritative. Surfaces the value already
-    /// computed in [`Self::try_from_schema`] so tests can assert the
-    /// box-decode bin count of a built decoder.
+    /// DFL-encoded. Taken from the first level.
     #[cfg(test)]
     pub(crate) fn boxes_reg_max(&self) -> Option<usize> {
         if self.box_encoding != BoxEncoding::Dfl {
@@ -412,11 +363,9 @@ impl PerScalePlan {
     }
 }
 
-/// Map a schema-level [`crate::schema::DType`] (which uses `Int8`/`Float32`
-/// style names) to the runtime [`edgefirst_tensor::DType`] (which uses
-/// `I8`/`F32` style names). Supports the integer + float types
-/// covered by the dispatch matrix; other variants surface as
-/// `NotSupported`.
+/// Map a schema-level [`crate::schema::DType`] (`Int8`/`Float32` style
+/// names) to the runtime [`edgefirst_tensor::DType`] (`I8`/`F32` style
+/// names). Variants outside the dispatch matrix return `NotSupported`.
 fn schema_dtype_to_tensor_dtype(d: crate::schema::DType) -> DecoderResult<edgefirst_tensor::DType> {
     use crate::schema::DType as S;
     use edgefirst_tensor::DType as T;
@@ -484,10 +433,8 @@ fn build_levels(
         })?;
         let (h, w) = extract_hw(b)?;
 
-        // Layout is derived from the box child's dshape and is required
-        // to match across the level's box / score / mc children. We
-        // validate score and mc match boxes here; mismatched layouts are
-        // rejected at plan time (an unsupported schema variant).
+        // The layout comes from the box child's dshape; the score and mc
+        // children must match it.
         let layout = detect_layout(b)?;
         let s_layout = detect_layout(s)?;
         if s_layout != layout {
@@ -509,9 +456,8 @@ fn build_levels(
 
         let reg_max = match encoding {
             BoxEncoding::Dfl => {
-                // DFL channel count is the box child's channel-axis size,
-                // NOT positional `shape.last()`. Channel-axis position
-                // varies with layout: NHWC last, NCHW second.
+                // DFL channel count is the size of the box child's channel
+                // axis, found by name.
                 let feat = box_channel_count(b)?;
                 if feat == 0 || feat % 4 != 0 {
                     return Err(DecoderError::InvalidConfig(format!(
@@ -543,9 +489,6 @@ fn build_levels(
 }
 
 /// Determine memory layout from a dshape slice and tensor rank.
-///
-/// Shared logic for both physical output children and logical outputs
-/// (e.g. protos, which may be the tensor directly rather than a child).
 fn detect_layout_from_dshape(dshape: &[(DimName, usize)], rank: usize) -> Layout {
     use DimName::*;
     let channel_pos = dshape
@@ -555,7 +498,7 @@ fn detect_layout_from_dshape(dshape: &[(DimName, usize)], rank: usize) -> Layout
         Some(idx) if idx == rank - 1 => Layout::Nhwc,
         Some(idx) if idx == 1 && rank >= 4 => Layout::Nchw,
         Some(idx) if idx == 1 && rank == 3 => Layout::Nhwc,
-        _ => Layout::Nhwc, // default fallback
+        _ => Layout::Nhwc,
     }
 }
 
@@ -565,8 +508,7 @@ fn detect_layout_from_dshape(dshape: &[(DimName, usize)], rank: usize) -> Layout
 /// - Channel axis at position `len-1` → NHWC.
 /// - Channel axis at position 1 (after batch) → NCHW.
 /// - Channel axis elsewhere in 4-D → unsupported (rejected).
-/// - No channel axis named at all → NHWC default (matches the existing
-///   positional fallback in `extract_hw`).
+/// - No channel axis named at all → NHWC.
 ///
 /// Channel-axis dim names: `BoxCoords`, `NumClasses`, `NumFeatures`,
 /// `NumProtos`.
@@ -590,9 +532,7 @@ fn detect_layout(p: &PhysicalOutput) -> DecoderResult<Layout> {
     }
 }
 
-/// Channel-axis size for a box child, found by name (not position).
-/// Used by the DFL `reg_max` derivation, which must work for both NHWC
-/// and NCHW children.
+/// Channel-axis size for a box child, found by name.
 fn box_channel_count(p: &PhysicalOutput) -> DecoderResult<usize> {
     use DimName::*;
     for (i, (name, _)) in p.dshape.iter().enumerate() {
@@ -600,9 +540,7 @@ fn box_channel_count(p: &PhysicalOutput) -> DecoderResult<usize> {
             return Ok(p.shape[i]);
         }
     }
-    // Back-compat fallback for schemas with no named channel axis: assume
-    // NHWC and use the trailing dim (matches the prior unconditional
-    // `shape.last()` behavior).
+    // A schema with no named channel axis is taken as NHWC: the trailing dim.
     p.shape
         .last()
         .copied()
@@ -677,8 +615,6 @@ mod tests {
             .expect("yolo26n schema is per-scale");
         assert_eq!(plan.levels.len(), 3);
         assert_eq!(plan.box_encoding, BoxEncoding::Direct);
-        // LTRB box channels = 4, so reg_max conceptually = 1 (degenerate;
-        // not consulted by the LTRB kernel, but must be set somewhere finite).
         for lvl in &plan.levels {
             assert_eq!(lvl.box_shape.last().copied(), Some(4));
         }
@@ -742,9 +678,7 @@ mod tests {
             .unwrap()
             .unwrap();
         use crate::per_scale::kernels::dispatch::BoxLevelDispatch;
-        // Tier-aware: scalar hosts pick `DflI8ToF32Lut`, aarch64 hosts
-        // `DflI8ToF32LutNeon`. The test asserts shape (DFL i8 → f32), not
-        // the SIMD tier. NEON variants are aarch64-only.
+        // Accepts the scalar and the NEON DFL i8 → f32 variants.
         let ok = match plan.box_dispatch {
             BoxLevelDispatch::DflI8ToF32Lut => true,
             #[cfg(target_arch = "aarch64")]
@@ -763,8 +697,7 @@ mod tests {
             .unwrap()
             .unwrap();
         use crate::per_scale::kernels::dispatch::BoxLevelDispatch;
-        // Tier-aware: see sibling test above. NEON variants are
-        // aarch64-only; LTRB has no FP16 variant by design.
+        // Accepts the scalar and the NEON LTRB variants.
         let ok = match plan.box_dispatch {
             BoxLevelDispatch::LtrbI8ToF32Scalar => true,
             #[cfg(target_arch = "aarch64")]
@@ -783,7 +716,6 @@ mod tests {
         // Fixture protos: [1, 160, 160, 32] NHWC
         assert_eq!(plan.proto_layout, Some(Layout::Nhwc));
         assert_eq!(plan.proto_shape.as_deref(), Some(&[1, 160, 160, 32][..]));
-        // NHWC: nhwc_shape == proto_shape (no transpose needed)
         assert_eq!(plan.proto_nhwc_shape, plan.proto_shape);
     }
 
@@ -815,8 +747,7 @@ mod tests {
         );
     }
 
-    /// An NCHW plan transposes with NEON on NEON tiers and with the element loop on the
-    /// scalar tier.
+    /// An NCHW plan transposes with NEON on NEON tiers and with the element loop on the scalar tier.
     #[test]
     fn nchw_transpose_follows_the_forced_tier() {
         use crate::per_scale::kernels::dispatch::TransposeDispatch;

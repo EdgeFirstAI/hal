@@ -1,58 +1,39 @@
 // SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! Portable GL render lowering — the single home for the pure geometry math the
-//! converged tile/batch renderer relies on. **No platform types** (no gbm,
-//! IOSurface, EGL, or `edgefirst_gl` symbols) appear here so the same lowering serves the
-//! Linux DMA-BUF and macOS IOSurface backends behind one seam.
+//! Portable GL render lowering: the pure geometry and planning math the
+//! tile/batch renderer uses. No platform types appear here.
 //!
-//! Three responsibilities live here, each previously open-coded at several call
-//! sites in `processor/mod.rs`:
-//!
-//! 1. **`region_to_viewport`** — the bottom-left y-origin flip for a *bottom-up*
-//!    render target. GL's window origin is bottom-left; HAL regions are
-//!    top-left. A tile at pixel `(x, y)` of size `(w, h)` in a `parent_h`-row
-//!    target maps to viewport `y' = parent_h − (y + h)`. NOTE: the live Linux
-//!    DMA-BUF destination batch path is **top-down** (GL row 0 == memory row 0,
-//!    verified on-target — the renderer's texcoords already flip the image
-//!    upright), so it uses `region.y` directly and does NOT call this. Kept for a
-//!    future bottom-up surface (e.g. the macOS pbuffer batch path).
-//!
-//! 2. **`source_uv`** — the source sampling rectangle in normalised `[0,1]` UV,
-//!    derived from a `Region`. Mirrors the `src_rect_uv` half of
-//!    [`crate::gl::core::float_crop_uniforms`].
-//!
-//! 3. **`plan_batch`** — the chunk planner. A batch of `n` destination tiles
-//!    renders into one reused import when every tile fits the GPU's
-//!    `GL_MAX_*` limits; otherwise it splits into chunks (one import per chunk)
-//!    or, degenerately, one import per tile. The tile region is *render state*
-//!    (`glViewport`), never part of the EGL cache key — that is what makes
-//!    "N tiles → 1 import" hold.
+//! * `region_to_viewport`: the bottom-left y-origin flip for a bottom-up
+//!   render target. A tile at pixel `(x, y)` of size `(w, h)` in a
+//!   `parent_h`-row target maps to viewport `y' = parent_h − (y + h)`.
+//! * `source_uv`: the source sampling rectangle in normalised `[0,1]` UV,
+//!   derived from a `Region`.
+//! * `plan_batch`: the chunk planner. A batch of `n` destination tiles
+//!   renders into one reused import when every tile fits the GPU's
+//!   `GL_MAX_*` limits; otherwise it splits into chunks (one import per
+//!   chunk) or one import per tile.
 
 use crate::Region;
 use edgefirst_tensor::{PixelFormat, PixelLayout, TensorMemory};
 
-/// How a convert's destination is realized on the GPU — the pure half of the
-/// destination lowering (`bind_dst` in `processor/mod.rs` performs the GL
-/// work). One lowering per *destination memory class*, never per platform:
-/// platform differences surface as the `zero_copy_import` capability bit.
+/// How a convert's destination is realized on the GPU. One lowering per
+/// destination memory class.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum DstLowering {
-    /// The destination buffer itself becomes the FBO colour attachment
-    /// (EGLImage renderbuffer/texture today, IOSurface pbuffer after the
-    /// platform seam). The render writes the buffer directly — no readback.
+    /// The destination buffer itself becomes the FBO colour attachment. The
+    /// render writes the buffer directly, with no readback.
     ZeroCopy,
     /// Offscreen texture render target, read back into the mapped tensor.
     TextureMem,
     /// Offscreen texture render target, read back into the destination PBO's
-    /// PACK binding (the tensor must never be mapped on the GL thread).
+    /// PACK binding.
     TexturePbo,
 }
 
 /// Classify the destination lowering from the platform's zero-copy import
 /// capability and the destination's memory class. A DMA destination without
-/// import support (e.g. dma-heap present but `EGL_EXT_image_dma_buf_import`
-/// missing) degrades to the mapped texture path rather than failing.
+/// import support lowers to the mapped texture path.
 pub(super) fn lower_dst(zero_copy_import: bool, dst_mem: TensorMemory) -> DstLowering {
     match dst_mem {
         TensorMemory::DmaBuf if zero_copy_import => DstLowering::ZeroCopy,
@@ -61,10 +42,8 @@ pub(super) fn lower_dst(zero_copy_import: bool, dst_mem: TensorMemory) -> DstLow
     }
 }
 
-/// How a convert renders — the pure plan half of the engine
-/// (`convert_via_engine` in `processor/mod.rs` executes it). Exactly one
-/// plan per (source format, destination format, destination lowering)
-/// triple.
+/// How a convert renders. One plan per (source format, source residence,
+/// destination format, destination lowering).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ConvertPlan {
     /// One render pass into the bound destination target (packed via the
@@ -73,54 +52,31 @@ pub(super) enum ConvertPlan {
     SinglePass,
     /// Zero-copy packed-RGB only: pass 1 renders RGBA into an intermediate
     /// texture, pass 2 packs it into the destination reinterpreted as
-    /// RGBA8 at `W*3/4 × H` (GL has no 3-byte render format). Texture
-    /// lowerings render genuine RGB in one pass instead — see
-    /// `setup_renderbuffer_non_dma`/`setup_renderbuffer_from_pbo`.
+    /// RGBA8 at `W*3/4 × H`.
     TwoPassPackedRgb,
-    /// Planar destination, driven by an ordinary packed convert: pass 1
-    /// renders the source into an intermediate RGBA texture via the full
-    /// `convert_to` machinery (any source format — `select_nv_path`'s
-    /// colorimetry-exact ShaderR8 + Vivante carve-out for NV*, the plain
-    /// upload/import path for everything else), pass 2 deinterleaves RGBA
-    /// into the planar destination (`bind_dst` classifies pass 2's target
-    /// the same way `SinglePass` does, so a texture lowering reads back
-    /// same as `SinglePass` would). Selected on EVERY lowering for NV* and
-    /// packed Rgb sources, and additionally on texture lowerings for every source:
-    /// the single-pass planar shader (`draw_camera_texture_to_rgb_planar`)
-    /// exists only where `Platform::EXTERNAL_OES` is true (false on
-    /// ANGLE/Android — `texture_program_planar` is `None` there,
-    /// regardless of source format), and even where it exists its source
-    /// import is DMA-only, with no upload path for a heap/Mem source.
-    /// Zero-copy keeps the non-NV single-pass route for a source it can
-    /// import (proven, EXTERNAL_OES path with a DMA source); a host source
-    /// takes this plan there too. Also the Vivante GC7000UL single-pass
-    /// GPU-hang workaround for NV* (EDGEAI-1180).
+    /// Planar destination: pass 1 renders the source into an intermediate
+    /// RGBA texture through the ordinary packed convert, pass 2 deinterleaves
+    /// RGBA into the planar destination. Selected on every lowering for NV*
+    /// and packed Rgb sources and for host-memory sources, and on texture
+    /// lowerings for every source.
     TwoPassNvPlanar,
     /// Grey destination from an RGB-family source: pass 1 renders RGBA into
     /// an intermediate texture through the ordinary packed convert, pass 2
-    /// writes its BT.601 luma into the destination. A Grey render target
-    /// keeps only the red channel of what a single pass draws, and the luma
-    /// cannot come from the source programs themselves: they reach it
-    /// through several routes (driver samplers, uploads, R8 views). YUV
-    /// sources stay single-pass, drawing their own luma plane.
+    /// writes its BT.601 luma into the destination. YUV sources stay
+    /// single-pass, drawing their own luma plane.
     TwoPassGrey,
 }
 
-/// Decide the render plan. Pure (src format, src residence, dst format, dst
-/// lowering) → plan; capability differences arrive via the lowering, never as
-/// platform branches here. `src_host` is a source in host memory (`Mem`,
-/// `Shm`): one with no GPU import, which only the upload path of the ordinary
-/// packed convert can read.
+/// Decide the render plan from the source format, source residence,
+/// destination format and destination lowering. `src_host` is a source in host
+/// memory (`Mem`, `Shm`).
 pub(super) fn plan_convert(
     src_fmt: PixelFormat,
     src_host: bool,
     dst_fmt: PixelFormat,
     lowering: DstLowering,
 ) -> ConvertPlan {
-    // Packed RGB only needs the two-pass W*3/4 reinterpretation on a
-    // zero-copy destination (no native 3-byte GL render format); texture
-    // destinations already render genuine RGB via `setup_renderbuffer_non_dma`
-    // / `setup_renderbuffer_from_pbo`, so they stay single-pass.
+    // A zero-copy packed RGB destination takes the two-pass W*3/4 reinterpretation.
     if lowering == DstLowering::ZeroCopy && dst_fmt == PixelFormat::Rgb {
         return ConvertPlan::TwoPassPackedRgb;
     }
@@ -132,33 +88,15 @@ pub(super) fn plan_convert(
     {
         return ConvertPlan::TwoPassGrey;
     }
-    // A texture-lowered (Mem/Pbo) planar destination has NO single-pass
-    // route for any source format: `texture_program_planar` (the
-    // EXTERNAL_OES planar shader `draw_camera_texture_to_rgb_planar`
-    // needs) is built only where `Platform::EXTERNAL_OES` is true — never
-    // on ANGLE or Android — and even on Linux (where it IS built) the
-    // source import (`get_or_create_egl_image`) is unconditionally
-    // DMA-only, so a heap/Mem source fails there too. The two-pass plan's
-    // pass 1 is the ordinary `convert_to` packed path, which already
-    // handles every source format (including a Mem source) on every
-    // platform.
+    // A texture-lowered planar destination is two-pass for every source format.
     if dst_fmt.layout() == PixelLayout::Planar && lowering != DstLowering::ZeroCopy {
         return ConvertPlan::TwoPassNvPlanar;
     }
-    // The same import rule on a zero-copy destination: the single-pass planar
-    // shader cannot read a host source, so it takes pass 1's upload instead.
-    // A driver that refuses the destination import re-plans onto the texture
-    // lowering above and reaches the same answer; one that accepts it (V3D,
-    // Mali) otherwise ended the convert with the source import's error.
+    // A zero-copy planar destination is two-pass for a host source.
     if dst_fmt.layout() == PixelLayout::Planar && src_host {
         return ConvertPlan::TwoPassNvPlanar;
     }
-    // Zero-copy NV*→planar still needs the two-pass ShaderR8 route: the
-    // single-pass planar shader has no multi-plane EGLImage/IOSurface
-    // binding for semi-planar NV even when EXTERNAL_OES is available. Packed
-    // Rgb likewise: most GPUs read it only through the R8 view, which the
-    // single-pass planar shader cannot sample. Zero-copy non-NV→planar
-    // otherwise stays single-pass (proven EXTERNAL_OES + DMA-source route).
+    // A zero-copy planar destination is two-pass for NV* and packed Rgb sources.
     if dst_fmt.layout() == PixelLayout::Planar
         && matches!(
             src_fmt,
@@ -170,7 +108,7 @@ pub(super) fn plan_convert(
     ConvertPlan::SinglePass
 }
 
-/// A GL viewport / scissor rectangle in **pixels**, bottom-left origin.
+/// A GL viewport / scissor rectangle in pixels, bottom-left origin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct Viewport {
     pub(super) x: i32,
@@ -179,15 +117,9 @@ pub(super) struct Viewport {
     pub(super) h: i32,
 }
 
-/// Lower a destination tile to its GL band rectangle on the live Linux
-/// DMA-BUF path, which is **top-down** (GL framebuffer row 0 == memory row 0,
-/// verified on-target): the band's GL `y` is simply `region.y`, with no
-/// bottom-left flip — the renderer's texcoord flip keeps the image upright.
-/// The single home for the orientation convention: BOTH the band `glViewport`
-/// (`bind_dst` setup) and the matching `glScissor` (letterbox-clear
-/// confinement in `convert_to`) lower through here so they can never
-/// disagree. [`region_to_viewport`] is the bottom-up twin for a future
-/// bottom-left-origin surface (e.g. the macOS pbuffer batch path).
+/// Lower a destination tile to its GL band rectangle on a top-down target (GL
+/// framebuffer row 0 == memory row 0): the band's GL `y` is `region.y`. Used
+/// for both the band `glViewport` and the matching `glScissor`.
 #[inline]
 pub(super) fn region_to_viewport_top_down(region: Region) -> Viewport {
     Viewport {
@@ -199,18 +131,11 @@ pub(super) fn region_to_viewport_top_down(region: Region) -> Viewport {
 }
 
 /// Lower a top-left `region` of an image `parent_h` rows tall to a bottom-left
-/// GL viewport. The horizontal axis is unchanged; the vertical axis is flipped
-/// so the region's *top* edge maps to the correct GL row.
-///
-/// Staged for the first bottom-left-origin render target (macOS pbuffer batch
-/// path, PR-A); the live Linux DMA-BUF path is top-down and uses
-/// [`region_to_viewport_top_down`]. Until then only the unit tests call this.
+/// GL viewport. The horizontal axis is unchanged; the vertical axis is flipped.
 #[allow(dead_code)]
 pub(super) fn region_to_viewport(region: Region, parent_h: usize) -> Viewport {
-    // Bottom-left origin: the GL y of the region's top-left corner is the number
-    // of rows *below* the region — `parent_h - (y + h)`. Saturating so a region
-    // flush against the bottom edge (or a degenerate over-tall region) yields a
-    // non-negative origin rather than wrapping.
+    // Bottom-left origin: the GL y of the region is the number of rows below
+    // it, `parent_h - (y + h)`, saturating at 0.
     let y_flipped = parent_h.saturating_sub(region.y.saturating_add(region.height));
     Viewport {
         x: region.x as i32,
@@ -222,13 +147,7 @@ pub(super) fn region_to_viewport(region: Region, parent_h: usize) -> Viewport {
 
 /// Source sampling rectangle as normalised `[u_min, v_min, u_extent, v_extent]`
 /// over a `src_w × src_h` texture. `None` (whole source) is the identity
-/// `[0, 0, 1, 1]`. Matches the `src_rect_uv` produced by
-/// [`crate::gl::core::float_crop_uniforms`] so the converged renderer and the
-/// float path agree on source addressing.
-///
-/// Staged for the source-view sampling path (the u8 renderer still computes
-/// its `RegionOfInterest` corners inline); until wired, only the unit tests
-/// call this.
+/// `[0, 0, 1, 1]`.
 #[allow(dead_code)]
 pub(super) fn source_uv(region: Option<Region>, src_w: usize, src_h: usize) -> [f32; 4] {
     match region {
@@ -244,15 +163,10 @@ pub(super) fn source_uv(region: Option<Region>, src_w: usize, src_h: usize) -> [
 
 /// How a batch of `n` destination tiles maps onto GPU imports.
 ///
-/// `OneImport` is the goal — the whole destination is imported once and each
-/// tile is a `glViewport` into it. `Chunked(tiles_per_chunk)` is the fallback
-/// when the full batched render target would exceed a `GL_MAX_*` limit: the
-/// batch is split into chunks of `tiles_per_chunk`, one import per chunk.
-/// `PerTileImport` is the degenerate floor (a single tile already too large to
-/// batch) — equivalent to the legacy per-call path.
-/// Staged for the `GL_MAX_*` chunking follow-up (split an over-limit batch
-/// into per-chunk imports); until wired into `convert_batch`, only the unit
-/// tests exercise this and [`plan_batch`].
+/// `OneImport`: the whole destination is imported once and each tile is a
+/// `glViewport` into it. `Chunked(tiles_per_chunk)`: the batch is split into
+/// chunks of `tiles_per_chunk`, one import per chunk. `PerTileImport`: one
+/// import per tile.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum BatchPath {
@@ -287,15 +201,9 @@ pub(super) fn plan_batch(n_tiles: usize, rows_per_tile: usize, max_rows: usize) 
     }
 }
 
-/// Where a tensor's logical image sits on the texture its import covers.
-///
-/// Two independent reasons the two can differ, both folded the same way:
-/// a pool buffer narrowed by `configure_image` keeps its whole texture and
-/// reports a larger [`extent`](Self::extent) (Windows/D3D11), and a source
-/// rebased to an aligned DMA-BUF offset starts the logical image partway
-/// into the import and reports a nonzero [`origin`](Self::origin) (Linux,
-/// issue #170). A platform whose import IS the logical image reports
-/// [`ImportMap::WHOLE`], which every helper here treats as the identity.
+/// Where a tensor's logical image sits on the texture its import covers. A
+/// platform whose import is the logical image reports [`ImportMap::WHOLE`],
+/// which every helper here treats as the identity.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) struct ImportMap {
     /// Texel size of the imported texture when it can exceed the logical
@@ -318,28 +226,11 @@ impl ImportMap {
 /// How one axis of a logical image maps onto the texture an import covers:
 /// `(origin, scale, limit)` — the normalized coordinate the logical image
 /// starts at, the factor that places it over its share of the texture, and the
-/// normalized coordinate of its far edge. An axis that is not narrowed or
-/// shifted (and a degenerate or contradictory map) maps as the identity.
+/// normalized coordinate of its far edge. A coordinate `t` over the logical
+/// image lands at `(origin + t * logical) / extent`.
 ///
-/// The far edge is not pulled half a physical texel inside here. These
-/// coordinates are the endpoints of the quad's texcoord attribute, so moving
-/// one rescales the whole affine dst-to-source mapping rather than excluding
-/// an edge: measured on a narrowed 128x96 source, the inset left the identity
-/// convert differing from a fresh buffer in 34380 of 49152 bytes.
-///
-/// The inset belongs on the sample instead, and that is where it now is: every
-/// shader that samples through this mapping clamps each sample coordinate to
-/// [`sample_clamp_rect`], so a `LINEAR` kernel centred within half a texel of
-/// the logical edge cannot blend the stale texel beyond it. Measured on the
-/// RTX 3070 and on WARP, the last row and column of an upscaled narrowed
-/// source then match a fresh buffer of the same geometry byte for byte
-/// (492-762 bytes differed by up to 48 without the clamp).
-///
-/// The origin is an ADDITIVE offset and the logical size a MULTIPLICATIVE
-/// scale, in that order: a coordinate `t` over the logical image lands at
-/// `(origin + t * logical) / extent`. A map whose shifted image would run
-/// past the texture is contradictory and maps as the identity, same as a
-/// degenerate one.
+/// A zero `extent` or `logical`, and a map whose shifted image would run past
+/// the texture, map as the identity `(0, 1, 1)`.
 fn axis_map(logical: usize, origin: u32, extent: u32) -> (f32, f32, f32) {
     let span = (origin as u64).saturating_add(logical as u64);
     if extent == 0 || logical == 0 || span > extent as u64 {
@@ -357,12 +248,9 @@ fn axis_map(logical: usize, origin: u32, extent: u32) -> (f32, f32, f32) {
 /// texture its import covers.
 ///
 /// `roi` is normalized over the logical image; `map` is where that image sits
-/// on the texture. The logical image occupies a contiguous block of the
-/// texture's own texels starting at the map's origin, so mapping one onto the
-/// other is one shift and one multiply per axis — the half-texel inset the
-/// crop math already applied scales with it — held inside the logical edge by
-/// [`axis_map`]. [`ImportMap::WHOLE`] and an extent no larger than the logical
-/// image leave `roi` untouched.
+/// on the texture. Each corner is shifted and scaled per axis through
+/// [`axis_map`] and held inside the logical image's far edge. A map with no
+/// extent leaves `roi` untouched.
 pub(super) fn scale_roi_to_import(
     roi: super::RegionOfInterest,
     logical: (usize, usize),
@@ -409,17 +297,6 @@ pub(super) fn scale_uv_rect_to_import(
 /// image's share of the texture in normalized coordinates, inset by half a
 /// physical texel on each side.
 ///
-/// A `LINEAR` sample at those bounds is centred on the logical image's edge
-/// texel, so the kernel cannot reach the texel beyond it. On a texture that
-/// is exactly the logical image ([`ImportMap::WHOLE`], or an extent no larger
-/// than `logical`) that texel does not exist and `CLAMP_TO_EDGE` already
-/// returns the edge value, so the clamp changes nothing there. On an import
-/// that covers more of the texture than the logical image the texels outside
-/// the image hold the pool buffer's previous content, or — when the map has a
-/// nonzero origin — the bytes the rebase walked back over and the pitch
-/// padding behind the last column, which an upscale would otherwise blend
-/// into the first or last row or column.
-///
 /// A degenerate logical size yields the whole texture, `[0, 0, 1, 1]`.
 pub(super) fn sample_clamp_rect(logical: (usize, usize), map: ImportMap) -> [f32; 4] {
     sample_clamp_rect_within(logical, map, [0.0, 0.0, 1.0, 1.0])
@@ -427,9 +304,7 @@ pub(super) fn sample_clamp_rect(logical: (usize, usize), map: ImportMap) -> [f32
 
 /// [`sample_clamp_rect`] narrowed to a source crop: `crop` is
 /// `[u_min, v_min, u_max, v_max]` normalized to the logical image, and the
-/// result brackets the crop's texels instead of the whole image's. A source
-/// crop's texture coordinates span its true edges, so this clamp is what keeps
-/// a `LINEAR` kernel at those edges from blending the pixels beyond them.
+/// result brackets the crop's texels.
 pub(super) fn sample_clamp_rect_within(
     logical: (usize, usize),
     map: ImportMap,
@@ -485,8 +360,6 @@ mod tests {
 
     #[test]
     fn viewport_top_down_is_identity() {
-        // The live DMA path is top-down: GL y == memory row y, no flip. Three
-        // stacked 16-row tiles keep their memory order in GL coordinates.
         let ys: Vec<i32> = (0..3)
             .map(|n| region_to_viewport_top_down(region(0, n * 16, 64, 16)).y)
             .collect();
@@ -504,8 +377,6 @@ mod tests {
 
     #[test]
     fn viewport_whole_image_is_origin() {
-        // A region covering the whole image maps to the full viewport at (0,0):
-        // y_flip = H - (0 + H) = 0.
         let vp = region_to_viewport(region(0, 0, 64, 48), 48);
         assert_eq!(
             vp,
@@ -520,8 +391,6 @@ mod tests {
 
     #[test]
     fn viewport_top_tile_lands_at_top_in_gl_coords() {
-        // Top 16-row band of a 48-tall image: GL y = 48 - (0 + 16) = 32
-        // (the top of a top-left image is the HIGH end of bottom-left GL space).
         let vp = region_to_viewport(region(0, 0, 64, 16), 48);
         assert_eq!(
             vp,
@@ -536,7 +405,6 @@ mod tests {
 
     #[test]
     fn viewport_bottom_tile_lands_at_origin() {
-        // Bottom 16-row band (y=32): GL y = 48 - (32 + 16) = 0.
         let vp = region_to_viewport(region(0, 32, 64, 16), 48);
         assert_eq!(
             vp,
@@ -551,8 +419,6 @@ mod tests {
 
     #[test]
     fn viewport_batch_bands_tile_without_overlap() {
-        // Three stacked 16-row tiles of a 48-tall batched target partition the
-        // viewport exactly: GL y bands are [32,48), [16,32), [0,16).
         let h = 16;
         let ys: Vec<i32> = (0..3)
             .map(|n| region_to_viewport(region(0, n * h, 64, h), 3 * h).y)
@@ -581,7 +447,6 @@ mod tests {
 
     #[test]
     fn source_uv_half_rect() {
-        // Right half of a 640×480 source.
         assert_eq!(
             source_uv(Some(region(320, 0, 320, 480)), 640, 480),
             [0.5, 0.0, 0.5, 1.0]
@@ -598,25 +463,21 @@ mod tests {
 
     #[test]
     fn plan_batch_fits_one_import() {
-        // 4 tiles × 64 rows = 256 ≤ 2048 → one import.
         assert_eq!(plan_batch(4, 64, 2048), BatchPath::OneImport);
     }
 
     #[test]
     fn plan_batch_chunks_when_over_limit() {
-        // 40 tiles × 64 rows = 2560 > 2048; floor(2048/64)=32 per chunk.
         assert_eq!(plan_batch(40, 64, 2048), BatchPath::Chunked(32));
     }
 
     #[test]
     fn plan_batch_single_oversize_tile_is_per_tile() {
-        // One planar tile of 3·1024 = 3072 rows > 2048 → degenerate per-tile.
         assert_eq!(plan_batch(8, 3072, 2048), BatchPath::PerTileImport);
     }
 
     #[test]
     fn plan_batch_exact_fit_is_one_import() {
-        // 32 tiles × 64 = 2048 == limit → still one import (≤, not <).
         assert_eq!(plan_batch(32, 64, 2048), BatchPath::OneImport);
     }
 
@@ -630,12 +491,11 @@ mod tests {
     fn plan_convert_full_table() {
         use DstLowering::*;
         use PixelFormat::*;
-        // Sources read through an R8 view on some GPU: NV* and packed Rgb.
+        // NV* and packed Rgb sources.
         let nv = [Nv12, Nv16, Nv24, Rgb];
         let non_nv = [Rgba, Bgra, Grey, Yuyv];
-        // Zero-copy: packed RGB destination always two-pass; NV/Rgb→planar
-        // two-pass; the rest single-pass (incl. non-NV → planar, which the
-        // planar shader handles in one pass).
+        // Zero-copy: packed RGB destination two-pass; NV/Rgb→planar two-pass;
+        // the rest single-pass.
         for src in nv.iter().chain(&non_nv) {
             assert_eq!(
                 plan_convert(*src, false, Rgb, ZeroCopy),
@@ -667,9 +527,8 @@ mod tests {
                 ConvertPlan::SinglePass
             );
         }
-        // A host source cannot feed the single-pass planar shader, so a
-        // zero-copy planar destination takes the two-pass route for it; a
-        // packed destination is unaffected.
+        // Zero-copy with a host source: planar destinations two-pass; packed
+        // destinations unaffected.
         for src in nv.iter().chain(&non_nv) {
             for dst in [PlanarRgb, PlanarRgba] {
                 assert_eq!(
@@ -687,14 +546,7 @@ mod tests {
                 ConvertPlan::SinglePass
             );
         }
-        // Texture lowerings: packed-RGB single-pass (the texture destination
-        // renders genuine RGB); EVERY source→planar is two-pass regardless
-        // of format — the single-pass planar shader
-        // (`draw_camera_texture_to_rgb_planar`) needs
-        // `Platform::EXTERNAL_OES` (false on ANGLE/Android) AND a DMA
-        // source, neither of which a texture-lowered destination can rely
-        // on, so non-NV sources route through the same two-pass plan as NV*
-        // instead of single-pass.
+        // Texture lowerings: packed RGB single-pass; every source→planar two-pass.
         for lowering in [TextureMem, TexturePbo] {
             for src in nv.iter().chain(&non_nv) {
                 for dst in [PlanarRgb, PlanarRgba] {
@@ -713,8 +565,8 @@ mod tests {
                 }
             }
         }
-        // Grey destination: RGB-family sources take the luma pass on every
-        // lowering and residence; YUV and Grey sources draw it in one pass.
+        // Grey destination: RGB-family sources two-pass on every lowering and
+        // residence; YUV and Grey sources single-pass.
         for lowering in [ZeroCopy, TextureMem, TexturePbo] {
             for host in [false, true] {
                 for src in [Rgb, Rgba, Bgra] {
@@ -738,14 +590,13 @@ mod tests {
     #[test]
     fn lower_dst_full_table() {
         use TensorMemory::*;
-        // With zero-copy import: only a DMA destination is zero-copy; PBO
-        // keeps its PACK readback; Mem/Shm read back through the map.
+        // With zero-copy import: DMA is zero-copy, PBO reads back through PACK,
+        // Mem/Shm through the map.
         assert_eq!(lower_dst(true, DmaBuf), DstLowering::ZeroCopy);
         assert_eq!(lower_dst(true, Pbo), DstLowering::TexturePbo);
         assert_eq!(lower_dst(true, Mem), DstLowering::TextureMem);
         assert_eq!(lower_dst(true, Shm), DstLowering::TextureMem);
-        // Without import support a DMA destination degrades to the mapped
-        // texture path (dma-heap without EGL dma_buf_import) — never an error.
+        // Without import support a DMA destination lowers to the mapped texture path.
         assert_eq!(lower_dst(false, DmaBuf), DstLowering::TextureMem);
         assert_eq!(lower_dst(false, Pbo), DstLowering::TexturePbo);
         assert_eq!(lower_dst(false, Mem), DstLowering::TextureMem);
@@ -758,7 +609,7 @@ mod tests {
 mod import_extent_tests {
     use super::*;
 
-    /// The pre-origin shape of every fold call: an extent, at origin `(0, 0)`.
+    /// An `ImportMap` with an extent at origin `(0, 0)`.
     fn narrowed(extent: (u32, u32)) -> ImportMap {
         ImportMap {
             extent: Some(extent),
@@ -775,8 +626,7 @@ mod import_extent_tests {
         }
     }
 
-    /// 128x96 written into a 128x128 pool texture: u is untouched (that axis
-    /// is not narrowed), v is scaled to the logical image's share.
+    /// 128x96 in a 128x128 texture: u is untouched and v is scaled to the image's share.
     #[test]
     fn a_narrowed_logical_image_scales_by_its_share_of_the_texture() {
         let r = scale_roi_to_import(roi(), (128, 96), narrowed((128, 128)));
@@ -807,8 +657,7 @@ mod import_extent_tests {
         assert_eq!((r.left, r.top, r.right, r.bottom), (0.0, 1.0, 1.0, 0.0));
     }
 
-    /// A logical image larger than the reported extent is a contradiction; the
-    /// rectangle is left alone rather than magnified past the texture.
+    /// A logical image larger than the reported extent leaves the rectangle unchanged.
     #[test]
     fn a_logical_image_larger_than_the_extent_is_not_magnified() {
         let r = scale_roi_to_import(roi(), (256, 256), narrowed((128, 128)));
@@ -821,8 +670,7 @@ mod import_extent_tests {
         assert_eq!((r.left, r.top, r.right, r.bottom), (0.0, 1.0, 1.0, 0.0));
     }
 
-    /// The float paths' origin+size rectangle: the origin scales and the size
-    /// is trimmed so the far edge lands where a corner would.
+    /// A UV rect's origin scales and its size is trimmed to the far edge.
     #[test]
     fn a_uv_rect_scales_its_origin_and_trims_its_size() {
         let r = scale_uv_rect_to_import([0.0, 0.0, 1.0, 1.0], (128, 96), narrowed((128, 128)));
@@ -833,8 +681,6 @@ mod import_extent_tests {
 
     #[test]
     fn a_uv_rect_keeps_an_interior_crop_and_passes_no_extent_through() {
-        // Half the width starting a quarter in, on an axis narrowed to 3/4:
-        // both scale, and the far edge (0.25 + 0.5) * 0.75 stays interior.
         let r = scale_uv_rect_to_import([0.25, 0.25, 0.5, 0.5], (96, 96), narrowed((128, 128)));
         assert_eq!([r[0], r[1]], [0.1875, 0.1875]);
         assert_eq!([r[2], r[3]], [0.375, 0.375]);
@@ -842,16 +688,14 @@ mod import_extent_tests {
         assert_eq!(r, [0.25, 0.25, 0.5, 0.5]);
     }
 
-    /// 128x96 in a 128x128 texture: u spans the whole texture inset by half
-    /// a texel, v stops half a texel short of row 96.
+    /// 128x96 in a 128x128 texture: u is inset half a texel, v stops half a texel short of row 96.
     #[test]
     fn a_narrowed_image_clamps_samples_half_a_texel_inside_its_edge() {
         let r = sample_clamp_rect((128, 96), narrowed((128, 128)));
         assert_eq!(r, [0.5 / 128.0, 0.5 / 128.0, 127.5 / 128.0, 95.5 / 128.0]);
     }
 
-    /// Without an extent the texture is the logical image, and the clamp is
-    /// the half-texel inset of the whole texture on both axes.
+    /// Without an extent the clamp is the half-texel inset of the whole texture on both axes.
     #[test]
     fn no_extent_clamps_to_the_textures_own_edge_texels() {
         let r = sample_clamp_rect((128, 96), ImportMap::WHOLE);
@@ -859,8 +703,7 @@ mod import_extent_tests {
         assert_eq!(sample_clamp_rect((128, 96), narrowed((128, 96))), r);
     }
 
-    /// An extent smaller than the logical image is a contradiction; the
-    /// texture is taken to be the logical image, as in `scale_roi_to_import`.
+    /// An extent smaller than the logical image is ignored.
     #[test]
     fn an_extent_smaller_than_the_image_is_ignored() {
         assert_eq!(
@@ -881,8 +724,7 @@ mod import_extent_tests {
         );
     }
 
-    /// One logical texel in a larger texture: min and max meet at that
-    /// texel's centre. The only input where the bound could invert.
+    /// One logical texel in a larger texture clamps min and max to that texel's centre.
     #[test]
     fn a_one_texel_image_clamps_to_its_single_texel_centre() {
         assert_eq!(
@@ -892,11 +734,7 @@ mod import_extent_tests {
         assert_eq!(sample_clamp_rect((1, 1), ImportMap::WHOLE), [0.5; 4]);
     }
 
-    /// A shifted import: the logical 16-wide image sits at texel 8 of a
-    /// 24-wide texture. The ROI must land on `[8/24, 24/24]`, not `[0, 16/24]`
-    /// -- the whole point of the origin. This is the (8, 0) view of issue
-    /// #165's probe at RGBA, whose 32-byte offset rebases to 0 with a
-    /// 8-texel shift.
+    /// A 16-wide image at texel 8 of a 24-wide texture maps the ROI onto `[8/24, 24/24]`.
     #[test]
     fn scale_roi_to_import_offsets_by_the_origin() {
         let roi = super::super::RegionOfInterest {
@@ -912,14 +750,11 @@ mod import_extent_tests {
         let got = scale_roi_to_import(roi, (16, 16), map);
         assert!((got.left - 8.0 / 24.0).abs() < 1e-6, "left {}", got.left);
         assert!((got.right - 1.0).abs() < 1e-6, "right {}", got.right);
-        // The unshifted axis is untouched.
         assert!((got.top - 0.0).abs() < 1e-6, "top {}", got.top);
         assert!((got.bottom - 1.0).abs() < 1e-6, "bottom {}", got.bottom);
     }
 
-    /// A half-width ROI on a shifted import: the origin is an ADDITIVE
-    /// offset and the logical size is the MULTIPLICATIVE scale, so the
-    /// midpoint lands at `(8 + 8) / 24`, not at `8 / 24 * 0.5` or `0.5`.
+    /// A half-width ROI on a shifted import has its midpoint at `(8 + 8) / 24`.
     #[test]
     fn scale_roi_to_import_composes_origin_and_scale() {
         let roi = super::super::RegionOfInterest {
@@ -943,9 +778,7 @@ mod import_extent_tests {
         assert!((got.bottom - 0.75).abs() < 1e-6, "bottom {}", got.bottom);
     }
 
-    /// `ImportMap::WHOLE` is the identity on all three helpers -- the state
-    /// every platform whose import IS the logical image reports, and the
-    /// state every call site had before the origin existed.
+    /// `ImportMap::WHOLE` is the identity on all three helpers.
     #[test]
     fn whole_import_map_is_the_identity() {
         let roi = super::super::RegionOfInterest {
@@ -969,8 +802,7 @@ mod import_extent_tests {
         assert!((u1 - 63.5 / 64.0).abs() < 1e-9 && (v1 - 63.5 / 64.0).abs() < 1e-9);
     }
 
-    /// A source crop narrows the clamp to its own texels, half a texel inside
-    /// its edges, on a whole texture and on a shifted import alike.
+    /// A source crop narrows the clamp to its own texels, half a texel inside its edges.
     #[test]
     fn sample_clamp_rect_within_brackets_a_crop() {
         let crop = [16.0 / 64.0, 8.0 / 32.0, 48.0 / 64.0, 24.0 / 32.0];
@@ -989,10 +821,7 @@ mod import_extent_tests {
         );
     }
 
-    /// The clamp rectangle must bracket the LOGICAL image's texels on a
-    /// shifted texture, so a LINEAR kernel at the left edge cannot blend
-    /// the rebase padding in front of it and one at the right edge cannot
-    /// reach the pitch padding behind it.
+    /// On a shifted texture the clamp rectangle brackets the logical image's texels.
     #[test]
     fn sample_clamp_rect_brackets_a_shifted_image() {
         let map = ImportMap {
@@ -1006,8 +835,7 @@ mod import_extent_tests {
         assert!((v1 - 15.5 / 16.0).abs() < 1e-6, "v1 {v1}");
     }
 
-    /// A contradictory map -- the shifted image would run past the texture
-    /// -- falls back to the identity rather than sampling outside it.
+    /// A shifted image that would run past the texture maps as the identity.
     #[test]
     fn a_shifted_image_that_overruns_the_extent_maps_as_the_identity() {
         let roi = super::super::RegionOfInterest {
@@ -1027,12 +855,7 @@ mod import_extent_tests {
         assert!((u1 - 15.5 / 16.0).abs() < 1e-6, "u1 {u1}");
     }
 
-    /// An origin with NO extent is DROPPED by every helper -- the map is the
-    /// identity, and the shift silently goes nowhere. This is why a leaf that
-    /// reports a nonzero origin must report the widened extent alongside it
-    /// (`GLProcessorST::cached_src_import_map` asserts the pairing): the
-    /// failure mode is a wrongly-sampled frame on the one board that rebases,
-    /// with nothing to see anywhere else.
+    /// An origin with no extent is dropped by every helper: the map is the identity.
     #[test]
     fn an_origin_without_an_extent_is_dropped_by_every_helper() {
         let map = ImportMap {
@@ -1055,8 +878,7 @@ mod import_extent_tests {
         );
     }
 
-    /// The float paths' origin-and-size rect: the origin shifts and the
-    /// size stays trimmed inside the same limit.
+    /// A UV rect on a shifted import has its origin shifted and its size trimmed.
     #[test]
     fn scale_uv_rect_to_import_offsets_by_the_origin() {
         let map = ImportMap {

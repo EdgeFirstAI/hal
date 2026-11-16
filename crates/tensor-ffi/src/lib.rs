@@ -1,19 +1,13 @@
 // SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! Declarations-only bindings to `libedgefirst_tensor` — the Rust "header".
+//! Declarations-only bindings to `libedgefirst_tensor`.
 //!
-//! This crate contains no code, only undefined symbols. It is one side of a
-//! two-sided contract whose other side is `edgefirst-tensor-capi`'s exports;
-//! `tensor-capi/tests/check_abi.rs` asserts every declaration here is a real
-//! export there, because a declaration without an export is a load-time
-//! failure waiting in every consumer. Linking is the consumer's decision:
-//! there is deliberately no `#[link]` attribute here.
+//! This crate contains no code, only undefined symbols, and carries no
+//! `#[link]` attribute: linking is the consumer's decision.
 //!
 //! Every declaration is transcribed from the generated
-//! `crates/tensor-capi/include/edgefirst/tensor.h`, which is the authority:
-//! when a signature here and the header disagree, the header wins and this
-//! file is wrong.
+//! `crates/tensor-capi/include/edgefirst/tensor.h`.
 
 use std::ffi::{c_char, c_int};
 
@@ -43,14 +37,13 @@ pub struct EfTensorImageDesc {
     _opaque: [u8; 0],
 }
 
-/// Declares the extern functions and records their names in [`DECLARED`],
-/// so the conformance test cannot drift from the declarations.
+/// Declares the extern functions and records their names in [`DECLARED`].
 macro_rules! declare_abi {
     ($(pub fn $name:ident($($arg:ident: $ty:ty),* $(,)?) $(-> $ret:ty)?;)*) => {
         extern "C" {
             $(pub fn $name($($arg: $ty),*) $(-> $ret)?;)*
         }
-        /// Every symbol this crate declares, for the check-abi gate.
+        /// Every symbol this crate declares.
         pub const DECLARED: &[&str] = &[$(stringify!($name)),*];
     };
 }
@@ -373,199 +366,9 @@ declare_abi! {
 mod tests {
     use super::DECLARED;
 
-    /// Pinned against `include/edgefirst/tensor.h`: 57 function declarations
+    /// The number of function declarations in `include/edgefirst/tensor.h`
     /// (`grep -cE '^[A-Za-z].*ef_.*\(' include/edgefirst/tensor.h` from
-    /// `crates/tensor-capi`). History, since this number moves for reasons
-    /// that look identical at a glance but are not: it was 38, then 32 when
-    /// the detection-list family (`ef_detect_box_list_{new,push,len,get,
-    /// data,free}`) moved OUT to `edgefirst-decoder-capi`, its one
-    /// implementation home; then 37 when the `ef_tensor_image_desc_{new,
-    /// free,set_memory,set_access,set_compression}` family moved IN from
-    /// `edgefirst-image-capi`, this being `ImageDesc`'s one implementation
-    /// home instead; then 38 again with `ef_tensor_image_desc_get` added --
-    /// the scalar getter that lets a foreign library read a request without
-    /// dereferencing the opaque handle; then 41 with `ef_tensor_colorimetry`,
-    /// `ef_tensor_set_colorimetry`, and `ef_tensor_view_origin` added -- the
-    /// three genuinely-new primitives `docs/superpowers/plans/
-    /// PRIMITIVE-INVENTORY.md` found the dynamic backend needs beyond what
-    /// was already exported; now 54 with the task-15 primitive families that
-    /// close the dynamic backend's stub gaps with live callers: 4 metadata
-    /// mutators (`ef_tensor_set_format`, `_set_row_stride`,
-    /// `_set_plane_offset`, `_configure_image` -- family 1 + 3, `import_image`
-    /// and JPEG decode-into-pool), 4 quantization primitives
-    /// (`ef_tensor_quantization_{info,get,set,clear}` -- family 2, the
-    /// decoder's int8 pipeline, `info`/`get` splitting the read into the
-    /// two-call idiom `Quantization`'s variable length requires), 4
-    /// construction/view primitives (`ef_tensor_image_alloc`,
-    /// `_image_with_stride_alloc`, `_view_region`, `_image_desc_alloc` --
-    /// family 4, image tiling and the V4L2 JPEG decoder's destination
-    /// allocation), and 1 consuming constructor (`ef_tensor_from_planes` --
-    /// family 5, the two-fd import path); then 55 with `ef_tensor_plane_offset`
-    /// added -- family 1's setter had no reader at all
-    /// (`ef_tensor_plane_at`'s plane-0 offset is `plane_table`'s
-    /// intra-buffer layout, always 0 for plane 0, a different quantity
-    /// entirely), found while proving the setter through the dynamic
-    /// backend and fixed in the same task rather than left as a second,
-    /// undiscovered gap. See `.superpowers/sdd/
-    /// 2026-08-24-single-tensor-home/task-15-report.md` for the derivation
-    /// of each. Then 56 with `ef_tensor_set_row_stride_unchecked` added --
-    /// task 17's predicate-divergence audit found `Tensor::
-    /// set_row_stride_unchecked` (the raw, format-independent stride setter
-    /// a multiplane chroma sub-tensor needs, since `from_planes` requires it
-    /// to carry no format) had a `dynamic`-side stub that only ever
-    /// panicked; the earlier 55 primitives covered every *formatted* stride
-    /// path but never this formatless one. See `.superpowers/sdd/
-    /// 2026-08-24-single-tensor-home/task-17-report.md`. Briefly 57 with
-    /// `ef_tensor_is_native` added -- task 9's own G3 harness (the
-    /// two-library JPEG-into-host-memory-tensor test) found that a `-capi`
-    /// leaf which had just switched to linking this library dynamically had
-    /// no safe way to tell "a destination handle this library itself
-    /// minted, now reachable through a real `ef_tensor_*` call" apart from
-    /// "a destination from a still-static sibling's private, structurally
-    /// different `EfTensorImpl` layout" -- the two invariant-2 transition
-    /// guards on `ef_tensor_map`/`_unmap` (own-mint only) meant every
-    /// caller-supplied host-memory destination fell through to the
-    /// fd-based foreign-re-import path, which cannot work at all without a
-    /// shareable handle. See `.superpowers/sdd/
-    /// 2026-08-24-single-tensor-home/task-9-report.md`.
-    /// **Back to 56** with `ef_tensor_is_native` deleted -- task 10 (this
-    /// track's "delete the transition vtable") removed the vtable dispatch
-    /// machinery `is_native` existed to distinguish a foreign handle from.
-    /// All four sibling `-capi` leaves now link `libedgefirst_tensor.so`
-    /// dynamically, so every handle in the process is the same layout from
-    /// the same allocator; there is no more "foreign, structurally
-    /// different" handle for a caller to tell apart, and the own-mint-only
-    /// restriction on `ef_tensor_retain`/`_map`/`_unmap`/`_copy_to` is gone
-    /// with it. See `.superpowers/sdd/2026-08-24-single-tensor-home/
-    /// task-10-report.md`.
-    /// `check_abi.rs`'s `the_ffi_declaration_count_matches_the_header`
-    /// re-derives this count from the header on every run, so this constant
-    /// cannot drift silently -- either both change together or that test
-    /// fails.
-    /// **Now 64** with task P2a's eight additions -- the primitives the
-    /// dynamic backend needs to satisfy `edgefirst-python-common`'s
-    /// `TensorDyn` call sites, which had never been compiled against this
-    /// backend before: `ef_tensor_sync_for_cpu`/`_sync_for_device` (the
-    /// standalone cache-maintenance bracket, `Tensor.cpu_access()`'s
-    /// context manager -- distinct from `ef_tensor_map`, which establishes
-    /// an address and the coherency window together), `ef_tensor_batch`
-    /// (the leading-dimension view, distinct from `ef_tensor_view_region`'s
-    /// spatial crop), and the three read-back accessors
-    /// `ef_tensor_capacity_bytes`, `ef_tensor_row_stride` and
-    /// `ef_tensor_compression` that `TensorDyn::descriptor_pinned` needs
-    /// and no existing primitive could answer (`ef_tensor_plane_at` reports
-    /// *effective* pitch and per-plane geometry, neither of which is the
-    /// recorded stride or the allocation's byte count). See
-    /// `.superpowers/sdd/2026-08-25-python-single-tensor-home/
-    /// task-P2a-report.md`. The last two are `TensorDyn::
-    /// import_descriptor`'s remaining two arms: `ef_tensor_wrap_host`
-    /// (`kind::MEM`/`SHM` -- alias a producer's host pointer, carrying its real
-    /// capacity so the import is not clamped to today's shape) and
-    /// `ef_tensor_from_iosurface_id` (`kind::IOSURFACE`, declared on every
-    /// platform and refused at runtime off Apple, so this library's symbol
-    /// set does not vary by target). `kind::DMABUF` needed nothing new --
-    /// `ef_tensor_builder_*` already covers it via `TensorDyn::from_fd` --
-    /// and `kind::PBO` needed nothing at all, being in-process Rust state
-    /// with no wire form.
-    /// **Now 65** with `ef_tensor_set_dtype` (task P2b) -- retag a handle's
-    /// element type without touching its bytes, refusing a width change.
-    /// Under `static` the dtype lives in the Rust type, so
-    /// `TensorDyn::from(Tensor<i8>)` after a layout-identical transmute is
-    /// free; under `dynamic` it lives in the C handle, so the transmute
-    /// changed a `PhantomData` and nothing else. That is what made
-    /// `create_image(dtype="int8")` report `uint8` -- the only one of P2b's
-    /// four regressions that returned a *wrong answer* rather than a
-    /// refusal.
-    /// **Now 67** with P2b's remaining two: `ef_tensor_reshape`, and
-    /// `ef_tensor_clone_fd` -- the latter not derivable from
-    /// `ef_tensor_plane_at`, whose *native handle* is a dma-buf fd or an
-    /// IOSurface id and `-1` for everything else, so deriving "clone this
-    /// tensor's fd" from it refused SHM-backed tensors, which do have one.
-    ///
-    /// A third, `ef_tensor_set_logical_shape`, was written and removed
-    /// before commit: nothing in this workspace calls it, and the defect
-    /// that motivated it turned out to be elsewhere (`Tensor<T>` never
-    /// overrides `TensorTrait::set_logical_shape`, so the capacity-aware
-    /// storage implementations are unreachable through it on *both*
-    /// backends -- see task P2b's report). Adding ABI surface for a caller
-    /// that does not exist is how an entry point drifts unwatched.
-    /// **Now 68** with `ef_tensor_last_error_class` (task P2c): the class
-    /// of the calling thread's last failure, beside the advisory message.
-    ///
-    /// It exists because an entry point that reports failure by returning
-    /// `NULL` has no errno to carry a class, so a consumer rebuilding a
-    /// typed error from one had only the message -- whose own contract says
-    /// never to parse it. `ef_tensor_batch`'s wrapper was parsing it anyway.
-    ///
-    /// **One new symbol, not an out-param on each of the twelve
-    /// NULL-returning entries.** An out-param would change those twelve
-    /// signatures, which is not additive at all: an existing caller passing
-    /// the old argument count to a function expecting one more is undefined
-    /// behaviour, and the loader cannot see it. This follows the ABI's own
-    /// `dlerror` convention instead -- the same thread-local, the same
-    /// lifetime rules, one accessor -- and covers every NULL-returning
-    /// entry at once. See task P2c's report for the enumeration.
-    /// **Now 90** after the leftover monolith ports: capability probes,
-    /// CUDA map, AHardwareBuffer/IOSurface, tracing, logging, and
-    /// `ef_tensor_name`.
-    /// **Now 100** with the Windows D3D11 texture family and the
-    /// non-blocking map it needs: `ef_d3d11_device`,
-    /// `ef_d3d11_use_external_device`, `ef_tensor_d3d11_texture`,
-    /// `_d3d11_layout`, `_d3d11_shared_handle`, `ef_tensor_gpu_completion`,
-    /// `ef_tensor_set_gpu_write`, `ef_tensor_from_d3d11_texture`,
-    /// `_from_d3d11_shared_handle`, and `ef_tensor_try_map`. Declared on
-    /// every platform and refused at run time off Windows, the rule
-    /// `ef_tensor_from_iosurface_id` already follows, so this library's
-    /// symbol set does not vary by target. `ef_tensor_try_map` is not
-    /// Windows-only in the same sense: it is the general non-blocking map,
-    /// but the D3D11 texture's staging refresh is the only backing that can
-    /// answer `EAGAIN` today, so it lands with this family.
-    /// **Now 101** with `ef_tensor_cuda_map_mut` (task C3), the writable
-    /// counterpart of `ef_tensor_cuda_map`. It is a distinct entry point
-    /// rather than a flag on the existing one because the two differ in what
-    /// `ef_tensor_cuda_unmap` then does: a D3D11 texture's CUDA mapping is a
-    /// linear copy of an opaque array, so only the writable map's release
-    /// copies the device buffer back into the texture. Every other backing
-    /// aliases its device memory and the two are the same mapping.
-    /// **Now 102** with `ef_tensor_gpu_write_value`: the recorded fence
-    /// value alone. `ef_tensor_gpu_completion` duplicates the fence handle
-    /// on every call, and the two callers that only forward the value -- the
-    /// Python bindings after each convert, and the dynamic backend's
-    /// descriptor export -- paid a `DuplicateHandle` and a `CloseHandle`
-    /// for a number they already had a fence for.
-    /// **Now 106** with the PBO storage family (Stage B of the client-side
-    /// state design): `ef_tensor_wrap_pbo` -- the constructor that makes a
-    /// client's GL buffer real `TensorStorage::Pbo` storage inside this
-    /// library, over a frozen `ef_client_state` callback channel -- plus
-    /// `ef_tensor_pbo_id` and `ef_tensor_pbo_is_mapped`, the whole surface
-    /// `edgefirst-image`'s nine PBO call sites use, and
-    /// `ef_tensor_pbo_vtable`, which the dynamic backend's
-    /// `descriptor_pinned` needs for the cross-package capsule's `PBO`
-    /// kind. It is a *constructor*, not an attach: the storage IS the GL
-    /// buffer, so there is no pre-existing tensor to decorate, and an
-    /// attach would have reproduced the host placeholder this stage
-    /// deletes.
-    /// **Now 108** with Stage D of the client-side state design:
-    /// `ef_tensor_is_multiplane` and `ef_tensor_chroma`, so a handle
-    /// wrapped via `from_raw` after `ef_tensor_from_planes` answers
-    /// multiplane the same way the constructing `from_planes` wrapper did.
-    /// **Now 110** with Stage C: `ef_tensor_cuda_attach` stores a GL-buffer
-    /// `CudaHandle` on the library tensor over a frozen `ef_client_state`
-    /// plus map/unmap/unregister ops, and `ef_tensor_cuda_attached` reports
-    /// whether that (or a D3D11) registration is present. No new `repr(C)`
-    /// struct: `EfClientState` stays 24 bytes.
-    /// **Now 111** with `ef_tensor_with_cpu_mappings_excluded`: runs a
-    /// callback while no tensor CPU mapping can be created, so the image
-    /// crate can hold that exclusion across Adreno's `eglDestroyImage`,
-    /// which unmaps its driver mapping twice.
-    /// **Now 114** with `ef_tensor_contiguity`,
-    /// `ef_tensor_image_desc_set_contiguous` and
-    /// `ef_tensor_image_desc_contiguous`: the physically contiguous (CMA
-    /// only) allocation request and the query of which heap a DMA-BUF
-    /// tensor came from.
-    /// **Now 117** with `ef_tensor_is_view` and `ef_tensor_mark_view`: a
-    /// tensor rebuilt from a view's descriptor has no view origin but must
-    /// still map `ReadWrite` for a CPU write.
+    /// `crates/tensor-capi`).
     const HEADER_DECLARATION_COUNT: usize = 117;
 
     #[test]

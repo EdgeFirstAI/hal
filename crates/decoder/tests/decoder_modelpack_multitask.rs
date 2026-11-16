@@ -1,17 +1,15 @@
 // SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! Cross-repo contract test for DE-2651: build a [`Decoder`] from the
-//! schema-v2 `edgefirst.json` that ModelPack now embeds for a multitask
-//! (detection + segmentation) model.
+//! Build a [`Decoder`] from the schema-v2 `edgefirst.json` that ModelPack
+//! embeds for a multitask (detection + segmentation) model.
 //!
-//! ModelPack emits, in order: per-FPN-scale `type: detection` anchor grids,
+//! The schema lists, in order: per-FPN-scale `type: detection` anchor grids,
 //! a raw `type: segmentation` per-class map (canonical NHWC `[1, H, W,
 //! num_classes]`), and a decoded `type: masks` argmax class-index map
-//! (`[1, H, W]`). HAL must classify this as `ModelPackSegDetSplit` — the
-//! decoded `masks` head is not consumed by the ModelPack decoder path and must
-//! not prevent the build, and the segmentation class count is taken from the
-//! NHWC channel axis.
+//! (`[1, H, W]`). The model builds as `ModelPackSegDetSplit`: the `masks`
+//! head is not read, and the segmentation class count is taken from the NHWC
+//! channel axis.
 
 use edgefirst_decoder::{schema::SchemaV2, DecoderBuilder};
 
@@ -65,10 +63,6 @@ const MODELPACK_MULTITASK_JSON: &str = r#"
 fn build_decoder_from_modelpack_multitask_schema() {
     let schema = SchemaV2::parse_json(MODELPACK_MULTITASK_JSON)
         .expect("parse ModelPack multitask edgefirst.json");
-    // The decoded `masks` head must not prevent the build: HAL ignores it in
-    // the ModelPack path and decodes the raw `segmentation` head. Previously
-    // an untagged/mis-tagged or undeclared output produced
-    // InvalidConfig("Invalid ModelPack model outputs") (DE-2651).
     DecoderBuilder::new()
         .with_schema(schema)
         .build()
@@ -77,11 +71,8 @@ fn build_decoder_from_modelpack_multitask_schema() {
 
 #[test]
 fn parse_tolerates_unknown_input_dshape_axis_name() {
-    // Older ModelPack exports tagged the input dshape channel axis as
-    // `channels`, which HAL's DimName enum does not define. Parsing must not
-    // reject the whole metadata over an unrecognised axis name — the unknown
-    // axis is preserved as `DimName::Unknown` and sorts to the canonical tail
-    // (DE-2651).
+    // An input dshape whose channel axis is named `channels`, which `DimName`
+    // does not define.
     let json = MODELPACK_MULTITASK_JSON.replace(
         "\"input\": { \"shape\": [1, 3, 480, 640] }",
         "\"input\": { \"shape\": [1, 480, 640, 3], \"dshape\": [\

@@ -2,20 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Windows D3D11 texture backing: the process device, adapter selection and
 //! the texture storage. Windows-only; the layout table lives in
-//! `crate::d3d11_layout` so every platform tests it.
-//!
-//! The module is gated once, on its declaration in `lib.rs`.
+//! `crate::d3d11_layout`.
 
 pub mod adapter;
 pub(crate) mod com;
 pub mod device;
-// Both backends: a constructor handed a raw texture reads its geometry
-// here rather than inferring it from a caller's shape, and three of the
-// four surfaces that do so build `dynamic`. See the module's own comment.
+// Compiled for both backends.
 pub mod geometry;
-// The texture storage is reachable only through the `static` backend's
-// `TensorStorage`; `dynamic` forwards every tensor call to the C ABI and never
-// constructs one, so compiling it there would be dead code.
 #[cfg(not(edgefirst_tensor_dynamic))]
 pub(crate) mod texture;
 
@@ -27,16 +20,14 @@ pub use adapter::{
 pub use device::{device, use_external_device, D3d11Device, GpuCompletion};
 pub use geometry::{d3d11_shared_handle_geometry, d3d11_texture_geometry};
 
-/// The `ID3D11Device*` the tensors *this build* allocates actually live on.
+/// The `ID3D11Device*` the tensors this build allocates live on.
 ///
-/// [`device`] answers for this copy of the crate. On the `dynamic` backend
-/// that copy allocates nothing: every tensor is created inside
-/// `libedgefirst_tensor`, whose own copy owns the process device, so the
-/// honest answer to "which device are my textures on" comes from asking that
-/// library through `ef_d3d11_device`. On `static` the two are one object.
+/// On the `static` backend this is [`device`]'s pointer. On the `dynamic`
+/// backend it is the device of `libedgefirst_tensor`, read through
+/// `ef_d3d11_device`.
 ///
-/// **Borrowed**: no reference is transferred, and the caller must never
-/// `Release` it.
+/// Borrowed: no reference is transferred, and the caller must not `Release`
+/// it.
 #[cfg(not(edgefirst_tensor_dynamic))]
 pub fn backend_device() -> crate::Result<*mut std::ffi::c_void> {
     device().map(|d| d.raw())
@@ -45,14 +36,9 @@ pub fn backend_device() -> crate::Result<*mut std::ffi::c_void> {
 /// Installs a host-owned `ID3D11Device*` into the copy of this crate that
 /// allocates.
 ///
-/// [`use_external_device`] installs into this copy's own slot. On the
-/// `dynamic` backend that slot is never read: the library allocates, and it
-/// consults its own slot and the rendezvous. A host that installed here and
-/// then allocated would silently get the library's own freshly created
-/// device instead, with no error to say so. Routing the call through
-/// `ef_d3d11_use_external_device` puts the pointer where the allocation reads
-/// it; the library then publishes it through the rendezvous, so this copy
-/// adopts it as well.
+/// On the `static` backend this is [`use_external_device`]. On the `dynamic`
+/// backend the call goes through `ef_d3d11_use_external_device`; the library
+/// publishes the device through the rendezvous and this copy adopts it.
 ///
 /// # Safety
 ///
@@ -60,13 +46,11 @@ pub fn backend_device() -> crate::Result<*mut std::ffi::c_void> {
 /// stay live until the first device use takes the reference.
 #[cfg(not(edgefirst_tensor_dynamic))]
 pub unsafe fn backend_use_external_device(ptr: *mut std::ffi::c_void) -> crate::Result<()> {
-    // SAFETY: the caller carries this function's own contract, which is the
-    // one `use_external_device` states.
+    // SAFETY: the caller carries the contract `use_external_device` states.
     unsafe { use_external_device(ptr) }
 }
 
-/// The `dynamic` backend's [`backend_device`]: the library's device, not this
-/// copy's.
+/// The `dynamic` backend's [`backend_device`]: the library's device.
 #[cfg(edgefirst_tensor_dynamic)]
 pub fn backend_device() -> crate::Result<*mut std::ffi::c_void> {
     // SAFETY: no arguments; the export returns a borrowed pointer or NULL
@@ -88,7 +72,7 @@ pub fn backend_device() -> crate::Result<*mut std::ffi::c_void> {
 #[cfg(edgefirst_tensor_dynamic)]
 pub unsafe fn backend_use_external_device(ptr: *mut std::ffi::c_void) -> crate::Result<()> {
     // SAFETY: the caller carries the contract `ef_d3d11_use_external_device`
-    // states, which is the one `use_external_device` states.
+    // states.
     let rc = unsafe { edgefirst_tensor_ffi::ef_d3d11_use_external_device(ptr) };
     if rc != 0 {
         return Err(crate::tensor_dyn::ffi_error(crate::Error::InvalidArgument));

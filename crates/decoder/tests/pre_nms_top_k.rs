@@ -163,8 +163,6 @@ fn count_for_tracking(d: &Decoder) -> usize {
 
 #[test]
 fn tracking_decode_uses_the_argmax_default_cap() {
-    // The multi-label default only exists for multi-label candidates;
-    // tracking decodes argmax, so it keeps the 300 default.
     let d = builder()
         .add_output(detection_cfg())
         .with_multi_label(true)
@@ -202,7 +200,7 @@ fn tracking_decode_honours_an_explicit_cap() {
 
 #[test]
 fn tracking_decode_honours_the_multi_label_value_assigned_after_build() {
-    // Assigning exactly the multi-label default is still an explicit choice.
+    // The multi-label default value, assigned after build.
     let mut d = builder()
         .add_output(detection_cfg())
         .with_multi_label(true)

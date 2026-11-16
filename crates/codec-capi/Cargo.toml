@@ -11,16 +11,11 @@ authors = ["Au-Zone Technologies <support@au-zone.com>"]
 homepage = "https://edgefirst.ai"
 repository = "https://github.com/EdgeFirstAI/hal"
 license = "Apache-2.0"
-publish = false # C library - distributed via GitHub Releases, not crates.io
+publish = false
 
 [lib]
-# The shipped artifact is libedgefirst_codec.{a,so,dylib} -- NOT
-# `..._capi`. The `-capi` suffix names the *source crate*, mirroring the
-# `python-*` siblings; it must never reach a filename a consumer links against.
-# `rlib` is deliberately absent: it would collide with the edgefirst-codec
-# crate's own libedgefirst_codec.rlib, and nothing needs it.
+# The library is libedgefirst_codec.{a,so,dylib}; no `rlib` is built.
 crate-type = ["staticlib", "cdylib"]
-# Shares its lib name with the library crate it wraps; rustdoc output would collide.
 doc = false
 name = "edgefirst_codec"
 
@@ -28,10 +23,9 @@ name = "edgefirst_codec"
 default = ["tracing"]
 tracing = ["edgefirst-tensor/tracing"]
 
-# Links libedgefirst_tensor.so (dynamic backend + tensor-ffi declarations)
-# rather than embedding a private tensor copy.
+# Links libedgefirst_tensor.so (dynamic backend and tensor-ffi declarations).
 [dependencies]
-# The engines this library ships, spelled out rather than inherited from codec's defaults.
+# The engines this library ships.
 edgefirst-codec = { version = "0.40.0", path = "../codec", default-features = false, features = [
     "v4l2",
     "nvjpeg",
@@ -51,15 +45,13 @@ log = "0.4.33"
 cbindgen = "0.29"
 edgefirst-build-support = { path = "../build-support" }
 
-# Excluded from the workspace (see the root Cargo.toml's [workspace.exclude]
-# comment), so this crate inherits NEITHER the root's [workspace.lints] NOR
-# its [profile.release]/[profile.profiling] -- both are restated here by hand. CONTRIBUTING.md
-# documents why and says to keep this in sync with the root manually.
+# Excluded from the workspace: the lints and profiles of the root Cargo.toml
+# are restated here.
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage,coverage_nightly)', 'cfg(edgefirst_tensor_dynamic)'] }
 
-# Shipped artifacts only (release branches): whole-program LTO in one codegen unit.
+# Release: whole-program LTO in one codegen unit.
 [profile.release]
 opt-level = 3
 lto = "fat"
@@ -67,7 +59,7 @@ codegen-units = 1
 strip = true
 debug = false
 
-# Every test and CI build: release optimisation without the fat-LTO link time.
+# Profiling: release optimisation without fat LTO.
 [profile.profiling]
 inherits = "release"
 lto = "thin"
@@ -75,7 +67,7 @@ codegen-units = 16
 strip = false
 debug = "line-tables-only"
 
-# Standalone package: stops cargo's upward workspace search. The resolver is
-# pinned to match the root workspace's behavior.
+# Standalone package: stops cargo's upward workspace search, with the root
+# workspace's resolver.
 [workspace]
 resolver = "3"

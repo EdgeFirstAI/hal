@@ -4,8 +4,7 @@ precision highp float;
 uniform __samplerExternal2DY2YEXT src;
 uniform highp vec4 src_extent;
 // Per-tensor colorimetry (YUV→RGB matrix + range), set by draw_nv_texture_2d
-// from the source tensor's resolved colorimetry. Path B applies the matrix in
-// the shader, so it is correct regardless of driver EGL color-hint support.
+// from the source tensor's resolved colorimetry.
 uniform float y_offset;
 uniform float y_scale;
 uniform float c_vr;
@@ -16,10 +15,7 @@ in vec3 fragPos;
 in highp vec2 tc;
 out vec4 color;
 
-// Floor expanded luma at 0 to match the CPU `yuv` crate's saturating (Y-16)
-// term (limited footroom Y<16 → 0). The top is left uncapped — the crate lets
-// headroom exceed 1.0 and relies on the final RGB clamp, so the GL path must
-// too. No-op for full range (y_offset=0, y_scale=1).
+// Floors expanded luma at 0; the top is not capped.
 vec3 nv_yuv_to_rgb(float yv, float u, float v) {
     float yp = max((yv - y_offset) * y_scale, 0.0);
     float up = u - 128.0 / 255.0;

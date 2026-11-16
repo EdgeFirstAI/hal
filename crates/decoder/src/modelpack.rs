@@ -478,7 +478,6 @@ pub(crate) fn postprocess_modelpack_split_quant<T: AsPrimitive<f32>>(
         };
         let p_sigmoid = p_sigmoid.as_standard_layout();
 
-        // Safe to unwrap since we ensured standard layout above
         let p = p_sigmoid
             .as_slice()
             .expect("Sigmoids are not in standard layout");
@@ -523,7 +522,6 @@ pub(crate) fn postprocess_modelpack_split_quant<T: AsPrimitive<f32>>(
             }
         }
     }
-    // Safe to unwrap since we ensured lengths will match above
 
     debug_assert_eq!(bboxes.len() % 4, 0);
     debug_assert_eq!(bscores.len() % nc, 0);
@@ -588,7 +586,6 @@ pub(crate) fn postprocess_modelpack_split_float<T: AsPrimitive<f32> + Send + Syn
         let p_sigmoid = p.mapv(|x| fast_sigmoid(x.as_()));
         let p_sigmoid = p_sigmoid.as_standard_layout();
 
-        // Safe to unwrap since we ensured standard layout above
         let p = p_sigmoid
             .as_slice()
             .expect("Sigmoids are not in standard layout");
@@ -633,7 +630,6 @@ pub(crate) fn postprocess_modelpack_split_float<T: AsPrimitive<f32> + Send + Syn
             }
         }
     }
-    // Safe to unwrap since we ensured lengths will match above
 
     debug_assert_eq!(bboxes.len() % 4, 0);
     debug_assert_eq!(bscores.len() % nc, 0);
@@ -663,7 +659,6 @@ pub(crate) fn modelpack_segmentation_to_mask(segmentation: ArrayView3<u8>) -> Ar
     let width = segmentation.shape()[1];
     let channels = segmentation.shape()[2];
     let segmentation = segmentation.as_standard_layout();
-    // Safe to unwrap since we ensured standard layout above
     let seg = segmentation
         .as_slice()
         .expect("Segmentation is not in standard layout");
@@ -747,9 +742,7 @@ mod modelpack_tests {
         }
     }
 
-    /// The 80.0 cut-off is exclusive. At exactly -80 the smooth branch still
-    /// runs and returns a small positive number; the saturating branch would
-    /// return a hard 0.0, which is a different value, not a rounding of it.
+    /// `fast_sigmoid` saturates beyond the 80.0 cut-off, not at it.
     #[test]
     fn fast_sigmoid_saturates_beyond_the_cutoff_not_at_it() {
         assert!(
@@ -796,8 +789,7 @@ mod modelpack_tests {
         let expected_scores = [full_sigmoid(1.0) * obj, full_sigmoid(-1.0) * obj];
 
         // fast_sigmoid is accurate to 5e-4; the width and height terms
-        // square it and scale by 4 * anchor, so the box tolerance is looser
-        // than the score tolerance by exactly that factor.
+        // square it and scale by 4 * anchor.
         for (i, want) in expected_box.iter().enumerate() {
             assert!(
                 (boxes[[0, i]] - want).abs() < 1e-2,

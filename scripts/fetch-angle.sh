@@ -4,11 +4,9 @@
 #
 # Download and verify a pre-built ANGLE package from the
 # EdgeFirstAI/angle-package GitHub release, then extract it to a local
-# directory. Used by the macOS, iOS and Windows builders so they share one
-# signed ANGLE artifact instead of each rebuilding from source (or, on
-# macOS, the Homebrew tap plus a re-sign step).
+# directory.
 #
-# The release ships, per tag (both built from the same pinned ANGLE commit):
+# The release ships, per tag:
 #   angle-xcframeworks-<tag>.zip          — EGL.xcframework + GLESv2.xcframework (macOS/iOS)
 #   angle-xcframeworks-<tag>.zip.sha256   — checksum
 #   angle-windows-x64-<tag>.zip           — bin/libEGL.dll + libGLESv2.dll, lib/*.lib,
@@ -29,18 +27,20 @@
 #   scripts/fetch-angle.sh [--windows|--macos] [dest-dir] [tag]
 #
 #   --windows / --macos  which package to fetch. Default: from the host
-#                        (`uname -s` MINGW*/MSYS*/CYGWIN* → windows, else macos);
-#                        FETCH_ANGLE_PLATFORM=windows|macos overrides.
-#   dest-dir  defaults to target/angle  (a cached download location)
-#   tag       defaults to v2.1.28252  (matches the ANGLE GL_VERSION string)
+#                        (`uname -s` MINGW*/MSYS*/CYGWIN* → windows, else macos).
+#   dest-dir    defaults to target/angle
+#   tag         defaults to v2.1.28252
+#   -h, --help  print this header
 #
 # Environment:
-#   GH_TOKEN / GITHUB_TOKEN  optional. EdgeFirstAI/angle-package is public, so no
-#                            auth is required to download the release. A token (or
-#                            a local `gh auth login`) is still honored if present
-#                            and raises GitHub's API rate limit, but is not needed.
+#   FETCH_ANGLE_PLATFORM           windows|macos; the package to fetch when no
+#                                  option names one.
+#   FETCH_ANGLE_ALLOW_UNVERIFIED   1 accepts the zip when its checksum cannot be
+#                                  fetched or read.
+#   GH_TOKEN / GITHUB_TOKEN        optional; sent with the download when set.
 #
-# Exit codes: 0 success (or already cached + verified); 1 download/verify/extract failure.
+# Exit codes: 0 success (or already cached + verified); 1 download, verify or
+# extract failure.
 
 set -euo pipefail
 
@@ -83,22 +83,18 @@ SHA_PATH="${CACHE_DIR}/${SHA_NAME}"
 
 # --- Download (if not cached) ------------------------------------------------
 #
-# The EdgeFirstAI/angle-package repo is public, so no authentication is required.
-# Prefer `gh release download` (handles redirects; uses a token if one happens to
-# be set); fall back to plain curl, which downloads the public asset with no token.
+# Uses `gh release download` when gh is present, and curl otherwise.
 
 download_asset() {
     local url="$1" out="$2" name="$3"
     if command -v gh >/dev/null 2>&1; then
-        # `gh release download` handles redirects (and auth if a token is set).
-        # --clobber overwrites a stale cached copy; --output names the file.
         if gh release download "${TAG}" --repo "${REPO}" --pattern "${name}" \
             --dir "${CACHE_DIR}" --clobber 2>/dev/null; then
             return 0
         fi
         echo "fetch-angle: gh download failed for ${name}, trying curl…" >&2
     fi
-    # curl fallback: the release is public, so no token is needed (one is used if set).
+    # curl fallback; a token is sent if one is set.
     local auth=()
     if [[ -n "${GH_TOKEN:-${GITHUB_TOKEN:-}}" ]]; then
         auth=(-H "Authorization: Bearer ${GH_TOKEN:-${GITHUB_TOKEN}}")
@@ -114,21 +110,17 @@ else
     echo "fetch-angle: using cached ${ZIP_PATH}"
 fi
 
-# Always (re)fetch the checksum — it's tiny and guards against a stale
-# checksum if the release was re-published. Capture failure rather than
-# swallowing it: this artifact is linked straight into the app, so verifying
-# it is a supply-chain requirement, not a nicety.
+# Always (re)fetch the checksum.
 sha_download_ok=1
 download_asset "${SHA_URL}" "${SHA_PATH}" "${SHA_NAME}" 2>/dev/null || sha_download_ok=0
 
 # --- Verify the checksum -----------------------------------------------------
 #
-# The .sha256 file may be "<hash>  <filename>" (shasum format) or bare "<hash>".
-# We take the first whitespace-delimited token as the hash, which handles both.
+# The .sha256 file may be "<hash>  <filename>" (shasum format) or bare "<hash>";
+# the first whitespace-delimited token is the hash.
 #
-# Fail CLOSED: if the checksum cannot be fetched/read we refuse to use the
-# unverified zip. Set FETCH_ANGLE_ALLOW_UNVERIFIED=1 to override (e.g. an
-# offline dev box working from a trusted cached zip).
+# When the checksum cannot be fetched or read the zip is refused, unless
+# FETCH_ANGLE_ALLOW_UNVERIFIED=1 is set.
 
 if [[ ${sha_download_ok} -eq 0 || ! -s "${SHA_PATH}" ]]; then
     if [[ "${FETCH_ANGLE_ALLOW_UNVERIFIED:-0}" == "1" ]]; then
@@ -140,9 +132,8 @@ if [[ ${sha_download_ok} -eq 0 || ! -s "${SHA_PATH}" ]]; then
         exit 1
     fi
 else
-    # First whitespace-delimited token = the hash (bare or "hash  filename").
     EXPECTED="$(awk '{print $1; exit}' "${SHA_PATH}")"
-    # macOS ships shasum, Git Bash ships sha256sum, and plain Windows has certutil.
+    # Uses sha256sum, shasum or certutil, whichever is present.
     if command -v sha256sum >/dev/null 2>&1; then
         ACTUAL="$(sha256sum "${ZIP_PATH}" | awk '{print $1}')"
     elif command -v shasum >/dev/null 2>&1; then
@@ -167,13 +158,12 @@ fi
 
 # --- Extract -----------------------------------------------------------------
 
-# Portable unzip: Git Bash has unzip; Windows 10+ tar reads zips; PowerShell
-# Expand-Archive is the last resort.
+# Extracts with unzip, tar or PowerShell Expand-Archive, whichever is present.
 extract_zip() {
     local zip="$1" dest="$2"
     mkdir -p "${dest}"
     if command -v unzip >/dev/null 2>&1; then
-        # -x "*/._*" skips macOS AppleDouble metadata files (harmless but noisy).
+        # -x "*/._*" skips macOS AppleDouble metadata files.
         unzip -q -o "${zip}" -d "${dest}" -x "*/._*" "*/.DS_Store"
     elif command -v tar >/dev/null 2>&1 && tar -tf "${zip}" >/dev/null 2>&1; then
         tar -xf "${zip}" -C "${dest}"
@@ -194,8 +184,8 @@ if [[ "${PLATFORM}" == windows ]]; then
         echo "fetch-angle: extracting to ${WIN_DIR}"
         rm -rf "${WIN_DIR}"
         extract_zip "${ZIP_PATH}" "${WIN_DIR}"
-        # The Windows zip is flat (bin/ lib/ include/ at the root); tolerate a
-        # top-level dir defensively, as the macOS branch does for dist/.
+        # The Windows zip is flat (bin/ lib/ include/ at the root); a top-level
+        # directory is also accepted.
         if [[ ! -f "${WIN_DIR}/bin/libEGL.dll" ]]; then
             for sub in "${WIN_DIR}"/*/; do
                 if [[ -f "${sub}bin/libEGL.dll" ]]; then
@@ -222,30 +212,19 @@ fi
 EGL_BIN="${DEST}/EGL.xcframework/macos-arm64/libEGL.framework/libEGL"
 GLES_BIN="${DEST}/GLESv2.xcframework/macos-arm64/libGLESv2.framework/libGLESv2"
 
-# Re-extract unless BOTH framework binaries are present. Checking only EGL let
-# a half-populated ${DEST} look complete.
+# Re-extract unless both framework binaries are present.
 if [[ -f "${EGL_BIN}" && -f "${GLES_BIN}" ]]; then
     echo "fetch-angle: already extracted at ${DEST}"
 else
     echo "fetch-angle: extracting to ${DEST}"
-    # Extract to a staging dir, then move the payload in deliberately,
-    # replacing whatever is already there.
-    #
-    # This used to extract straight into ${DEST} and flatten the zip's top
-    # level with `mv "${DEST}"/dist/* "${DEST}"/ 2>/dev/null || true`. When
-    # ${DEST}/EGL.xcframework already existed -- which a partially restored
-    # target/ cache leaves behind -- BSD mv refuses to merge one directory into
-    # another and fails. The redirect hid the message and `|| true` hid the
-    # status, so the payload stayed in ${DEST}/dist and the script ran on to
-    # fail in the cp below, reporting "No such file or directory" for a path
-    # the zip definitely contains. It only surfaced on a cache miss, which is
-    # why the same commit passed and failed hours apart.
+    # Extract to a staging dir, then move the payload in, replacing whatever is
+    # already there.
     STAGING="${DEST}/.extract"
     rm -rf "${STAGING}"
     extract_zip "${ZIP_PATH}" "${STAGING}"
 
-    # The zip's top level is "dist/"; consumers expect ${DEST}/EGL.xcframework
-    # directly. Tolerate the prefix being absent.
+    # The zip's top level is "dist/"; the payload moves to ${DEST} directly.
+    # The prefix may be absent.
     SRC="${STAGING}/dist"
     [[ -d "${SRC}" ]] || SRC="${STAGING}"
 
@@ -256,12 +235,11 @@ else
     done
     rm -rf "${STAGING}"
 
-    # A flat-lib left by an earlier extract would otherwise be reused below
-    # without being restaged against the binaries just unpacked.
+    # Remove a flat-lib left by an earlier extract.
     rm -rf "${DEST}/macos-flat-lib"
 fi
 
-# Fail where the cause is legible, rather than in the cp below.
+# Check that both framework binaries exist.
 for required in "${EGL_BIN}" "${GLES_BIN}"; do
     [[ -f "${required}" ]] || {
         echo "fetch-angle: ERROR - ${required} missing after extracting ${ZIP_NAME}" >&2
@@ -272,16 +250,8 @@ done
 
 # --- Stage the macOS flat-lib layout ----------------------------------------
 #
-# The macOS runtime path `dlopen`s libEGL, and ANGLE's libEGL in turn
-# `dlopen`s `libGLESv2.dylib` from its OWN directory (located via dladdr).
-# The framework bundle layout (`libEGL.framework/libEGL`) does NOT satisfy
-# this — ANGLE would look for `libEGL.framework/libGLESv2.dylib`, which
-# doesn't exist. So for the macOS host-test path we stage a flat directory of
-# `libEGL.dylib` + `libGLESv2.dylib` siblings copied from the framework
-# binaries. Point `EDGEFIRST_ANGLE_PATH` at this dir.
-#
-# (The iOS path is unaffected — it resolves via Library::this() from the
-# embedded frameworks and never goes through this dlopen flow.)
+# A flat directory of `libEGL.dylib` + `libGLESv2.dylib` siblings copied from
+# the framework binaries. `EDGEFIRST_ANGLE_PATH` points at this directory.
 FLAT_DIR="${DEST}/macos-flat-lib"
 if [[ -f "${FLAT_DIR}/libEGL.dylib" && -f "${FLAT_DIR}/libGLESv2.dylib" ]]; then
     echo "fetch-angle: flat-lib already staged at ${FLAT_DIR}"
@@ -292,18 +262,7 @@ else
     cp "${GLES_BIN}" "${FLAT_DIR}/libGLESv2.dylib"
 fi
 
-# Ad-hoc re-sign the flattened dylibs. The release framework binaries are
-# Developer-ID-signed + notarized, but that signature is scoped to the
-# framework BUNDLE (it seals the framework's Info.plist). Pulling the binary
-# out to a flat `libEGL.dylib` invalidates it: `codesign --verify` reports
-# "invalid Info.plist (plist or signature have been modified)" and `dlopen`
-# fails with "code signature invalid" (an invalid signature is rejected more
-# firmly than an unsigned binary). A fresh ad-hoc signature is self-contained
-# (no bundle dependency) and loads cleanly; the macOS test binaries carry the
-# `disable-library-validation` entitlement, so they accept ad-hoc-signed
-# dylibs. This mirrors the Homebrew re-sign step, and only the flat-lib needs
-# it — the xcframework/iOS-embed path keeps the original signed frameworks
-# intact. Runs every time (idempotent) so it also repairs a stale cached copy.
+# Ad-hoc re-sign the flattened dylibs. Runs every time.
 if command -v codesign >/dev/null 2>&1; then
     echo "fetch-angle: ad-hoc re-signing flat-lib dylibs (bundle-scoped signature is invalid once flattened)"
     codesign --force --sign - "${FLAT_DIR}/libGLESv2.dylib"

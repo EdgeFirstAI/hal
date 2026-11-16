@@ -2,14 +2,9 @@
 # SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 # SPDX-License-Identifier: Apache-2.0
 #
-# Compile every shipped header as C11 AND C++17 under -Werror, then LINK AND
-# RUN one consumer per library. `-fsyntax-only` proves a header parses; only
-# an executed binary proves the library loads and its symbols resolve.
-#
-# INABILITY TO MEASURE IS NOT A PASS. A missing compiler, a missing library,
-# or a link/run step that gets silently skipped must all count as a failure
-# -- never as "0 checked, want 0, PASS". See scripts/check-single-home.sh's
-# cannot_measure() for the same rule applied to the sibling gate script.
+# Compile every shipped header as C11 and C++17 under -Werror, then link and
+# run one consumer per library. A missing compiler, a missing library, or a
+# skipped link or run step fails the script.
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "${ROOT}"
 LIBDIR="target/${PROFILE:-debug}"; fails=0
@@ -20,8 +15,7 @@ trap 'rm -rf "${WORKDIR}"' EXIT
 INCS="-Icrates/decoder-abi/include"
 for l in tensor image codec decoder tracker kernels; do INCS="${INCS} -Icrates/${l}-capi/include"; done
 
-# G4: detect.h has one home. Copies under *-capi/include are the duplication
-# this split exists to remove, and they are not packaged.
+# Fails when a copy of detect.h exists under a *-capi/include directory.
 for dup in crates/image-capi/include/edgefirst/detect.h \
            crates/decoder-capi/include/edgefirst/detect.h \
            crates/tracker-capi/include/edgefirst/detect.h; do
@@ -35,10 +29,7 @@ if [[ ! -s crates/decoder-abi/include/edgefirst/detect.h ]]; then
   fails=$((fails+1))
 fi
 
-# A compiler that cannot be invoked at all must fail loudly rather than let
-# every `-fsyntax-only`/link step below silently no-op through a missing
-# binary -- `command -v` catches that before the loop ever starts trusting
-# CC/CXX's exit code as a real verdict.
+# Fails when a compiler cannot be invoked.
 if ! command -v "${CC}" >/dev/null 2>&1; then
   echo "FAIL: C compiler '${CC}' not found -- cannot measure"; exit 1
 fi
@@ -91,11 +82,7 @@ for l in tensor image codec decoder tracker kernels; do
   ran_link=$((ran_link+1))
 done
 
-# The gated count (`fails`) is legitimately 0 in the passing state, so it
-# cannot double as proof the link-and-run step ran at all -- a loop body that
-# silently skipped every library (e.g. every `[ -f "${src}" ]` check failing
-# open) would also leave `fails` at 0. `ran_link` is independent of pass/fail
-# outcome and must be exactly 6 (one per library) for this run to count.
+# `ran_link` counts the libraries linked and run; it must be 6.
 if [[ "${ran_link}" -ne 6 ]]; then
   echo "FAIL: only ${ran_link}/6 libraries were actually linked and run -- cannot measure the rest"
   fails=$((fails+1))

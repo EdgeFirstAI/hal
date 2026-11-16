@@ -13,10 +13,8 @@
  * or MJPEG access units (ef_video_encoder), and decode access units into
  * frames whose pictures are tensors (ef_video_decoder).
  *
- * Image decoding writes *into* a tensor you already have, rather than
- * allocating one: that is what lets a decode target be a DMA buffer the GPU
- * will read next, with no copy in between. The tensor may come from any
- * EdgeFirst library.
+ * Image decoding writes into a tensor the caller supplies. The tensor may
+ * come from any EdgeFirst library.
  *
  * Every codec runs on an engine (ef_codec_engine): V4L2 on Linux, Media
  * Foundation on Windows, nvJPEG on Linux with CUDA, or the CPU for still
@@ -50,9 +48,6 @@ extern "C" {
 
 /**
  * @brief An opaque image decoder.
- *
- * Forward-declared so callers write `ef_image_decoder *` without the `struct`
- * keyword. Its definition is private: decoder state is not part of the ABI.
  */
 typedef struct ef_image_decoder ef_image_decoder;
 
@@ -93,7 +88,7 @@ enum ef_codec
    */
   EF_CODEC_H264 = 2,
   /**
-   * HEVC, as an Annex B byte stream. No engine runs it yet.
+   * HEVC, as an Annex B byte stream. No engine runs it.
    */
   EF_CODEC_HEVC = 3,
   /**
@@ -101,15 +96,15 @@ enum ef_codec
    */
   EF_CODEC_MJPEG = 4,
   /**
-   * VP8. No engine runs it yet.
+   * VP8. No engine runs it.
    */
   EF_CODEC_VP8 = 5,
   /**
-   * VP9. No engine runs it yet.
+   * VP9. No engine runs it.
    */
   EF_CODEC_VP9 = 6,
   /**
-   * AV1. No engine runs it yet.
+   * AV1. No engine runs it.
    */
   EF_CODEC_AV1 = 7,
 };
@@ -300,7 +295,7 @@ enum ef_video_memory
    */
   EF_VIDEO_MEMORY_IMPORTED = 0,
   /**
-   * The device's own buffers, exported as DMA-BUFs because it would not
+   * The device's own buffers, exported as DMA-BUFs, when it does not
    * import the pool's. CPU reads of these may be uncached and slow.
    */
   EF_VIDEO_MEMORY_EXPORTED = 1,
@@ -518,14 +513,6 @@ extern "C" {
 
 /**
  * ABI version of this library's C surface.
- *
- * 2: `ef_codec_colorimetry_from_v4l2` takes an `is_rgb_or_hsv` argument
- * before `out`.
- *
- * 3: engines, capabilities, `ef_image_encoder`, `ef_video_encoder` and
- * `ef_video_decoder`; `ef_codec_last_error`; image decoding answers
- * `EBADMSG` for undecodable data and `ENOTSUP` for unsupported features,
- * which were `EIO`.
  */
 uint32_t ef_codec_abi_version(void);
 
@@ -535,7 +522,7 @@ uint32_t ef_codec_abi_version(void);
 ef_image_decoder *ef_image_decoder_new(void);
 
 /**
- * Free a decoder. Freeing `NULL` is a no-op, matching `free(3)`.
+ * Free a decoder. Freeing `NULL` is a no-op.
  *
  * # Safety
  * `d` must be `NULL` or have come from [`ef_image_decoder_new`].
@@ -546,7 +533,7 @@ void ef_image_decoder_free(ef_image_decoder *d);
  * Decode JPEG or PNG bytes into `dst`, sizing and formatting it to the image.
  *
  * The container is detected from magic bytes. `dst` must be large enough;
- * a smaller allocation is an error rather than a truncated image.
+ * a smaller allocation is an error.
  *
  * @return 0 on success, `ENOSPC` when `dst` is too small, `EACCES` when the
  *         CPU decoder must write a `dst` not declared CPU-writable,
@@ -628,8 +615,7 @@ int ef_image_decoder_reset_output_format(ef_image_decoder *d);
  * `quant` is full range for an RGB/HSV format, whatever the colorspace, and
  * for `V4L2_COLORSPACE_JPEG`; limited for a YUV format in any other
  * recognised colorspace; and unset (range byte 0) for a YUV format in a
- * `DEFAULT` or unrecognised colorspace, so the at-use height heuristic
- * decides.
+ * `DEFAULT` or unrecognised colorspace.
  *
  * # Safety
  * `out` must be writable.
@@ -747,8 +733,8 @@ int ef_codec_engine_from_name(const char *name, uint32_t *out);
 /**
  * Probes the codec engines on this machine.
  *
- * Probing opens no stream, but it opens device nodes and enumerates (on
- * Windows, activates) transforms, so it is not free: call it once.
+ * Probing opens no stream; it opens device nodes and enumerates (on
+ * Windows, activates) transforms.
  *
  * @return the list, freed with [`ef_codec_capabilities_free`]; `NULL` only
  *         if allocation fails.
@@ -850,9 +836,8 @@ int ef_video_encoder_config_set_bitrate(struct ef_video_encoder_config *c, uint3
 int ef_video_encoder_config_set_gop(struct ef_video_encoder_config *c, uint32_t gop);
 
 /**
- * Whether to emit the parameter sets with every key frame, so a receiver
- * can start at any key frame (on by default). The first frame always
- * carries them.
+ * Whether to emit the parameter sets with every key frame (on by default).
+ * The first frame always carries them.
  *
  * @return 0, or `EINVAL`.
  *
@@ -994,11 +979,9 @@ const struct ef_video_encoder_info *ef_video_encoder_get_info(struct ef_video_en
  *
  * `pool_count` is the frames the caller may hold at once, 4 if 0; the
  * device's own reference pictures and one buffer to decode into are added
- * to it.
- * A V4L2 device takes a bounded number of buffers (31 on the i.MX 95's
- * Wave6, its own included); a count beyond that makes
- * [`ef_video_decoder_decode`] fail with `EINVAL` once the stream's format is
- * known.
+ * to it. A V4L2 device takes a bounded number of buffers; a count beyond
+ * that makes [`ef_video_decoder_decode`] fail with `EINVAL` once the
+ * stream's format is known.
  *
  * Platforms: Linux (V4L2 memory-to-memory decoders), Windows (Media
  * Foundation: Microsoft's H.264 decoder with DXVA, and MJPEG decoders).

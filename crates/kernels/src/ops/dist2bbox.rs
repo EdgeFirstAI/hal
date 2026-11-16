@@ -58,10 +58,9 @@ impl Kernel {
 /// Ultralytics operation order, as `prim::box_primitives::dist2bbox_anchor_f32`. The kernel is
 /// chosen at creation:
 ///
-/// 1. On NEON (every NEON tier): the decoder's NEON dequantize and four-anchor dist2bbox, fused
-///    into one pass of sixteen anchors per step (`prim::neon_ltrb`), bit for bit the decoder's
-///    level result for a one-level call. On Cortex-A55 its f32 boxes rounded to f16 are faster
-///    than native FP16 boxes, so the FP16 tier runs it too.
+/// 1. On NEON (every NEON tier, FP16 included): the decoder's NEON dequantize and four-anchor
+///    dist2bbox, fused into one pass of sixteen anchors per step (`prim::neon_ltrb`), bit for
+///    bit the decoder's level result for a one-level call.
 /// 2. Without NEON, the scalar f32 kernels.
 ///
 /// `f32` outputs are stored directly. `f16` outputs are the tier's `f32` result rounded once

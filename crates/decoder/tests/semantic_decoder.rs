@@ -202,9 +202,7 @@ fn layouts_and_dtypes_match_reference() {
 /// The scores as f32, f16, i8 and u8 tensors, each with the NCHW values its
 /// decode must match. Values sit on a 1/16 grid in [-4, 4): exact in f16, and
 /// in i8/u8 as 16*v (+128 for u8) with a matching scale and zero point. u8
-/// carries a zero point, so its interpolated values round differently from
-/// the real ones; it is checked on stored values, which differ from the
-/// real-value argmax only at exact ties.
+/// is checked on its stored values.
 fn quantized_inputs(shape: &[usize], stored: &[f32], nchw: &[f32]) -> Vec<(TensorDyn, Vec<f32>)> {
     let mut i8_input = tensor(
         shape,
@@ -275,7 +273,7 @@ fn assert_matches_reference(
 fn per_channel_quantization_dequantizes_first() {
     let (c, h, w) = (3, 4, 5);
     let v = values(c * h * w, 11);
-    // Channel k stores v / scale_k; the argmax must be taken on real values.
+    // Channel k stores v / scale_k.
     let scales = [0.5f32, 0.25, 0.125];
     let stored: Vec<i8> = v
         .iter()
@@ -303,7 +301,6 @@ fn per_channel_quantization_dequantizes_first() {
 
 #[test]
 fn per_channel_quantization_needs_one_scale_per_class() {
-    // The schema's quantization is not checked against the tensor shape.
     let input = tensor(&[1, 3, 2, 2], &[0i8; 12]);
     let config = SemanticConfig::scores(&[1, 3, 2, 2], 1, 2, 3)
         .unwrap()
@@ -398,7 +395,7 @@ fn class_map_follows_its_dshape_axes() {
 
 #[test]
 fn ties_take_the_lowest_class() {
-    // Every class scores the same everywhere: torch.argmax picks class 0.
+    // Every class scores the same everywhere.
     let input = tensor(&[1, 4, 3, 3], &[1.0f32; 36]);
     let config = SemanticConfig::scores(&[1, 4, 3, 3], 1, 2, 3).unwrap();
     for mode in [DecodeMode::Accurate, DecodeMode::Fast] {
@@ -1052,7 +1049,7 @@ fn outputs_without_write_and_inputs_without_read_are_refused() {
     let err = decode_semantic(&scores, &config, &mut dst, None, &opts).unwrap_err();
     denied(err, CpuAccess::Write, CpuAccess::Read);
 
-    // A write-only class map is enough: the decoder never reads it back.
+    // A write-only class map decodes.
     let mut dst = declared(&[2, 2], CpuAccess::Write);
     decode_semantic(&input, &config, &mut dst, None, &opts).unwrap();
 }

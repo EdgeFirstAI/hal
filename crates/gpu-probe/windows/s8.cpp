@@ -2,10 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // S8: the D3D12 side. A D3D11 texture and fence opened on a D3D12 device
-// through NT handles, the linear texture-to-buffer copy D3D11 lacks, a
-// DirectML operator over that buffer, ANGLE's own D3D11on12 platform, and
-// a probe-owned D3D12 device wrapped by D3D11On12 and injected into ANGLE
-// so textures unwrap to ID3D12Resource without any handle.
+// through NT handles, a linear texture-to-buffer copy, a DirectML operator
+// over that buffer, ANGLE's own D3D11on12 platform, and a probe-owned D3D12
+// device wrapped by D3D11On12 and injected into ANGLE.
 #include "probe.h"
 
 #include <d3d12.h>
@@ -360,7 +359,7 @@ void run_s8(GlSession& s) {
     }
     report("S8.2", bad == 0 ? Verdict::Pass : Verdict::Fail, "%s: GL render -> fence -> D3D12 CopyTextureRegion to buffer: %s", fmt_name(fmt),
            bad == SIZE_MAX ? "copy did not complete" : (bad ? "bad bytes" : "0 mismatches"));
-    // Without the queue wait, to show whether the fence is needed.
+    // The same without the queue wait.
     {
       int stale = 0;
       const int N = 100;

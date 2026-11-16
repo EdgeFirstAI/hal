@@ -1,35 +1,31 @@
 // SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! Float render-target capability probe — F16 / F32.
+//! Float render-target capability probe (F16 / F32).
 //!
-//! Answers, per target, what the GPU supports for **rendering** half-float
-//! (F16) and float (F32) color attachments and how the result can be moved
-//! to an inference runtime with the fastest available API:
+//! Reports what the GPU supports for rendering half-float (F16) and float
+//! (F32) color attachments:
 //!
-//! * **Extensions** — `GL_EXT_color_buffer_float` / `_half_float`.
-//! * **Internal-format FBO renderability** — `RGBA16F`, `R16F`, `RG16F`
+//! * **Extensions**: `GL_EXT_color_buffer_float` / `_half_float`.
+//! * **Internal-format FBO renderability**: `RGBA16F`, `R16F`, `RG16F`
 //!   (F16) and `R32F`, `RG32F`, `RGBA32F` (F32) as texture-backed color
 //!   attachments, validated with `glCheckFramebufferStatus`.
-//! * **DMA-buf zero-copy float render** — import a float DMA-buf as an
-//!   EGLImage-backed renderbuffer, render a known pattern, read it back and
-//!   verify. Only F16 has a portable DRM fourcc (`DRM_FORMAT_ABGR16161616F`);
-//!   there is **no** 32-bit-float DRM fourcc, so F32 dma-buf render is N/A.
-//! * **PBO readback** — render to an internal float FBO, `glReadPixels` into
-//!   a `GL_PIXEL_PACK_BUFFER`, map and verify; timed at representative packed
-//!   dimensions so the two transfer mechanisms can be compared directly.
+//! * **DMA-buf float render**: import a float DMA-buf
+//!   (`DRM_FORMAT_ABGR16161616F`) as an EGLImage-backed renderbuffer, render
+//!   a known pattern, read it back and verify. F32 has no DRM fourcc and is
+//!   reported N/A.
+//! * **PBO readback**: render to an internal float FBO, `glReadPixels` into
+//!   a `GL_PIXEL_PACK_BUFFER`, map and verify; timed at the packed
+//!   dimensions below.
 //!
-//! The probe never panics: every GL/EGL step is guarded and reported as
-//! PASS / FAIL / SKIP / N/A so a single driver quirk cannot abort the run.
+//! Every GL/EGL step is guarded and reported as PASS / FAIL / SKIP / N/A.
 //!
-//! ## Layout context (why these dimensions)
+//! ## Timed dimensions
 //!
-//! The HAL float-preprocessing target layouts are:
-//! * **orin-nano (TensorRT, F16):** NCHW planar `[3,H,W]` packed 4 contiguous
-//!   `f16` per RGBA16F texel → surface `(W/4, 3·H)`. For 640×640 that is
-//!   `(160, 1920)` RGBA16F = 2,457,600 bytes.
-//! * **rpi5-hailo (HailoRT, F32):** NHWC tightly-packed `[H,W,3]`. `RGB32F`
-//!   is not color-renderable, so the candidate is a single-channel `R32F`
+//! * **F16:** NCHW planar `[3,H,W]` packed 4 contiguous `f16` per RGBA16F
+//!   texel → surface `(W/4, 3·H)`. For 640×640 that is `(160, 1920)`
+//!   RGBA16F = 2,457,600 bytes.
+//! * **F32:** NHWC tightly-packed `[H,W,3]` as a single-channel `R32F`
 //!   surface `(W·3, H)` where the shader emits one channel per fragment. For
 //!   640×640×3 that is `(1920, 640)` R32F = 4,915,200 bytes.
 
@@ -39,15 +35,13 @@ use std::os::unix::io::AsRawFd;
 use std::ptr::null;
 use std::time::Instant;
 
-/// `DRM_FORMAT_ABGR16161616F` — the only float DRM fourcc usable as a
-/// renderable RGBA16F dma-buf. Packed little-endian R,G,B,A half-floats.
+/// `DRM_FORMAT_ABGR16161616F`: packed little-endian R,G,B,A half-floats.
 const DRM_FORMAT_ABGR16161616F: u32 = 1_211_384_385;
 
 /// `GL_FRAMEBUFFER_INCOMPLETE_DIMENSIONS` (0x8CD9).
 const FRAMEBUFFER_INCOMPLETE_DIMENSIONS: u32 = 0x8CD9;
 
-/// Iterations for the transfer-timing loops. Kept small so the probe stays
-/// quick on slow embedded GPUs while still averaging out scheduler jitter.
+/// Iterations for the transfer-timing loops.
 const TIMING_ITERS: u32 = 50;
 
 fn yn(b: bool) -> &'static str {
@@ -216,9 +210,8 @@ unsafe fn pbo_readback_timed(case: &FormatCase, w: i32, h: i32) -> Option<f64> {
         return None;
     }
 
-    // GLES 3.0 §4.3.2 only guarantees the implementation's preferred read pair.
-    // Query it and prefer it over the nominal (format, type) when they differ so
-    // strict drivers don't return GL_INVALID_OPERATION from glReadPixels.
+    // Query the implementation's preferred read pair and use it when it
+    // differs from the nominal (format, type).
     let mut impl_fmt: i32 = 0;
     let mut impl_ty: i32 = 0;
     edgefirst_gl::gl::GetIntegerv(
@@ -233,8 +226,7 @@ unsafe fn pbo_readback_timed(case: &FormatCase, w: i32, h: i32) -> Option<f64> {
         && impl_ty != 0
         && (impl_fmt as u32 != case.format || impl_ty as u32 != case.ty);
     let (rd_fmt, rd_ty, rd_bpp) = if use_impl {
-        // Promote to the driver-preferred pair. Compute bytes-per-pixel for the
-        // promoted (format, type) so the PBO is sized correctly.
+        // Bytes per pixel of the driver-preferred (format, type), for the PBO size.
         let comps = match impl_fmt as u32 {
             edgefirst_gl::gl::RED => 1,
             edgefirst_gl::gl::RG => 2,
@@ -282,8 +274,7 @@ unsafe fn pbo_readback_timed(case: &FormatCase, w: i32, h: i32) -> Option<f64> {
         let start = Instant::now();
 
         edgefirst_gl::gl::Viewport(0, 0, w, h);
-        // Distinct per-iteration clear color so a stale-buffer read cannot
-        // masquerade as a successful transfer.
+        // Distinct clear color per iteration.
         let c = 0.25 + (i % 4) as f32 * 0.1;
         edgefirst_gl::gl::ClearColor(c, 0.5, 0.75, 1.0);
         edgefirst_gl::gl::Clear(edgefirst_gl::gl::COLOR_BUFFER_BIT);
@@ -302,11 +293,7 @@ unsafe fn pbo_readback_timed(case: &FormatCase, w: i32, h: i32) -> Option<f64> {
             edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::PIXEL_PACK_BUFFER, 0);
             break;
         }
-        // Sanity-check the channel actually transferred. The clear color
-        // encodes to multi-byte half/float words whose *low* byte can be
-        // zero (e.g. half 0.25 == 0x3400 → bytes 00,34), so scan a span of
-        // the first few texels for any non-zero byte rather than testing a
-        // single byte.
+        // Scan the first texels for any non-zero byte.
         if i == 0 {
             let scan = byte_size.min(64);
             let bytes = std::slice::from_raw_parts(map as *const u8, scan);
@@ -330,9 +317,7 @@ unsafe fn pbo_readback_timed(case: &FormatCase, w: i32, h: i32) -> Option<f64> {
     }
 }
 
-/// Outcome of the F16 dma-buf render attempt, disambiguating the stage that
-/// failed so a missing dma-heap (allocation) is not confused with a driver
-/// that cannot import/render an RGBA16F dma-buf.
+/// Outcome of the F16 dma-buf render attempt, by the stage that failed.
 enum DmaF16Status {
     /// No `glEGLImageTargetRenderbufferStorageOES` entry point.
     NoRenderbufferExt,
@@ -342,7 +327,7 @@ enum DmaF16Status {
     EglImportFailed(String),
     /// EGLImage imported but the FBO was incomplete.
     FboIncomplete(String),
-    /// Rendered, but the readback came back all-zero (silent driver trap).
+    /// Rendered, but the readback came back all-zero.
     ReadbackEmpty,
     /// Full render + readback round-trip succeeded.
     Ok,
@@ -373,7 +358,6 @@ impl DmaF16Status {
 /// Requires a current GL context.
 unsafe fn dmabuf_f16_render(ctx: &GpuContext, w: u32, h: u32) -> DmaF16Status {
     if !ctx.has_rgb8_renderbuffer() {
-        // Same entry point (glEGLImageTargetRenderbufferStorageOES) gates this.
         return DmaF16Status::NoRenderbufferExt;
     }
     let bpp: u32 = 8; // RGBA16F
@@ -428,8 +412,7 @@ unsafe fn dmabuf_f16_render(ctx: &GpuContext, w: u32, h: u32) -> DmaF16Status {
         edgefirst_gl::gl::Clear(edgefirst_gl::gl::COLOR_BUFFER_BIT);
         edgefirst_gl::gl::Finish();
 
-        // Read back through the FBO as RGBA16F to confirm the render landed
-        // (guards against the silent all-zeros EGLImage trap some drivers hit).
+        // Read back through the FBO as RGBA16F.
         let mut buf = vec![0u8; (w * h * bpp) as usize];
         edgefirst_gl::gl::ReadPixels(
             0,
@@ -590,7 +573,7 @@ pub fn run(ctx: &GpuContext) {
     }
     println!();
 
-    // --- Verdict (machine-greppable) ---
+    // --- Verdict ---
     let f16_fbo = *renderable.get("RGBA16F").unwrap_or(&false);
     let f32_fbo = *renderable.get("R32F").unwrap_or(&false);
     let f16_fastest = if f16_dma_verified {
@@ -601,7 +584,6 @@ pub fn run(ctx: &GpuContext) {
         "none".to_string()
     };
     let f32_fastest = match f32_pbo {
-        // F32 dma-buf is impossible (no fourcc), so PBO is the ceiling.
         Some(ms) => format!("pbo({ms:.2}ms)"),
         None => "none".to_string(),
     };

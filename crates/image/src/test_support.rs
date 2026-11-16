@@ -16,7 +16,7 @@ mod dma_require;
 
 /// [`edgefirst_tensor::is_dma_available`] under the `HAL_TEST_REQUIRE_DMA=1`
 /// policy: on a lane that requires a DMA heap, an unavailable one fails the
-/// calling test instead of letting it skip while reporting success.
+/// calling test.
 pub(crate) fn is_dma_available() -> bool {
     dma_require::decide(
         edgefirst_tensor::is_dma_available(),
@@ -139,16 +139,14 @@ fn g2d_skip_wins_over_availability() {
     assert_eq!(g2d_skip_decide(false, false, false, "t"), Some(G2D_MISSING));
 }
 
-/// Background of the box-outline fixture; its alpha is not 255 so a test
-/// can tell whether a draw wrote the destination's alpha channel.
+/// Background of the box-outline fixture; its alpha is not 255.
 pub(crate) const BOX_BG: [u8; 4] = [10, 20, 30, 200];
 /// Side of the square box-outline fixture.
 pub(crate) const BOX_DIM: usize = 32;
 
 /// Draws one box over [`BOX_BG`] with `processor` using `color`, `width`
 /// (`None` keeps the processor's) and `opacity`, and returns the RGBA
-/// pixels. The box is the middle half of
-/// a [`BOX_DIM`]-square image, so its outline sits well inside the border.
+/// pixels. The box is the middle half of a [`BOX_DIM`]-square image.
 pub(crate) fn draw_box_fixture(
     processor: &mut dyn crate::ImageProcessorTrait,
     color: [u8; 4],

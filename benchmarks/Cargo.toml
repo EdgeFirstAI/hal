@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 # SPDX-License-Identifier: Apache-2.0
 #
-# Separate workspace for Article-1 comparison modules. Root HAL Cargo.toml
-# lists `exclude = ["benchmarks"]` so these never enter `cargo build --workspace`.
+# Separate workspace for the benchmark comparison modules, excluded from the
+# root HAL workspace.
 
 [workspace]
 resolver = "3"
@@ -24,7 +24,7 @@ edition = "2021"
 license = "Apache-2.0"
 publish = false
 
-# Optimized + debug symbols for on-target perf / chrome traces (mirrors root).
+# Optimized + debug symbols for on-target perf / chrome traces.
 [profile.release]
 opt-level = 3
 lto = "fat"

@@ -1,4 +1,4 @@
-"""The A3 packaging contract, verified against installed modules."""
+"""The packaging contract of the edgefirst namespace, checked on installed modules."""
 
 import importlib
 import pathlib
@@ -23,7 +23,7 @@ def test_module_imports(name):
 
 
 def test_no_namespace_init_anywhere():
-    """One edgefirst/__init__.py would shadow the namespace for every sibling."""
+    """No path of the edgefirst namespace holds an __init__.py."""
     import edgefirst
 
     for path in edgefirst.__path__:
@@ -33,9 +33,7 @@ def test_no_namespace_init_anywhere():
 
 
 def test_importing_all_modules_does_not_panic():
-    """env_logger::Builder::init() panics on a second logger. With several
-    pymodule_init functions in one process, anything but try_init crashes
-    every user on their second import."""
+    """Importing every module in one process does not panic."""
     code = "import edgefirst.tensor, edgefirst.codec, edgefirst.image, edgefirst.decoder, edgefirst.tracker, edgefirst.kernels"
     r = subprocess.run(
         [sys.executable, "-c", code], capture_output=True, text=True, check=False
@@ -46,7 +44,7 @@ def test_importing_all_modules_does_not_panic():
 
 @pytest.mark.parametrize("name", MODULES)
 def test_pyclass_modules_are_named(name):
-    """PyO3 defaults __module__ to 'builtins', which breaks pickling and repr."""
+    """Every class of a module reports an edgefirst.* __module__ or 'builtins'."""
     mod = importlib.import_module(name)
     for attr in vars(mod).values():
         if isinstance(attr, type) and attr.__module__ != "builtins":
@@ -56,16 +54,14 @@ def test_pyclass_modules_are_named(name):
 
 
 def test_packages_do_not_share_python_types():
-    """The premise of A3: each extension statically links its own bindings, so
-    the same Rust type surfaces as DIFFERENT Python classes per module. Any
-    cross-package handoff that relied on isinstance would be broken."""
+    """The same Rust type surfaces as a different Python class in each package."""
     from edgefirst import image, tensor
 
     assert tensor.Tensor is not image.Tensor
 
 
 def test_cross_package_handoff_uses_the_capsule():
-    """...which is why the contract is a capsule, read by duck typing."""
+    """A tensor hands itself across packages as an `edgefirst_tensor_v2` capsule."""
     from edgefirst import tensor
 
     t = tensor.Tensor([16, 16, 3], "uint8")
@@ -78,17 +74,15 @@ def test_cross_package_handoff_uses_the_capsule():
     "name", ["tensor", "codec", "image", "decoder", "tracker", "kernels"]
 )
 def test_each_package_ships_stubs_and_marker(name):
-    """The pre-0.29 wheel shipped no stubs at all (the .pyi was sdist-only);
-    the split must not repeat that."""
+    """Each package ships a py.typed marker and stubs."""
     mod = importlib.import_module(f"edgefirst.{name}")
     pkg = pathlib.Path(mod.__file__).parent
     assert (pkg / "py.typed").exists(), f"edgefirst.{name} has no py.typed"
     assert (pkg / "__init__.pyi").exists(), f"edgefirst.{name} has no stubs"
 
 
-def test_no_symbol_was_lost_in_the_split():
-    """Every top-level name the old edgefirst_hal exported must still exist
-    somewhere in the namespace."""
+def test_every_expected_symbol_is_available():
+    """Every top-level name edgefirst_hal exported exists in the namespace."""
     from edgefirst import codec, decoder, image, tensor, tracker
 
     available = set()
@@ -107,4 +101,4 @@ def test_no_symbol_was_lost_in_the_split():
         "is_dma_available",
         "is_v4l2_available",
     ):
-        assert name in available, f"{name} lost in the split"
+        assert name in available, f"{name} is missing"

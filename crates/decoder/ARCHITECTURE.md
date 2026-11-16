@@ -180,7 +180,7 @@ The tag alone does not make a head end-to-end: a YOLO26 model exported with `end
 The [`infer`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/src/infer.rs)
 module derives a `SchemaV2` for a vanilla Ultralytics export directly from
 `ModelSignals` (the runtime-reported tensor shapes/dtypes and the model's
-own embedded metadata), so a hand-authored `edgefirst.json` is no longer
+own embedded metadata), so a hand-authored `edgefirst.json` is not
 required for standard YOLOv8/11/26 detection and segmentation exports.
 Identity and labels come from metadata (`names`, `task`, `end2end`); the exact
 tensor layout — combined pre-NMS, detection+proto segmentation, or YOLO26
@@ -252,7 +252,7 @@ a class-count problem, not a reason to try the other layout.
 ### Output tensor physical-order contract
 
 Every output declared to the decoder — whether programmatically via
-`hal_decoder_params_add_output` / `DecoderBuilder`, or through YAML/JSON
+`ef_decoder_params_add_output` / `DecoderBuilder`, or through YAML/JSON
 config — must list `shape` and `dshape` fields in **physical memory order,
 outermost axis first, innermost axis last**. The decoder derives C-contiguous
 strides from `shape` and wraps the raw buffer bytes with those strides; it
@@ -278,13 +278,7 @@ ONNX/TFLite flat-detection.
 An empty `dshape` skips all of it: the caller is asserting `shape` is already
 canonical for the role.
 
-Mis-declaring physical order causes every element access to index the wrong
-byte. This was the root cause of two production bugs: a vertical-stripe mask
-artifact on i.MX 8M Plus TFLite segmentation, and a coordinate mis-decode
-with Ara-2 anchor-first split-tensor boxes. HAL cannot detect the mismatch
-at runtime — it has no visibility into how the inference engine laid out
-bytes. **Producer ownership:** the entity emitting the model metadata is
-responsible for matching the physical layout it produced.
+Mis-declaring physical order causes every element access to index the wrong byte. HAL cannot detect the mismatch at runtime — it has no visibility into how the inference engine laid out bytes. **Producer ownership:** the entity emitting the model metadata is responsible for matching the physical layout it produced.
 
 Common physical layouts by framework:
 
@@ -309,7 +303,7 @@ Names are settled for every output before any output falls back to shape or posi
 
 A `masks` output has no role: no decode function reads it, so its tensor is never asked for. It still counts among the configured outputs, for positions and for the shapes it shares.
 
-The bound tensors are handed on in role order (`binding::Role`, declared in the order the decode functions look roles up: detection or boxes, scores, classes, mask coefficients, protos, segmentation). Every decode function that reads two roles reads them in that order and skips the tensors already taken, so each first-fit lookup lands on the bound tensor and the roughly 120 lookup sites stay as they are. A new decode function has to keep to that order and pass on what it took: ModelPack detection and segmentation are separate functions, so the detection ones return the indices of their tensors for the segmentation lookup to skip, and `match_outputs_to_detect` gives detection heads of one shape successive tensors.
+The bound tensors are handed on in role order (`binding::Role`, declared in the order the decode functions look roles up: detection or boxes, scores, classes, mask coefficients, protos, segmentation). Every decode function that reads two roles reads them in that order and skips the tensors already taken, so each first-fit lookup lands on the bound tensor. A new decode function has to keep to that order and pass on what it took: ModelPack detection and segmentation are separate functions, so the detection ones return the indices of their tensors for the segmentation lookup to skip, and `match_outputs_to_detect` gives detection heads of one shape successive tensors.
 
 Schemas with physical children go through the merge program, which emits one logical tensor per decoded output in schema order; `binding::lookup_order` reorders those by role for the same reason, with an unread `masks` output last. The children themselves are still bound by shape in schema order (`merge::find_and_dequantize`), and the per-scale subsystem binds its own.
 
@@ -364,13 +358,7 @@ per-scale tensors (e.g. 80×80, 40×40, 20×20). The pipeline:
 
 **Decode dtype.** `DecoderBuilder::with_decode_dtype` sets the dtype of the decoded boxes and scores; a builder given none uses `DecodeDtype::native()`: `F16` when the decoder's CPU probe reports FP16 arithmetic (AArch64 `fphp`/`asimdhp`: Cortex-A55, A76, A78), `F32` otherwise (Cortex-A53, x86). The probe honours `EDGEFIRST_DECODER_FORCE_KERNEL`, so `neon` or `scalar` selects `F32` on an FP16 CPU, which is also the override for the C and Python bindings (they have no dtype setter). `Decoder::decode_dtype()` reports the dtype in use. Detections are reported in f32 either way; with `F16` boxes and scores are f16-rounded, which on the Model Zoo yolov8n, yolo11n and yolo26n smart exports moves boxes by about a quarter pixel at 640 and scores by about 1e-4.
 
-The per-scale path achieved 17–45× mask-materialize speedup on i.MX 8M Plus
-in the v0.18 → v0.20 cycle through batched GEMM, NEON FP16 fused-multiply,
-and tile-transpose layout changes. See
-[`BENCHMARKS.md`](https://github.com/EdgeFirstAI/hal/blob/main/BENCHMARKS.md)
-for the empirical numbers and
-[`CHANGELOG.md`](https://github.com/EdgeFirstAI/hal/blob/main/CHANGELOG.md)
-for the release-by-release history.
+See [`BENCHMARKS.md`](https://github.com/EdgeFirstAI/hal/blob/main/BENCHMARKS.md) for the measured numbers.
 
 ### Mask rendering APIs
 
@@ -406,7 +394,7 @@ for the GPU-side fused algorithm.
 
 ### Semantic segmentation
 
-`Decoder::decode_semantic` (and the free function `semantic::decode_semantic`) writes an `[H, W]` u8 or u16 class map into a caller tensor. The builder routes a schema whose typed outputs are a single `decoder: semantic` output to `SemanticConfig::from_logical`, sets `ModelType::Semantic`, and skips the legacy lowering; `decode` and `decode_proto` return `NotSupported` for such a decoder. A programmatic configuration with a semantic output is converted with `SchemaV2::from_v1` and takes the same path. ModelPack segmentation outputs also get a `SemanticConfig`, built from the logical output so it keeps `activation_applied` (NHWC with the class axis from `num_classes` or the channel position, the rule `verify_modelpack_seg` uses; fast by default), so `decode_semantic` works on them beside the existing `decode`; a ModelPack output with no semantic view logs a warning instead of failing the build. Semantic outputs pass the same `dshape` validation as every other output (`configs::validate_dshape`).
+`Decoder::decode_semantic` (and the free function `semantic::decode_semantic`) writes an `[H, W]` u8 or u16 class map into a caller tensor. The builder routes a schema whose typed outputs are a single `decoder: semantic` output to `SemanticConfig::from_logical`, sets `ModelType::Semantic`, and skips the legacy lowering; `decode` and `decode_proto` return `NotSupported` for such a decoder. A programmatic configuration with a semantic output is converted with `SchemaV2::from_v1` and takes the same path. ModelPack segmentation outputs also get a `SemanticConfig`, built from the logical output so it keeps `activation_applied` (NHWC with the class axis from `num_classes` or the channel position, the rule `verify_modelpack_seg` uses; fast by default), so `decode_semantic` works on them beside `decode`; a ModelPack output with no semantic view logs a warning instead of failing the build. Semantic outputs pass the same `dshape` validation as every other output (`configs::validate_dshape`).
 
 Geometry: the content region `[x0, y0, x1, y1]` scales to a fractional region of the score map, and each output pixel samples it at its centre. Bilinear taps follow PyTorch `interpolate` (`align_corners` false or true) with clamping to the whole score map, so taps at the region's edge read the padding rows, as the reference does when it resizes to the input before cropping. Nearest sampling uses pixel centres (`nearest-exact`). On SegFormer-B1 ADE20K val this exact fractional region agrees with the mmseg two-step reference on 99.94–99.97% of pixels, against 99.4–99.7% for an integer `ceil` crop, and centre sampling gains about 0.05 mIoU points over PyTorch's legacy nearest.
 

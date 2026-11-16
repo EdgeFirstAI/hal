@@ -1,16 +1,15 @@
 // SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! `EGL_ANGLE_image_d3d11_texture` attribute assembly. Pure so it is unit
-//! tested without a display; the leaf passes the result to `eglCreateImage`.
+//! `EGL_ANGLE_image_d3d11_texture` attribute assembly; the leaf passes the
+//! result to `eglCreateImage`.
 
 use edgefirst_egl as egl;
 
 /// `eglCreateImage` target for an `ID3D11Texture2D` client buffer.
 pub(super) const EGL_D3D11_TEXTURE_ANGLE: egl::Enum = 0x3484;
 pub(super) const EGL_TEXTURE_INTERNAL_FORMAT_ANGLE: egl::Attrib = 0x345D;
-/// Plane index for YUV DXGI formats; unused by the HAL's combined-plane R8
-/// layout, kept for the native NV12 opt-in.
+/// Plane index for YUV DXGI formats, used for native NV12 textures.
 pub(super) const EGL_D3D11_TEXTURE_PLANE_ANGLE: egl::Attrib = 0x3492;
 
 /// Assemble the `eglCreateImage` attribute list for an `ID3D11Texture2D`

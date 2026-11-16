@@ -18,11 +18,11 @@ pub enum DecoderError {
     InvalidShape(String),
     /// An error occurred while parsing YAML
     Yaml(serde_yaml::Error),
-    /// An error occurred while parsing YAML
+    /// An error occurred while parsing JSON
     Json(serde_json::Error),
-    /// Attmpted to use build a decoder without configuration
+    /// Attempted to build a decoder without configuration
     NoConfig,
-    /// The provide decoder configuration was invalid
+    /// The provided decoder configuration was invalid
     InvalidConfig(String),
     /// An error occurred with ndarray shape operations
     NDArrayShape(ndarray::ShapeError),
@@ -42,9 +42,8 @@ pub enum DecoderError {
         role: &'static str,
         level: usize,
     },
-    /// Internal logic bug — a dispatch variant was constructed but the
-    /// concrete kernel wasn't matched. Indicates a missing arm in the
-    /// dispatch enum's `run()` impl.
+    /// A dispatch variant was constructed but no concrete kernel matched
+    /// it.
     KernelDispatchUnreachable(String),
     /// `EDGEFIRST_DECODER_FORCE_KERNEL` requested a tier whose features
     /// the running CPU doesn't support.

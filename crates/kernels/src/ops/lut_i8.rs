@@ -72,14 +72,14 @@ pub struct LutI8Plan {
     table: [u8; 256],
     #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
     window: Window,
-    /// Every entry maps to itself: runs copy instead of looking up.
+    /// Every entry maps to itself: runs copy.
     identity: bool,
     kernel: Kernel,
 }
 
 /// The varying part of a byte table, in value order (`i8` values from −128, `u8` from 0):
 /// entries are constant below `lo` and above `hi`, so a lookup may clamp into `lo..=hi` and
-/// read `table[v − lo]`. Saturating activations (logistic, tanh) vary over a narrow window.
+/// read `table[v − lo]`.
 #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 #[derive(Clone, Debug)]
 pub(super) struct Window {
@@ -253,7 +253,7 @@ impl LutI8Plan {
         pool: Option<&dyn Pool>,
     ) -> Result<()> {
         match (self.dtype, input, output) {
-            // A table lookup does not depend on position, so transposed views can go by tiles.
+            // Transposed views go by tiles.
             (DType::I8, TensorRef::I8(input), TensorMut::I8(mut output)) => {
                 if let Some(r) = self.transposed(&input, &mut output, pool) {
                     return r;
@@ -402,8 +402,7 @@ mod tests {
         }
     }
 
-    /// Four channels of a 16-channel `[80, 80, 16]` tensor written channel-major (a YOLO box
-    /// head): the two spatial axes merge on both sides into one 6400-long transpose of 4-byte runs.
+    /// Four channels of a 16-channel tensor written channel-major transpose by 4-byte runs.
     #[test]
     fn channel_slices_transpose_by_runs() {
         let table: [u8; 256] =

@@ -16,8 +16,8 @@ pub trait DequantKernel<I, F> {
     fn dequant_slice(input: &[I], q: Quant, output: &mut [F]);
 }
 
-/// In-place numerically stable softmax over a length-`reg_max` slice.
-/// Subtract-max prevents `exp` overflow on large logits.
+/// In-place numerically stable softmax over a length-`reg_max` slice: subtract-max, exp,
+/// normalize.
 pub trait SoftmaxKernel<F> {
     fn softmax_inplace(buf: &mut [F]);
 }

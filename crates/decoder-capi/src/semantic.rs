@@ -468,7 +468,7 @@ mod tests {
                     )
                 };
                 assert_eq!(decode(), 0, "{access:?}");
-                // A second reference makes the handle shared; reading must still work.
+                // A second reference makes the handle shared.
                 assert_eq!(edgefirst_tensor_ffi::ef_tensor_retain(input), 0);
                 assert_eq!(decode(), 0, "shared {access:?}");
                 drop(TensorDyn::from_raw(input));

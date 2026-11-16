@@ -7,8 +7,7 @@ mod sealed {
     pub trait Sealed {}
 }
 
-/// An element [`nchw_to_nhwc`] moves: a plain 1-, 2- or 4-byte number with no padding, so its
-/// bits can be moved as an integer lane. Sealed.
+/// An element [`nchw_to_nhwc`] moves: a plain 1-, 2- or 4-byte number with no padding. Sealed.
 pub trait TransposeElement: Copy + sealed::Sealed {
     /// Size in bytes: 1, 2 or 4.
     #[doc(hidden)]
@@ -28,17 +27,15 @@ transpose_element!(u8, i8, u16, i16, half::f16, u32, i32, f32);
 /// NCHW → NHWC transpose of one image: `src` is `[c, h, w]` and `dst` is written as `[h, w, c]`.
 ///
 /// Both slices must hold exactly `h * w * c` elements; otherwise nothing is written and `dst`
-/// is left unchanged. Never panics. The transpose is a pure permutation: every element's bits
-/// move unchanged, NaN payloads included.
+/// is left unchanged. Never panics. Every element's bits move unchanged, NaN payloads included.
 ///
 /// When `c` or `h * w` is 1 the layouts coincide and `src` is copied. On aarch64 the rest runs
 /// NEON: `ST2`/`ST3`/`ST4` interleaving for `c` of 2 to 4, and square register tiles (16×16
 /// bytes, 8×8 halfwords, 4×4 words) otherwise, with edge tiles overlapped or staged through
-/// the stack so no shape falls back to an element loop. Other targets walk the destination in
-/// order.
+/// the stack. Other targets walk the destination in order.
 #[inline]
 pub fn nchw_to_nhwc<T: TransposeElement>(src: &[T], h: usize, w: usize, c: usize, dst: &mut [T]) {
-    // The NEON paths read and write unchecked, so both lengths must match the shape.
+    // Both lengths must match the shape.
     let n = h.checked_mul(w).and_then(|hw| hw.checked_mul(c));
     if n != Some(src.len()) || n != Some(dst.len()) || src.is_empty() {
         return;
@@ -63,8 +60,8 @@ pub fn nchw_to_nhwc<T: TransposeElement>(src: &[T], h: usize, w: usize, c: usize
     nchw_to_nhwc_scalar(src, h, w, c, dst);
 }
 
-/// [`nchw_to_nhwc`] as the element loop on every target, for a forced scalar tier: walks the
-/// destination in order; writes nothing unless both slices hold `h * w * c` elements.
+/// [`nchw_to_nhwc`] as the element loop on every target: walks the destination in order;
+/// writes nothing unless both slices hold `h * w * c` elements.
 #[doc(hidden)]
 #[inline]
 pub fn nchw_to_nhwc_scalar<T: Copy>(src: &[T], h: usize, w: usize, c: usize, dst: &mut [T]) {
@@ -93,7 +90,7 @@ enum Route {
     Tile,
 }
 
-/// The route for a non-empty shape; compiled on every target so the rule is tested everywhere.
+/// The route for a non-empty shape.
 const fn route(hw: usize, c: usize) -> Route {
     if c == 1 || hw == 1 {
         Route::Copy
@@ -118,7 +115,7 @@ mod neon {
         /// Whether full tiles at this shape run [`position_outer`] rather than [`channel_outer`].
         fn position_outer(hw: usize, c: usize) -> bool;
 
-        /// Full tiles channel tile by channel tile ([`channel_outer`] or a faster walk).
+        /// Full tiles channel tile by channel tile ([`channel_outer`] or the type's own walk).
         ///
         /// # Safety
         /// As [`channel_outer`].
@@ -802,9 +799,7 @@ pub(crate) use neon::{interleave4, transpose16};
 mod tests {
     use super::*;
 
-    /// Hand-checked small case: NCHW `[1, 2, 2, 3]` → NHWC `[1, 2, 3, 2]`.
-    /// Source layout (channel-major): chan0[(0,0), (0,1), (0,2), (1,0), …]
-    /// chan1[(0,0), (0,1), (0,2), (1,0), …].
+    /// NCHW `[1, 2, 2, 3]` → NHWC `[1, 2, 3, 2]` on a hand-written case.
     #[test]
     fn nchw_to_nhwc_small_hand_check() {
         // h=2, w=3, c=2 → 12 elements.
@@ -844,9 +839,7 @@ mod tests {
         assert!(dst32.iter().all(|&v| v == -1.0));
     }
 
-    /// Roundtrip: NCHW → NHWC → NCHW recovers the original.
-    /// Verifies the inverse exists (we don't ship the inverse but the
-    /// algebra confirms the forward transpose is well-defined).
+    /// NCHW → NHWC → NCHW recovers the original.
     #[test]
     fn nchw_to_nhwc_roundtrip_random() {
         let h = 5;
@@ -994,8 +987,7 @@ mod tests {
         }
     }
 
-    /// Sixteen channels but only fifteen spatial positions: not a full tile,
-    /// so the result must still be a correct transpose.
+    /// Sixteen channels and fifteen spatial positions: not a full tile.
     #[test]
     fn nchw_to_nhwc_u8_with_fewer_than_a_tile_of_positions() {
         let (h, w, c) = (1, 15, 16);
@@ -1018,18 +1010,16 @@ mod tests {
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn nchw_to_nhwc_u8_neon_matches_scalar_aligned_16_16() {
-        // Exact 16×16 case: one full tile, no edges.
+        // One full 16×16 tile, no edges.
         let h = 4;
         let w = 4;
         let c = 16;
         let n = h * w * c;
-        // Use a unique value per (channel, spatial) so any swap shows up.
         let src: Vec<u8> = (0..n).map(|i| (i % 251) as u8).collect();
         let mut dst_neon = vec![0u8; n];
         let mut dst_scalar = vec![0u8; n];
         super::nchw_to_nhwc(&src, h, w, c, &mut dst_neon);
-        // Force scalar by inlining the loop here (mirrors the generic
-        // fallback after the cfg block).
+        // Reference: the element loop.
         let hw = h * w;
         let mut idx = 0;
         for hi in 0..h {
@@ -1044,9 +1034,7 @@ mod tests {
         assert_eq!(dst_neon, dst_scalar, "NEON 16x16 tile mismatched scalar");
     }
 
-    /// NEON path with a tail in BOTH directions: c=20 (one 16-tile +
-    /// 4-channel tail), hw=20 (one 16-tile + 4-spatial tail). Exercises
-    /// every code path in the kernel.
+    /// A tail in both directions: c=20 and hw=20, one 16-tile plus a 4-element tail each.
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn nchw_to_nhwc_u8_neon_matches_scalar_with_both_tails() {
@@ -1072,8 +1060,7 @@ mod tests {
         assert_eq!(dst_neon, dst_scalar);
     }
 
-    /// Realistic per-scale shape: c=80 (score), h*w=400 (level 2's
-    /// 20×20 grid). Exercises 5 channel tiles × 25 spatial tiles.
+    /// c=80, h*w=400: 5 channel tiles × 25 spatial tiles.
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn nchw_to_nhwc_u8_neon_realistic_score_shape() {
@@ -1099,9 +1086,7 @@ mod tests {
         assert_eq!(dst_neon, dst_scalar);
     }
 
-    /// i8 inputs go through the same NEON byte path (size_of::<i8>() == 1).
-    /// Bit-pattern preservation is what we rely on; this confirms it
-    /// holds across the full signed range including negatives.
+    /// i8 inputs keep their bit patterns across the full signed range.
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn nchw_to_nhwc_i8_neon_matches_scalar() {

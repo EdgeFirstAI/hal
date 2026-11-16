@@ -39,9 +39,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# `python3` first (Linux/macOS, GitHub runners); Git Bash on a Windows dev box
-# usually has only `python`, and `python3` may resolve to the Microsoft Store
-# stub, which exits 49 with "Python was not found" — so probe by running it.
+# Picks the first of python3 and python that runs.
 PY=""
 for cand in python3 python; do
   if command -v "${cand}" >/dev/null 2>&1 && "${cand}" -c 'pass' >/dev/null 2>&1; then
@@ -104,7 +102,7 @@ STAGE="${OUTDIR}/${PKG_NAME}"
 rm -rf "${STAGE}"
 mkdir -p "${STAGE}/include/edgefirst" "${STAGE}/lib/pkgconfig"
 # Windows: DLLs in bin/, import libraries in lib/. Unix: shared objects in lib/.
-# The archive never ships a Rust staticlib (libedgefirst_*.a / edgefirst_*.lib).
+# The archive ships no Rust staticlib (libedgefirst_*.a / edgefirst_*.lib).
 
 cp LICENSE NOTICE packaging/c/INSTALL.txt packaging/c/README.md "${STAGE}/"
 
@@ -136,10 +134,9 @@ for leaf in ${LEAVES}; do
   elif [[ "${TARGET}" == *-windows ]]; then
     mkdir -p "${STAGE}/bin"
     # Cargo writes edgefirst_X.dll + edgefirst_X.dll.lib (import) +
-    # edgefirst_X.lib (Rust staticlib) into the same directory. Ship the
-    # DLL and the import library under the conventional names
-    # bin/edgefirst_X.dll and lib/edgefirst_X.lib. Never copy the staticlib:
-    # linking a C consumer against it embeds a second rust std.
+    # edgefirst_X.lib (Rust staticlib) into the same directory. Ships the
+    # DLL and the import library as bin/edgefirst_X.dll and
+    # lib/edgefirst_X.lib.
     if [[ -f "${LIBDIR}/edgefirst_${leaf}.dll" ]]; then
       copy_or_die "${LIBDIR}/edgefirst_${leaf}.dll" "${STAGE}/bin/edgefirst_${leaf}.dll"
       implib="${LIBDIR}/edgefirst_${leaf}.dll.lib"
@@ -155,8 +152,7 @@ for leaf in ${LEAVES}; do
       exit 1
     fi
     copy_or_die "${implib}" "${STAGE}/lib/edgefirst_${leaf}.lib"
-    # Import libraries are a few hundred KB. The Rust staticlib is tens of MB;
-    # if we ever copy the wrong file, fail here instead of publishing it.
+    # Fails when the import library is larger than 5 MB.
     implib_bytes="$(wc -c < "${STAGE}/lib/edgefirst_${leaf}.lib")"
     if [[ "${implib_bytes}" -gt 5000000 ]]; then
       echo "FAIL: ${STAGE}/lib/edgefirst_${leaf}.lib is ${implib_bytes} B — that is the Rust staticlib, not the DLL import library" >&2
@@ -168,12 +164,9 @@ for leaf in ${LEAVES}; do
   fi
 done
 
-# Windows: bundle ANGLE (GLES over Direct3D 11) next to edgefirst_image.dll
-# when EDGEFIRST_ANGLE_PATH points at the fetched DLLs (scripts/fetch-angle.sh),
-# so a consumer gets the GPU backend with zero configuration — the runtime
-# loader looks next to the loading module before anything else. ANGLE is
-# BSD-3-Clause; its licence ships alongside. Without EDGEFIRST_ANGLE_PATH the
-# archive is CPU-only, exactly as before.
+# Windows: bundles ANGLE (GLES over Direct3D 11) next to edgefirst_image.dll,
+# and its licence under share/licenses/angle, when EDGEFIRST_ANGLE_PATH points
+# at the fetched DLLs (scripts/fetch-angle.sh).
 if [[ "${TARGET}" == *-windows ]]; then
   if [[ -n "${EDGEFIRST_ANGLE_PATH:-}" && -f "${EDGEFIRST_ANGLE_PATH}/libEGL.dll" && -f "${EDGEFIRST_ANGLE_PATH}/libGLESv2.dll" ]]; then
     cp "${EDGEFIRST_ANGLE_PATH}/libEGL.dll" "${EDGEFIRST_ANGLE_PATH}/libGLESv2.dll" "${STAGE}/bin/"
@@ -200,8 +193,7 @@ sed "s/@VERSION@/${VERSION}/" \
   crates/decoder-abi/edgefirst-decoder-abi.pc.in \
   > "${STAGE}/lib/pkgconfig/edgefirst-decoder-abi.pc"
 
-# Libs.private is Unix-only. macOS has no libdl (dlopen lives in libSystem);
-# Windows does not consume these .pc files for linking in the shipped layout.
+# Replaces the Libs.private line of the .pc files on macOS and Windows.
 rewrite_libs_private() {
   local pc="$1" replacement="$2"
   local tmp="${pc}.new"
@@ -219,10 +211,8 @@ elif [[ "${TARGET}" == *-windows ]]; then
 fi
 
 mkdir -p "${OUTDIR}"
-# Archive root is PKG_NAME. Linux: tar.gz (keeps the SONAME symlink chain).
-# Windows and macOS: zip. zipfile.write follows dylib symlinks, so the macOS
-# zip contains both the versioned and unversioned names as regular files —
-# extractable with Explorer / Archive Utility / python -m zipfile.
+# Archive root is PKG_NAME. Linux: tar.gz. Windows and macOS: zip, with the
+# macOS dylib symlinks stored as regular files.
 if [[ "${TARGET}" == *-linux ]]; then
   ARCHIVE="${OUTDIR}/${PKG_NAME}.tar.gz"
   tar -C "${OUTDIR}" -czf "${ARCHIVE}" "${PKG_NAME}"

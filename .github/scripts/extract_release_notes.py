@@ -4,12 +4,6 @@
 #
 # Print the CHANGELOG section for a version, or exit 1 if it has none.
 #
-# Replaces an awk range that silently produced nothing. `/## \[VERSION\]/,/^## \[/`
-# ends on the first line matching the second pattern -- and the heading the
-# range starts on matches it too, so the range was always a single record that
-# the body then skipped with `next`. Every release since the script was written
-# shipped empty notes: v0.32.0's GitHub Release body is zero characters.
-#
 # Usage:
 #   python3 .github/scripts/extract_release_notes.py CHANGELOG.md 0.36.0
 
@@ -22,11 +16,10 @@ from pathlib import Path
 
 def extract(text: str, version: str) -> str | None:
     """Return the body of the `## [version]` section, or None if absent."""
-    # A candidate has no section of its own; it releases the base version's.
+    # A release candidate uses the base version's section.
     base = version.split("-rc")[0].split("rc")[0]
     esc = re.escape(base)
-    # The version must be a complete token: a prefix match would take the
-    # `## [1.2.30]` section for release 1.2.3 and ship another release's notes.
+    # The version is matched as a complete token.
     pattern = rf"^## (?:\[{esc}\]|{esc}\b)[^\n]*\n(.*?)(?=^## |\Z)"
     match = re.search(pattern, text, re.M | re.S)
     return match.group(1).strip() if match else None

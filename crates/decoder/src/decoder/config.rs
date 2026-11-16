@@ -10,8 +10,7 @@
 //!
 //! Declare `shape` and `dshape` in physical memory order, outermost axis
 //! first. See the output tensor physical-order contract in the crate's
-//! `ARCHITECTURE.md` — mis-declaring it makes every element access index the
-//! wrong byte, and nothing at runtime can detect it.
+//! `ARCHITECTURE.md`.
 
 use super::configs::{self, DimName, QuantTuple};
 use serde::{Deserialize, Serialize};
@@ -29,8 +28,7 @@ use serde::{Deserialize, Serialize};
 /// # }
 /// ```
 ///
-/// The struct is `#[non_exhaustive]` so new optional settings can be added
-/// without a breaking change. Outside this crate, start from
+/// The struct is `#[non_exhaustive]`. Outside this crate, start from
 /// [`ConfigOutputs::new`] (or [`Default`], or a parser) and assign fields:
 ///
 /// ```rust
@@ -62,7 +60,7 @@ pub struct ConfigOutputs {
     /// - `Some(Yolo26)` — end-to-end model with embedded NMS
     /// - `Some(Yolov5/Yolov8/Yolo11)` — traditional models requiring external
     ///   NMS
-    /// - `None` — infer from other settings (legacy behavior)
+    /// - `None` — infer from other settings
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decoder_version: Option<configs::DecoderVersion>,
 }
@@ -336,7 +334,7 @@ impl ConfigOutput {
     }
 
     /// Returns the decoder type of the output.
-    ///    
+    ///
     /// # Examples
     /// ```rust
     /// # use edgefirst_decoder::{configs, ConfigOutput};

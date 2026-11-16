@@ -3,10 +3,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Capture a CoreML model's I/O signals into a decoder test fixture.
 
-Mirrors the ONNX/TFLite capture used for the existing
-``crates/decoder/testdata/infer/*.signals.json`` fixtures: shapes, dtypes
-and the flat string metadata map exactly as an inference runtime would
-report them to ``infer_ultralytics_schema``.
+Captures shapes, dtypes and the flat string metadata map, in the format of
+the ``crates/decoder/testdata/infer/*.signals.json`` fixtures.
 """
 
 from __future__ import annotations
@@ -20,18 +18,8 @@ import coremltools as ct
 
 # CoreML ArrayFeatureType.ArrayDataType -> decoder schema dtype names.
 #
-# Values are `coremltools.proto.FeatureTypes_pb2.ArrayFeatureType.ArrayDataType`,
-# enumerated against coremltools 9.0. They encode bit-width in the high bits and
-# sit close together, which makes them very easy to transpose by eye -- never
-# edit this table from memory, re-enumerate the proto:
-#
-#   python -c "from coremltools.proto import FeatureTypes_pb2 as ft; \
-#              print(dict(ft.ArrayFeatureType.ArrayDataType.items()))"
-#
-# DOUBLE (65600) is deliberately absent: `edgefirst_decoder::schema::DType`
-# has no Float64 variant, so a captured "float64" signal would produce a
-# fixture nothing downstream can consume. It falls through to the
-# unmapped-dtype error below, which is the correct outcome for it.
+# Values are `coremltools.proto.FeatureTypes_pb2.ArrayFeatureType.ArrayDataType`.
+# DOUBLE (65600) has no entry.
 _ARRAY_DTYPE = {
     65552: "float16",  # FLOAT16
     65568: "float32",  # FLOAT32
@@ -39,11 +27,7 @@ _ARRAY_DTYPE = {
     131104: "int32",   # INT32
 }
 
-# Integer dtype names, matching `edgefirst_decoder::schema::DType::is_integer`
-# -- kept in sync with that method by hand, the same as `_ARRAY_DTYPE` is kept
-# in sync with the CoreML proto. Only `int8`/`int32` are reachable through
-# `_ARRAY_DTYPE` today, but the full set is listed so a future dtype addition
-# there does not silently bypass the output check below.
+# Integer dtype names, matching `edgefirst_decoder::schema::DType::is_integer`.
 _INTEGER_DTYPES = frozenset({"int8", "uint8", "int16", "uint16", "int32", "uint32"})
 
 

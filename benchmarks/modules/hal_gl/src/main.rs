@@ -4,7 +4,7 @@
 //! HAL software JPEG → NV12/NV24 + HAL OpenGL letterbox convert.
 //!
 //! Forces `EDGEFIRST_FORCE_BACKEND=opengl` and `EDGEFIRST_DISABLE_V4L2=1`.
-//! Decode source stays on DMA (auto) for zero-copy GL import.
+//! Decode source stays on auto (DMA).
 
 use clap::Parser;
 use edgefirst_bench_common::{run_hal_module, BenchArgs, HalModuleConfig};

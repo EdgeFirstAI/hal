@@ -1,39 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! Frozen fixtures for CPU mask rendering, generated **before** the
-//! `Segmentation` container change and the semantic-argmax rewrite.
+//! Frozen fixtures for CPU mask rendering.
 //!
-//! # Why this exists
-//!
-//! Nothing checked a single rendered mask pixel. `test_segmentation` in
-//! `src/cpu/tests.rs` — the only test exercising the semantic (`C > 1`) argmax
-//! path — renders, calls `save_jpeg`, and asserts nothing, so it can only fail
-//! by panicking; the argmax could return any class and the suite stayed green.
-//! `test_segmentation_yolo` asserts one colour-table entry, no pixels. Both
-//! mask families are frozen here before the rework touches them.
-//!
-//! # What is deliberately NOT in the fixture
-//!
-//! The background is a synthetic analytic ramp, not a decoded JPEG. A decoded
-//! source would fold the JPEG decoder's arithmetic into the checksum, so an
-//! unrelated codec change would break this gate and a real mask regression
-//! could hide behind a "known" fixture churn. The ramp keeps the CRC a
-//! function of the mask math alone. The masks themselves are real model
-//! outputs — a synthetic mask would not exercise the argmax meaningfully.
-//!
-//! # Per-architecture
-//!
-//! The fixture is stored per-arch like `crop_golden`'s, but measured: the
-//! aarch64 and x86_64 CRCs came out **identical** (3505191700 / 2921905178),
-//! so mask rendering — unlike the YUV convert kernels — has no per-target
-//! divergence to accommodate. The split files are kept anyway, because a
-//! future kernel could introduce one and a shared file would then have no
-//! place to record it. An arch with no frozen file SKIPS loudly rather than
-//! passing.
-//!
-//! **Never regenerate** to make a failure go away — the frozen bytes are the
-//! arbiter, and `generate_golden` exists only for the freeze commit.
+//! The background is a synthetic analytic ramp and the masks are model
+//! outputs. The fixture is stored per architecture; an architecture with no
+//! frozen file skips with a warning.
 
 use edgefirst_image::{CPUProcessor, ImageProcessorTrait};
 use edgefirst_tensor::{CpuAccess, DType, PixelFormat, TensorDyn, TensorMapTrait, TensorTrait};
@@ -50,8 +22,7 @@ struct Case {
     crc32: u32,
 }
 
-/// A deterministic RGBA background — every byte a function of its offset, so a
-/// mask that lands in the wrong place cannot coincidentally match.
+/// A deterministic RGBA background: every byte is a function of its offset.
 fn background() -> TensorDyn {
     let mut t = TensorDyn::image(
         DST_W,
@@ -81,8 +52,7 @@ struct Family {
     fixture: &'static str,
     shape: (usize, usize, usize),
     chw: bool,
-    /// Instance masks are drawn per detection, so the `C = 1` case needs a
-    /// box; the semantic case renders the whole plane and takes none.
+    /// The box and label an instance mask is drawn for; `None` for the semantic case.
     detect: Option<([f32; 4], usize)>,
 }
 
@@ -105,12 +75,7 @@ fn families() -> [Family; 2] {
     ]
 }
 
-// ── The two functions Task 4 rewrites ───────────────────────────────────────
-//
-// Everything above is container-agnostic. These two are the only places that
-// know `Segmentation` currently carries an `ndarray::Array3<u8>`; when it
-// becomes a `TensorDyn` these change and nothing else does. The frozen CRCs
-// must not move across that swap — it is a container change, not a value one.
+// ── The container-specific functions ────────────────────────────────────────
 
 fn build_segmentation(hwc: &[u8], dims: [usize; 3]) -> edgefirst_tensor::Segmentation {
     let segmentation = ndarray::Array3::from_shape_vec((dims[0], dims[1], dims[2]), hwc.to_vec())
@@ -151,8 +116,7 @@ fn render(f: &Family) -> (Vec<u8>, [usize; 3]) {
     let raw = edgefirst_bench::testdata::read(f.fixture);
     let (d0, d1, d2) = f.shape;
 
-    // Transpose CHW -> HWC where needed, by hand rather than via ndarray, so
-    // this harness does not depend on a crate the code under test is dropping.
+    // Transpose CHW -> HWC where needed.
     let (hwc, dims) = if f.chw {
         let (c, h, w) = (d0, d1, d2);
         let mut out = vec![0u8; c * h * w];
@@ -205,12 +169,7 @@ fn generate_golden() {
     .expect("write fixture");
 }
 
-/// The fixture is compiled in rather than read from `tests/data/` at runtime.
-/// A relative path resolves against the *current working directory*, which on
-/// an on-target run is a deployed binary directory with no source tree — so
-/// the replay test skipped on every board while looking perfectly green
-/// locally. `include_str!` resolves at compile time and travels with the
-/// binary, which is what `crop_golden` does for the same reason.
+/// The frozen fixture for this architecture, compiled in.
 #[cfg(target_arch = "aarch64")]
 const GOLDEN_JSON: Option<&str> = Some(include_str!("data/mask_golden.aarch64.json"));
 #[cfg(target_arch = "x86_64")]
@@ -221,8 +180,6 @@ const GOLDEN_JSON: Option<&str> = None;
 #[test]
 fn masks_match_golden() {
     let Some(raw) = GOLDEN_JSON else {
-        // Not a silent pass: an arch with no frozen fixture must say so, and
-        // libtest discards println! for passing tests.
         use std::io::Write;
         let _ = writeln!(
             &mut std::io::stderr(),

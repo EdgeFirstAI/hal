@@ -1,17 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! Regression test for EDGEAI-1304: `Decoder::decode()` (the inline
-//! mask-materialising entrypoint) must return bbox coordinates that
-//! are bit-identical to `Decoder::decode_proto()` for the same input.
-//!
-//! Before the fix, `decode_segdet_f32` and `decode_segdet_quant` in
-//! `crates/decoder/src/yolo.rs` overwrote each post-NMS bbox with the
-//! proto-grid-quantized roi returned by `protobox` — snapping every
-//! coordinate to the nearest `1/160` step on a 160×160 proto grid.
-//! Two distinct detections that happened to fall in the same proto
-//! cell became bit-identical in the output, breaking IoU evaluation
-//! and same-class duplicate counts on cluttered scenes.
+//! `Decoder::decode()` (the inline mask-materialising entrypoint) returns
+//! bbox coordinates that are bit-identical to `Decoder::decode_proto()`
+//! for the same input: the post-NMS bbox is not replaced by the
+//! proto-grid-snapped roi that `protobox` returns.
 
 use edgefirst_decoder::{
     configs::{self, DecoderType, DimName, QuantTuple},
@@ -19,10 +12,9 @@ use edgefirst_decoder::{
 };
 use edgefirst_tensor::{Tensor, TensorDyn, TensorMapTrait, TensorMemory, TensorTrait};
 
-/// Build a YOLOv8-seg-shaped synthetic decoder. We plant 5 detections
-/// at non-overlapping x positions whose post-NMS bboxes deliberately
-/// fall on **non-grid** sub-pixel coordinates (e.g. 0.493750 = 79/160
-/// would snap on-grid; we use 0.493753 so the snap is observable).
+/// Build a YOLOv8-seg-shaped synthetic decoder with 5 detections at
+/// non-overlapping x positions whose post-NMS bboxes fall on off-grid
+/// sub-pixel coordinates.
 fn build_synthetic_segdet_decoder() -> (
     edgefirst_decoder::Decoder,
     Vec<TensorDyn>,
@@ -70,9 +62,7 @@ fn build_synthetic_segdet_decoder() -> (
     let set = |d: &mut [f32], r: usize, c: usize, v: f32| d[r * N + c] = v;
     for t in 0..n_targets {
         let anchor = target_start + t;
-        // Off-grid bbox: every component is deliberately not a multiple
-        // of 1/160 so the post-fix coords are observably un-snapped.
-        // xc, yc, w, h all chosen so xc±w/2 and yc±h/2 land off-grid.
+        // Off-grid bbox: no component is a multiple of 1/160.
         let xc = 0.0625 * t as f32 + 0.123_456;
         let yc = 0.503_137; // off-grid (≠ k/160)
         let w = 0.041_257; // off-grid; also keeps xc±w/2 off-grid
@@ -150,8 +140,7 @@ fn decode_returns_bit_identical_bboxes_to_decode_proto() {
         assert_eq!(
             a.bbox.xmin.to_bits(),
             b.bbox.xmin.to_bits(),
-            "det[{i}] xmin: decode={} decode_proto={} (EDGEAI-1304: \
-             decode used to snap to proto grid)",
+            "det[{i}] xmin: decode={} decode_proto={}",
             a.bbox.xmin,
             b.bbox.xmin,
         );
@@ -181,11 +170,6 @@ fn decode_returns_bit_identical_bboxes_to_decode_proto() {
 
 #[test]
 fn decode_does_not_snap_bboxes_to_proto_grid() {
-    // Stronger assertion: every coord we plant is deliberately
-    // off-grid (not a multiple of 1/160). After the EDGEAI-1304 fix,
-    // none of the returned bboxes should have coordinates that are
-    // exact multiples of 1/160, since `decode()` no longer overwrites
-    // them with `protobox`-snapped values.
     let (decoder, owned, _expected) = build_synthetic_segdet_decoder();
     let inputs: Vec<&TensorDyn> = owned.iter().collect();
 
@@ -199,9 +183,6 @@ fn decode_does_not_snap_bboxes_to_proto_grid() {
     let on_grid = |v: f32| (v / proto_step - (v / proto_step).round()).abs() < 1e-5;
 
     for (i, b) in boxes.iter().enumerate() {
-        // Stronger than the original `&&` (which would only fail when ALL
-        // four coords snapped together): assert NO single coord snapped.
-        // Each coord is independently planted off-grid in the fixture.
         let any_coord_on_grid = on_grid(b.bbox.xmin)
             || on_grid(b.bbox.ymin)
             || on_grid(b.bbox.xmax)
@@ -210,7 +191,7 @@ fn decode_does_not_snap_bboxes_to_proto_grid() {
             !any_coord_on_grid,
             "det[{i}] ({:?}) has at least one coord snapped to the proto \
              grid (1/160); decode() should not call protobox-style \
-             quantization on the output bbox (EDGEAI-1304)",
+             quantization on the output bbox",
             b.bbox
         );
     }
