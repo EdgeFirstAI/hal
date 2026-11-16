@@ -2,12 +2,10 @@
 # SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 # SPDX-License-Identifier: Apache-2.0
 #
-# Cross-build a self-contained on-target bundle: everything a board needs to
-# run HAL's full test suite or its benchmarks, and nothing it has to build.
-# scripts/on-target-test.sh deploys one over ssh; the hardware-test and
-# hardware-bench workflows ship one to each board as an artifact. Both then run
-# the same board-side script from inside it, so what runs on a board does not
-# depend on how it got there.
+# Cross-builds a self-contained on-target bundle: everything a board needs to
+# run HAL's test suite or its benchmarks. scripts/on-target-test.sh deploys
+# one over ssh; the hardware-test and hardware-bench workflows ship one to
+# each board as an artifact.
 #
 # Usage:
 #   ./scripts/on-target-bundle.sh tests <arch> <out-dir>
@@ -17,9 +15,11 @@
 #
 # tests bundle:
 #   bin/                  the Rust test binaries of CRATES
-#   target/debug/         the C-API libraries, their .so.0 names, and
-#                         the G3 two-library-user binary
+#   target/debug/         the C-API libraries, their .so.0 names,
+#                         test_two_library_user and test_codec_api
 #   crates/*-capi/        src/ and include/, which check-single-home.sh reads
+#   python/, tests/codec  with PYTHON_WHEELS: the unpacked wheels and the
+#                         Python codec tests
 #   scripts/              on-target-run.sh, check-single-home.sh,
 #                         dma-heap-setup.sh
 #   testdata/             testdata/ merged with every crates/*/testdata
@@ -39,6 +39,10 @@
 #                 project floor; see README "Toolchain and Platform Floors")
 #   TESTDATA      1 to include testdata/ (default: 1). scripts/on-target-test.sh
 #                 passes its SYNC_TESTDATA here.
+#   PYTHON_WHEELS tests: a directory of aarch64 wheels (edgefirst-tensor,
+#                 edgefirst-codec, pytest and its dependencies) to bundle with
+#                 the Python codec tests (default: none, and the board skips
+#                 them)
 
 set -euo pipefail
 
@@ -54,20 +58,17 @@ case "${MODE}" in tests|bench) ;; *) echo "unknown mode '${MODE}'" >&2; exit 2 ;
 case "${ARCH}" in aarch64|x86_64) ;; *) echo "unsupported arch '${ARCH}'" >&2; exit 2 ;; esac
 
 CRATES="${CRATES:-edgefirst-tensor edgefirst-codec edgefirst-image edgefirst-decoder edgefirst-tracker edgefirst-kernels}"
-# Each -capi leaf is its own standalone `[workspace]` (see each Cargo.toml's
-# own comment), so these are built by `--manifest-path`, not `-p`.
+# Each -capi leaf is its own workspace, built by `--manifest-path`.
 CAPI_CRATES="${CAPI_CRATES:-tensor-capi image-capi codec-capi decoder-capi tracker-capi kernels-capi}"
 GLIBC="${GLIBC:-2.35}"
 FEATURES="${FEATURES:-}"
 TESTDATA="${TESTDATA:-1}"
+PYTHON_WHEELS="${PYTHON_WHEELS:-}"
 TRIPLE="${ARCH}-unknown-linux-gnu.${GLIBC}"
 LOGS="${ROOT}/target/on-target-bundle-logs"
 mkdir -p "${LOGS}"
 
-# Executables of one artifact kind from cargo's JSON output. Located this way
-# rather than by globbing for a `<hash>` suffix: globbing picks up stale
-# binaries from previous builds, which is how you end up confidently testing
-# code you did not just change.
+# Prints the executables of one artifact kind from cargo's JSON output.
 executables() {
   local json="$1" kind="$2"
   python3 - "${json}" "${kind}" <<'PY'
@@ -99,8 +100,7 @@ PY
 build_tests() {
   local pkgs=() c
   for c in ${CRATES}; do pkgs+=(-p "$c"); done
-  # Empty FEATURES must not become a bare `--features ''`, which cargo reads
-  # as a request for a feature named "" and rejects.
+  # Passes --features only when FEATURES is set.
   local feats=()
   if [[ -n "${FEATURES}" ]]; then
     feats=(--features "${FEATURES}")
@@ -122,8 +122,7 @@ build_tests() {
 build_benches() {
   echo "==> building benchmarks for ${TRIPLE}"
   local json="${LOGS}/bench-${ARCH}.json"
-  # The Makefile's `bench` feature set. The python crates are excluded: PyO3
-  # cannot cross-compile without a target interpreter.
+  # Builds with the Makefile's `bench` feature set, without the python crates.
   if ! cargo-zigbuild zigbuild --release --benches --target "${TRIPLE}" \
         --features opengl,ndarray --workspace \
         --exclude edgefirst-python-common --exclude edgefirst-python-tensor \
@@ -139,34 +138,12 @@ build_benches() {
   return 0
 }
 
-# The C-API libraries + the G3 two-library-user binary. G1/G2
-# (embedded-symbol/dynamic-link inspection, scripts/check-single-home.sh) and
-# G3 (the two-library JPEG user) are the ones worth re-verifying per board,
-# under that board's own toolchain -- a compiler's dead-code elimination,
-# symbol visibility, and linker defaults can all differ by target in ways a
-# single x86_64 CI runner cannot surface.
-#
-# DEBUG, not release: `check-single-home.sh`'s own G1 needs an unstripped
-# `.so` to see `static_backend` symbols at all -- release now ships with
-# `strip = true` (see that script's own `BASELINE_BYTES` comment). No
-# `target/release` is bundled at all, so G5 (footprint, a release-only,
-# host-specific metric that is not meaningful cross-architecture) correctly
-# reads `cannot_measure` on every board -- a named, attributable gap, not a
-# regression. Same reasoning for G7 (Miri): `scripts/miri.sh` is not
-# bundled, since Miri only ever runs on the build host.
+# Builds the C-API libraries (debug), test_two_library_user and
+# test_codec_api.
 build_libs() {
   echo "==> building the C-API libraries + G3 for ${TRIPLE}"
-  # `--target-dir` MUST be the repo's own plain `target` dir, not a scratch
-  # directory of this script's own choosing -- every sibling leaf's
-  # build.rs computes its `-L` search path for libedgefirst_tensor.so as a
-  # FIXED `<crate_dir>/../../target[/<TARGET-triple>]/<profile>`, derived
-  # from CARGO_MANIFEST_DIR, not from whatever `--target-dir` the build was
-  # invoked with. A custom `--target-dir` here would build real, correct
-  # libraries that the very next sibling's build.rs then fails to find (or
-  # worse, silently finds a stale HOST-architecture one already sitting in
-  # target/debug from an unrelated local build). Cross vs. native output does
-  # not collide: cargo nests cross-compiled artifacts under
-  # target/<TARGET-triple>/<profile>/, never bare target/<profile>/.
+  # Builds into the repository's `target` directory, where each leaf's
+  # build.rs looks for libedgefirst_tensor.so.
   local c
   for c in ${CAPI_CRATES}; do
     local blog="${LOGS}/libbuild-${c}-${ARCH}.log"
@@ -181,24 +158,15 @@ build_libs() {
     fi
   done
 
-  # build.rs sets `-soname libedgefirst_X.so.0`, but cargo only ever writes
-  # the unversioned name -- the same gap `make capi-symlinks` closes locally,
-  # and without it no C binary can resolve the library via its DT_NEEDED
-  # entry.
-  #
-  # The bare rustc triple, not ${TRIPLE}: cargo-zigbuild's glibc-version
-  # suffix (the `.2.35`) selects which zig sysroot to link against, but is
-  # never part of the on-disk directory cargo creates.
+  # Creates the `.so.0` names the libraries' sonames refer to, in the bare
+  # rustc triple's output directory.
   local outdir="target/${ARCH}-unknown-linux-gnu/debug"
   local l
   for l in tensor image codec decoder tracker kernels; do
     ln -sf "libedgefirst_${l}.so" "${outdir}/libedgefirst_${l}.so.0"
   done
 
-  # G3: cross-compile the two-library-user C test the same way `make
-  # test-two-library-user` builds it locally, via zig's own `cc` -- zig is
-  # already the linker cargo-zigbuild uses for the Rust side, so it needs no
-  # extra toolchain.
+  # Cross-compiles test_two_library_user with zig cc.
   local g3log="${LOGS}/libbuild-g3-${ARCH}.log"
   if ! zig cc -std=c11 -Wall -Wextra -target "${ARCH}-linux-gnu.${GLIBC}" \
         -o "${outdir}/test_two_library_user" \
@@ -211,12 +179,41 @@ build_libs() {
     tail -30 "${g3log}" >&2
     return 1
   fi
+
+  # Cross-compiles test_codec_api, the codec C API program, with zig cc.
+  local codeclog="${LOGS}/libbuild-codec-api-${ARCH}.log"
+  if ! zig cc -std=c11 -Wall -Wextra -Werror -target "${ARCH}-linux-gnu.${GLIBC}" \
+        -o "${outdir}/test_codec_api" \
+        crates/codec-capi/tests/c/test_codec_api.c \
+        -Icrates/codec-capi/include -Icrates/tensor-capi/include \
+        -L"${outdir}" -ledgefirst_codec -ledgefirst_tensor \
+        -Wl,-rpath,'$ORIGIN' \
+        > "${codeclog}" 2>&1; then
+    echo "BUILD FAILED for test_codec_api (${TRIPLE}); last lines of ${codeclog}:" >&2
+    tail -30 "${codeclog}" >&2
+    return 1
+  fi
   return 0
 }
 
-# testdata/ plus every crates/*/testdata merged into one tree: every
-# EDGEFIRST_TESTDATA_DIR-aware fixture loader resolves relative to one root.
-# A crate file that would overwrite another is an error, as in ci-setup.sh.
+# Unpacks the wheels into python/ and copies the Python codec tests into
+# tests/.
+bundle_python() {
+  local wheels="$1" w
+  echo "==> unpacking the Python wheels from ${wheels}"
+  mkdir -p "${OUT}/python" "${OUT}/tests"
+  for w in "${wheels}"/*.whl; do
+    [[ -e "${w}" ]] || { echo "no wheels in ${wheels}" >&2; return 1; }
+    python3 -m zipfile -e "${w}" "${OUT}/python"
+    echo "    $(basename "${w}")"
+  done
+  cp tests/__init__.py tests/conftest.py "${OUT}/tests/"
+  cp -a tests/codec "${OUT}/tests/"
+  return 0
+}
+
+# Merges testdata/ and every crates/*/testdata into one tree. A crate file
+# that would overwrite another is an error.
 merge_testdata() {
   local dst="$1"
   mkdir -p "${dst}"
@@ -249,13 +246,16 @@ if [[ "${MODE}" == tests ]]; then
   libdir="target/${ARCH}-unknown-linux-gnu/debug"
   mkdir -p "${OUT}/target/debug"
   cp -a "${libdir}"/libedgefirst_*.so "${libdir}"/libedgefirst_*.so.0 \
-        "${libdir}/test_two_library_user" "${OUT}/target/debug/"
+        "${libdir}/test_two_library_user" "${libdir}/test_codec_api" "${OUT}/target/debug/"
   for c in ${CAPI_CRATES}; do
     mkdir -p "${OUT}/crates/${c}"
     cp -a "crates/${c}/src" "crates/${c}/include" "${OUT}/crates/${c}/"
   done
   cp scripts/on-target-run.sh scripts/check-single-home.sh \
      .github/scripts/dma-heap-setup.sh "${OUT}/scripts/"
+  if [[ -n "${PYTHON_WHEELS}" ]]; then
+    bundle_python "${PYTHON_WHEELS}"
+  fi
 else
   build_benches
   while IFS= read -r bin; do

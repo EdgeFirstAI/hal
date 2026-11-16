@@ -745,6 +745,10 @@ class VideoDecoder:
                 DMA-BUF buffer (an NV12 D3D11 image of the stream's visible
                 size on Windows). The decoder writes those tensors: do not
                 use them while it is open.
+                A V4L2 device takes a bounded number of buffers (31 on the
+                i.MX 95's Wave6, its own included); a pool beyond that
+                raises ``InvalidConfigError`` from :meth:`decode` once the
+                stream's format is known.
 
         Raises:
             NoDeviceError: There is no decoder.
