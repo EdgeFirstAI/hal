@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! Shared helpers for Article-1 JPEG → letterbox benchmark modules.
+//! Shared helpers for the JPEG → letterbox benchmark modules.
 
 mod cpu;
 
@@ -64,8 +64,7 @@ pub struct BenchArgs {
 
     /// Force decode/output tensor memory backend.
     ///
-    /// `auto` follows HAL (DMA→PBO→Mem). Prior `codec_benchmark` numbers used
-    /// Mem; decoding into DMA-BUF pays sync/coherency cost on the CPU write path.
+    /// `auto` follows HAL (DMA→PBO→Mem).
     #[arg(long, value_enum, default_value_t = TensorMem::Auto)]
     pub tensor_mem: TensorMem,
 
@@ -82,9 +81,8 @@ pub struct BenchArgs {
 
     /// Time JPEG→raster only (skip `ImageProcessor::convert` / letterbox).
     ///
-    /// Use with `--decode-fmt native` (YUV/NV*) or `--decode-fmt rgb` for a
-    /// fair decoder A/B against TurboJPEG `--decode-only --format yuv|rgb`.
-    /// Model-input preprocessing is out of scope for this mode.
+    /// Use with `--decode-fmt native` (YUV/NV*) or `--decode-fmt rgb` to compare
+    /// against TurboJPEG `--decode-only --format yuv|rgb`.
     #[arg(long, env = "EDGEFIRST_BENCH_DECODE_ONLY", default_value_t = false)]
     pub decode_only: bool,
 
@@ -92,12 +90,8 @@ pub struct BenchArgs {
     /// decode → NV*/GREY → same-size RGB, a pure colour-conversion second
     /// pass with no scaling.
     ///
-    /// For the hardware-decode table's "full cost to RGB" rows: hardware
-    /// JPEG blocks that emit only their stream's native YUV layout (e.g.
-    /// i.MX mxc-jpeg) need this pass before an RGB consumer can use the
-    /// pixels, while NV12-native consumers stop at `--decode-only`. The
-    /// per-frame decode/convert split is reported so both costs publish
-    /// from one run. Ignored when `--decode-only` is set.
+    /// The per-frame decode/convert split is reported. Ignored when
+    /// `--decode-only` is set.
     #[arg(long, default_value_t = false)]
     pub full_res_convert: bool,
 }
@@ -171,9 +165,8 @@ pub fn expand_tilde(path: &str) -> PathBuf {
 
 /// Sorted list of `.jpg` / `.jpeg` paths under `dir`.
 ///
-/// When `limit` is set and smaller than the full set, returns **evenly spaced**
-/// samples across the sorted directory. COCO val2017's lexicographic prefix is
-/// dominated by 4:4:4 JPEGs; stride sampling avoids a biased smoke set.
+/// When `limit` is set and smaller than the full set, returns evenly spaced
+/// samples across the sorted directory.
 pub fn list_jpegs(dir: &Path, limit: Option<usize>) -> Result<Vec<PathBuf>> {
     if !dir.is_dir() {
         bail!("COCO directory not found: {}", dir.display());
@@ -215,7 +208,7 @@ pub struct TimingStats {
     pub ms_p99: f64,
     pub ms_mean: f64,
     /// ~95% confidence interval for the median (nonparametric, order-statistic
-    /// ranks n/2 ∓ 1.96·√n/2 — no distribution assumption on the samples).
+    /// ranks n/2 ∓ 1.96·√n/2).
     pub ms_p50_ci_lo: f64,
     pub ms_p50_ci_hi: f64,
     pub mpix_per_s: f64,
@@ -346,7 +339,7 @@ fn csv_escape(s: &str) -> String {
 /// How HAL modules configure decode / convert for a composed arm.
 #[derive(Debug, Clone, Copy)]
 pub struct HalModuleConfig {
-    /// Plan class label for CSV (`cpu`, `hybrid_gl`, `hybrid_2d`, `hw_gl`).
+    /// Class label for CSV (`cpu`, `hybrid_gl`, `hybrid_2d`, `hw_gl`).
     pub class: &'static str,
     /// Module directory name.
     pub module: &'static str,
@@ -354,14 +347,12 @@ pub struct HalModuleConfig {
     pub force_backend: &'static str,
     /// When true, set `EDGEFIRST_DISABLE_V4L2=1` (software JPEG only).
     pub disable_v4l2: bool,
-    /// When true and `--tensor-mem=auto`, force Mem decode source (matches
-    /// historical `codec_benchmark` Mem numbers; avoids DMA write sync cost).
+    /// When true and `--tensor-mem=auto`, force Mem decode source.
     pub prefer_heap_src: bool,
 }
 
 impl HalModuleConfig {
     pub fn apply_env(&self) {
-        // Must be set before ImageProcessor::new / first decode.
         std::env::set_var("EDGEFIRST_FORCE_BACKEND", self.force_backend);
         if self.disable_v4l2 {
             std::env::set_var("EDGEFIRST_DISABLE_V4L2", "1");
@@ -371,11 +362,10 @@ impl HalModuleConfig {
     }
 }
 
-/// Allocate the reusable decode source pool (Studio profiler pattern).
+/// Allocate the reusable decode source pool.
 ///
-/// Sized as a single-plane Grey/R8 surface with height `3·max_h` so NV24
-/// (and every smaller native JPEG layout) fits without reallocating. Allocating
-/// as `Nv24` FourCC instead of Grey forces GL off the zero-copy R8 bind path.
+/// A single-plane Grey/R8 surface of height `3·max_h`, which holds NV24 and
+/// every smaller native JPEG layout.
 fn create_decode_source_pool(
     processor: &ImageProcessor,
     max_w: usize,
@@ -406,9 +396,9 @@ fn resolve_src_memory(cfg: &HalModuleConfig, args: &BenchArgs) -> Option<TensorM
 }
 
 /// Finish a per-frame crop: when the decoded image is smaller than the pooled
-/// tensor, pin `source` so the GPU samples only the live sub-rect (profiler
-/// pattern). `base` carries the fit — letterbox for the model-input pipeline,
-/// `Crop::no_crop()` for the full-resolution colour-conversion pass.
+/// tensor, set `source` to the live sub-rect. `base` carries the fit: letterbox
+/// for the model-input pipeline, `Crop::no_crop()` for the full-resolution
+/// colour-conversion pass.
 fn frame_crop(base: Crop, info_w: usize, info_h: usize, tensor: &TensorDyn) -> Crop {
     let mut crop = base;
     let shape = tensor.shape();
@@ -421,14 +411,7 @@ fn frame_crop(base: Crop, info_w: usize, info_h: usize, tensor: &TensorDyn) -> C
 }
 
 /// Per-frame convert setup: build the crop and, in full-res mode, reconfigure
-/// the pooled destination to this frame's dimensions so the convert is a pure
-/// NV*/GREY→RGB colour conversion (no scaling). The pool is sized for the
-/// largest frame, so `configure_image` only moves logical dims — a realloc
-/// would show up as `identity_churn`. Note the GL backend still re-imports an
-/// EGLImage per *distinct* configured geometry (cached per size; required for
-/// correct pitch), so on varying-size corpora the GL convert leg carries real
-/// per-new-size import cost that is measured convert work, not allocation
-/// churn — see BENCHMARKS.md § Hardware decoders.
+/// the pooled destination to this frame's dimensions.
 fn prepare_convert(
     args: &BenchArgs,
     info_w: usize,
@@ -453,15 +436,9 @@ fn prepare_convert(
 
 /// HAL JPEG latency sweep: decode → optional letterbox convert.
 ///
-/// Hot loop reuses a single decode-source DMA pool (and, unless
-/// `--decode-only`, a single 640×640 output tensor) — `load_image` / `convert`
-/// only reconfigure logical dims, never allocate. JPEG bytes are preloaded so
-/// disk I/O is outside the timed section.
-///
-/// With `--decode-only`, only `load_image` is timed (JPEG bytes → YUV/NV* or
-/// fused RGB in the source pool). That is the fair decoder A/B against
-/// TurboJPEG `--decode-only`; convert / letterbox is preprocessing and is not
-/// included.
+/// The hot loop reuses a single decode-source pool and, unless
+/// `--decode-only`, a single output tensor. JPEG bytes are preloaded outside
+/// the timed section. With `--decode-only`, only `load_image` is timed.
 pub fn run_hal_module(cfg: HalModuleConfig, args: &BenchArgs) -> Result<TimingStats> {
     cpu::pin_qos();
     cfg.apply_env();
@@ -547,7 +524,6 @@ pub fn run_hal_module(cfg: HalModuleConfig, args: &BenchArgs) -> Result<TimingSt
                 PixelFormat::Rgb,
                 DType::U8,
                 dst_memory,
-                // GPU path declares None; CPU fallback still writes the destination.
                 CpuAccess::Write,
             )
             .context("create output")?,
@@ -572,7 +548,7 @@ pub fn run_hal_module(cfg: HalModuleConfig, args: &BenchArgs) -> Result<TimingSt
         args.tensor_mem
     );
 
-    // Host GL/PBO cannot upload Nv24; keep a CPU processor for those frames.
+    // CPU processor for the frames the GPU path cannot upload.
     let mut cpu_fallback: Option<ImageProcessor> = if cfg.force_backend == "cpu" || args.decode_only
     {
         None
@@ -619,7 +595,7 @@ pub fn run_hal_module(cfg: HalModuleConfig, args: &BenchArgs) -> Result<TimingSt
         }
     };
 
-    // Warm-fill + warmup (page faults / EGL import out of the timed loop).
+    // Warm-fill + warmup.
     let first = &images[0].1;
     for _ in 0..args.warmup {
         let info = input
@@ -670,7 +646,7 @@ pub fn run_hal_module(cfg: HalModuleConfig, args: &BenchArgs) -> Result<TimingSt
             t1
         };
 
-        // BufferIdentity must stay stable — a new id means a silent realloc.
+        // Count frames whose source or destination buffer identity changed.
         let dst_changed = output
             .as_ref()
             .is_some_and(|o| o.buffer_identity().id() != dst_id0);
@@ -684,7 +660,7 @@ pub fn run_hal_module(cfg: HalModuleConfig, args: &BenchArgs) -> Result<TimingSt
         convert_ms.push(t2.duration_since(t1).as_secs_f64() * 1000.0);
         total_mpix += (info.width as f64) * (info.height as f64) / 1_000_000.0;
 
-        // Cheap /proc/stat sample every frame for peak-core tracking.
+        // Sample /proc/stat every fourth frame for peak-core tracking.
         if i % 4 == 0 {
             cpu_peak.sample();
         }

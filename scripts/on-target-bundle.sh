@@ -141,7 +141,7 @@ build_benches() {
 # Builds the C-API libraries (debug), test_two_library_user and
 # test_codec_api.
 build_libs() {
-  echo "==> building the C-API libraries + G3 for ${TRIPLE}"
+  echo "==> building the C-API libraries and test_two_library_user for ${TRIPLE}"
   # Builds into the repository's `target` directory, where each leaf's
   # build.rs looks for libedgefirst_tensor.so.
   local c
@@ -167,16 +167,16 @@ build_libs() {
   done
 
   # Cross-compiles test_two_library_user with zig cc.
-  local g3log="${LOGS}/libbuild-g3-${ARCH}.log"
+  local two_lib_log="${LOGS}/libbuild-two-library-user-${ARCH}.log"
   if ! zig cc -std=c11 -Wall -Wextra -target "${ARCH}-linux-gnu.${GLIBC}" \
         -o "${outdir}/test_two_library_user" \
         crates/codec-capi/tests/c/test_two_library_user.c \
         -Icrates/codec-capi/include -Icrates/tensor-capi/include \
         -L"${outdir}" -ledgefirst_codec -ledgefirst_tensor \
         -Wl,-rpath,'$ORIGIN' \
-        > "${g3log}" 2>&1; then
-    echo "BUILD FAILED for the G3 binary (${TRIPLE}); last lines of ${g3log}:" >&2
-    tail -30 "${g3log}" >&2
+        > "${two_lib_log}" 2>&1; then
+    echo "BUILD FAILED for test_two_library_user (${TRIPLE}); last lines of ${two_lib_log}:" >&2
+    tail -30 "${two_lib_log}" >&2
     return 1
   fi
 

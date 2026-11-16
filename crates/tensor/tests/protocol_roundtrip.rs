@@ -1,20 +1,16 @@
 //! Consumer side of the cross-package tensor protocol:
-//! [`TensorDyn::import_descriptor`] rebuilding a usable, *aliasing* tensor
-//! from an [`TensorDesc`](edgefirst_tensor::TensorDesc).
+//! [`TensorDyn::import_descriptor`] rebuilding a usable, aliasing tensor from
+//! an [`TensorDesc`](edgefirst_tensor::TensorDesc).
 //!
-//! The aliasing tests are the ones that matter here: a consumer that copies
-//! instead of aliasing would still pass a naive shape/dtype assertion while
-//! defeating the entire point of the protocol. Every roundtrip test below
-//! writes through the producer handle and reads back through the imported
-//! one to prove the two see the same physical bytes.
+//! Every roundtrip test writes through the producer handle and reads back
+//! through the imported one.
 
 use edgefirst_tensor::{
     Colorimetry, CpuAccess, Error, PixelFormat, Tensor, TensorDyn, TensorMapTrait, TensorMemory,
     TensorTrait,
 };
 
-/// The DMA-heap skip policy, shared with every DMA-gated test so a skip under
-/// `HAL_TEST_REQUIRE_DMA=1` fails instead. Linux-only, like its callers.
+/// The DMA-heap skip policy: a skip under `HAL_TEST_REQUIRE_DMA=1` fails.
 #[cfg(target_os = "linux")]
 #[path = "support/dma_require.rs"]
 mod dma_require;
@@ -41,7 +37,7 @@ fn host_roundtrip_sees_the_same_bytes() {
         m.as_mut_slice()[0] = 0xAB;
     }
 
-    // `pin_host` must be taken before `t` moves into the TensorDyn wrapper.
+    // The pin is taken before `t` moves into the `TensorDyn` wrapper.
     let pin = t.pin_host(CpuAccess::ReadWrite).unwrap();
     let dyn_t = TensorDyn::from(t);
     let desc = dyn_t.descriptor_pinned(Some(&pin));
@@ -57,10 +53,7 @@ fn host_roundtrip_sees_the_same_bytes() {
 
 #[test]
 fn planar_format_round_trips_through_import() {
-    // PlanarRgb.to_fourcc() == 0 -- the same sentinel a non-image tensor
-    // uses -- so this only round-trips if import_descriptor prefers
-    // format over fourcc, per format_from_code(desc.format) with a
-    // fourcc fallback only when format is NONE.
+    // `PlanarRgb.to_fourcc()` is 0, the value a non-image tensor carries.
     let t = Tensor::<u8>::image(
         640,
         480,
@@ -102,9 +95,7 @@ fn rejects_unknown_version() {
     );
 }
 
-/// Version 1 numbered `kind` differently (1 was dma-buf, where the
-/// `TensorMemory` numbering has `Shm`), so a version-1 descriptor must be
-/// refused rather than read with the version-2 kinds.
+/// A version-1 descriptor is refused.
 #[test]
 fn rejects_a_version_1_descriptor() {
     let t = Tensor::<u8>::new(&[4], Some(TensorMemory::Mem), None).unwrap();
@@ -131,11 +122,7 @@ fn rejects_unknown_dtype_code() {
 
 #[test]
 fn colorimetry_round_trips_through_import() {
-    // Task 10b, defect A: `descriptor_pinned` packs colorimetry, but until
-    // fixed `import_descriptor` never unpacked it back onto the imported
-    // tensor -- a decode through the cross-package path left the caller
-    // unable to see BT.601/full-range JFIF tagging, silently degrading
-    // downstream colour conversion accuracy.
+    // `descriptor_pinned` packs colorimetry and `import_descriptor` unpacks it.
     let t = Tensor::<u8>::image(
         16,
         16,
@@ -176,13 +163,7 @@ fn undefined_colorimetry_imports_as_none() {
 
 #[test]
 fn host_import_inherits_the_producers_capacity_headroom() {
-    // Task 10b, defect B. NV12 at an odd width pads the row stride (even,
-    // then 64-byte aligned) beyond shape.product(): a real allocation gap
-    // between `capacity_bytes()` and the logical shape's byte size, exactly
-    // like a decoder's MCU-aligned write headroom. Before the fix, a host-memory
-    // import had no way to learn about that gap -- the reconstructed tensor's
-    // capacity was clamped to exactly the declared shape, so writing the
-    // producer's own padded stride into it would have run out of bounds.
+    // NV12 at an odd width pads the row stride beyond `shape.product()`.
     let t = Tensor::<u8>::image(
         295,
         175,
@@ -212,10 +193,7 @@ fn host_import_inherits_the_producers_capacity_headroom() {
          just the declared shape's byte size"
     );
 
-    // Reconfiguring within that headroom (the decode-time `configure_image`
-    // pool-reuse path) must succeed -- this is exactly what previously
-    // returned `Error::InsufficientCapacity` even though the producer's real
-    // allocation had room, because the import discarded the padding.
+    // Reconfigures within that headroom.
     let mut imported = imported;
     imported
         .configure_image(295, 175, PixelFormat::Nv12)
@@ -224,16 +202,8 @@ fn host_import_inherits_the_producers_capacity_headroom() {
 
 #[test]
 fn host_import_preserves_the_producers_row_stride_for_pool_reuse() {
-    // Task 10b, defect B (the other half): `configure_image`'s pool-reuse
-    // logic only *prefers* keeping a stride when one is already recorded on
-    // the tensor (`prior_stride`). Capacity headroom alone is not enough --
-    // without restoring the producer's stride on import, a reconfigure to a
-    // smaller image recomputes a tighter, un-padded stride instead of
-    // preserving the producer's real (wider) allocation pitch, corrupting
-    // row addressing for any consumer that reads rows at the reported
-    // stride. This mirrors `test_decode_image_from_bytes` in the Python
-    // suite (a 1920-wide pool tensor decoding a 1280-wide image must still
-    // report row_stride=1920, not 1280).
+    // The import restores the producer's stride, and a reconfigure to a
+    // smaller image keeps it.
     let t = Tensor::<u8>::image(
         1920,
         1080,
@@ -266,14 +236,7 @@ fn host_import_preserves_the_producers_row_stride_for_pool_reuse() {
 
 #[test]
 fn host_import_rejects_a_row_stride_that_would_overflow_capacity() {
-    // `set_row_stride` validates only a minimum (`stride >= min_stride`) --
-    // it does no size validation by design, since it is pure layout
-    // metadata for callers who never touch a real allocation (see
-    // `strides_follow_row_stride_not_shape` in `tests/protocol.rs`). A
-    // descriptor crossing the capsule boundary is untrusted input, though:
-    // import_descriptor must guard `stride_bytes * rows <= capacity` itself
-    // rather than trusting an oversized stride just because `set_row_stride`
-    // accepted it.
+    // `import_descriptor` checks `stride_bytes * rows <= capacity`.
     let t = Tensor::<u8>::image(
         16,
         16,
@@ -285,8 +248,7 @@ fn host_import_rejects_a_row_stride_that_would_overflow_capacity() {
     let pin = t.pin_host(CpuAccess::ReadWrite).unwrap();
     let dyn_t = TensorDyn::from(t);
     let mut desc = dyn_t.descriptor_pinned(Some(&pin));
-    // Claim a row pitch that, times the row count, wildly exceeds the real
-    // 16×16×3-byte capacity -- as if a corrupt or hostile producer sent it.
+    // A row pitch that, times the row count, exceeds the 16x16x3-byte capacity.
     let malicious_stride = 1_000_000i64;
     desc.strides[0] = malicious_stride;
 
@@ -301,8 +263,7 @@ fn host_import_rejects_a_row_stride_that_would_overflow_capacity() {
 
 #[test]
 fn host_import_without_pin_fails() {
-    // A bare (unpinned) descriptor is descriptive-only: ptr is null. Importing
-    // it must fail loudly rather than dereference a null address.
+    // An unpinned descriptor has a null `ptr`.
     let t = Tensor::<u8>::new(&[4], Some(TensorMemory::Mem), None).unwrap();
     let desc = TensorDyn::from(t).descriptor();
     let err = TensorDyn::import_descriptor(&desc).unwrap_err();
@@ -314,11 +275,6 @@ fn host_import_without_pin_fails() {
 
 // ---------------------------------------------------------------------------
 // dma-buf (Linux only): not testable on this platform.
-//
-// This is a real, load-bearing gap, not an oversight -- dma-buf import
-// (TensorDyn::import_descriptor's kind::DMABUF arm) has no coverage on any
-// non-Linux CI lane. libtest swallows println! for a passing test, so this
-// says so on stderr where it cannot be missed.
 // ---------------------------------------------------------------------------
 #[cfg(not(target_os = "linux"))]
 #[test]
@@ -332,9 +288,7 @@ fn dmabuf_import_has_no_coverage_off_linux() {
     );
 }
 
-/// A `Shm` producer reports its own code, `kind::SHM` (1), not dma-buf: the
-/// descriptor kind is the `TensorMemory` numbering. The import treats it as
-/// host memory and aliases the pinned address.
+/// A `Shm` producer reports `kind::SHM`; the import aliases the pinned address as host memory.
 #[cfg(unix)]
 #[test]
 fn shm_descriptor_reports_shm_and_imports_as_host_memory() {
@@ -372,7 +326,7 @@ fn dmabuf_roundtrip_sees_the_same_bytes() {
         m.as_mut_slice()[0] = 0xEF;
     }
     let dyn_t = TensorDyn::from(t);
-    let desc = dyn_t.descriptor(); // handle carries the dma-buf fd; no pin needed
+    let desc = dyn_t.descriptor(); // handle carries the dma-buf fd
     assert_eq!(desc.kind, edgefirst_tensor::tensor_kind::DMABUF);
     assert_eq!(desc.kind, TensorMemory::DmaBuf.code());
     assert_eq!(desc.kind, 2, "dma-buf is code 2 on every surface");
@@ -386,25 +340,8 @@ fn dmabuf_roundtrip_sees_the_same_bytes() {
 #[cfg(target_os = "linux")]
 #[test]
 fn imported_dmabuf_with_a_recorded_stride_is_still_cpu_mappable() {
-    // Task 10b follow-up (the flagship-pipeline regression): `configure_image`
-    // (called from inside a JPEG decode, `crates/codec/src/jpeg/mod.rs`)
-    // unconditionally records a row pitch for any `Dma`-backed destination,
-    // self-allocated or not. An imported DMA-BUF crossing the capsule
-    // protocol -- `decode_file_into` writing into an `edgefirst.image`
-    // `ImageProcessor.create_image()` destination from `edgefirst.codec`,
-    // the documented cross-package pipeline -- used to fail the moment the
-    // decoder's MCU writer tried to `map_write()` it, because `Tensor::map`
-    // rejected *any* strided imported DMA-BUF outright. Fixed by bounds-
-    // checking a strided imported DMA-BUF against its real (`fstat`-derived)
-    // `buf_size` instead of rejecting it unconditionally -- the same check
-    // a self-allocated Dma tensor already relied on for its own soundness.
-    //
-    // This reproduces the mechanism directly (`from_fd` + `set_row_stride`,
-    // mirroring what `configure_image` does), without going through the
-    // Python packages: mint a self-allocated Dma tensor, import an *aliased*
-    // copy of its own fd (so `is_imported = true`), record a stride on the
-    // import the way `configure_image` would, and confirm the write through
-    // it both succeeds and is visible through the original owner.
+    // Imports an aliased copy of a self-allocated Dma tensor's fd, records a
+    // stride on the import, and writes through it.
     if !dma_or_skip("imported_dmabuf_with_a_recorded_stride_is_still_cpu_mappable") {
         return;
     }
@@ -420,9 +357,7 @@ fn imported_dmabuf_with_a_recorded_stride_is_still_cpu_mappable() {
     let fd = TensorTrait::clone_fd(&owner).expect("clone dma-buf fd");
     let mut imported = Tensor::<u8>::from_fd(fd, &[32, 64, 3], None).expect("import via from_fd");
     imported.set_format(PixelFormat::Rgb).expect("set_format");
-    // What `configure_image` would compute for this exact width/format:
-    // width * channels * elem, already a whole number and (here) already
-    // 64-aligned -- the ordinary case this regression broke.
+    // width * channels * elem.
     imported
         .set_row_stride(64 * 3)
         .expect("set_row_stride: a HAL-computed pitch for the import's own format/width");
@@ -448,17 +383,6 @@ fn imported_dmabuf_with_a_recorded_stride_is_still_cpu_mappable() {
 #[cfg(target_os = "linux")]
 #[test]
 fn dmabuf_import_preserves_the_producers_row_stride_for_pool_reuse() {
-    // Task 10b follow-up (confirmed on rpi5-hailo, not just anticipated):
-    // `Tensor::image()` auto-selects `Dma` when a DMA-BUF heap is available
-    // (the common case on Linux), so the exact host-memory pool-reuse scenario
-    // `host_import_preserves_the_producers_row_stride_for_pool_reuse` covers
-    // also happens routinely on `Dma`. Before extending the stride-restore
-    // gate past host memory, a decode into an oversized DMA-BUF-backed
-    // destination crossing the capsule protocol recomputed a tighter stride
-    // for the smaller decoded image instead of keeping the pool's true
-    // (wider) pitch -- silent misalignment for any GPU consumer reading at
-    // the buffer's real physical stride. Mirrors the host-memory test exactly,
-    // for `TensorMemory::DmaBuf`.
     if !dma_or_skip("dmabuf_import_preserves_the_producers_row_stride_for_pool_reuse") {
         return;
     }
@@ -477,7 +401,7 @@ fn dmabuf_import_preserves_the_producers_row_stride_for_pool_reuse() {
     );
 
     let dyn_t = TensorDyn::from(t);
-    let desc = dyn_t.descriptor(); // handle carries the dma-buf fd; no pin needed
+    let desc = dyn_t.descriptor(); // handle carries the dma-buf fd
 
     let mut imported = TensorDyn::import_descriptor(&desc).unwrap();
     imported
@@ -492,8 +416,7 @@ fn dmabuf_import_preserves_the_producers_row_stride_for_pool_reuse() {
 }
 
 // ---------------------------------------------------------------------------
-// IOSurface (macOS/iOS): TensorMemory::DmaBuf is IOSurface-backed there, so
-// this platform's own "Dma" arm gets real aliasing coverage.
+// IOSurface (macOS/iOS).
 // ---------------------------------------------------------------------------
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 #[test]
@@ -511,22 +434,12 @@ fn iosurface_roundtrip_sees_the_same_bytes() {
         m.as_mut_slice()[0] = 0xCD;
     }
     let dyn_t = TensorDyn::from(t);
-    let desc = dyn_t.descriptor(); // handle carries the IOSurfaceID; no pin needed
+    let desc = dyn_t.descriptor(); // handle carries the IOSurfaceID
     assert_eq!(desc.kind, edgefirst_tensor::tensor_kind::IOSURFACE);
 
     let imported = TensorDyn::import_descriptor(&desc).unwrap();
     assert_eq!(imported.shape(), dyn_t.shape());
-    // `restore_imported_row_stride` lists the kinds whose pitch is a
-    // property of the shared buffer itself, and since issue #161 an
-    // IOSurface is one of them. This used to assert the opposite, guarding
-    // a Linux DMA-BUF CPU-map restriction that has since been lifted at the
-    // map site (`imported_dmabuf_with_a_recorded_stride_is_still_cpu_mappable`
-    // pins that). The stride must now survive the round trip, and the map
-    // below must still alias with it recorded. At 64 RGB texels the pitch
-    // equals the tight row, so this only proves the restore ran; the
-    // padded-pitch case is
-    // `descriptor_import_restores_the_iosurface_pitch_onto_a_view` in the
-    // `iosurface` module.
+    // The stride survives the round trip.
     assert_eq!(
         imported.row_stride(),
         Some(desc.strides()[0] as usize),
@@ -553,7 +466,7 @@ fn iosurface_import_rejects_dead_id() {
     )
     .unwrap();
     let mut desc = TensorDyn::from(t).descriptor();
-    desc.handle = 0x7FFF_FFFF; // implausible id: no live surface should hold it
+    desc.handle = 0x7FFF_FFFF; // an id no live surface holds
     let err = TensorDyn::import_descriptor(&desc).unwrap_err();
     assert!(
         matches!(err, Error::InvalidArgument(_)),
@@ -563,13 +476,7 @@ fn iosurface_import_rejects_dead_id() {
 
 #[test]
 fn import_refuses_a_descriptor_advertising_an_unwaitable_fence() {
-    // `sync` is reserved in this build, so a producer that sets
-    // SYNC_PRESENT is describing a fence nothing here can wait on. Importing
-    // anyway would alias memory the producer's device may still be writing,
-    // and the resulting corruption would be timing-dependent -- the worst
-    // kind to diagnose. Refusing is the only honest option while the field
-    // is reserved; this test is what stops a future change from quietly
-    // relaxing it into "ignore the flag".
+    // `sync` is reserved in this build: a descriptor with `SYNC_PRESENT` is refused.
     let t = Tensor::<u8>::image(
         16,
         8,
@@ -578,9 +485,7 @@ fn import_refuses_a_descriptor_advertising_an_unwaitable_fence() {
         CpuAccess::ReadWrite,
     )
     .expect("alloc");
-    // `pin_host` before the move, so the descriptor carries a real address --
-    // otherwise the import fails for an unrelated reason and this test would
-    // pass without ever reaching the SYNC_PRESENT check.
+    // The pin is taken before the move: the descriptor carries a real address.
     let pin = t.pin_host(CpuAccess::ReadWrite).unwrap();
     let dyn_t = TensorDyn::from(t);
     let mut desc = dyn_t.descriptor_pinned(Some(&pin));
@@ -598,13 +503,7 @@ fn import_refuses_a_descriptor_advertising_an_unwaitable_fence() {
     );
 }
 
-/// `D3D11_TEXTURE` is the one kind allowed to set `SYNC_PRESENT`, and it
-/// carries the fence's NT handle in `ptr`. A descriptor that advertises a
-/// fence value with a null `ptr` therefore names a completion nobody can wait
-/// on, which is the same in-flight-write hazard rather than a missing
-/// feature. Refused on every platform: the check is in the shared validation,
-/// not in the Windows construction arm, so a non-Windows consumer refuses it
-/// too instead of reporting the kind as unimplemented.
+/// A `D3D11_TEXTURE` descriptor with a fence value and a null `ptr` is refused on every platform.
 #[test]
 fn import_refuses_a_d3d11_completion_with_no_fence_handle() {
     let t = Tensor::<u8>::image(
@@ -637,19 +536,13 @@ fn import_refuses_a_d3d11_completion_with_no_fence_handle() {
 
 // --- A PBO's descriptor pointer, on both backends -------------------------
 
-/// Mock [`edgefirst_tensor::PboOps`] over a `Vec<u8>`, so this file can
-/// build a PBO-backed tensor with no GL context. A sibling of the one in
-/// `dynamic_primitives.rs`, reimplemented here for the same reason: an
-/// integration test can only reach the crate's public API, and this file
-/// runs on BOTH backends where that one is `dynamic`-only.
+/// Mock [`edgefirst_tensor::PboOps`] over a `Vec<u8>`.
 struct MockPboOps {
     storage: std::sync::Mutex<Vec<u8>>,
 }
 
-// SAFETY: the returned pointer addresses a `Vec<u8>` allocated once in
-// `new` and never resized, so it stays valid for as long as the
-// `MockPboOps` does -- which outlives every mapping handed out, since the
-// tensor holds an `Arc` to it.
+// SAFETY: the returned pointer addresses a `Vec<u8>` allocated once in `new`
+// and never resized, and the tensor holds an `Arc` to the `MockPboOps`.
 unsafe impl edgefirst_tensor::PboOps for MockPboOps {
     fn map_buffer(
         &self,
@@ -682,22 +575,7 @@ fn pbo_backed(buffer_id: u32, bytes: usize, shape: &[usize]) -> TensorDyn {
         .into()
 }
 
-/// A PBO-backed tensor's descriptor carries the PBO vtable pointer in
-/// `ptr`, never a host address.
-///
-/// `TensorDesc::ptr` is filled from a pin *before* `pbo_vtable_ptr`
-/// (`protocol.rs`'s `from_parts`), a precedence that is only safe because
-/// the two are mutually exclusive: a PBO refuses `pin_host` on both
-/// backends, so no PBO descriptor can carry a pin. That makes this a real
-/// invariant rather than a restatement of the code -- swap the two arms and
-/// nothing changes today, but the day a PBO acquires a pin the consumer
-/// would open a host address as a vtable. Pinning the *value* is what
-/// catches that; pinning the ordering would not.
-///
-/// The consumer side is the reason it matters: `import_descriptor`'s
-/// `kind::PBO` arm reads `ptr` as an `EfClientState` vtable and calls
-/// through it. A host address there is a call through whatever bytes the
-/// producer's pixels happen to spell.
+/// A PBO-backed tensor's descriptor carries the PBO vtable pointer in `ptr`, not a host address.
 #[test]
 fn a_pbo_descriptor_carries_the_vtable_pointer_not_a_host_address() {
     let t = pbo_backed(77, 4 * 4, &[4, 4, 1]);
@@ -718,9 +596,7 @@ fn a_pbo_descriptor_carries_the_vtable_pointer_not_a_host_address() {
          calls through -- a host address here would be called as a vtable"
     );
 
-    // The same descriptor, taken the way a capsule takes it: an explicit
-    // (absent) pin. `descriptor_pinned(None)` is the `access=None` form the
-    // converter uses, and it must reach the same answer.
+    // The same descriptor through `descriptor_pinned(None)`.
     let d = t.descriptor_pinned(None);
     assert_eq!(
         d.ptr.0 as *const std::ffi::c_void, vtable,
@@ -728,8 +604,7 @@ fn a_pbo_descriptor_carries_the_vtable_pointer_not_a_host_address() {
          there is no pin to prefer"
     );
 
-    // And the precondition the precedence rests on: a PBO has no pin to
-    // take, on either backend, so `pin` can never win the `or_else` above.
+    // A PBO has no pin to take.
     assert!(
         matches!(
             t.pin_host(CpuAccess::Read),
@@ -740,23 +615,6 @@ fn a_pbo_descriptor_carries_the_vtable_pointer_not_a_host_address() {
 }
 
 /// A PBO `view()` keeps its parent's pitch across the descriptor.
-///
-/// The sibling of `host_import_preserves_the_producers_row_stride_for_pool_reuse`
-/// and its DMA-BUF twin, for the kind that was left out of
-/// `restore_imported_row_stride`'s allowlist. A sub-view's recorded stride
-/// is the PARENT's pitch -- that is how its rows are spaced -- so a rebuild
-/// that recomputed a tight pitch from the window's own width put every row
-/// after the first on the wrong columns. Silent: the shape, the dtype, the
-/// buffer id and the offset all survive, and only the pixels are wrong.
-///
-/// A GL buffer has no pitch of its own to fall back on (it is bytes), so
-/// unlike a D3D11 texture the producer's stride is the only description
-/// there is. The exclusion was correct before Stage B for a reason that
-/// stopped being true: `import_descriptor` had no `kind::PBO` arm at all,
-/// so no PBO descriptor ever reached that function.
-///
-/// The narrow window is load-bearing: a full-width band's tight pitch and
-/// its parent's pitch are the same number, so it passes either way.
 #[test]
 fn pbo_import_preserves_a_views_parent_pitch() {
     const W: usize = 64;
@@ -796,30 +654,12 @@ fn pbo_import_preserves_a_views_parent_pitch() {
         Some(parent_pitch),
         "the rebuilt view must step rows by the parent pitch ({parent_pitch}); \
          {} is the window's own tight row, which shears every row after the \
-         first (issue #162)",
+         first",
         SIDE * 3
     );
 }
 
-/// `pin_host` is refused on a PBO by BOTH backends, with the same message.
-///
-/// `glMapBufferRange`'s address is valid only until `glUnmapBuffer`, so a
-/// pin -- which promises an address that outlives the call -- has nothing
-/// to hand back. The static backend refuses in `Tensor::pin_host`'s
-/// `TensorStorage::Pbo` arm; the dynamic backend cannot forward to it,
-/// because `ef_tensor_map` is `map`, not `pin_host`, and the library cannot
-/// tell the two callers apart -- so the refusal is repeated in
-/// `dynamic_backend.rs` and both arms read the same
-/// `crate::pbo::PIN_HOST_PBO_REFUSAL`. Without the repeat, a PBO pinned on
-/// one backend and refused on the other from the identical call, which is
-/// precisely the divergence G13 cannot see.
-///
-/// This file, not `dynamic_primitives.rs`: only a test that COMPILES on
-/// both backends can make a claim about both, and this one is in
-/// `DYNAMIC_TEST_TARGETS` as well as the default static run.
-///
-/// The host half is not padding: it proves the refusal is keyed on the
-/// storage kind rather than a `pin_host` that simply never works here.
+/// `pin_host` works on host memory and is refused on a PBO, on both backends.
 #[test]
 fn pin_host_is_refused_by_a_pbo_on_both_backends() {
     let host: TensorDyn = Tensor::<u8>::new(&[4, 4], Some(TensorMemory::Mem), None)
@@ -841,8 +681,7 @@ fn pin_host_is_refused_by_a_pbo_on_both_backends() {
     }
 }
 
-/// The descriptor's buffer id is carried verbatim, whatever its value, and
-/// only a negative one means "no buffer".
+/// The descriptor's buffer id is carried verbatim, and only a negative one means no buffer.
 #[test]
 fn a_pbo_descriptor_carries_any_buffer_id_and_refuses_a_missing_one() {
     let t = pbo_backed(0, 16, &[4, 4, 1]);
@@ -859,10 +698,7 @@ fn a_pbo_descriptor_carries_any_buffer_id_and_refuses_a_missing_one() {
     );
 }
 
-/// A `Shm` tensor's descriptor relabelled `kind::DMABUF` around a dup of its
-/// fd, which is what the dma-buf import arm receives from a real producer:
-/// it dups the fd and lets `from_fd` classify it, so this reaches that arm on
-/// a host with no DMA heap.
+/// A `Shm` tensor's descriptor relabelled `kind::DMABUF` around a dup of its fd.
 #[cfg(target_os = "linux")]
 fn shm_relabelled_as_dmabuf(
     first: u8,
@@ -887,7 +723,7 @@ fn shm_relabelled_as_dmabuf(
 fn a_dmabuf_descriptor_imports_a_dup_of_its_fd() {
     let (_src, fd, desc) = shm_relabelled_as_dmabuf(0x5A);
     let imported = TensorDyn::import_descriptor(&desc).expect("the dma-buf arm imports the fd");
-    // The import holds its own dup, so the descriptor's fd may close.
+    // The import holds its own dup of the fd.
     drop(fd);
     assert_eq!(
         imported.memory(),
@@ -910,9 +746,7 @@ fn a_dmabuf_descriptor_with_a_negative_handle_carries_no_fd() {
     );
 }
 
-/// `0` is an fd number like any other; only a negative handle is absent.
-/// Whatever this process's fd 0 is, the import must try it rather than
-/// refuse it as missing.
+/// Handle `0` is an fd number like any other; only a negative handle is absent.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_dmabuf_descriptor_naming_fd_zero_is_not_refused_as_absent() {

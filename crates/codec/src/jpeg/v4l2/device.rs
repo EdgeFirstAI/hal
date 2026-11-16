@@ -1,12 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! Vendor-neutral V4L2 JPEG-decoder discovery.
+//! V4L2 JPEG-decoder discovery.
 //!
-//! The probe is purely capability-based — no device-node, driver-name, or
-//! output-format is hardcoded. Any Linux device that exposes a JPEG decoder
-//! through the standard V4L2 mem2mem API (i.MX `mxc-jpeg`, Rockchip Hantro,
-//! Chips&Media coda, Allwinner Cedrus, …) is discovered the same way.
+//! The probe is capability-based: any Linux device that exposes a JPEG
+//! decoder through the V4L2 mem2mem API is discovered, with no device node,
+//! driver name or output format built in.
 
 use std::path::{Path, PathBuf};
 
@@ -47,8 +46,7 @@ impl ProbedDevice {
 /// Probe for an accessible V4L2 JPEG decoder.
 ///
 /// Returns the first node that passes the capability checks, or `None` when
-/// none is available (or probing is disabled). Discovery failure is never an
-/// error, it just means the CPU decoder is used.
+/// none is available or probing is disabled.
 pub fn probe() -> Option<ProbedDevice> {
     if crate::jpeg::env_flag(ENV_DISABLE) {
         log::debug!("v4l2 jpeg decode disabled via {ENV_DISABLE}");

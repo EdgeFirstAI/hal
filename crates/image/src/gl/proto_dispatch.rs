@@ -1,16 +1,12 @@
-//! Pure decision table for the GL proto-segmentation render path.
+//! Decision table for the GL proto-segmentation render path.
 //!
 //! `plan_proto` maps `(proto dtype, layout, capabilities, interpolation
-//! mode)` to a [`ProtoPlan`] — which upload strategy feeds the proto
+//! mode)` to a [`ProtoPlan`]: which upload strategy feeds the proto
 //! texture, which shader program samples it, and which count uniform that
-//! program consumes. The table is GL-free and host-tested exhaustively,
-//! mirroring `float_dispatch::classify_float_render` and
-//! `render::plan_convert`: capability differences arrive as inputs, never
-//! as platform branches inside the renderer.
+//! program consumes. The table is GL-free.
 //!
-//! `dequant_coeffs` is the shared coefficient-widening helper for the
-//! integer mask-coefficient dtypes (the GL shaders consume f32 uniforms
-//! regardless of source dtype).
+//! `dequant_coeffs` widens the integer mask-coefficient dtypes to the f32
+//! uniforms the GL shaders consume.
 
 use edgefirst_tensor::ProtoLayout;
 use edgefirst_tensor::{DType, QuantMode};
@@ -28,11 +24,10 @@ pub(super) enum ProtoUpload {
     I8CpuRepack,
     /// CPU HWC→CHW repack, uploaded as R32F (one proto per layer).
     F32R32f,
-    /// f32→f16 repack packing 4 protos per RGBA16F layer — the capability
-    /// fallback for GPUs without `GL_OES_texture_float_linear`.
+    /// f32→f16 repack packing 4 protos per RGBA16F layer, for GPUs without
+    /// `GL_OES_texture_float_linear`.
     F32ToRgba16f,
-    /// Native-f16 shuffle packing 4 protos per RGBA16F layer (no widening
-    /// — uploading f16 protos as F32 would double the upload bytes).
+    /// Native-f16 shuffle packing 4 protos per RGBA16F layer.
     F16Rgba16f,
 }
 
@@ -65,16 +60,17 @@ pub(super) struct ProtoPlan {
     pub(super) count_uniform: CountUniform,
 }
 
-/// Decide the proto render plan. Pure: capabilities are inputs.
+/// Decide the proto render plan.
 ///
 /// * `compute_active` — the processor compiled the proto-repack compute
-///   program (GLES 3.1 compute present AND `EDGEFIRST_PROTO_COMPUTE=1`).
+///   program (GLES 3.1 compute present and `EDGEFIRST_PROTO_COMPUTE=1`).
 /// * `has_float_linear` — `GL_OES_texture_float_linear` (possibly forced
 ///   off via `EDGEFIRST_GL_NO_FLOAT_LINEAR`).
 ///
-/// Errors preserve the dispatcher's user-facing messages: NCHW layouts and
-/// unsupported proto dtypes are `NotSupported`/`InvalidShape` exactly as
-/// before the table existed.
+/// # Errors
+///
+/// An NCHW layout returns `NotSupported`; an unsupported proto dtype returns
+/// `InvalidShape`.
 pub(super) fn plan_proto(
     proto_dtype: DType,
     layout: ProtoLayout,
@@ -82,8 +78,6 @@ pub(super) fn plan_proto(
     has_float_linear: bool,
     int8_mode: Int8InterpolationMode,
 ) -> crate::Result<ProtoPlan> {
-    // The GL upload path assumes NHWC for ArrayView3 creation; NCHW would
-    // need a transpose first — the caller falls back to CPU.
     if layout == ProtoLayout::Nchw {
         return Err(crate::Error::NotSupported(
             "GL segmentation path does not yet support NCHW proto layout; \
@@ -104,10 +98,7 @@ pub(super) fn plan_proto(
                 Int8InterpolationMode::Bilinear => ProtoProgram::Int8Bilinear,
                 Int8InterpolationMode::TwoPass => ProtoProgram::Int8TwoPass,
             };
-            // The two-pass dequant target packs 4 protos per RGBA16F layer
-            // and samples through the f16 program, but its layer math is
-            // internal to the pass — the int8 entry points consume
-            // `num_protos`.
+            // Every int8 program consumes `num_protos`.
             ProtoPlan {
                 upload,
                 program,
@@ -144,8 +135,7 @@ pub(super) fn plan_proto(
 }
 
 /// HWC → layer-first repack: one proto per texture layer
-/// (`out[k][y][x] = in[y][x][k]`). Monomorphized per element type — the
-/// int8 (R8I) and f32 (R32F) upload paths share this exact transpose.
+/// (`out[k][y][x] = in[y][x][k]`).
 pub(super) fn repack_layers<T: Copy + Default>(protos: ndarray::ArrayView3<'_, T>) -> Vec<T> {
     let (height, width, num_protos) = protos.dim();
     let mut out = vec![T::default(); height * width * num_protos];
@@ -161,9 +151,7 @@ pub(super) fn repack_layers<T: Copy + Default>(protos: ndarray::ArrayView3<'_, T
 
 /// HWC → RGBA16F-packed layers: 4 protos per layer, zero-padded tail
 /// channels when `num_protos % 4 != 0`. Returns the raw f16 bits as bytes
-/// plus the layer count. `conv` is monomorphized per source dtype — the
-/// f32 fallback narrows (`f16::from_f32`), the native-f16 path passes
-/// through; protos are never widened to f32 (doubles upload bytes).
+/// plus the layer count. `conv` converts one source element to `f16`.
 pub(super) fn repack_rgba_f16_layers<S: Copy>(
     protos: ndarray::ArrayView3<'_, S>,
     conv: impl Fn(S) -> half::f16,
@@ -197,8 +185,7 @@ pub(super) fn repack_rgba_f16_layers<S: Copy>(
 
 /// Widen integer mask coefficients to the f32 the GL shaders consume,
 /// applying per-tensor dequantization. `None` quantization is a plain
-/// cast. Per-channel modes are rejected with the dispatcher's original
-/// message (a single scale/zp uniform cannot express them).
+/// cast. Per-channel modes are rejected.
 pub(super) fn dequant_coeffs<T: Copy + Into<f32>>(
     vals: &[T],
     mode: Option<QuantMode<'_>>,
@@ -228,13 +215,12 @@ mod tests {
         Int8InterpolationMode::TwoPass,
     ];
 
-    /// Every (dtype, capability, mode) row of the table, exhaustively.
+    /// Every (dtype, capability, mode) row of the table.
     #[test]
     fn plan_proto_full_table() {
         for compute in [false, true] {
             for linear in [false, true] {
-                // I8: upload follows compute_active, program follows mode,
-                // float-linear is irrelevant.
+                // I8: upload follows compute_active, program follows mode.
                 for mode in MODES {
                     let plan =
                         plan_proto(DType::I8, ProtoLayout::Nhwc, compute, linear, mode).unwrap();
@@ -257,8 +243,7 @@ mod tests {
                     assert_eq!(plan.count_uniform, CountUniform::NumProtos);
                 }
 
-                // F32: float-linear picks native R32F vs the RGBA16F
-                // fallback; compute and int8 mode are irrelevant.
+                // F32: float-linear picks native R32F or the RGBA16F fallback.
                 for mode in MODES {
                     let plan =
                         plan_proto(DType::F32, ProtoLayout::Nhwc, compute, linear, mode).unwrap();
@@ -273,7 +258,7 @@ mod tests {
                     }
                 }
 
-                // F16 native: one row regardless of capabilities.
+                // F16: one row regardless of capabilities.
                 for mode in MODES {
                     let plan =
                         plan_proto(DType::F16, ProtoLayout::Nhwc, compute, linear, mode).unwrap();
@@ -332,7 +317,6 @@ mod tests {
             .collect();
         let view = ndarray::ArrayView3::from_shape((2, 2, 3), &data).unwrap();
         let out = repack_layers(view);
-        // out[k][y][x]
         assert_eq!(out.len(), 12);
         for k in 0..3 {
             for y in 0..2 {
@@ -345,8 +329,8 @@ mod tests {
 
     #[test]
     fn repack_rgba_f16_layers_packs_quads_and_zero_pads_tail() {
-        // 1x2x6 HWC → 2 RGBA layers; 6 protos fill layer 0 fully and half
-        // of layer 1 (channels 2,3 of every pixel zero-padded).
+        // 1x2x6 HWC → 2 RGBA layers, the last two channels of layer 1
+        // zero-padded.
         let data: Vec<f32> = (0..2 * 6).map(|i| i as f32).collect();
         let view = ndarray::ArrayView3::from_shape((1, 2, 6), &data).unwrap();
         let (bytes, num_layers) = repack_rgba_f16_layers(view, half::f16::from_f32);
@@ -366,7 +350,7 @@ mod tests {
             }
         }
 
-        // Native-f16 identity conversion produces the identical packing.
+        // The native-f16 identity conversion produces the same packing.
         let data_f16: Vec<half::f16> = data.iter().map(|v| half::f16::from_f32(*v)).collect();
         let view_f16 = ndarray::ArrayView3::from_shape((1, 2, 6), &data_f16).unwrap();
         let (bytes_native, layers_native) = repack_rgba_f16_layers(view_f16, |v| v);
@@ -400,7 +384,6 @@ mod tests {
         .unwrap();
         assert_eq!(sym, vec![-0.5, 0.0, 0.5]);
 
-        // No quantization metadata → plain cast.
         let plain = dequant_coeffs(&vals, None, "I16").unwrap();
         assert_eq!(plain, vec![-2.0, 0.0, 2.0]);
     }

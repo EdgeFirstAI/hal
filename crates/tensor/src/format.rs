@@ -5,55 +5,11 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 // Declared through `ef_vocabulary!` (see `vocabulary.rs`): `.code()` is this
-// crate's wire numbering, mirrored by `protocol::format` and (via an
-// explicit, fallible outlier mapping -- see `to_hal_pixel_format` in the
-// capi crate) the C ABI's `hal_pixel_format`, which was numbered
-// independently before this vocabulary was unified and keeps its own frozen
-// values.
-//
-// Stays `#[non_exhaustive]`, deliberately: this attribute protects
-// DOWNSTREAM, not us -- `profiler`, `mobile-sdk` and any third party with an
-// exhaustive `match PixelFormat` keep compiling the day a variant such as
-// `Nv21` is added here. Removing it would narrow a published promise, and
-// narrowing is not reversible: re-adding it later breaks every downstream
-// exhaustive match that has grown in the meantime. That a new variant is
-// already a coordinated, single-declaration change *in this repo* (the
-// macro's whole point) says nothing about matches written outside it.
-// Consequence: a C mapping of `PixelFormat` cannot be a
-// compile-enforced exhaustive match (rustc requires a wildcard arm on a
-// `#[non_exhaustive]` enum outside its defining crate) -- it keeps a
-// wildcard `Err` arm.
-//
-// `as_str()`'s wire strings are a THIRD spelling, deliberately distinct from
-// both `Display` (FourCC-derived: `RGB`, `Y800`, ...) and the `serde` derive
-// (PascalCase variant names: `Rgb`, `PlanarRgb`, ...) -- those two existed
-// before this design and stay as they are; unifying them with the wire
-// vocabulary is not a cleanup, it is a breaking change to two formats that
-// are not this one. This declaration is the format table the schemas repo's
-// `Tensor.msg` cites as canonical, derived by grepping every format-string
-// literal already in use across that repo:
-//
-// | Variant      | `as_str()`     | Convention                                |
-// |--------------|----------------|--------------------------------------------|
-// | `Rgb`        | `"rgb8"`       | ROS `sensor_msgs/Image` encoding (36 uses)  |
-// | `Rgba`       | `"rgba8"`      | ROS encoding                               |
-// | `Bgra`       | `"bgra8"`      | ROS encoding                               |
-// | `Grey`       | `"mono8"`      | ROS encoding (2 uses)                      |
-// | `Yuyv`       | `"YUYV"`       | FourCC                                     |
-// | `Vyuy`       | `"VYUY"`       | FourCC                                     |
-// | `Nv12`       | `"NV12"`       | FourCC (11 uses, vs. 3 stray `"nv12"`)     |
-// | `Nv16`       | `"NV16"`       | FourCC                                     |
-// | `PlanarRgb`  | `"rgb8_planar"`  | ROS encoding, planar; no dimension-order  |
-// | `PlanarRgba` | `"rgba8_planar"` | suffix -- `shape` is the addressing grid  |
-// | `Nv24`       | `"NV24"`       | FourCC                                     |
-//
-// Case follows the format's home ecosystem, not one blanket rule: RGB-family
-// names and `Grey`/`mono8` come from ROS `sensor_msgs/Image`, which is
-// lowercase; YUV-family names are FourCC codes, which are uppercase. The two
-// planar spellings drop the `_nchw` suffix the one pre-existing schemas-repo
-// site (`rgb8_planar_nchw`) still carries -- redundant now that dimension
-// order lives in `shape`, not in the format name. That site needs
-// reconciling in the schemas repo; it is not changed here.
+// crate's wire numbering, mirrored by `protocol::format`. `as_str()` returns
+// the wire string, which is distinct from both `Display` (FourCC-derived:
+// `RGB`, `Y800`, ...) and the `serde` names (PascalCase variant names). The
+// RGB-family and `mono8` wire strings are ROS `sensor_msgs/Image` encodings
+// (lowercase); the YUV-family wire strings are FourCC codes (uppercase).
 crate::ef_vocabulary! {
     /// Pixel format identifier.
     #[derive(Serialize, Deserialize)]
@@ -80,17 +36,12 @@ crate::ef_vocabulary! {
         /// Planar RGBA, channels-first [4, H, W]
         PlanarRgba = 10, "rgba8_planar", PLANAR_RGBA,
         /// Semi-planar YUV 4:4:4, contiguous shape `[H*3, W]`. Full-resolution
-        /// chroma: Y plane (H rows of W bytes) + interleaved Cb/Cr plane (H image
-        /// rows of W pairs = 2W bytes/row, laid out as 2H rows of W) → 3H rows
-        /// total. Multiplane NV24 is not yet supported (see `from_planes`). Added
-        /// last to keep the existing discriminants (and any serialized values)
-        /// stable.
+        /// chroma: Y plane (H rows of W bytes) + interleaved Cb/Cr plane (H
+        /// image rows of W pairs = 2W bytes/row, laid out as 2H rows of W) → 3H
+        /// rows total. Multiplane NV24 is not supported (see `from_planes`).
         Nv24 = 11, "NV24", NV24,
     }
-    // `#[doc(hidden)]`: has to be `pub` for `protocol::format`'s re-export
-    // below to compile (see `ef_vocabulary!`'s doc comment), but it is
-    // emission plumbing, not a second documented API -- `protocol::format`
-    // is the canonical, documented path.
+    // Emitted wire-code module, re-exported by `protocol::format`.
     #[doc(hidden)]
     pub mod pixel_format_wire;
 }
@@ -107,9 +58,8 @@ pub enum PixelLayout {
     SemiPlanar,
 }
 
-/// Chroma addressing parameters for a semi-planar (NV12/NV16/NV24) format —
-/// the single source of truth shared by the codec writer, CPU readers, and the
-/// Linux + macOS GL shaders. See [`PixelFormat::chroma_layout`].
+/// Chroma addressing parameters for a semi-planar (NV12/NV16/NV24) format. See
+/// [`PixelFormat::chroma_layout`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChromaLayout {
     /// Right-shift applied to the luma `x` to get the chroma column: 1 = half
@@ -127,15 +77,8 @@ pub struct ChromaLayout {
 /// Where one plane's bytes physically live inside a tensor's allocation.
 ///
 /// The counterpart to [`PixelFormat::addressing_shape`]: the grid says how a
-/// consumer indexes the image, this says where the bytes are. Buffer extent
-/// comes from here, never from the shape — for a subsampled format
-/// `product(shape) * dtype_size` is smaller than the allocation.
-///
-/// Field names and widths mirror `TensorPlane.msg` so the two map 1:1.
-/// `modifier` is deliberately absent: it describes how a *producer* tiled or
-/// compressed the plane (AFBC on Mali, UBWC on Adreno) and cannot be derived
-/// from the format alone, so it is carried on the tensor rather than computed
-/// here.
+/// consumer indexes the image, this says where the bytes are. Field names and
+/// widths mirror `TensorPlane.msg`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlaneGeometry {
     /// Byte offset of this plane from the start of the allocation.
@@ -146,11 +89,7 @@ pub struct PlaneGeometry {
     pub size: u64,
 }
 
-// V4L2 pixel format codes (`V4L2_PIX_FMT_*` from <linux/videodev2.h>),
-// stable kernel UAPI. Declared here rather than imported because this crate
-// builds on every platform and `edgefirst-v4l2` is Linux-only; the Linux
-// test `to_fourcc_matches_edgefirst_v4l2` asserts each against
-// `edgefirst_v4l2::uapi`.
+// V4L2 pixel format codes (`V4L2_PIX_FMT_*` from <linux/videodev2.h>).
 /// `V4L2_PIX_FMT_RGB24`.
 const FOURCC_RGB: u32 = u32::from_le_bytes(*b"RGB3");
 /// `V4L2_PIX_FMT_RGBA32` (bytes R, G, B, A; also DRM `ABGR8888`).
@@ -191,76 +130,54 @@ impl PixelFormat {
         }
     }
 
-    /// The **allocation geometry** for this format at `width`×`height`, or
-    /// `None` if the dimensions are invalid for the format, or the format is
-    /// an unsupported semi-planar variant (any `SemiPlanar` variant other than
+    /// The allocation geometry for this format at `width`×`height`, or `None`
+    /// if the dimensions are invalid for the format, or the format is an
+    /// unsupported semi-planar variant (any `SemiPlanar` variant other than
     /// `Nv12`, `Nv16`, and `Nv24`).
     ///
-    /// This is the shape that *sizes a buffer*. For a subsampled format it is
-    /// deliberately not the shape a consumer indexes with — NV12 640×480
-    /// allocates `[720, 640]` here but addresses a `[480, 640]` luma grid.
-    /// Use [`addressing_shape`](Self::addressing_shape) for the latter, which
-    /// is what descriptors, blobs and `Tensor.msg` carry.
+    /// This is the shape that sizes a buffer. For a subsampled format it
+    /// differs from the shape a consumer indexes with: NV12 640×480 allocates
+    /// `[720, 640]` here but addresses a `[480, 640]` luma grid.
+    /// [`addressing_shape`](Self::addressing_shape) returns the latter.
     ///
-    /// Renamed from `image_shape` when the two meanings were separated: every
-    /// caller of the old name sized an allocation with it (`Tensor::image`,
-    /// `import_image`, and the two PBO helpers), so a single name called "the
-    /// shape" made picking the wrong one the default. There is now no such
-    /// name.
+    /// Odd dimensions are supported. The combined-plane height for NV12 is
+    /// `height + ceil(height / 2)` (luma rows + chroma rows), e.g. 483 → 725
+    /// rows (483 luma + 242 chroma).
     ///
-    /// Odd dimensions are fully supported.  The combined-plane height for NV12
-    /// is `height + ceil(height / 2)` (luma rows + chroma rows), which equals
-    /// the classic `height * 3 / 2` for even heights and stays exact for odd
-    /// ones — e.g. 483 → 725 rows (483 luma + 242 chroma).
-    ///
-    /// For semi-planar formats the shape carries the **logical** width as-is
-    /// (odd widths are preserved, e.g. `[720, 789]` for a 789×384 NV12).
-    /// The row stride recorded separately on the tensor is `>= even(width)` and
-    /// 64-byte aligned; it may exceed the logical width.  Use
-    /// `effective_row_stride()` to determine the true byte pitch for
-    /// mapping and allocation.  Allocation byte size = `total_h * row_stride`,
-    /// NOT the shape product.
+    /// For semi-planar formats the shape carries the logical width as-is (odd
+    /// widths are preserved, e.g. `[720, 789]` for a 789×384 NV12). The row
+    /// stride recorded separately on the tensor is `>= even(width)` and 64-byte
+    /// aligned; it may exceed the logical width. Allocation byte size is
+    /// `total_h * row_stride`, not the shape product.
     pub fn allocation_shape(&self, width: usize, height: usize) -> Option<Vec<usize>> {
         match self.layout() {
             PixelLayout::Packed => Some(vec![height, width, self.channels()]),
             PixelLayout::Planar => Some(vec![self.channels(), height, width]),
             PixelLayout::SemiPlanar => {
-                // Shape carries logical width; row_stride (>= even(width), 64-aligned)
-                // is stored separately on the Tensor and governs byte layout.
+                // The shape carries the logical width; the row stride is stored
+                // on the tensor.
                 Some(vec![self.combined_plane_height(height)?, width])
             }
         }
     }
 
-    /// The **addressing grid**: how a consumer logically indexes this image.
+    /// The addressing grid: how a consumer logically indexes this image.
     ///
-    /// This is the shape that belongs in a descriptor, a blob, or a
-    /// `Tensor.msg` — never the allocation size. For a subsampled format
-    /// `product(addressing_shape) * dtype_size` is *smaller* than the buffer:
-    /// NV12 640×480 addresses a 640×480 luma grid inside a 460 800-byte
-    /// allocation. Buffer extent comes from the plane table, never from here.
-    ///
-    /// Contrast [`allocation_shape`](Self::allocation_shape), which is the
-    /// buffer geometry every allocating caller must keep using.
-    ///
-    /// The per-format convention is pinned here so producers cannot each
-    /// invent one; it matches the merged `schemas` golden fixtures.
+    /// This is the shape carried in a descriptor, a blob, or a `Tensor.msg`.
+    /// For a subsampled format `product(addressing_shape) * dtype_size` is
+    /// smaller than the buffer: NV12 640×480 addresses a 640×480 luma grid
+    /// inside a 460 800-byte allocation.
+    /// [`allocation_shape`](Self::allocation_shape) returns the buffer
+    /// geometry.
     pub fn addressing_shape(&self, width: usize, height: usize) -> Option<Vec<usize>> {
         match self.layout() {
-            // A channel dimension only when there is more than one channel to
-            // address: `mono8` is `[h, w]`, not `[h, w, 1]`. That keeps it
-            // consistent with the semi-planar grid below (also one sample per
-            // pixel position), matches how every array library presents
-            // grayscale, and matches the merged schemas `mono8` golden. The
-            // spec's format table does not cover single-channel packed
-            // formats; this is the rule chosen for them.
+            // A channel dimension only when there is more than one channel:
+            // `mono8` is `[h, w]`, not `[h, w, 1]`.
             PixelLayout::Packed if self.channels() == 1 => Some(vec![height, width]),
             PixelLayout::Packed => Some(vec![height, width, self.channels()]),
             PixelLayout::Planar => Some(vec![self.channels(), height, width]),
-            // The luma/sample grid. Chroma is subsampled and is not separately
-            // addressable through `shape`; its geometry lives in the plane
-            // table. Validated for the same dimension support as
-            // `allocation_shape` so the two agree on what they accept.
+            // The luma/sample grid. Validated for the same dimensions as
+            // `allocation_shape`.
             PixelLayout::SemiPlanar => {
                 self.combined_plane_height(height)?;
                 Some(vec![height, width])
@@ -270,27 +187,21 @@ impl PixelFormat {
 
     /// Where each plane's bytes live, given the allocation's row pitch.
     ///
-    /// `row_stride` is the byte pitch of a **luma/packed** row — the value
+    /// `row_stride` is the byte pitch of a luma/packed row: the value
     /// [`Tensor::effective_row_stride`](crate::Tensor::effective_row_stride)
     /// reports, which on a DMA backing is 64-byte aligned and may exceed
-    /// `width * bytes_per_pixel`. Planes are laid out contiguously in the
-    /// order a consumer expects them (Y then UV; R then G then B).
+    /// `width * bytes_per_pixel`. Planes are laid out contiguously in order (Y
+    /// then UV; R then G then B).
     ///
     /// Returns `None` for an unsupported semi-planar variant, or if the
-    /// geometry overflows `u64` — dimensions reaching this from an imported
-    /// descriptor are untrusted, and a wrapped size would look small enough
-    /// to pass a capacity check it should fail.
-    ///
-    /// Chroma extent is derived from
-    /// [`combined_plane_height`](Self::combined_plane_height) rather than
-    /// recomputed, so the two cannot drift on odd heights.
+    /// geometry overflows `u64`.
     pub fn plane_table(
         &self,
         width: usize,
         height: usize,
         row_stride: usize,
     ) -> Option<Vec<PlaneGeometry>> {
-        let _ = width; // extent is governed by row_stride, not logical width
+        let _ = width;
         let stride = u64::try_from(row_stride).ok()?;
         let rows = u64::try_from(height).ok()?;
         let plane_bytes = stride.checked_mul(rows)?;
@@ -314,8 +225,6 @@ impl PixelFormat {
                     .collect()
             }
             PixelLayout::SemiPlanar => {
-                // Derived, never recomputed: `H + ceil(H/2)` for NV12 is exact
-                // for odd heights where a hand-written `H/2` is not.
                 let total_rows = u64::try_from(self.combined_plane_height(height)?).ok()?;
                 let chroma_rows = total_rows.checked_sub(rows)?;
                 Some(vec![
@@ -344,10 +253,7 @@ impl PixelFormat {
     ///     stride-wide buffer rows, so `2H` chroma rows).
     ///
     /// Returns `None` for non-semi-planar formats (and unsupported SemiPlanar
-    /// variants). This is the single source of truth for the vertical extent of
-    /// the contiguous NV* buffer — [`allocation_shape`](Self::allocation_shape), the GL
-    /// DMA-BUF/IOSurface imports, the PBO allocator, and the gpu-probe all
-    /// derive from it, so the combined-plane height can never drift between them.
+    /// variants).
     pub const fn combined_plane_height(&self, height: usize) -> Option<usize> {
         match self {
             PixelFormat::Nv12 => Some(height + height.div_ceil(2)),
@@ -362,16 +268,9 @@ impl PixelFormat {
     /// non-semi-planar format.
     ///
     /// The inverse of [`combined_plane_height`](Self::combined_plane_height),
-    /// and verified against it before returning: the forward map is not
-    /// surjective, so a shape carrying a combined height nothing produced must
-    /// be rejected rather than rounded to a nearby image height.
-    ///
-    /// [`crate::image_dims_from_shape`] uses it to recover the logical height
-    /// from a semi-planar allocation shape.
+    /// verified against it before returning.
     pub fn image_height_from_combined(&self, combined: usize) -> Option<usize> {
         let candidate = match self {
-            // Checked: a garbled combined height read off a descriptor must
-            // not wrap into a plausible-looking image height.
             PixelFormat::Nv12 => combined.checked_mul(2)? / 3,
             PixelFormat::Nv16 => combined / 2,
             PixelFormat::Nv24 => combined / 3,
@@ -380,10 +279,8 @@ impl PixelFormat {
         (self.combined_plane_height(candidate) == Some(combined)).then_some(candidate)
     }
 
-    /// Per-format semi-planar chroma addressing parameters, shared by the codec
-    /// writer ([`uv_rows_per_luma`](ChromaLayout::uv_rows_per_luma)), the CPU
-    /// readers, and both GL shaders so the combined-plane chroma geometry has a
-    /// single source of truth. Returns `None` for non-semi-planar formats.
+    /// Per-format semi-planar chroma addressing parameters. Returns `None` for
+    /// non-semi-planar formats.
     pub const fn chroma_layout(&self) -> Option<ChromaLayout> {
         match self {
             // 4:2:0 — half horizontal & vertical chroma resolution.
@@ -412,20 +309,8 @@ impl PixelFormat {
     /// semi-planar combined plane bound as one `bpe`-byte-per-element texture,
     /// or `None` for non-semi-planar formats.
     ///
-    /// The width is rounded up to the 64-aligned row pitch (`== bytes_per_row`)
-    /// rather than left at the even logical width. ANGLE (and tiled GPUs in
-    /// general) will not address texels beyond a surface's declared width via
-    /// `texelFetch`, so a surface narrower than its padded `bytes_per_row`
-    /// leaves the padding columns unreachable. That is fatal for NV24 (4:4:4):
-    /// its chroma line is `2*W` interleaved bytes, which spills past the even
-    /// width into those padding columns whenever the row is padded
-    /// (`bytes_per_row > even_width`). Making the surface width equal the pitch
-    /// keeps every byte addressable and costs nothing — `bytes_per_row` is
-    /// already this value.
-    ///
-    /// Single source of truth for both IOSurface allocators (the tensor crate's
-    /// `IoSurfaceTensor::new_image` and the image crate's `ImageLayout`), so
-    /// they cannot diverge.
+    /// The width is rounded up to the 64-aligned row pitch (`==
+    /// bytes_per_row`).
     pub fn semi_planar_surface_dims(
         &self,
         width: usize,
@@ -433,8 +318,7 @@ impl PixelFormat {
         bpe: usize,
     ) -> Option<(usize, usize)> {
         let total_h = self.combined_plane_height(height)?;
-        // allocation_shape carries the logical width; round its byte pitch up to 64
-        // (bpe == 1 for the R8 combined-plane binding, so pitch == aligned width).
+        // Round the byte pitch up to 64 and convert it back to texels.
         let pitch_width = (width * bpe).next_multiple_of(64) / bpe;
         Some((pitch_width, total_h))
     }
@@ -594,7 +478,6 @@ mod tests {
             PixelFormat::Nv24.semi_planar_surface_dims(40, 8, 4),
             Some((48, 24))
         );
-        // An already-aligned pitch is left alone.
         assert_eq!(
             PixelFormat::Nv12.semi_planar_surface_dims(64, 64, 1),
             Some((64, 96))
@@ -612,8 +495,6 @@ mod tests {
 
     #[test]
     fn addressing_shape_is_the_grid_not_the_allocation() {
-        // The spec's format table, and the merged schemas goldens
-        // (schemas 71b56ed, fixture "Tensor": NV12 640x480 -> shape [480, 640]).
         assert_eq!(
             PixelFormat::Nv12.addressing_shape(640, 480).unwrap(),
             vec![480, 640]
@@ -626,7 +507,6 @@ mod tests {
             PixelFormat::PlanarRgb.addressing_shape(640, 480).unwrap(),
             vec![3, 480, 640]
         );
-        // schemas fixture "Tensor_inline" uses format "mono8" with shape [2, 4].
         assert_eq!(
             PixelFormat::Grey.addressing_shape(4, 2).unwrap(),
             vec![2, 4]
@@ -635,8 +515,6 @@ mod tests {
 
     #[test]
     fn allocation_shape_still_sizes_the_buffer() {
-        // Unchanged from `image_shape`: NV12 keeps the combined-plane height,
-        // because four callers size real allocations with this.
         assert_eq!(
             PixelFormat::Nv12.allocation_shape(640, 480).unwrap(),
             vec![720, 640]
@@ -646,7 +524,6 @@ mod tests {
             PixelFormat::Nv12.allocation_shape(640, 483).unwrap(),
             vec![725, 640]
         );
-        // Multi-channel, non-subsampled formats: the two agree exactly.
         for f in [PixelFormat::Rgb, PixelFormat::PlanarRgb, PixelFormat::Rgba] {
             assert_eq!(
                 f.allocation_shape(64, 48),
@@ -654,9 +531,6 @@ mod tests {
                 "{f:?}: allocation and grid coincide when nothing is subsampled"
             );
         }
-        // Single-channel packed is the second place they legitimately differ:
-        // the allocation keeps its trailing 1-channel dimension, the grid
-        // drops it. Same element count either way, so nothing is mis-sized.
         assert_eq!(
             PixelFormat::Grey.allocation_shape(64, 48).unwrap(),
             vec![48, 64, 1]
@@ -683,7 +557,6 @@ mod tests {
 
     #[test]
     fn the_grid_is_not_the_buffer_size_for_subsampled_formats() {
-        // The consequence the spec says must be documented, not discovered.
         let grid: usize = PixelFormat::Nv12
             .addressing_shape(640, 480)
             .unwrap()
@@ -704,8 +577,6 @@ mod tests {
 
     #[test]
     fn nv12_plane_table_matches_the_schemas_golden() {
-        // (golden) schemas 71b56ed, scripts/generate_cdr_testdata.py fixture
-        // "Tensor": one allocation, Y at 0 and UV at w*h, both stride 640.
         let planes = PixelFormat::Nv12.plane_table(640, 480, 640).unwrap();
         assert_eq!(planes.len(), 2);
         assert_eq!(planes[0].offset, 0);
@@ -732,9 +603,6 @@ mod tests {
 
     #[test]
     fn plane_table_honours_a_padded_luma_stride() {
-        // The case with no representation before the plane table existed: a
-        // 64-byte-aligned luma pitch wider than the logical width pushes
-        // chroma's offset out. Implicit `w*h` chroma placement gets this wrong.
         let planes = PixelFormat::Nv12.plane_table(640, 480, 704).unwrap();
         assert_eq!(planes[0].stride, 704);
         assert_eq!(
@@ -747,11 +615,8 @@ mod tests {
 
     #[test]
     fn plane_table_extent_agrees_with_allocation_shape() {
-        // The two must never drift: total plane bytes == the allocation the
-        // combined-plane height implies. Odd height included, since that is
-        // where a duplicated `h/2` would diverge from `h + ceil(h/2)`.
         for (w, h) in [(640, 480), (789, 383), (64, 1)] {
-            let stride = w; // tight, so the comparison is exact
+            let stride = w;
             let planes = PixelFormat::Nv12.plane_table(w, h, stride).unwrap();
             let total: u64 = planes.iter().map(|p| p.size).sum();
             let rows = PixelFormat::Nv12.combined_plane_height(h).unwrap();
@@ -765,8 +630,6 @@ mod tests {
 
     #[test]
     fn plane_table_rejects_overflow_rather_than_wrapping() {
-        // Dimensions come from untrusted descriptors elsewhere in this crate;
-        // a wrapped size would look small enough to pass a capacity check.
         assert!(PixelFormat::Nv12
             .plane_table(usize::MAX, usize::MAX, usize::MAX)
             .is_none());
@@ -902,8 +765,7 @@ mod tests {
         use edgefirst_v4l2::uapi;
         let expect = [
             (PixelFormat::Rgb, uapi::V4L2_PIX_FMT_RGB24),
-            // `edgefirst-v4l2` 0.2.1 does not declare `V4L2_PIX_FMT_RGBA32`;
-            // built with its own `fourcc` packer from the kernel's spelling.
+            // `V4L2_PIX_FMT_RGBA32`, built with `uapi::fourcc`.
             (PixelFormat::Rgba, uapi::fourcc(b'A', b'B', b'2', b'4')),
             (PixelFormat::Bgra, uapi::V4L2_PIX_FMT_ABGR32),
             (PixelFormat::Grey, uapi::V4L2_PIX_FMT_GREY),

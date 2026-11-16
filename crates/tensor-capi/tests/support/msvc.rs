@@ -2,27 +2,21 @@
 // SPDX-License-Identifier: Apache-2.0
 //! MSVC toolchain discovery for the C tests on Windows.
 //!
-//! There is no `cc` on a Windows host, and `cl.exe` is only on PATH inside
-//! a Visual Studio developer shell. This module finds a working `cl.exe`
-//! once per test process: the current environment when it already is a
-//! developer shell, otherwise the newest Visual Studio with the C++ toolset
-//! (through vswhere), whose `VsDevCmd.bat` supplies PATH, INCLUDE and LIB.
-//! That is the bootstrap `crates/gpu-probe/windows/build.ps1` uses.
+//! This module finds a working `cl.exe` once per test process: the current
+//! environment when it is a developer shell, otherwise the newest Visual
+//! Studio with the C++ toolset (through vswhere), whose `VsDevCmd.bat`
+//! supplies PATH, INCLUDE and LIB.
 //!
-//! Discovery ends with a trivial program compiled and linked, so a caller
-//! that gets a [`Toolchain`] has one that works. Everything that can fail
-//! carries the command line and the compiler output into the reason string,
-//! because a skip whose reason is a bare "cannot build" cannot be acted on.
+//! Discovery ends with a trivial program compiled and linked. Every failure
+//! carries the command line and the compiler output in its reason string.
 //!
 //! Discovery also sets the process error mode to
-//! `SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX`. A C program that fails
-//! an `assert()` aborts through `_CALL_REPORTFAULT`, and Windows Error
-//! Reporting would put a dialog in front of it; a child inherits the error
-//! mode, so setting it here turns that dialog into an exit code the harness
-//! can report instead of a test that hangs in `output()`.
+//! `SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX`, which child processes
+//! inherit: a crashing C program exits with a code instead of raising a
+//! dialog.
 //!
 //! Test support only, `#[path]`-included by each modular C-API leaf's test
-//! module; nothing here reaches a shipped library.
+//! module.
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -30,17 +24,6 @@ use std::process::{Command, Output};
 use std::sync::OnceLock;
 
 /// System libraries a leaf's Rust staticlib needs on top of its own archive.
-///
-/// Captured with `cargo rustc --manifest-path crates/<leaf>-capi/Cargo.toml
-/// --lib -- --print native-static-libs` on rustc 1.98.0, which prints the
-/// same list for both leaves (the image leaf adds `edgefirst_tensor.dll.lib`,
-/// which its caller passes, and repeats `kernel32.lib`). `/defaultlib:msvcrt`
-/// from the same note is why the harness compiles with `/MD`.
-///
-/// Direct3D and DXGI are absent from that note because the `windows` crate
-/// binds them as raw-dylib imports, which travel inside the staticlib
-/// itself; neither leaf names `d3d11.lib` or `dxgi.lib` on its link line for
-/// that reason.
 pub const SYSTEM_LIBS: &[&str] = &[
     "legacy_stdio_definitions.lib",
     "kernel32.lib",
@@ -50,16 +33,11 @@ pub const SYSTEM_LIBS: &[&str] = &[
     "dbghelp.lib",
 ];
 
-/// Compiler flags a caller's environment must not be able to inject.
-///
-/// `cl.exe` prepends `CL` and appends `_CL_` to every command line it is
-/// given, so a developer with `CL=/w` set would silently defeat the
-/// `/W4 /WX` these checks depend on.
+/// Environment variables removed from every compiler invocation: `cl.exe`
+/// prepends `CL` and appends `_CL_` to its command line.
 const INJECTED_FLAG_VARS: [&str; 2] = ["CL", "_CL_"];
 
-// SAFETY: kernel32 exports these with the documented signatures; the harness
-// is Windows-only test-support code and the `windows` crate stays inside the
-// tensor crate.
+// SAFETY: kernel32 exports these with the documented signatures.
 #[link(name = "kernel32", kind = "raw-dylib")]
 unsafe extern "system" {
     fn SetErrorMode(mode: u32) -> u32;
@@ -81,23 +59,15 @@ pub struct Toolchain {
     scratch: PathBuf,
 }
 
-/// Report a skipped check on stderr as `SKIPPED: {reason}`.
-///
-/// Straight to the handle, not `eprintln!`: libtest captures a passing
-/// test's `eprintln!` and a skip nobody sees is indistinguishable from a
-/// pass. Same wire format as `artifacts::skip` beside it -- both are
-/// `#[path]`-included per leaf, and `scripts/on-target-test.sh` counts a
-/// board's skips by grepping for the literal `SKIPPED`.
+/// Report a skipped check by writing `WARNING: SKIPPED: {reason}` directly
+/// to stderr.
 pub fn skip(reason: &str) {
     use std::io::Write;
     let _ = writeln!(std::io::stderr(), "WARNING: SKIPPED: {reason}");
 }
 
-/// The toolchain for this process, or the reason there is none.
-///
-/// Located once: discovery runs `VsDevCmd.bat` and a probe compile, and
-/// repeating either per test both wastes seconds and races, since several
-/// libtest threads would drive one compiler over one set of scratch files.
+/// The toolchain for this process, located once, or the reason there is
+/// none.
 pub fn toolchain() -> Result<&'static Toolchain, &'static str> {
     static TOOLCHAIN: OnceLock<Result<Toolchain, String>> = OnceLock::new();
     TOOLCHAIN
@@ -118,13 +88,9 @@ pub fn require(what: &str) -> Option<&'static Toolchain> {
 }
 
 impl Toolchain {
-    /// A private directory for this process's compiler output.
-    ///
-    /// Per-process, not a fixed name under `%TEMP%`: two leaves' test
-    /// binaries, or two `cargo test` runs, would otherwise compile over
-    /// each other's object and executable files. It outlives the run so a
-    /// failure can be reproduced by hand; [`sweep_scratch`] removes the
-    /// directories of processes that have exited.
+    /// A per-process directory for this process's compiler output.
+    /// [`sweep_scratch`] removes the directories of processes that have
+    /// exited.
     pub fn scratch(&self) -> &Path {
         &self.scratch
     }
@@ -138,13 +104,9 @@ impl Toolchain {
 
     /// `tool` with this toolchain's environment applied.
     ///
-    /// The vswhere branch captured a whole environment from `VsDevCmd.bat`,
-    /// which already carries everything a compiler needs, so the caller's is
-    /// cleared first: nothing outside that capture should reach the
-    /// compiler. The developer-shell branch captured nothing and keeps
-    /// inheriting, because its environment *is* the developer environment.
-    /// Either way the two variables `cl.exe` splices into its own command
-    /// line are removed.
+    /// When an environment was captured from `VsDevCmd.bat`, the caller's is
+    /// cleared and replaced by it; otherwise the caller's is inherited. The
+    /// variables in [`INJECTED_FLAG_VARS`] are removed in both cases.
     fn tool(&self, tool: &Path) -> Command {
         let mut cmd = Command::new(tool);
         if !self.env.is_empty() {
@@ -162,9 +124,7 @@ impl Toolchain {
         cmd
     }
 
-    /// Parse `src` without generating code.
-    ///
-    /// `/W4 /WX` is the `-Wall -Werror` of the POSIX branch; `flags` carries
+    /// Parse `src` without generating code, with `/W4 /WX`. `flags` carries
     /// per-check options such as `/std:c11`.
     pub fn syntax_check(&self, includes: &[&str], flags: &[&str], src: &str) -> Output {
         let mut cmd = self.cl();
@@ -176,11 +136,8 @@ impl Toolchain {
         run(cmd)
     }
 
-    /// Compile `src` and link it with `libs` and [`SYSTEM_LIBS`] into `exe`.
-    ///
-    /// `/MD` matches the dynamic CRT rustc's staticlib defaults to
-    /// (`/defaultlib:msvcrt` in its link note); a static-CRT object next to
-    /// it would give the linker two C runtimes.
+    /// Compile `src` with `/MD` and link it with `libs` and [`SYSTEM_LIBS`]
+    /// into `exe`.
     pub fn build(&self, includes: &[&str], src: &str, exe: &Path, libs: &[&OsStr]) -> Output {
         let mut cmd = self.cl();
         cmd.args(["/W4", "/WX", "/MD"]);
@@ -196,10 +153,8 @@ impl Toolchain {
         run(cmd)
     }
 
-    /// Names `binary` exports, from `dumpbin /exports`.
-    ///
-    /// The Windows counterpart of `nm -D --defined-only`. `dumpbin.exe` sits
-    /// beside `cl.exe` in the toolset's `bin` directory.
+    /// Names `binary` exports, from `dumpbin /exports`. `dumpbin.exe` is
+    /// taken from the directory `cl.exe` is in.
     pub fn exports(&self, binary: &Path) -> Result<Vec<String>, String> {
         let dumpbin = self.cl.with_file_name("dumpbin.exe");
         if !dumpbin.is_file() {
@@ -236,16 +191,9 @@ impl Toolchain {
     }
 }
 
-/// Run `cmd` and fold what it printed into one `stderr`.
+/// Run `cmd` and fold its command line, stdout and stderr into one `stderr`.
 ///
-/// `cl.exe` and `link.exe` write their diagnostics to stdout, so a caller
-/// that reports only `stderr` would show nothing at all for a failed
-/// compile. The command line leads the text so a report says what ran.
-///
-/// A tool that cannot be spawned comes back as a failed `Output` rather
-/// than a panic: discovery runs inside a `OnceLock`, where a panic would
-/// poison the cell for every later caller instead of reaching the skip
-/// path that exists to report exactly this.
+/// A tool that cannot be spawned returns a failed `Output`.
 fn run(mut cmd: Command) -> Output {
     let line = format!("{cmd:?}");
     match cmd.output() {
@@ -278,10 +226,8 @@ fn locate() -> Result<Toolchain, String> {
     sweep_scratch();
     let scratch = scratch_dir()?;
     let mut reasons = Vec::new();
-    // A developer shell already carries everything cl.exe needs. Its cl.exe
-    // is still probed, and a failure falls through to vswhere rather than
-    // ending discovery: a half-configured shell must not hide a working
-    // install.
+    // Probe a developer shell's `cl.exe` first; a failure falls through to
+    // vswhere.
     if std::env::var_os("INCLUDE").is_some() && std::env::var_os("LIB").is_some() {
         if let Some(cl) = find_on_path(std::env::var_os("PATH").as_deref()) {
             let candidate = Toolchain {
@@ -320,16 +266,10 @@ fn joined(earlier: &[String], last: &str) -> String {
     format!("{}; {last}", earlier.join("; "))
 }
 
-/// Turns a crashing child's error dialogs into an exit code.
-///
-/// A failed `assert()` in one of these C programs calls `abort()`, which
-/// hands the process to Windows Error Reporting; on a desktop that is a
-/// modal dialog, and the harness would sit in `output()` until someone
-/// dismissed it. Children inherit the error mode, so one call before the
-/// first spawn covers every program.
+/// Sets the process error mode so a crashing child exits with a code
+/// instead of raising an error dialog. Children inherit the mode.
 fn quiet_crash_dialogs() {
-    // SAFETY: documented call with no preconditions; the previous mode is
-    // discarded because nothing in a test process depends on it.
+    // SAFETY: `SetErrorMode` has no preconditions.
     unsafe { SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX) };
 }
 
@@ -343,12 +283,8 @@ fn scratch_dir() -> Result<PathBuf, String> {
     Ok(dir)
 }
 
-/// Removes the scratch directories of test processes that have exited.
-///
-/// The current process keeps its own until the next run sweeps it, so a
-/// failing program can be re-run by hand from the path the diagnostic
-/// names. libtest offers no shutdown hook, and a `static` is never dropped,
-/// so a sweep at discovery is what keeps `%TEMP%` from growing.
+/// Removes the scratch directories of test processes that have exited. The
+/// current process's directory is kept.
 fn sweep_scratch() {
     let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
         return;
@@ -365,18 +301,13 @@ fn sweep_scratch() {
         if pid == me || is_process_alive(pid) {
             continue;
         }
-        // A directory another process is still writing is left alone by the
-        // liveness check above; a failure here (a file held open by a
-        // debugger, say) is not worth reporting.
+        // A removal failure is ignored.
         let _ = std::fs::remove_dir_all(entry.path());
     }
 }
 
-/// Is a process with this id still running?
-///
-/// Only a handle the kernel refuses because the id names nothing counts as
-/// gone: a live process this one may not query is still live, and sweeping
-/// its directory would delete files it is compiling into.
+/// Whether a process with this id is running. Only an id the kernel reports
+/// as naming no process counts as gone.
 fn is_process_alive(pid: u32) -> bool {
     // SAFETY: documented call; a returned handle is closed below.
     let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
@@ -389,11 +320,8 @@ fn is_process_alive(pid: u32) -> bool {
     unsafe { GetLastError() != ERROR_INVALID_PARAMETER }
 }
 
-/// Compile and link a trivial program with this toolchain.
-///
-/// Separates "MSVC is broken on this host" from "our library is broken",
-/// the same split the POSIX harness makes with `cc`. The error carries the
-/// command line and everything the compiler printed.
+/// Compile and link a trivial program with this toolchain. The error carries
+/// the command line and everything the compiler printed.
 fn probe(toolchain: &Toolchain) -> Result<(), String> {
     let scratch = &toolchain.scratch;
     let src = scratch.join("probe.c");
@@ -448,11 +376,8 @@ fn visual_studio_install() -> Result<PathBuf, String> {
     Ok(PathBuf::from(path))
 }
 
-/// vswhere's fixed install location under the 32-bit program files.
-///
-/// `ProgramFiles(x86)` is the documented way to name that directory, but a
-/// parenthesis in a variable name does not survive every shell, so the
-/// literal path is tried as well rather than reporting no toolchain.
+/// vswhere's install location under the 32-bit program files, looked up
+/// through `ProgramFiles(x86)`, `ProgramFiles` and the literal path.
 fn find_vswhere() -> Result<PathBuf, String> {
     let mut roots: Vec<PathBuf> = Vec::new();
     for var in ["ProgramFiles(x86)", "ProgramFiles"] {
@@ -490,11 +415,9 @@ fn developer_environment(vs: &Path) -> Result<Vec<(String, String)>, String> {
     } else {
         "amd64"
     };
-    // Passed verbatim: cmd's own quoting rules, not the C runtime's. `/u`
-    // makes cmd write UTF-16, so an install or profile path outside the OEM
-    // code page survives; `/s` strips the outer quotes and runs the quoted
-    // batch path with its arguments; `set` then prints the environment the
-    // batch left behind.
+    // Passed verbatim, under cmd's quoting rules. `/u` makes cmd write
+    // UTF-16; `/s` strips the outer quotes and runs the quoted batch path
+    // with its arguments; `set` then prints the environment the batch left.
     let line = format!(
         "/d /u /s /c \"\"{}\" -arch={arch} -host_arch={arch} -no_logo && set\"",
         bat.display()
@@ -520,9 +443,7 @@ fn developer_environment(vs: &Path) -> Result<Vec<(String, String)>, String> {
         .filter(|(name, _)| !name.is_empty())
         .map(|(name, value)| (name.to_string(), value.to_string()))
         .collect();
-    // VsDevCmd.bat exits 0 having printed a usage banner when an argument is
-    // wrong, so the two variables the compiler cannot work without are what
-    // decides whether the batch did its job.
+    // The environment must carry INCLUDE and LIB.
     let has = |want: &str| env.iter().any(|(name, _)| name.eq_ignore_ascii_case(want));
     if !has("INCLUDE") || !has("LIB") {
         return Err(format!(
@@ -534,13 +455,8 @@ fn developer_environment(vs: &Path) -> Result<Vec<(String, String)>, String> {
     Ok(env)
 }
 
-/// Decodes what a `cmd.exe /u` pipe carried.
-///
-/// cmd writes its own output as UTF-16LE under `/u`, while a program it ran
-/// writes whatever bytes it likes into the same pipe. Text from cmd is
-/// mostly ASCII, whose UTF-16LE encoding puts a zero in every second byte
-/// and which no UTF-8 text contains at all, so the two are told apart by
-/// counting those.
+/// Decodes what a `cmd.exe /u` pipe carried: UTF-16LE when zero bytes at odd
+/// offsets make up at least a quarter of the input, UTF-8 otherwise.
 fn decode_console(bytes: &[u8]) -> String {
     let zeros = bytes.iter().skip(1).step_by(2).filter(|&&b| b == 0).count();
     if bytes.len() >= 2 && zeros * 4 >= bytes.len() {
@@ -555,10 +471,8 @@ fn decode_console(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
-/// What a batch printed, without the environment `set` dumped after it.
-///
-/// The reason string reaches a CI log, and the environment there holds
-/// tokens; only the lines that are not `NAME=value` say what went wrong.
+/// What a batch printed, without the `NAME=value` lines `set` dumped after
+/// it, limited to 20 lines.
 fn banner(stdout: &str) -> String {
     stdout
         .lines()

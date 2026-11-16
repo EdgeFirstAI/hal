@@ -27,7 +27,7 @@ pub enum Error {
     HostView(String),
     Format(String),
     Io(std::io::Error),
-    /// A CPU access refusal the image crate reported, kept typed.
+    /// A CPU access refusal reported by the image crate.
     #[cfg(feature = "image")]
     Image(edgefirst_image::Error),
     /// A codec failure, raised as its `edgefirst.codec` exception.
@@ -40,10 +40,6 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            // Display, not Debug: variants with a hand-written Display arm
-            // (UnknownBufferType's hex magic, InsufficientCapacity,
-            // RegionOutOfBounds, BatchIndexOutOfBounds) render legibly, and
-            // the rest fall back to Debug inside tensor::Error's own Display.
             Error::Tensor(e) => write!(f, "Tensor error: {e}"),
             Error::UnsupportedMemoryType(msg) => write!(f, "Invalid memory type: {msg}"),
             Error::UnsupportedDataType(msg) => write!(f, "Invalid data type: {msg}"),
@@ -142,17 +138,15 @@ thread_local! {
         RefCell::new(edgefirst_codec::ImageDecoder::new());
 }
 
-/// IDCT accuracy/speed selection for the software JPEG decoder.
+/// IDCT kernel selection for the software JPEG decoder.
 ///
-/// :attr:`Accurate` is the default: the `islow`-class Loeffler IDCT,
-/// bit-comparable to libjpeg-turbo's default. :attr:`Fast` opts into the
-/// AAN `ifast`-class kernel — roughly an eighth of the multiplies, at a
-/// small, bounded pixel accuracy cost. Fast is advisory: paths without a
-/// fast kernel (non-NEON tiers, the V4L2/nvJPEG hardware decoders, and PNG)
-/// use their normal accurate path. Applies to the thread-local decoder used
-/// by :meth:`Tensor.decode_image` / :meth:`Tensor.decode_image_file`; set via
-/// :func:`set_dct_method`. Each thread has its own decoder state, so this
-/// must be set on every thread that decodes images.
+/// :attr:`Accurate` is the default: the `islow`-class Loeffler IDCT.
+/// :attr:`Fast` selects the AAN `ifast`-class kernel, which is faster and less
+/// accurate. Fast is advisory: paths without a fast kernel (non-NEON tiers,
+/// the V4L2/nvJPEG hardware decoders, and PNG) use their accurate path.
+/// Applies to the thread-local decoder used by :meth:`Tensor.decode_image` /
+/// :meth:`Tensor.decode_image_file`; set via :func:`set_dct_method`. Each
+/// thread has its own decoder state.
 #[cfg(feature = "codec")]
 #[pyo3::pyclass(name = "DctMethod", eq, eq_int, from_py_object)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -176,12 +170,11 @@ impl From<PyDctMethod> for edgefirst_codec::DctMethod {
 
 /// Select the software JPEG IDCT kernel class for the thread-local decoder
 /// used by :meth:`Tensor.decode_image` / :meth:`Tensor.decode_image_file`.
-/// This only affects the calling thread; call it on every thread that
-/// decodes images if you want a non-default setting everywhere.
+/// Affects only the calling thread.
 ///
-/// Accurate by default. See :class:`DctMethod` for the accuracy/speed
-/// tradeoff. ``EDGEFIRST_CODEC_DCT=fast`` in the environment flips a
-/// **new** thread's default for A/B runs.
+/// The default is :attr:`DctMethod.Accurate`. ``EDGEFIRST_CODEC_DCT=fast`` in
+/// the environment sets the default of a new thread to
+/// :attr:`DctMethod.Fast`.
 ///
 /// Args:
 ///     method: IDCT kernel class.
@@ -191,26 +184,20 @@ pub fn set_dct_method(method: PyDctMethod) {
     DECODER.with(|cell| cell.borrow_mut().set_dct_method(method.into()));
 }
 
-/// Request a fused JPEG decode output format instead of the source's
-/// native format, for the thread-local decoder used by
-/// :meth:`Tensor.decode_image` / :meth:`Tensor.decode_image_file`. Only
-/// affects the calling thread. PNG decodes are unaffected.
+/// Request a fused JPEG decode output format for the thread-local decoder
+/// used by :meth:`Tensor.decode_image` / :meth:`Tensor.decode_image_file`.
+/// Affects only the calling thread. PNG decodes are unaffected.
 ///
-/// This is a **pure CPU, single-pass** path inside the software JPEG
-/// decoder — colour conversion / chroma downsample happens at the MCU
-/// write stage. It is **not** a GPU hybrid or nvJPEG path; V4L2/nvJPEG are
-/// bypassed whenever the resolved output differs from native.
+/// The software JPEG decoder converts colour and downsamples chroma at the
+/// MCU write stage. The V4L2 and nvJPEG decoders are bypassed when the
+/// resolved output differs from the native format.
 ///
-/// - ``PixelFormat.RGB``: 4:4:4 colour JPEGs decode straight to interleaved
-///   RGB. Other sources fall back to native.
+/// - ``PixelFormat.RGB``: 4:4:4 colour JPEGs decode to interleaved RGB.
+///   Other sources decode to their native format.
 /// - ``PixelFormat.NV12``: colour JPEGs decode to NV12, downsampling
 ///   chroma at the write stage (2×2 average for 4:4:4, vertical for 4:2:2).
-/// - Any other format is ignored; the decode falls back to native.
+/// - Any other format is ignored; the decode produces the native format.
 /// - ``None`` (default): native format (``Nv12``/``Nv16``/``Nv24``/``Grey``).
-///
-/// Callers still run ``ImageProcessor.convert()`` on the result for
-/// model-input preprocessing (letterbox, resize, EXIF orientation). With
-/// fused RGB that convert step is typically a pure resize.
 ///
 /// Args:
 ///     format: Requested fused output format, or ``None`` to restore native
@@ -224,12 +211,10 @@ pub fn set_output_format(format: Option<PyPixelFormat>) {
 }
 
 /// True when a V4L2 hardware JPEG decoder (e.g. the i.MX ``mxc-jpeg``
-/// block) is present and not opted out via ``EDGEFIRST_DISABLE_V4L2``.
+/// block) is present and not disabled via ``EDGEFIRST_DISABLE_V4L2``.
 ///
-/// Opens and drops the device once; the decode path re-probes lazily and
-/// keeps its own context. Always ``False`` on platforms without V4L2
-/// hardware decode support. Useful for benchmarks and callers that must
-/// fail fast instead of silently falling back to the CPU decoder.
+/// Opens and closes the device once. Always ``False`` on platforms without
+/// V4L2 hardware decode support.
 #[cfg(feature = "codec")]
 #[pyo3::pyfunction]
 pub fn is_v4l2_available() -> bool {
@@ -237,8 +222,7 @@ pub fn is_v4l2_available() -> bool {
 }
 
 /// Shared decode body for ``Tensor.decode_image`` and the cross-package
-/// ``decode_into`` free function -- both must run exactly this code, or the
-/// two entry points silently drift apart.
+/// ``decode_into`` free function.
 #[cfg(feature = "codec")]
 fn decode_image_into(dst: &mut TensorDyn, data: &[u8]) -> Result<PyImageInfo> {
     use edgefirst_codec::ImageLoad;
@@ -257,20 +241,9 @@ fn decode_image_into(dst: &mut TensorDyn, data: &[u8]) -> Result<PyImageInfo> {
     })
 }
 
-/// Copy a decode's resulting format/shape/colorimetry from `tensor` --
-/// the independent `TensorDyn` [`crate::interop::reconstruct`] built for the
-/// detached region -- back onto `dst`, the real `PyTensor`'s own `TensorDyn`.
-///
-/// Needed because `dst`/`tensor` are no longer the same value: `reconstruct`
-/// aliases the same backing memory (so `decode_image_into`'s pixel writes
-/// above already landed on the real allocation) but keeps its own
-/// `shape_cache` etc. (see `RawTensorAccess`'s docs), so the metadata
-/// `load_image` set on `tensor` -- not `dst` -- needs writing back
-/// explicitly. `Tensor.decode_image`/`decode_image_file`'s counterpart to
-/// `decode_into`'s Foreign write-back, but going through `TensorDyn`
-/// directly rather than a generic `call_method1`/`setattr`: `dst` is known
-/// statically to be a `PyTensor` from this crate, so there is no
-/// third-party destination to degrade gracefully for.
+/// Copy the format, shape and colorimetry of a decode from `tensor`, the
+/// `TensorDyn` [`crate::interop::reconstruct`] built for the detached region,
+/// onto `dst`.
 #[cfg(feature = "codec")]
 fn write_back_decode(dst: &mut TensorDyn, tensor: &TensorDyn, info: &PyImageInfo) -> Result<()> {
     let fmt: PixelFormat = info.format.into();
@@ -280,27 +253,18 @@ fn write_back_decode(dst: &mut TensorDyn, tensor: &TensorDyn, info: &PyImageInfo
 }
 
 /// Decode image bytes (JPEG/PNG) into any object implementing the
-/// ``__edgefirst_tensor__`` capsule protocol -- the cross-package
-/// counterpart of :meth:`Tensor.decode_image` for destinations created by
-/// another ``edgefirst.*`` extension, e.g.
-/// ``edgefirst.image.ImageProcessor.create_image()``.
+/// ``__edgefirst_tensor__`` capsule protocol, such as a destination created by
+/// another ``edgefirst.*`` extension (e.g.
+/// ``edgefirst.image.ImageProcessor.create_image()``).
 ///
 /// Decode semantics (native format, EXIF handling, ``set_output_format`` /
-/// ``set_dct_method`` hooks) are identical to :meth:`Tensor.decode_image`;
-/// this is a thin wrapper that resolves ``tensor`` through the interop
-/// protocol and shares the exact same decode path.
+/// ``set_dct_method``) are those of :meth:`Tensor.decode_image`.
 ///
-/// For a foreign ``tensor`` (a different ``edgefirst.*`` package than this
-/// one), the pixels are always written correctly -- that part cannot fail.
-/// ``tensor``'s own format, dimensions and colorimetry are then updated to
-/// match the decode on a **best-effort** basis: if ``tensor`` does not
-/// implement ``configure_image()``, or exposes ``colorimetry`` read-only,
-/// that update is silently skipped (only a ``log::warn`` on the Rust side
-/// notes it -- nothing raises). The returned :class:`ImageInfo` always
-/// describes the decode accurately regardless, so a caller that needs the
-/// decoded format/dimensions reliably should read them from the return
-/// value, not from ``tensor`` itself, when ``tensor`` may not be a
-/// ``PyTensor`` from this crate.
+/// After the decode, ``tensor``'s format, dimensions and colorimetry are
+/// updated through ``configure_image()`` and ``colorimetry``. When ``tensor``
+/// does not implement ``configure_image()`` or exposes ``colorimetry``
+/// read-only, that update is skipped without raising. The returned
+/// :class:`ImageInfo` always describes the decode.
 ///
 /// Args:
 ///     tensor: Destination tensor, from this or another ``edgefirst.*``
@@ -311,61 +275,25 @@ fn write_back_decode(dst: &mut TensorDyn, tensor: &TensorDyn, info: &PyImageInfo
 pub fn decode_into(tensor: &Bound<'_, PyAny>, data: &[u8]) -> PyResult<PyImageInfo> {
     let py = tensor.py();
     let arg = crate::interop::TensorArg::extract_mut(tensor, None)?;
-    // Copy while the GIL is still held -- see `PyTensor::decode_image`.
+    // Copy the input while the GIL is held.
     let data = data.to_vec();
     let (info, colorimetry) = if arg.can_detach() {
-        // `into_raw_access` decodes into an independent `TensorDyn`
-        // reconstructed from `tensor`'s own descriptor (see
-        // `RawTensorAccess`'s docs) -- never `tensor` itself, for the
-        // native path just as much as the foreign one. Every Python guard
-        // is released by this point, so the decode itself can run with the
-        // GIL released.
+        // Decode into a `TensorDyn` reconstructed from `tensor`'s descriptor, with
+        // the GIL released.
         let mut raw = arg.into_raw_access()?;
         let (info, raw) = py
             .detach(move || decode_image_into(raw.as_mut(), &data).map(|info| (info, raw)))
             .map_err(PyErr::from)?;
         (info, raw.as_ref().colorimetry())
     } else {
-        // A GL-PBO-backed `tensor`: `TensorArg::can_detach` (see its docs)
-        // cannot reconstruct an independent `TensorDyn` for it, so this
-        // call keeps the GIL held for its whole duration, exactly this
-        // crate's behaviour before GIL release existed for tensors at all.
-        // (Always the native path here: a PBO-backed `Foreign` extraction
-        // already fails upstream, at `TensorArg::extract_mut`, for the same
-        // reason `can_detach` would refuse it -- `import_descriptor` has no
-        // PBO arm either way.)
+        // A PBO-backed `tensor` is decoded in place with the GIL held.
         let mut arg = arg;
         let info = decode_image_into(arg.as_mut(), &data).map_err(PyErr::from)?;
         (info, arg.as_ref().colorimetry())
     };
 
-    // `configure_image` (format + logical shape) and colorimetry the decode
-    // determined must be copied back onto `tensor` explicitly, to leave it
-    // in the same state a direct in-place decode would -- every downstream
-    // `convert()` call resolves `tensor` afresh via its own
-    // `__edgefirst_tensor__` capsule (or, for a same-module `PyTensor`,
-    // reads its fields directly), so anything left only on the disposable
-    // reconstructed copy is invisible to it either way. (For the
-    // non-detached branch above, `tensor` and the decoded value are the
-    // same object, so this only re-asserts values it already has --
-    // harmless, and simpler than special-casing it away.)
-    //
-    // Best-effort: the pixels are already written zero-copy into the real
-    // allocation by this point (a host-kind reconstruction aliases the
-    // producer's own pinned address; `DMABUF`/`IOSURFACE` alias the same
-    // fd/surface), regardless of what happens below -- that part cannot
-    // fail here. INTEROP.md's `EdgeFirstTensorExportable` requires only
-    // `__edgefirst_tensor__`, so a conforming third-party destination need
-    // not expose `configure_image` or a settable `colorimetry`; failing the
-    // whole decode over metadata write-back after the actual write already
-    // succeeded would be a failure-after-success, the worst shape for a
-    // caller to handle. A `PyTensor` from this crate (the common case,
-    // native or foreign) always accepts both calls, so this only degrades
-    // for a non-`PyTensor` destination.
-    //
-    // This re-enters Python (`call_method1`/`setattr`); on the detached
-    // branch it runs after `py.detach` has returned and the GIL is held
-    // again, and on the non-detached branch the GIL was never released.
+    // Copy the decoded format, shape and colorimetry onto `tensor`. A
+    // destination that rejects either update is logged and skipped.
     if let Err(e) = tensor.call_method1("configure_image", (info.width, info.height, info.format)) {
         log::warn!(
             "decode_into: destination rejected configure_image({}, {}, {:?}) after a \
@@ -398,9 +326,6 @@ pub fn decode_into(tensor: &Bound<'_, PyAny>, data: &[u8]) -> PyResult<PyImageIn
 #[cfg(feature = "codec")]
 #[pyo3::pyfunction]
 pub fn decode_file_into(tensor: &Bound<'_, PyAny>, filename: &str) -> PyResult<PyImageInfo> {
-    // `decode_into` releases the GIL for the decode itself; the file read
-    // ahead of it is comparatively small next to CPU JPEG/PNG decode, so
-    // it stays a plain synchronous read rather than its own detach.
     let data = std::fs::read(filename).map_err(Error::Io)?;
     decode_into(tensor, &data)
 }
@@ -446,22 +371,7 @@ impl PyImageInfo {
     }
 }
 
-// No `eq`/`eq_int` here: those auto-generate `__richcmp__`, which would
-// collide with the hand-written `__eq__`/`__ne__` below (needed for the
-// cross-package fallback -- see `eq_int_richcmp`). `__int__()` is still
-// generated unconditionally for every simple enum, `eq`/`eq_int` or not.
-//
-// Discriminants are the shared codes from `edgefirst_tensor`'s
-// `TensorMemory` (declared via `ef_vocabulary!`), not a locally-numbered
-// list -- this is the fix for the bug this vocabulary work closes: before,
-// this enum had NO explicit discriminants and a `#[cfg(unix)]` variant in
-// the middle, so `MEM` was `3` on unix and `2` elsewhere, while the C ABI's
-// `PBO` was `3` -- bridging the two surfaces by raw integer silently handed
-// back `PBO` where `MEM` was asked for. `SHM` is no longer `#[cfg(unix)]`:
-// the code is defined on every platform (only `TensorMemory::is_available`
-// answers the runtime question), so a tensor recorded on Linux and read
-// back on macOS can still be *named* here even though it cannot be
-// materialised.
+// Discriminants are the codes of `edgefirst_tensor::TensorMemory`.
 #[pyclass(
     name = "TensorMemory",
     skip_from_py_object,
@@ -477,32 +387,22 @@ pub enum PyTensorMemory {
     /// platform; only allocatable on unix.
     SHM = 1,
     /// Platform-native zero-copy GPU buffer: DMA-BUF on Linux,
-    /// IOSurface on macOS. Same Python name on both platforms.
+    /// IOSurface on macOS.
     DMABUF = 2,
-    /// Apple IOSurface, named specifically rather than through the
-    /// portable `DMABUF` spelling. No backend produces or accepts it yet --
-    /// macOS/iOS allocate and report `DMABUF`.
+    /// Apple IOSurface. No backend produces or accepts it; macOS and iOS
+    /// allocate and report `DMABUF`.
     IOSURFACE = 3,
     /// GPU Pixel Buffer Object (PBO) allocation. Used for zero-copy GPU
     /// upload/readback on platforms without DMA-buf support.
     PBO = 4,
-    /// CUDA device memory. No backend produces or accepts it yet.
+    /// CUDA device memory. No backend produces or accepts it.
     CUDA = 5,
-    /// Windows D3D11 texture, named specifically rather than through the
-    /// portable `DMABUF` spelling. No backend produces or accepts it yet --
-    /// Windows allocates and reports `DMABUF`.
+    /// Windows D3D11 texture. No backend produces or accepts it; Windows
+    /// allocates and reports `DMABUF`.
     D3D11_TEXTURE = 6,
 }
 
-// The literals above are copied from `TensorMemory::code()`, not computed
-// from it -- PyO3 requires a literal in a `#[pyclass]` enum's discriminant
-// position, so `MEM = TensorMemory::Mem.code()` does not parse. Without
-// something enforcing the link, that copy is exactly the kind of
-// hand-synced parallel table this vocabulary work exists to remove; it
-// would just be a smaller one. These assertions are that enforcement: a
-// mismatch on either side is a BUILD failure, naming the failed assertion,
-// not a test someone has to remember to run. `TensorMemory::code()` is
-// `const fn` for exactly this purpose (see `ef_vocabulary!`'s doc comment).
+// Compile-time checks that each discriminant equals `TensorMemory::code()`.
 const _: () = assert!(PyTensorMemory::MEM as u32 == TensorMemory::Mem.code());
 const _: () = assert!(PyTensorMemory::SHM as u32 == TensorMemory::Shm.code());
 const _: () = assert!(PyTensorMemory::DMABUF as u32 == TensorMemory::DmaBuf.code());
@@ -513,15 +413,7 @@ const _: () = assert!(PyTensorMemory::D3D11_TEXTURE as u32 == TensorMemory::D3d1
 
 impl PyTensorMemory {
     /// Reconstruct from the `__int__()` discriminant of a sibling package's
-    /// copy of this enum. Used by the cross-package `FromPyObject` fallback
-    /// below -- see `extract_eq_int_enum`.
-    ///
-    /// Delegates to `TensorMemory::from_code` rather than a hand-written
-    /// `if v == Self::X as i64` chain: that chain is the parallel table
-    /// this vocabulary work removes. `PyTensorMemory`'s discriminants are
-    /// the same shared codes by construction (see the enum's doc comment
-    /// above), so a code that resolves on the Rust side always resolves
-    /// here too.
+    /// copy of this enum.
     fn from_discriminant(v: i64) -> Option<Self> {
         u32::try_from(v)
             .ok()
@@ -530,12 +422,8 @@ impl PyTensorMemory {
     }
 }
 
-/// A sibling `edgefirst.*` package's `TensorMemory` names the same variant
-/// but is a distinct PyO3 type object (see `interop.rs`'s module docs), so
-/// `#[pyclass(from_py_object)]`'s auto-derived native-only extraction would
-/// reject it. Try the native downcast first, then fall back to the
-/// `__int__()` discriminant a sibling package's copy also exposes (via
-/// `eq_int`).
+/// Extracts a native instance, or a sibling `edgefirst.*` package's
+/// `TensorMemory` through its `__int__()` discriminant.
 impl<'a, 'py> FromPyObject<'a, 'py> for PyTensorMemory {
     type Error = PyErr;
 
@@ -554,11 +442,7 @@ impl PyTensorMemory {
         eq_int_richcmp(*self, other, true, "TensorMemory", Self::from_discriminant)
     }
 
-    /// Equal objects must hash equal: this is the same discriminant
-    /// `__eq__`/`__ne__` compare (and, since a plain int compares equal
-    /// when its value matches, the same integer Python's own `hash(int)`
-    /// returns -- `int.__hash__` is the identity function for values this
-    /// small).
+    /// Returns the discriminant as the hash.
     fn __hash__(&self) -> isize {
         *self as isize
     }
@@ -584,19 +468,10 @@ impl From<TensorMemory> for PyTensorMemory {
             TensorMemory::Mem => PyTensorMemory::MEM,
             TensorMemory::Shm => PyTensorMemory::SHM,
             TensorMemory::DmaBuf => PyTensorMemory::DMABUF,
-            // Task 4 left this arm as a placeholder mapping to `MEM` with a
-            // warning, pending this task's decision: now that `SHM` is
-            // defined on every platform and `IoSurface`/`Cuda` each have a
-            // same-named, same-coded Python variant, every one of them maps
-            // straight across -- no more folding or fallback needed.
             TensorMemory::IoSurface => PyTensorMemory::IOSURFACE,
             TensorMemory::Pbo => PyTensorMemory::PBO,
             TensorMemory::Cuda => PyTensorMemory::CUDA,
             TensorMemory::D3d11Texture => PyTensorMemory::D3D11_TEXTURE,
-            // `TensorMemory` is `#[non_exhaustive]`, so rustc requires this
-            // arm outside its defining crate. Reached only by a variant
-            // added upstream without a decision made here -- which is what
-            // the warning is for, since this signature cannot fail.
             other => {
                 log::warn!("TensorMemory {other:?} has no Python counterpart, reporting MEM");
                 PyTensorMemory::MEM
@@ -605,32 +480,13 @@ impl From<TensorMemory> for PyTensorMemory {
     }
 }
 
-/// Cross-package fallback shared by every `#[pyclass(eq, eq_int)]` value
-/// enum (`TensorMemory`, `PixelFormat`, the colorimetry axis enums): try the
-/// native downcast first (same-package instance -- zero-cost, the common
-/// case), then fall back to a sibling package's copy of the same enum.
+/// Extract a `#[pyclass(eq, eq_int)]` value enum (`TensorMemory`,
+/// `PixelFormat`, the colorimetry axis enums) from a native instance or from a
+/// sibling `edgefirst.*` package's copy of the same enum.
 ///
-/// A sibling package's enum names the same variant but is a distinct PyO3
-/// type object -- each `edgefirst.*` extension statically links its own copy
-/// of these bindings (see `interop.rs`'s module docs) -- so the downcast
-/// always fails for it. `eq_int` gives every such enum an `__int__()` (but
-/// deliberately *not* an `__index__()`, so `Bound::extract::<uN>()` does not
-/// silently accept these values where an ordinary integer was expected);
-/// call it explicitly and reconstruct locally from the discriminant.
-///
-/// The `__int__()` fallback is gated on `type(obj).__name__` matching
-/// `type_name` first. Without this gate, *any* object with an `__int__()`
-/// would be accepted here -- including an unrelated `eq_int` enum that
-/// happens to share a discriminant, e.g. `PixelFormat.Rgb` and
-/// `TensorMemory.SHM` are both `1`. That is a type-confusion bug, not a
-/// looser acceptance policy: it let a `TensorMemory` silently pass as a
-/// `PixelFormat` (and compare/hash equal to it). Every `edgefirst.*`
-/// package's copy of the SAME type shares the same `#[pyclass(name = ...)]`,
-/// so the name check still accepts a sibling package's copy while rejecting
-/// a same-shaped but unrelated type. It also means a bare Python `int` is no
-/// longer accepted here (`type(1).__name__ == "int"`) -- unlike equality
-/// (see `eq_int_richcmp`), argument extraction never accepted a bare int as
-/// a matter of policy; this closes an accidental hole where it used to.
+/// The native downcast is tried first. Otherwise, when `type(obj).__name__`
+/// equals `type_name`, the value is rebuilt from the object's `__int__()`
+/// discriminant. A bare Python `int` is not accepted.
 pub(crate) fn extract_eq_int_enum<'a, 'py, T, F>(
     obj: Borrowed<'a, 'py, PyAny>,
     type_name: &str,
@@ -662,23 +518,13 @@ where
     )))
 }
 
-/// Shared cross-package `__eq__`/`__ne__` for the value enums covered by
-/// [`extract_eq_int_enum`] above. `#[pyclass(eq, eq_int)]`'s auto-generated
-/// `__richcmp__` resolves `other` by native identity or a bare int only, so
-/// a sibling package's copy of the same enum compares unequal -- silently,
-/// never an error, which is worse: `tensor.memory != TensorMemory.DMABUF`
-/// returns `True` for values that ARE equal. This reuses the exact
-/// `FromPyObject` fallback (name-gated -- see `extract_eq_int_enum`) so
-/// `==`/`!=` agree with what the enum already accepts as a value.
+/// Cross-package `__eq__`/`__ne__` for the value enums covered by
+/// [`extract_eq_int_enum`].
 ///
-/// A plain `int` still compares by discriminant exactly as `eq_int` did
-/// (`TensorMemory.MEM == 0`), but only a genuine `int`: extracted via
-/// `Bound::extract::<i64>()`, which goes through `__index__` -- an unrelated
-/// `eq_int` enum has `__int__()` but deliberately no `__index__()` (see
-/// `extract_eq_int_enum`'s docs), so it cannot slip through this branch
-/// either. A genuinely unrelated type gets `NotImplemented` so Python's
-/// normal fallback (and thus `!=`'s identity default) applies. `invert`
-/// selects `__ne__` over `__eq__`.
+/// `other` compares equal when it extracts to the same variant through
+/// [`extract_eq_int_enum`], or when it is a Python `int` equal to the
+/// discriminant. Any other type returns `NotImplemented`. `invert` selects
+/// `__ne__` over `__eq__`.
 pub(crate) fn eq_int_richcmp<T, F>(
     this: T,
     other: &Bound<'_, PyAny>,
@@ -765,8 +611,8 @@ fn dtype_to_str(dtype: DType) -> &'static str {
 }
 
 // ─── Type-erased HostView ──────────────────────────────────────────────────
-// Needed for Python buffer protocol — must dispatch per dtype to get typed
-// pointers, format strings, and per-element operations.
+// Dispatches per dtype for typed pointers, format strings and per-element
+// operations.
 
 pub enum TensorMapT {
     TensorU8(tensor::HostView<'static, u8>),
@@ -807,13 +653,6 @@ impl TensorMapT {
     }
 
     /// Whether the underlying mapping permits writes.
-    ///
-    /// Read from the mapping itself rather than from the access string the
-    /// caller passed, so the buffer protocol's `readonly` flag cannot drift
-    /// from the bracket actually taken -- if the direction ever stopped
-    /// reaching `map_with`, this would report writable and the read-only
-    /// tests would fail, instead of agreeing with a request that was never
-    /// honoured.
     pub fn is_writable(&self) -> bool {
         map_dispatch!(self, is_writable)
     }
@@ -826,7 +665,7 @@ impl TensorMapT {
         map_dispatch!(self, size)
     }
 
-    /// Bytes the mapping actually spans. For a strided image this is every
+    /// Bytes the mapping spans. For a strided image this is every
     /// padded row, which is more than [`size`](Self::size)'s logical bytes.
     pub fn mapped_bytes(&self) -> usize {
         match self {
@@ -844,13 +683,6 @@ impl TensorMapT {
         }
     }
 
-    // Deliberately ungated: pure size_of arithmetic per variant, no
-    // PyO3/buffer-protocol dependency, and called from both `numpy()`
-    // branches below -- the `__getbuffer__`-based one (any(not(Py_LIMITED_API),
-    // Py_3_11)) and the abi3-py38 manual-memoryview one (the exact opposite
-    // condition). A cfg gate here previously matched only the first branch,
-    // compiling this out precisely in the one configuration (Py_LIMITED_API
-    // without Py_3_11) that calls it from the second.
     pub fn element_size(&self) -> usize {
         match self {
             TensorMapT::TensorU8(_) => std::mem::size_of::<u8>(),
@@ -967,7 +799,7 @@ impl TensorMapT {
 enum MapWait {
     /// `map_with`: wait for a GPU copy the map depends on to finish.
     Block,
-    /// `try_map_with`: `WouldBlock` instead of that wait.
+    /// `try_map_with`: returns `WouldBlock` instead of waiting.
     Fail,
 }
 
@@ -977,16 +809,7 @@ fn map_tensor_dyn(
     access: tensor::CpuAccess,
     wait: MapWait,
 ) -> tensor::Result<TensorMapT> {
-    // `map_with`, not `map()`: `map()` is `map_with(ReadWrite)`, and on a
-    // non-coherent backing a ReadWrite bracket pays a full-buffer cache
-    // writeback on unmap even when the caller only read. Routing the
-    // direction through means a reader skips it (and on macOS takes the
-    // read-only IOSurface lock, which skips the unlock flush).
-    //
-    // `wait` picks that same call's non-blocking form for `Tensor.try_map`.
-    // The two differ only on the Windows D3D11 texture, where
-    // `try_map_with` reports `WouldBlock` while the staging copy the map
-    // depends on is still in flight.
+    // Maps with `map_with` or `try_map_with` according to `wait`.
     macro_rules! lens {
         ($ty:ty, $variant:ident) => {{
             let typed = t.as_typed::<$ty>().expect("dtype checked");
@@ -1015,13 +838,8 @@ fn map_tensor_dyn(
     }
 }
 
-/// Translate a failed `MapWait::Fail` mapping into the exception Python
-/// expects from a non-blocking call.
-///
-/// A `WouldBlock` is `BlockingIOError` -- the standard exception for "this
-/// would have blocked, ask again" -- rather than the blanket `RuntimeError`
-/// every other tensor error keeps, so `try_map` can be retried in a loop
-/// without matching on a message.
+/// Translate a failed `MapWait::Fail` mapping into a Python exception:
+/// `BlockingIOError` for `WouldBlock`, the tensor error's exception otherwise.
 fn would_block_err(err: tensor::Error) -> PyErr {
     match &err {
         tensor::Error::IoError(io) if io.kind() == std::io::ErrorKind::WouldBlock => {
@@ -1033,18 +851,8 @@ fn would_block_err(err: tensor::Error) -> PyErr {
 
 /// Check a texture-import `shape` against the geometry read off the texture.
 ///
-/// The dimensions come from the texture's own description, never from the
-/// shape: a semi-planar allocation shape and an addressing shape are both
-/// rank 2 and nothing in the numbers tells them apart, so a shape-derived
-/// reading would silently pick one. Here the texture decides and the shape is
-/// only checked against it.
-///
-/// Either shape it gives those dimensions is accepted -- the allocation shape
-/// every allocating caller uses, and the addressing shape a descriptor or a
-/// blob reports. Both are honest answers to "what shape is this", and
-/// refusing one would make the constructor unusable from whichever surface
-/// reports the other. This is the same rule `ef_tensor_from_d3d11_texture`
-/// applies, so the two bindings accept the same arguments.
+/// Accepts the allocation shape or the addressing shape the format gives
+/// those dimensions.
 #[cfg(target_os = "windows")]
 fn check_d3d11_shape(
     geometry: tensor::Result<(usize, usize)>,
@@ -1078,21 +886,16 @@ const PARALLEL_THRESHOLD_BYTES: usize = 256 * 1024;
 /// Downcasts the numpy array to the concrete element type matching the
 /// tensor's dtype, then copies via the typed `HostView` slice.
 ///
-/// Copy strategy (selected automatically):
-/// 1. **Fully contiguous** → single `copy_from_slice` (memcpy).
-/// 2. **Strided with contiguous inner rows** → one memcpy per row,
-///    iterating over outer dimensions.
-/// 3. **Fully strided** (e.g. transposed view, every-other-element) →
-///    materialize a contiguous source via `np.ascontiguousarray()`
-///    before the destination memcpy. numpy's vectorized strided→contig
-///    pass is dramatically faster than ndarray's stride-respecting
-///    iterator for fully strided arrays — on a `(1, 116, 8400)` f32
-///    transposed view (typical HailoRT output) this is ≈12× faster
-///    than per-element iteration.
+/// Copy strategy:
+/// 1. Fully contiguous: a single `copy_from_slice`.
+/// 2. Strided with contiguous inner rows: one memcpy per row, iterating over
+///    the outer dimensions.
+/// 3. Fully strided (e.g. a transposed view): a contiguous source is
+///    materialized via `np.ascontiguousarray()` and then copied.
 ///
-/// All three paths use `rayon` parallel iteration when ≥ 256 KiB.
+/// All three paths use `rayon` parallel iteration at 256 KiB and above.
 ///
-/// Raises on dtype mismatch or element-count mismatch.
+/// Returns an error on dtype mismatch or element-count mismatch.
 fn copy_numpy_to_tensor_dyn(src: &Bound<'_, pyo3::types::PyAny>, tensor: &TensorDyn) -> Result<()> {
     macro_rules! lens {
         ($ty:ty) => {
@@ -1154,18 +957,11 @@ fn copy_numpy_typed<
     let dst_len = dst.len();
     let nbytes = tensor_len * std::mem::size_of::<T>();
     let parallel = nbytes >= PARALLEL_THRESHOLD_BYTES;
-    // Minimum chunk: 4 KiB worth of elements (scales with element size).
+    // Minimum chunk: 4 KiB worth of elements.
     let min_chunk = (4096 / std::mem::size_of::<T>()).max(1);
 
-    // Destination-side stride padding (STRIDES_BUG.md): when
-    // `create_image` allocates a DMA-BUF or PBO buffer with GPU
-    // pitch alignment padding, `map()` exposes the full padded
-    // buffer (`stride × height` bytes) but the logical element
-    // count from shape is smaller (`width × channels × height`).
-    // A flat `copy_from_slice` would panic on the length
-    // mismatch. Detect this and copy row-by-row, placing
-    // `row_elems` logical pixels per row and skipping the
-    // padding bytes in the destination.
+    // A destination map longer than the logical element count has row padding:
+    // copy row by row, skipping the padding bytes in the destination.
     if dst_len > tensor_len {
         return copy_numpy_padded(
             py,
@@ -1221,11 +1017,8 @@ fn copy_numpy_padded<
     if elem_sz == 0 || stride_bytes == 0 {
         return Ok(());
     }
-    // A strided map spans exactly `rows * stride` bytes, where `rows` counts
-    // every padded row: `H` per packed image, `C * H` per planar one and the
-    // combined `H*k` per semi-planar one, times any batch. Deriving `rows`
-    // from the mapping keeps this copy in step with that layout rather than
-    // assuming one row per pixel of height.
+    // A strided map spans `rows * stride` bytes; `rows` is derived from the
+    // mapping.
     if !stride_bytes.is_multiple_of(elem_sz) {
         return Err(Error::Format(format!(
             "stride-padded copy: row pitch {stride_bytes} B is not a whole number of \
@@ -1312,8 +1105,7 @@ fn copy_numpy_c_contiguous<T: numpy::Element + Copy + Send + Sync>(
             }
         });
     } else {
-        // C-contiguous but as_slice() failed (e.g., misaligned buffer).
-        // Fall back to element-wise copy.
+        // C-contiguous but `as_slice()` returned `None`: element-wise copy.
         py.detach(|| {
             for (d, &s) in dst.iter_mut().zip(src_view.iter()) {
                 *d = s;
@@ -1343,7 +1135,7 @@ fn copy_numpy_noncontiguous<
     // Non-contiguous: find the longest contiguous inner dimension.
     // Walk inward from the last axis: if stride[i] == product of
     // shape[i+1..] (in elements), that axis and all inner axes form
-    // a contiguous row we can memcpy.
+    // a contiguous row.
     let shape = src_view.shape();
     let strides = src_view.strides(); // in elements (ndarray convention)
     let ndim = shape.len();
@@ -1351,7 +1143,7 @@ fn copy_numpy_noncontiguous<
     let mut contig_elems: usize = 1;
     let mut contig_dims: usize = 0;
     for i in (0..ndim).rev() {
-        // Size-1 dims are always contiguous regardless of stride.
+        // Size-1 dims count as contiguous.
         if strides[i] == contig_elems as isize || shape[i] <= 1 {
             contig_elems *= shape[i];
             contig_dims += 1;
@@ -1385,14 +1177,13 @@ fn copy_numpy_strided_rows<T: Copy + Send + Sync>(
 ) {
     let (tensor_len, contig_elems, contig_dims, ndim) = contig;
     let (shape, strides) = layout;
-    // Path 2: strided outer, contiguous inner rows.
-    // Compute row byte-offsets from strides in O(n_rows) —
-    // no element-level iteration needed.
+    // Path 2: strided outer, contiguous inner rows. Row byte offsets are
+    // computed from the strides.
     let n_rows = tensor_len / contig_elems;
     let row_len = contig_elems;
     let elem_size = std::mem::size_of::<T>() as isize;
 
-    // Outer dimensions are those NOT part of the contiguous tail.
+    // Outer dimensions are those not part of the contiguous tail.
     let outer_ndim = ndim - contig_dims;
     let outer_shape = &shape[..outer_ndim];
     let outer_strides = &strides[..outer_ndim];
@@ -1412,10 +1203,8 @@ fn copy_numpy_strided_rows<T: Copy + Send + Sync>(
         row_offsets.push(byte_off);
     }
 
-    // Store base as usize for Send+Sync safety in rayon closures.
-    // The pointer is reconstructed inside each task. This is safe
-    // because the numpy readonly guard pins the source buffer for
-    // our entire scope.
+    // The base address is stored as `usize` and rebuilt into a pointer inside
+    // each task.
     let base_addr = src_view.as_ptr() as usize;
 
     py.detach(|| {
@@ -1448,25 +1237,8 @@ fn copy_numpy_via_contiguous_array<T: numpy::Element + Copy + Send + Sync>(
 ) -> Result<()> {
     use numpy::PyArrayMethods;
 
-    // Path 3: fully strided (contig_elems == 1) — e.g. a
-    // transposed view of a contiguous backing buffer such as
-    // the (1, channels, anchors) output that HailoRT returns
-    // as a (0, 2, 1) transpose of (1, anchors, channels).
-    //
-    // Element-wise iteration over a strided ndarray view is
-    // dramatically slower than a contiguous memcpy because
-    // every load incurs stride arithmetic and breaks
-    // vectorization. Measurements on rpi5-hailo with a
-    // (1, 116, 8400) f32 view showed 27 ms/call for the old
-    // per-element path versus 6.5 ms/call when the caller
-    // pre-applied np.ascontiguousarray().
-    //
-    // Materialize a contiguous source via
-    // np.ascontiguousarray() — its strided→contig pass runs
-    // in vectorized C and is much faster than ndarray's
-    // stride-respecting iter() — then fall back to the
-    // Path 1 memcpy. The intermediate buffer is owned by
-    // numpy and freed when contig_obj is dropped.
+    // Path 3: fully strided (`contig_elems == 1`). Materialize a contiguous
+    // source via `np.ascontiguousarray()`, then copy as in path 1.
     let np = py
         .import("numpy")
         .map_err(|e| Error::Format(format!("failed to import numpy: {e}")))?;
@@ -1497,8 +1269,7 @@ fn copy_numpy_via_contiguous_array<T: numpy::Element + Copy + Send + Sync>(
 
 // ─── PyTensor ───────────────────────────────────────────────────────────────
 
-/// `subclass`: `edgefirst.codec.Frame` is a `Tensor` that also holds its
-/// decoder's buffer.
+/// A typed N-dimensional buffer. `edgefirst.codec.Frame` subclasses it.
 #[pyclass(name = "Tensor", str, subclass, module = "edgefirst.tensor")]
 pub struct PyTensor(pub(crate) TensorDyn);
 
@@ -1535,17 +1306,14 @@ impl PyTensor {
     /// Platforms:
     ///     Linux, macOS.
     ///
-    /// The buffer type is detected, not chosen. On Linux a `dma_buf` fd
-    /// imports as `TensorMemory.DMABUF` and a tmpfs fd (`/dev/shm` or `memfd`)
-    /// as `TensorMemory.SHM`, decided by filesystem magic; any other
-    /// filesystem raises `RuntimeError` rather than silently falling back to
-    /// shared memory. On macOS the fd is always imported as SHM.
+    /// The buffer type is detected. On Linux a `dma_buf` fd imports as
+    /// `TensorMemory.DMABUF` and a tmpfs fd (`/dev/shm` or `memfd`) as
+    /// `TensorMemory.SHM`, decided by filesystem magic; any other filesystem
+    /// raises `RuntimeError`. On macOS the fd is always imported as SHM.
+    /// `tensor.memory` reports the detected type.
     ///
-    /// The fd is `dup()`'d immediately — the caller retains ownership of the
-    /// original and must close it.
-    ///
-    /// Check `tensor.memory` if you require zero-copy; a successful import
-    /// is not by itself proof of DMA backing.
+    /// The fd is duplicated; the caller retains ownership of the original and
+    /// must close it.
     #[cfg(unix)]
     #[staticmethod]
     #[pyo3(signature = (fd, shape, dtype = "float32", name = None))]
@@ -1558,7 +1326,7 @@ impl PyTensor {
             )));
         }
         let dt = parse_dtype(dtype)?;
-        // Dup the fd — caller retains ownership of the original.
+        // Duplicate the fd; the caller keeps the original.
         let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
         let fd = borrowed.try_clone_to_owned()?;
         let tensor = TensorDyn::from_fd(fd, &shape, dt, name)?;
@@ -1570,11 +1338,10 @@ impl PyTensor {
     /// Platforms:
     ///     macOS.
     ///
-    /// `surface_ref` is an `IOSurfaceRef` cast to `int` — typically
-    /// obtained via `ctypes` from a CoreVideo / AVFoundation /
-    /// VideoToolbox handle, or via `IOSurfaceLookup(id)` to recover a
-    /// surface received over XPC. The surface is retained for the
-    /// tensor's lifetime; the caller keeps its own reference.
+    /// `surface_ref` is an `IOSurfaceRef` cast to `int`, e.g. obtained via
+    /// `ctypes` from a CoreVideo, AVFoundation or VideoToolbox handle, or via
+    /// `IOSurfaceLookup(id)`. The surface is retained for the tensor's
+    /// lifetime; the caller keeps its own reference.
     ///
     /// Raises RuntimeError on non-macOS platforms.
     #[cfg(target_os = "macos")]
@@ -1673,17 +1440,15 @@ impl PyTensor {
         Ok(self.0.reshape(&shape)?)
     }
 
-    /// Zero-copy rectangular sub-region view of an image tensor — the
-    /// destination/source **crop** primitive.
+    /// Zero-copy rectangular sub-region view of an image tensor.
     ///
     /// ``region`` is in pixels of the image's leading frame. The returned view
-    /// shares the parent's buffer (and ``BufferIdentity``) with **no copy**,
-    /// addressing the sub-rectangle by offset + the parent's row pitch.
-    /// ``convert(src, dst.view(region), ...)`` renders into that sub-rectangle.
-    /// The parent must be a packed-format image tensor.
+    /// shares the parent's buffer and addresses the sub-rectangle by offset and
+    /// the parent's row pitch. ``convert(src, dst.view(region), ...)`` renders
+    /// into that sub-rectangle. The parent must be a packed-format image tensor.
     ///
-    /// The view exposes the same surface as any other tensor —
-    /// :meth:`map` (NumPy buffer protocol), :meth:`from_numpy`, ``fd``.
+    /// The view supports :meth:`map`, :meth:`from_numpy` and ``fd`` like any
+    /// other tensor.
     #[pyo3(signature = (region))]
     fn view(&self, region: PyRegion) -> Result<Self> {
         let view = self.0.view(region.into())?;
@@ -1694,11 +1459,10 @@ impl PyTensor {
     ///
     /// A batched tensor prepends ``N`` as the leading dimension over the
     /// per-element image layout (``[N, H, W, C]`` packed or ``[N, C, H, W]``
-    /// planar). ``batch(n)`` returns element ``n`` — the contiguous per-element
+    /// planar). ``batch(n)`` returns element ``n``: the contiguous per-element
     /// region at byte offset ``n * element_size``, sharing the parent's buffer.
     /// ``batch(0)`` on a tensor with ``N == 1`` is equivalent to the whole
-    /// tensor. This is the destination primitive for assembling a batch into a
-    /// single buffer.
+    /// tensor.
     #[pyo3(signature = (n))]
     fn batch(&self, n: usize) -> Result<Self> {
         let view = self.0.batch(n)?;
@@ -1708,8 +1472,7 @@ impl PyTensor {
     /// Attach pixel format metadata to this tensor.
     ///
     /// Validates that the tensor's shape is compatible with the format's
-    /// layout (packed, planar, or semi-planar). This enables
-    /// `from_fd()` tensors to be used as image conversion destinations.
+    /// layout (packed, planar, or semi-planar).
     fn set_format(&mut self, format: PyPixelFormat) -> Result<()> {
         use edgefirst_tensor::PixelFormat;
         let fmt: PixelFormat = format.into();
@@ -1719,15 +1482,8 @@ impl PyTensor {
     /// Set this tensor's logical dimensions and pixel format to a decoded
     /// image, reusing the existing allocation.
     ///
-    /// Unlike :meth:`set_format` (which only validates the *current* shape
-    /// against a format) and :meth:`reshape` (which requires the same
-    /// element count), this can shrink or grow the logical shape within the
-    /// tensor's allocated capacity -- exactly what a JPEG/PNG decode does to
-    /// its destination. This is the Python-visible counterpart of the
-    /// decoder's own `Tensor::configure_image`, used by the cross-package
-    /// `decode_into`/`decode_file_into` write-back
-    /// (`crates/python-common/src/tensor.rs`) to leave a foreign
-    /// destination in the same state a same-module decode would.
+    /// The logical shape can shrink or grow within the tensor's allocated
+    /// capacity.
     ///
     /// Raises if the allocation cannot hold ``width``x``height`` in
     /// ``format``, or if the dimensions are invalid for the format.
@@ -1777,11 +1533,11 @@ impl PyTensor {
     /// Platforms:
     ///     macOS.
     ///
-    /// Use this to hand the surface off to native macOS APIs that take
-    /// an IOSurfaceRef directly (CIImage, AVSampleBufferDisplayLayer,
-    /// CVPixelBufferCreateWithIOSurface). Wrap with `ctypes.c_void_p(...)`
-    /// before passing to a ctypes-bound C function. The pointer's
-    /// lifetime is tied to this tensor — do not call CFRelease on it.
+    /// Passed to native macOS APIs that take an IOSurfaceRef (CIImage,
+    /// AVSampleBufferDisplayLayer, CVPixelBufferCreateWithIOSurface). Wrap
+    /// with `ctypes.c_void_p(...)` before passing to a ctypes-bound C
+    /// function. The pointer's lifetime is tied to this tensor; do not call
+    /// CFRelease on it.
     ///
     /// Returns None when the tensor is not IOSurface-backed.
     #[cfg(target_os = "macos")]
@@ -1853,10 +1609,8 @@ impl PyTensor {
     /// Platforms:
     ///     Windows.
     ///
-    /// The same number :meth:`gpu_completion` returns as ``value``, with no
-    /// fence handle to close: for a consumer that already holds the process
-    /// fence and needs only the value to wait for. 0 when no write has been
-    /// recorded, or when the tensor is not a texture.
+    /// The same number :meth:`gpu_completion` returns as ``value``. 0 when no
+    /// write has been recorded, or when the tensor is not a texture.
     #[cfg(target_os = "windows")]
     #[getter]
     fn gpu_write_value(&self) -> u64 {
@@ -1868,8 +1622,7 @@ impl PyTensor {
     /// Platforms:
     ///     Windows.
     ///
-    /// The recorded value is a maximum, so a producer may record on a tensor
-    /// its consumers already hold.
+    /// The recorded value is the maximum of the values set.
     ///
     /// Raises:
     ///     RuntimeError: If the tensor is not a D3D11 texture.
@@ -1883,15 +1636,14 @@ impl PyTensor {
     /// Platforms:
     ///     Windows.
     ///
-    /// The width and height are read from the texture's own description, so
-    /// ``shape`` describes it rather than defining it: it must be either the
-    /// allocation shape or the addressing shape ``format`` gives those
-    /// dimensions.
+    /// The width and height are read from the texture's own description.
+    /// ``shape`` must be either the allocation shape or the addressing shape
+    /// ``format`` gives those dimensions.
     ///
     /// A semi-planar texture (``Nv12``, ``Nv16``, ``Nv24``) carries the
-    /// image's row stride as its width, so it is accepted only when that
-    /// width is even and equal to the staging row pitch the driver gives a
-    /// texture of that width. Allocate through the HAL, or match the pitch.
+    /// image's row stride as its width. It is accepted only when that width is
+    /// even and equal to the staging row pitch the driver gives a texture of
+    /// that width.
     ///
     /// Raises:
     ///     ValueError: If ``shape`` is neither shape of this texture; the
@@ -1911,16 +1663,13 @@ impl PyTensor {
     ) -> PyResult<Self> {
         let fmt: PixelFormat = format.into();
         let texture = texture as *mut c_void;
-        // SAFETY: the caller contracts a live `ID3D11Texture2D*`; the helper
-        // takes and drops its own reference and keeps no pointer.
-        // ``shape`` goes in as well as out: a semi-planar texture is as wide
-        // as its row pitch, so the image width comes from the shape.
+        // SAFETY: `texture` is a live `ID3D11Texture2D*` per the caller's
+        // contract; the helper takes and drops its own reference.
         let geometry =
             unsafe { edgefirst_tensor::d3d11_texture_geometry(texture, fmt, Some(&shape)) };
         let (width, height) = check_d3d11_shape(geometry, fmt, &shape, "from_d3d11_texture")?;
-        // SAFETY: as above -- the geometry read just proved the pointer is a
-        // live texture holding this image; the constructor takes its own
-        // reference.
+        // SAFETY: `texture` is a live texture holding this image; the
+        // constructor takes its own reference.
         let tensor = unsafe {
             TensorDyn::from_d3d11_texture(
                 texture,
@@ -1942,12 +1691,12 @@ impl PyTensor {
     /// Platforms:
     ///     Windows.
     ///
-    /// ``handle`` and ``completion``'s fence handle stay the caller's: this
-    /// duplicates what it keeps. The width and height are read from the
-    /// opened texture's own description, so ``shape`` describes it rather
-    /// than defining it: it must be either the allocation shape or the
-    /// addressing shape ``format`` gives those dimensions. The semi-planar
-    /// width rule of :meth:`from_d3d11_texture` applies here too.
+    /// ``handle`` and ``completion``'s fence handle stay the caller's; the
+    /// tensor duplicates what it keeps. The width and height are read from the
+    /// opened texture's own description. ``shape`` must be either the
+    /// allocation shape or the addressing shape ``format`` gives those
+    /// dimensions. The semi-planar width rule of :meth:`from_d3d11_texture`
+    /// applies.
     ///
     /// Args:
     ///     completion: ``(fence_handle, value)`` from
@@ -1973,17 +1722,16 @@ impl PyTensor {
     ) -> PyResult<Self> {
         let fmt: PixelFormat = format.into();
         let handle = handle as *mut c_void;
-        // SAFETY: the caller contracts an NT shared handle of a D3D11 texture
-        // valid in this process; the helper opens a texture from it and drops
-        // that texture before returning.
-        // As above: the shape carries the semi-planar image width.
+        // SAFETY: `handle` is an NT shared handle of a D3D11 texture valid in
+        // this process per the caller's contract; the helper drops the texture it
+        // opens before returning.
         let geometry =
             unsafe { edgefirst_tensor::d3d11_shared_handle_geometry(handle, fmt, Some(&shape)) };
         let (width, height) = check_d3d11_shape(geometry, fmt, &shape, "from_d3d11_shared_handle")?;
         let completion = completion.map(|(fence, value)| (fence as *mut c_void, value));
-        // SAFETY: as above for `handle`; the caller contracts that
-        // `completion`'s handle is a shared fence handle. The constructor
-        // duplicates what it keeps.
+        // SAFETY: `handle` is as above and `completion`'s handle is a shared
+        // fence handle per the caller's contract; the constructor duplicates what
+        // it keeps.
         let tensor = unsafe {
             TensorDyn::from_d3d11_shared_handle(
                 handle,
@@ -2002,27 +1750,19 @@ impl PyTensor {
 
     /// Producer half of the cross-package tensor protocol.
     ///
-    /// Returns a ``PyCapsule`` named ``edgefirst_tensor_v2`` wrapping an
-    /// ``TensorDesc`` and this tensor's quantization metadata. Consumers in *other* EdgeFirst packages read this
-    /// rather than type-checking, because each extension module statically
-    /// links its own copy of the bindings and therefore has its own PyO3 type
-    /// objects — ``isinstance`` across packages would always fail.
+    /// Returns a ``PyCapsule`` named ``edgefirst_tensor_v2`` wrapping a
+    /// ``TensorDesc`` and this tensor's quantization metadata.
     ///
-    /// Host memory is only addressable through the descriptor when the tensor
-    /// has been pinned; the capsule then holds the pin alive for as long as the
-    /// consumer holds the capsule.
+    /// Host memory is addressable through the descriptor only when the tensor
+    /// has been pinned; the capsule holds the pin for as long as the consumer
+    /// holds the capsule.
     ///
-    /// A consumer may call this more than once per operation — for example to
-    /// retry with a different ``access`` after an ``access=None`` descriptor
-    /// turns out to need a host address after all. Implementations (including
-    /// third-party producers) must therefore be side-effect free: repeated
-    /// calls, with the same or different ``access``, must be safe and must not
-    /// accumulate state.
+    /// The call has no side effects and may be repeated with the same or a
+    /// different ``access``.
     ///
     /// Args:
-    ///     access: ``None`` (default) requests no pin — the descriptor still
-    ///         carries shape, format and the native handle, which is all a
-    ///         zero-copy consumer needs. ``"read"``, ``"write"`` or
+    ///     access: ``None`` (default) requests no pin; the descriptor carries
+    ///         shape, format and the native handle. ``"read"``, ``"write"`` or
     ///         ``"readwrite"`` pins host memory with the matching access and
     ///         fills in the descriptor's address.
     ///
@@ -2036,19 +1776,13 @@ impl PyTensor {
     ) -> PyResult<Bound<'py, pyo3::types::PyCapsule>> {
         use edgefirst_tensor::CpuAccess;
 
-        // Only pin the access the caller actually asked for: `convert(src,
-        // dst)` needs just the dma-buf handle from `access=None` on both
-        // sides, and a read-only source must not be silently upgraded to
-        // ReadWrite.
+        // Pin only for the access the caller asked for.
         let pin = match access.map(|s| (s, CpuAccess::from_str_code(s))) {
             None => None,
             Some((_, Some(a))) if a != CpuAccess::None => {
                 Some(self.0.pin_host(a).map_err(Error::from)?)
             }
-            // A bad access string is an invalid argument value, not a tensor
-            // error, so raise ValueError directly instead of routing through
-            // Error's blanket PyRuntimeError conversion. "none" is refused
-            // too: the absence of a pin is spelled `None`.
+            // Any other string, including "none", raises `ValueError`.
             Some((other, _)) => {
                 return Err(pyo3::exceptions::PyValueError::new_err(format!(
                     "access must be None, \"read\", \"write\" or \"readwrite\", got {other:?}"
@@ -2057,18 +1791,9 @@ impl PyTensor {
         };
         let desc = self.0.descriptor_pinned(pin.as_ref());
 
-        // The capsule owns the descriptor, the pin, and (for a PBO-backed
-        // tensor) the vtable keepalive: dropping the capsule releases all
-        // three, which is what keeps `desc.ptr` valid for exactly as long as
-        // the consumer can see it. `pbo_keepalive()` is `None` for every
-        // other kind, so this is unconditional rather than gated on
-        // `desc.kind`. `TensorCapsulePayload` is `#[repr(C)]` because this
-        // crosses an `.so` boundary -- see its doc comment in `interop.rs`.
-        // Quantization is cloned into an `Arc` the payload owns, and
-        // `quant` borrows that `Arc`'s arrays -- the consumer copies them
-        // out during import. Without it an integer tensor arrives on the
-        // far side looking unquantized, and every dequantizing consumer
-        // refuses it.
+        // The capsule owns the descriptor, the pin, the PBO keepalive and an
+        // `Arc` of the quantization that `quant` borrows; dropping the capsule
+        // releases them.
         let quant_keepalive = self.0.quantization().cloned().map(std::sync::Arc::new);
         let payload = crate::interop::TensorCapsulePayload {
             desc,
@@ -2077,9 +1802,7 @@ impl PyTensor {
                 .map_or_else(crate::interop::QuantDesc::absent, |q| {
                     crate::interop::QuantDesc::borrowing(q)
                 }),
-            // A `view()`'s byte offset into the parent buffer. Carried for
-            // the same reason as the quantization above and lost the same
-            // way without it -- see `interop::apply_plane_offset`.
+            // A `view()`'s byte offset into the parent buffer.
             plane_offset: self.0.plane_offset().unwrap_or(0) as u64,
             pin,
             pbo_keepalive: self.0.pbo_keepalive(),
@@ -2091,12 +1814,10 @@ impl PyTensor {
 
     /// Pin a stable host address for this tensor's data.
     ///
-    /// The returned :class:`HostPin` carries no borrow of the tensor, so you
-    /// can pin once at init and still pass the tensor to
-    /// ``ImageProcessor.convert()`` every frame — the borrow conflict reported
-    /// in issue #134. The address stays valid until the pin is released.
+    /// The returned :class:`HostPin` carries no borrow of the tensor. The
+    /// address stays valid until the pin is released.
     ///
-    /// It is **not** a coherency guarantee: bracket CPU access with
+    /// The pin gives no coherency guarantee: bracket CPU access with
     /// :meth:`cpu_access`.
     ///
     /// Args:
@@ -2104,8 +1825,8 @@ impl PyTensor {
     ///
     /// Raises:
     ///     RuntimeError: if the backend cannot pin. PBO and AHardwareBuffer
-    ///         have no host address outside their map/lock, so use
-    ///         :meth:`map` there; the error says so.
+    ///         have no host address outside their map/lock; use :meth:`map`
+    ///         there.
     fn pin_host(slf: &Bound<'_, Self>, access: &str) -> Result<PyHostPin> {
         let pin = slf.borrow().0.pin_host(parse_cpu_access(access)?)?;
         Ok(PyHostPin {
@@ -2122,9 +1843,8 @@ impl PyTensor {
     ///     with t.cpu_access("write"):
     ///         ctypes.memset(pin.ptr, 0, pin.len)
     ///
-    /// A no-op on backends that owe no maintenance (``Mem``, ``Shm``), so
-    /// portable code can bracket unconditionally. The direction is replayed on
-    /// exit: a mismatched pair skips half the cache maintenance.
+    /// A no-op on backends that need no maintenance (``Mem``, ``Shm``). The
+    /// same direction is applied on exit.
     ///
     /// Args:
     ///     access: ``"read"``, ``"write"`` or ``"readwrite"``.
@@ -2143,22 +1863,16 @@ impl PyTensor {
     ///     with tensor.map("read") as view:
     ///         frame = np.asarray(view)     # shape, dtype and strides carried
     ///
-    /// The map owns its coherency bracket in both directions -- unlike
-    /// :meth:`pin_host`, which is deliberately decoupled and pairs with
-    /// :meth:`cpu_access`.
+    /// The map owns its coherency bracket in both directions.
     ///
-    /// `access` selects the direction of that bracket, and it is worth
-    /// setting: the default ``"readwrite"`` pays a full-buffer cache
-    /// writeback on unmap, which a reader does not need. On a non-coherent
-    /// backing (Arm DMA-BUF) that is real per-frame cost; ``"read"`` skips
-    /// it, and on macOS takes the read-only IOSurface lock, skipping the
-    /// unlock flush. A ``"read"`` view is advertised to the buffer protocol
-    /// as read-only, so ``np.asarray`` of it is not writable.
+    /// `access` selects the direction of that bracket. ``"read"`` skips the
+    /// cache writeback on unmap and, on macOS, takes the read-only IOSurface
+    /// lock. A ``"read"`` view is advertised to the buffer protocol as
+    /// read-only, so ``np.asarray`` of it is not writable.
     ///
     /// Args:
     ///     access: ``"read"``, ``"write"`` or ``"readwrite"`` (default).
-    ///         ``"none"`` is rejected -- a mapping is CPU access by
-    ///         definition.
+    ///         ``"none"`` is rejected.
     #[pyo3(signature = (access=None))]
     fn map(slf: &Bound<'_, Self>, access: Option<&str>) -> Result<PyTensorMap> {
         let this = slf.borrow();
@@ -2170,17 +1884,12 @@ impl PyTensor {
                     .to_owned(),
             ));
         }
-        // Capture the physical row pitch so the buffer protocol can expose a
-        // padded (DMA / GPU pitch-aligned) backing as a correctly-strided view.
-        // Only image tensors (pixel format set) have a row pitch: a formatless
-        // DMA tensor's plane-0 stride is the whole allocation, and treating
-        // that as strides[0] makes numpy `.fill` walk off the mapping.
+        // Capture the physical row pitch of an image tensor for the buffer
+        // protocol's strides.
         let row_stride = this.0.format().and(this.0.effective_row_stride());
         let layout = this.0.format().map(|f| f.layout());
         let mapped = map_tensor_dyn(&this.0, access, MapWait::Block)?;
         Ok(PyTensorMap {
-            // Derived from the mapping, not from `access`: see
-            // `TensorMapT::is_writable`.
             readonly: !mapped.is_writable(),
             mapped: Some(mapped),
             row_stride,
@@ -2195,8 +1904,7 @@ impl PyTensor {
     /// flight; identical to :meth:`map` on backings without such a copy.
     ///
     /// A caller that retries after ``BlockingIOError`` must yield or sleep
-    /// between attempts: on the WARP software adapter the CPU threads are
-    /// the GPU, so a tight retry loop starves the copy it is waiting for.
+    /// between attempts.
     ///
     /// Args:
     ///     access: as :meth:`map`.
@@ -2232,11 +1940,9 @@ impl PyTensor {
     ///
     /// Returns a ``CudaMap`` context manager exposing ``device_ptr`` and
     /// ``size``, or ``None`` if CUDA is unavailable for this tensor (libcudart
-    /// not found, or the tensor was not registered with CUDA). Fast-fails to
-    /// ``None`` without GL-thread routing.
+    /// not found, or the tensor was not registered with CUDA).
     ///
-    /// The recommended pattern is to try ``cuda_map()`` first and fall back to
-    /// ``map()`` when it returns ``None``::
+    /// Fall back to ``map()`` when it returns ``None``::
     ///
     ///     cm = tensor.cuda_map()
     ///     if cm is not None:
@@ -2247,21 +1953,16 @@ impl PyTensor {
     ///             run_cpu_path(host)                    # fallback
     ///
     /// On Windows the mapping of a D3D11 texture tensor is tight rows of
-    /// ``width * bytes_per_texel``, and ``size`` is their sum, whatever
-    /// :attr:`row_stride` reports -- that is the D3D11 staging pitch a CPU
-    /// map sees, a larger number on a padded backing. A consumer must not
-    /// stride the device pointer by :attr:`row_stride`.
+    /// ``width * bytes_per_texel``, and ``size`` is their sum, independent of
+    /// :attr:`row_stride`. A consumer must not stride the device pointer by
+    /// :attr:`row_stride`.
     ///
-    /// A semi-planar texture (NV12, NV16, NV24) is as wide as its own pitch,
-    /// so there the mapping is :attr:`row_stride` times the combined height
-    /// and striding by it is correct.
+    /// A semi-planar texture (NV12, NV16, NV24) is as wide as its own pitch;
+    /// its mapping is :attr:`row_stride` times the combined height.
     fn cuda_map(slf: Bound<'_, Self>) -> Option<PyCudaMap> {
         let owner: Py<PyTensor> = slf.clone().unbind();
-        // SAFETY: The CudaMap borrows into the tensor's storage. We extend
-        // the lifetime to 'static and keep the PyTensor alive via `_owner`.
-        // `PyCudaMap.map` is declared before `_owner`, so Rust drops the
-        // CudaMap guard before decrementing the tensor ref-count. Callers
-        // must not reshape the tensor while a CudaMap is live.
+        // SAFETY: the mapping borrows the tensor's storage; `_owner` keeps the
+        // `PyTensor` alive and is dropped after `map`.
         let borrowed = slf.borrow();
         let map = borrowed.0.cuda_map()?;
         let map_static: edgefirst_tensor::CudaMap<'static> = unsafe { std::mem::transmute(map) };
@@ -2274,26 +1975,21 @@ impl PyTensor {
     /// Writable counterpart of :meth:`cuda_map`.
     ///
     /// Changes are written back to the tensor when the mapping is released.
-    /// The same object as :meth:`cuda_map` where the mapping aliases the
-    /// tensor's memory, and ``None`` on the same terms. A Windows D3D11
-    /// texture is the backing that does not alias: its release copies the
-    /// device buffer back into the texture.
+    /// Returns ``None`` on the same terms as :meth:`cuda_map`. For a Windows
+    /// D3D11 texture the release copies the device buffer back into the
+    /// texture.
     ///
     /// On Windows the mapping of a D3D11 texture tensor is tight rows of
-    /// ``width * bytes_per_texel``, and ``size`` is their sum, whatever
-    /// :attr:`row_stride` reports -- that is the D3D11 staging pitch a CPU
-    /// map sees, a larger number on a padded backing. A consumer must not
-    /// stride the device pointer by :attr:`row_stride`; writing at that
-    /// pitch scrambles the image rather than failing.
+    /// ``width * bytes_per_texel``, and ``size`` is their sum, independent of
+    /// :attr:`row_stride`. A consumer must not stride the device pointer by
+    /// :attr:`row_stride`.
     ///
-    /// A semi-planar texture (NV12, NV16, NV24) is as wide as its own pitch,
-    /// so there the mapping is :attr:`row_stride` times the combined height
-    /// and striding by it is correct.
+    /// A semi-planar texture (NV12, NV16, NV24) is as wide as its own pitch;
+    /// its mapping is :attr:`row_stride` times the combined height.
     fn cuda_map_mut(slf: Bound<'_, Self>) -> Option<PyCudaMap> {
         let owner: Py<PyTensor> = slf.clone().unbind();
-        // SAFETY: as `cuda_map` -- the borrow into the tensor's storage is
-        // extended to 'static and the PyTensor is kept alive by `_owner`,
-        // which `PyCudaMap`'s field order drops after the mapping.
+        // SAFETY: the mapping borrows the tensor's storage; `_owner` keeps the
+        // `PyTensor` alive and is dropped after `map`.
         let borrowed = slf.borrow();
         let map = borrowed.0.cuda_map_mut()?;
         let map_static: edgefirst_tensor::CudaMap<'static> = unsafe { std::mem::transmute(map) };
@@ -2311,12 +2007,11 @@ impl PyTensor {
     /// `"write"` for whole-buffer writes, or `"none"`); hardware access is
     /// always implied. A CPU map outside the declaration raises, as does HAL
     /// CPU work it does not cover. On Linux a `"none"` or `"write"` DMA-BUF
-    /// comes from the uncached CMA heap where available, which devices map
-    /// without CPU cache maintenance.
+    /// comes from the uncached CMA heap where available.
     ///
     /// `contiguous=True` requires physically contiguous memory: a DMA-BUF
-    /// from the Linux CMA heap, or an error naming the heap, never a
-    /// fallback (see :attr:`contiguity`).
+    /// from the Linux CMA heap, or an error naming the heap (see
+    /// :attr:`contiguity`).
     #[staticmethod]
     #[pyo3(signature = (width, height, format, mem = None, access = "readwrite", contiguous = false))]
     fn image(
@@ -2350,12 +2045,10 @@ impl PyTensor {
 
     /// Parse the header of a JPEG/PNG byte string and return its native
     /// dimensions, pixel format, and EXIF orientation without decoding
-    /// pixels. Use this to allocate a tensor at the right size before
-    /// calling ``decode_image``.
+    /// pixels.
     ///
-    /// The reported dimensions are unrotated (the decode never applies EXIF
-    /// rotation); ``rotation_degrees`` / ``flip_horizontal`` report the EXIF
-    /// orientation so callers can apply it themselves if desired.
+    /// The reported dimensions are unrotated; ``rotation_degrees`` /
+    /// ``flip_horizontal`` report the EXIF orientation.
     #[cfg(feature = "codec")]
     #[staticmethod]
     fn peek_image_info(data: &[u8]) -> Result<PyImageInfo> {
@@ -2382,10 +2075,6 @@ impl PyTensor {
     }
 
     /// Save this image tensor as a JPEG file.
-    ///
-    /// Gated on the `image` feature: JPEG encoding lives in edgefirst-image,
-    /// and pulling it in unconditionally would make `edgefirst.tensor` and
-    /// `edgefirst.codec` link the OpenGL stack they never use.
     #[cfg(feature = "image")]
     #[pyo3(signature = (filename, quality=80))]
     fn save_jpeg(&self, filename: &str, quality: u8) -> Result<()> {
@@ -2398,51 +2087,29 @@ impl PyTensor {
     /// The image is decoded in its native pixel format (JPEG → ``Nv12`` for
     /// colour / ``Grey`` for greyscale; PNG → ``Rgb`` / ``Rgba`` / ``Grey``)
     /// and the tensor's dimensions and format are configured by the decoder
-    /// to match. The decode never rotates or flips; if you need RGB, decode
-    /// then call ``ImageProcessor.convert(...)``.
+    /// to match. The decode never rotates or flips.
     ///
     /// Returns an ``ImageInfo`` with the native ``width``, ``height``,
     /// ``format``, ``row_stride``, and the EXIF ``rotation_degrees`` /
     /// ``flip_horizontal``. The tensor must have sufficient capacity for the
     /// decoded image (it is reconfigured within that capacity).
     ///
-    /// This is the preferred API for real-time pipelines: allocate once via
-    /// ``ImageProcessor.create_image()``, then call ``decode_image()`` in
-    /// the main loop to avoid per-frame allocations.
-    ///
-    /// Call :func:`set_output_format` beforehand to opt a JPEG source into a
-    /// fused ``Rgb``/``Nv12`` output instead, computed in the same decode
-    /// pass.
+    /// :func:`set_output_format` selects a fused ``Rgb``/``Nv12`` output for a
+    /// JPEG source.
     ///
     /// Args:
     ///     data: Raw JPEG or PNG bytes.
     #[cfg(feature = "codec")]
     fn decode_image<'py>(mut self_: PyRefMut<'py, Self>, data: &[u8]) -> Result<PyImageInfo> {
         let py = self_.py();
-        // Copy while the GIL is still held -- `data` borrows a Python
-        // `bytes` object tied to this call's GIL token and cannot itself
-        // cross `py.detach`. The decode this feeds is a software JPEG/PNG
-        // decode, orders of magnitude more expensive than one linear copy
-        // of the (compressed, therefore smaller-than-the-output) input.
+        // Copy the input while the GIL is held.
         let data = data.to_vec();
         if self_.0.memory() == TensorMemory::Pbo {
-            // A GL-PBO-backed tensor: `crate::interop::TensorArg::
-            // can_detach`'s docs explain why `reconstruct` below cannot
-            // build an independent value for it, so this call keeps the
-            // GIL held for its whole duration, exactly this crate's
-            // behaviour before GIL release existed for tensors at all.
+            // A PBO-backed tensor is decoded in place with the GIL held.
             return decode_image_into(&mut self_.0, &data);
         }
-        // Reconstruct an independent `TensorDyn` aliasing the same backing
-        // memory as `self_`'s own, rather than a raw pointer straight at
-        // the live `PyTensor`'s field -- see `crate::interop::
-        // RawTensorAccess`'s docs for why the latter is unsound to
-        // dereference once `self_`'s borrow is dropped below. Called
-        // directly (not via `TensorArg::into_raw_access`) so `self_bound`
-        // below keeps a *typed* handle rather than one folded into an
-        // opaque `Py<PyAny>` keepalive -- the decode's resulting
-        // format/shape/colorimetry need writing back onto the real object
-        // once `py.detach` returns (see `write_back_decode`).
+        // Decode into a `TensorDyn` reconstructed over the same backing memory,
+        // with the GIL released.
         let (mut tensor, _pin) =
             crate::interop::reconstruct(&self_.0, crate::interop::write_pin_access(&self_.0))
                 .map_err(Error::Py)?;
@@ -2469,15 +2136,15 @@ impl PyTensor {
         filename: &str,
     ) -> Result<PyImageInfo> {
         let py = self_.py();
-        // Copy while the GIL is still held -- see `decode_image`.
+        // Copy the filename while the GIL is held.
         let filename = filename.to_string();
         if self_.0.memory() == TensorMemory::Pbo {
-            // See `decode_image`: a GL-PBO-backed tensor keeps the GIL held.
+            // A PBO-backed tensor is decoded in place with the GIL held.
             let data = std::fs::read(&filename).map_err(Error::Io)?;
             return decode_image_into(&mut self_.0, &data);
         }
-        // See `decode_image` for why this reconstructs rather than going
-        // through `TensorArg::into_raw_access`.
+        // Decode into a `TensorDyn` reconstructed over the same backing memory,
+        // with the GIL released.
         let (mut tensor, _pin) =
             crate::interop::reconstruct(&self_.0, crate::interop::write_pin_access(&self_.0))
                 .map_err(Error::Py)?;
@@ -2513,7 +2180,7 @@ impl PyTensor {
     /// Effective row stride in bytes, or ``None`` if unknown.
     ///
     /// For images allocated via ``ImageProcessor.create_image``, this
-    /// reflects any DMA pitch-alignment padding applied to the row.
+    /// includes any DMA pitch-alignment padding applied to the row.
     /// Returns the explicit stride when set, otherwise computes
     /// ``width × channels × sizeof(element)`` from the pixel format.
     /// Returns ``None`` for non-image tensors without a pixel format.
@@ -2538,10 +2205,6 @@ impl PyTensor {
     /// ``Unsigned`` (``x / 255``), ``Signed`` (``(x - zp) / 127.5``, or
     /// ``x - zp`` into ``int8``) or ``Raw``. ``None`` is ``Raw`` for a
     /// ``uint8`` destination and ``Signed`` otherwise.
-    ///
-    /// Gated on the `image` feature: normalization lives in the image module,
-    /// and gating it keeps `edgefirst.tensor` and `edgefirst.codec` from
-    /// linking the OpenGL stack they never use.
     #[cfg(feature = "image")]
     #[pyo3(signature = (dst, normalization=None, zero_point=None))]
     fn normalize_to_numpy(
@@ -2620,7 +2283,7 @@ impl PyTensor {
 
     /// Colorimetry metadata, or ``None`` when undefined.
     ///
-    /// Faithful: never auto-filled. Set to ``None`` to clear.
+    /// Never auto-filled. Set to ``None`` to clear.
     #[getter]
     fn colorimetry(&self) -> Option<crate::colorimetry::PyColorimetry> {
         self.0.colorimetry().map(Into::into)
@@ -2774,8 +2437,6 @@ impl From<edgefirst_tensor::d3d11_layout::D3d11ImageLayout> for PyD3d11Layout {
     fn from(layout: edgefirst_tensor::d3d11_layout::D3d11ImageLayout) -> Self {
         PyD3d11Layout {
             dxgi_format: layout.dxgi_format,
-            // Texture dimensions are bounded by D3D11's 16384-texel limit,
-            // so the narrowing is exact.
             texture_width: layout.texture_width as u32,
             texture_height: layout.texture_height as u32,
             bytes_per_texel: layout.bytes_per_texel as u32,
@@ -2803,21 +2464,17 @@ impl PyD3d11Layout {
 // ─── PyCudaMap ──────────────────────────────────────────────────────────────
 
 /// Scoped zero-copy CUDA device-pointer mapping for a tensor (e.g. a TensorRT
-/// input). Use as a context manager; the mapping is released on exit so the
-/// GPU buffer can be reused by the next convert(). Obtain via Tensor.cuda_map().
+/// input). Use as a context manager; the mapping is released on exit. Obtain
+/// via Tensor.cuda_map().
 #[pyclass(name = "CudaMap", module = "edgefirst.tensor")]
 pub struct PyCudaMap {
-    // FIELD ORDER IS LOAD-BEARING: `map` must be declared before `_owner` so
-    // that Rust drops `map` (the CudaMap guard) before `_owner` (the PyTensor
-    // ref-count). This preserves the invariant that the CUDA mapping is
-    // released before the tensor can be freed.
+    // `map` is declared before `_owner` and is dropped first.
     map: Option<edgefirst_tensor::CudaMap<'static>>,
     _owner: Py<PyTensor>,
 }
 
-// SAFETY: CudaMap holds a *mut c_void CUDA device pointer. CUDA device
-// pointers are process-global and may be used from any thread, so Send+Sync
-// are sound here. The owning PyTensor Py<> handle is also Send+Sync.
+// SAFETY: a CUDA device pointer is process-global and usable from any
+// thread; `Py<PyTensor>` is `Send + Sync`.
 unsafe impl Send for PyCudaMap {}
 unsafe impl Sync for PyCudaMap {}
 
@@ -2842,8 +2499,8 @@ impl PyCudaMap {
         self.size()
     }
 
-    /// Release the CUDA mapping (idempotent). Called automatically on ``with``
-    /// exit; may also be called explicitly when early release is needed.
+    /// Release the CUDA mapping (idempotent). Called on ``with`` exit; may also
+    /// be called explicitly.
     fn release(&mut self) {
         self.map = None; // drops the CudaMap guard → unmaps
     }
@@ -2861,18 +2518,15 @@ impl PyCudaMap {
 
 /// A stable host address for a tensor's data, valid until released.
 ///
-/// Carries **no borrow of the tensor**, so a caller can pin once at init and
-/// still pass the tensor to ``ImageProcessor.convert()`` every frame — the
-/// borrow conflict reported in issue #134.
+/// Carries no borrow of the tensor.
 ///
-/// The address is not a coherency guarantee. Bracket CPU access with
-/// :meth:`Tensor.cpu_access`, which is a no-op where the backend owes nothing.
+/// The address gives no coherency guarantee. Bracket CPU access with
+/// :meth:`Tensor.cpu_access`.
 #[pyclass(name = "HostPin", module = "edgefirst.tensor")]
 pub struct PyHostPin {
     pin: Option<edgefirst_tensor::HostPin<'static>>,
-    /// The tensor object the pin came from, kept alive while the pin is: a
-    /// decoded frame's buffer stays leased until then. After `pin`, so it is
-    /// released after the pin.
+    /// The tensor object the pin came from, kept alive while the pin is and
+    /// released after it.
     pub(crate) _owner: Option<Py<PyAny>>,
 }
 
@@ -2889,19 +2543,14 @@ impl PyHostPin {
 
     /// Usable length in bytes.
     ///
-    /// The tensor's **logical** length, not the allocation's capacity — a
-    /// backend may round up, and reporting that would let a caller read
-    /// padding as data. For a stride-padded image use :meth:`Tensor.map`,
-    /// which exposes the padded extent.
+    /// The tensor's logical length, not the allocation's capacity. For a
+    /// stride-padded image :meth:`Tensor.map` exposes the padded extent.
     #[getter]
     fn len(&self) -> usize {
         self.pin.as_ref().map_or(0, |p| p.len())
     }
 
     /// Alignment of the pinned address in bytes.
-    ///
-    /// TFLite requires 64-byte alignment unless the caller opts out, and
-    /// upstream warns that opting out can crash in ``Invoke()``.
     #[getter]
     fn alignment(&self) -> usize {
         self.pin.as_ref().map_or(0, |p| p.alignment())
@@ -2935,15 +2584,10 @@ impl PyHostPin {
 
 /// Coherency bracket returned by :meth:`Tensor.cpu_access`.
 ///
-/// One guard parameterised by direction, rather than a class per direction:
-/// ``CpuAccess`` has four variants and only the caller knows which applies.
-/// The direction is replayed on exit because a mismatched pair skips half the
-/// cache maintenance — a read-only bracket lets the kernel skip the writeback,
-/// a write-only one skips the invalidate.
+/// The direction given on entry is applied again on exit.
 #[pyclass(name = "CpuAccessGuard", module = "edgefirst.tensor")]
 pub struct PyCpuAccessGuard {
-    /// A Python reference, not a clone: `TensorDyn` is not `Clone`, and the
-    /// guard must keep the tensor alive for the bracket's duration anyway.
+    /// The tensor, kept alive for the bracket's duration.
     tensor: Py<PyTensor>,
     access: edgefirst_tensor::CpuAccess,
     active: bool,
@@ -2985,35 +2629,21 @@ impl PyCpuAccessGuard {
 #[pyclass(name = "HostView", module = "edgefirst.tensor")]
 pub struct PyTensorMap {
     pub(crate) mapped: Option<TensorMapT>,
-    /// True when the map was taken read-only, so `__getbuffer__` must
-    /// advertise the view as such. A writable view over a read-only map
-    /// would let a consumer write bytes that the unmap deliberately does
-    /// not flush -- silently discarded on a non-coherent backing.
+    /// True when the map was taken read-only; `__getbuffer__` advertises the
+    /// view as read-only.
     pub(crate) readonly: bool,
     /// Physical row pitch in bytes for image tensors, captured from
-    /// `effective_row_stride()` at map time. `Some` for **any** image tensor
-    /// that has a pixel format set (including DMA, IOSurface, and
-    /// self-allocated semi-planar tensors whose stride is always
-    /// 64-byte-aligned). `None` only for non-image tensors or tensors without
-    /// a pixel format. The `__getbuffer__` impl applies the padded stride only
-    /// when `rs > strides[0]` (tight buffers pass through unchanged).
-    ///
-    /// Read **only** by `__getbuffer__`, which is itself gated on
-    /// `any(not(Py_LIMITED_API), Py_3_11)` — the buffer protocol is not part
-    /// of the stable ABI before 3.11. The field stays unconditional so the
-    /// construction sites need no cfg, and dead_code is silenced in exactly
-    /// the configuration that compiles the reader out. That configuration is
-    /// not hypothetical: `.github/workflows/release.yml` builds
-    /// `--features abi3-py38`, so `-D warnings` fails there without this.
+    /// `effective_row_stride()` at map time. `Some` for any tensor with a pixel
+    /// format, `None` otherwise. `__getbuffer__` applies the padded stride only
+    /// when it exceeds the tight stride.
     #[cfg_attr(all(Py_LIMITED_API, not(Py_3_11)), allow(dead_code))]
     pub(crate) row_stride: Option<usize>,
     /// Pixel layout at map time, which says which dimension `row_stride`
     /// pads: `[H, W, C]` and `[H*k, W]` pad dim 0, planar `[C, H, W]` pads
     /// dim 1 and makes each plane `row_stride * H` bytes.
     pub(crate) layout: Option<tensor::PixelLayout>,
-    /// The tensor object the map came from, kept alive while the map is: a
-    /// decoded frame's buffer stays leased until then. After `mapped`, so it
-    /// is released after the mapping.
+    /// The tensor object the map came from, kept alive while the map is and
+    /// released after it.
     pub(crate) _owner: Option<Py<PyAny>>,
 }
 
@@ -3031,10 +2661,8 @@ impl PyTensorMap {
         let itemsize = mapped.element_size() as i64;
         let tight = tensor::protocol::c_byte_strides(&dims, itemsize, self.layout, None);
         let tight_len = mapped.size();
-        // `row_stride` is only captured for formatted tensors, so it is a real
-        // pitch. The padded strides apply when they differ from the tight ones
-        // and the rows they describe lie inside the mapping -- which also holds
-        // for a one-row image whose pitch exceeds its whole logical size.
+        // The padded strides apply when they differ from the tight ones and the
+        // rows they describe lie inside the mapping.
         let padded = self
             .row_stride
             .map(|rs| tensor::protocol::c_byte_strides(&dims, itemsize, self.layout, Some(rs)))
@@ -3083,10 +2711,6 @@ impl PyTensorMap {
     }
 
     fn __setitem__(&mut self, index: usize, value: Py<PyAny>, py: Python) -> PyResult<()> {
-        // Checked before reaching the map: `set_value_at` asserts on a
-        // read-only view, and that panic crosses the FFI boundary as a
-        // `PanicException`, which derives from `BaseException` and so escapes
-        // an ordinary `except Exception` handler.
         if self.readonly {
             return Err(PyBufferError::new_err(
                 "this view is read-only: it was obtained with access=\"read\", \
@@ -3113,11 +2737,8 @@ impl PyTensorMap {
             return Err(PyBufferError::new_err("Buffer not mapped"));
         }
 
-        // PEP 3118: a consumer that asks for a writable buffer must be
-        // refused rather than handed a read-only one. Silently downgrading
-        // is the dangerous outcome here -- the caller would write bytes that
-        // this map's unmap deliberately does not flush, so on a non-coherent
-        // backing they would be discarded without a diagnostic.
+        // PEP 3118: a request for a writable buffer on a read-only view is
+        // refused.
         const PY_BUF_WRITABLE: c_int = 0x0001;
         if slf2.readonly && (flags & PY_BUF_WRITABLE) != 0 {
             return Err(PyBufferError::new_err(
@@ -3132,17 +2753,13 @@ impl PyTensorMap {
         let shape: Vec<isize> = mapped.shape().iter().map(|&s| s as isize).collect();
         let ndim = shape.len();
 
-        // Row-padded image backing (DMA / GPU pitch alignment): `map().as_slice()`
-        // exposes the full padded buffer, so a consumer
-        // (`np.asarray(memoryview(map))`) must be handed the padded strides to
-        // read the logical pixels zero-copy instead of a sheared contiguous
-        // reinterpretation.
+        // A row-padded image backing is exposed with its padded strides.
         let (strides, buf_len) = slf2.buffer_geometry(mapped);
         let buf_len = buf_len as isize;
         let itemsize = mapped.element_size() as isize;
 
-        // Box both arrays together so we can recover the length in __releasebuffer__.
-        // Store (shape_ptr, strides_ptr, ndim) using view.internal.
+        // Box the shape and strides; `__releasebuffer__` frees them using the
+        // `ndim` stored in `view.internal`.
         let mut shape = shape.into_boxed_slice();
         let mut strides = strides.into_boxed_slice();
 
@@ -3160,7 +2777,7 @@ impl PyTensorMap {
             (*view).ndim = ndim as i32;
             (*view).shape = shape.as_mut_ptr();
             (*view).strides = strides.as_mut_ptr();
-            // Store ndim in internal so __releasebuffer__ can reconstruct the slices.
+            // `internal` holds ndim, read by `__releasebuffer__`.
             (*view).internal = ndim as *mut c_void;
             std::mem::forget(shape); // dropped in __releasebuffer__
             std::mem::forget(strides); // dropped in __releasebuffer__
@@ -3199,11 +2816,8 @@ impl PyTensorMap {
         self._owner = None;
     }
 
-    /// Zero-copy NumPy array over the mapped buffer, honouring DMA row
-    /// padding the same way ``memoryview(self)`` / ``__getbuffer__`` does.
-    ///
-    /// On the abi3 wheel ``__getbuffer__`` is compiled out, so this path
-    /// constructs the strided array itself.
+    /// Zero-copy NumPy array over the mapped buffer, with the same row-padding
+    /// strides as ``memoryview(self)``.
     fn numpy(slf: Bound<'_, Self>, py: Python<'_>) -> PyResult<Py<PyAny>> {
         if slf.borrow().mapped.is_none() {
             return Err(PyBufferError::new_err("Buffer not mapped"));
@@ -3243,18 +2857,11 @@ impl PyTensorMap {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Moved from image.rs: both wrap edgefirst_tensor types (PixelFormat, Region),
-// so they are tensor-level concepts. Living in image.rs forced tensor.rs to
-// depend on image.rs, which meant every extension module linked the OpenGL
-// stack whether it used it or not.
-// ---------------------------------------------------------------------------
+// ─── PyPixelFormat / PyRegion ──────────────────────────────────────────────
 
 /// Pixel format for image tensors.
 ///
 /// Each variant maps directly to an `edgefirst_tensor::PixelFormat` value.
-// No `eq`/`eq_int` -- see `PyTensorMemory`'s comment above; `__eq__`/`__ne__`
-// are hand-written below instead, for the cross-package fallback.
 #[pyclass(name = "PixelFormat", skip_from_py_object, module = "edgefirst.tensor")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PyPixelFormat {
@@ -3271,9 +2878,7 @@ pub enum PyPixelFormat {
     PlanarRgba = 10,
 }
 
-// Same reasoning as `PyTensorMemory`'s const assertions above: these
-// literals are copied from `PixelFormat::code()`, and this is what stops
-// that copy drifting silently -- a mismatch fails the build.
+// Compile-time checks that each discriminant equals `PixelFormat::code()`.
 const _: () = assert!(PyPixelFormat::Rgb as u32 == PixelFormat::Rgb.code());
 const _: () = assert!(PyPixelFormat::Rgba as u32 == PixelFormat::Rgba.code());
 const _: () = assert!(PyPixelFormat::Bgra as u32 == PixelFormat::Bgra.code());
@@ -3301,7 +2906,7 @@ impl PyPixelFormat {
         eq_int_richcmp(*self, other, true, "PixelFormat", Self::from_discriminant)
     }
 
-    /// See `PyTensorMemory::__hash__` -- same discriminant-is-the-hash story.
+    /// Returns the discriminant as the hash.
     fn __hash__(&self) -> isize {
         *self as isize
     }
@@ -3309,17 +2914,7 @@ impl PyPixelFormat {
 
 impl PyPixelFormat {
     /// Reconstruct from the `__int__()` discriminant of a sibling package's
-    /// copy of this enum. See `extract_eq_int_enum`.
-    ///
-    /// Delegates to `PixelFormat::from_code` -- see `PyTensorMemory::
-    /// from_discriminant`'s doc comment for why a hand-written match here
-    /// is the parallel table this vocabulary work removes. Every code
-    /// `PixelFormat::from_code` accepts today has a same-named Python
-    /// variant (`TryFrom<PixelFormat> for PyPixelFormat` below is total
-    /// over the current set), so this only returns `None` for a code that
-    /// is unassigned on the Rust side too, or -- once `PixelFormat` grows a
-    /// variant upstream without a matching Python addition -- one that
-    /// resolves on the Rust side but has no Python counterpart yet.
+    /// copy of this enum.
     fn from_discriminant(v: i64) -> Option<Self> {
         u32::try_from(v)
             .ok()
@@ -3328,7 +2923,8 @@ impl PyPixelFormat {
     }
 }
 
-/// See `PyTensorMemory`'s `FromPyObject` impl -- same cross-package story.
+/// Extracts a native instance, or a sibling `edgefirst.*` package's
+/// `PixelFormat` through its `__int__()` discriminant.
 impl<'a, 'py> FromPyObject<'a, 'py> for PyPixelFormat {
     type Error = PyErr;
 
@@ -3397,8 +2993,6 @@ impl TryFrom<PixelFormat> for PyPixelFormat {
     }
 }
 
-// No `eq` here -- see `PyTensorMemory`'s comment above; `__eq__`/`__ne__`
-// are hand-written below instead, for the cross-package fallback.
 #[pyclass(name = "Region", skip_from_py_object, module = "edgefirst.tensor")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PyRegion {
@@ -3424,12 +3018,8 @@ impl PyRegion {
         }
     }
 
-    /// Cross-package equality: `#[pyclass(eq)]`'s auto-generated `__eq__`
-    /// resolves `other` by native identity only, so a sibling package's
-    /// `Region` with identical `x`/`y`/`width`/`height` compared unequal --
-    /// silently, never an error. Reuses this type's own `FromPyObject`
-    /// (native downcast first, then the four field getters) so `==`/`!=`
-    /// agree with what `Region` already accepts as a value.
+    /// Equality against a native `Region` or a sibling package's `Region` with
+    /// the same `x`/`y`/`width`/`height`.
     fn __eq__(&self, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
         let py = other.py();
         match other.as_borrowed().extract::<PyRegion>() {
@@ -3446,21 +3036,8 @@ impl PyRegion {
         }
     }
 
-    /// Equal objects must hash equal, and `__eq__` above compares exactly
-    /// `x`/`y`/`width`/`height` -- so the hash mixes exactly those four
-    /// fields, in this fixed order, and nothing else.
-    ///
-    /// Deliberately NOT routed through `std::hash::Hash`/`DefaultHasher`:
-    /// every `edgefirst.*` extension module must compute the identical
-    /// hash for the identical value (each is a separately compiled copy of
-    /// this same source), and while `DefaultHasher`'s *seed* is fixed
-    /// (`SipHasher13::new_with_keys(0, 0)`), its *algorithm* is documented
-    /// as unspecified across std/compiler versions -- a future split
-    /// toolchain build could silently reintroduce the exact bug this hash
-    /// exists to prevent. Mixing the fields here with primitive,
-    /// unconditionally well-defined operations (rotate/xor/wrapping-mul)
-    /// removes that cross-build assumption instead of merely documenting
-    /// it. The constant is FxHash's.
+    /// Hash of `x`, `y`, `width` and `height`, mixed in that order with rotate,
+    /// xor and wrapping multiply by the FxHash constant.
     fn __hash__(&self) -> u64 {
         const K: u64 = 0x517c_c1b7_2722_0a95;
         let mut h: u64 = 0;
@@ -3471,19 +3048,8 @@ impl PyRegion {
     }
 }
 
-/// `Region` is a plain value struct, not an `eq_int` enum, so the fallback
-/// here reads the four fields back via `getattr` instead of a discriminant
-/// -- a sibling package's `Region` exposes the same `x`/`y`/`width`/`height`
-/// properties (see `PyTensorMemory`'s `FromPyObject` impl for the identity
-/// story this is working around).
-///
-/// Gated on `type(obj).__name__ == "Region"` first. Without this gate, the
-/// getattr fallback is pure structural duck typing: *any* object exposing
-/// `x`/`y`/`width`/`height` -- not just a sibling package's `Region` -- would
-/// be accepted and compare equal. Every `edgefirst.*` package's copy of
-/// `Region` shares the same `#[pyclass(name = "Region")]`, so the check
-/// still accepts a sibling package's copy while rejecting an unrelated
-/// same-shaped type.
+/// Extracts a native instance, or an object whose type is named `Region`
+/// through its `x`/`y`/`width`/`height` attributes.
 impl<'a, 'py> FromPyObject<'a, 'py> for PyRegion {
     type Error = PyErr;
 

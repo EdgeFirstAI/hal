@@ -17,23 +17,15 @@ ATTRIBUTION_REQUIRED_LICENSES: Set[str] = {
     "BSD-4-Clause",
     "ISC",
     "MIT",
-    # Listed so that an MPL component is named rather than absent for an
-    # unstated reason. The licence's source-availability obligation attaches to
-    # modification and distribution, neither of which applies here.
     "MPL-2.0",
     "Zlib",
-    # Assigned to a component whose licence could not be mapped to an SPDX id,
-    # so that it surfaces in NOTICE rather than being dropped.
+    # Assigned to a component whose licence could not be mapped to an SPDX id.
     "Unclassified",
 }
 
 # Substrings identifying a licence from its full text, for a component whose
-# SBOM entry carries no SPDX id or expression. A crate setting `license-file`
-# rather than `license` lands here: cargo-cyclonedx emits
-# `{"license": {"name": "Unknown", "text": {...}}}` for it.
-#
-# Order matters: BSD-3-Clause's text contains BSD-2-Clause's, so it is tested
-# first.
+# SBOM entry carries no SPDX id or expression. BSD-3-Clause is tested before
+# BSD-2-Clause.
 LICENSE_TEXT_SIGNATURES: List[Tuple[str, Tuple[str, ...]]] = [
     ("Apache-2.0", ("apache license", "version 2.0")),
     ("ISC", ("permission to use, copy, modify, and/or distribute this software",)),
@@ -43,10 +35,7 @@ LICENSE_TEXT_SIGNATURES: List[Tuple[str, Tuple[str, ...]]] = [
     ("BSD-2-Clause", ("redistributions in binary form must reproduce",)),
 ]
 
-# Licences that are real, recognised, and ask for nothing. They are listed so a
-# component carrying one is KNOWN to need no attribution, rather than merely
-# failing to match the set above -- the difference between a deliberate omission
-# and a silent loss, which is the whole subject of this file.
+# Licences that require no attribution.
 NO_ATTRIBUTION_LICENSES: Set[str] = {
     "0BSD",
     "CC0-1.0",
@@ -55,13 +44,8 @@ NO_ATTRIBUTION_LICENSES: Set[str] = {
     "WTFPL",
 }
 
-# Every licence identifier this script can reason about. A `name` is accepted as
-# identification only if it appears here: names are free-form, so treating an
-# unrecognised one ("MIT License", a bespoke corporate licence) as identification
-# would mark the component classified, skip the licence text that could have
-# placed it, and then drop it for not matching the attribution set -- reinstating
-# exactly the silent loss this script exists to prevent. Anything else falls
-# through to the text, and failing that to Unclassified, which is attributed.
+# Every licence identifier this script recognises. A `name` identifies a
+# licence only if it appears here.
 KNOWN_LICENSES: Set[str] = (
     ATTRIBUTION_REQUIRED_LICENSES | NO_ATTRIBUTION_LICENSES) - {"Unclassified"}
 
@@ -70,7 +54,7 @@ def identify_license_text(text_entry: Dict) -> Set[str]:
     """Identify a licence from its embedded full text.
 
     Returns the matching SPDX ids, or {"Unclassified"} when text is present but
-    unrecognised. Never an empty set: that would drop the component.
+    unrecognised. Never an empty set.
     """
     content = text_entry.get("content")
     if not content:
@@ -105,25 +89,20 @@ def extract_license_from_component(component: Dict) -> Set[str]:
             licenses.add(license_obj["id"])
             identified = True
 
-        # A `name` is free-form, so it identifies a licence only when it is a
-        # recognised identifier. "Unknown" and "MIT License" alike fall through
-        # to the licence text below.
+        # A `name` identifies a licence only when it is a recognised identifier.
         name = (license_obj.get("name") or "").strip()
         if name in KNOWN_LICENSES:
             licenses.add(name)
             identified = True
 
-        # Last resort: the full licence text. Only consulted when neither an id
-        # nor a recognised name was found, so a component is never dropped for
-        # expressing its licence as prose.
+        # The full licence text, consulted when neither an id nor a recognised
+        # name was found.
         if not identified and "text" in license_obj:
             identified_text = identify_license_text(license_obj["text"])
             licenses |= identified_text
             identified = identified or bool(identified_text)
 
-        # The entry carried a name or text but nothing above could identify it.
-        # Unclassified keeps the component in NOTICE, where an unreadable
-        # licence is visible; dropping it would not be.
+        # A name or text that could not be identified is Unclassified.
         if not identified and (name or "text" in license_obj):
             licenses.add("Unclassified")
 
@@ -224,9 +203,7 @@ def attributable_entries(sbom_path: str) -> List[Tuple[str, str]]:
     with open(sbom_path, "r") as handle:
         sbom = json.load(handle)
 
-    # Deduplicated the way generate_notice() renders them: the merged SBOM can
-    # carry the same (name, version) from several per-target scans, and the
-    # count is meant to describe NOTICE's lines, not the merge's row count.
+    # Deduplicated the way generate_notice() renders them.
     entries = set()
     for component in sbom.get("components", []):
         licenses = extract_license_from_component(component)
@@ -239,13 +216,8 @@ def attributable_entries(sbom_path: str) -> List[Tuple[str, str]]:
 def check_notice(sbom_path: str, notice_path: str) -> int:
     """Fail when NOTICE omits a component whose licence requires attribution.
 
-    Scoped to what this script would write, not to every component in the SBOM.
-    The generator omits components under licences asking for no attribution, so
-    gating on the full list would fail on a component NOTICE is correct to omit,
-    and regenerating could not clear it.
-
-    Entries match on name and version, so a version bump leaving NOTICE stale is
-    caught as well.
+    Checks the components this script would write. Entries match on name and
+    version.
     """
     with open(notice_path, "r", encoding="utf-8") as handle:
         notice = handle.read()

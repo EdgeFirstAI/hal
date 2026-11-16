@@ -12,19 +12,9 @@ use std::{
     os::fd::{AsRawFd, OwnedFd},
 };
 
-/// Derive a [`crate::BufferIdentity`] from an fd's `(st_dev, st_ino)`.
-///
-/// `dup` (and therefore `from_fd` importing a producer's cloned fd) preserves
-/// the inode, so this yields the same identity in every process that holds
-/// the buffer -- the property a downstream GL import cache keys on. dma-buf
-/// inodes all live on one anonymous mount, so `st_ino` alone would already be
-/// unique; folding in `st_dev` costs nothing and drops the assumption that
-/// stays true.
-// `st_dev`/`st_ino` are `i32`/`u64` on Darwin but `u64`/`u64` on Linux, so
-// exactly one of these casts is a clippy::unnecessary_cast on any given
-// platform; both are needed for the expression to compile on both. Note this
-// file is `target_os = "linux"`-gated, so a macOS `cargo clippy` never sees it
-// at all -- the Linux lane is the only one that catches a lint here.
+/// Derive a [`crate::BufferIdentity`] from an fd's `(st_dev, st_ino)`. `dup`
+/// preserves the inode, so every process holding the buffer derives the same
+/// identity.
 #[allow(clippy::unnecessary_cast)]
 fn identity_from_stat(stat: &nix::sys::stat::FileStat) -> crate::BufferIdentity {
     let key = ((stat.st_dev as u64) << 32) ^ (stat.st_ino as u64);
@@ -33,13 +23,9 @@ fn identity_from_stat(stat: &nix::sys::stat::FileStat) -> crate::BufferIdentity 
 
 /// A tensor backed by DMA (Direct Memory Access) memory.
 ///
-/// On Linux, for self-allocated (dma_heap) buffers a DRM PRIME attachment is
-/// created to enable CPU cache coherency via `DMA_BUF_IOCTL_SYNC`. Without an
-/// active attachment, sync ioctls are no-ops on cached CMA heaps.
-///
-/// For imported (foreign) DMA-BUF fds — e.g. those exported by the Neutron
-/// NPU driver — no DRM attachment is created. Cache coherency for foreign
-/// buffers is the responsibility of the buffer owner (the kernel driver).
+/// On Linux, a self-allocated (dma_heap) buffer gets a DRM PRIME attachment,
+/// with which `DMA_BUF_IOCTL_SYNC` maintains CPU cache coherency. An imported
+/// DMA-BUF fd gets no DRM attachment.
 #[derive(Debug)]
 pub struct DmaTensor<T>
 where
@@ -60,11 +46,9 @@ where
     /// Set via `Tensor::set_plane_offset` for sub-region imports.
     pub(crate) mmap_offset: usize,
     /// Whether this tensor was created via `from_fd()` (imported from an
-    /// external allocator).  Propagated through `try_clone()` so that DRM
-    /// PRIME import failures are logged at DEBUG rather than WARN. It does
-    /// not gate CPU mapping: a strided map of an imported buffer succeeds
-    /// when `stride × rows` fits `buf_size − mmap_offset`, the same rule
-    /// as for a buffer allocated here.
+    /// external allocator). Propagated through `try_clone()`. DRM PRIME import
+    /// failures for an imported tensor are logged at DEBUG rather than WARN. It
+    /// does not gate CPU mapping.
     #[cfg(target_os = "linux")]
     pub(crate) is_imported: bool,
     /// Which heap the memory came from, as far as this crate knows: CMA,
@@ -88,18 +72,13 @@ pub(crate) struct HeapPolicy {
     /// Physically contiguous memory only: the CMA heaps, never the system
     /// heap.
     pub(crate) contiguous: bool,
-    /// Prefer the uncached CMA heap. For buffers the CPU never reads: a
-    /// device mapping a cached buffer cleans and invalidates the CPU cache
-    /// over all of it on every access, while an uncached one needs no cache
-    /// maintenance, and CPU writes to it go out write-combined.
+    /// Prefer the uncached CMA heap. For buffers the CPU never reads.
     pub(crate) uncached: bool,
 }
 
 impl HeapPolicy {
     /// The policy for a buffer declared with `access`: uncached when the
-    /// declaration excludes CPU reads (`None`, `Write`). The declaration is
-    /// enforced on every CPU map, the HAL's own included, so such a buffer is
-    /// never read through a slow uncached mapping.
+    /// declaration excludes CPU reads (`None`, `Write`).
     pub(crate) fn for_access(access: crate::CpuAccess, contiguous: bool) -> Self {
         Self {
             contiguous,
@@ -109,20 +88,10 @@ impl HeapPolicy {
 }
 
 /// Allocate `size` bytes of DMA-BUF: from the uncached CMA heap first when
-/// `policy.uncached` and the system has one, then from the CMA heap when
-/// there is one, and from the system heap when there is none or the CMA
-/// pool cannot fit the buffer. With `policy.contiguous`, from the CMA heaps
-/// only.
-///
-/// CMA memory is physically contiguous, which some consumers need (G2D,
-/// GPUs and capture engines without an IOMMU); system-heap memory is not.
-/// Without the second fallback, a board whose CMA pool is small next to its
-/// frames -- a Raspberry Pi 5 reserves 64 MB, and one 4K YUYV frame is
-/// 16.6 MB -- loses DMA-BUF for exactly the large frames zero-copy matters
-/// most for, and the caller drops to a PBO or host memory. A consumer that
-/// cannot import a system-heap buffer declines it as it declines any other
-/// import, unless the allocation asked for `contiguous`. When both heaps
-/// fail, the CMA heap's error is the one reported.
+/// `policy.uncached` and the system has one, then from the CMA heap when there
+/// is one, and from the system heap when there is none or the CMA pool cannot
+/// fit the buffer. With `policy.contiguous`, from the CMA heaps only. When both
+/// heaps fail, the CMA heap's error is the one reported.
 #[cfg(all(target_os = "linux", not(miri)))]
 fn heap_allocate(
     size: usize,
@@ -212,14 +181,6 @@ impl<T> TensorTrait<T> for DmaTensor<T>
 where
     T: Num + Clone + fmt::Debug + Send + Sync,
 {
-    // `dma-heap` is excluded from the dependency graph under Miri (see
-    // Cargo.toml's `[target.'cfg(all(target_os = "linux", not(miri)))'.
-    // dependencies]`): `dma-heap 0.4.1` fails to type-check at all under
-    // Miri (its hardcoded `u32` ioctl opcode constant conflicts with
-    // `rustix`'s Miri-forced libc backend, whose `Opcode` is `u64` on this
-    // target), so this real-allocation branch must agree -- every normal
-    // (non-Miri) build is unaffected, `not(miri)` is only ever true when
-    // `cargo miri` is doing the compiling.
     #[cfg(all(target_os = "linux", not(miri)))]
     fn new(shape: &[usize], name: Option<&str>) -> Result<Self> {
         use log::debug;
@@ -278,10 +239,7 @@ where
             return Err(Error::InvalidSize(0));
         }
 
-        // One fstat serves two purposes below: buf_size (with a fallback for
-        // kernels that report st_size=0 on DMA-BUF fds) and, further down,
-        // this tensor's identity. Calling it twice risked the two derived
-        // values disagreeing if the fd's backing changed between calls.
+        // One `fstat` provides both `buf_size` and the identity.
         let stat = nix::sys::stat::fstat(&fd)?;
         let buf_size = if stat.st_size > 0 && stat.st_size as usize >= logical_size {
             stat.st_size as usize
@@ -289,14 +247,7 @@ where
             logical_size
         };
 
-        // Do NOT attempt a DRM attachment for foreign (imported) DMA-BUF fds.
-        // DRM PRIME import is only meaningful for DMA-BUF fds that were
-        // allocated by the same DRM device (e.g. via the CMA/system heap).
-        // For fds owned by other kernel drivers (e.g. Neutron NPU), the
-        // PRIME_FD_TO_HANDLE ioctl will fail and the resulting no-op
-        // attachment attempt adds unnecessary ioctl overhead on every import.
-        // DMA_BUF_IOCTL_SYNC coherency for foreign buffers is the
-        // responsibility of the buffer owner (the NPU driver in this case).
+        // An imported DMA-BUF fd gets no DRM attachment.
         #[cfg(target_os = "linux")]
         let drm_attachment = None;
 
@@ -307,10 +258,6 @@ where
             _marker: std::marker::PhantomData,
             #[cfg(target_os = "linux")]
             _drm_attachment: drm_attachment,
-            // dup() preserves (st_dev, st_ino), so an imported tensor gets
-            // the same identity as the producer's -- what lets a GL import
-            // cache hit across a library boundary instead of missing every
-            // frame on a fresh counter value.
             identity: identity_from_stat(&stat),
             buf_size,
             mmap_offset: 0,
@@ -386,11 +333,11 @@ where
     /// Zero-copy sub-region view sharing this buffer's fd and
     /// [`BufferIdentity`](crate::BufferIdentity), positioned at `offset_bytes`
     /// from this tensor's own window with logical `shape`. The view maps
-    /// `[abs_offset, abs_offset + shape.product()*size_of::<T>())` of the shared
-    /// DMA-BUF.
+    /// `[abs_offset, abs_offset + shape.product()*size_of::<T>())` of the
+    /// shared DMA-BUF.
     ///
-    /// DMA-BUF backing is Linux-only; on other platforms `DmaTensor` falls back
-    /// to the trait's `NotImplemented` default (the type only exists as a stub).
+    /// Linux only; on other platforms the trait's `NotImplemented` default
+    /// applies.
     ///
     /// # Errors
     ///
@@ -399,8 +346,6 @@ where
     #[cfg(target_os = "linux")]
     fn view(&self, offset_bytes: usize, shape: &[usize]) -> Result<Self> {
         let elem = std::mem::size_of::<T>();
-        // Alignment depends on `align_of::<T>()`, not element size (a
-        // `size_of == 1`, `align_of > 1` type would otherwise skip the check).
         if !offset_bytes.is_multiple_of(std::mem::align_of::<T>()) {
             return Err(Error::InvalidOperation(format!(
                 "DmaTensor::view: offset {offset_bytes} not aligned to align_of::<T>()={}",
@@ -421,7 +366,7 @@ where
                 capacity: self.buf_size,
             });
         }
-        // try_clone preserves fd, identity and buf_size; override the logical
+        // `try_clone` preserves fd, identity and `buf_size`; set the logical
         // shape and absolute offset for this window.
         let mut v = self.try_clone()?;
         v.shape = shape.to_vec();
@@ -439,17 +384,8 @@ where
     }
 }
 
-/// Keepalive that owns a DMA-BUF map's **cache-coherency bracket**.
-///
-/// `host_pin` deliberately performs no sync — that is the whole point of
-/// separating a pin's lifetime from its coherency window. A *map* is the
-/// opposite: it promises coherent CPU access for its duration, so it issues
-/// `DMA_BUF_SYNC_START` on acquire and the matching `..._END` on drop, exactly
-/// as the deleted `DmaMap` did.
-///
-/// Getting this wrong does not crash: a missing invalidate yields
-/// stale-but-plausible pixels, which is how it reached hardware unnoticed and
-/// showed up as accuracy deltas rather than failures.
+/// Keepalive that owns a DMA-BUF map's cache-coherency bracket:
+/// `DMA_BUF_SYNC_START` on acquire and the matching `DMA_BUF_SYNC_END` on drop.
 pub(crate) struct DmaSyncBracket {
     fd: std::os::fd::OwnedFd,
     access: crate::CpuAccess,
@@ -458,7 +394,7 @@ pub(crate) struct DmaSyncBracket {
 
 impl Drop for DmaSyncBracket {
     fn drop(&mut self) {
-        // Direction must match the START, or the kernel skips the writeback.
+        // Same direction as the START sync.
         if let Err(e) = crate::dmabuf::sync_access(&self.fd, false, self.access) {
             log::error!("DMA_BUF_SYNC_END failed: {e}");
         }
@@ -472,24 +408,13 @@ where
     /// Allocate a DMA-BUF with an explicit byte size that may exceed
     /// `shape.product() * sizeof(T)`.
     ///
-    /// Used for image tensors that need a row-padded layout so the
-    /// resulting DMA-BUF satisfies a downstream consumer's pitch
-    /// alignment requirement (e.g. Mali Valhall's 64-byte EGLImage
-    /// import rule). The `shape` field stores the **logical** dimensions
-    /// `[height, width, channels]`, so `Tensor::width()` / `height()` /
-    /// `shape()` continue to report the user-requested values; the
-    /// padding is carried separately by `Tensor::row_stride` and is
-    /// visible to the CPU mapping (which spans the full `byte_size`
-    /// bytes) but not to the logical shape.
+    /// `shape` stores the logical dimensions `[height, width, channels]`; the
+    /// row padding is carried by `Tensor::row_stride` and is visible to the
+    /// CPU mapping, which spans the full `byte_size` bytes.
     ///
     /// Errors:
     /// - `InvalidArgument` if `byte_size < shape.product() * sizeof(T)`
-    ///   (the request would lose data)
     /// - `IoError` if the DMA-heap allocation fails
-    // `static`-only: called from `Tensor::image_with_stride` (`lib.rs`,
-    // `impl<T> Tensor<T>`), which is itself `#[cfg(not(edgefirst_tensor_dynamic))]`.
-    // `dynamic`'s `image_with_stride` drives `ef_tensor_image_with_stride_alloc`
-    // instead, never this method directly.
     #[cfg(all(target_os = "linux", not(edgefirst_tensor_dynamic), not(miri)))]
     pub(crate) fn new_with_byte_size(
         shape: &[usize],
@@ -500,10 +425,7 @@ where
         use log::debug;
         use nix::sys::stat::fstat;
 
-        // Compute the logical byte size with checked arithmetic. A caller
-        // passing an absurdly large shape (or sizeof::<T> × product) must
-        // not silently wrap — the comparison below would then accept an
-        // allocation that's actually smaller than the logical size.
+        // Logical byte size, with checked arithmetic.
         let logical_elems = shape
             .iter()
             .copied()
@@ -577,16 +499,9 @@ where
         ))
     }
 
-    /// Map this DMA tensor with an explicit total byte size.
-    ///
-    /// Used by `Tensor::map()` for self-allocated strided tensors — the
-    /// returned view exposes the full `byte_size` bytes via
-    /// `as_slice()`/`as_mut_slice()`, not just the shape-derived logical
-    /// count. Callers are expected to iterate rows with
-    /// `Tensor::effective_row_stride()` so they don't read past the end.
-    ///
-    /// `static`-only: the sole caller, `impl<T> TensorMapTrait<T> for
-    /// Tensor<T>` in `lib.rs`, is itself `#[cfg(not(edgefirst_tensor_dynamic))]`.
+    /// Map this DMA tensor with an explicit total byte size: the returned view
+    /// exposes the full `byte_size` bytes via `as_slice()`/`as_mut_slice()`,
+    /// not just the shape-derived logical count.
     #[cfg(not(edgefirst_tensor_dynamic))]
     pub(crate) fn map_with_byte_size<'a>(
         &self,
@@ -601,8 +516,7 @@ where
 
     pub fn try_clone(&self) -> Result<Self> {
         let fd = self.clone_fd()?;
-        // Preserve the imported/owned distinction: imported fds never get a
-        // DRM attachment (consistent with from_fd()).
+        // An imported fd gets no DRM attachment.
         #[cfg(target_os = "linux")]
         let drm_attachment = if self.is_imported {
             None
@@ -631,10 +545,6 @@ where
     T: Num + Clone + fmt::Debug + Send + Sync,
 {
     /// Validate the window a map would expose, before any syscall.
-    ///
-    /// A mapping that slipped past these checks would SIGBUS on access rather
-    /// than fail cleanly. The alignment and multiple-of checks are no-ops for
-    /// single-byte `T` (`align_of` and `size_of` are both 1).
     fn check_map_window(&self, byte_size_override: Option<usize>) -> Result<()> {
         let t_size = std::mem::size_of::<T>();
         let logical_size = self.shape.iter().product::<usize>() * t_size;
@@ -690,12 +600,9 @@ where
         ))
     }
 
-    /// Map for CPU access: pin the address **and** open the coherency window.
-    ///
-    /// This is what `map_with` uses. Unlike [`host_pin`](Self::host_pin) it
-    /// issues `DMA_BUF_SYNC_START` now and the matching `..._END` when the
-    /// returned pin's keepalive drops, so the bracket lasts exactly as long as
-    /// the view does.
+    /// Map for CPU access: pin the address and open the coherency window.
+    /// Issues `DMA_BUF_SYNC_START` now and the matching `DMA_BUF_SYNC_END` when
+    /// the returned pin's keepalive drops.
     pub(crate) fn scoped_pin<'a>(
         &self,
         access: crate::CpuAccess,
@@ -731,15 +638,9 @@ where
         Ok(crate::pin::HostPin::new(keepalive, data, len))
     }
 
-    /// Establish a persistent host mapping over this DMA-BUF.
-    ///
-    /// Unlike [`map_with`](TensorTrait::map_with) this performs **no** sync
-    /// bracketing: the mapping's lifetime and the coherency window are now
-    /// separate concerns, which is the whole point. Callers bracket with
+    /// Establish a persistent host mapping over this DMA-BUF. Performs no sync
+    /// bracketing; callers bracket with
     /// [`Tensor::sync_for_cpu`](crate::Tensor::sync_for_cpu).
-    ///
-    /// `static`-only: called only from `TensorStorage::pin_host`
-    /// (`lib.rs`), itself `#[cfg(not(edgefirst_tensor_dynamic))]`.
     #[cfg(not(edgefirst_tensor_dynamic))]
     pub(crate) fn host_pin<'a>(&self) -> crate::Result<crate::pin::HostPin<'a>>
     where
@@ -760,12 +661,10 @@ where
         let base = std::ptr::NonNull::new(ptr.as_ptr()).ok_or(Error::InvalidSize(mmap_size))?;
         let mapping = std::sync::Arc::new(crate::pin::MmapOwner::new(base, mmap_size));
 
-        // Offset-adjusted, so a strided or sub-region tensor does not hand back
-        // the raw mmap base -- requirement 2 of issue #134.
+        // The mmap base plus this tensor's offset.
         let data = unsafe { mapping.base().add(self.mmap_offset) };
-        // Everything addressable from this tensor's offset. Tensor::pin_host
-        // narrows to the logical extent; a map guard keeps this wider window
-        // so it can expose stride-padded rows.
+        // Everything addressable from this tensor's offset; `Tensor::pin_host`
+        // narrows to the logical extent.
         let len = mmap_size.saturating_sub(self.mmap_offset);
         Ok(crate::pin::HostPin::new(mapping, data, len))
     }
@@ -1023,8 +922,8 @@ mod tests {
         }
     }
 
-    /// `host_pin` needs no sync, so it works over any mmap-able fd: the pin
-    /// starts at the tensor's offset and spans the rest of the buffer.
+    /// `host_pin` over a memfd starts at the tensor's offset and spans the rest
+    /// of the buffer.
     #[test]
     fn host_pin_of_an_imported_segment_is_offset_adjusted_and_readable() {
         let fd = memfd(8192, |i| (i % 251) as u8);
@@ -1037,9 +936,7 @@ mod tests {
         assert_eq!(bytes[300 - 16], (300 % 251) as u8);
     }
 
-    /// A map opens a coherency bracket; over a fd that is not a dma-buf the
-    /// START sync fails, and the map must report it rather than hand back an
-    /// unbracketed view.
+    /// A map over a fd that is not a dma-buf fails on the START sync.
     #[test]
     fn map_of_a_fd_that_is_not_a_dma_buf_fails_on_the_start_sync() {
         let t = DmaTensor::<u8>::from_fd(memfd(4096, |_| 0), &[4096], None).unwrap();
@@ -1069,9 +966,7 @@ mod tests {
         ));
     }
 
-    /// A buffer the whole CMA pool could not hold is still a DMA-BUF: it
-    /// comes from the system heap. Skipped without both heaps, and where the
-    /// pool is large enough that exceeding it means allocating a gigabyte.
+    /// A buffer larger than the CMA pool is allocated from the system heap.
     #[test]
     #[cfg(not(miri))]
     fn a_buffer_larger_than_the_cma_pool_comes_from_the_system_heap() {
@@ -1159,9 +1054,9 @@ mod tests {
         assert!(HeapPolicy::for_access(CpuAccess::None, true).contiguous);
     }
 
-    /// An uncached request is served whenever a cached one is: from the
-    /// uncached CMA heap when it can allocate, from the cached heaps
-    /// otherwise. A cached request never comes from the uncached heap.
+    /// An uncached request is served from the uncached CMA heap when it can
+    /// allocate and from the cached heaps otherwise; a cached request never
+    /// comes from the uncached heap.
     #[test]
     #[cfg(not(miri))]
     fn uncached_requests_are_served_and_cached_ones_never_uncached() {
@@ -1210,9 +1105,6 @@ mod tests {
         if let Some(name) = exporter(&fd) {
             assert!(!name.ends_with("-uncached"), "exporter {name}");
         }
-        // A contiguous request falls back to the cached CMA heap only: it is
-        // served from there, or refused naming that heap (no CMA heap, or its
-        // pool exhausted), never served from the system heap.
         let contiguous = HeapPolicy {
             contiguous: true,
             uncached: true,
@@ -1257,9 +1149,7 @@ mod tests {
         );
     }
 
-    /// A contiguous request is served by the CMA heap, or fails naming it:
-    /// where there is none (the hosted CI runners have only the system
-    /// heap), and where its pool is full.
+    /// A contiguous request is served by the CMA heap, or fails naming it.
     #[test]
     #[cfg(not(miri))]
     fn a_contiguous_request_comes_from_the_cma_heap_or_fails() {
@@ -1289,9 +1179,6 @@ mod tests {
             return;
         }
         let t = DmaTensor::<u8>::new(&[4096], None).expect("alloc");
-        // With a CMA heap, a full pool makes the system heap serve even this
-        // buffer, so either known answer is valid; without one, only the
-        // system heap can.
         if cma_heap_present() {
             assert_ne!(t.contiguity, crate::Contiguity::Unknown);
         } else {
@@ -1337,8 +1224,8 @@ mod tests {
         nix::sys::stat::fstat(fd).expect("fstat").st_size as usize
     }
 
-    /// Heap allocations are page-rounded; capacity must report what the
-    /// kernel actually allocated, not the request.
+    /// Capacity reports the page-rounded size the kernel allocated, not the
+    /// request.
     #[test]
     #[cfg(not(miri))]
     fn heap_allocation_capacity_is_the_fstat_size() {
@@ -1393,41 +1280,34 @@ mod tests {
         if !crate::test_support::dma_or_skip("test_dma_map_with_offset") {
             return;
         }
-        let total_size: usize = 4096 * 4; // 16KB
-        let offset: usize = 4096; // 4KB offset
-        let data_size: usize = 4096; // 4KB of data after offset
+        let total_size: usize = 4096 * 4;
+        let offset: usize = 4096;
+        let data_size: usize = 4096;
 
         let large_buf = Tensor::<u8>::new(&[total_size], Some(TensorMemory::DmaBuf), None)
             .expect("DMA allocation");
 
-        // Fill entire buffer with sentinel
         {
             let mut map = large_buf.map().unwrap();
             map.as_mut_slice().fill(0xAA);
         }
 
-        // Import at offset as a smaller tensor using clone_fd + set_plane_offset
         let fd = large_buf.clone_fd().unwrap();
         let mut offset_tensor = Tensor::<u8>::from_fd(fd, &[data_size], None).unwrap();
         offset_tensor.set_plane_offset(offset);
 
-        // Map the offset tensor — should succeed (not rejected)
         let mut map = offset_tensor.map().unwrap();
         let slice = map.as_mut_slice();
 
-        // Should see the sentinel at the offset position
         assert_eq!(slice.len(), data_size);
         assert!(
             slice.iter().all(|&b| b == 0xAA),
             "Offset tensor map should see sentinel data at offset"
         );
 
-        // Write different data at offset
         slice.fill(0xBB);
         drop(map);
 
-        // Verify via the original buffer: bytes before offset unchanged,
-        // bytes at offset are 0xBB
         {
             let map = large_buf.map().unwrap();
             let buf = map.as_slice();

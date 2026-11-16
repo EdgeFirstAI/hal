@@ -301,10 +301,6 @@ impl Decoder {
             .map(Quantization::from)
             .unwrap_or_default();
 
-        // Reserve up-front so the post-NMS push doesn't reallocate. The
-        // detection-count cap is `self.max_det` only — caller-provided
-        // capacity is an allocation hint, not a semantic bound (see
-        // `Decoder::decode` rustdoc and EDGEAI-1302).
         output_boxes.reserve(self.max_det.saturating_sub(output_boxes.len()));
         output_masks.reserve(self.max_det.saturating_sub(output_masks.len()));
         with_quantized!(boxes_tensor, b, {
@@ -768,8 +764,6 @@ impl Decoder {
 
         let protos_tensor = Self::swap_axes_if_needed(protos_tensor, protos.into());
         let protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
-        // Reserve up-front; capacity is an allocation hint, not a cap
-        // (see `Decoder::decode` rustdoc and EDGEAI-1302).
         output_boxes.reserve(self.max_det.saturating_sub(output_boxes.len()));
         output_masks.reserve(self.max_det.saturating_sub(output_masks.len()));
         impl_yolo_segdet_float::<XYWH, _, _>(
@@ -1374,7 +1368,7 @@ impl Decoder {
         let (protos_tensor, _) =
             Self::find_outputs_with_shape_quantized(&protos.shape, outputs, &skip)?;
 
-        // Step 1: boxes + scores (2-level nesting, 36 paths).
+        // Step 1: boxes + scores.
         let mut det_indices = with_quantized!(boxes_tensor, b, {
             with_quantized!(scores_tensor, s, {
                 let boxes_tensor = Self::swap_axes_if_needed(b, boxes.into());
@@ -1403,7 +1397,7 @@ impl Decoder {
             self.input_dims,
         );
 
-        // Step 2: masks + protos (2-level nesting, 36 paths).
+        // Step 2: masks + protos.
         let proto = with_quantized!(mask_tensor, m, {
             with_quantized!(protos_tensor, p, {
                 let mask_tensor = Self::swap_axes_if_needed(m, mask_coeff.into());
@@ -1838,10 +1832,6 @@ macro_rules! process_tracked_yolo_segmentation {
                 let protos_tensor = Decoder::swap_axes_if_needed(p, $protos.into());
                 let protos_tensor = protos_tensor.slice(s![0, .., .., ..]);
 
-                // `shape()[2]` avoids `dim().2`, which requires the
-                // compiler to pin the view to `Ix3` — the removal of
-                // `protos_to_hwc` (whose signature forced `Ix3`) broke
-                // that inference path when the `tracker` feature is on.
                 let num_protos = protos_tensor.shape()[2];
 
                 // Split boxes/scores/masks
@@ -1860,11 +1850,7 @@ macro_rules! process_tracked_yolo_segmentation {
                     false,
                 )?;
 
-                // Pull pixel-space boxes into `[0, 1]` before tracking so
-                // tracked locations, masks, and accessor-reported coords
-                // share a single space across all `YoloSegDet` entry
-                // points (`decode`, `decode_proto`, `decode_tracked`,
-                // `decode_tracked_proto`) — see EDGEAI-1303.
+                // Normalizes pixel-space boxes to `[0, 1]` before tracking.
                 crate::yolo::maybe_normalize_boxes_in_place(
                     &mut detect_boxes,
                     $self.normalized,
@@ -1973,11 +1959,7 @@ macro_rules! process_tracked_yolo_segmentation_split {
             })
         });
 
-        // Pull pixel-space boxes into `[0, 1]` before tracking so tracked
-        // locations, masks, and accessor-reported coords share a single
-        // space across all `YoloSplitSegDet` entry points
-        // (`decode`, `decode_proto`, `decode_tracked`,
-        // `decode_tracked_proto`) — see EDGEAI-1303.
+        // Normalizes pixel-space boxes to `[0, 1]` before tracking.
         crate::yolo::maybe_normalize_boxes_in_place(&mut boxes, $self.normalized, $self.input_dims);
 
         let (new_boxes, old_boxes) =
@@ -2074,11 +2056,7 @@ macro_rules! process_tracked_yolo_segmentation_2way {
             )?
         });
 
-        // Pull pixel-space boxes into `[0, 1]` before tracking so tracked
-        // locations, masks, and accessor-reported coords share a single
-        // space across all `YoloSegDet2Way` entry points
-        // (`decode`, `decode_proto`, `decode_tracked`,
-        // `decode_tracked_proto`) — see EDGEAI-1303.
+        // Normalizes pixel-space boxes to `[0, 1]` before tracking.
         crate::yolo::maybe_normalize_boxes_in_place(&mut boxes, $self.normalized, $self.input_dims);
 
         // Tracker: integrate before mask extraction
@@ -2241,14 +2219,10 @@ impl Decoder {
             self.nms,
             self.pre_nms_top_k_for(false),
             self.max_det,
-            false, // multi_label: tracked decode is always single-label
+            false, // multi_label
         )?;
 
-        // Pull pixel-space boxes into `[0, 1]` before tracking so tracked
-        // locations, masks, and accessor-reported coords share a single
-        // space across all `YoloSegDet` entry points (`decode`,
-        // `decode_proto`, `decode_tracked`, `decode_tracked_proto`) —
-        // see EDGEAI-1303.
+        // Normalizes pixel-space boxes to `[0, 1]` before tracking.
         crate::yolo::maybe_normalize_boxes_in_place(&mut boxes, self.normalized, self.input_dims);
 
         Ok(Self::finish_tracked_yolo_segdet_with_masks(
@@ -2356,14 +2330,10 @@ impl Decoder {
             self.nms,
             self.pre_nms_top_k_for(false),
             self.max_det,
-            false, // multi_label: tracked decode is always single-label
+            false, // multi_label
         )?;
 
-        // Pull pixel-space boxes into `[0, 1]` before tracking so tracked
-        // locations, masks, and accessor-reported coords share a single
-        // space across all `YoloSplitSegDet` entry points
-        // (`decode`, `decode_proto`, `decode_tracked`,
-        // `decode_tracked_proto`) — see EDGEAI-1303.
+        // Normalizes pixel-space boxes to `[0, 1]` before tracking.
         crate::yolo::maybe_normalize_boxes_in_place(&mut boxes, self.normalized, self.input_dims);
 
         Ok(Self::finish_tracked_yolo_segdet_with_masks(
@@ -3171,14 +3141,10 @@ impl Decoder {
             self.nms,
             self.pre_nms_top_k_for(false),
             self.max_det,
-            false, // multi_label: tracked decode is always single-label
+            false, // multi_label
         )?;
 
-        // Pull pixel-space boxes into `[0, 1]` before tracking so tracked
-        // locations, masks, and accessor-reported coords share a single
-        // space across all `YoloSegDet2Way` entry points
-        // (`decode`, `decode_proto`, `decode_tracked`,
-        // `decode_tracked_proto`) — see EDGEAI-1303.
+        // Normalizes pixel-space boxes to `[0, 1]` before tracking.
         crate::yolo::maybe_normalize_boxes_in_place(&mut boxes, self.normalized, self.input_dims);
 
         // Tracker integrates after NMS, before mask materialization
@@ -3300,14 +3266,10 @@ impl Decoder {
             self.nms,
             self.pre_nms_top_k_for(false),
             self.max_det,
-            false, // multi_label: tracked decode is always single-label
+            false, // multi_label
         )?;
 
-        // Pull pixel-space boxes into `[0, 1]` before tracking so tracked
-        // locations, masks, and accessor-reported coords share a single
-        // space across all `YoloSegDet2Way` entry points
-        // (`decode`, `decode_proto`, `decode_tracked`,
-        // `decode_tracked_proto`) — see EDGEAI-1303.
+        // Normalizes pixel-space boxes to `[0, 1]` before tracking.
         crate::yolo::maybe_normalize_boxes_in_place(&mut boxes, self.normalized, self.input_dims);
 
         // Tracker integrates before mask extraction
@@ -3461,11 +3423,8 @@ impl Decoder {
         )
     }
 
-    /// Shared tracked-segdet finish stage: update the tracker, run `mask_fn`
-    /// on live boxes, then append aged-out boxes without masks.
-    ///
-    /// Extracted from the six `process_tracked_yolo_*` variants so the
-    /// tracker/mask/extend tail is not duplicated (cognitive-complexity).
+    /// Tracked-segdet finish stage: update the tracker, run `mask_fn` on live
+    /// boxes, then append aged-out boxes without masks.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn finish_tracked_yolo_segdet_with_masks<
         TR: edgefirst_tracker::Tracker<DetectBox>,
@@ -3508,9 +3467,8 @@ impl Decoder {
         boxes: Vec<(DetectBox, usize)>,
         tracks: &mut Vec<TrackInfo>,
     ) -> (Vec<(DetectBox, usize)>, Vec<DetectBox>) {
-        // custom tracking since we can only use live boxes for masks. We
-        // can still output "old" boxes but they will not have masks.
-        // let live_tracks = tracker.update(output_boxes, timestamp);
+        // Returns the live boxes, which get masks, apart from the old boxes,
+        // which do not.
         let (new_boxes, boxes_indices): (Vec<_>, Vec<_>) = boxes.into_iter().unzip();
         let live_tracks = tracker.update(&new_boxes, timestamp);
         let old_tracks = tracker

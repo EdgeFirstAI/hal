@@ -4,41 +4,22 @@
 //! Android implementation of [`GlPlatform`]: native EGL display bring-up
 //! and AHardwareBuffer buffer import.
 //!
-//! Android is a hybrid of the two existing backends:
+//! * Import: the AHardwareBuffer becomes an `EGLImage`
+//!   (`ahardwarebuffer_import.rs`) bound to a `GL_TEXTURE_2D` via
+//!   `glEGLImageTargetTexture2DOES`. The binding persists on the texture
+//!   object across GPU passes (`PERSISTENT_TEX_BINDINGS = true`), and
+//!   `end_gpu_pass` is a no-op.
+//! * Dispatch: imports bind as `TEXTURE_2D`; `EXTERNAL_OES = false`.
+//! * Display bring-up: `eglGetDisplay(EGL_DEFAULT_DISPLAY)` on the native
+//!   GPU driver. `EglDisplayKind` is ignored.
 //!
-//! * **Import mechanism = Linux.** The AHardwareBuffer becomes an
-//!   `EGLImage` (`ahardwarebuffer_import.rs`) bound to a `GL_TEXTURE_2D`
-//!   via `glEGLImageTargetTexture2DOES`, and the binding **persists** on
-//!   the texture object across GPU passes — `PERSISTENT_TEX_BINDINGS =
-//!   true`, the engine's binding-skip cache applies, `end_gpu_pass` is a
-//!   no-op. (iOS/ANGLE releases its pbuffer binds per pass.)
-//! * **Dispatch semantics = macOS (for now).** Imports bind as
-//!   `TEXTURE_2D`; `EXTERNAL_OES = false`. Android's driver does expose
-//!   `GL_OES_EGL_image_external`, but only the RGBA8→TEXTURE_2D import
-//!   was validated by the Phase-1 probe — flipping to the external-OES
-//!   YUV sampler for camera NV12 buffers is a planned follow-up gated on
-//!   on-device testing.
-//! * **Display bring-up = its own.** `eglGetDisplay(EGL_DEFAULT_DISPLAY)`
-//!   on the real GPU driver (Adreno/Mali/…): no ANGLE translation layer,
-//!   no GBM/PlatformDevice probing. Android ships a first-class GLES
-//!   implementation, so `EglDisplayKind` is ignored here like on macOS.
+//! The bring-up flow is a shared display plus a per-processor private
+//! context and dummy pbuffer, made current once and held for the worker
+//! thread's life.
 //!
-//! The bring-up flow (shared display + per-processor private context +
-//! dummy pbuffer, made current once and held for the worker thread's
-//! life) is the [`super::angle`] shape, productized from the validated
-//! Phase-1 probe (`hal-mobile/crates/edgefirst-android-probe`).
-//!
-//! ## Lifecycle caveat: GPU reset / context loss
-//!
-//! Because the HAL renders offscreen (no window surface), ordinary app
-//! backgrounding does NOT invalidate anything here. A GPU reset /
-//! `EGL_CONTEXT_LOST`, however, would poison the leaked shared display,
-//! every per-processor context, and all cached EGLImages with no rebuild
-//! path — the same (rare, catastrophic) stance as the Linux and macOS
-//! backends, but statistically more likely on mobile. Detection and
-//! rebuild are a known follow-up shared across platforms; embedding apps
-//! that must survive GPU resets should recreate their `ImageProcessor`
-//! in a fresh process.
+//! A GPU reset / `EGL_CONTEXT_LOST` is not detected: the shared display,
+//! every per-processor context and all cached EGLImages have no rebuild
+//! path.
 
 use super::super::{ahardwarebuffer_import, native_fence, Egl};
 use super::GlPlatform;
@@ -51,7 +32,7 @@ use std::sync::OnceLock;
 
 // ---------------------------------------------------------------------------
 // EGL constants shared by display bring-up and per-processor context
-// creation (from EGL headers; edgefirst_egl does not export these).
+// creation (from EGL headers).
 // ---------------------------------------------------------------------------
 
 const EGL_OPENGL_ES3_BIT: i32 = 0x0040;
@@ -64,18 +45,15 @@ const EGL_BLUE_SIZE: i32 = 0x3022;
 const EGL_ALPHA_SIZE: i32 = 0x3021;
 const EGL_CONTEXT_CLIENT_VERSION: i32 = 0x3098;
 
-/// Cached libEGL handle. Android's system `libEGL.so` lives on the
-/// default linker search path. Leaked at first load to avoid
-/// dlclose-during-shutdown crashes (same pattern as Linux's `EGL_LIB` in
-/// `context.rs` and the macOS ANGLE loader).
+/// Cached libEGL handle for Android's system `libEGL.so`. Leaked at first
+/// load.
 static EGL_LIB: OnceLock<&libloading::Library> = OnceLock::new();
 
 fn load_egl_lib() -> Result<&'static libloading::Library> {
     if let Some(lib) = EGL_LIB.get() {
         return Ok(lib);
     }
-    // SAFETY: dlopen is unsafe because the loaded library can run
-    // initializers. The Android system libEGL is well-behaved.
+    // SAFETY: the Android system libEGL's initializers are sound to run.
     let lib = unsafe { libloading::Library::new("libEGL.so") }.map_err(|e| {
         Error::Io(std::io::Error::other(format!(
             "failed to load libEGL.so: {e}"
@@ -98,20 +76,16 @@ pub(in crate::opengl_headless) struct SharedAndroidDisplay {
     /// destination tensors on the AHardwareBuffer render path.
     pub(in crate::opengl_headless) supports_f32_color: bool,
     /// `GL_EXT_color_buffer_half_float` is exposed by this driver. Gates
-    /// F16 destination tensors (the primary NPU-input path) — confirmed
-    /// on Adreno 840 and the API-36 emulator by the Phase-1 probe.
+    /// F16 destination tensors.
     pub(in crate::opengl_headless) supports_f16_color: bool,
     /// `EGL_ANDROID_native_fence_sync` (+ `EGL_KHR_fence_sync`) exposed
-    /// by this display. Gates `export_completion_fence` — the GL→NPU
-    /// sync-fence handoff. Probed from the EGL (not GL) extension
-    /// string: `eglGetProcAddress` may return non-NULL stubs for
-    /// unsupported extensions, so the string is the authority.
+    /// by this display, as probed from the EGL extension string. Gates
+    /// `export_completion_fence`.
     pub(in crate::opengl_headless) supports_native_fence: bool,
 }
 
-// SAFETY: every member is either a leaked static or an EGL handle;
-// Android's system EGL synchronizes display-level entry points
-// internally (specification-conformant), same contract as ANGLE.
+// SAFETY: every member is a leaked static or an EGL handle, and the system
+// EGL synchronizes display-level entry points internally.
 unsafe impl Send for SharedAndroidDisplay {}
 unsafe impl Sync for SharedAndroidDisplay {}
 
@@ -119,8 +93,7 @@ static SHARED_DISPLAY: OnceLock<std::result::Result<SharedAndroidDisplay, String
     OnceLock::new();
 
 /// Acquire a reference to the process-global native EGL display,
-/// initialising it on first call. The error case is cached too — once EGL
-/// fails to load we don't keep retrying.
+/// initialising it on first call. A failed initialisation is cached.
 pub(in crate::opengl_headless) fn shared_display() -> Result<&'static SharedAndroidDisplay> {
     SHARED_DISPLAY
         .get_or_init(|| init_shared_display().map_err(|e| e.to_string()))
@@ -145,7 +118,7 @@ fn init_shared_display() -> Result<SharedAndroidDisplay> {
     }
     .map_err(|e| Error::Io(std::io::Error::other(format!("EGL load: {e:?}"))))?;
 
-    // 2. Native default display — the real GPU driver, no ANGLE.
+    // 2. Native default display.
     let display = unsafe { egl.get_display(egl::DEFAULT_DISPLAY) }.ok_or_else(|| {
         Error::Io(std::io::Error::other(
             "eglGetDisplay(EGL_DEFAULT_DISPLAY) returned NO_DISPLAY",
@@ -156,10 +129,7 @@ fn init_shared_display() -> Result<SharedAndroidDisplay> {
         .map_err(|e| Error::Io(std::io::Error::other(format!("eglInitialize: {e:?}"))))?;
     debug!("Native Android EGL {maj}.{min} initialised (process-global shared display)");
 
-    // EGL (display-level) extension probe for the GL→NPU fence handoff.
-    // Universal on real Android devices (sync fences underpin SurfaceFlinger)
-    // but probed anyway: emulators/exotic drivers may omit it, and the
-    // fenced convert falls back to the blocking contract there.
+    // EGL (display-level) extension probe for the native fence.
     let egl_extensions = egl
         .query_string(Some(display), egl::EXTENSIONS)
         .map(|s| s.to_string_lossy().into_owned())
@@ -175,8 +145,7 @@ fn init_shared_display() -> Result<SharedAndroidDisplay> {
     egl.bind_api(egl::OPENGL_ES_API)
         .map_err(|e| Error::Io(std::io::Error::other(format!("eglBindAPI: {e:?}"))))?;
 
-    // 3. GLES3 + pbuffer config (offscreen only — the HAL renders to FBOs
-    //    backed by AHardwareBuffer EGLImages; no window surface exists).
+    // 3. GLES3 + pbuffer config.
     let cfg_attribs = [
         EGL_RENDERABLE_TYPE,
         EGL_OPENGL_ES3_BIT,
@@ -197,7 +166,7 @@ fn init_shared_display() -> Result<SharedAndroidDisplay> {
         .map_err(|e| Error::Io(std::io::Error::other(format!("eglChooseConfig: {e:?}"))))?
         .ok_or_else(|| Error::NotSupported("no EGL config with GLES3+PBUFFER+RGBA8".into()))?;
 
-    // 4. Throwaway context so GL symbols and extensions can be probed.
+    // 4. Throwaway context for probing GL symbols and extensions.
     let ctx_attribs = [EGL_CONTEXT_CLIENT_VERSION, 3, egl::NONE];
     let context = egl
         .create_context(display, config, None, &ctx_attribs)
@@ -219,14 +188,11 @@ fn init_shared_display() -> Result<SharedAndroidDisplay> {
         ))));
     }
 
-    // 5. Load the GL function-pointer table once per process, via the
-    //    now-initialised display (drivers may need a current context to
-    //    expose GLES symbols through eglGetProcAddress).
+    // 5. Load the GL function-pointer table once per process.
     load_gl_once_inner(&egl);
 
-    // Probe the float-color-buffer extensions while the context is still
-    // current. Adreno/Mali expose both on every device class the HAL
-    // targets; consumers fall back per dtype where missing.
+    // Probe the float-color-buffer extensions while the context is
+    // current.
     let extensions = unsafe {
         let ptr = edgefirst_gl::gl::GetString(edgefirst_gl::gl::EXTENSIONS);
         if ptr.is_null() {
@@ -237,11 +203,8 @@ fn init_shared_display() -> Result<SharedAndroidDisplay> {
                 .into_owned()
         }
     };
-    // GL_OES_EGL_image is the extension behind glEGLImageTargetTexture2DOES
-    // — the ONLY way any AHardwareBuffer reaches the GPU here. Universal on
-    // Android GLES drivers, but if it were ever absent the attach call
-    // would be a null function pointer (segfault); fail the display
-    // bring-up cleanly instead so the engine falls back to CPU.
+    // Fail the display bring-up when GL_OES_EGL_image, the extension behind
+    // glEGLImageTargetTexture2DOES, is missing.
     if !extensions
         .split_ascii_whitespace()
         .any(|e| e == "GL_OES_EGL_image")
@@ -272,8 +235,7 @@ fn init_shared_display() -> Result<SharedAndroidDisplay> {
         );
     }
 
-    // The throwaway probe context is torn down; each processor creates
-    // its own private context in `init_display`.
+    // Tear down the throwaway probe context.
     let _ = egl.make_current(display, None, None, None);
     let _ = egl.destroy_surface(display, dummy);
     let _ = egl.destroy_context(display, context);
@@ -289,7 +251,7 @@ fn init_shared_display() -> Result<SharedAndroidDisplay> {
 }
 
 // ---------------------------------------------------------------------------
-// One-shot GL function-pointer table (same rationale as angle.rs).
+// One-shot GL function-pointer table.
 // ---------------------------------------------------------------------------
 
 static GL_LOADED: OnceLock<()> = OnceLock::new();
@@ -307,31 +269,25 @@ fn load_gl_once_inner(egl: &Egl) {
 // Per-processor display: a private context on the shared native display.
 // ---------------------------------------------------------------------------
 
-/// One processor's GL bring-up state: a PRIVATE EGL context (plus dummy
+/// One processor's GL bring-up state: a private EGL context (plus dummy
 /// pbuffer) on the process-global shared native display.
 ///
 /// Created on the processor's dedicated worker thread, made current there
-/// ONCE, and held current for the thread's life — the Linux `GlContext` /
-/// macOS `AngleDisplay` model. NOT `Send`: the context is current on its
-/// creating thread and must be dropped there too (the dispatch wrapper
-/// guarantees both).
+/// once, and held current for the thread's life. Not `Send`: the context is
+/// current on its creating thread and must be dropped there.
 pub(in crate::opengl_headless) struct AndroidGlContext {
     pub(in crate::opengl_headless) shared: &'static SharedAndroidDisplay,
     context: egl::Context,
     dummy_pbuffer: egl::Surface,
-    /// Duck-typed counterparts of the two `GlContext` members the
-    /// portable engine reads. AHardwareBuffer is the only zero-copy
-    /// transfer backend on Android. GLES 3.1+ compute exists on the
-    /// native drivers but is untested by the Phase-1 probe, so it stays
-    /// off until validated on-device (the engine's CPU fallbacks apply).
+    /// Counterparts of the two `GlContext` members the portable engine
+    /// reads: the AHardwareBuffer transfer backend, and `has_compute` off.
     pub(in crate::opengl_headless) transfer_backend: super::super::TransferBackend,
     pub(in crate::opengl_headless) has_compute: bool,
 }
 
 impl Drop for AndroidGlContext {
     fn drop(&mut self) {
-        // Runs on the owning worker thread (the only place the wrapper
-        // drops it): release the context from this thread, then destroy.
+        // Release the context from this thread, then destroy it.
         let d = self.shared;
         let _ = d.egl.make_current(d.display, None, None, None);
         let _ = d.egl.destroy_surface(d.display, self.dummy_pbuffer);
@@ -340,10 +296,8 @@ impl Drop for AndroidGlContext {
 }
 
 /// An owned AHardwareBuffer→EGLImage import. Dropping destroys the
-/// EGLImage (the AHardwareBuffer itself stays owned by the tensor; the
-/// import cache's `Weak` guard ties the two lifetimes together). Cached
-/// in `ImportCache<AndroidEglImage>` keyed by `BufferImportKey`, exactly
-/// like Linux `EglImage`s.
+/// EGLImage; the AHardwareBuffer stays owned by the tensor. Cached in
+/// `ImportCache<AndroidEglImage>` keyed by `BufferImportKey`.
 pub(in crate::opengl_headless) struct AndroidEglImage {
     shared: &'static SharedAndroidDisplay,
     pub(in crate::opengl_headless) image: egl::Image,
@@ -359,8 +313,8 @@ impl Drop for AndroidEglImage {
     }
 }
 
-/// Extract the tensor's AHardwareBuffer pointer, or explain why the
-/// zero-copy import cannot proceed.
+/// Extract the tensor's AHardwareBuffer pointer, or return an error when
+/// the tensor has none.
 fn tensor_ahb_ptr<T>(img: &Tensor<T>) -> Result<*mut c_void>
 where
     T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync,
@@ -378,19 +332,13 @@ impl GlPlatform for AndroidEgl {
     type Import = AndroidEglImage;
     type ImportHandle = egl::Image;
 
-    // EGLImage targets persist on the texture object — the engine's
-    // binding-skip cache (BufferImportKey on Texture) applies, exactly
-    // like Linux DMA-BUF.
+    // EGLImage targets persist on the texture object.
     const PERSISTENT_TEX_BINDINGS: bool = true;
 
-    /// What this leaf has run: the planar F16 zero-copy render and nothing
-    /// else. The float shaders this branch added were validated on Windows
-    /// only, and every other tuple still falls through to the CPU converter
-    /// that produces this platform's reference output.
+    /// The planar F16 zero-copy render only. Every other float tuple falls
+    /// through to the CPU converter.
     const ZERO_COPY_FLOAT: super::super::float_dispatch::ZeroCopyFloatSet =
         super::super::float_dispatch::ZeroCopyFloatSet::PlanarF16;
-    // Only the RGBA8/RGBA16F → TEXTURE_2D import was probe-validated;
-    // the external-OES YUV sampler flip is a planned on-device follow-up.
     const EXTERNAL_OES: bool = false;
 
     fn load_gl_once(display: &AndroidGlContext) {
@@ -404,8 +352,7 @@ impl GlPlatform for AndroidEgl {
         }
         let shared = shared_display()?;
         let ctx_attribs = [EGL_CONTEXT_CLIENT_VERSION, 3, egl::NONE];
-        // No share-list: each processor owns its programs/VAOs/FBOs, the
-        // same isolation Linux and macOS contexts have.
+        // No share-list: each processor owns its programs, VAOs and FBOs.
         let context = shared
             .egl
             .create_context(shared.display, shared.config, None, &ctx_attribs)
@@ -424,8 +371,8 @@ impl GlPlatform for AndroidEgl {
                     "eglCreatePbufferSurface (per-processor dummy): {e:?}"
                 )))
             })?;
-        // Made current ONCE on the calling (worker) thread and held for
-        // the thread's life.
+        // Made current once on the calling thread and held for the thread's
+        // life.
         if let Err(e) = shared.egl.make_current(
             shared.display,
             Some(dummy_pbuffer),
@@ -452,8 +399,7 @@ impl GlPlatform for AndroidEgl {
     }
 
     fn import_extent(_import: &AndroidEglImage) -> Option<(u32, u32)> {
-        // `eglGetNativeClientBufferANDROID` carries the AHardwareBuffer's own
-        // description, and a HAL tensor's buffer is its logical image.
+        // The AHardwareBuffer is the tensor's logical image.
         None
     }
 
@@ -471,10 +417,6 @@ impl GlPlatform for AndroidEgl {
         _display: &AndroidGlContext,
         _handle: egl::Image,
     ) -> Result<()> {
-        // Unreachable in practice: PlatformCaps::external_oes mirrors
-        // EXTERNAL_OES (false), so path selection never picks the
-        // external-sampler path. Becomes real when the YUV camera flip
-        // lands.
         Err(Error::NotSupported(
             "GL_TEXTURE_EXTERNAL_OES sampling is not enabled on Android yet".into(),
         ))
@@ -494,11 +436,11 @@ impl GlPlatform for AndroidEgl {
     }
 
     fn begin_gpu_pass(_display: &AndroidGlContext) {
-        // Native EGL keeps per-context state; nothing to re-sync.
+        // No-op on native EGL.
     }
 
     fn end_gpu_pass(_display: &AndroidGlContext) {
-        // EGLImage texture targets persist by design; nothing to release.
+        // Nothing to release.
     }
 
     fn native_fence_sync(display: &AndroidGlContext) -> bool {
@@ -520,13 +462,11 @@ impl GlPlatform for AndroidEgl {
         _dst: &mut TensorDyn,
         _submit: bool,
     ) -> Option<u64> {
-        // No device fence on Android — convert() returning (or the
-        // exported native fence signaling) means the GPU work is complete.
         None
     }
 
     fn submit_recorded(_display: &AndroidGlContext) {
-        // Nothing is ever queued unsubmitted: there is no device fence.
+        // No device fence: nothing to submit.
     }
 
     fn import_buffer(
@@ -535,10 +475,6 @@ impl GlPlatform for AndroidEgl {
         fmt: PixelFormat,
         _for_dst: bool,
     ) -> Result<AndroidEglImage> {
-        // Semi-planar YUV import needs the external-OES sampler (or the
-        // API-29 R8 plane binding) — both deferred. NV tensors cannot be
-        // AHardwareBuffer-backed today anyway (no format mapping at
-        // allocation), so this arm is defensive.
         if matches!(
             fmt,
             PixelFormat::Nv12 | PixelFormat::Nv16 | PixelFormat::Nv24
@@ -547,16 +483,11 @@ impl GlPlatform for AndroidEgl {
                 "AHardwareBuffer import has no NV binding yet (external-OES flip pending)".into(),
             ));
         }
-        // The AHardwareBuffer is self-describing (format/dims/stride fixed
-        // at allocation), so no geometry or view handling is needed here:
-        // a dst view()/batch() tile shares its parent's buffer pointer,
-        // which is exactly what gets imported — the per-tile offset is
-        // viewport state, and `BufferImportKey` already collapses sibling
-        // views onto the parent import.
+        // A destination view()/batch() tile shares its parent's buffer
+        // pointer, which is what gets imported.
         let ptr = tensor_ahb_ptr(img)?;
         let shared = display.shared;
-        // SAFETY: ptr borrowed from a live tensor; the import cache
-        // entry's `guard` ties the EGLImage's lifetime to it.
+        // SAFETY: `ptr` is borrowed from a live tensor.
         let image = unsafe {
             ahardwarebuffer_import::create_ahardwarebuffer_eglimage(
                 &shared.egl,
@@ -572,10 +503,6 @@ impl GlPlatform for AndroidEgl {
         _img: &Tensor<u8>,
         _fmt: PixelFormat,
     ) -> Result<AndroidEglImage> {
-        // The single-plane R8 AHardwareBuffer format needs API 29; the HAL
-        // floor is 26, and NV tensors are not AHardwareBuffer-backed today
-        // (no allocation mapping), so the R8 "Path B" has no zero-copy
-        // source on Android yet.
         Err(Error::NotSupported(
             "AHardwareBuffer R8 NV binding requires API 29 (HAL floor is 26)".into(),
         ))
@@ -597,14 +524,8 @@ impl GlPlatform for AndroidEgl {
             ));
         }
         let ptr = tensor_ahb_ptr(img)?;
-        // The AHardwareBuffer is self-describing — the import cannot
-        // reinterpret it at different dimensions the way the Linux DMA-BUF
-        // attribute list can. The caller's packed dims must therefore
-        // match the buffer's own physical descriptor (they do for every
-        // tensor allocated by `Tensor::image` — `new_image` sizes the
-        // buffer with the same `packed_rgba16f_layout` the caller used);
-        // a mismatch means the buffer was allocated with different
-        // geometry and sampling it would read the wrong pitch.
+        // The caller's packed dims must match the buffer's own physical
+        // descriptor.
         if let Some((pw, ph)) = img.hardware_buffer_physical_dims() {
             if (pw, ph) != (width, height) {
                 return Err(Error::NotSupported(format!(

@@ -7,22 +7,13 @@
 //! emitted by HAL crates into Chrome JSON trace files viewable at
 //! <https://ui.perfetto.dev/>.
 //!
-//! # Design
+//! The HAL library crates emit [`tracing::trace_span!`] spans on their hot
+//! paths. [`start_tracing`] installs a process-wide subscriber: a Chrome trace
+//! layer writing those spans to a JSON file. `log::*` output continues
+//! independently.
 //!
-//! Every HAL library crate — `edgefirst-tensor`, `edgefirst-codec`,
-//! `edgefirst-image`, `edgefirst-decoder`, and `edgefirst-tracker` — emits
-//! [`tracing::trace_span!`] spans on its hot paths. These have near-zero
-//! overhead when no subscriber is active (a single relaxed atomic load per
-//! span site).
-//!
-//! This module installs a **process-wide subscriber** consisting of a Chrome
-//! trace layer writing spans to a JSON file for Perfetto. Existing `log::*`
-//! output (via `env_logger`) continues independently to stderr.
-//!
-//! The subscriber is installed once on the first call to [`start_tracing`].
-//! Only one trace capture session is supported per process lifetime (this is
-//! a limitation of Rust's global subscriber model and is acceptable for
-//! profiling workflows where a single trace per run is the norm).
+//! The subscriber is installed once, on the first call to [`start_tracing`].
+//! Only one trace capture session is supported per process lifetime.
 //!
 //! # Usage from Rust
 //!
@@ -105,14 +96,13 @@ impl std::error::Error for TracingError {}
 /// The trace file is created immediately. All `tracing::trace_span!` spans
 /// emitted by HAL crates will be recorded until [`stop_tracing`] is called.
 ///
-/// Only one session per process lifetime is supported (a limitation of
-/// Rust's global subscriber model).
+/// Only one session per process lifetime is supported.
 ///
 /// # Errors
 ///
 /// Returns [`TracingError::AlreadyActive`] if a session is currently capturing.
 /// Returns [`TracingError::SessionExhausted`] if a session was previously
-/// started and stopped (the global subscriber cannot be replaced).
+/// started and stopped.
 /// Returns [`TracingError::SubscriberInstallFailed`] if another tracing
 /// subscriber was installed by user code outside the HAL.
 pub fn start_tracing(path: &str) -> Result<(), TracingError> {
@@ -126,14 +116,11 @@ pub fn start_tracing(path: &str) -> Result<(), TracingError> {
         return Err(TracingError::SessionExhausted);
     }
 
-    // Build chrome layer writing to the specified file.
     let (chrome_layer, guard) = tracing_chrome::ChromeLayerBuilder::new()
         .file(path)
         .include_args(true)
         .build();
 
-    // Install only the chrome layer. Existing log::* output continues through
-    // env_logger to stderr independently — no conflict.
     let subscriber = tracing_subscriber::registry().with(chrome_layer);
 
     tracing::subscriber::set_global_default(subscriber)
@@ -152,7 +139,8 @@ pub fn stop_tracing() {
     let mut lock = GUARD
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    // Dropping the FlushGuard flushes remaining spans and closes the file.
+    // Dropping the `FlushGuard` flushes the remaining spans and closes the
+    // file.
     lock.take();
 }
 
@@ -169,51 +157,42 @@ mod tests {
     use super::*;
     use std::path::Path;
 
-    // Single test because the global subscriber is per-process lifetime.
     #[test]
     fn test_trace_lifecycle() {
         let dir = std::env::temp_dir();
         let path = dir.join("hal_test_trace_lifecycle.json");
         let path_str = path.to_str().unwrap();
 
-        // Clean up any previous test artifact
         let _ = std::fs::remove_file(&path);
 
         assert!(!is_tracing_active());
 
-        // First start should succeed
         start_tracing(path_str).expect("start_tracing should succeed");
         assert!(is_tracing_active());
 
-        // Second start while active should fail with AlreadyActive
         let err = start_tracing(path_str).unwrap_err();
         assert!(
             matches!(err, TracingError::AlreadyActive),
             "expected AlreadyActive, got: {err:?}"
         );
 
-        // Emit a span to ensure the file gets content
         {
             let _span = tracing::trace_span!("hal.test_span", key = "value").entered();
         }
 
-        // Stop should deactivate
         stop_tracing();
         assert!(!is_tracing_active());
 
-        // Trace file should exist with content
         assert!(Path::new(path_str).exists());
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(!content.is_empty(), "trace file should not be empty");
 
-        // Third start fails because session was already used
         let err = start_tracing(path_str).unwrap_err();
         assert!(
             matches!(err, TracingError::SessionExhausted),
             "expected SessionExhausted, got: {err:?}"
         );
 
-        // Clean up
         let _ = std::fs::remove_file(&path);
     }
 }

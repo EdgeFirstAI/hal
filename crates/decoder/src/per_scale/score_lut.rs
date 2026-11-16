@@ -3,11 +3,10 @@
 
 //! Decoded scores of 8-bit score tensors by table lookup.
 //!
-//! An 8-bit score has 256 raw values, so a level's score kernel is run over
-//! all of them once per quantization and every score of a frame is then
-//! read from the table. The probe is a whole number of the kernel's
-//! vector chunks, so each entry is the value the kernel's vector path
-//! gives that raw score.
+//! A level's score kernel is run over the 256 raw values of an 8-bit score
+//! once per quantization, and every score of a frame is read from the
+//! table. The probe is a whole number of the kernel's vector chunks: each
+//! entry is the value the kernel's vector path gives that raw score.
 
 use super::kernels::dispatch::{DstSliceMut, InputView};
 use super::plan::{Layout, LevelPlan, PerScalePlan};
@@ -35,8 +34,8 @@ pub(crate) struct ScoreTable {
     probe: Option<LevelPlan>,
 }
 
-/// `dst[k] = table[src[k]]`, the raw byte as the index. Eight indices are read before their
-/// eight lookups, so the lookups are independent loads an in-order core can overlap.
+/// `dst[k] = table[src[k]]`, the raw byte as the index, eight indices read before their eight
+/// lookups.
 fn lookup<S: Copy, T: Copy>(table: &[T; RAW_VALUES], src: &[S], dst: &mut [T], index: fn(S) -> u8) {
     const STEP: usize = 8;
     let mut d = dst.chunks_exact_mut(STEP);

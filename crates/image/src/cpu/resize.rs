@@ -60,58 +60,26 @@ impl CPUProcessor {
         Ok(())
     }
 
-    /// How many extra source pixels the **configured** resize filter can read
+    /// How many extra source pixels the configured resize filter can read
     /// beyond each edge of the crop rect along one axis, when `src_extent`
     /// cropped source pixels are resampled to `dst_extent` destination pixels.
     ///
-    /// `fast_image_resize` clamps its filter window to the *image* bounds, not
-    /// to the crop rect (the FIXME in [`Self::resize_flip_rotate_pf`]), so a
-    /// cropped convert legitimately samples a margin of real neighbouring
-    /// pixels around the crop. Reproducing that margin — the *halo* — is what
-    /// lets the pre-resize intermediate shrink to the crop without changing a
-    /// single output byte.
-    ///
-    /// The arithmetic mirrors `fast_image_resize`'s `precompute_coefficients`:
-    /// with `scale = src_extent / dst_extent` the kernel radius is
+    /// With `scale = src_extent / dst_extent` the kernel radius is
     /// `support * max(scale, 1)` for `Convolution` (adaptive kernel size) and
     /// `support` for `Interpolation` (fixed kernel), and the window for the
     /// first/last output pixel reaches `ceil(radius - scale / 2)` pixels
-    /// outside an integer-aligned crop edge. The filter supports are the
-    /// crate's own (`Box` 0.5, `Bilinear`/`Hamming` 1, `CatmullRom`/`Mitchell`
-    /// 2, `Gaussian`/`Lanczos3` 3) — read from `self.options.algorithm`, never
-    /// assumed by the caller.
+    /// outside an integer-aligned crop edge. The filter supports are `Box` 0.5,
+    /// `Bilinear`/`Hamming` 1, `CatmullRom`/`Mitchell` 2, `Gaussian`/`Lanczos3`
+    /// 3, read from `self.options.algorithm`.
     ///
-    /// The result is never zero — see `HALO_SLACK` below, which is load-bearing
-    /// and not just slack.
+    /// The result is never zero (see `HALO_SLACK`).
     ///
-    /// Returns `None` when the reach is not modelled (`SuperSampling`, or a
-    /// filter/algorithm added by a future upstream release), so the caller
-    /// keeps the full-frame intermediate and its unchanged output.
+    /// Returns `None` when the reach is not modelled (`SuperSampling`, or an
+    /// unknown filter or algorithm).
     pub(super) fn filter_halo(&self, src_extent: usize, dst_extent: usize) -> Option<usize> {
         use fast_image_resize::{FilterType, ResizeAlg};
 
-        /// One spare pixel added to *every* modelled reach, so the halo is
-        /// never zero. It earns its place twice over.
-        ///
-        /// 1. Slack. Growing the extracted rect *beyond* the filter's true
-        ///    reach cannot change any output pixel — the extra columns/rows are
-        ///    simply never sampled — so a spare pixel costs a few bytes and
-        ///    buys immunity to f64 rounding and to small kernel changes in an
-        ///    upstream release.
-        /// 2. **It keeps `needs_resize` true.** With a zero halo an already
-        ///    chroma-aligned crop grows by nothing, so the rebased source rect
-        ///    becomes the *whole* intermediate and `needs_resize` in
-        ///    [`Self::resize_flip_rotate_pf`] flips to false — handing control
-        ///    to `flip_rotate_ndarray_pf`, which assumes tightly-packed
-        ///    destination rows and so bypasses the padded-destination destride.
-        ///    A crop that is not the whole frame must stay on the resize path
-        ///    it took before this optimisation existed. A nonzero halo
-        ///    guarantees that: the grown rect can only equal the crop when the
-        ///    crop is clamped on all four sides, i.e. when it *is* the whole
-        ///    frame — which the caller has already rejected.
-        ///
-        /// Only `Nearest` has a genuinely zero filter reach, so before this was
-        /// applied uniformly it was the only algorithm that could reach 0.
+        /// One spare pixel added to every modelled reach; the halo is never zero.
         const HALO_SLACK: usize = 1;
 
         fn support(filter: FilterType) -> Option<f64> {
@@ -126,8 +94,7 @@ impl CPUProcessor {
         }
 
         let (support, adaptive_kernel) = match self.options.algorithm {
-            // Nearest samples exactly one source pixel per output pixel, always
-            // inside the crop: zero reach, plus HALO_SLACK below.
+            // Nearest samples one source pixel per output pixel: zero reach.
             ResizeAlg::Nearest => (0.0, false),
             ResizeAlg::Convolution(f) => (support(f)?, true),
             ResizeAlg::Interpolation(f) => (support(f)?, false),
@@ -179,26 +146,14 @@ impl CPUProcessor {
 
         let actual_src_stride = tensor_row_stride(src);
         let tight_stride = src_w * channels;
-        // `fast_image_resize` requires a tight (no row padding) input buffer,
-        // and `flip_rotate_ndarray_pf` uses ndarray shapes that assume tightly
-        // packed rows. When the source has a larger stride (e.g. from codec
-        // decode into a pre-allocated oversized tensor), copy the visible
-        // pixels row-by-row into a tight scratch before proceeding.
-        // The copy is gated on `actual_src_stride != tight_stride` so it is
-        // a no-op for all already-tight sources.
-        // Read-only: nothing here writes the source. A read-write map takes the
-        // PBO's exclusive map state, so two threads cropping the SAME source
-        // concurrently (SAHI tiling across several pre-processing workers) made
-        // the second one fail with `PboMapped`. `map_read` joins the shared
-        // read mapping instead, which is what that state exists for.
+        // A source with a stride larger than the tight row is copied
+        // row-by-row into a tight scratch. The source is mapped read-only.
         let src_map = src.map_read()?;
-        // When the source is padded (stride != tight), de-stride it into the
-        // processor-owned scratch (reused across calls — no per-call alloc).
-        // `destrided` records whether we populated the scratch this call.
+        // `destrided` records whether the scratch was populated this call.
         let destrided = actual_src_stride != tight_stride;
         if destrided {
             let need = src_h * tight_stride;
-            // Only grown: the row copies below overwrite all of `[..need]`.
+            // Only grown.
             if self.resize_destride_scratch.len() < need {
                 self.resize_destride_scratch.resize(need, 0u8);
             }
@@ -215,7 +170,7 @@ impl CPUProcessor {
         } else {
             src_map.as_slice()
         };
-        // Pixels outside a placement with no fill colour survive the resize, so they are read back.
+        // Pixels outside a placement with no fill colour are kept: a partial-write map.
         let keeps_outside = crop.dst_color.is_none() && !Self::covers(crop.dst_rect, dst_w, dst_h);
         let mut dst_map = if keeps_outside {
             dst.map_for_partial_write()?
@@ -224,10 +179,7 @@ impl CPUProcessor {
         };
 
         // FIXME: fast_image_resize does not clamp its filter kernel at crop
-        // boundaries — bilinear/bicubic taps can sample 1-2 pixels beyond the
-        // specified crop rect, causing colour bleed from adjacent regions.
-        // A proper fix would inset the crop by the filter radius or use a
-        // library that supports boundary clamping.
+        // boundaries; taps can sample 1-2 pixels beyond the crop rect.
         let options = if let Some(crop) = crop.src_rect {
             self.options.crop(
                 crop.left as f64,
@@ -257,9 +209,7 @@ impl CPUProcessor {
             || !Self::covers(crop.dst_rect, dst_w, dst_h);
 
         if needs_resize {
-            // `ImageRef` (read-only) rather than `Image::from_slice_u8`, which
-            // needs `&mut [u8]` and was the only reason the source map above
-            // had to be read-write. The resizer only ever reads the source.
+            // A read-only `ImageRef` over the source.
             let src_view = fast_image_resize::images::ImageRef::new(
                 src_w as u32,
                 src_h as u32,
@@ -378,10 +328,9 @@ impl CPUProcessor {
     }
 
     /// Resize into the `dst_rect` of a padded destination through a tight
-    /// scratch, then copy it back at the real stride: `fast_image_resize`
-    /// addresses rows by `row * width * bpp`. `keep_outside` seeds the scratch
-    /// from `dst` so pixels outside `dst_rect` survive; otherwise they are
-    /// overwritten later and the scratch starts zeroed.
+    /// scratch, then copy it back at the real stride. `keep_outside` seeds the
+    /// scratch from `dst` so pixels outside `dst_rect` survive; otherwise the
+    /// scratch starts zeroed.
     #[allow(clippy::too_many_arguments)]
     fn resize_into_padded_dst(
         resizer: &mut fast_image_resize::Resizer,
@@ -465,14 +414,9 @@ impl CPUProcessor {
         }
     }
 
-    /// Fill the letterbox border of one image surface with `pix`.
-    ///
-    /// Rows advance by `dst_stride`, and each row is clipped to its own
-    /// `dst_width * N` pixel bytes: for an allocation-padded destination the
-    /// remainder is dead padding, and for a `Tensor::view()` destination it is
-    /// the parent image's neighbouring columns — the border must not spill into
-    /// either. On a tightly-packed destination (stride == row bytes) this fills
-    /// exactly the pixels the previous flat-index form did.
+    /// Fill the letterbox border of one image surface with `pix`. Rows advance
+    /// by `dst_stride`, and each row is clipped to its own `dst_width * N`
+    /// pixel bytes.
     pub(super) fn fill_image_outside_crop_<const N: usize>(
         (dst, dst_width, dst_height, dst_stride): (&mut [u8], usize, usize, usize),
         pix: [u8; N],
@@ -529,8 +473,7 @@ impl CPUProcessor {
                 "planar fill plane size overflow (stride={dst_stride}, h={dst_height})"
             ))
         })?;
-        // `par_chunks_exact_mut` silently drops a short tail, which zipped with
-        // `pix` would skip planes rather than fail, so require all `N` up front.
+        // Requires all `N` planes up front.
         let need = plane.saturating_mul(N);
         if dst.len() < need {
             return Err(Error::InvalidShape(format!(
@@ -557,8 +500,7 @@ impl CPUProcessor {
         uv: [u8; 2],
         mut crop: Rect,
     ) -> Result<()> {
-        // Validate the buffer holds the luma plane before splitting so a
-        // caller-supplied (untrusted) dst cannot panic the `split_at_mut`.
+        // Checks that the buffer holds the luma plane before splitting.
         let luma = dst_stride.checked_mul(dst_height).ok_or_else(|| {
             Error::InvalidShape(format!(
                 "semiplanar fill luma size overflow (stride={dst_stride}, h={dst_height})"

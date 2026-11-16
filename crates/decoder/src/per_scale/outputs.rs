@@ -4,10 +4,9 @@
 //! Output buffer storage and zero-copy view types for the per-scale decoder.
 //!
 //! The decoder owns three flat output `Vec<F>`s (boxes, scores,
-//! mask_coefs) and an optional `Array4<F>` for protos. They're
-//! pre-allocated at first frame and overwritten in place each subsequent
-//! frame. Callers receive `DecodedOutputsRef<'_>` views borrowed from
-//! the decoder.
+//! mask_coefs) and an optional `Array4<F>` for protos. They are allocated
+//! once and overwritten in place each frame. Callers receive
+//! `DecodedOutputsRef<'_>` views borrowed from the decoder.
 
 use super::kernels::dispatch::DstSliceMut;
 use super::DecodeDtype;
@@ -16,25 +15,18 @@ use ndarray::{Array4, ArrayView2, ArrayView4};
 
 /// Owned output buffers, reused frame-to-frame.
 #[derive(Debug)]
-#[allow(dead_code)] // Wired by Task 21.
+#[allow(dead_code)]
 pub(crate) struct DecodedOutputBuffers {
     pub(crate) boxes: Buffer,
     pub(crate) scores: Buffer,
     pub(crate) mask_coefs: Option<Buffer>,
-    /// Protos, NHWC `[1, H_p, W_p, NM]`, always f32: the mask kernels take f32.
+    /// Protos, NHWC `[1, H_p, W_p, NM]`, always f32.
     pub(crate) protos: Option<Array4<f32>>,
 
-    /// Per-frame transpose scratch for NCHW children. Populated lazily
-    /// by `pipeline::run` when at least one level is declared NCHW
-    /// (otherwise stays default-empty and costs nothing). Per-dtype
-    /// fields each grow on first use to `max(h * w * c)` across all
-    /// per-scale levels and roles for that dtype, then are reused for
-    /// every subsequent frame.
-    ///
-    /// The fields are public to the pipeline orchestration. Callers
-    /// must use the `ensure_*` methods to size them — direct mutation
-    /// risks under-sized allocations and out-of-bounds writes inside
-    /// the transpose helper.
+    /// Per-frame transpose scratch for NCHW children, filled by
+    /// `pipeline::run` when a level is declared NCHW. Each per-dtype field
+    /// grows on first use and is reused on later frames. The `ensure_*`
+    /// methods size the fields.
     pub(crate) layout_scratch: LayoutScratch,
 
     /// Per-level compact-decode scratch for the score prefilter, built on
@@ -54,9 +46,7 @@ pub(crate) struct DecodedOutputBuffers {
     pub(crate) pieces: (usize, Vec<super::pipeline::Piece>),
 }
 
-/// Per-dtype scratch for NCHW → NHWC transpose. Lazy allocation: the
-/// common case where all per-scale children share one dtype (e.g. all
-/// int8 from a TFLite or NPU export) populates exactly one field.
+/// Per-dtype scratch for NCHW → NHWC transpose, allocated on first use.
 #[derive(Debug, Default)]
 #[allow(dead_code)]
 pub(crate) struct LayoutScratch {
@@ -70,8 +60,7 @@ pub(crate) struct LayoutScratch {
 
 impl LayoutScratch {
     /// Grow the i8 scratch to at least `n` elements; return the prefix
-    /// of length `n`. Backed by `Vec::resize`, which keeps existing
-    /// elements and zero-initializes any new tail.
+    /// of length `n`. New elements are zero-initialized.
     #[allow(dead_code)]
     pub(crate) fn ensure_i8(&mut self, n: usize) -> &mut [i8] {
         if self.i8.len() < n {
@@ -131,7 +120,7 @@ pub(crate) enum Buffer {
 
 impl DecodedOutputBuffers {
     /// Allocate buffers sized for the plan.
-    #[allow(dead_code)] // Wired by Task 21.
+    #[allow(dead_code)]
     pub(crate) fn new(
         out_dtype: DecodeDtype,
         total_anchors: usize,
@@ -146,8 +135,8 @@ impl DecodedOutputBuffers {
         let alloc_proto = |s: &[usize]| -> Option<Array4<f32>> {
             (s.len() == 4).then(|| Array4::zeros((s[0], s[1], s[2], s[3])))
         };
-        // The prefilter writes whole packs, so its last level can run up
-        // to one pack, less an anchor, past the kept count.
+        // Room for the prefilter's last pack: up to one pack, less an anchor,
+        // past the anchor count.
         let capacity = total_anchors + super::prefilter::PACK_ANCHORS - 1;
         Self {
             boxes: alloc_buf(4 * capacity),
@@ -223,11 +212,8 @@ impl DecodedOutputBuffers {
         self.protos.as_mut()?.as_slice_mut().map(DstSliceMut::F32)
     }
 
-    /// Snapshot the pre-NMS buffers as owned f32 ndarrays.
-    ///
-    /// Used by [`crate::Decoder::_testing_run_per_scale_pre_nms`].
-    /// Widens f16 buffers to f32 if the decoder was built with
-    /// [`crate::per_scale::DecodeDtype::F16`].
+    /// Snapshot the pre-NMS buffers as owned f32 ndarrays, widening f16
+    /// buffers to f32.
     #[doc(hidden)]
     pub(crate) fn snapshot_owned_f32(
         &self,
@@ -262,12 +248,7 @@ impl DecodedOutputBuffers {
 }
 
 // Free helpers that take a single field by mutable reference instead of
-// `&mut DecodedOutputBuffers`. Used by the pipeline orchestrator when it
-// needs to hold a destination slice and a scratch slice simultaneously
-// (the borrow checker tracks disjoint field borrows on direct field
-// accesses, but the `&mut self` methods above hold the entire struct).
-//
-// Logic is identical to the same-named methods on `DecodedOutputBuffers`.
+// `&mut DecodedOutputBuffers`.
 
 /// `boxes_level_slice` for use with disjoint field borrows.
 #[allow(dead_code)]
@@ -318,7 +299,7 @@ pub(crate) fn mask_coefs_level_slice_of(
 
 /// Zero-copy view returned to the caller; borrows from the decoder's buffers.
 #[derive(Debug)]
-#[allow(dead_code)] // Consumed by Task 24's decoder integration.
+#[allow(dead_code)]
 pub(crate) struct DecodedOutputsRef<'a> {
     pub(crate) boxes: BufferRef<'a>,
     pub(crate) scores: BufferRef<'a>,
@@ -341,7 +322,7 @@ pub(crate) enum BufferRef<'a> {
 }
 
 impl<'a> BufferRef<'a> {
-    /// View as an `(N, cols)` 2-D array — used by the existing NMS path.
+    /// View as an `(N, cols)` 2-D array.
     #[allow(dead_code)]
     pub(crate) fn as_array_view2_f32(
         &self,
@@ -434,7 +415,6 @@ mod tests {
         } else {
             panic!()
         }
-        // Verify both writes preserved
         match &b.boxes {
             Buffer::F32(v) => {
                 assert!((v[0] - 1.0).abs() < 1e-9);

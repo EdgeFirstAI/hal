@@ -15,7 +15,7 @@ It has no dependency on any other `edgefirst-*` crate; instead, it is consumed
 as a feature by the decoder and image crates:
 
 - [`edgefirst-decoder`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/) (feature `tracker`) calls `Tracker::update` from `decode_tracked()`.
-- [`edgefirst-image`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/) (feature `tracker`) calls `draw_masks_tracked()` to render masks for tracked detections and surface track info to the caller. Colour stability per track UUID is the planned use of `ColorMode::Track`, but `Track` currently aliases `Instance` (detection-order colouring) — the slot is reserved so the API surface won't change once the per-UUID palette lands.
+- [`edgefirst-image`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/) (feature `tracker`) calls `draw_masks_tracked()` to render masks for tracked detections and surface track info to the caller. `ColorMode::Track` aliases `Instance` (detection-order colouring); a per-UUID palette is not implemented.
 
 ## Algorithms
 
@@ -178,8 +178,7 @@ track**, index-aligned across them:
   are dropped from all three buffers, and tracks that are still alive but
   unmatched this frame are added to them.
 
-That last point is the one that surprises people: the output is the tracker's
-view of the world, not a per-detection annotation of this frame's decode.
+The output is the tracker's view of the scene, not a per-detection annotation of this frame's decode.
 
 ## Documentation
 

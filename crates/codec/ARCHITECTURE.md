@@ -19,13 +19,7 @@ to [`ImageProcessor::convert()`](../image), which runs on the GPU where
 available. This keeps the decode path branch-free and lets a single
 `convert()` fold all the geometry/colour work into one pass.
 
-One measured exception: `ImageDecoder::set_output_format` lets a caller opt
-into a **pure CPU fused decode output** — `Rgb` (4:4:4 or native 4:2:0
-sources) or `Nv12` (any colour source) — where the conversion happens inside
-the software MCU
-write stage (not a GPU hybrid). Callers still run `ImageProcessor::convert()`
-afterward for model-input preprocessing. See
-[Fused Decode Output](#fused-decode-output-opt-in-pure-cpu).
+One exception: `ImageDecoder::set_output_format` lets a caller opt into a **pure CPU fused decode output** — `Rgb` (4:4:4 or native 4:2:0 sources) or `Nv12` (any colour source) — where the conversion happens inside the software MCU write stage (not a GPU hybrid). Callers still run `ImageProcessor::convert()` afterward for model-input preprocessing. See [Fused Decode Output](#fused-decode-output-opt-in-pure-cpu).
 
 ## Crate Position in the Workspace
 
@@ -76,7 +70,7 @@ dependency graph clean.
 | `idct/neon.rs`   | NEON 8×8 IDCT on 16-bit coefficients: 8-lane dequant, lane-indexed `vmull` Loeffler butterfly, sparse bottom-row/right-column shortcuts, register-resident workspace |
 | `idct/sse2.rs`   | x86 8×8 IDCT: 16-bit-lane `islow` Loeffler, `pmullw` dequant + `pmaddwd` butterflies (shared by all Intel tiers) |
 | `idct/avx2.rs`   | VEX-encoded build of the `sse2.rs` kernel |
-| `mcu.rs`         | MCU decode loops — dedicated 4:4:4 1×1 direct loop (`decode_image_444_direct`: tables resolved to plain locals, no sampling loops; the generic loop's frame spilled past the register file and cost 4–8% on every core) + generic sampling loop — `McuScratch`, native `Grey`/`Nv12`/`Nv16`/`Nv24` row writes, fused `Rgb`/`Nv12` writes (NEON/SSE chroma downsample for `Nv12`; `write_rgb_rows_420` box-upsamples native 4:2:0 chroma into `Rgb`), chroma downsample for the non-matching subsamplings (`avg_block`) |
+| `mcu.rs`         | MCU decode loops — dedicated 4:4:4 1×1 direct loop (`decode_image_444_direct`: tables resolved to plain locals, no sampling loops; the generic loop's frame spills past the register file and costs 4–8% on every core) + generic sampling loop — `McuScratch`, native `Grey`/`Nv12`/`Nv16`/`Nv24` row writes, fused `Rgb`/`Nv12` writes (NEON/SSE chroma downsample for `Nv12`; `write_rgb_rows_420` box-upsamples native 4:2:0 chroma into `Rgb`), chroma downsample for the non-matching subsamplings (`avg_block`) |
 | `v4l2/`          | Optional Linux hardware JPEG backend (see below)     |
 | `nvjpeg/`        | Optional nvJPEG GPU backend (Linux + CUDA, see below) |
 
@@ -424,17 +418,9 @@ three places take deliberate care:
   built from the next block's bits. Per-tier because in-order A53/A55 retire
   the phantom overhead with no OoO slack to hide it (measured −1-3%), while
   the A76 gains ~2.7%; the instantiation is selected once per decode as a fn
-  pointer — keeping a second live call site in the MCU loop cost ~7% on the
+  pointer — keeping a second live call site in the MCU loop costs ~7% on the
   A53.
-- **Register-resident bit cursor** (`BitCursor`): the block decoder copies the
-  `BitStream` state into a function-local cursor and commits it back on every
-  exit. `&mut BitStream` is caller-visible memory, and `perf annotate` on
-  Cortex-A53 showed `avail` written back to the struct on every decoded
-  coefficient; the cursor keeps the whole bit buffer in registers
-  (libjpeg-turbo `BITREAD_LOAD_STATE`/`SAVE_STATE` discipline).
-  `decode_block` is `#[inline(never)]` to keep its register-allocation problem
-  out of the MCU loop's already-spilling frame — letting it inline cost ~20%
-  of A53 decode time (measured 7.68 → 9.23 ms p50 on imx8mp COCO).
+- **Register-resident bit cursor** (`BitCursor`): the block decoder copies the `BitStream` state into a function-local cursor and commits it back on every exit. `&mut BitStream` is caller-visible memory, so through it `avail` is written back to the struct on every decoded coefficient; the cursor keeps the whole bit buffer in registers (libjpeg-turbo `BITREAD_LOAD_STATE`/`SAVE_STATE` discipline). `decode_block` is `#[inline(never)]` to keep its register-allocation problem out of the MCU loop's already-spilling frame — inlined, it costs ~20% of A53 decode time (7.68 → 9.23 ms p50 on imx8mp COCO).
 - **Entropy-derived IDCT sparsity** (`BlockInfo::last_k`): the highest zigzag
   index written is a free by-product of the scan order, and because zigzag
   fills the top-left corner first, a small `last_k` proves whole regions zero.
@@ -515,7 +501,7 @@ path; fused RGB and exotic NV12 averaging take the color/downsample kernels.
 
 The butterfly constants are held in two `int16x8` registers and addressed by
 lane (`vmull_laneq_s16`), not splatted per multiply: the butterfly is inlined
-four times, so `vdup_n_s16(FIX_x)` at each use site cost 64 `dup`s per block.
+four times, so `vdup_n_s16(FIX_x)` at each use site costs 64 `dup`s per block.
 The `black_box` on the constant pointers in `idct_8x8_neon_inner` is what makes
 that stick — see the comment there.
 | **Color / UV** | Q14 `SQRDMULH` YCbCr→RGB; `vst2` UV interleave; NEON 2×2 / 1×2 chroma downsample | 8–16 samples/iter |
@@ -705,21 +691,14 @@ MJPEG reuses the H.264 backends where the platform's model fits. On V4L2 the sta
 
 ## Media Foundation backend (Windows)
 
-`video/mf/` implements `EncoderBackend` and `DecoderBackend` with the Media
-Foundation H.264 transforms. The traits are unchanged.
+`video/mf/` implements `EncoderBackend` and `DecoderBackend`, the traits the V4L2 backend implements, with the Media Foundation H.264 transforms.
 
 - **Loading.** `mfplat.dll` is opened from System32 at run time and its six
   flat functions resolved, so the crate has no load-time Media Foundation
   import (checked with `dumpbin /imports`). Windows N without the Media Feature
   Pack loads it and reports `NoDevice`. COM interfaces come from the `windows`
   crate, at the version the tensor crate uses.
-- **Threads.** Every call runs on the caller's thread, joined to the COM MTA
-  once per thread. Hardware encoders are asynchronous MFTs: their
-  `METransformNeedInput`/`METransformHaveOutput` events are polled with
-  `MF_EVENT_FLAG_NO_WAIT` rather than delivered to callbacks, so no D3D11
-  readback or upload ever runs on a Media Foundation work queue (on the camera
-  backend that held callbacks back for seconds). After a drain an asynchronous
-  MFT asks for input again only after `MFT_MESSAGE_NOTIFY_START_OF_STREAM`.
+- **Threads.** Every call runs on the caller's thread, joined to the COM MTA once per thread. Hardware encoders are asynchronous MFTs: their `METransformNeedInput`/`METransformHaveOutput` events are polled with `MF_EVENT_FLAG_NO_WAIT` rather than delivered to callbacks, so no D3D11 readback or upload runs on a Media Foundation work queue. After a drain an asynchronous MFT asks for input again only after `MFT_MESSAGE_NOTIFY_START_OF_STREAM`.
 - **Memory.** A transform that is D3D11-aware gets a DXGI device manager over
   HAL's own D3D11 device (`MFT_MESSAGE_SET_D3D_MANAGER`, before the media
   types), so pixels stay on the GPU; NV12 D3D11 tensors are native
@@ -799,15 +778,7 @@ workers do not serialise on the default stream.
 
 ### RGB output — a deliberate exception to the native-format contract
 
-Unlike the CPU/V4L2 paths (native NV12/Grey/NV24, never colour-converted), the
-nvJPEG path emits packed **`Rgb`** via `NVJPEG_OUTPUT_RGBI`. nvJPEG performs the
-YCbCr→RGB on the GPU at near-zero marginal cost, the result is GPU-resident, and
-`ImageProcessor::convert()` accepts an `Rgb` source directly (removing the
-downstream NV12→RGB step). `Rgbi` maps onto the existing `PixelFormat::Rgb` — no
-new enum variant. The backend reconfigures the destination NV12→Rgb and, on any
-post-reconfigure failure, restores the native format so the V4L2/CPU
-fall-through writes into a correctly-shaped tensor. (The L4T nvJPEG 12.3.3 build
-has no `NVJPEG_OUTPUT_NV12`, so RGB is also the only single-call option here.)
+Unlike the CPU/V4L2 paths (native NV12/Grey/NV24, never colour-converted), the nvJPEG path emits packed **`Rgb`** via `NVJPEG_OUTPUT_RGBI`. nvJPEG performs the YCbCr→RGB on the GPU at near-zero marginal cost, the result is GPU-resident, and `ImageProcessor::convert()` accepts an `Rgb` source directly (removing the downstream NV12→RGB step). `Rgbi` maps onto `PixelFormat::Rgb`. The backend reconfigures the destination NV12→Rgb and, on any post-reconfigure failure, restores the native format so the V4L2/CPU fall-through writes into a correctly-shaped tensor. (The L4T nvJPEG 12.3.3 build has no `NVJPEG_OUTPUT_NV12`, so RGB is also the only single-call option here.)
 
 ### PBO + `cuda_map` zero-copy chain
 
@@ -856,10 +827,6 @@ nvJPEG error (the native format is restored and the CPU decoder — which handle
 progressive/non-baseline JPEGs nvJPEG rejects — runs on the same tensor), and
 `Fatal` for deterministic tensor errors. After `MAX_CONSECUTIVE_FAILURES` (8)
 the backend is demoted for the rest of the session (circuit breaker).
-
-A future increment (not built) could defer the `cudaStreamSynchronize`/unmap and
-hand a CUDA event to `convert()`, gated on a measured demonstration that
-per-decode sync stalls the worker.
 
 ## Tracing Spans
 

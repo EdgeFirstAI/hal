@@ -39,8 +39,7 @@ BIN_DIR="${BENCH_WS}/target/${TARGET_TRIPLE}/${PROFILE}"
 ssh "${HOST}" "mkdir -p '${REMOTE_BIN}/perf' '${REMOTE_BIN}/sets/zidane'"
 scp -q "${BIN_DIR}/hal_cpu" "${BIN_DIR}/hal_gl" "${BIN_DIR}/hal_v4l2_gl" \
   "${HOST}:${REMOTE_BIN}/"
-# Reference decoder arm: native C, so a profile of it is a profile of
-# libturbojpeg rather than of an interpreter calling it.
+# Reference decoder arm: native C.
 make -C "${BENCH_WS}/modules/turbojpeg" aarch64
 scp -q "${BENCH_WS}/modules/turbojpeg/build/turbojpeg_bench.aarch64" \
   "${HOST}:${REMOTE_BIN}/turbojpeg_bench"
@@ -56,7 +55,7 @@ ZIDANE="${REMOTE_BIN}/sets/zidane"
 echo "  COCO=${COCO}"
 echo "  ZIDANE=${ZIDANE}"
 
-# Lower paranoid if we can (root boards often already allow).
+# Lower perf_event_paranoid when running as root.
 ssh "${HOST}" 'if [[ $(id -u) -eq 0 ]]; then echo -1 > /proc/sys/kernel/perf_event_paranoid 2>/dev/null || true; fi
   cat /proc/sys/kernel/perf_event_paranoid'
 

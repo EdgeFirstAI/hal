@@ -5,7 +5,7 @@
 //! the decoder's internal `ArrayViewD`/`ArrayViewDQuantized` representations.
 //!
 //! This module maps `TensorDyn` outputs into memory and converts them into
-//! ndarray views that the existing decode methods consume.
+//! ndarray views that the decode methods consume.
 
 use edgefirst_tensor::{HostView, PixelLayout, TensorDyn, TensorMapTrait, TensorTrait};
 use half::f16;
@@ -172,8 +172,7 @@ impl QuantizedMap {
 /// All integer types (u8, i8, u16, i16, u32, i32) are grouped as quantized.
 /// Float types (f16, f32, f64) are grouped by precision. Mixed float/integer
 /// inputs are an error, except that i32 tensors mixed with a float dtype are
-/// allowed (some models produce mixed outputs where shape/count tensors are
-/// i32).
+/// skipped.
 ///
 /// # Errors
 ///
@@ -221,8 +220,7 @@ fn map_float_tensors(
             for &t in outputs {
                 match t.dtype() {
                     edgefirst_tensor::DType::F16 => maps.push(map_input!(t, f16)),
-                    // Mixed f16 + i32 is allowed: skip i32 tensors silently
-                    // (matches the f32 path's handling of count/shape tensors).
+                    // i32 tensors among f16 outputs are skipped.
                     edgefirst_tensor::DType::I32 => continue,
                     _ => {
                         return Err(DecoderError::InvalidConfig(format!(
@@ -239,8 +237,7 @@ fn map_float_tensors(
             for &t in outputs {
                 match t.dtype() {
                     edgefirst_tensor::DType::F32 => maps.push(map_input!(t, f32)),
-                    // Some models have mixed f32 + i32 outputs (e.g. count tensors).
-                    // Skip i32 tensors silently; the decoder indexes only f32 outputs.
+                    // i32 tensors among f32 outputs are skipped.
                     edgefirst_tensor::DType::I32 => continue,
                     _ => {
                         return Err(DecoderError::InvalidConfig(format!(
@@ -499,22 +496,19 @@ mod tensor_bridge_tests {
 
     #[test]
     fn test_map_tensors_f32_with_i32_skipped() {
-        // Mixed f32 + i32 is allowed: i32 tensors are silently skipped.
         let t1 = make_f32(&[1, 2], &[1.0, 2.0]);
         let t2 = make_f32(&[1, 3], &[3.0, 4.0, 5.0]);
         let t3 = make_i32(&[1, 1], &[42]);
         let mapped = tensor_bridge::map_tensors(&[&t1, &t2, &t3]).unwrap();
         if let MappedOutputs::Float32(maps) = &mapped {
-            // The i32 tensor should be skipped
             assert_eq!(maps.len(), 2);
         } else {
             panic!("expected MappedOutputs::Float32");
         }
 
-        // check that order doesn't matter
+        // The same tensors in another order.
         let mapped = tensor_bridge::map_tensors(&[&t3, &t2, &t1]).unwrap();
         if let MappedOutputs::Float32(maps) = &mapped {
-            // The i32 tensor should be skipped
             assert_eq!(maps.len(), 2);
         } else {
             panic!("expected MappedOutputs::Float32");
@@ -715,8 +709,6 @@ mod tensor_bridge_tests {
 
     #[test]
     fn test_map_tensors_f16_with_i32_skipped() {
-        // Mixed f16 + i32 is allowed: i32 tensors are silently skipped,
-        // mirroring the f32 path (some models emit count/shape tensors as i32).
         let t1 = make_f16(
             &[1, 2],
             &[half::f16::from_f32(1.0), half::f16::from_f32(2.0)],

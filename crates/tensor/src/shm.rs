@@ -16,26 +16,9 @@ use std::{
 };
 
 /// Derive a [`crate::BufferIdentity`] for a POSIX shm segment from its fd's
-/// `(st_dev, st_ino)`, mirroring dma-buf's treatment: it survives `dup` (so
-/// `clone_fd`/`from_fd` importing a producer's fd yields the same identity),
-/// which is what lets a downstream GL import cache recognize the same buffer
-/// handed off between independently-linked copies of this crate.
-///
-/// That key is only usable where the platform actually populates it. Probed
-/// directly on this host (macOS 27, both with and without an intervening
-/// `shm_unlink`): `fstat` on a `shm_open` fd always reports `(st_dev,
-/// st_ino) = (0, 0)` -- Darwin's POSIX shm objects are not real vnodes with
-/// stable inode numbers. Using that pair unconditionally would collapse
-/// every live shm segment to ONE identity there, which is the exact defect
-/// this derivation exists to prevent. When the stat pair is all-zero, fall
-/// back to the raw fd number: it carries no cross-process meaning, but it
-/// IS unique among this process's currently-open fds (the same
-/// close/reuse hazard as any process-local key -- a pointer, a GL name --
-/// mitigated the same way per `IdentityKind`'s doc), which is what a
-/// same-process import cache actually needs.
-// `st_dev`/`st_ino` are `i32`/`u64` on Darwin but `u64`/`u64` on Linux, so
-// exactly one of these casts is a clippy::unnecessary_cast on any given
-// platform; both are needed for the expression to compile on both.
+/// `(st_dev, st_ino)`, which survives `dup`. When the stat pair is all-zero the
+/// identity is derived from the raw fd number instead, as a process-local
+/// `HostPtr` key.
 #[allow(clippy::unnecessary_cast)]
 fn identity_from_stat(fd: &OwnedFd, stat: &nix::sys::stat::FileStat) -> crate::BufferIdentity {
     if stat.st_dev == 0 && stat.st_ino == 0 {
@@ -54,16 +37,14 @@ where
     pub fd: OwnedFd,
     pub shape: Vec<usize>,
     /// Byte offset into the shared segment where this tensor's logical window
-    /// begins. `0` for whole-segment tensors; non-zero for `view()` sub-regions
-    /// (mirrors `DmaTensor::mmap_offset` / `MemTensor::offset`). Applied in
-    /// `ShmMap::as_slice`, which maps the whole segment and indexes from here.
+    /// begins. `0` for whole-segment tensors; non-zero for `view()`
+    /// sub-regions. Maps cover the whole segment and index from here.
     offset: usize,
     /// Logical byte length of the backing segment (the size requested at
     /// `ftruncate`), as opposed to the physical `fstat().st_size` exposed by
-    /// [`capacity_bytes`](Self::capacity_bytes). These diverge on macOS, where
-    /// POSIX shm segments are rounded up to a page, so bounds checks must use
-    /// this logical length to stay platform-consistent. Inherited unchanged by
-    /// `view()` sub-regions (they share the same segment).
+    /// [`capacity_bytes`](Self::capacity_bytes); the two differ on macOS, where
+    /// POSIX shm segments are rounded up to a page. Bounds checks use this
+    /// length. Inherited unchanged by `view()` sub-regions.
     byte_len: usize,
     pub _marker: std::marker::PhantomData<T>,
     identity: crate::BufferIdentity,
@@ -76,18 +57,12 @@ impl<T> ShmTensor<T>
 where
     T: Num + Clone + fmt::Debug + Send + Sync,
 {
-    /// Allocate the anonymous POSIX shared-memory segment backing a new
-    /// tensor: `shm_open` with a random name, then immediately `shm_unlink`
-    /// so nothing outlives the process — the library's sharing model is
-    /// file descriptors (`clone_fd`), never names.
+    /// Allocate the anonymous POSIX shared-memory segment backing a new tensor:
+    /// `shm_open` with a random name, then immediately `shm_unlink`.
     ///
-    /// Android's bionic libc has no POSIX shared memory (`shm_open` /
-    /// `shm_unlink` do not exist), so allocation reports `NotImplemented`
-    /// there. Receiving a segment created elsewhere still works on Android:
-    /// [`from_fd`](TensorTrait::from_fd) needs only `mmap`/`fstat`, which
-    /// bionic provides. (A `memfd_create`-backed allocator is the planned
-    /// replacement: the syscall exists on all Android kernels, but the
-    /// bionic wrapper appears at API 30 and the HAL floor is 26.)
+    /// Not available on Android, whose libc has no POSIX shared memory:
+    /// allocation reports `NotImplemented` there.
+    /// [`from_fd`](TensorTrait::from_fd) works on Android.
     #[cfg(not(target_os = "android"))]
     fn alloc_anon_fd(name: &str) -> Result<OwnedFd> {
         use nix::fcntl::OFlag;
@@ -113,8 +88,7 @@ where
 
     /// Create a shared-memory tensor with a logical `shape` but a physical
     /// allocation of `byte_size` bytes (which must be `>= shape.product() *
-    /// sizeof(T)`).  Used for image tensors with a 64-byte-aligned row stride
-    /// that exceeds the logical shape product.
+    /// sizeof(T)`).
     pub(crate) fn new_with_byte_size(
         shape: &[usize],
         byte_size: usize,
@@ -173,9 +147,8 @@ where
         T: 'a,
     {
         let exposed = byte_size_override.unwrap_or_else(|| self.size());
-        // Map the whole segment from fd offset 0 and apply `self.offset` in
-        // `ShmMap::as_slice` — mmap cannot take a non-page-aligned fd offset,
-        // and the segment is small (mirrors `DmaMap`, which maps `buf_size`).
+        // Map the whole segment from fd offset 0; `self.offset` is applied to
+        // the mapped base.
         let mmap_size = self.capacity_bytes();
         let end = self
             .offset
@@ -265,10 +238,7 @@ where
             return Err(Error::InvalidSize(0));
         }
 
-        // One fstat serves two purposes below: byte_len (the true logical
-        // length of an externally shared segment is otherwise unknown --
-        // exact on Linux, page-rounded on macOS) and this tensor's identity,
-        // mirroring dma-buf's from_fd.
+        // One `fstat` provides both `byte_len` and the identity.
         let stat = fstat(&fd)?;
         let byte_len = stat.st_size as usize;
         let identity = identity_from_stat(&fd, &stat);
@@ -348,17 +318,16 @@ where
     }
 
     /// Zero-copy sub-region view sharing this tensor's segment via a cloned fd
-    /// (the SHM sharing model is fd-based, like `clone_fd`/`from_fd`) and its
-    /// [`BufferIdentity`](crate::BufferIdentity).
+    /// and its [`BufferIdentity`](crate::BufferIdentity).
     ///
     /// The view maps `[offset_bytes, offset_bytes + logical_size)` measured from
     /// this tensor's own window (`logical_size = shape.product() *
-    /// size_of::<T>()`), so a sub-view of a sub-view composes. N such views into
-    /// one parent share the segment (no copy) and write independently.
+    /// size_of::<T>()`). N such views into one parent share the segment (no
+    /// copy) and write independently.
     ///
     /// # Errors
     /// - [`Error::InvalidOperation`] if `offset_bytes` is not aligned to
-    ///   `align_of::<T>()` (required for the `ShmMap` pointer cast).
+    ///   `align_of::<T>()`.
     /// - [`Error::InsufficientCapacity`] if the window exceeds the segment.
     fn view(&self, offset_bytes: usize, shape: &[usize]) -> Result<Self> {
         let elem = std::mem::size_of::<T>();
@@ -373,9 +342,8 @@ where
             .checked_add(offset_bytes)
             .ok_or(Error::InvalidSize(offset_bytes))?;
         let logical = shape.iter().product::<usize>() * elem;
-        // Bound against the segment's *logical* byte length, not the physical
-        // `capacity_bytes()` (`st_size`): the latter is page-rounded on macOS,
-        // which would let an out-of-bounds window slip through (see `byte_len`).
+        // Bound against the segment's logical byte length, not the physical
+        // `capacity_bytes()`.
         let capacity = self.byte_len;
         let needed = abs_offset
             .checked_add(logical)
@@ -390,9 +358,7 @@ where
             offset: abs_offset,
             byte_len: self.byte_len,
             _marker: std::marker::PhantomData,
-            // A sub-view is the *same* segment: share the parent's identity so
-            // identity-keyed logic treats the windows as one buffer at distinct
-            // offsets, not unrelated allocations.
+            // A sub-view shares the parent's identity.
             identity: self.identity.clone(),
         })
     }
@@ -402,20 +368,15 @@ impl<T> ShmTensor<T>
 where
     T: Num + Clone + fmt::Debug + Send + Sync,
 {
-    /// Establish a persistent host mapping over this segment.
-    ///
-    /// Unlike [`map_with`](TensorTrait::map_with) the mapping is owned by the
-    /// returned pin rather than by a guard, so the address stays valid for as
-    /// long as the pin lives. SHM is plain CPU memory, so there is no sync to
-    /// bracket — [`Tensor::sync_for_cpu`](crate::Tensor::sync_for_cpu) is a
-    /// documented no-op here.
+    /// Establish a persistent host mapping over this segment. The mapping is
+    /// owned by the returned pin, so the address stays valid for as long as the
+    /// pin lives.
     pub(crate) fn host_pin<'a>(&self) -> crate::Result<crate::pin::HostPin<'a>>
     where
         T: 'a,
     {
         // Map the whole segment from fd offset 0 and apply `self.offset`
-        // afterwards: mmap cannot take a non-page-aligned fd offset, and this
-        // mirrors what map_with already does.
+        // afterwards.
         let mmap_size = self.capacity_bytes();
         let size = NonZero::new(mmap_size).ok_or(Error::InvalidSize(mmap_size))?;
         let _mapping_guard = crate::pin::cpu_mapping_shared();
@@ -432,8 +393,6 @@ where
         let base = NonNull::new(ptr.as_ptr()).ok_or(Error::InvalidSize(mmap_size))?;
         let owner = std::sync::Arc::new(crate::pin::MmapOwner::new(base, mmap_size));
 
-        // Offset-adjusted, so a sub-region view hands back its own window
-        // rather than the raw mmap base.
         if self.offset > mmap_size {
             return Err(Error::InsufficientCapacity {
                 needed: self.offset,
@@ -447,10 +406,9 @@ where
         Ok(crate::pin::HostPin::new(owner, data, len))
     }
 
-    /// Set the byte offset of the logical window into the backing segment
-    /// (mirrors `MemTensor::set_offset`). Unvalidated here -- `map_inner`
-    /// bounds- and alignment-checks `self.offset` against the segment at
-    /// map time, the same way `MemTensor`'s consumer validates at `map()`.
+    /// Set the byte offset of the logical window into the backing segment.
+    /// Unvalidated here; `map_inner` bounds- and alignment-checks it at map
+    /// time.
     pub(crate) fn set_offset(&mut self, offset: usize) {
         self.offset = offset;
     }
@@ -472,13 +430,8 @@ mod tests {
     use crate::TensorMapTrait;
     use crate::{TensorMemory, TensorTrait};
 
-    /// Android's bionic libc has no POSIX shared memory, so `ShmTensor::new`
-    /// reports `NotImplemented` there (see the module docs). These tests
-    /// allocate, so they cannot run on that platform — skip loudly rather
-    /// than unwrapping a documented failure.
-    ///
-    /// Probing beats `cfg(target_os = "android")`: it also covers a host where
-    /// /dev/shm is absent or unwritable, which looks identical from here.
+    /// Whether SHM can be allocated on this host; reports a skip for `what`
+    /// when it cannot.
     fn shm_or_skip(what: &str) -> bool {
         if crate::is_shm_available() {
             return true;
@@ -732,7 +685,6 @@ mod tests {
         if !shm_or_skip("test_from_fd_roundtrip") {
             return;
         }
-        // Create tensor A and write data into it.
         let tensor_a = ShmTensor::<u8>::new(&[2, 4], None).unwrap();
         {
             let mut map_a = tensor_a.map().unwrap();
@@ -740,11 +692,9 @@ mod tests {
             map_a.as_mut_slice()[7] = 0xCD;
         }
 
-        // Clone A's fd and create tensor B from it.
         let fd = tensor_a.clone_fd().unwrap();
         let tensor_b = ShmTensor::<u8>::from_fd(fd, &[2, 4], Some("clone")).unwrap();
 
-        // Verify B sees the same data (shared memory).
         let map_b = tensor_b.map().unwrap();
         assert_eq!(map_b.as_slice()[0], 0xAB);
         assert_eq!(map_b.as_slice()[7], 0xCD);
@@ -760,7 +710,6 @@ mod tests {
         assert_eq!(tensor.shape(), &[12]);
         assert_eq!(tensor.len(), 12);
 
-        // Incompatible reshape should fail.
         let result = tensor.reshape(&[7]);
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), Error::ShapeMismatch(_)));
@@ -773,10 +722,6 @@ mod tests {
         }
         let a = ShmTensor::<u8>::new(&[8], None).unwrap();
         let b = ShmTensor::<u8>::new(&[8], None).unwrap();
-        // `Shm` where the platform's fstat gives a real inode (Linux); the
-        // `HostPtr`-tagged fd-number fallback where it does not (confirmed
-        // on macOS -- see `identity_from_stat`'s doc). Either way two
-        // distinct segments must not collide.
         assert!(matches!(
             a.buffer_identity().kind(),
             crate::IdentityKind::Shm | crate::IdentityKind::HostPtr
@@ -789,15 +734,6 @@ mod tests {
         if !shm_or_skip("a_dup_of_the_same_shm_segment_has_the_same_identity") {
             return;
         }
-        // `from_fd` on a dup'd fd is what a cross-library import does. If dup
-        // changed the identity, every such import would miss the GL cache --
-        // the measured blocker this derivation exists to fix (mirrors the
-        // dma-buf test in `crates/tensor/tests/identity.rs`). This property
-        // only holds where the identity is keyed on the real `(st_dev,
-        // st_ino)` -- `dup` preserves the inode, but not the fd number the
-        // `HostPtr` fallback keys on where the platform's fstat gives no
-        // usable inode (see `identity_from_stat`'s doc). Skip loudly rather
-        // than asserting a property this platform cannot provide.
         let a = ShmTensor::<u8>::new(&[8], None).unwrap();
         if a.buffer_identity().kind() != crate::IdentityKind::Shm {
             crate::test_support::report_skip(
@@ -812,18 +748,7 @@ mod tests {
         assert_eq!(a.buffer_identity().id(), dup.buffer_identity().id());
     }
 
-    /// `set_plane_offset` must move a Shm tensor's CPU-map window, not
-    /// merely record a number on the wrapper.
-    ///
-    /// The Shm mirror of the PBO/IOSurface `set_plane_offset` tests.
-    /// `ShmTensor::offset` is the offset `map_inner`/`host_pin` add to the
-    /// mmap base, and `ShmTensor::view` already set it on the fresh-view
-    /// path -- so only *restoring* an offset onto an already-built tensor
-    /// was broken, which is why a freshly created view was right and only
-    /// the descriptor round trip (the `from_fd` reconstruction below,
-    /// mirroring a cross-process import) was wrong. Before the `Shm` arm
-    /// this falls into `set_plane_offset`'s `_ => {}` and the map starts at
-    /// the parent's origin.
+    /// `set_plane_offset` moves a Shm tensor's CPU-map window.
     #[test]
     fn set_plane_offset_moves_the_shm_map_window() {
         if !shm_or_skip("set_plane_offset_moves_the_shm_map_window") {
@@ -835,8 +760,6 @@ mod tests {
         const OFFSET: usize = 64;
         const WINDOW: usize = 64;
 
-        // Ramp the buffer so byte i holds i: a window at the wrong origin
-        // cannot coincidentally match the expected bytes.
         let whole = Tensor::<u8>::new(&[PARENT], Some(TensorMemory::Shm), None).expect("alloc");
         {
             let mut m = whole.map().expect("map the whole buffer");
@@ -845,9 +768,6 @@ mod tests {
             }
         }
 
-        // Re-wrap the WHOLE segment via a cloned fd, as a cross-process
-        // import does: the fd names the parent segment, so this lands at
-        // its origin.
         let fd = whole.clone_fd().expect("clone_fd");
         let mut rebuilt = Tensor::<u8>::from_fd(fd, &[PARENT], None).expect("from_fd");
         rebuilt
@@ -862,7 +782,6 @@ mod tests {
             );
         }
 
-        // The restore under test.
         rebuilt.set_plane_offset(OFFSET);
         assert_eq!(
             rebuilt.plane_offset(),
@@ -876,7 +795,7 @@ mod tests {
         assert_ne!(
             s[0], 0,
             "map() still starts at the parent's origin — set_plane_offset was \
-             a no-op on Shm storage (issue #161)"
+             a no-op on Shm storage"
         );
         for (i, b) in s.iter().enumerate() {
             assert_eq!(
@@ -888,15 +807,7 @@ mod tests {
         }
     }
 
-    /// A nested `subview` must not compound its offset now that
-    /// `set_plane_offset` writes through to Shm storage.
-    ///
-    /// The double-apply guard: `Tensor::subview` sets the offset *twice* by
-    /// two different routes -- `ShmTensor::view` computes `self.offset +
-    /// offset_bytes` inside `TensorStorage::view`, and then `subview` calls
-    /// `set_plane_offset(plane_offset + offset_bytes)` on the result. Those
-    /// are the same number only while the wrapper field and the storage
-    /// field stay in sync, which is what the new arm makes true.
+    /// A nested `subview` does not compound its offset.
     #[test]
     fn nested_shm_subviews_do_not_compound_their_plane_offset() {
         if !shm_or_skip("nested_shm_subviews_do_not_compound_their_plane_offset") {
@@ -926,13 +837,8 @@ mod tests {
         }
     }
 
-    /// `set_format` must clear the Shm tensor's storage-internal window,
-    /// not only the wrapper field.
-    ///
-    /// The clear that pairs with the setter above: without it, changing
-    /// the format leaves `plane_offset() == None` while `map()` still
-    /// starts at the old offset -- a *stale* window rather than a lost
-    /// one, which is strictly harder to notice.
+    /// `set_format` clears the Shm tensor's storage-internal window as well as
+    /// the wrapper field.
     #[test]
     fn set_format_clears_the_shm_map_window() {
         if !shm_or_skip("set_format_clears_the_shm_map_window") {
@@ -961,11 +867,7 @@ mod tests {
         );
     }
 
-    /// `reshape` must clear the Shm tensor's storage-internal window too --
-    /// unlike `PboTensor::reshape`/`IoSurfaceTensor::reshape`, `ShmTensor`'s
-    /// own `reshape` (this file, `fn reshape`) only revalidates the element
-    /// count and swaps `self.shape`; it never zeroes `self.offset`. The
-    /// clear has to live at `Tensor::<T>::reshape`'s call site instead.
+    /// `reshape` clears the Shm tensor's storage-internal window.
     #[test]
     fn reshape_clears_the_shm_map_window() {
         if !shm_or_skip("reshape_clears_the_shm_map_window") {
@@ -984,8 +886,6 @@ mod tests {
         t.set_plane_offset(64);
         assert_eq!(t.plane_offset(), Some(64));
 
-        // Same element count (64), so `TensorTrait::reshape`'s equal-count
-        // rule accepts it.
         t.reshape(&[8, 8]).expect("reshape to an equal-size shape");
         assert_eq!(
             t.plane_offset(),

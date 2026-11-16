@@ -1,10 +1,8 @@
 #!/usr/bin/env bash
 # audit-injection.sh — find GitHub Actions script-injection sites.
 #
-# Flags `${{ ... }}` expressions that appear INSIDE a `run:` block, which is
-# the only place they become shell code. The same expression in `if:`,
-# `with:`, or `env:` is evaluated by the Actions expression engine and passed
-# as a value — those are safe and are deliberately not reported.
+# Flags `${{ ... }}` expressions that appear inside a `run:` block. The same
+# expression in `if:`, `with:`, or `env:` is not reported.
 #
 # Usage:  audit-injection.sh [repo-root ...]      (default: current dir)
 # Exit:   1 if any finding, else 0
@@ -13,8 +11,7 @@ set -uo pipefail
 python3 - "$@" <<'PY'
 import re, sys, os, glob
 
-# Contexts an attacker can set. github.event.* is broadly attacker-influenced;
-# these are the ones that carry free-form text.
+# Contexts that carry attacker-controlled free-form text.
 RISKY = re.compile(r'''github\.(
       head_ref
     | event\.(

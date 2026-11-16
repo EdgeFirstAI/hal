@@ -3,22 +3,12 @@
 
 //! Layout-only C ABI contract for the EdgeFirst tensor surface.
 //!
-//! Plain `#[repr(C)]` values and the integer vocabularies, declared exactly
-//! once. Every `-capi` crate imports these instead of carrying an "identical
-//! copy" — r2's duplication was safe but unverified-by-construction; a single
-//! declaration makes divergence impossible instead of merely absent.
+//! Plain `#[repr(C)]` values and the integer vocabularies, declared once and
+//! imported by every `-capi` crate.
 //!
-//! This crate has **no dependencies** and must never gain one. The vocabulary
-//! values are asserted against `edgefirst-tensor`'s authority from the crates
-//! that depend on both (see `edgefirst-tensor-capi/src/codes.rs`) — this
-//! crate is emitted surface, never a second authority.
+//! This crate has no dependencies.
 
 /// One plane's location, mirroring `TensorPlane` on the wire.
-///
-/// The route by which one library consumes a tensor another minted: the Rust
-/// types are not shared across `.so` boundaries, so the planes are the
-/// interface. Emitted into `edgefirst/tensor.h` as `ef_tensor_plane` by
-/// cbindgen.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct EfTensorPlane {
@@ -55,10 +45,8 @@ pub enum EfDtype {
 
 /// Backing store for a tensor.
 ///
-/// Every kind is declared on every platform. Whether one can be *materialised*
-/// here is a runtime question — an IOSurface is a meaningful thing to name on
-/// Linux even though nothing will allocate one — and platform-gating the
-/// vocabulary would make the same integer mean different things per target.
+/// Every kind is declared on every platform; whether one can be allocated is a
+/// runtime question.
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EfStorageKind {
@@ -94,12 +82,6 @@ pub enum EfStorageKind {
 ///   targets, CPU-drawn overlays). On Linux a DMA-BUF comes from the uncached
 ///   CMA heap where available, and CPU writes are write-combined.
 /// - `EF_CPU_ACCESS_READ_WRITE`: both; cached memory. The default.
-///
-/// A device that maps a cached buffer cleans and invalidates the CPU cache
-/// over all of it on every access (a compositor blitting the buffer every
-/// frame, for example); an uncached buffer needs no cache maintenance. CPU
-/// reads of uncached memory are slow, so only declarations without CPU reads
-/// select it.
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EfCpuAccess {
@@ -109,12 +91,12 @@ pub enum EfCpuAccess {
     ReadWrite = 3,
 }
 
-/// Compression *request*, as `ef_tensor_image_desc_set_compression` takes it
-/// and [`EfImageDescView::compression`] reports it.
+/// Compression request, as `ef_tensor_image_desc_set_compression` takes it and
+/// [`EfImageDescView::compression`] reports it.
 ///
 /// Distinct from [`EfCompression`], which names the scheme an allocation
-/// resolved to. No C setter can request `Scheme`; the view reports it so a
-/// request made through the Rust API is not folded into `Any` or dropped.
+/// resolved to. No C setter can request `Scheme`; the view reports it for a
+/// request made through the Rust API.
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EfCompressionRequest {
@@ -127,23 +109,18 @@ pub enum EfCompressionRequest {
     Scheme = 2,
 }
 
-/// Vendor tile-compression scheme actually in force for a tensor's
-/// allocation.
+/// Vendor tile-compression scheme in force for a tensor's allocation.
 ///
-/// A *result*, not a request: [`EfImageDescView::compression`] carries what
-/// an allocation asked for ("any scheme" / "a specific one"), whereas this
-/// names the scheme the allocator actually resolved to. `None` is a real
-/// enumerator rather than a presence flag because "linear" is the answer for
-/// almost every allocation on almost every platform -- there is no absent
-/// case to distinguish from it, unlike `EfViewOrigin`/`EfQuantizationInfo`
-/// where every field value is legitimate.
+/// A result, not a request: [`EfImageDescView::compression`] carries what an
+/// allocation asked for, and this names the scheme the allocator resolved to.
+/// `None` means a linear layout.
 ///
-/// Mirrors `edgefirst_tensor::CompressionScheme`'s variants, plus the
-/// `None` the Rust side spells as `Option::None`.
+/// Mirrors `edgefirst_tensor::CompressionScheme`'s variants, plus the `None`
+/// the Rust side spells as `Option::None`.
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EfCompression {
-    /// Linear layout -- no vendor tile compression.
+    /// Linear layout: no vendor tile compression.
     #[default]
     None = 0,
     /// Qualcomm Adreno Universal Bandwidth Compression.
@@ -172,25 +149,12 @@ pub enum EfContiguity {
     NonContiguous = 2,
 }
 
-/// Which *kind* of failure the calling thread's last failing
-/// `ef_tensor_*` call was.
+/// Which kind of failure the calling thread's last failing `ef_tensor_*` call
+/// was. The companion to `ef_tensor_last_error_message`.
 ///
-/// The companion to `ef_tensor_last_error_message`, and the reason it
-/// exists: an entry point that reports failure by returning `NULL` has no
-/// errno to carry a class, so a Rust consumer rebuilding a typed
-/// `edgefirst_tensor::Error` from it had nothing to go on but the advisory
-/// message -- which the message's own contract says must never be parsed.
-/// `ef_tensor_batch` really did match on a fragment of a `Display` string
-/// for exactly this reason.
-///
-/// A **class**, not a one-to-one mirror of `edgefirst_tensor::Error`. Its
-/// variants are the distinctions a caller acts on differently; several Rust
-/// variants deliberately collapse into one here, and adding a Rust variant
-/// does not oblige adding one here. `Unspecified` is the honest answer when
-/// a failure path recorded only a message, and is what every such path
-/// resets this to -- a stale class from an earlier failure would be read as
-/// this call's, which is the confident-falsehood shape this whole mechanism
-/// exists to remove.
+/// A class, not a one-to-one mirror of `edgefirst_tensor::Error`: several Rust
+/// variants collapse into one here. `Unspecified` is reported when a failure
+/// path recorded only a message, and every such path resets the class to it.
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EfErrorClass {
@@ -211,7 +175,7 @@ pub enum EfErrorClass {
     /// The operation is not available for this tensor's backing, on this
     /// platform, or in this build.
     NotSupported = 6,
-    /// The operation is legal but not permitted right now -- a live map, a
+    /// The operation is legal but not permitted right now: a live map, a
     /// shared handle, a lock another holder owns.
     InvalidOperation = 7,
     /// An allocation failed, or a syscall backing one did.
@@ -222,20 +186,12 @@ pub enum EfErrorClass {
 
 /// Flattened, `#[repr(C)]` view of an image-request descriptor's fields.
 ///
-/// `ef_tensor_image_desc` is opaque (handles are opaque both ways: a
-/// receiving library never dereferences, sizes, or copies one). This is the
-/// scalar block `ef_tensor_image_desc_get` fills instead -- the same shape as
-/// `ef_tensor_plane`, which lets one library read a tensor it did not mint
-/// without touching the other's private layout.
+/// `ef_tensor_image_desc` is opaque; this is the scalar block
+/// `ef_tensor_image_desc_get` fills.
 ///
-/// `memory` and `compression` are each a value plus an explicit presence
-/// flag rather than a sentinel: every code in `ef_storage_kind` (0..=6) is a
-/// real value, so there is no unused number to repurpose as "no request"
-/// without colliding with `ef_storage_kind`'s `MEM == 0`. `compression` is an
-/// [`EfCompressionRequest`]: `Any`, or `Scheme` for "a specific vendor
-/// scheme", the latter not further decodable through this view -- no
-/// `ef_tensor_image_desc_set_*` entry point can request one, so this view has
-/// never needed to carry more detail than "present, and it's a specific one."
+/// `memory` and `compression` are each a value plus an explicit presence flag.
+/// `compression` is an [`EfCompressionRequest`]: `Any`, or `Scheme` for a
+/// specific vendor scheme, which this view does not decode further.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct EfImageDescView {
@@ -262,12 +218,9 @@ pub struct EfImageDescView {
 
 /// Parent-region snapshot for a tensor that is a `view`/`batch` sub-region.
 ///
-/// The scalar block `ef_tensor_view_origin` fills, the same shape as
-/// `ef_tensor_plane` and `ef_tensor_image_desc_view` -- one library reading a
-/// tensor it did not mint. `has_origin` is a presence flag rather than a
-/// sentinel value because every field is a legitimate 0 for a view pinned at
-/// the parent's top-left corner; the other fields are meaningful only when
-/// it is non-zero. Mirrors `edgefirst_tensor::ViewOrigin`.
+/// The scalar block `ef_tensor_view_origin` fills. The other fields are
+/// meaningful only when `has_origin` is non-zero. Mirrors
+/// `edgefirst_tensor::ViewOrigin`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct EfViewOrigin {
@@ -288,37 +241,28 @@ pub struct EfViewOrigin {
 
 /// The D3D11 texture behind a Windows texture tensor.
 ///
-/// The scalar block `ef_tensor_d3d11_layout` fills, the same shape as
-/// `ef_tensor_plane` and `ef_tensor_view_origin` -- one library reading a
-/// tensor it did not mint. Mirrors `edgefirst_tensor::d3d11_layout::
-/// D3d11ImageLayout`.
+/// The scalar block `ef_tensor_d3d11_layout` fills. Mirrors
+/// `edgefirst_tensor::d3d11_layout::D3d11ImageLayout`.
 ///
 /// The dimensions are the texture's, in texels and rows, not the image's in
 /// pixels: a combined-plane semi-planar image is one texture whose row count
-/// covers both planes, and a YUYV image is one texel per two pixels, so
-/// `texture_width`/`texture_height` do not match `ef_tensor_shape` for
-/// either. Read the image's own dimensions from the shape.
+/// covers both planes, and a YUYV image is one texel per two pixels. Read the
+/// image's own dimensions from `ef_tensor_shape`.
 ///
 /// An NV12 image of even width and height is a native two-plane texture,
-/// `dxgi_format` 103 (`DXGI_FORMAT_NV12`): `texture_width` x
-/// `texture_height` is the luma grid, the image's own size, and the chroma
-/// plane is a second plane of the same texture at half each dimension, which
-/// GL and video APIs address by plane index. A CPU map of it is still laid
-/// out as luma rows then chroma rows at `ef_tensor_row_stride`.
+/// `dxgi_format` 103 (`DXGI_FORMAT_NV12`): `texture_width` x `texture_height`
+/// is the luma grid, the image's own size, and the chroma plane is a second
+/// plane of the same texture at half each dimension, which GL and video APIs
+/// address by plane index. A CPU map of it is laid out as luma rows then
+/// chroma rows at `ef_tensor_row_stride`.
 ///
 /// Every other semi-planar image (`nv16`, `nv24`, and `nv12` at an odd size)
 /// is the combined-plane `R8` texture, whose `texture_width` is the driver's
-/// row pitch -- at least `even(width)`, and on a discrete adapter commonly
-/// more (128 bytes on NVIDIA, so a 64-wide NV16 image is a 128-wide texture).
-/// It is the pitch the combined plane's rows are spaced by and the width a
-/// sampler must address the texture at. Never derive it from the image
-/// width: read this field, or `ef_tensor_row_stride`, which carries the same
-/// number.
+/// row pitch: at least `even(width)`, and possibly more. It is the pitch the
+/// combined plane's rows are spaced by and the width a sampler addresses the
+/// texture at. `ef_tensor_row_stride` carries the same number.
 ///
-/// By-value and frozen forever: a consumer bakes this size and these offsets
-/// into its call sites, so the struct evolves by a suffixed successor, never
-/// by an in-place edit. `d3d11_layout_is_pinned` and the C golden in
-/// `tensor-capi/tests/c/test_layout_goldens.c` hold both sides to it.
+/// Passed by value; its size and field offsets are fixed.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct EfD3d11Layout {
@@ -335,20 +279,12 @@ pub struct EfD3d11Layout {
     pub gl_internal_format: u32,
 }
 
-/// Presence/shape summary of a tensor's quantization metadata.
+/// Presence and shape summary of a tensor's quantization metadata.
 ///
 /// The first half of the two-call idiom `ef_tensor_quantization_info` /
-/// `ef_tensor_quantization_get` use: this scalar block tells the caller
-/// *whether* quantization is attached and *how big* a buffer the second call
-/// needs, without allocating on either side of the boundary --
-/// `Quantization` itself is variable-length (an axis plus per-axis `scales`
-/// and `zero_points`), so unlike `ef_tensor_plane`/`ef_tensor_view_origin`
-/// this view cannot carry the payload itself.
-///
-/// `has_quantization` is a presence flag, not a sentinel, for the same
-/// reason `EfViewOrigin::has_origin` is: axis `0` and a scale of `0.0` are
-/// both legitimate values, so there is no unused bit pattern to repurpose as
-/// "absent" without colliding with a real one.
+/// `ef_tensor_quantization_get` use: this scalar block reports whether
+/// quantization is attached and how many entries the second call's buffers
+/// need.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct EfQuantizationInfo {
@@ -366,11 +302,9 @@ pub struct EfQuantizationInfo {
 
 /// A mapped CPU window over a tensor's bytes.
 ///
-/// By-value with no version field and no reserved tail, so its size
-/// is baked into consumer call sites, so it evolves by a suffixed successor
-/// (`ef_tensor_view2` + new entry points), never in place. The pointer is
-/// valid from `ef_tensor_map` until the matching `ef_tensor_unmap`; writing
-/// through it is allowed only when the map was taken with a writable access.
+/// Passed by value; its size is fixed. The pointer is valid from
+/// `ef_tensor_map` until the matching `ef_tensor_unmap`; writing through it is
+/// allowed only when the map was taken with a writable access.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct EfTensorView {
@@ -383,60 +317,34 @@ pub struct EfTensorView {
 /// Must be safe to call from any thread and must not unwind.
 pub type EfClientRefFn = unsafe extern "C" fn(ctx: *const core::ffi::c_void);
 
-/// Client-owned state a library entry point calls back into — **frozen by
-/// value, forever**, and reused verbatim by every domain that needs one
-/// (PBO today; CUDA-GL next).
+/// Client-owned state a library entry point calls back into. Passed by value;
+/// its size and field offsets are fixed.
 ///
-/// # What `retain`/`release` govern — and what they do not
+/// # What `retain`/`release` govern
 ///
-/// They extend the life of the **callback channel only**. They never
-/// transfer ownership of the GL buffer, the CUDA resource, or anything else
-/// the context happens to address. Getting this backwards double-frees a GL
-/// buffer:
+/// They extend the life of the callback channel only. They never transfer
+/// ownership of the GL buffer, the CUDA resource, or anything else the context
+/// addresses:
 ///
 /// * The producing side's own destructor stays the sole caller of the real
 ///   `delete_buffer`.
 /// * A library that reconstructed operations from this struct treats
-///   `delete_buffer` as a no-op — it borrows the resource, it does not own
-///   it.
+///   `delete_buffer` as a no-op: it borrows the resource.
 ///
 /// # Ownership at an entry point
 ///
-/// An entry point that stores this struct calls `retain(ctx)` itself and
-/// calls `release(ctx)` exactly once when the object holding it is
-/// destroyed. The caller keeps its own count and may drop it at any time
-/// after the call returns.
+/// An entry point that stores this struct calls `retain(ctx)` itself and calls
+/// `release(ctx)` exactly once when the object holding it is destroyed. The
+/// caller keeps its own count and may drop it at any time after the call
+/// returns.
 ///
-/// # Freezing
-///
-/// This vocabulary declines the `struct_size` handshake (see the root
-/// `ARCHITECTURE.md`, "Why there is no `struct_size` handshake"), so a
-/// by-value struct grows only by a major bump or a suffixed successor.
-/// Freezing **one** tiny universal struct — rather than one per domain, or
-/// one that grows per domain — is what keeps that cost paid once. Its size
-/// and offsets are pinned by `tests/c/test_layout_goldens.c` in
-/// `edgefirst-tensor-capi` and by `client_state_layout_is_pinned` below.
-///
-/// `ctx` is opaque to the library: only the producing copy of the code ever
+/// `ctx` is opaque to the library: only the producing copy of the code
 /// dereferences it.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct EfClientState {
     /// Opaque to every caller except this struct's own function pointers.
     pub ctx: *const core::ffi::c_void,
-    // Spelled out rather than as `Option<EfClientRefFn>` -- the identical
-    // type -- because cbindgen resolves `Option<T>` to a plain C function
-    // pointer only when `T` is syntactically a bare `fn`. Given the alias it
-    // emits an opaque wrapper struct and uses it *by value*, an incomplete
-    // type in C: the header would not even compile, let alone match this
-    // struct's 24 bytes. (A third form also works and is what the PBO ops
-    // use -- an alias whose right-hand side is itself `Option<bare fn>`;
-    // see `EfPboMapFnNullable`. It is not used here because these fields
-    // want no name of their own in the header.)
-    //
-    // This comment is `//`, not `///`, on purpose: it would otherwise be
-    // copied into the C header, where it would describe Rust machinery to a
-    // C reader and name a struct that does not exist in the emitted output.
     /// Add one reference to the callback channel. Never NULL in a valid
     /// state; an entry point receiving NULL must fail with `EINVAL`.
     pub retain: Option<unsafe extern "C" fn(ctx: *const core::ffi::c_void)>,
@@ -459,29 +367,11 @@ pub type EfPboMapFn = unsafe extern "C" fn(
 pub type EfPboUnmapFn =
     unsafe extern "C" fn(ctx: *const core::ffi::c_void, buffer_id: u32) -> core::ffi::c_int;
 
-// This doc is what a C reader sees for `ef_pbo_map_fn`, so it says what the
-// callback does and nothing about Rust. The mechanics, for Rust readers:
-//
-// Two Rust aliases, one C type. In C there is only ever a function pointer
-// that may or may not be NULL, so this one carries the `ef_pbo_map_fn` name
-// in the header and the bare `EfPboMapFn` is not emitted at all. The bare
-// alias is the Rust-side vocabulary for a pointer already checked -- what
-// `PboOpsVtable` stores and what `client_state_pbo_ops` takes -- and it must
-// stay bare, or every holder would carry an `Option` it has already proved
-// is `Some`.
-//
-// This one is spelled as `Option<` over a *bare* `fn`, not over
-// `EfPboMapFn`: cbindgen resolves `Option<T>` to a nullable C function
-// pointer only when `T` is syntactically a bare `fn`. Given the alias it
-// emits an opaque `struct Option_EfPboMapFn` and passes it by value -- an
-// incomplete type no C caller can name. Given this, it emits
-// `typedef int (*ef_pbo_map_fn)(...)` and uses that name at the call site,
-// which is why `ef_tensor_wrap_pbo`'s header signature does not move.
 /// Map a PBO for CPU access. `0` on success; `-1` when the GL context is
 /// gone; any other non-zero value a generic failure.
 ///
-/// May be NULL where an entry point takes one; such an entry point refuses
-/// a NULL rather than calling through it.
+/// May be NULL where an entry point takes one; such an entry point refuses a
+/// NULL.
 pub type EfPboMapFnNullable = Option<
     unsafe extern "C" fn(
         ctx: *const core::ffi::c_void,
@@ -492,12 +382,10 @@ pub type EfPboMapFnNullable = Option<
     ) -> core::ffi::c_int,
 >;
 
-// See `EfPboMapFnNullable` for why there are two aliases and why this one
-// spells the `fn` out rather than naming `EfPboUnmapFn`.
 /// Unmap a PBO previously mapped by an `ef_pbo_map_fn`. Same return codes.
 ///
-/// May be NULL where an entry point takes one; such an entry point refuses
-/// a NULL rather than calling through it.
+/// May be NULL where an entry point takes one; such an entry point refuses a
+/// NULL.
 pub type EfPboUnmapFnNullable =
     Option<unsafe extern "C" fn(ctx: *const core::ffi::c_void, buffer_id: u32) -> core::ffi::c_int>;
 
@@ -519,8 +407,8 @@ pub type EfCudaUnregisterFn =
 
 /// Map a CUDA graphics resource to a device pointer. `0` on success.
 ///
-/// May be NULL where an entry point takes one; such an entry point refuses
-/// a NULL rather than calling through it.
+/// May be NULL where an entry point takes one; such an entry point refuses a
+/// NULL.
 pub type EfCudaMapFnNullable = Option<
     unsafe extern "C" fn(
         ctx: *const core::ffi::c_void,
@@ -532,15 +420,15 @@ pub type EfCudaMapFnNullable = Option<
 
 /// Unmap a resource previously mapped by an `ef_cuda_map_fn`.
 ///
-/// May be NULL where an entry point takes one; such an entry point refuses
-/// a NULL rather than calling through it.
+/// May be NULL where an entry point takes one; such an entry point refuses a
+/// NULL.
 pub type EfCudaUnmapFnNullable =
     Option<unsafe extern "C" fn(ctx: *const core::ffi::c_void, resource: *mut core::ffi::c_void)>;
 
 /// Unregister a CUDA graphics resource.
 ///
-/// May be NULL where an entry point takes one; such an entry point refuses
-/// a NULL rather than calling through it.
+/// May be NULL where an entry point takes one; such an entry point refuses a
+/// NULL.
 pub type EfCudaUnregisterFnNullable =
     Option<unsafe extern "C" fn(ctx: *const core::ffi::c_void, resource: *mut core::ffi::c_void)>;
 
@@ -551,7 +439,7 @@ mod tests {
     #[test]
     fn plane_layout_is_the_48_byte_scalar_block_the_blob_assumes() {
         // The blob's 56-byte plane record is this 48-byte scalar block plus
-        // two 4-byte sequence counts (spec: Blob format, [r2] As built).
+        // two 4-byte sequence counts.
         assert_eq!(std::mem::size_of::<EfTensorPlane>(), 48);
         assert_eq!(std::mem::align_of::<EfTensorPlane>(), 8);
     }
@@ -571,17 +459,14 @@ mod tests {
 
     #[test]
     fn image_desc_view_layout_is_pinned() {
-        // Two `u64`s force 8-byte alignment, so the seven trailing `u32`s
-        // (28 bytes) pad out to a 48-byte struct. Pinned so a field reorder
-        // or an added field is a deliberate, visible change here.
+        // Two `u64`s and seven `u32`s (28 bytes) pad out to 48 bytes at align 8.
         assert_eq!(std::mem::size_of::<EfImageDescView>(), 48);
         assert_eq!(std::mem::align_of::<EfImageDescView>(), 8);
     }
 
     #[test]
     fn view_origin_layout_is_pinned() {
-        // Five `u64`s plus a trailing `u32` pad out to 48 at align 8. Same
-        // freeze as the C golden: a field reorder is a new suffixed struct.
+        // Five `u64`s plus a trailing `u32` pad out to 48 at align 8.
         assert_eq!(std::mem::size_of::<EfViewOrigin>(), 48);
         assert_eq!(std::mem::align_of::<EfViewOrigin>(), 8);
     }
@@ -589,9 +474,6 @@ mod tests {
     #[test]
     fn error_class_is_u32_and_unspecified_is_zero() {
         assert_eq!(std::mem::size_of::<EfErrorClass>(), 4);
-        // 0 must be the "nothing recorded" answer: a zeroed or never-set
-        // slot has to read as "no class", never as a real classification a
-        // consumer would then act on.
         assert_eq!(EfErrorClass::Unspecified as u32, 0);
         assert_eq!(EfErrorClass::default(), EfErrorClass::Unspecified);
     }
@@ -600,8 +482,6 @@ mod tests {
     fn compression_is_u32_and_none_is_zero() {
         assert_eq!(std::mem::size_of::<EfCompression>(), 4);
         assert_eq!(std::mem::size_of::<EfContiguity>(), 4);
-        // `ef_tensor_compression` returns this by value, and a zeroed/failed
-        // read must read as "linear", never as a scheme.
         assert_eq!(EfCompression::None as u32, 0);
         assert_eq!(EfCompression::default(), EfCompression::None);
     }
@@ -613,29 +493,21 @@ mod tests {
 
     #[test]
     fn d3d11_layout_is_pinned() {
-        // Five 4-byte fields, no `u64` to force wider alignment -- 20 bytes,
-        // 4-byte aligned, and the field order the C golden asserts offsets
-        // for. A widened field or a reorder is a new suffixed struct.
+        // Five 4-byte fields: 20 bytes, 4-byte aligned.
         assert_eq!(std::mem::size_of::<EfD3d11Layout>(), 20);
         assert_eq!(std::mem::align_of::<EfD3d11Layout>(), 4);
     }
 
     #[test]
     fn quantization_info_layout_is_pinned() {
-        // Three 4-byte fields, no `u64` to force wider alignment -- 12 bytes,
-        // 4-byte aligned. Pinned so a field reorder or an added field is a
-        // deliberate, visible change here.
+        // Three 4-byte fields: 12 bytes, 4-byte aligned.
         assert_eq!(std::mem::size_of::<EfQuantizationInfo>(), 12);
         assert_eq!(std::mem::align_of::<EfQuantizationInfo>(), 4);
     }
 
     #[test]
     fn a_nullable_pbo_op_is_one_pointer_and_matches_its_bare_alias() {
-        // The nullable aliases are what `ef_tensor_wrap_pbo` receives and
-        // what the header's `ef_pbo_map_fn` typedef describes. If the
-        // null-pointer optimization did not apply they would not be plain C
-        // function pointers, and the header would describe an argument the
-        // ABI does not pass.
+        // The nullable aliases are the size of a plain function pointer.
         assert_eq!(
             core::mem::size_of::<EfPboMapFnNullable>(),
             core::mem::size_of::<EfPboMapFn>()
@@ -648,8 +520,7 @@ mod tests {
             core::mem::size_of::<EfPboMapFnNullable>(),
             core::mem::size_of::<*const core::ffi::c_void>()
         );
-        // And `Some(f)` really is `f`: the two aliases describe one C type,
-        // so these assignments must compile.
+        // `Some(f)` of the bare alias is the nullable alias: these assignments compile.
         unsafe extern "C" fn m(
             _: *const core::ffi::c_void,
             _: u32,
@@ -670,10 +541,7 @@ mod tests {
 
     #[test]
     fn client_state_layout_is_pinned() {
-        // Three pointer-sized members at align 8. Frozen forever: this
-        // vocabulary declines a `struct_size` handshake, so a field added
-        // here is a new suffixed struct, not an edit. Mirrored by
-        // `_Static_assert`s in edgefirst-tensor-capi's C layout goldens.
+        // Three pointer-sized members at align 8.
         assert_eq!(std::mem::size_of::<EfClientState>(), 24);
         assert_eq!(std::mem::align_of::<EfClientState>(), 8);
         assert_eq!(std::mem::offset_of!(EfClientState, ctx), 0);
@@ -683,18 +551,12 @@ mod tests {
 
     #[test]
     fn a_nullable_client_ref_fn_is_pointer_sized() {
-        // `Option<extern "C" fn(..)>` must use the null-pointer
-        // optimization, or `retain`/`release` would not be a plain C
-        // function pointer and the struct above would not be 24 bytes.
-        // `EfClientRefFn` is the same type the two fields spell out (they
-        // spell it out only so cbindgen emits a C function pointer rather
-        // than an opaque `Option_` struct), so this covers both.
+        // `Option<extern "C" fn(..)>` is pointer-sized.
         assert_eq!(
             std::mem::size_of::<Option<EfClientRefFn>>(),
             std::mem::size_of::<*const core::ffi::c_void>()
         );
-        // And they really are the same type, not merely the same size: this
-        // assignment would not compile otherwise.
+        // The field's type is `Option<EfClientRefFn>`: this assignment compiles.
         let _: Option<EfClientRefFn> = EfClientState {
             ctx: core::ptr::null(),
             retain: None,
@@ -705,9 +567,7 @@ mod tests {
 
     #[test]
     fn this_crate_has_no_dependencies_and_never_may() {
-        // Load-bearing for the whole design: tensor-ffi -> tensor-abi must never
-        // drag an implementation into the dynamic backend (spec r3). The
-        // [dependencies] table is empty and this test keeps it that way.
+        // The `[dependencies]` table is empty.
         let manifest = include_str!("../Cargo.toml");
         assert!(
             !manifest.contains("[dependencies."),

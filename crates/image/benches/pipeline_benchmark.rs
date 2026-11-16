@@ -8,7 +8,7 @@
 //! `EDGEFIRST_FORCE_BACKEND=cpu|g2d|opengl` to pin a specific backend.
 //!
 //! The harness runs all benchmarks sequentially in a single process with
-//! no forking, avoiding GPU driver state corruption across fork boundaries.
+//! no forking.
 //!
 //! ## Run benchmarks (host)
 //! ```bash
@@ -336,7 +336,7 @@ fn bench_flip(proc: &mut ImageProcessor, suite: &mut BenchSuite, max_width: usiz
 }
 
 // =============================================================================
-// Letterbox Pipeline Benchmarks: Realistic camera -> model with clear+resize
+// Letterbox Pipeline Benchmarks: camera -> model with clear+resize
 // =============================================================================
 
 fn bench_letterbox_pipeline(
@@ -364,7 +364,7 @@ fn bench_letterbox_pipeline(
         (PixelFormat::Nv12, PixelFormat::Rgba, DType::U8),
         (PixelFormat::Nv12, PixelFormat::Rgb, DType::U8),
         (PixelFormat::Nv12, PixelFormat::PlanarRgb, DType::U8),
-        // packed RGB source: a fused RGB JPEG decode
+        // packed RGB source
         (PixelFormat::Rgb, PixelFormat::Rgba, DType::U8),
         (PixelFormat::Rgb, PixelFormat::Rgb, DType::U8),
         (PixelFormat::Rgb, PixelFormat::PlanarRgb, DType::U8),
@@ -431,7 +431,7 @@ fn bench_letterbox_pipeline(
                 continue;
             }
 
-            // Calculate correct throughput based on actual input format bytes
+            // Throughput from the input format's bytes.
             let throughput = BenchConfig::new(w, h, 640, 640, *in_fmt, *out_fmt).throughput();
             let result = run_bench(&name, WARMUP, ITERATIONS, || {
                 proc.convert(
@@ -461,7 +461,7 @@ fn main() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(usize::MAX);
-    // Optional: skip NV12 planar combos (hangs on Vivante GC7000UL)
+    // Optional: skip NV12 planar combos.
     let skip_nv12_planar = std::env::var("BENCH_SKIP_NV12_PLANAR").is_ok();
 
     println!("Pipeline Benchmark — edgefirst-bench harness");

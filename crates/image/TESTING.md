@@ -21,9 +21,9 @@ crates/image/
 ├── tests/
 │   ├── crop_golden.rs      # Frozen per-architecture cropped-convert fixtures
 │   ├── convert_span_feed_fields.rs  # src_feed/dst_feed land on image.convert.gl
-│   │                       # (own binary + a GLOBAL subscriber: tracing caches
-│   │                       #  callsite interest per PROCESS, so a scoped one
-│   │                       #  among parallel tests is a coin flip)
+│   │                       # (own binary + a global subscriber: tracing caches
+│   │                       #  callsite interest per process, so a scoped one
+│   │                       #  among parallel tests is unreliable)
 │   ├── odd_dim_cpu.rs      # End-to-end odd-dimension CPU conversion
 │   ├── write_only_destinations.rs  # CPU convert never reads a Write destination
 │   │                       # (pre-filled two ways through a ReadWrite alias);
@@ -73,16 +73,7 @@ cargo test -p edgefirst-image --doc -- --test-threads=1
 
 ### Single-threaded execution is mandatory
 
-All `edgefirst-image` tests must run with `--test-threads=1`. The image
-crate is the load-bearing reason for the
-[project-wide single-threaded rule](https://github.com/EdgeFirstAI/hal/blob/main/TESTING.md#single-threaded-execution)
-— concurrent EGL, G2D, and DMA-heap operations crash on Vivante
-hardware and risk CMA pool exhaustion on memory-constrained targets.
-The
-[`Makefile`](https://github.com/EdgeFirstAI/hal/blob/main/Makefile)
-enforces `-j 1` automatically. See
-[`ARCHITECTURE.md`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/ARCHITECTURE.md#gl-concurrency-model-serialization-policy)
-for the `GL_MUTEX` implementation that makes this rule load-bearing.
+All `edgefirst-image` tests must run with `--test-threads=1`. The image crate is the reason for the [project-wide single-threaded rule](https://github.com/EdgeFirstAI/hal/blob/main/TESTING.md#single-threaded-execution) — concurrent EGL, G2D, and DMA-heap operations crash on Vivante hardware and risk CMA pool exhaustion on memory-constrained targets. The [`Makefile`](https://github.com/EdgeFirstAI/hal/blob/main/Makefile) enforces `-j 1` automatically. See [`ARCHITECTURE.md`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/ARCHITECTURE.md#gl-concurrency-model-serialization-policy) for the `GL_MUTEX` implementation.
 
 ### GL hardware-gated tests
 
@@ -210,7 +201,7 @@ EDGEFIRST_DISABLE_GL=1 EDGEFIRST_DISABLE_G2D=1 \
 
 [`tests/crop_golden.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/tests/crop_golden.rs) holds an 80-case matrix of CPU cropped-convert outputs, stored as CRC32s in `tests/data/crop_golden.<arch>.json`. It is the byte-exactness arbiter for the crop path: `cropped_convert_matches_golden` replays the matrix and fails on any change to a single output byte.
 
-**Regenerate the fixtures only for a deliberate change to the CPU resampling.** `generate_golden` exists and is `#[ignore]`d. A crop-path change must keep the existing fixtures green; regenerating to make it pass turns the guard into a rubber stamp for whatever the code currently does. When the resampling itself changes on purpose, regenerate both architecture files from the same tree and say so in the commit.
+**Regenerate the fixtures only for a deliberate change to the CPU resampling.** `generate_golden` exists and is `#[ignore]`d. A crop-path change must keep the existing fixtures green; regenerating to make it pass removes the guard. When the resampling itself changes on purpose, regenerate both architecture files from the same tree and say so in the commit.
 
 The fixtures are **per architecture**. The `yuv` crate's exact (`Professional`) YUV→RGB kernels are picked at runtime, one NEON kernel on aarch64 and AVX2 or SSE4.1 on x86_64, and the two files currently hold the same checksums: verified on an AVX2 host and on i.MX 95 (Cortex-A55) and i.MX 8M Plus (Cortex-A53) hardware. An x86_64 CPU without AVX2 **skips** the matrix test, because only the AVX2 kernel has been compared; cropped-convert correctness there is covered by the oracle-based lib tests (`fused_region_matches_general_path`, `left_edge_crop_zero_copy_*`, `crop_edge_matches_full_frame_intermediate`), which compare against references computed in the same run.
 
@@ -377,19 +368,7 @@ LIBGL_ALWAYS_SOFTWARE=1 EGL_PLATFORM=surfaceless EDGEFIRST_ALLOW_SOFTWARE_GL=1 \
 
 ### Known ceiling: Linux GL float DMA-BUF render path
 
-After the software-gl lane, the only float-render code with no CI coverage is
-the **DMA-BUF zero-copy** path — `gl/processor/float.rs::convert_float_to_dma`
-and its EGLImage/DMA-BUF import. It binds a `DRM_FORMAT_ABGR16161616F`
-dma-buf as the render target, which only works on a real **V3D** (Raspberry
-Pi 5) or **Mali** (i.MX 95) GPU. The CI coverage matrix has no such runner
-(x86_64/aarch64 are headless, the i.MX 8M Plus lane is **Vivante** where float
-GL is *disabled*, `supported_render_dtypes()` → `{ f16: false, f32: false }`).
-That path is therefore covered **on-target, manually** — the
-`convert_f16_nchw_dma_roundtrip` test passes on rpi5-hailo and imx95-frdm —
-but does not contribute to the CI coverage number until a V3D/Mali board joins
-the coverage matrix. It is the only remaining float-render gap; everything
-else (pure logic, CPU fallback, IOSurface F16, and the Linux PBO render path)
-is covered in CI.
+The only float-render code with no CI coverage is the **DMA-BUF zero-copy** path — `gl/processor/float.rs::convert_float_to_dma` and its EGLImage/DMA-BUF import. It binds a `DRM_FORMAT_ABGR16161616F` dma-buf as the render target, which only works on a real **V3D** (Raspberry Pi 5) or **Mali** (i.MX 95) GPU. The CI coverage matrix has no such runner (x86_64/aarch64 are headless, the i.MX 8M Plus lane is **Vivante** where float GL is *disabled*, `supported_render_dtypes()` → `{ f16: false, f32: false }`). That path is therefore covered **on-target, manually** — the `convert_f16_nchw_dma_roundtrip` test passes on rpi5-hailo and imx95-frdm — but does not contribute to the CI coverage number until a V3D/Mali board joins the coverage matrix. It is the only float-render gap; everything else (pure logic, CPU fallback, IOSurface F16, and the Linux PBO render path) is covered in CI.
 
 ## Cross-References
 

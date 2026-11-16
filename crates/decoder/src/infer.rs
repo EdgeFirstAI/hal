@@ -3,11 +3,10 @@
 
 //! Ultralytics YOLO schema inference from raw model I/O signals.
 //!
-//! Model export pipelines (ONNX, TFLite, CoreML) carry Ultralytics-authored
+//! Model exports (ONNX, TFLite, CoreML) carry Ultralytics-authored
 //! metadata (class names, task, input size) alongside the tensor shapes
-//! and dtypes the runtime reports. This module turns that raw signal into
-//! a [`crate::schema::SchemaV2`] the decoder can act on, without requiring
-//! a hand-written `edgefirst.json` for every Ultralytics export.
+//! and dtypes the runtime reports. This module turns those signals into
+//! a [`crate::schema::SchemaV2`].
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -38,39 +37,22 @@ edgefirst_tensor::ef_vocabulary! {
     /// The code is the one the C `EF_MODEL_SOURCE_*` enumerators use; the
     /// string form is the one the Python bindings accept.
     pub enum ModelSource {
-        /// An ONNX export. Ultralytics emits pixel-space box coordinates here,
-        /// so the inferred schema sets `normalized: false`.
+        /// An ONNX export. Ultralytics emits pixel-space box coordinates;
+        /// the inferred schema sets `normalized: false`.
         Onnx = 0, "onnx", ONNX,
         /// A TFLite/LiteRT export. Ultralytics emits boxes normalized to
-        /// `[0, 1]` here, so the inferred schema sets `normalized: true`.
+        /// `[0, 1]`; the inferred schema sets `normalized: true`.
         TfLite = 1, "tflite", TFLITE,
-        /// A CoreML export (`.mlpackage` / `.mlmodelc`). Ultralytics' CoreML
-        /// converter traces the same graph the ONNX exporter traces — the
-        /// `1/w` normalize lives only in `IOSDetectModel`, which is used
-        /// solely on the `nms=True` pipeline path — so a no-NMS export emits
-        /// pixel-space box coordinates and the inferred schema sets
-        /// `normalized: false`, matching [`ModelSource::Onnx`].
+        /// A CoreML export (`.mlpackage` / `.mlmodelc`). A no-NMS export
+        /// emits pixel-space box coordinates; the inferred schema sets
+        /// `normalized: false`, as for [`ModelSource::Onnx`].
         ///
-        /// Established by source-tracing the Ultralytics exporter and
-        /// confirmed by runtime magnitude measurement against a matched fp16
-        /// ONNX pair; `testdata/infer/NOTES.md` records the reasoning, the
-        /// measurement and the captured fixture.
-        ///
-        /// This resolution covers the no-NMS export only. A `nms=True` export
-        /// runs Apple's NMS pipeline (`image`/`iouThreshold`/
-        /// `confidenceThreshold` inputs, dynamically-shaped `confidence`/
-        /// `coordinates` outputs) — a different artifact entirely, not the
-        /// anchor-grid tensor this resolution reasons about. Inference does
-        /// not classify it as a schema: neither output's shape can match the
-        /// `[1, 4+nc, A]` anchor-grid layout this module looks for.
+        /// A `nms=True` export (`image`/`iouThreshold`/`confidenceThreshold`
+        /// inputs, dynamically-shaped `confidence`/`coordinates` outputs) is
+        /// not classified: inference returns an error for it.
         CoreMl = 3, "coreml", COREML,
-        /// Any other container. Inference **refuses** this with
-        /// [`InferError::UnknownBoxConvention`] rather than assuming a box
-        /// convention: whether coordinates are pixel-space or `[0, 1]` follows
-        /// the exporter, is not derivable from tensor shapes, and getting it
-        /// wrong scales every box by the input size. The variant exists so a
-        /// signal collector can report honestly what it read; add a measured
-        /// container here rather than routing it through `Other`.
+        /// Any other container. Inference refuses this with
+        /// [`InferError::UnknownBoxConvention`].
         Other = 2, "other", OTHER,
     }
     #[doc(hidden)]
@@ -112,8 +94,7 @@ pub enum InferError {
     /// The Ultralytics `names` metadata field could not be parsed.
     BadNames(String),
     /// A metadata field is present but carries a value that cannot be
-    /// interpreted. Distinct from an absent field, which is allowed to
-    /// select a fallback.
+    /// interpreted.
     BadMetadata(String),
     /// The Ultralytics `task` metadata field names an unsupported task.
     UnsupportedTask(String),
@@ -123,19 +104,15 @@ pub enum InferError {
     /// The output tensor layout does not match any supported Ultralytics
     /// convention.
     UnsupportedLayout(String),
-    /// More than one output matches the same layout, so which tensor
-    /// carries the detections depends on the order the runtime reported
-    /// them. Reported rather than resolved by position.
+    /// More than one output matches the same layout.
     AmbiguousLayout(String),
-    /// A boundary tensor carries quantization the decoder cannot consume.
-    /// Currently this means per-channel quantization: the decoder supports
-    /// per-tensor only, so such a schema would build a decoder that fails.
+    /// A boundary tensor carries quantization the decoder cannot consume:
+    /// per-channel quantization, no scale, or zero points that do not pair
+    /// with the scale.
     UnsupportedQuantization(String),
-    /// The signals came from [`ModelSource::Other`], for which the box
-    /// coordinate convention is unmeasured. Only the ONNX (pixel-space),
-    /// TFLite (`[0, 1]`), and CoreML (pixel-space) conventions are
-    /// characterized, and picking the wrong one silently scales every box
-    /// by the input size.
+    /// The signals came from [`ModelSource::Other`], which has no known
+    /// box coordinate convention. The known conventions are ONNX
+    /// (pixel-space), TFLite (`[0, 1]`) and CoreML (pixel-space).
     UnknownBoxConvention,
 }
 
@@ -205,21 +182,8 @@ struct UltralyticsMeta {
     end2end: Option<bool>,
 }
 
-/// Refuses metadata that positively identifies a *different* vendor.
-///
-/// A `names` map alone is not an Ultralytics signature — any exporter can
-/// write class names — and this function then applies Ultralytics box,
-/// score and normalization conventions to whatever it was given. Real
-/// exports carry `author: "Ultralytics"` and a `docs` URL, so when either
-/// is present and names someone else, that is a positive contradiction and
-/// an error.
-///
-/// Absence is not treated as a contradiction: intermediate tools
-/// (quantizers, format converters) routinely preserve `names` while
-/// dropping provenance fields, and those exports are still the ones this
-/// module exists to read. The layout cross-checks that follow remain the
-/// substantive guard — a model whose shapes don't fit is rejected whatever
-/// its metadata claims.
+/// Returns an error when `author` or `docs` is present, non-empty and
+/// does not name Ultralytics. Absent fields are accepted.
 fn reject_foreign_vendor(author: Option<&String>, docs: Option<&String>) -> Result<(), InferError> {
     let names_ultralytics = |v: &String| v.to_ascii_lowercase().contains("ultralytics");
     for (field, value) in [("author", author), ("docs", docs)] {
@@ -281,9 +245,8 @@ impl UltralyticsMeta {
         })
     }
 
-    /// Takes the `names` value directly rather than re-looking it up:
-    /// [`Self::from_metadata`] only reaches here after finding the key, so
-    /// a second lookup would add an error arm that can never fire.
+    /// Builds the metadata from a JSON envelope object and its `names`
+    /// value.
     fn from_json_envelope(
         obj: &serde_json::Map<String, serde_json::Value>,
         names_value: &serde_json::Value,
@@ -294,8 +257,7 @@ impl UltralyticsMeta {
             .and_then(|v| v.as_str())
             .map(Task::parse)
             .transpose()?;
-        // The envelope types it properly, so anything non-boolean is
-        // corrupt rather than merely absent.
+        // A non-boolean `end2end` is an error.
         let end2end = match obj.get("end2end") {
             None | Some(serde_json::Value::Null) => None,
             Some(serde_json::Value::Bool(b)) => Some(*b),
@@ -316,10 +278,7 @@ impl UltralyticsMeta {
 /// Parses an Ultralytics `end2end` metadata string value (`"True"` /
 /// `"False"`, case-insensitively).
 ///
-/// An unparseable value is an error rather than `None`: `None` means "the
-/// key is absent", which selects the shape-only fallback. Letting a
-/// corrupt value collapse into that would classify by shape while the
-/// model was actively claiming something else.
+/// Any other value is an error.
 fn parse_bool_str(s: &str) -> Result<bool, InferError> {
     match s.trim().to_ascii_lowercase().as_str() {
         "true" => Ok(true),
@@ -383,8 +342,7 @@ fn names_from_json_value(v: &serde_json::Value) -> Result<Vec<String>, InferErro
 }
 
 /// Converts a string-keyed names map (JSON form) into ordered class names
-/// by parsing keys as indices, rather than relying on lexicographic string
-/// order (which would misorder e.g. "10" before "2").
+/// by parsing keys as indices.
 fn names_from_str_keyed_map(map: BTreeMap<String, String>) -> Result<Vec<String>, InferError> {
     let mut indexed: BTreeMap<usize, String> = BTreeMap::new();
     for (k, v) in map {
@@ -399,10 +357,6 @@ fn names_from_str_keyed_map(map: BTreeMap<String, String>) -> Result<Vec<String>
 /// Requires a `0..n` contiguous index range and returns the values in
 /// index order.
 fn contiguous_values(indexed: BTreeMap<usize, String>) -> Result<Vec<String>, InferError> {
-    // Zero classes is not a degenerate-but-valid model: `feat` would be
-    // `4 + 0`, and the decoder requires at least one class, so a schema
-    // built from it parses and then fails at `DecoderBuilder::build`.
-    // Refuse here, where the message can say what is actually missing.
     if indexed.is_empty() {
         return Err(InferError::BadNames("class map is empty".into()));
     }
@@ -415,8 +369,8 @@ fn contiguous_values(indexed: BTreeMap<usize, String>) -> Result<Vec<String>, In
     Ok(indexed.into_values().collect())
 }
 
-/// Splits a dict body on top-level commas, treating `'...'` and `"..."`
-/// spans as opaque so commas inside class names never split an entry.
+/// Splits a dict body on top-level commas; commas inside `'...'` and
+/// `"..."` spans do not split.
 fn split_top_level_commas(s: &str) -> Vec<String> {
     let mut parts = Vec::new();
     let mut current = String::new();
@@ -462,13 +416,9 @@ fn unquote(s: &str) -> Option<String> {
 /// Classifies a rank-4 model input's spatial layout.
 ///
 /// Channel dimension is wherever the shape holds a `3`: index 1 (NCHW) or
-/// index 3 (NHWC). Layout is never assumed from [`ModelSource`] — some
-/// TFLite exports are still NCHW at the tensor level.
+/// index 3 (NHWC). [`ModelSource`] is not consulted.
 ///
-/// Batch must be 1. Every output layout this module classifies is
-/// batch-1 (`classify_pre_nms`, `find_e2e_candidate` and `classify_proto`
-/// all require it), so accepting a batched input would emit a `dshape`
-/// whose `Batch` disagrees with the detection tensor it is paired with.
+/// Batch must be 1.
 #[allow(clippy::type_complexity)]
 fn classify_input_layout(
     input: &TensorInfo,
@@ -519,10 +469,8 @@ fn classify_input_layout(
 
 /// If `shape` is rank-3 with a unit leading (batch) dim and one of its
 /// remaining two dims equals `expected_anchors`, returns the other dim's
-/// value and its index (1 or 2) within `shape`. `None` if no dim matches,
-/// including when the leading dim isn't 1 — same requirement as
-/// [`find_e2e_candidate`], so a batch > 1 tensor is never silently
-/// mislabeled batch-1.
+/// value and its index (1 or 2) within `shape`. `None` if no dim matches
+/// or the leading dim isn't 1.
 fn find_anchors_dim(shape: &[usize], expected_anchors: usize) -> Option<(usize, usize)> {
     if shape.len() != 3 || shape[0] != 1 {
         return None;
@@ -536,21 +484,13 @@ fn find_anchors_dim(shape: &[usize], expected_anchors: usize) -> Option<(usize, 
     }
 }
 
-/// Classifies the combined pre-NMS detection layout (rule 4): a rank-3
-/// output whose dims contain both `expected_anchors` and `feat` (`4 + nc`).
+/// Classifies the combined pre-NMS detection layout: a rank-3 output whose
+/// dims contain both `expected_anchors` and `feat` (`4 + nc`).
 ///
-/// Every rank-3 output is scanned to completion. A tensor that carries the
-/// anchor count but the wrong feature width is remembered as a fallback
-/// [`InferError::ClassCountMismatch`] rather than returned immediately,
-/// because an export can legitimately publish more than one anchor-shaped
-/// output — a `[1, 4, 8400]` box tensor beside the `[1, 4+nc, 8400]`
-/// detection tensor, or a `[1, k, 8400]` mask-coefficient tensor — and
-/// returning on the first near-miss made the result depend on the order the
-/// runtime happened to report its outputs in. The mismatch is only
-/// surfaced when no output matched, where it is the more useful diagnostic:
-/// a dim equal to the anchor count unambiguously signals pre-NMS intent, so
-/// a feature-width mismatch there is a class-count problem rather than a
-/// layout question.
+/// Every rank-3 output is scanned. A tensor that carries the anchor count
+/// but the wrong feature width yields [`InferError::ClassCountMismatch`]
+/// only when no output matches; two matching outputs yield
+/// [`InferError::AmbiguousLayout`].
 #[allow(clippy::type_complexity)]
 fn classify_pre_nms<'a>(
     rank3_outputs: &[&'a TensorInfo],
@@ -578,8 +518,7 @@ fn classify_pre_nms<'a>(
                     (DimName::NumFeatures, feat),
                 ]
             };
-            // Two tensors of the identical detection shape leave nothing to
-            // choose between them but the order the runtime listed them in.
+            // Two outputs of the same detection shape are ambiguous.
             if let Some((first, _)) = &matched {
                 return Err(InferError::AmbiguousLayout(format!(
                     "outputs `{}` and `{}` both match the pre-NMS detection layout \
@@ -612,18 +551,9 @@ fn classify_pre_nms<'a>(
 
 /// Finds an end-to-end (YOLO26) candidate: a rank-3 output shaped
 /// `[1, N, feat]`, where `feat` is `6` for detection or `6 + k` for
-/// segmentation (`k` being the proto channel count).
-///
-/// `N` is the export's `max_det`, which Ultralytics bakes into the graph
-/// rather than applying afterwards: the head's `postprocess` runs a TopK
-/// with `k = min(max_det, anchors)` (`nn/modules/head.py`), so the tensor
-/// carries exactly that many rows and no padding. The bound here is
-/// upstream's own clamp, `m.max_det = min(args.max_det, available)` where
-/// `available` is the anchor count summed over strides
-/// (`engine/exporter.py`) — the identical quantity this module computes as
-/// `expected_anchors`. So `N == expected_anchors` is a legitimate
-/// end-to-end shape (any `max_det >= anchors` produces it, verified by
-/// export), not a pre-NMS tensor to be excluded.
+/// segmentation (`k` being the proto channel count) and
+/// `0 < N <= expected_anchors`. `N` is the export's `max_det`. More than
+/// one match is [`InferError::AmbiguousLayout`].
 fn find_e2e_candidate<'a>(
     rank3_outputs: &[&'a TensorInfo],
     expected_anchors: usize,
@@ -634,15 +564,11 @@ fn find_e2e_candidate<'a>(
         .filter_map(|o| {
             let s = &o.shape;
             debug_assert_eq!(s.len(), 3, "caller filters to rank-3 outputs");
-            // `N > 0`: a zero-row tensor satisfies every other condition but
-            // produces a schema the decoder rejects for a zero dimension.
             (s[0] == 1 && s[2] == feat && s[1] > 0 && s[1] <= expected_anchors)
                 .then_some((*o, s[1]))
         })
         .collect();
-    // Two tensors of the same end-to-end shape leave nothing to choose
-    // between them but the order the runtime listed them in. This module
-    // reports ambiguity rather than picking.
+    // Two outputs of the same end-to-end shape are ambiguous.
     if matches.len() > 1 {
         return Err(InferError::AmbiguousLayout(format!(
             "{} outputs match the end-to-end layout [1, N, {feat}]: {:?}; \
@@ -654,18 +580,14 @@ fn find_e2e_candidate<'a>(
     Ok(matches.into_iter().next())
 }
 
-/// Classifies a rank-4 proto tensor (rule 1): the mask-prototype output
-/// paired with a segmentation detection tensor. Expected spatial dims are
-/// `(H/4, W/4)` (Ultralytics proto stride 4); the remaining non-batch dim
-/// is the proto channel count `k`, never hardcoded. Supports both
-/// `[1, k, H/4, W/4]` (NCHW) and `[1, H/4, W/4, k]` (NHWC).
+/// Classifies a rank-4 proto tensor: the mask-prototype output paired with
+/// a segmentation detection tensor. Expected spatial dims are `(H/4, W/4)`
+/// (Ultralytics proto stride 4); the remaining non-batch dim is the proto
+/// channel count `k`. Supports both `[1, k, H/4, W/4]` (NCHW) and
+/// `[1, H/4, W/4, k]` (NHWC).
 ///
-/// The NCHW check runs first, so a shape where `k` happens to equal one of
-/// the spatial dims (e.g. `[1, 160, 160, 160]` on a 640x640 input, where
-/// `k == H/4 == W/4`) is shape-undecidable and deliberately resolves NCHW
-/// rather than erroring — no real Ultralytics export produces a proto with
-/// that many channels, so this tie-break is a pragmatic default, not a
-/// verified convention.
+/// The NCHW check runs first: a shape that fits both layouts (e.g.
+/// `[1, 160, 160, 160]` on a 640x640 input) resolves as NCHW.
 fn classify_proto(
     proto: &TensorInfo,
     h: usize,
@@ -731,20 +653,8 @@ fn default_logical() -> LogicalOutput {
 }
 
 /// Rejects an integer-dtype boundary tensor that carries no quantization
-/// parameters — there would be no way to dequantize it, so this is always
-/// an error rather than a value silently passed through as raw integers.
-///
-/// Real Ultralytics int8 TFLite exports never hit this: the int8 graph is
-/// wrapped in dequant/quant ops, so the boundary tensors the runtime
-/// reports are float32 (see `infer_int8_tflite_classifies_like_float32`).
-/// This guard only fires for a genuinely quantized boundary, which no
-/// captured fixture exhibits but a future export convention might.
-/// Per-channel quantization is refused here for the same reason: the
-/// decoder supports per-tensor quantization only, so a per-channel boundary
-/// would produce a schema that parses and then fails at
-/// `DecoderBuilder::build` with an error naming the decoder rather than the
-/// signal that caused it. Refusing at the boundary names the real problem
-/// while the caller still has the tensor in hand.
+/// parameters, and a quantization that is per-channel, has no scale, or
+/// has zero points that do not pair with the scale.
 fn check_quantized_boundary(tensor: &TensorInfo) -> Result<(), InferError> {
     if tensor.dtype.is_integer() && tensor.quantization.is_none() {
         return Err(InferError::UnsupportedLayout(format!(
@@ -761,18 +671,13 @@ fn check_quantized_boundary(tensor: &TensorInfo) -> Result<(), InferError> {
                 q.scale.len()
             )));
         }
-        // Exactly one scale, not merely "not per-channel". An empty scale
-        // list passed the check above and produced `{"scale": []}`, which
-        // the decoder reads as a zero scale rather than rejecting.
         if q.scale.is_empty() {
             return Err(InferError::UnsupportedQuantization(format!(
                 "output `{}` is quantized but carries no scale",
                 tensor.name
             )));
         }
-        // Zero points are optional (symmetric quantization), but when
-        // present must pair with the scale; a longer list was silently
-        // truncated to its first element.
+        // Zero points, when present, pair with the scale.
         if let Some(zp) = &q.zero_point {
             if zp.len() != q.scale.len() {
                 return Err(InferError::UnsupportedQuantization(format!(
@@ -792,9 +697,8 @@ fn check_quantized_boundary(tensor: &TensorInfo) -> Result<(), InferError> {
 ///
 /// Detection and segmentation are both supported. Segmentation is
 /// recognised either by metadata (`task == segment`) or by the presence of
-/// a rank-4 proto tensor; the two signals are cross-checked (rule 5) so a
-/// `segment` task with no proto, or a `detect` task with a proto present,
-/// is always an error rather than a guess.
+/// a rank-4 proto tensor; a `segment` task with no proto, or a `detect`
+/// task with a proto present, is an error.
 ///
 /// # Examples
 ///
@@ -842,7 +746,7 @@ fn check_quantized_boundary(tensor: &TensorInfo) -> Result<(), InferError> {
 /// ```
 ///
 /// Signals that carry no Ultralytics metadata are refused with a typed
-/// error rather than a best-effort guess:
+/// error:
 ///
 /// ```
 /// use std::collections::BTreeMap;
@@ -978,13 +882,8 @@ fn infer_from_meta(
     let expected_anchors = anchor_count(h, w);
     let nc = meta.names.len();
 
-    // Segmentation detection features carry `k` extra mask coefficients
-    // (`4 + nc + k`); the end-to-end feature width grows by the same `k`
-    // (`6 + k`). `k` comes from the proto tensor itself (rule 1), never
-    // hardcoded, so both widths fall back to the plain detection case when
-    // there's no proto.
-    // `is_segment` is already true whenever a proto is present (the two
-    // are cross-checked above), so the proto's presence alone decides here.
+    // `k` is the proto channel count (0 without a proto): detection
+    // features are `4 + nc + k` wide, end-to-end features `6 + k`.
     let (k, proto_dshape) = match proto {
         Some(proto) => {
             let (k, dshape) = classify_proto(proto, h, w)?;
@@ -1001,9 +900,8 @@ fn infer_from_meta(
         .filter(|o| o.shape.len() == 3)
         .collect();
 
-    // The `end2end` metadata flag is the primary end-to-end signal (present
-    // on every real export). The shape-based e2e fallback applies only
-    // when the flag is absent (stripped metadata).
+    // The `end2end` metadata flag selects the layout; when it is absent
+    // the shapes decide.
     let (out, dshape, version) = match meta.end2end {
         Some(true) => {
             let (out, n) = find_e2e_candidate(&rank3_outputs, expected_anchors, e2e_feat)?
@@ -1059,22 +957,8 @@ fn infer_from_meta(
         check_quantized_boundary(proto)?;
     }
 
-    // Box normalization is the one field shape cannot reveal -- it follows
-    // the exporter. ONNX and TFLite are pinned by runtime magnitude
-    // measurement (see testdata/infer/NOTES.md answer 5: 637.25 px vs
-    // 0.9957 on the same image); CoreML resolves alongside ONNX on both
-    // bases. Source-tracing the Ultralytics exporter shows the `1/w`
-    // normalize lives only in `IOSDetectModel`, used solely on the
-    // `nms=True` path, so a plain no-NMS CoreML export passes the raw model
-    // through pixel-space exactly as ONNX does; the same runtime check run
-    // against a matched fp16 ONNX pair agrees, with x reaching 640.25 on a
-    // 640-pixel input and every coordinate statistic matching within half a
-    // pixel -- fp16 rounding, where a convention difference would be a
-    // factor of 640 (see testdata/infer/NOTES.md for both, and the captured
-    // fixture). Guessing it wrong scales every box by the input size, which
-    // is why `Other` is refused rather than defaulted: everywhere else this
-    // module errors on ambiguity, and this is the field whose corruption
-    // `tests/infer_builder.rs` exists to pin.
+    // Box normalization follows the container: `[0, 1]` for TFLite,
+    // pixel-space for ONNX and CoreML; `Other` is refused.
     let normalized = match signals.source {
         ModelSource::TfLite => true,
         ModelSource::Onnx | ModelSource::CoreMl => false,
@@ -1084,12 +968,8 @@ fn infer_from_meta(
     };
     let det = LogicalOutput {
         name: Some(out.name.clone()),
-        // `Detections` (plural) is the schema vocabulary's fully-decoded
-        // post-NMS type; `Detection` is the anchor-grid output that still
-        // needs decoding. Both collapse to the same legacy path today
-        // (schema.rs `logical_to_legacy`), but this JSON now leaves the
-        // process through the C and Python bindings, so it has to name the
-        // tensor it actually describes.
+        // `Detections` is the decoded post-NMS type; `Detection` is the
+        // anchor-grid output.
         type_: Some(match version {
             DecoderVersion::Yolo26 => LogicalType::Detections,
             _ => LogicalType::Detection,
@@ -1097,7 +977,7 @@ fn infer_from_meta(
         shape: out.shape.clone(),
         dshape,
         decoder: Some(DecoderKind::Ultralytics),
-        encoding: Some(BoxEncoding::Direct), // graph already decoded DFL
+        encoding: Some(BoxEncoding::Direct), // DFL is decoded in the graph
         score_format: Some(ScoreFormat::PerClass),
         normalized: Some(normalized),
         anchors: None,
@@ -1133,12 +1013,8 @@ fn infer_from_meta(
             preprocessing: None,
         }),
         outputs,
-        // Ultralytics runs NMS with `agnostic=False`, i.e. class-aware; stated
-        // explicitly so the schema describes the model rather than relying on
-        // the builder's fallback. An explicit `.with_nms(..)` still overrides.
-        //
-        // YOLO26 end-to-end heads do their NMS in-graph, so they carry none:
-        // this field describes what the *decoder* must add.
+        // Class-aware NMS for pre-NMS heads; none for YOLO26 end-to-end
+        // heads, which run NMS in-graph.
         nms: match version {
             DecoderVersion::Yolo26 => None,
             _ => Some(NmsMode::ClassAware),
@@ -1167,17 +1043,9 @@ fn infer_from_meta(
 mod tests {
     use super::*;
 
-    /// Root of the `testdata/infer` fixture directory.
-    ///
-    /// `EDGEFIRST_TESTDATA_DIR` wins when set -- `scripts/on-target-test.sh`
-    /// and CI both mirror `crates/decoder/testdata/infer` into
-    /// `$EDGEFIRST_TESTDATA_DIR/infer` (see `on-target-test.sh`'s testdata
-    /// sync and `.github/workflows/test.yml`'s "Upload testdata as
-    /// artifact" step). The manifest-relative fallback is baked in at
-    /// **compile** time, so a cross-compiled binary carries the build
-    /// host's absolute path and can never find fixtures on a different
-    /// target -- same reasoning as `decoder_from_edgefirst_json.rs`'s
-    /// `testdata_root()`.
+    /// Root of the `testdata/infer` fixture directory:
+    /// `$EDGEFIRST_TESTDATA_DIR/infer` when the variable is set, else the
+    /// manifest-relative path.
     fn infer_fixture_dir() -> std::path::PathBuf {
         std::env::var("EDGEFIRST_TESTDATA_DIR")
             .map(std::path::PathBuf::from)
@@ -1287,10 +1155,7 @@ mod tests {
         );
     }
 
-    /// Loads a captured Task-0 fixture's `metadata` map, exactly as
-    /// `ModelSignals::metadata` would carry it: raw string key/values,
-    /// regardless of whether the source was ONNX (flat props) or TFLite
-    /// (single `metadata.json` envelope entry).
+    /// Loads a captured fixture's `metadata` map as raw string key/values.
     fn load_fixture_metadata(name: &str) -> BTreeMap<String, String> {
         let path = infer_fixture_dir().join(format!("{name}.signals.json"));
         let content = std::fs::read_to_string(&path)
@@ -1332,9 +1197,8 @@ mod tests {
         assert_eq!(u.end2end, Some(false));
     }
 
-    /// Loads a captured Task-0 fixture into `ModelSignals`, exactly as the
-    /// inference runtime would report it: tensor names/shapes/dtypes plus
-    /// the raw metadata map.
+    /// Loads a captured fixture into `ModelSignals`: tensor
+    /// names/shapes/dtypes plus the raw metadata map.
     fn signals_from_fixture(name: &str) -> ModelSignals {
         let path = infer_fixture_dir().join(format!("{name}.signals.json"));
         let content = std::fs::read_to_string(&path)
@@ -1379,9 +1243,7 @@ mod tests {
                     .map(|d| d.as_u64().expect("shape dim is a number") as usize)
                     .collect(),
                 dtype: parse_dtype(v["dtype"].as_str().expect("tensor `dtype` is a string")),
-                // Every captured fixture reports `"quantization": null`
-                // (see testdata/infer/NOTES.md); real quantized signals
-                // are out of scope for this task.
+                // Every captured fixture reports `"quantization": null`.
                 quantization: None,
             }
         }
@@ -1419,8 +1281,7 @@ mod tests {
     }
 
     /// Builds a synthetic Ultralytics-style metadata map (Python dict-repr
-    /// `names`, `task`, `end2end`) for hand-built layout tests that don't
-    /// need a full captured fixture.
+    /// `names`, `task`, `end2end`).
     fn synthetic_metadata(nc: usize, task: &str, end2end: &str) -> BTreeMap<String, String> {
         let names = (0..nc)
             .map(|i| format!("{i}: 'c{i}'"))
@@ -1435,11 +1296,7 @@ mod tests {
 
     #[test]
     fn infer_transposed_det_layout_classified() {
-        // Anchors-first layout ([1, A, 4+nc]), as produced by older
-        // Ultralytics TFLite exporters. Rule 4 must still classify this
-        // correctly from tensor shape alone, and the builder's dshape-order
-        // e2e-inference pitfall must be guarded by an explicit
-        // decoder_version.
+        // Anchors-first layout ([1, A, 4+nc]).
         let s = ModelSignals {
             source: ModelSource::TfLite,
             inputs: vec![TensorInfo {
@@ -1492,14 +1349,9 @@ mod tests {
 
     #[test]
     fn infer_seg_class_count_mismatch_rejected() {
-        // Covers the generalized ClassCountMismatch math for segmentation,
-        // where the non-class base width is `4 + k` (proto channels), not
-        // the plain-detection `4`. Real yolov8n-seg det tensor is
-        // [1, 116, 8400] (features-first, feat = 4+80+32); truncating
-        // `names` to 1 class makes the expected feat 4+1+32=37, so the
-        // real 116-feature tensor mismatches with found = 116-(37-1) = 80
-        // — the true class count the features imply, unaffected by the
-        // metadata truncation.
+        // The yolov8n-seg det tensor is [1, 116, 8400] (feat = 4+80+32).
+        // With `names` cut to 1 class the expected feat is 4+1+32=37, and
+        // the mismatch reports found = 116-(37-1) = 80.
         let mut s = signals_from_fixture("yolov8n-seg");
         s.metadata.insert("names".into(), "{0: 'only-one'}".into()); // nc=1
         assert!(matches!(
@@ -1513,10 +1365,7 @@ mod tests {
 
     #[test]
     fn infer_end2end_flag_shape_conflict_rejected() {
-        // The end2end flag is the primary signal: a real yolov8n ONNX
-        // export with its pre-NMS [1, 84, 8400] output, but with `end2end`
-        // forced to "True", must never be guessed into an end-to-end
-        // classification — flag/shape disagreement is always an error.
+        // A pre-NMS [1, 84, 8400] output with `end2end` forced to "True".
         let mut s = signals_from_fixture("yolov8n");
         s.metadata.insert("end2end".into(), "True".into());
         assert!(matches!(
@@ -1547,12 +1396,8 @@ mod tests {
 
     #[test]
     fn infer_yolov8n_seg_tflite_proto_nchw() {
-        // The real yolov8n-seg_float32 TFLite export's proto is
-        // [1, 32, 160, 160], NCHW-ordered — same as its ONNX counterpart.
-        // An earlier draft of this test assumed TFLite seg exports carry a
-        // NHWC-transposed proto; no captured fixture confirms that (see
-        // infer_nhwc_proto_layout_classified for the synthetic NHWC coverage
-        // the shape-driven classifier still supports).
+        // The yolov8n-seg_float32 TFLite export's proto is
+        // [1, 32, 160, 160], NCHW-ordered.
         let r = infer_ultralytics_schema(&signals_from_fixture("yolov8n-seg_float32")).unwrap();
         let proto = r
             .schema
@@ -1573,9 +1418,8 @@ mod tests {
 
     #[test]
     fn infer_nhwc_proto_layout_classified() {
-        // Hand-built signals: TFLite source, NHWC input, features-first det
-        // tensor (4+80+32=116), NHWC proto ([1, 160, 160, 32]) — the other
-        // valid proto channel ordering rule 1 must also classify correctly.
+        // TFLite source, NHWC input, features-first det tensor
+        // (4+80+32=116), NHWC proto ([1, 160, 160, 32]).
         let s = ModelSignals {
             source: ModelSource::TfLite,
             inputs: vec![TensorInfo {
@@ -1611,9 +1455,7 @@ mod tests {
         assert_eq!(proto.dshape[3].1, 32);
     }
 
-    /// The proto output is built field by field over `default_logical()`, so
-    /// a dropped field reads as `None` rather than failing to compile. The
-    /// decoder needs every one of these to dequantize and route the tensor.
+    /// The proto output carries its name, decoder, dtype and quantization.
     #[test]
     fn infer_proto_output_carries_its_name_decoder_dtype_and_quantization() {
         let quant = Quantization {
@@ -1665,8 +1507,7 @@ mod tests {
     }
 
     /// A proto tensor makes the model a segmentation model whether or not the
-    /// metadata says `task: segment`. Requiring both would silently decode a
-    /// segmentation export as plain detection.
+    /// metadata says `task: segment`.
     #[test]
     fn infer_treats_a_proto_tensor_without_a_task_as_segmentation() {
         let mut metadata = synthetic_metadata(80, "segment", "False");
@@ -1703,8 +1544,6 @@ mod tests {
                 .any(|o| o.type_ == Some(LogicalType::Protos)),
             "proto tensor present but no protos output was emitted"
         );
-        // The task the metadata did not state is the one reported back, which
-        // is the only place `is_segment` is observable.
         assert!(r.description.contains("segment"), "{}", r.description);
     }
 
@@ -1717,8 +1556,7 @@ mod tests {
         }
     }
 
-    /// Both halves of the rank-and-batch guard have to reject on their own.
-    /// Requiring both instead would index past the end of a rank-3 shape.
+    /// A wrong rank and a wrong batch are each rejected.
     #[test]
     fn classify_proto_rejects_wrong_rank_or_batch() {
         for shape in [vec![1, 32, 160], vec![2, 32, 160, 160], vec![1, 160, 160]] {
@@ -1730,22 +1568,20 @@ mod tests {
         }
     }
 
-    /// The NHWC branch needs both spatial dims to line up. Accepting either
-    /// one would read the proto count out of a dimension that is not it.
+    /// The NHWC branch requires both spatial dims to match.
     #[test]
     fn classify_proto_rejects_a_shape_matching_only_one_spatial_dim() {
         // h/4 = w/4 = 160. s[1] matches, s[2] does not.
         let err = classify_proto(&proto_tensor(vec![1, 160, 7, 9]), 640, 640).unwrap_err();
         assert!(matches!(err, InferError::UnsupportedLayout(_)), "{err:?}");
 
-        // The genuine NHWC shape still classifies, with the proto count last.
+        // The NHWC shape classifies, with the proto count last.
         let (k, dshape) = classify_proto(&proto_tensor(vec![1, 160, 160, 32]), 640, 640).unwrap();
         assert_eq!(k, 32);
         assert_eq!(dshape[3], (DimName::NumProtos, 32));
     }
 
-    /// `unquote` strips a matching pair only. A single quote on one end is an
-    /// unterminated value, not a quoted one.
+    /// `unquote` strips a matching pair of quotes only.
     #[test]
     fn unquote_requires_a_matching_pair_of_quotes() {
         assert_eq!(unquote("'abc'").as_deref(), Some("abc"));
@@ -1757,9 +1593,7 @@ mod tests {
         assert_eq!(unquote("abc"), None);
     }
 
-    /// A comma inside a quoted value is part of the value. Without the quote
-    /// arm the scanner never enters quoted state and splits straight through
-    /// it.
+    /// A comma inside a quoted value does not split.
     #[test]
     fn split_top_level_commas_keeps_quoted_commas_together() {
         let parts = split_top_level_commas("a='x,y', b=2");
@@ -1772,8 +1606,7 @@ mod tests {
         );
     }
 
-    /// `InferError` is what a rejection reports to the caller. A `Display`
-    /// that writes nothing turns every diagnostic into an empty string.
+    /// `InferError`'s `Display` states the reason.
     #[test]
     fn infer_error_display_states_the_reason() {
         let err = InferError::NotUltralytics("no names key".into());
@@ -1843,11 +1676,9 @@ mod tests {
 
     #[test]
     fn infer_int8_tflite_classifies_like_float32() {
-        // Real Ultralytics int8 TFLite exports expose float32 I/O with NO
-        // boundary quantization — the int8 graph is wrapped in
-        // dequant/quant ops (Task 0 finding). The classifier must treat
-        // this fixture exactly like its float32 counterpart, not attempt
-        // to recover quantization that isn't there.
+        // Ultralytics int8 TFLite exports expose float32 I/O with no
+        // boundary quantization; this fixture classifies like its float32
+        // counterpart.
         let r = infer_ultralytics_schema(&signals_from_fixture("yolov8n_int8")).unwrap();
         let det = &r.schema.outputs[0];
         assert_eq!(det.type_, Some(LogicalType::Detection));
@@ -1859,10 +1690,8 @@ mod tests {
 
     #[test]
     fn infer_quantized_boundary_carries_quantization() {
-        // Hand-built signals for a model that DOES expose a quantized
-        // boundary output (unlike any captured fixture) — the classifier
-        // must pass `TensorInfo.quantization` through onto the schema's
-        // detection output untouched.
+        // A quantized boundary output: `TensorInfo.quantization` passes
+        // through onto the schema's detection output.
         let quant = Quantization {
             scale: vec![0.02],
             zero_point: Some(vec![-5]),
@@ -1893,10 +1722,6 @@ mod tests {
 
     #[test]
     fn infer_rejects_batched_input() {
-        // Every output layout here is batch-1, so a batched input would
-        // emit an input dshape whose Batch disagrees with the detection
-        // tensor beside it. Previously this succeeded and emitted
-        // `(Batch, 4)`.
         let s = ModelSignals {
             source: ModelSource::Onnx,
             inputs: vec![TensorInfo {
@@ -1995,17 +1820,8 @@ mod tests {
 
     #[test]
     fn infer_end_to_end_accepts_any_max_det_up_to_the_anchor_count() {
-        // Ultralytics bakes max_det into the graph: the head's postprocess
-        // is a TopK with k = min(max_det, anchors), so N is whatever the
-        // export chose. The exporter clamps it to the anchor count
-        // (exporter.py: `m.max_det = min(args.max_det, available)`), which
-        // is the same quantity as `expected_anchors` here -- verified by
-        // exporting yolo26n at max_det = 100/1000/2000/8400/10000, the last
-        // two both yielding [1, 8400, 6].
-        //
-        // 300 is the default; 2000 is what a crowded-scene export uses and
-        // was rejected outright before; 8400 == expected_anchors is what any
-        // max_det >= anchors produces and is equally legitimate.
+        // N is the export's `max_det`, at most the anchor count: 300 is the
+        // Ultralytics default and 8400 equals `expected_anchors`.
         for n in [1, 300, 2000, 8400] {
             let r = infer_ultralytics_schema(&det_signals(80, vec![1, n, 6], "True"))
                 .unwrap_or_else(|e| panic!("max_det={n} must infer: {e}"));
@@ -2020,16 +1836,13 @@ mod tests {
                 ],
                 "max_det={n}"
             );
-            // End-to-end ran NMS in-graph, so the schema adds none.
             assert_eq!(r.schema.nms, None, "max_det={n}");
         }
     }
 
     #[test]
     fn infer_end_to_end_rejects_more_rows_than_anchors() {
-        // Upstream cannot emit this: TopK's k is clamped to the anchor
-        // count, so a longer tensor is not an Ultralytics end-to-end output
-        // and the bound stays a real check rather than a formality.
+        // N above the anchor count is not an end-to-end output.
         match infer_ultralytics_schema(&det_signals(80, vec![1, 8401, 6], "True")) {
             Err(InferError::UnsupportedLayout(msg)) => {
                 assert!(msg.contains("N<=8400"), "unexpected message: {msg}");
@@ -2040,11 +1853,8 @@ mod tests {
 
     #[test]
     fn infer_legacy_nms_model_is_unaffected_by_max_det() {
-        // The pre-NMS (NMS-required) head has no max_det in its graph at
-        // all: it emits every anchor, and the detection count is decided
-        // later by the decoder's own NMS. So the schema must classify it by
-        // the anchor count regardless, and must NOT acquire a NumBoxes
-        // dimension that looks like an end-to-end row count.
+        // The pre-NMS head emits every anchor and classifies by the anchor
+        // count.
         let r = infer_ultralytics_schema(&det_signals(80, vec![1, 84, 8400], "False")).unwrap();
         assert_eq!(r.schema.decoder_version, Some(DecoderVersion::Yolov8));
         assert_eq!(r.schema.outputs[0].type_, Some(LogicalType::Detection));
@@ -2056,13 +1866,9 @@ mod tests {
                 (DimName::NumBoxes, 8400),
             ]
         );
-        // Class-aware NMS, matching Ultralytics' own agnostic=False. The
-        // schema names the mode only; thresholds and max_det stay the
-        // caller's, set on the builder per frame-rate/recall budget.
         assert_eq!(r.schema.nms, Some(NmsMode::ClassAware));
 
-        // Anchors-first is classified identically -- neither orientation
-        // may be mistaken for an end-to-end [1, N, feat] tensor.
+        // Anchors-first classifies identically.
         let t = infer_ultralytics_schema(&det_signals(80, vec![1, 8400, 84], "False")).unwrap();
         assert_eq!(t.schema.decoder_version, Some(DecoderVersion::Yolov8));
         assert_eq!(
@@ -2077,10 +1883,9 @@ mod tests {
 
     #[test]
     fn infer_pre_nms_wins_when_a_shape_reads_as_both() {
-        // With metadata stripped and nc == 2, feat == 4 + nc == 6 == the
-        // end-to-end feature width, so [1, A, 6] is genuinely both layouts
-        // at once. pre-NMS is tried first and wins; this is the one place a
-        // guess remains, so it is pinned rather than left to drift.
+        // With metadata stripped and nc == 2, feat == 4 + nc == 6 equals the
+        // end-to-end feature width, so [1, A, 6] fits both layouts; pre-NMS
+        // is tried first.
         let mut m = synthetic_metadata(2, "detect", "False");
         m.remove("end2end");
         let s = ModelSignals {
@@ -2093,8 +1898,6 @@ mod tests {
 
     #[test]
     fn meta_empty_names_rejected() {
-        // nc == 0 makes feat == 4, so a [1,4,A] output would infer a schema
-        // the decoder then refuses ("Yolo num_features 4 must be > 4").
         let mut m = BTreeMap::new();
         m.insert("names".into(), "{}".into());
         match UltralyticsMeta::from_metadata(&m) {
@@ -2105,9 +1908,6 @@ mod tests {
 
     #[test]
     fn meta_malformed_end2end_is_an_error_not_an_absent_key() {
-        // `None` means "key absent", which selects the shape-only fallback.
-        // A corrupt value must not collapse into that -- the model is
-        // actively claiming something, just not something parseable.
         let mut m = synthetic_metadata(80, "detect", "False");
         m.insert("end2end".into(), "yes".into());
         match UltralyticsMeta::from_metadata(&m) {
@@ -2115,16 +1915,12 @@ mod tests {
             other => panic!("expected BadMetadata, got {other:?}"),
         }
 
-        // Absent is still fine, and still means "fall back to shapes".
         m.remove("end2end");
         assert_eq!(UltralyticsMeta::from_metadata(&m).unwrap().end2end, None);
     }
 
     #[test]
     fn meta_foreign_vendor_rejected_but_missing_provenance_allowed() {
-        // A `names` map alone is not an Ultralytics signature; another
-        // exporter's model would otherwise be given Ultralytics box, score
-        // and normalization conventions.
         let mut m = synthetic_metadata(80, "detect", "False");
         m.insert("author".into(), "SomeOtherVendor".into());
         assert!(matches!(
@@ -2137,8 +1933,7 @@ mod tests {
         m.insert("docs".into(), "https://docs.ultralytics.com".into());
         assert!(UltralyticsMeta::from_metadata(&m).is_ok());
 
-        // Absence is not a contradiction: quantizers and format converters
-        // routinely keep `names` and drop provenance.
+        // Absent provenance passes.
         m.remove("author");
         m.remove("docs");
         assert!(UltralyticsMeta::from_metadata(&m).is_ok());
@@ -2146,8 +1941,7 @@ mod tests {
 
     #[test]
     fn infer_zero_row_end_to_end_rejected() {
-        // [1, 0, 6] satisfies every other end-to-end condition but yields a
-        // schema the decoder refuses for a zero dimension.
+        // A zero-row [1, 0, 6] tensor is refused.
         assert!(matches!(
             infer_ultralytics_schema(&det_signals(80, vec![1, 0, 6], "True")),
             Err(InferError::UnsupportedLayout(_))
@@ -2169,8 +1963,7 @@ mod tests {
             quantization: None,
         };
 
-        // Two identical pre-NMS detection tensors: nothing distinguishes
-        // them but the order the runtime listed them in.
+        // Two identical pre-NMS detection tensors.
         let pre = ModelSignals {
             source: ModelSource::Onnx,
             inputs: vec![input.clone()],
@@ -2184,7 +1977,7 @@ mod tests {
             other => panic!("expected AmbiguousLayout, got {other:?}"),
         }
 
-        // Same for two end-to-end candidates.
+        // Two end-to-end candidates.
         let e2e = ModelSignals {
             source: ModelSource::Onnx,
             inputs: vec![input],
@@ -2216,8 +2009,7 @@ mod tests {
             metadata: synthetic_metadata(80, "detect", "False"),
         };
 
-        // No scale at all: previously emitted `{"scale": []}`, which the
-        // decoder reads as a zero scale instead of refusing.
+        // A quantization with no scale is refused.
         match infer_ultralytics_schema(&build(Quantization {
             scale: vec![],
             zero_point: Some(vec![]),
@@ -2230,8 +2022,7 @@ mod tests {
             other => panic!("expected UnsupportedQuantization, got {other:?}"),
         }
 
-        // Zero points that do not pair with the scale were silently
-        // truncated to the first element.
+        // Zero points that do not pair with the scale are refused.
         match infer_ultralytics_schema(&build(Quantization {
             scale: vec![0.02],
             zero_point: Some(vec![-5, -7]),
@@ -2244,7 +2035,7 @@ mod tests {
             other => panic!("expected UnsupportedQuantization, got {other:?}"),
         }
 
-        // Symmetric quantization (no zero points) stays valid.
+        // Symmetric quantization (no zero points) is accepted.
         assert!(infer_ultralytics_schema(&build(Quantization {
             scale: vec![0.02],
             zero_point: None,
@@ -2256,11 +2047,9 @@ mod tests {
 
     #[test]
     fn infer_pre_nms_is_independent_of_output_order() {
-        // An export may publish more than one anchor-shaped rank-3 output:
-        // a `[1, 4, A]` box tensor beside the `[1, 4+nc, A]` detection
-        // tensor, or a `[1, k, A]` mask-coefficient tensor. Scanning must
-        // not stop at the first near-miss, or the result depends on the
-        // order the runtime happened to report its outputs in.
+        // Several anchor-shaped rank-3 outputs: a `[1, 4, A]` box tensor
+        // beside the `[1, 4+nc, A]` detection tensor, or a `[1, k, A]`
+        // mask-coefficient tensor.
         let det = TensorInfo {
             name: "output0".into(),
             shape: vec![1, 84, 8400],
@@ -2296,8 +2085,8 @@ mod tests {
 
     #[test]
     fn infer_class_count_mismatch_survives_a_full_scan() {
-        // When nothing matches, the anchor-shaped near-miss is still the
-        // more useful diagnostic than "no output matches the layout".
+        // When nothing matches, the anchor-shaped near-miss reports a
+        // class-count mismatch.
         let s = ModelSignals {
             source: ModelSource::Onnx,
             inputs: vec![TensorInfo {
@@ -2324,15 +2113,7 @@ mod tests {
         ));
     }
 
-    /// What every captured fixture must infer to, asserted field by field.
-    ///
-    /// `yolo11n-seg` and `yolov8n-seg_int8` previously appeared only in
-    /// `tests/infer_builder.rs`'s "did the builder accept it" loop, which
-    /// passes for any schema that parses -- so the only v11 segmentation
-    /// fixture and the only int8 *segmentation* fixture had no field-level
-    /// coverage at all. A table keeps every fixture honest at once, and
-    /// `every_fixture_is_asserted` below makes an unasserted one impossible
-    /// to add.
+    /// What a captured fixture infers to.
     struct FixtureExpectation {
         name: &'static str,
         version: DecoderVersion,
@@ -2350,9 +2131,7 @@ mod tests {
 
     fn fixture_expectations() -> Vec<FixtureExpectation> {
         use DimName::{Batch, NumBoxes, NumFeatures};
-        // Every captured export is features-first ([1, 4+nc, A]); no real
-        // exporter transposes to anchors-first, despite an early draft of
-        // these tests assuming TFLite did.
+        // Every captured export is features-first ([1, 4+nc, A]).
         const DET: &[(DimName, usize)] = &[(Batch, 1), (NumFeatures, 4 + NC), (NumBoxes, A)];
         const SEG: &[(DimName, usize)] = &[(Batch, 1), (NumFeatures, 4 + NC + 32), (NumBoxes, A)];
         // End-to-end heads emit [1, max_det, 6] (+32 mask coefficients).
@@ -2374,7 +2153,6 @@ mod tests {
             det_type: LogicalType::Detections,
             det_dshape,
             normalized,
-            // End-to-end heads ran NMS in-graph; the schema adds none.
             nms: None,
             proto,
         };
@@ -2393,13 +2171,8 @@ mod tests {
             e2e("yolo26n", E2E, false, None),
             e2e("yolo26n-seg", E2E_SEG, false, P),
             e2e("yolo26n_float32", E2E, true, None),
-            // Same network, different exporter default. The `yolo26n` row above
-            // was captured from ultralytics 8.4.137, whose `nms` arg defaulted to
-            // `False`; `exporter.py`'s `model.end2end = self.args.nms is False`
-            // then selected the one2one (NMS-free, [1, 300, 6]) head. In 8.4.153
-            // that default is `None`, so the same expression is false and the
-            // one2many anchor-grid head ships instead -- hence a Yolov8-shaped
-            // pre-NMS row for a YOLO26 checkpoint. Both heads live in the weights.
+            // A YOLO26 checkpoint exported with the one2many anchor-grid
+            // head: a pre-NMS row.
             pre_nms("yolo26n_coreml", DET, false, None),
         ]
     }
@@ -2476,9 +2249,7 @@ mod tests {
 
     #[test]
     fn every_fixture_is_asserted() {
-        // Without this, a fixture can be added (or renamed) and silently
-        // never asserted on -- which is exactly how `yolo11n-seg` and
-        // `yolov8n-seg_int8` ended up with no field-level coverage.
+        // Every `*.signals.json` on disk has a row in `fixture_expectations`.
         let dir = infer_fixture_dir();
         let mut on_disk: Vec<String> = std::fs::read_dir(&dir)
             .unwrap_or_else(|e| panic!("{} exists: {e}", dir.display()))
@@ -2503,12 +2274,7 @@ mod tests {
 
     #[test]
     fn infer_other_source_refuses_rather_than_guessing_normalization() {
-        // `normalized` follows the exporter and cannot be read off the
-        // shapes. ONNX (pixel-space) and TFLite ([0,1]) are measured;
-        // CoreML (pixel-space) is both source-traced and measured. An
-        // uncharacterized container gets a
-        // typed refusal, because guessing scales every box by the input
-        // size and the resulting schema looks perfectly valid.
+        // An uncharacterized container is refused with a typed error.
         let s = ModelSignals {
             source: ModelSource::Other,
             inputs: vec![TensorInfo {
@@ -2530,8 +2296,7 @@ mod tests {
             Err(InferError::UnknownBoxConvention)
         ));
 
-        // The same signals under a characterized source succeed, so the
-        // refusal is about the container and nothing else.
+        // The same signals under a known source succeed.
         let ok = ModelSignals {
             source: ModelSource::Onnx,
             ..s
@@ -2544,14 +2309,7 @@ mod tests {
 
     #[test]
     fn infer_per_channel_quantization_rejected() {
-        // Per-channel quantization on a boundary output is refused here
-        // rather than passed through. The decoder supports per-tensor only
-        // (`the v1 decoder only supports per-tensor quantization`), and it
-        // refuses per-channel with OR without an `axis` -- so emitting the
-        // schema anyway would defer the failure to `DecoderBuilder::build`,
-        // where the message names the decoder instead of the tensor that
-        // caused it. No captured fixture exhibits this; a future export
-        // convention might.
+        // Per-channel quantization on a boundary output is refused.
         let s = ModelSignals {
             source: ModelSource::TfLite,
             inputs: vec![TensorInfo {
@@ -2587,8 +2345,7 @@ mod tests {
 
     #[test]
     fn infer_per_channel_proto_quantization_rejected() {
-        // The same guard runs on the proto tensor, not just the detection
-        // output -- `check_quantized_boundary` is called for both.
+        // The proto tensor is checked as well as the detection output.
         let s = ModelSignals {
             source: ModelSource::TfLite,
             inputs: vec![TensorInfo {
@@ -2631,9 +2388,8 @@ mod tests {
 
     #[test]
     fn infer_integer_output_without_quant_rejected() {
-        // Same synthetic signals as above but with `quantization: None` —
-        // an integer-dtype boundary output with no quantization params is
-        // never silently accepted (there'd be no way to dequantize it).
+        // An integer-dtype boundary output with `quantization: None` is
+        // refused.
         let s = ModelSignals {
             source: ModelSource::TfLite,
             inputs: vec![TensorInfo {
@@ -2664,9 +2420,7 @@ mod tests {
     #[test]
     fn infer_pre_nms_rejects_non_unit_batch() {
         // A [2, 84, 8400] output has a matching anchors/feature pair but a
-        // non-unit leading (batch) dim. It must never be silently accepted
-        // and mislabeled batch-1 (find_e2e_candidate already requires
-        // shape[0] == 1; find_anchors_dim must match it).
+        // non-unit leading (batch) dim.
         let mut s = signals_from_fixture("yolov8n");
         s.outputs[0].shape = vec![2, 84, 8400];
         assert!(matches!(
@@ -2677,8 +2431,7 @@ mod tests {
 
     #[test]
     fn coreml_source_resolves_a_box_convention() {
-        // CoreML must not hit the `Other` refusal: a native `.mlpackage`
-        // export is a characterized convention, not an unknown one.
+        // A CoreML source is not refused as `Other`.
         let s = ModelSignals {
             source: ModelSource::CoreMl,
             inputs: vec![TensorInfo {
@@ -2708,19 +2461,9 @@ mod tests {
 
     #[test]
     fn coreml_nms_pipeline_export_is_refused_not_classified() {
-        // `yolo export ... format=coreml nms=True` does not produce the
-        // anchor-grid tensor `ModelSource::CoreMl`'s pixel-space
-        // resolution reasons about -- it substitutes Apple's own NMS
-        // pipeline, whose two outputs are dynamically shaped and already
-        // post-NMS. Real measured shapes (Task 3b brief, from a genuine
-        // `yolo26n.pt` export): `confidence` and `coordinates` are both
-        // float32 multiArrays with an empty (fully dynamic) shape --
-        // nothing here is the `[1, 4+nc, A]` layout this module looks
-        // for, so inference must refuse it rather than guess. This
-        // refusal is intentional: do not "fix" it into acceptance, since
-        // that would apply CoreMl's pixel-space convention (or none at
-        // all) to output Apple's pipeline has already decoded and scaled
-        // its own way.
+        // A `nms=True` CoreML export: `confidence` and `coordinates` are
+        // float32 outputs with an empty shape, neither of them the
+        // `[1, 4+nc, A]` layout.
         let s = ModelSignals {
             source: ModelSource::CoreMl,
             inputs: vec![TensorInfo {

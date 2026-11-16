@@ -15,7 +15,7 @@ crates/kernels/
 │   │                                                   #   view bounds, quantize, TFLite helpers
 │   ├── ops/*_neon.rs                                   # NEON vs portable, bit for bit
 │   ├── ops/levels.rs, ops/rows.rs                      # Block sizing, row walking, overlap check
-│   └── prim/                                           # Primitives moved from the decoder, with
+│   └── prim/                                           # Primitives shared with the decoder, with
 │                                                       #   their scalar vs NEON / FP16 parity tests
 ├── tests/
 │   ├── common/mod.rs        # Fixture loaders, tier matrix, misbehaving pools, pool/concurrency check

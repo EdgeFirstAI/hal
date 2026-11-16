@@ -23,8 +23,8 @@ enum GLProcessorMessage {
         tokio::sync::oneshot::Sender<Result<(), Error>>,
     ),
     /// Convert without the terminal CPU sync, replying with a native
-    /// fence fd guarding the GPU work (the GL→NPU handoff). `Ok(None)` =
-    /// converted with blocking semantics (no fence on this platform).
+    /// fence fd guarding the GPU work. `Ok(None)` = converted with blocking
+    /// semantics (no fence on this platform).
     ImageConvertFenced(
         SendablePtr<TensorDyn>,
         SendablePtr<TensorDyn>,
@@ -72,12 +72,12 @@ enum GLProcessorMessage {
         crate::Interpolation,
         tokio::sync::oneshot::Sender<Result<(), Error>>,
     ),
-    /// Test hook (issue #175): make every zero-copy destination import fail.
+    /// Test hook: make every zero-copy destination import fail.
     #[cfg(test)]
     SetFailDstImport(bool, tokio::sync::oneshot::Sender<Result<(), Error>>),
-    /// Snapshot the EGLImage cache counters (steady-state import assertions).
+    /// Snapshot the EGLImage cache counters.
     EglCacheStats(tokio::sync::oneshot::Sender<Result<super::cache::GlCacheStats, Error>>),
-    /// Snapshot the per-convert source-feed counters (zero-copy observability).
+    /// Snapshot the per-convert source-feed counters.
     ConvertStats(tokio::sync::oneshot::Sender<Result<super::cache::ConvertStats, Error>>),
     PboCreate(
         usize, // buffer size in bytes
@@ -99,35 +99,24 @@ enum GLProcessorMessage {
     CudaUnregister(usize), // fire-and-forget
 }
 
-/// Compute the flat element count for a PBO image buffer of the given format.
+/// Compute the flat element count for a PBO image buffer of the given format:
+/// the product of the format's `allocation_shape`.
 ///
-/// NV12 and NV16 are semiplanar with non-trivial element counts; all other
-/// formats use `width * height * channels`.
-///
-/// Returns `None` on `usize` overflow. A wrapped element count would size
-/// the PBO too small and corrupt memory on readback, so callers must treat
-/// `None` as an invalid-dimensions error (the same way they already reject
-/// a zero count).
+/// Returns `None` on `usize` overflow.
 fn pbo_elem_count(
     width: usize,
     height: usize,
     format: edgefirst_tensor::PixelFormat,
 ) -> Option<usize> {
-    // Element count == product of the canonical image shape (the PBO holds u8,
-    // one byte per element). Delegating to `allocation_shape` keeps the combined
-    // semi-planar height in lockstep with every other consumer (and is exact
-    // for odd heights — `height*3/2` truncation under-sized odd-H NV12 by a
-    // row, and the old NV24 arm fell through to `channels` = far too small).
-    // `checked_mul` so a wrapped count can't silently undersize the PBO.
     format
         .allocation_shape(width, height)?
         .iter()
         .try_fold(1usize, |acc, &d| acc.checked_mul(d))
 }
 
-/// Compute the tensor shape for a PBO image of the given format — the canonical
-/// [`PixelFormat::allocation_shape`] (Planar `[C,H,W]`, SemiPlanar `[total_h, W]`
-/// with the odd-height-exact combined-plane height, Packed `[H,W,C]`).
+/// Compute the tensor shape for a PBO image of the given format: the canonical
+/// [`PixelFormat::allocation_shape`] (Planar `[C,H,W]`, SemiPlanar `[total_h, W]`,
+/// Packed `[H,W,C]`).
 fn pbo_shape(width: usize, height: usize, format: edgefirst_tensor::PixelFormat) -> Vec<usize> {
     format
         .allocation_shape(width, height)
@@ -136,12 +125,10 @@ fn pbo_shape(width: usize, height: usize, format: edgefirst_tensor::PixelFormat)
 
 /// Best-effort registration of a freshly-created PBO with CUDA GL interop.
 ///
-/// When libcudart is present, asks the GL worker (where the GL context is
-/// current) to call `cudaGraphicsGLRegisterBuffer` for `buffer_id`, then
-/// attaches a [`CudaHandle`] so `cuda_map()` can later yield a linear,
-/// 256-byte-aligned device pointer for TensorRT. On any failure (no CUDA,
-/// channel closed, registration rejected) the handle is left unset and the
-/// PBO is still usable as a normal CPU/GL buffer.
+/// When libcudart is present, asks the GL worker to call
+/// `cudaGraphicsGLRegisterBuffer` for `buffer_id`, then attaches a
+/// [`CudaHandle`] to the tensor. On any failure (no CUDA, channel closed,
+/// registration rejected) the handle is left unset.
 fn register_pbo_cuda<T>(
     tensor: &mut edgefirst_tensor::Tensor<T>,
     buffer_id: u32,
@@ -171,18 +158,14 @@ fn register_pbo_cuda<T>(
     }
 }
 
-/// Implements PboOps by sending commands to the GL thread.
-///
-/// Uses a `WeakSender` so that PBO images don't keep the GL thread's channel
-/// alive. When the `GLProcessorThreaded` is dropped, its `Sender` is the last
-/// strong reference — dropping it closes the channel and lets the GL thread
-/// exit. PBO operations after that return `PboDisconnected`.
+/// Implements PboOps by sending commands to the GL thread through a
+/// `WeakSender`. After the `GLProcessorThreaded` is dropped, PBO operations
+/// return `PboDisconnected`.
 struct GlPboOps {
     sender: WeakSender<GLProcessorMessage>,
-    /// Which GL worker owns the context these buffers live in. Compared
-    /// against [`GL_WORKER`] so a re-entrant map is serviced inline ONLY by
-    /// the worker whose context actually holds the buffer — a different
-    /// processor's worker must still go through the channel.
+    /// Which GL worker owns the context these buffers live in. A call made
+    /// on that worker's thread is serviced inline; any other goes through the
+    /// channel.
     worker_id: u64,
 }
 
@@ -193,35 +176,22 @@ static NEXT_GL_WORKER_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 struct GlWorkerState {
     id: u64,
     /// Full per-message serialization: this thread holds the process-wide GL
-    /// lock for the whole message, so no other worker can run until it returns.
+    /// lock for the whole message.
     serializes: bool,
     /// Buffers currently `glMapBufferRange`-ed against this context.
     mapped: std::collections::HashSet<u32>,
 }
 
 thread_local! {
-    /// `Some(state)` on a GL worker thread, `None` everywhere else.
-    ///
-    /// This exists because a GL message handler can itself need a PBO map:
-    /// a mask draw into a PBO destination the caller holds mapped reads it
-    /// back through `TensorTrait::map` -> `PboHandle::acquire_map` ->
-    /// `GlPboOps::map_buffer`. Routing that through the channel would have the
-    /// worker `blocking_send` to the queue it is itself the only consumer of —
-    /// a self-deadlock (observed: a 1-in-5 hang on the desktop NVIDIA PBO path).
-    /// The worker already holds the context current on this thread, so it
-    /// performs the map directly instead.
-    ///
-    /// The mapped-buffer set lives here rather than on the worker's stack so the
-    /// inline path and the message path share one view of which buffers are
-    /// mapped — `glMapBufferRange` on an already-mapped buffer is undefined
-    /// behaviour, and the two paths must not be able to double-map.
+    /// `Some(state)` on a GL worker thread, `None` everywhere else. Holds the
+    /// worker's identity and its mapped-buffer set, shared by the message path
+    /// and the inline path.
     static GL_WORKER: std::cell::RefCell<Option<GlWorkerState>> =
         const { std::cell::RefCell::new(None) };
 }
 
 /// The mapped-PBO set for the current GL worker thread, or `None` off-worker.
-/// The closure must not re-enter `GL_WORKER` (keep it to set bookkeeping — no
-/// GL calls inside).
+/// The closure must not re-enter `GL_WORKER`.
 fn with_worker_mapped<R>(f: impl FnOnce(&mut std::collections::HashSet<u32>) -> R) -> Option<R> {
     GL_WORKER.with(|c| c.borrow_mut().as_mut().map(|s| f(&mut s.mapped)))
 }
@@ -232,14 +202,13 @@ fn on_owning_gl_worker(worker_id: u64) -> bool {
 }
 
 /// True when this thread is a GL worker holding the process-wide per-message
-/// lock, so no other worker can make progress until this message returns.
+/// lock.
 fn on_serializing_gl_worker() -> bool {
     GL_WORKER.with(|c| matches!(*c.borrow(), Some(ref s) if s.serializes))
 }
 
-/// A PBO owned by another worker's context, reached from a worker holding the
-/// process-wide per-message lock. The owning worker cannot take that lock until
-/// this message returns, so sending to it would never be answered.
+/// The error for a PBO owned by another worker's context, reached from a
+/// worker holding the process-wide per-message lock.
 fn cross_context_pbo_error(op: &str, buffer_id: u32) -> edgefirst_tensor::Error {
     edgefirst_tensor::Error::InvalidOperation(format!(
         "PBO {buffer_id}: cannot {op} a buffer owned by another GL context while \
@@ -255,12 +224,7 @@ thread_local! {
 }
 
 /// Run a re-entrant PBO op inline on the owning worker, turning a panic into
-/// an error exactly as the channel path's `reply_caught` does.
-///
-/// The unwind MUST stop here. `PboHandle::acquire_map` publishes
-/// `MapState::Mapping` before calling `map_buffer` and clears it only on
-/// return, so a panic crossing it strands that handle in `Mapping` and every
-/// later map on it waits on the condvar forever.
+/// an error and setting `GL_WORKER_POISON`.
 fn inline_gl_op<T>(what: &str, f: impl FnOnce() -> Result<T, Error>) -> Result<T, Error> {
     match std::panic::catch_unwind(AssertUnwindSafe(f)) {
         Ok(result) => result,
@@ -274,21 +238,17 @@ fn inline_gl_op<T>(what: &str, f: impl FnOnce() -> Result<T, Error>) -> Result<T
     }
 }
 
-// SAFETY: GlPboOps runs every GL operation on the thread owning the context --
-// via the channel, or inline when that thread is already this one (see
-// `GL_WORKER`). `map_buffer` returns a CPU-visible pointer from `glMapBufferRange`
-// that remains valid until `unmap_buffer` calls `glUnmapBuffer` on the GL thread.
-// `delete_buffer` sends a fire-and-forget deletion command to the GL thread.
+// SAFETY: every GL operation runs on the thread owning the context, through
+// the channel or inline when that thread is this one. The pointer `map_buffer`
+// returns from `glMapBufferRange` is valid until `unmap_buffer` calls
+// `glUnmapBuffer`.
 unsafe impl edgefirst_tensor::PboOps for GlPboOps {
     fn map_buffer(
         &self,
         buffer_id: u32,
         size: usize,
     ) -> edgefirst_tensor::Result<edgefirst_tensor::PboMapping> {
-        // Re-entrant call from inside a GL message handler on the worker that
-        // owns this context (e.g. a mask draw reading back into a mapped PBO
-        // destination). The context is already current on this thread,
-        // and sending would block on the queue this thread alone drains.
+        // Re-entrant call on the worker that owns this context: map inline.
         if on_owning_gl_worker(self.worker_id) {
             return inline_gl_op("PboMap", || pbo_map_on_gl_thread(buffer_id, size)).map_err(|e| {
                 edgefirst_tensor::Error::NotImplemented(format!("GL PBO map failed: {e:?}"))
@@ -314,13 +274,12 @@ unsafe impl edgefirst_tensor::PboOps for GlPboOps {
     }
 
     fn unmap_buffer(&self, buffer_id: u32) -> edgefirst_tensor::Result<()> {
-        // See `map_buffer` — same re-entrancy, same reasoning.
+        // Re-entrant call on the owning worker: unmap inline.
         if on_owning_gl_worker(self.worker_id) {
             return inline_gl_op("PboUnmap", || pbo_unmap_on_gl_thread(buffer_id)).map_err(|e| {
                 edgefirst_tensor::Error::NotImplemented(format!("GL PBO unmap failed: {e:?}"))
             });
         }
-        // See `map_buffer`.
         if on_serializing_gl_worker() {
             return Err(cross_context_pbo_error("unmap", buffer_id));
         }
@@ -340,11 +299,9 @@ unsafe impl edgefirst_tensor::PboOps for GlPboOps {
     }
 
     fn delete_buffer(&self, buffer_id: u32) {
-        // See `map_buffer` — a drop mid-convert must not queue to itself.
+        // Re-entrant call on the owning worker: delete inline.
         if on_owning_gl_worker(self.worker_id) {
             with_worker_mapped(|set| set.remove(&buffer_id));
-            // Reached from `PboHandle::Drop`; an unwind out of a drop that is
-            // itself unwinding aborts the process.
             let _ = inline_gl_op("PboDelete", || {
                 unsafe { edgefirst_gl::gl::DeleteBuffers(1, &buffer_id) };
                 Ok(())
@@ -352,7 +309,7 @@ unsafe impl edgefirst_tensor::PboOps for GlPboOps {
             return;
         }
         if let Some(sender) = self.sender.upgrade() {
-            // See `map_buffer`: blocking here would deadlock the same way.
+            // Foreign context under the per-message lock: send without blocking.
             if on_serializing_gl_worker() {
                 if sender
                     .try_send(GLProcessorMessage::PboDelete(buffer_id))
@@ -370,12 +327,8 @@ unsafe impl edgefirst_tensor::PboOps for GlPboOps {
     }
 }
 
-/// Routes CUDA GL-interop map/unmap/unregister to the GL thread.
-///
-/// Mirrors [`GlPboOps`]: holds a [`WeakSender`] so a registered PBO doesn't
-/// keep the GL thread's channel alive. The CUDA primitives
-/// (`cudaGraphicsMapResources` etc.) require the GL context to be current,
-/// so they must execute on the dedicated GL worker thread.
+/// Routes CUDA GL-interop map/unmap/unregister to the GL thread through a
+/// [`WeakSender`].
 struct GlCudaOps {
     sender: WeakSender<GLProcessorMessage>,
 }
@@ -405,10 +358,9 @@ impl edgefirst_tensor::CudaGlOps for GlCudaOps {
     }
 }
 
-/// OpenGL multi-threaded image converter. The actual conversion is done in a
-/// separate rendering thread, as OpenGL contexts are not thread-safe. This can
-/// be safely sent between threads. The `convert()` call sends the conversion
-/// request to the rendering thread and waits for the result.
+/// OpenGL multi-threaded image converter. The conversion is done in a
+/// separate rendering thread: `convert()` sends the conversion request to
+/// that thread and waits for the result. This can be sent between threads.
 #[derive(Debug)]
 pub struct GLProcessorThreaded {
     // This is only None when the converter is being dropped.
@@ -417,14 +369,14 @@ pub struct GLProcessorThreaded {
     // This is only None when the converter is being dropped.
     sender: Option<Sender<GLProcessorMessage>>,
     /// Identity of this processor's worker thread, handed to every `GlPboOps`
-    /// it creates so a re-entrant map can be matched to the owning context.
+    /// it creates.
     worker_id: u64,
     /// The PBOs this processor handed out, shared with its worker's
     /// `GLProcessorST`: only these may be bound in the worker's context.
     owned_pbos: std::sync::Arc<super::processor::OwnedPbos>,
     /// Immutable capability surface (transfer backend, float render
     /// support, serialization policy), captured once from the worker at
-    /// construction. See `PlatformCaps` in `platform/mod.rs`.
+    /// construction.
     caps: super::platform::PlatformCaps,
 }
 
@@ -527,9 +479,7 @@ fn reject_poisoned_message(msg: GLProcessorMessage) {
         GLProcessorMessage::CudaMap(_, resp) => {
             let _ = resp.send(None);
         }
-        // GL context is poisoned/dead — the GL buffer is unusable, so unmapping/
-        // unregistering the CUDA interop is moot (the resource is reclaimed at
-        // process exit). Same accepted "GL is gone" no-op as PboDelete above.
+        // No reply channel: the message is dropped.
         GLProcessorMessage::CudaUnmap(_) => {}
         GLProcessorMessage::CudaUnregister(_) => {}
     }
@@ -543,10 +493,7 @@ fn run_gl_worker(
     mut recv: tokio::sync::mpsc::Receiver<GLProcessorMessage>,
     create_ctx_send: tokio::sync::oneshot::Sender<Result<super::platform::PlatformCaps, Error>>,
 ) {
-    // Creation runs under the global lifecycle lock on Linux
-    // (bring-up races on some embedded drivers); ANGLE serializes
-    // display-level entry points internally, so macOS needs none
-    // (validated by the A0 lifecycle-churn spike leg).
+    // Linux: creation runs under the global lifecycle lock.
     #[cfg(target_os = "linux")]
     let init_result = {
         let _guard = super::context::GL_MUTEX
@@ -554,18 +501,10 @@ fn run_gl_worker(
             .unwrap_or_else(|e| e.into_inner());
         GLProcessorST::new(kind, capacity)
     };
-    // macOS: ANGLE/Metal serializes display-level entry points
-    // internally. Android: the system EGL is specification-conformant
-    // thread-safe. Neither needs the Linux lifecycle lock.
+    // macOS, iOS and Android: creation takes no lock.
     #[cfg(any(target_os = "macos", target_os = "ios", target_os = "android"))]
     let init_result = GLProcessorST::new(kind, capacity);
-    // Windows: ANGLE's D3D11 backend drives one immediate device context
-    // (and one state manager) per display from every GL context and is not
-    // safe to use from two threads at once: a processor bringing up its
-    // context (shader compiles, texture allocation) while another converted
-    // crashed with an access violation. Lifecycle and messages therefore
-    // share NON_LINUX_GL_MUTEX there; per-message locking is the ANGLE Full
-    // policy anyway.
+    // Windows: creation runs under `NON_LINUX_GL_MUTEX`.
     #[cfg(target_os = "windows")]
     let init_result = {
         let _guard = NON_LINUX_GL_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
@@ -579,32 +518,12 @@ fn run_gl_worker(
         }
     };
     gl_converter.owned_pbos = owned_pbos;
-    // Capability surface captured ONCE before the message loop —
-    // immutable for the worker's life, never re-probed per message.
+    // Capability surface captured once before the message loop.
     let caps = gl_converter.platform_caps();
     let _ = create_ctx_send.send(Ok(caps));
     let mut poisoned = false;
-    // Tracks which PBO buffer_ids currently have an outstanding GL
-    // mapping, scoped to this one GL context/thread -- the ONE
-    // place every PboOps call against this context's buffers
-    // actually serializes, regardless of which `PboHandle`
-    // (edgefirst-tensor) issued the `PboMap`/`PboUnmap` message.
-    // `PboHandle::acquire_map`'s own per-handle `Mutex<MapState>`
-    // enforces "at most one mapping" WITHIN one handle, including
-    // read-sharing (several readers reuse ONE mapping without ever
-    // re-sending `PboMap` here) -- but it has no visibility into a
-    // SEPARATE `PboHandle` for the same real `buffer_id`, which
-    // task 11's cross-cdylib PBO import made newly reachable: a
-    // producer's own tensor and a reconstructed cross-package
-    // consumer tensor for the same `buffer_id` are two independent
-    // `PboHandle`s, each believing it is the only mapper.
-    // `glMapBufferRange` on an already-mapped buffer is undefined
-    // behaviour per the GL spec, so THIS set -- not the per-handle
-    // mutex, which never sees another handle's calls -- is what
-    // actually prevents that.
-    // Install this thread's GL-worker identity and its mapped-PBO set. Both
-    // the message path and the re-entrant inline path read them from here —
-    // see [`GL_WORKER`] for why the inline path has to exist at all.
+    // Install this thread's GL-worker identity and its mapped-PBO set, which
+    // tracks the buffer ids with an outstanding GL mapping on this context.
     GL_WORKER.with(|c| {
         *c.borrow_mut() = Some(GlWorkerState {
             id: worker_id,
@@ -613,8 +532,7 @@ fn run_gl_worker(
             mapped: std::collections::HashSet::new(),
         });
     });
-    // Clear on every exit path, including unwind, so a recycled thread id can
-    // never inherit a dead worker's identity.
+    // Cleared on every exit path, including unwind.
     struct GlWorkerSlot;
     impl Drop for GlWorkerSlot {
         fn drop(&mut self) {
@@ -623,21 +541,11 @@ fn run_gl_worker(
         }
     }
     let _gl_worker_slot = GlWorkerSlot;
-    // Per-message serialization policy: Full where the platform
-    // demands it (`caps.serialize_gl` — Vivante/galcore is not
-    // thread-safe for concurrent GL across contexts), LifecycleOnly
-    // everywhere else — multiple processors then run GL work in
-    // parallel, each on its own thread + context. See the GL_MUTEX
-    // doc comment in context.rs. EDGEFIRST_GL_SERIALIZE overrides
-    // per-driver defaults (full = escape hatch for unknown-bad
-    // drivers; lifecycle = force-parallel).
+    // Per-message serialization policy: `caps.serialize_gl`, overridden by
+    // `EDGEFIRST_GL_SERIALIZE` (`full` or `lifecycle`).
     let serialize_per_msg = match std::env::var("EDGEFIRST_GL_SERIALIZE").as_deref() {
         Ok("full") => true,
         Ok("lifecycle") => {
-            // The per-message lock is what makes ANGLE's per-display state
-            // manager safe here: `LAST_ACTIVE_CONTEXT` and the per-message
-            // context re-sync it drives are documented as touched only under
-            // it, and concurrent GL on this backend has crashed this box.
             #[cfg(target_os = "windows")]
             log::warn!(
                 "EDGEFIRST_GL_SERIALIZE=lifecycle drops the per-message lock the ANGLE/D3D11 context re-sync relies on; concurrent GL across processors is not supported on this backend"
@@ -661,13 +569,6 @@ fn run_gl_worker(
     });
     while let Some(msg) = recv.blocking_recv() {
         // Full policy: one processor's message at a time, process-wide.
-        // Linux locks GL_MUTEX (messages must also exclude the locked
-        // lifecycle operations — on Vivante a convert racing a context
-        // bring-up is part of the driver bug class). macOS has no
-        // lifecycle lock (ANGLE serializes display entry points
-        // internally), so message-vs-message exclusion suffices —
-        // needed on virtualized GPUs, where concurrent GL across
-        // contexts mis-renders (paravirtual Metal, macOS CI runners).
         #[cfg(target_os = "linux")]
         let _guard = serialize_per_msg.then(|| {
             super::context::GL_MUTEX
@@ -683,32 +584,23 @@ fn run_gl_worker(
         let _guard =
             serialize_per_msg.then(|| NON_LINUX_GL_MUTEX.lock().unwrap_or_else(|e| e.into_inner()));
 
-        // After a panic, the GL context is in an undefined state. Reject
-        // all subsequent messages with an error rather than risking wrong
-        // output or a GPU hang from corrupted GL state. This follows the
-        // same pattern as std::sync::Mutex poisoning.
+        // After a panic, reject all subsequent messages with an error.
         if poisoned {
             reject_poisoned_message(msg);
             continue;
         }
 
-        // Platform pre-message hook (ANGLE/D3D11 re-syncs this context's
-        // state when another processor's context issued the last commands;
-        // a no-op elsewhere). Runs under the lock taken above.
+        // Platform pre-message hook, under the lock taken above.
         gl_converter.begin_gpu_pass();
         handle_gl_message(msg, &mut gl_converter, &mut poisoned);
-        // A re-entrant inline PBO op reports its panic here: `inline_gl_op`
-        // converted it to an error so it could not unwind into the tensor
-        // crate, which means `reply_caught` never saw it.
+        // Fold in a panic from a re-entrant inline PBO op.
         poisoned |= GL_WORKER_POISON.with(|p| p.replace(false));
-        // Per-pass platform texture attachments (macOS pbuffer
-        // binds) are released once the message's GPU work has
-        // synced; deferred batches keep theirs until Flush.
+        // Per-pass platform texture attachments are released once the
+        // message's GPU work has synced; deferred batches keep theirs until
+        // Flush.
         gl_converter.end_gpu_pass_if_synced();
     }
-    // Explicitly drop under the mutex so EGL teardown is serialized
-    // (Linux, and Windows for the D3D11 reason above; ANGLE teardown is
-    // display-internal on macOS).
+    // Drop under the mutex on Linux and Windows.
     #[cfg(target_os = "linux")]
     let _guard = super::context::GL_MUTEX
         .lock()
@@ -718,22 +610,14 @@ fn run_gl_worker(
     drop(gl_converter);
 }
 
-/// Per-message serialization lock for the platforms without a Linux-style
-/// `GL_MUTEX` (macOS/iOS, Android, Windows) — taken per message under the
-/// Full policy, and on Windows also around processor bring-up/teardown.
+/// Per-message serialization lock for macOS/iOS, Android and Windows: taken
+/// per message under the Full policy, and on Windows also around processor
+/// bring-up/teardown.
 #[cfg(not(target_os = "linux"))]
 static NON_LINUX_GL_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Take [`NON_LINUX_GL_MUTEX`] on behalf of a caller outside the GL worker
-/// threads. Poison-tolerant, like every other user of it.
-///
-/// Windows leaf tests MUST hold this guard for their whole body: any test
-/// that brings up an ANGLE display or a GL context does so on the test's own
-/// thread, and the lib test binary runs other tests whose GL workers are
-/// alive at the same time. ANGLE's D3D11 backend drives one immediate device
-/// context per display from every GL context and is not safe to use from two
-/// threads at once — the access-violation pattern documented on
-/// [`run_gl_worker`], which takes the same lock around bring-up and teardown.
+/// threads. Poison-tolerant.
 #[cfg(target_os = "windows")]
 pub(super) fn lifecycle_guard() -> std::sync::MutexGuard<'static, ()> {
     NON_LINUX_GL_MUTEX.lock().unwrap_or_else(|e| e.into_inner())
@@ -859,16 +743,10 @@ fn handle_gl_message(
             handle_pbo_delete(buffer_id, poisoned);
         }
         GLProcessorMessage::CudaRegisterBuffer(buffer_id, resp) => {
-            // CUDA GL-interop must run on the GL-context thread.
             let _ = resp.send(edgefirst_tensor::gl_register_buffer(buffer_id));
         }
         GLProcessorMessage::CudaMap(resource, resp) => {
-            // Auto-flush: if a batched `convert_deferred` is still
-            // owed its single GPU sync, complete it before CUDA maps
-            // the buffer — otherwise the device could read a render
-            // still in flight. This makes `cuda_map()` correct on a
-            // batched output with no API change (the caller pays the
-            // sync it would have owed anyway).
+            // Complete any deferred batch before CUDA maps the buffer.
             gl_converter.flush_pending();
             let _ = resp.send(edgefirst_tensor::gl_map_resource(resource));
         }
@@ -890,14 +768,13 @@ fn handle_image_convert(
     poisoned: &mut bool,
 ) {
     let (options, defer) = geom;
-    // SAFETY: This is safe because the convert() function waits for the resp to
-    // be sent before dropping the borrow for src and dst
+    // SAFETY: `convert()` waits for the reply before dropping its borrows of
+    // `src` and `dst`.
     let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
         let src = unsafe { src.ptr.as_ref() };
         let dst = unsafe { dst.ptr.as_mut() };
-        // A deferred convert skips the per-tile glFinish and
-        // leaves a single sync owed at Flush; an eager convert
-        // finishes as usual.
+        // A deferred convert skips the per-tile glFinish and leaves a single
+        // sync owed at Flush.
         if defer {
             gl_converter.convert_deferred(src, dst, Some(options))
         } else {
@@ -915,8 +792,8 @@ fn handle_image_convert_fenced(
     gl_converter: &mut GLProcessorST,
     poisoned: &mut bool,
 ) {
-    // SAFETY: as ImageConvert — convert_with_fence()
-    // blocks on the reply before the borrows drop.
+    // SAFETY: `convert_with_fence()` blocks on the reply before its borrows
+    // drop.
     let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
         let src = unsafe { src.ptr.as_ref() };
         let dst = unsafe { dst.ptr.as_mut() };
@@ -940,9 +817,8 @@ fn handle_draw_decoded_masks(
     poisoned: &mut bool,
 ) {
     let (opacity, bg, content_region, color_mode) = overlay;
-    // SAFETY: This is safe because the draw_decoded_masks() function waits for the
-    // resp to be sent before dropping the borrow for dst, detect,
-    // segmentation, and background
+    // SAFETY: `draw_decoded_masks()` waits for the reply before dropping its
+    // borrows of `dst`, `detect`, `segmentation` and `background`.
     let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
         let dst = unsafe { dst.ptr.as_mut() };
         let det = unsafe { std::slice::from_raw_parts(det.ptr.as_ptr(), det.len) };
@@ -978,8 +854,7 @@ fn handle_draw_proto_masks(
     poisoned: &mut bool,
 ) {
     let (opacity, bg, content_region, color_mode) = overlay;
-    // SAFETY: Same safety invariant as DrawDecodedMasks — caller
-    // blocks on resp before dropping borrows.
+    // SAFETY: the caller blocks on the reply before dropping its borrows.
     let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
         let dst = unsafe { dst.ptr.as_mut() };
         let det = unsafe { std::slice::from_raw_parts(det.ptr.as_ptr(), det.len) };
@@ -1027,9 +902,8 @@ fn handle_pbo_create(
     reply_caught(result, resp, poisoned, "PboCreate");
 }
 
-/// Perform a PBO map on the calling thread, which MUST be the GL worker that
-/// owns the buffer (context already current). Shared by the message handler and
-/// the re-entrant inline path so the dedup rule is enforced identically.
+/// Perform a PBO map on the calling thread, which must be the GL worker that
+/// owns the buffer. Refuses a buffer that is already mapped in this context.
 fn pbo_map_on_gl_thread(
     buffer_id: u32,
     size: usize,
@@ -1061,22 +935,18 @@ fn pbo_map_on_gl_thread(
         }
     }));
     if !matches!(result, Ok(Ok(_))) {
-        // The map did not take — release the reservation so a retry is not
-        // permanently blocked by a mapping that never happened.
+        // The map failed: release the reservation.
         with_worker_mapped(|set| set.remove(&buffer_id));
     }
     match result {
         Ok(result) => result,
-        // Reaches whichever boundary the caller has: `handle_pbo_map` on the
-        // message path, `inline_gl_op` on the re-entrant one.
         Err(panic) => std::panic::resume_unwind(panic),
     }
 }
 
 /// Unmap counterpart of [`pbo_map_on_gl_thread`]; same thread requirement.
 fn pbo_unmap_on_gl_thread(buffer_id: u32) -> Result<(), Error> {
-    // Always release the reservation, matching `PboHandle::release_map`'s
-    // "state returns to Unmapped either way" contract.
+    // Release the reservation whether or not the unmap succeeds.
     with_worker_mapped(|set| set.remove(&buffer_id));
     unsafe {
         edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::PIXEL_PACK_BUFFER, buffer_id);
@@ -1113,12 +983,7 @@ fn handle_pbo_unmap(
 }
 
 fn handle_pbo_delete(buffer_id: u32, poisoned: &mut bool) {
-    // Defensive: a live mapping should never reach here
-    // (PboHandle::Drop unmaps before deleting), but a
-    // stale reservation for a since-deleted (and
-    // possibly buffer-id-recycled) buffer would
-    // otherwise wrongly block every future map of a NEW
-    // buffer that reuses the same id.
+    // Drop any reservation left for this buffer id.
     with_worker_mapped(|set| set.remove(&buffer_id));
     if let Err(e) = std::panic::catch_unwind(AssertUnwindSafe(|| unsafe {
         edgefirst_gl::gl::DeleteBuffers(1, &buffer_id);
@@ -1138,9 +1003,9 @@ impl GLProcessorThreaded {
         Self::with_cache_capacity(kind, None)
     }
 
-    /// As [`new`](Self::new), with an explicit per-cache import capacity —
-    /// [`ImageProcessorConfig::egl_cache_capacity`], which documents what the
-    /// number bounds and takes precedence over the environment.
+    /// As [`new`](Self::new), with an explicit per-cache import capacity
+    /// ([`ImageProcessorConfig::egl_cache_capacity`]), which takes precedence
+    /// over the environment.
     ///
     /// [`ImageProcessorConfig::egl_cache_capacity`]: crate::ImageProcessorConfig::egl_cache_capacity
     pub fn with_cache_capacity(
@@ -1392,11 +1257,8 @@ impl GLProcessorThreaded {
         })?
     }
 
-    /// Test hook (issue #175): make every zero-copy DESTINATION import fail,
-    /// the way a driver that refuses the buffer does, so the fallback to the
-    /// mapped-texture readback is exercised on a host whose driver accepts
-    /// every destination. The failure is injected at the import itself, so
-    /// what a test drives is the production trigger.
+    /// Test hook: make every zero-copy destination import fail. The failure
+    /// is injected at the import itself.
     #[cfg(test)]
     pub(crate) fn set_fail_dst_import(&mut self, fail: bool) -> Result<(), Error> {
         let (err_send, err_recv) = tokio::sync::oneshot::channel();
@@ -1427,11 +1289,7 @@ impl GLProcessorThreaded {
     }
 
     /// Snapshot the EGLImage cache counters (src, dst, NV R8) from the GL
-    /// thread. Steady-state tests capture this after warmup and after an
-    /// N-frame loop over a fixed buffer pool and assert
-    /// [`total_misses`](super::cache::GlCacheStats::total_misses) stays flat —
-    /// any increase means a convert re-imported a buffer it should have found
-    /// cached (the cache-behavior equality gate for GL refactors).
+    /// thread.
     pub fn egl_cache_stats(&self) -> Result<super::cache::GlCacheStats, Error> {
         let (send, recv) = tokio::sync::oneshot::channel();
         self.sender
@@ -1444,16 +1302,15 @@ impl GLProcessorThreaded {
         })?
     }
 
-    /// Convert and return a native sync-fence fd that signals when the
-    /// GPU work completes, instead of blocking the CPU on `glFinish` —
-    /// the GL→NPU handoff (`EGL_ANDROID_native_fence_sync`).
+    /// Convert and return a native sync-fence fd that signals when the GPU
+    /// work completes, without blocking the CPU on `glFinish`
+    /// (`EGL_ANDROID_native_fence_sync`).
     ///
     /// `Ok(None)` means the convert completed with the normal blocking
-    /// semantics (platform/driver has no native fence, or a pure-CPU-
-    /// readback path was taken) — the destination is already safe to
-    /// read. `Ok(Some(fd))` means the caller (or the NPU runtime, via
-    /// `ANeuralNetworksExecution_startComputeWithDependencies`) must wait
-    /// on the fd before consuming the destination buffer.
+    /// semantics (the platform or driver has no native fence, or a CPU
+    /// readback path was taken): the destination is safe to read.
+    /// `Ok(Some(fd))` means the caller must wait on the fd before consuming
+    /// the destination buffer.
     pub fn convert_with_fence(
         &mut self,
         src: &TensorDyn,
@@ -1463,8 +1320,7 @@ impl GLProcessorThreaded {
         let options = options.unwrap_or_default();
         use crate::ImageProcessorTrait as _;
         if !self.caps.native_fence_sync {
-            // No fence on this display: the plain blocking convert IS the
-            // fenced contract with `None` — skip the special round-trip.
+            // No fence on this display: blocking convert, `None`.
             self.convert(src, dst, Some(options))?;
             return Ok(None);
         }
@@ -1491,9 +1347,6 @@ impl GLProcessorThreaded {
     }
 
     /// Snapshot the per-convert source-feed counters from the GL thread.
-    /// A pipeline that expects end-to-end zero-copy asserts
-    /// [`src_uploads`](super::cache::ConvertStats::src_uploads) stays flat
-    /// (every frame fed by import, never by a CPU map + upload).
     pub fn convert_stats(&self) -> Result<super::cache::ConvertStats, Error> {
         let (send, recv) = tokio::sync::oneshot::channel();
         self.sender
@@ -1506,11 +1359,8 @@ impl GLProcessorThreaded {
         })?
     }
 
-    /// Create a PBO-backed [`Tensor<u8>`](edgefirst_tensor::Tensor) image on the GL thread.
-    ///
-    /// Declared [`CpuAccess::ReadWrite`](edgefirst_tensor::CpuAccess): the GL
-    /// readback maps the buffer on the CPU itself (repack, BGRA swap, row
-    /// spread), and a narrower declaration buys no cheaper PBO mapping.
+    /// Create a PBO-backed [`Tensor<u8>`](edgefirst_tensor::Tensor) image on the GL thread,
+    /// declared [`CpuAccess::ReadWrite`](edgefirst_tensor::CpuAccess).
     pub fn create_pbo_image(
         &self,
         width: usize,
@@ -1551,12 +1401,7 @@ impl GLProcessorThreaded {
         tensor
             .set_format(format)
             .map_err(|e| Error::OpenGl(format!("Failed to set format on PBO tensor: {e:?}")))?;
-        // Register the PBO with CUDA (best-effort; no-op without libcudart) so
-        // `cuda_map()` can yield a device pointer — matching the float PBO path
-        // in `create_pbo_image_dtype`. Without this, u8 PBOs were never
-        // CUDA-interop-capable, so the codec's nvJPEG backend (and any CUDA
-        // consumer) could not use a `create_image`-allocated PBO destination.
-        // The i8 transmute by the caller preserves the attached handle.
+        // Register the PBO with CUDA (best-effort; no-op without libcudart).
         register_pbo_cuda(&mut tensor, buffer_id, size, sender);
         self.owned_pbos.insert(tensor.pbo_vtable_ptr(), &owned_ops);
         Ok(tensor)
@@ -1652,12 +1497,8 @@ impl GLProcessorThreaded {
         self.caps.transfer_backend
     }
 
-    /// Report which float dtypes the GPU can render to.
-    ///
-    /// Values are probed once at construction time and adjusted for
-    /// Vivante GC7000UL, whose float readback latency (170-320 ms) makes
-    /// GL float destinations impractical; `ImageProcessor::convert()` falls
-    /// back to CPU float output (normalized to `[0, 1]`) for these targets.
+    /// Report which float dtypes the GPU can render to. Values are probed
+    /// once at construction time and adjusted for driver quirks.
     pub(crate) fn supported_render_dtypes(&self) -> crate::RenderDtypeSupport {
         self.caps.render_dtypes
     }
@@ -1704,18 +1545,12 @@ impl GLProcessorThreaded {
 impl Drop for GLProcessorThreaded {
     fn drop(&mut self) {
         // Closing the channel ends the worker loop, which drops the
-        // `GLProcessorST` it owns; that `Drop` pays any device submission an
-        // open batch still owes. The join is what makes it ordered before this
-        // returns -- and it has to happen on the worker, which is the thread
-        // holding the context.
+        // `GLProcessorST` it owns; the join waits for that.
         drop(self.sender.take());
         let _ = self.handle.take().and_then(|h| h.join().ok());
     }
 }
 
-// `pbo_elem_count` / `pbo_shape` are pure (no GL), so they are unit-testable
-// without a GPU. The overflow→None arm of `pbo_elem_count` guards against an
-// undersized PBO allocation, so it is worth pinning explicitly.
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
@@ -1724,55 +1559,29 @@ mod tests {
 
     #[test]
     fn elem_count_per_format() {
-        // Packed RGBA: w*h*4.
         assert_eq!(pbo_elem_count(8, 4, PixelFormat::Rgba), Some(8 * 4 * 4));
-        // Packed RGB: w*h*3.
         assert_eq!(pbo_elem_count(8, 4, PixelFormat::Rgb), Some(8 * 4 * 3));
-        // NV12 semiplanar: w*h*3/2.
         assert_eq!(pbo_elem_count(8, 4, PixelFormat::Nv12), Some(8 * 4 * 3 / 2));
-        // NV16 semiplanar: w*h*2.
         assert_eq!(pbo_elem_count(8, 4, PixelFormat::Nv16), Some(8 * 4 * 2));
     }
 
     #[test]
     fn elem_count_overflow_is_none() {
-        // w*h already overflows usize → None (never a wrapped, undersized count).
         assert_eq!(pbo_elem_count(usize::MAX, 2, PixelFormat::Rgba), None);
-        // w*h fits but *channels overflows → None.
         assert_eq!(pbo_elem_count(usize::MAX, 1, PixelFormat::Rgb), None);
     }
 
     #[test]
     fn shape_per_format() {
-        // Planar: [channels, height, width].
         assert_eq!(pbo_shape(8, 4, PixelFormat::PlanarRgb), vec![3, 4, 8]);
-        // SemiPlanar NV12: [height*3/2, width].
         assert_eq!(pbo_shape(8, 4, PixelFormat::Nv12), vec![4 * 3 / 2, 8]);
-        // SemiPlanar NV16: [height*2, width].
         assert_eq!(pbo_shape(8, 4, PixelFormat::Nv16), vec![4 * 2, 8]);
-        // Packed: [height, width, channels].
         assert_eq!(pbo_shape(8, 4, PixelFormat::Rgba), vec![4, 8, 4]);
     }
 
-    /// Regression test for the cross-handle PBO map race task 11's review
-    /// found: `PboHandle::acquire_map`'s per-handle `Mutex<MapState>`
-    /// (`edgefirst-tensor`) has no visibility into a SEPARATE `PboHandle`
-    /// for the same real `buffer_id` -- exactly what a cross-cdylib
-    /// reconstructed consumer tensor now is, alongside the producer's own
-    /// tensor, since task 11 wired a real `kind::PBO` `import_descriptor`
-    /// arm. Simulates that with two independent `PboTensor`s built
-    /// directly (rather than through the full descriptor/vtable round
-    /// trip, which needs a second compiled `.so` to be meaningful) that
-    /// both point at the SAME real GL buffer via a fresh [`GlPboOps`]
-    /// wrapping the SAME sender -- exactly the relationship `import_descriptor`'s
-    /// PBO arm produces between a producer's handle and a reconstructed
-    /// one. Without `mapped_pbo_buffers`, the second map would reach
-    /// `glMapBufferRange` on an already-mapped buffer (undefined
-    /// behaviour); this asserts it is refused instead, and that the
-    /// refusal is a real, releasable reservation rather than a permanently
-    /// stuck `buffer_id`.
+    /// A second map of one GL buffer through another `PboHandle` is refused until the first is released.
     #[test]
-    #[cfg(any(target_os = "linux", target_os = "windows"))] // PBO destinations: Linux + Windows
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     fn concurrent_maps_from_two_independent_handles_on_one_buffer_do_not_corrupt_gl_state() {
         let gl = match GLProcessorThreaded::new(None) {
             Ok(gl) => gl,
@@ -1791,9 +1600,7 @@ mod tests {
         let size = tensor_a.capacity_bytes();
         let shape = tensor_a.shape().to_vec();
 
-        // A second, independent PboHandle for the IDENTICAL real buffer --
-        // same relationship a producer's handle and a reconstructed
-        // consumer's handle have to the same GL context.
+        // A second, independent PboHandle for the same GL buffer.
         let ops_b: std::sync::Arc<dyn edgefirst_tensor::PboOps> = std::sync::Arc::new(GlPboOps {
             sender: gl.sender.as_ref().unwrap().downgrade(),
             worker_id: gl.worker_id,
@@ -1802,20 +1609,10 @@ mod tests {
             edgefirst_tensor::PboTensor::<u8>::from_pbo(buffer_id, size, &shape, None, ops_b)
                 .expect("from_pbo against a real, already-created buffer_id must succeed");
 
-        // tensor_a maps first and holds the mapping open.
         let map_a = tensor_a.map().expect("first map must succeed");
 
-        // tensor_b's own Mutex<MapState> starts at Unmapped and knows
-        // nothing about tensor_a's outstanding mapping -- without the
-        // GL-thread-level fix this reaches glMapBufferRange a second time.
         let map_b_result = tensor_b.map();
-        // `glMapBufferRange` on an already-mapped buffer is UNDEFINED
-        // BEHAVIOUR per the GL spec, not guaranteed to fail cleanly on
-        // every driver -- so this asserts the SPECIFIC refusal
-        // `mapped_pbo_buffers` produces (matching this file's own error
-        // text), not merely "some error occurred", which a
-        // driver-dependent null return could also produce and would make
-        // this test pass even with the fix reverted.
+        // Assert the specific already-mapped refusal.
         let Err(map_b_err) = map_b_result else {
             panic!(
                 "a second, independent handle mapping the SAME real buffer while the \
@@ -1831,9 +1628,6 @@ mod tests {
 
         drop(map_a);
 
-        // Once the first mapping releases, the SAME second handle must be
-        // able to map successfully -- proves the refusal above was a real,
-        // releasable reservation, not a permanently stuck buffer_id.
         let map_b_after = tensor_b.map();
         assert!(
             map_b_after.is_ok(),

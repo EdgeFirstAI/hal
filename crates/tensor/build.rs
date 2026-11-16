@@ -1,9 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-// Under the dynamic backend this crate's own test binaries need libedgefirst_tensor, which
-// `edgefirst-tensor-ffi` declares without a `#[link]`; `-tests` link args never reach dependents.
-// Mirrors build-support's `tensor_lib_dir`, which this published crate cannot depend on.
+// Emits the `coverage` cfg for instrumented builds and, under the dynamic
+// backend, links this crate's test binaries against libedgefirst_tensor.
 fn main() {
     let rustflags = std::env::var("CARGO_ENCODED_RUSTFLAGS").unwrap_or_default();
     let wrapper = std::env::var("__CARGO_LLVM_COV_RUSTC_WRAPPER_RUSTFLAGS").unwrap_or_default();

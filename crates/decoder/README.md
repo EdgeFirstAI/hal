@@ -345,20 +345,7 @@ for the C API alone, which has no dict to hand across the boundary.
 
 The inferred schema pins the NMS *mode* but not the thresholds. Ultralytics runs NMS class-aware (`agnostic=False`), and the schema says so explicitly rather than relying on the builder's fallback. `with_nms` still overrides. YOLO26 end-to-end exports perform NMS in-graph and carry no mode.
 
-Box normalization follows the export format, not a fixed convention:
-Ultralytics ONNX exports report pixel-space boxes (`normalized: false`),
-while TFLite exports report boxes normalized to `[0, 1]` (`normalized:
-true`) — the inferred schema always matches the tensors the model actually
-produces. A CoreML export (no-NMS) is pixel-space too, matching ONNX,
-established by source-tracing the Ultralytics exporter and confirmed by the
-same runtime measurement that pinned the other two. `ModelSource::Other` is refused rather
-than defaulted, because this is the one field no tensor shape reveals and
-picking wrong scales every box by the input size. The schema's
-`decoder_version` (`yolov8` or `yolo26`) is always
-set explicitly rather than left for the builder to infer from output shape,
-because shape-based inference of end-to-end vs. pre-NMS layout is
-ambiguous in the general case; inference here settles it once, from the
-model's own `end2end` metadata flag when present.
+Box normalization follows the export format, not a fixed convention: Ultralytics ONNX exports report pixel-space boxes (`normalized: false`), while TFLite exports report boxes normalized to `[0, 1]` (`normalized: true`) — the inferred schema always matches the tensors the model actually produces. A CoreML export (no-NMS) is pixel-space too, matching ONNX. `ModelSource::Other` is refused rather than defaulted, because this is the one field no tensor shape reveals and picking wrong scales every box by the input size. The schema's `decoder_version` (`yolov8` or `yolo26`) is always set explicitly rather than left for the builder to infer from output shape, because shape-based inference of end-to-end vs. pre-NMS layout is ambiguous in the general case; inference here settles it once, from the model's own `end2end` metadata flag when present.
 
 ## Tiled Inference (SAHI)
 
@@ -427,16 +414,7 @@ standard SAHI with Ultralytics YOLO models. Merged boxes can be fed straight to
 the tracker (next section), which expects normalized coordinates, hence
 `finalize_normalized`.
 
-> **Note:** `MergeMode::KeepBest` suppresses — the best box of each matched
-> group comes back unchanged, never grown — so an object larger than a single tile
-> is reported as its best fragment. `MergeMode::Union` grows that box to the
-> group's *enclosing union* instead, but on the Ocean Cleanup ADIS 4K
-> validation (TOP2-836) the union cost about 0.05 AP50 on every frame, tiled
-> or not (whole frame: 0.491 AP50 with plain NMS, 0.437 after the union, 0.490
-> with keep-best; 28-tile pipeline: 0.500 keep-best vs 0.442 union), which is
-> why keep-best is the default. Add an optional full-frame downscaled pass
-> (another `push_tile` at `origin=(0,0)`, `crop_size=frame_dims`) for
-> mixed-scale datasets.
+> **Note:** `MergeMode::KeepBest` suppresses — the best box of each matched group comes back unchanged, never grown — so an object larger than a single tile is reported as its best fragment. `MergeMode::Union` grows that box to the group's *enclosing union* instead. Add an optional full-frame downscaled pass (another `push_tile` at `origin=(0,0)`, `crop_size=frame_dims`) for mixed-scale datasets.
 
 ## Tracked Decoding
 

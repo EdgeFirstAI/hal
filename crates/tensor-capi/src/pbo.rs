@@ -1,34 +1,21 @@
 // SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! PBO-backed tensors: the constructor, and the three facts a GL consumer
-//! needs back.
+//! PBO-backed tensors: the constructor, and the three accessors a GL
+//! consumer reads back.
 //!
-//! A GL Pixel Buffer Object cannot move into this library — its map and
-//! unmap must run on the client's GL-worker thread, and this library never
-//! makes a GL call. What crosses instead is the **callback channel**:
-//! `ef_client_state` plus the two op functions. This library builds a real
-//! `TensorStorage::Pbo` tensor over them, so a PBO handle behaves like any
-//! other tensor — `ef_tensor_view_region`, `ef_tensor_map`,
-//! `ef_tensor_set_plane_offset` and the rest all work — while every actual
-//! GL operation calls back out.
-//!
-//! **This is a constructor, not an attach.** The storage *is* the GL
-//! buffer; there is no pre-existing tensor to decorate. An
-//! `ef_tensor_pbo_attach` that decorated a host tensor would reproduce the
-//! two-sources-of-truth shape this design exists to remove, just moved
-//! across the ABI.
+//! This library makes no GL call. The client passes a callback channel:
+//! `ef_client_state` plus the map and unmap functions. This library builds a
+//! `TensorStorage::Pbo` tensor over them, and every GL operation calls back
+//! out through that channel.
 //!
 //! # Mapping a PBO handle
 //!
-//! `ef_tensor_map` is the mapping entry point for a PBO handle like any
-//! other, and its one-outstanding-map rule applies unchanged: a second
-//! concurrent map on the same handle is refused with `EBUSY` and an
-//! `EF_ERROR_CLASS_INVALID_OPERATION` last-error class, never silently
-//! dropped or replaced. The underlying `PboHandle` does support several
-//! concurrent readers, but that is reachable only from inside the library;
-//! a caller that wants two simultaneous readers takes two handles, via
-//! `ef_tensor_view_region`.
+//! `ef_tensor_map` is the mapping entry point for a PBO handle, and its
+//! one-outstanding-map rule applies: a second concurrent map on the same
+//! handle is refused with `EBUSY` and an `EF_ERROR_CLASS_INVALID_OPERATION`
+//! last-error class. A caller that wants two simultaneous readers takes two
+//! handles, via `ef_tensor_view_region`.
 
 use std::ffi::{c_int, c_void};
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -49,27 +36,20 @@ use crate::last_error::{
 /// when the last reference to the returned tensor is freed. The caller
 /// keeps its own reference and may drop it as soon as this returns.
 ///
-/// **`retain`/`release` govern the channel only.** They never transfer
+/// `retain`/`release` govern the channel only. They do not transfer
 /// ownership of the GL buffer: this library never deletes it, and the
-/// caller's own destructor stays the sole caller of `glDeleteBuffers`.
-/// Getting this backwards double-frees the buffer.
+/// caller remains the sole caller of `glDeleteBuffers`.
 ///
 /// `size` is the GL allocation's full byte count, which may exceed the
-/// product of `dims` — a PBO allocated at a 64-byte-aligned row stride is
-/// larger than its shape implies, and clamping to the shape would lose the
-/// padding a strided map needs.
+/// product of `dims`.
 ///
 /// `map_fn` and `unmap_fn` are called on the caller's own thread, never on
 /// a thread this library creates. They must be safe to call concurrently
 /// and must not unwind.
 ///
-/// **The whole channel is checked, not assumed.** `state.ctx`,
-/// `state.retain`, `state.release`, `map_fn` and `unmap_fn` are five
-/// non-NULL requirements, and all five are rejected rather than
-/// dereferenced: a NULL function pointer this library called would be
-/// undefined behaviour, not a diagnosable failure, so the check happens
-/// before anything is constructed. The two op parameters are nullable
-/// function pointers in C for exactly that reason.
+/// `state.ctx`, `state.retain`, `state.release`, `map_fn` and `unmap_fn`
+/// must all be non-NULL; a NULL one is rejected before anything is
+/// constructed.
 ///
 /// @retval a new tensor the caller must free with `ef_tensor_free`.
 /// @retval `NULL` for a NULL `state.ctx`/`state.retain`/`state.release`/
@@ -77,8 +57,7 @@ use crate::last_error::{
 ///         unrecognized `dtype`, or a `size` smaller than the shape needs
 ///         — `ef_tensor_last_error_message` carries the reason and
 ///         `ef_tensor_last_error_class` its class. `errno` is set to
-///         `EINVAL` for the argument-validation refusals, alongside the
-///         `NULL` return that is this entry point's contract.
+///         `EINVAL` for these argument-validation refusals.
 ///
 /// # Safety
 /// `dims` must point to `ndim` readable `uint64_t`. `state.ctx` must remain
@@ -92,20 +71,11 @@ pub unsafe extern "C" fn ef_tensor_wrap_pbo(
     dtype: u32,
     dims: *const u64,
     ndim: u32,
-    // Nullable: C can pass a NULL function pointer, and reading one as a
-    // bare `fn` is undefined behaviour before any check could run. Only the
-    // entry point's parameters change -- `PboOpsVtable`'s own fields stay
-    // bare, because a table this library built has already been checked.
-    // See `EfPboMapFnNullable` for why the alias exists and why the header
-    // signature still reads `ef_pbo_map_fn map_fn`.
+    // Nullable: C can pass a NULL function pointer.
     map_fn: EfPboMapFnNullable,
     unmap_fn: EfPboUnmapFnNullable,
 ) -> *mut EfTensor {
     unsafe {
-        // The quiet hook, before the catch: a caught panic must WRITE the
-        // thread-local, or a consumer reading `ef_tensor_last_error_class`
-        // after this returns NULL gets a class left behind by an earlier
-        // failure and reports it as this call's. See `ensure_hook_installed`.
         ensure_hook_installed();
         catch_unwind(AssertUnwindSafe(|| {
             let Some(shape) = read_dims(dims, ndim, "wrap_pbo") else {
@@ -121,16 +91,6 @@ pub unsafe extern "C" fn ef_tensor_wrap_pbo(
                 );
                 return std::ptr::null_mut();
             };
-            // `client_state_pbo_ops` re-checks the three `state` members, but
-            // checking here names the entry point in the message and keeps
-            // the EINVAL contract in the header true independently of a
-            // helper two crates away.
-            //
-            // Spec section 6 says a NULL `ctx`/`retain`/`release` is
-            // `EINVAL`, so `errno` is set as well as the class -- the
-            // convention `hardware.rs`, `cuda.rs` and `d3d11.rs` already
-            // follow for entry points whose only failure channel is a NULL
-            // return.
             if state.ctx.is_null() || state.retain.is_none() || state.release.is_none() {
                 set_errno(libc::EINVAL);
                 set_last_error_classified(
@@ -139,11 +99,6 @@ pub unsafe extern "C" fn ef_tensor_wrap_pbo(
                 );
                 return std::ptr::null_mut();
             }
-            // The two ops are checked HERE and nowhere else: past this point
-            // they are bare `fn` values, and a NULL one is undefined
-            // behaviour the moment Rust reads it -- not a failure any
-            // downstream layer could still diagnose. Nothing is constructed
-            // before this returns, so a refusal leaks no channel reference.
             let (Some(map_fn), Some(unmap_fn)) = (map_fn, unmap_fn) else {
                 set_errno(libc::EINVAL);
                 set_last_error_classified(
@@ -156,18 +111,6 @@ pub unsafe extern "C" fn ef_tensor_wrap_pbo(
             match TensorDyn::from_client_pbo(state, map_fn, unmap_fn, buffer_id, size, &shape, dt) {
                 Ok(t) => into_handle(t),
                 Err(e) => {
-                    // Every failure `from_client_pbo` can return is an
-                    // argument refusal -- an incomplete channel
-                    // (`client_state_pbo_ops`), a `size` smaller than the
-                    // shape needs, a zero `size`, or a shape footprint that
-                    // overflows `usize` (`PboTensor::from_pbo`). The header
-                    // above promises `EINVAL` for the argument-validation
-                    // refusals and names the `size` one explicitly, so this
-                    // arm has to set it too: without it a caller reading
-                    // `errno` after a NULL return sees whatever an earlier,
-                    // unrelated call left there. The *class* stays the one
-                    // the failing layer recorded -- errno is the coarse
-                    // channel, `ef_tensor_last_error_class` the precise one.
                     set_errno(libc::EINVAL);
                     set_last_error_classified(class_of(&e), &format!("wrap_pbo: {e}"));
                     std::ptr::null_mut()
@@ -182,8 +125,8 @@ pub unsafe extern "C" fn ef_tensor_wrap_pbo(
 ///
 /// @retval 0 success; `*out_id` holds the buffer name.
 /// @retval EINVAL `t` is NULL/unresolvable, `out_id` is NULL, or `t` is not
-///         PBO-backed. `ef_tensor_storage_kind` is the unambiguous
-///         predicate; do not infer the backing from this call's failure.
+///         PBO-backed. Use `ef_tensor_storage_kind` to test whether a tensor
+///         is PBO-backed.
 ///
 /// # Safety
 /// `t` must be NULL or a live handle; `out_id` must be NULL or a writable
@@ -216,20 +159,14 @@ pub unsafe extern "C" fn ef_tensor_pbo_id(t: *const EfTensor, out_id: *mut u32) 
     }
 }
 
-/// Whether a PBO-backed tensor currently holds (or is establishing) a CPU
-/// mapping — "is this buffer free for GL operations?", not "does a CPU
-/// pointer exist right now".
+/// Whether a PBO-backed tensor holds, or is establishing, a CPU mapping.
 ///
 /// @retval 1 mapped, or a map/unmap is in flight.
 /// @retval 0 fully unmapped.
 /// @retval -1 `t` is NULL/unresolvable or not PBO-backed.
 ///
-/// @warning Three-valued behind an `int`. Test `< 0` **before**
-/// truthiness: `if (ef_tensor_pbo_is_mapped(t))` is true for the error
-/// value, so a caller that writes it that way treats "not a PBO" as
-/// "mapped". The shape is
-/// `int r = ef_tensor_pbo_is_mapped(t); if (r < 0) { ...error... } else if
-/// (r) { ...mapped... }`.
+/// @warning Three-valued: the error value `-1` is truthy. Test `< 0` before
+/// testing for non-zero.
 ///
 /// # Safety
 /// `t` must be NULL or a live handle.
@@ -237,9 +174,6 @@ pub unsafe extern "C" fn ef_tensor_pbo_id(t: *const EfTensor, out_id: *mut u32) 
 pub unsafe extern "C" fn ef_tensor_pbo_is_mapped(t: *const EfTensor) -> c_int {
     ensure_hook_installed();
     catch_unwind(AssertUnwindSafe(|| {
-        // `tensor_of` is safe to *call*; this function stays `unsafe` because
-        // its contract on `t` (NULL or a live handle from this library) is
-        // what makes that call sound.
         let Some(inner) = tensor_of(t) else {
             set_last_error("pbo_is_mapped: could not resolve handle");
             return -1;
@@ -256,12 +190,12 @@ pub unsafe extern "C" fn ef_tensor_pbo_is_mapped(t: *const EfTensor) -> c_int {
     .unwrap_or(-1)
 }
 
-/// The address of this PBO's callback vtable, for the cross-package
-/// descriptor protocol's `ptr` field under its `PBO` kind.
+/// The address of this PBO's callback vtable, as carried in the
+/// cross-package descriptor's `ptr` field for the `PBO` kind.
 ///
-/// Borrowed, never owned: valid for as long as `t` is, and a consumer that
-/// reconstructs operations from it takes its own reference through the
-/// `ef_client_state` embedded in it.
+/// Borrowed: valid for as long as `t` is. A consumer that reconstructs
+/// operations from it takes its own reference through the `ef_client_state`
+/// embedded in it.
 ///
 /// @retval the vtable address.
 /// @retval `NULL` when `t` is NULL/unresolvable or not PBO-backed.
@@ -272,8 +206,6 @@ pub unsafe extern "C" fn ef_tensor_pbo_is_mapped(t: *const EfTensor) -> c_int {
 pub unsafe extern "C" fn ef_tensor_pbo_vtable(t: *const EfTensor) -> *const c_void {
     ensure_hook_installed();
     catch_unwind(AssertUnwindSafe(|| {
-        // See `ef_tensor_pbo_is_mapped` on why the body needs no `unsafe`
-        // block while the function itself stays `unsafe`.
         let Some(inner) = tensor_of(t) else {
             set_last_error("pbo_vtable: could not resolve handle");
             return std::ptr::null();
@@ -289,8 +221,6 @@ pub unsafe extern "C" fn ef_tensor_pbo_vtable(t: *const EfTensor) -> *const c_vo
 #[cfg(test)]
 mod tests {
     use super::*;
-    // The aliases the entry point's signature deliberately spells out: the
-    // tests may name them, because nothing here goes through cbindgen.
     use edgefirst_tensor::{EfPboMapFn, EfPboUnmapFn, TensorMemory};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
@@ -299,12 +229,8 @@ mod tests {
     static RELEASES: AtomicUsize = AtomicUsize::new(0);
     static STORAGE: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 
-    /// The counters and the backing storage above are one shared channel, so
-    /// the tests that actually retain it must not overlap. The Makefile runs
-    /// this crate with `--test-threads=1`, but a bare `cargo test` does not,
-    /// and a test that flakes only outside the Makefile is worse than one
-    /// that flakes always. Poison is recovered rather than propagated: a
-    /// panic in one test must fail that test, not cascade into the next.
+    /// Serializes the tests that use the shared counters and backing
+    /// storage.
     static CHANNEL: Mutex<()> = Mutex::new(());
 
     fn channel_guard() -> std::sync::MutexGuard<'static, ()> {
@@ -336,12 +262,7 @@ mod tests {
         0
     }
 
-    /// A non-NULL, never-dereferenced sentinel: `retain`/`release` above
-    /// ignore it, which is exactly what "opaque to the library" means.
-    ///
-    /// A real static's address rather than a fabricated integer, so a
-    /// regression that *did* dereference `ctx` reads a valid byte and fails
-    /// an assertion instead of becoming undefined behaviour.
+    /// A non-NULL sentinel `ctx` that `retain`/`release` never dereference.
     static CTX: u8 = 0;
 
     fn state() -> EfClientState {
@@ -352,9 +273,9 @@ mod tests {
         }
     }
 
-    /// The constructor round trip: the handle reports PBO storage, hands
-    /// back the buffer name, answers `is_mapped`, exposes a vtable, and
-    /// holds the channel for exactly its own lifetime.
+    /// The handle reports PBO storage, returns the buffer name, answers
+    /// `is_mapped`, exposes a vtable, and holds the channel for its own
+    /// lifetime.
     #[test]
     fn wrap_pbo_mints_a_pbo_handle_and_balances_the_channel() {
         let _serialized = channel_guard();
@@ -393,10 +314,8 @@ mod tests {
         );
     }
 
-    /// The bytes really are the client's: a map through `ef_tensor_map`
-    /// lands in the client's own storage, via the client's `map_fn`. A
-    /// constructor that quietly allocated host memory instead would pass
-    /// every assertion above and fail this one.
+    /// A map through `ef_tensor_map` lands in the client's own storage, via
+    /// the client's `map_fn`.
     #[test]
     fn a_wrapped_pbo_maps_through_the_clients_own_callback() {
         let _serialized = channel_guard();
@@ -422,8 +341,7 @@ mod tests {
             );
             *view.ptr = 0xA5;
 
-            // A second concurrent map on the same handle is refused loudly
-            // (controller ruling 2) -- never dropping the live guard.
+            // A second concurrent map on the same handle is refused.
             let mut second = edgefirst_tensor_abi::EfTensorView {
                 ptr: std::ptr::null_mut(),
                 len: 0,
@@ -450,10 +368,8 @@ mod tests {
         );
     }
 
-    /// §6: a NULL `ctx`, `retain` or `release` is EINVAL, not a silently
-    /// non-owning wrap. `errno` as well as the class, because §6 says
-    /// `EINVAL` and this entry point's only other failure channel is the
-    /// `NULL` return.
+    /// A NULL `ctx`, `retain` or `release` is refused with `EINVAL` and the
+    /// `InvalidArgument` class.
     #[test]
     fn wrap_pbo_refuses_an_incomplete_channel() {
         let _serialized = channel_guard();
@@ -483,7 +399,7 @@ mod tests {
                 crate::last_error::last_class(),
                 EfErrorClass::InvalidArgument
             );
-            assert_eq!(errno::errno().0, libc::EINVAL, "spec §6 says EINVAL");
+            assert_eq!(errno::errno().0, libc::EINVAL, "must be EINVAL");
         }
         assert_eq!(
             RETAINS.load(Ordering::Acquire),
@@ -492,16 +408,8 @@ mod tests {
         );
     }
 
-    /// A NULL `map_fn` or `unmap_fn` is `EINVAL`, not a call through a NULL
-    /// function pointer.
-    ///
-    /// This is the arm the `state` check cannot cover: `retain`/`release`
-    /// are `Option` fields the library inspects, but the two ops used to be
-    /// bare `fn` parameters, so a C caller passing NULL produced a value
-    /// Rust may not even materialize — undefined behaviour before any check
-    /// could run. They are nullable at the boundary now, and the refusal
-    /// happens before anything is constructed, so no channel reference
-    /// leaks.
+    /// A NULL `map_fn` or `unmap_fn` is refused with `EINVAL`, and no
+    /// channel reference is taken.
     #[test]
     fn wrap_pbo_refuses_a_null_op() {
         let _serialized = channel_guard();
@@ -510,8 +418,8 @@ mod tests {
         let cases: [(Option<EfPboMapFn>, Option<EfPboUnmapFn>); 3] =
             [(None, Some(unmap)), (Some(map), None), (None, None)];
         for (m, u) in cases {
-            // SAFETY: `dims` is a live local; a NULL op is exactly what this
-            // entry point contracts to reject rather than call.
+            // SAFETY: `dims` is a live local; a NULL op is rejected, not
+            // called.
             let t = unsafe { ef_tensor_wrap_pbo(state(), 7, 64, 0, dims.as_ptr(), 1, m, u) };
             assert!(t.is_null(), "a NULL map_fn/unmap_fn must be refused");
             assert_eq!(
@@ -527,16 +435,8 @@ mod tests {
         );
     }
 
-    /// The malformed-geometry arms: a NULL `dims`, a zero `ndim` and an
-    /// unknown dtype code each refuse rather than mint a handle over the
-    /// client's buffer with a shape nobody agreed to.
-    ///
-    /// All three are `InvalidArgument` with `errno == EINVAL`, because the
-    /// header groups them with the NULL-channel refusal in one sentence and
-    /// a caller reading `ef_tensor_last_error_class` must find that true.
-    /// The NULL-`dims` and zero-`ndim` arms go through `read_dims`, which is
-    /// shared with `ef_tensor_wrap_host` and records `Unspecified`, so those
-    /// are exactly the arms a regression would silently lose.
+    /// A NULL `dims`, a zero `ndim` and an unknown dtype code are each
+    /// refused as `InvalidArgument` with `errno == EINVAL`.
     #[test]
     fn wrap_pbo_refuses_malformed_geometry() {
         let _serialized = channel_guard();
@@ -570,11 +470,7 @@ mod tests {
                 "{what}: the refusal must be classified, not left Unspecified"
             );
             assert_eq!(errno::errno().0, libc::EINVAL, "{what}: errno");
-            // The message stays the one the failing layer wrote. The two
-            // `read_dims` arms word themselves differently, and classifying
-            // by restating a message here would collapse them and sometimes
-            // name the wrong refusal -- which is why `wrap_pbo` re-classes
-            // rather than re-records.
+            // The message is the one the failing layer wrote.
             // SAFETY: the pointer is this thread's own thread-local, read
             // before any further `tensor-capi` call.
             let msg = unsafe {
@@ -594,13 +490,9 @@ mod tests {
         );
     }
 
-    /// The refusals that come back from the tensor layer rather than from
-    /// this file's own argument checks: a `size` smaller than the shape
-    /// needs, and a shape whose byte footprint overflows `usize` (`2^63 * 4`
-    /// wraps to `0`, which an 8-byte allocation would otherwise satisfy).
-    /// Both are argument-validation refusals, so both owe the header's
-    /// `EINVAL` — `errno` is seeded with an unrelated value first, so a
-    /// passing assertion means this call set it and not some earlier one.
+    /// A `size` smaller than the shape needs, and a shape whose byte
+    /// footprint overflows `usize`, are each refused with `EINVAL` and the
+    /// tensor layer's class.
     #[test]
     fn wrap_pbo_sets_einval_on_the_refusals_the_tensor_layer_makes() {
         let _serialized = channel_guard();
@@ -651,9 +543,7 @@ mod tests {
                 "{what}: the class the tensor layer recorded must survive"
             );
         }
-        // Unlike the argument refusals above, these two are made *after*
-        // `client_state_pbo_ops` has taken its reference, so the channel is
-        // retained and then released again -- balanced, not untouched.
+        // The channel is retained and then released again.
         assert_eq!(
             RETAINS.load(Ordering::Acquire),
             RELEASES.load(Ordering::Acquire),
@@ -661,9 +551,8 @@ mod tests {
         );
     }
 
-    /// The three accessors refuse a non-PBO handle rather than inventing an
-    /// answer, and `is_mapped`'s refusal is negative so a caller testing
-    /// `< 0` sees it.
+    /// The three accessors refuse a non-PBO handle; `is_mapped` returns a
+    /// negative value.
     #[test]
     fn the_pbo_accessors_refuse_a_host_tensor() {
         let dims: [u64; 1] = [8];
@@ -680,11 +569,10 @@ mod tests {
         }
     }
 
-    /// A NULL handle and a NULL `out_id` are refused on every accessor, and
-    /// none of them dereferences.
+    /// Every accessor refuses a NULL handle, and `pbo_id` a NULL `out_id`.
     #[test]
     fn the_pbo_accessors_refuse_null_arguments() {
-        // SAFETY: NULL is an explicitly permitted argument on all three.
+        // SAFETY: NULL is a permitted argument on all three.
         unsafe {
             let mut id = 0u32;
             assert_eq!(ef_tensor_pbo_id(std::ptr::null(), &mut id), libc::EINVAL);

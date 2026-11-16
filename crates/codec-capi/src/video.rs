@@ -90,7 +90,7 @@ pub enum EfVideoMemory {
     /// The pool's tensors, which the device imports, or which each picture
     /// is copied into.
     Imported = 0,
-    /// The device's own buffers, exported as DMA-BUFs because it would not
+    /// The device's own buffers, exported as DMA-BUFs, when it does not
     /// import the pool's. CPU reads of these may be uncached and slow.
     Exported = 1,
 }
@@ -262,9 +262,8 @@ pub unsafe extern "C" fn ef_video_encoder_config_set_gop(
     }
 }
 
-/// Whether to emit the parameter sets with every key frame, so a receiver
-/// can start at any key frame (on by default). The first frame always
-/// carries them.
+/// Whether to emit the parameter sets with every key frame (on by default).
+/// The first frame always carries them.
 ///
 /// @return 0, or `EINVAL`.
 ///
@@ -688,11 +687,9 @@ fn open_decoder(config: DecoderConfig) -> Result<EfVideoDecoder, c_int> {
 ///
 /// `pool_count` is the frames the caller may hold at once, 4 if 0; the
 /// device's own reference pictures and one buffer to decode into are added
-/// to it.
-/// A V4L2 device takes a bounded number of buffers (31 on the i.MX 95's
-/// Wave6, its own included); a count beyond that makes
-/// [`ef_video_decoder_decode`] fail with `EINVAL` once the stream's format is
-/// known.
+/// to it. A V4L2 device takes a bounded number of buffers; a count beyond
+/// that makes [`ef_video_decoder_decode`] fail with `EINVAL` once the
+/// stream's format is known.
 ///
 /// Platforms: Linux (V4L2 memory-to-memory decoders), Windows (Media
 /// Foundation: Microsoft's H.264 decoder with DXVA, and MJPEG decoders).
@@ -758,8 +755,7 @@ pub unsafe extern "C" fn ef_video_decoder_new_with_pool(
         if raws.iter().any(|t| t.is_null()) {
             return Err(invalid("a pool tensor is NULL"));
         }
-        // The decoder's references are taken here and the caller's released
-        // only on success, so a failure leaves the caller's intact.
+        // Take the decoder's references; the caller's are released on success.
         let mut tensors = Vec::with_capacity(count);
         for &raw in raws {
             if unsafe { edgefirst_tensor_ffi::ef_tensor_retain(raw) } != 0 {
@@ -968,7 +964,7 @@ mod tests {
     use super::*;
     use crate::engine::{EfCodec, EfCodecEngine};
 
-    /// The one struct a caller fills: four `uint32_t`, as the header says.
+    /// `EfCodecRegion` is four `uint32_t`.
     #[test]
     fn a_region_is_four_u32() {
         assert_eq!(std::mem::size_of::<EfCodecRegion>(), 16);
@@ -1023,8 +1019,7 @@ mod tests {
         }
     }
 
-    /// A codec no engine runs is refused at open, with the errno a caller
-    /// can branch on.
+    /// A codec no engine runs is refused at open with `ENOTSUP` or `ENODEV`.
     #[test]
     fn a_codec_no_engine_runs_is_enotsup_or_enodev() {
         let d = ef_video_decoder_new(EfCodec::Av1 as u32, EfCodecEngine::Auto as u32, 0);
@@ -1106,9 +1101,7 @@ mod tests {
             assert_eq!(errno::errno().0, libc::EINVAL);
             let msg = std::ffi::CStr::from_ptr(crate::error::ef_codec_last_error());
             assert!(msg.to_str().unwrap().contains("same buffer"), "{msg:?}");
-            // The caller still holds exactly its two references: a CPU write
-            // map is refused while the handle is shared, and succeeds once one
-            // is released.
+            // A CPU write map is refused while the caller holds two references.
             assert!(!TensorDyn::with_raw(t, |t| t
                 .map_bytes(CpuAccess::Write)
                 .is_ok()));

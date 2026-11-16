@@ -6,9 +6,7 @@
 //!
 //! Obtains an EGL display (via PlatformDevice or GBM fallback), creates a
 //! surfaceless GLES 3.0 context using `EGL_KHR_no_config_context`, and makes
-//! it current with `EGL_NO_SURFACE`. This is a standalone version of the
-//! HAL's `opengl_headless::GlContext` stripped down for diagnostic /
-//! benchmarking use only.
+//! it current with `EGL_NO_SURFACE`.
 
 use edgefirst_egl::{self as egl, Attrib, Display, Dynamic, Instance, EGL1_4};
 use gbm::{
@@ -49,18 +47,16 @@ const DMA_BUF_PLANE0_PITCH: u32 = 0x3274;
 const DMA_BUF_PLANE1_FD: u32 = 0x3275;
 const DMA_BUF_PLANE1_OFFSET: u32 = 0x3276;
 const DMA_BUF_PLANE1_PITCH: u32 = 0x3277;
-// YUV import hints (EGL_EXT_image_dma_buf_import) — mirror the HAL's
-// BT.601 full-range (JFIF) stop-gap so the probe imports natively-sampled
-// YUV the same way `DmaImportAttrs::to_egl_attribs` does.
+// YUV import hints (EGL_EXT_image_dma_buf_import).
 const YUV_COLOR_SPACE_HINT: u32 = 0x327B;
 const SAMPLE_RANGE_HINT: u32 = 0x327C;
 const ITU_REC601: u32 = 0x327F;
 const YUV_FULL_RANGE: u32 = 0x3282;
-// EGL_IMAGE_PRESERVED_KHR — preserve pixel data across the import.
+// EGL_IMAGE_PRESERVED_KHR: preserve pixel data across the import.
 const IMAGE_PRESERVED: u32 = 0x30D2;
 
 // ---------------------------------------------------------------------------
-// EGL library loader (leaked to avoid dlclose crashes)
+// EGL library loader (the library is leaked)
 // ---------------------------------------------------------------------------
 
 type Egl = Instance<Dynamic<&'static libloading::Library, EGL1_4>>;
@@ -130,11 +126,11 @@ impl Card {
 // GpuContext
 // ---------------------------------------------------------------------------
 
-/// Backing storage for the EGL display — keeps the underlying resource alive.
+/// Backing storage for the EGL display.
 enum DisplayBacking {
-    /// PlatformDevice display — no external resources needed.
+    /// PlatformDevice display.
     Device,
-    /// GBM display — the GBM device must outlive the EGL display.
+    /// GBM display, holding the GBM device.
     Gbm(Device<Card>),
 }
 
@@ -151,7 +147,7 @@ pub struct GpuContext {
 impl GpuContext {
     /// Bootstrap a headless GLES 3.0 surfaceless context.
     ///
-    /// Tries PlatformDevice first (zero external deps), falls back to GBM.
+    /// Tries PlatformDevice first, falls back to GBM.
     pub fn new() -> Result<Self, String> {
         let egl: Egl = unsafe {
             Instance::<Dynamic<_, EGL1_4>>::load_required_from(get_egl_lib()?)
@@ -208,9 +204,7 @@ impl GpuContext {
             &[egl::ATTRIB_NONE],
         )?;
 
-        // Adreno's device display initializes but segfaults on
-        // eglQueryString(EGL_EXTENSIONS); its GBM display is fully functional.
-        // EGL_VENDOR is safe to query on the device display.
+        // Reject the device display when EGL_VENDOR names Qualcomm.
         egl.initialize(display)
             .map_err(|e| format!("eglInitialize failed: {e}"))?;
         let is_qualcomm = egl
@@ -363,8 +357,8 @@ impl GpuContext {
     /// `glEGLImageTargetRenderbufferStorageOES` entry point needed to back
     /// them with an EGLImage.
     ///
-    /// Returns `true` when **both** conditions are met:
-    /// 1. RGB8 renderbuffer format is available — either via OpenGL ES 3.0+
+    /// Returns `true` when both conditions are met:
+    /// 1. RGB8 renderbuffer format is available, either via OpenGL ES 3.0+
     ///    (which mandates `GL_RGB8`) or the `GL_OES_rgb8_rgba8` extension.
     /// 2. The `glEGLImageTargetRenderbufferStorageOES` function pointer is
     ///    resolvable through `eglGetProcAddress`.
@@ -401,8 +395,7 @@ impl GpuContext {
     // -------------------------------------------------------------------
 
     /// Returns `true` if the EGL stack supports `eglCreateImage(KHR)` with
-    /// `EGL_LINUX_DMA_BUF_EXT` target — required for zero-copy DMA-buf
-    /// import.
+    /// the `EGL_LINUX_DMA_BUF_EXT` target.
     pub fn has_egl_create_image_khr(&self) -> bool {
         // EGL 1.5 has native create_image
         if self.egl.upcast::<egl::EGL1_5>().is_some() {
@@ -464,15 +457,11 @@ impl GpuContext {
 
     /// Create an EGLImage from a (possibly multi-plane) DMA-buf.
     ///
-    /// This is the richer counterpart to [`create_egl_image_dma`]: it carries a
-    /// per-plane `offset`, an optional second plane (interleaved CbCr), and the
-    /// BT.601 full-range YUV import hints. It mirrors exactly what the HAL's
-    /// `DmaImportAttrs::to_egl_attribs` emits, so a successful import here proves
-    /// the real HAL allocation is GPU-importable.
+    /// Carries a per-plane `offset`, an optional second plane (interleaved
+    /// CbCr), and the BT.601 full-range YUV import hints.
     ///
-    /// * `plane1` — second plane for NV12/NV16/NV24 native semi-planar import.
-    /// * `yuv_hints` — add BT.601 full-range colour-space hints (required for
-    ///   native YUV fourccs sampled via `samplerExternalOES`).
+    /// * `plane1`: second plane for NV12/NV16/NV24 native semi-planar import.
+    /// * `yuv_hints`: add BT.601 full-range colour-space hints.
     pub fn create_egl_image_planar(
         &self,
         width: i32,
@@ -555,8 +544,7 @@ impl GpuContext {
 
     /// `(modifier, external_only)` pairs the display accepts for `fourcc`
     /// (`eglQueryDmaBufModifiersEXT`), or `None` when the entry point is
-    /// absent. An empty list means the driver lists no explicit modifiers,
-    /// which leaves the implicit (linear) layout as the only import.
+    /// absent. An empty list means the driver lists no explicit modifiers.
     pub fn query_dmabuf_modifiers(&self, fourcc: u32) -> Option<Vec<(u64, bool)>> {
         let f = self.egl.get_proc_address("eglQueryDmaBufModifiersEXT")?;
         let query: unsafe extern "system" fn(
@@ -614,8 +602,7 @@ pub struct EglPlane {
 
 impl Drop for GpuContext {
     fn drop(&mut self) {
-        // Defence-in-depth cleanup: destroy context and terminate the EGL
-        // display inside catch_unwind to absorb driver panics.
+        // Destroy the context and terminate the EGL display inside catch_unwind.
         let prev_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

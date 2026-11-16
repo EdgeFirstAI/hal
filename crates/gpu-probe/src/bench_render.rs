@@ -1,13 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! Full render pipeline benchmarks — measures the complete GL render path
+//! Full render pipeline benchmarks: measures the complete GL render path
 //! including EGLImage creation, texture binding, FBO setup, and draw calls.
 //!
-//! This is the headline benchmark: it replicates what the HAL's `convert()`
-//! does at the raw GL level, comparing per-call resource creation versus
-//! cached resources. The delta between the two IS the EGLImage + FBO creation
-//! overhead we want to measure.
+//! Compares per-call resource creation with cached resources.
 
 use crate::bench::{run_bench, BenchResult};
 use crate::egl_context::GpuContext;
@@ -141,7 +138,7 @@ pub(crate) fn compile_program(vert: &CString, frag: &CString) -> Result<u32, Str
             return Err(format!("program link failed: {msg}"));
         }
 
-        // Detach shaders so they can be deleted while program remains
+        // Detach the shaders.
         edgefirst_gl::gl::DetachShader(program, vs);
         edgefirst_gl::gl::DetachShader(program, fs);
         edgefirst_gl::gl::DeleteShader(vs);
@@ -440,7 +437,7 @@ pub fn run(ctx: &GpuContext) -> Vec<BenchResult> {
 
             let name = format!("render_cached/{label}");
             let r = run_bench(&name, 10, 200, || unsafe {
-                // Only the render path — resources are already set up
+                // Render path only.
                 edgefirst_gl::gl::BindFramebuffer(edgefirst_gl::gl::FRAMEBUFFER, fbo);
                 edgefirst_gl::gl::Viewport(0, 0, dst_w as i32, dst_h as i32);
 

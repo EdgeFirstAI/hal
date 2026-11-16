@@ -501,7 +501,7 @@ fn modelpack_det_u8() {
     check("modelpack_det u8", &modelpack_det(Dtype::U8));
 }
 
-/// The fused float path already supported multi-label; split float must agree.
+/// Split float matches fused float under multi-label.
 #[test]
 fn split_float_matches_fused_float_under_multi_label() {
     let mut fused = decode(&yolo_segdet(Dtype::F32), Some(true));
@@ -530,8 +530,7 @@ fn multi_label_with_nms_bypassed_keeps_all_candidates() {
     assert_eq!(labels(&boxes), vec![0, 1, 2]);
 }
 
-/// ModelPack detection honours the configured NMS mode: class-aware keeps an
-/// overlapping box of another class that class-agnostic suppresses.
+/// ModelPack detection honours the configured NMS mode: class-aware keeps an overlapping box of another class that class-agnostic suppresses.
 #[test]
 fn modelpack_det_honours_nms_mode() {
     let fx = modelpack_det_overlapping_classes();
@@ -566,8 +565,7 @@ fn modelpack_det_overlapping_classes() -> Fixture {
     fx
 }
 
-/// Tracked decode always uses one label per box, whatever the decoder's
-/// multi-label setting, and never panics.
+/// The boxes and track count after three tracked decodes of `fx`.
 #[cfg(feature = "tracker")]
 fn tracked_boxes(fx: &Fixture, multi_label: bool) -> (Vec<DetectBox>, usize) {
     use edgefirst_tracker::ByteTrackBuilder;
@@ -684,8 +682,8 @@ fn decode_for_tracking_is_single_label() {
     assert_eq!(labels(&boxes), vec![0, 2]);
 }
 
-/// `Decoder::max_det` and `pre_nms_top_k` bound the output of every NMS path,
-/// and the caller's `Vec` capacity is only an allocation hint.
+/// The number of boxes a multi-label decode of `fx` returns into a `Vec` of
+/// capacity `cap`, with the builder tuned by `tune`.
 fn decode_with(fx: &Fixture, tune: impl Fn(DecoderBuilder) -> DecoderBuilder, cap: usize) -> usize {
     let mut b = DecoderBuilder::default()
         .with_score_threshold(SCORE_THRESHOLD)
@@ -801,11 +799,9 @@ fn build_nms(fx: &Fixture, nms: configs::Nms, from_config: bool, multi_label: bo
     b.build().expect("fixture decoder must build")
 }
 
-/// Multi-label candidates go through the NMS mode the caller or config chose.
-/// Anchor 0's class-0 and class-1 candidates share one bbox, so class-agnostic
-/// NMS keeps only the higher-scoring class 0, as Ultralytics
-/// `non_max_suppression(multi_label=True, agnostic=True)` does, while
-/// class-aware NMS keeps both.
+/// Under multi-label, class-agnostic NMS keeps only the higher-scoring class of
+/// anchor 0's shared bbox and class-aware NMS keeps both, with the mode set by
+/// the caller or the config.
 fn check_nms_mode_under_multi_label(name: &str, fx: &Fixture) {
     for from_config in [false, true] {
         let run = |nms: configs::Nms| {
@@ -901,8 +897,7 @@ fn bypass_top(fx: &Fixture, max_det: usize) -> Vec<f32> {
         .collect()
 }
 
-/// With NMS bypassed, `max_det` keeps the highest-scoring boxes, not the
-/// first anchors, in descending score order.
+/// With NMS bypassed, `max_det` keeps the highest-scoring boxes in descending score order.
 #[test]
 fn nms_bypass_max_det_keeps_highest_scores() {
     let fixtures = [

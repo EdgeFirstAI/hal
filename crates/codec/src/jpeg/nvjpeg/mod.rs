@@ -3,24 +3,18 @@
 
 //! Optional nvJPEG GPU JPEG-decoder backend (Linux + CUDA only).
 //!
-//! When the CUDA nvJPEG library is present (NVIDIA Jetson / discrete GPU), this
-//! backend decodes a JPEG straight into the destination tensor's CUDA device
-//! pointer, emitting interleaved **RGB**. The destination is a
-//! `TensorMemory::Pbo` tensor (what `ImageProcessor::create_image` yields on
-//! Jetson, where there is no dma-heap); its CUDA GL-buffer registration is
-//! mapped to a device pointer via [`Tensor::cuda_map`], nvJPEG decodes into it
-//! on a per-decoder CUDA stream, and the unmapped PBO is then consumed
-//! GPU-resident by `ImageProcessor::convert()` — no CPU bounce.
+//! Decodes a JPEG into the destination tensor's CUDA device pointer, emitting
+//! interleaved RGB. The destination is a `TensorMemory::Pbo` tensor; its CUDA
+//! GL-buffer registration is mapped to a device pointer via
+//! [`Tensor::cuda_map`], nvJPEG decodes into it on a per-decoder CUDA stream,
+//! and the PBO is then unmapped.
 //!
-//! Unlike the CPU/V4L2 paths (which emit native NV12/Grey/NV24 and never
-//! colour-convert), this backend produces packed `Rgb`: nvJPEG does the
-//! YCbCr→RGB on the GPU at near-zero marginal cost, the result is GPU-resident,
-//! and `convert()` accepts an `Rgb` source directly. This is a deliberate,
-//! documented exception to the codec's native-format contract.
+//! The CPU and V4L2 paths emit native NV12/Grey/NV24; this backend produces
+//! packed `Rgb`.
 //!
-//! Capability-probed and entirely `dlopen`-based: absent libnvjpeg/libcudart,
-//! or a non-CUDA destination, the decoder transparently falls through to the
-//! V4L2/CPU backends.
+//! Capability-probed and `dlopen`-based: without libnvjpeg/libcudart, or with
+//! a non-CUDA destination, the decoder falls through to the V4L2/CPU
+//! backends.
 
 mod ffi;
 mod loader;
@@ -36,11 +30,10 @@ use ffi::*;
 use std::os::raw::c_uchar;
 
 /// Consecutive nvJPEG failures after which the backend is demoted to the
-/// V4L2/CPU decoders for the rest of the session (circuit breaker).
+/// V4L2/CPU decoders for the rest of the session.
 const MAX_CONSECUTIVE_FAILURES: u32 = 8;
 
-/// Outcome of a hardware decode attempt, distinct from [`CodecError`] so the
-/// caller can react to a transient failure by retrying on V4L2/CPU.
+/// Failure of an nvJPEG decode attempt.
 pub(crate) enum NvJpegDecode {
     /// nvJPEG could not decode this image; decode it on V4L2/CPU. Carries a
     /// short reason.
@@ -51,22 +44,17 @@ pub(crate) enum NvJpegDecode {
 
 /// Internal decode error, mapped to [`NvJpegDecode`] by the public entry point.
 enum DecodeErr {
-    /// An nvJPEG/CUDA failure: count toward the circuit breaker and fall back.
+    /// An nvJPEG/CUDA failure: count it and fall back.
     Reset(String),
-    /// A configuration we don't drive (e.g. RGB exceeds the PBO mapping): fall
-    /// back without counting it as a failure — the device is fine.
+    /// A configuration this backend does not drive (e.g. RGB exceeds the PBO
+    /// mapping): fall back without counting a failure.
     Unsupported(String),
-    /// A real error to surface (e.g. tensor reconfigure failure).
+    /// An error to surface (e.g. tensor reconfigure failure).
     Fatal(CodecError),
 }
 
-/// Lazily-probed nvJPEG backend state, stored on the reusable decoder state so
-/// the library is probed at most once and the context (handle/state/stream) is
-/// reused across decodes.
-//
-// `Ready` is much larger than the unit variants, but there is exactly one probe
-// per decoder and it is `Ready` in the steady state, so boxing would add
-// indirection on the hot path for no real saving.
+/// Lazily-probed nvJPEG backend state: the library is probed at most once and
+/// the context (handle/state/stream) is reused across decodes.
 #[allow(clippy::large_enum_variant)]
 #[derive(Default)]
 pub(crate) enum NvJpegProbe {
@@ -77,8 +65,7 @@ pub(crate) enum NvJpegProbe {
 }
 
 /// A persistent nvJPEG decode context: the library handle, a reusable decode
-/// state (keeps nvJPEG's internal device scratch hot), and one CUDA stream so
-/// concurrent decoders do not serialise on the default stream.
+/// state, and one CUDA stream.
 pub(crate) struct NvJpegContext {
     handle: NvjpegHandle,
     state: NvjpegJpegState,
@@ -87,15 +74,12 @@ pub(crate) struct NvJpegContext {
 }
 
 // SAFETY: the nvJPEG handle/state and the CUDA stream are owned exclusively by
-// the per-`ImageDecoder` probe and only touched from its owning thread; the
-// device pointers they operate on are process-global via the primary context.
-// Send (not Sync) matches the one-decoder-per-thread usage.
+// the per-`ImageDecoder` probe and only touched from its owning thread.
 unsafe impl Send for NvJpegContext {}
 
 impl NvJpegContext {
     /// Probe once: load libnvjpeg + libcudart, create a stream, an nvJPEG handle
-    /// (DEFAULT backend — the dedicated-hardware backend is unsupported on
-    /// Orin), and a reusable decode state. `None` on any failure.
+    /// (DEFAULT backend) and a reusable decode state. `None` on any failure.
     fn new() -> Option<Self> {
         let lib = loader::lib()?;
         if !edgefirst_tensor::is_cuda_available() {
@@ -140,7 +124,7 @@ impl NvJpegContext {
 
     /// Decode `data` into `dst` as packed RGB. Reconfigures `dst` to `Rgb`; on
     /// any failure after that reconfigure, restores `output_fmt` (the native
-    /// NV12/Grey/NV24) so the V4L2/CPU fall-through sees a clean tensor.
+    /// NV12/Grey/NV24).
     fn decode<T: ImagePixel>(
         &self,
         data: &[u8],
@@ -158,9 +142,7 @@ impl NvJpegContext {
         )
         .entered();
 
-        // Run the reconfigure + device decode in a helper so EVERY failure path
-        // — including a failed `Rgb` reconfigure — restores the caller's native
-        // format, leaving a correctly-shaped tensor for the V4L2/CPU fall-through.
+        // Every failure path restores the caller's native format.
         match self.decode_reconfigured(data, dst, img_w, img_h) {
             Ok(info) => Ok(info),
             Err(e) => {
@@ -170,9 +152,9 @@ impl NvJpegContext {
         }
     }
 
-    /// Reconfigure `dst` to `Rgb` and decode into its device pointer. Any error
-    /// leaves `dst` configured as `Rgb` (possibly partially) — the caller's
-    /// [`decode`](Self::decode) restores the native format.
+    /// Reconfigure `dst` to `Rgb` and decode into its device pointer. An error
+    /// leaves `dst` configured as `Rgb`; [`decode`](Self::decode) restores the
+    /// native format.
     fn decode_reconfigured<T: ImagePixel>(
         &self,
         data: &[u8],
@@ -183,25 +165,16 @@ impl NvJpegContext {
         let lib =
             loader::lib().ok_or_else(|| DecodeErr::Reset("nvjpeg library vanished".into()))?;
 
-        // Reconfigure the destination NV12 → Rgb. `configure_image` preserves the
-        // tensor's CUDA registration (same PBO + device pointer), and chooses the
-        // row stride from the backing: a CUDA-backed DMA destination is rounded up
-        // to a 64-byte-aligned pitch, a PBO stays tight (`width*3`). A failed
-        // reconfigure — e.g. an NV12 buffer (1.5 B/px) is too small for RGB
-        // (3 B/px) — is NOT fatal: fall back to V4L2/CPU.
+        // Reconfigure the destination to Rgb. A failed reconfigure falls back to
+        // V4L2/CPU.
         dst.configure_image(img_w, img_h, PixelFormat::Rgb)
             .map_err(|e| DecodeErr::Unsupported(format!("Rgb reconfigure failed: {e}")))?;
 
-        // Use the stride `configure_image` actually set, NOT an assumed `width*3`:
-        // on an alignment-padded (DMA) destination the rows are 64-aligned, and
-        // writing at `width*3` would shear rows that `convert()` then samples at
-        // the wider pitch.
+        // The row stride `configure_image` set.
         let rgb_stride = dst
             .effective_row_stride()
             .ok_or_else(|| DecodeErr::Reset("no row stride after Rgb reconfigure".into()))?;
 
-        // The device decode borrows `dst` immutably (via `cuda_map`); scope it so
-        // the format can be restored mutably on the error path by the caller.
         self.decode_into_device(lib, dst, data, img_w, img_h, rgb_stride)?;
         Ok(ImageInfo {
             width: img_w,
@@ -214,8 +187,7 @@ impl NvJpegContext {
     }
 
     /// Map the destination PBO to a device pointer, decode RGB into it on the
-    /// context's stream, synchronise, and unmap. Takes `&Tensor` so the
-    /// immutable `cuda_map` borrow is scoped to this call.
+    /// context's stream, synchronise, and unmap.
     fn decode_into_device<T: ImagePixel>(
         &self,
         lib: &loader::NvjpegLib,
@@ -225,10 +197,8 @@ impl NvJpegContext {
         img_h: usize,
         rgb_stride: usize,
     ) -> Result<(), DecodeErr> {
-        // Map the PBO's CUDA registration to a device pointer (routes to the GL
-        // worker thread that owns the PBO). The map must stay live across the
-        // whole decode+sync — `device_ptr` is only valid while mapped, and
-        // dropping it unmaps so `convert()` can re-take the PBO.
+        // Map the PBO's CUDA registration to a device pointer; the map stays
+        // live across the decode and sync.
         let cuda = {
             let _s = tracing::trace_span!("codec.decode_jpeg.nvjpeg_map").entered();
             dst.cuda_map()
@@ -242,15 +212,9 @@ impl NvJpegContext {
         }
         let map_len = cuda.len();
 
-        // Bounds-check the packed RGB write against the true PBO allocation
-        // (`configure_image` does NOT guard a packed format on GL memory).
-        // Two distinct failure modes:
-        //   * `img_h * rgb_stride` overflowing `usize` is a degenerate image
-        //     geometry (only reachable for an enormous image on a 32-bit
-        //     `usize`) — unrepresentable for ANY backend, so surface it as
-        //     `InvalidData` rather than a misleading capacity error.
-        //   * the write merely exceeding THIS PBO mapping is a destination-too-
-        //     small case — fall back to V4L2/CPU.
+        // Bounds-check the packed RGB write against the PBO allocation: an
+        // overflowing size is `InvalidData`; a write past the mapping falls back
+        // to V4L2/CPU.
         let offset = dst.plane_offset().unwrap_or(0);
         let needed = img_h.checked_mul(rgb_stride).ok_or_else(|| {
             DecodeErr::Fatal(CodecError::InvalidData(format!(
@@ -263,8 +227,8 @@ impl NvJpegContext {
             )));
         }
 
-        // Header info: confirm the dims match the parsed JPEG. Subsampling is
-        // recorded on the span only; RGBI output normalises every subsampling.
+        // Header info: confirm the dimensions match the parsed JPEG. Subsampling
+        // is recorded on the span only.
         let mut ncomp: i32 = 0;
         let mut subsampling: i32 = 0;
         let mut widths = [0i32; NVJPEG_MAX_COMPONENT];
@@ -302,8 +266,7 @@ impl NvJpegContext {
         {
             let _s = tracing::trace_span!("codec.decode_jpeg.nvjpeg_submit").entered();
             // SAFETY: valid handle/state, in-bounds input, valid device image,
-            // and a live stream. Progressive/non-baseline JPEGs the GPU_HYBRID
-            // backend rejects surface here and fall back to the CPU decoder.
+            // and a live stream.
             let st = unsafe {
                 (lib.decode)(
                     self.handle,
@@ -328,9 +291,7 @@ impl NvJpegContext {
             }
         }
 
-        // Unmap the PBO (routes to the GL worker thread) so `convert()` can
-        // sample it. Explicit drop after the sync guarantees the device write
-        // is complete and visible first.
+        // Unmap the PBO after the sync.
         let _s = tracing::trace_span!("codec.decode_jpeg.nvjpeg_unmap").entered();
         drop(cuda);
         Ok(())
@@ -370,9 +331,9 @@ impl NvJpegProbe {
     /// - `Ok(Some(info))` — decoded on the GPU into the PBO as RGB.
     /// - `Ok(None)` — no nvJPEG, or the destination is not CUDA-backed; the
     ///   caller uses the V4L2/CPU decoders.
-    /// - `Err(NvJpegDecode::Fallback)` — transient/unsupported; decode this
+    /// - `Err(NvJpegDecode::Fallback)` — transient or unsupported; decode this
     ///   image on V4L2/CPU.
-    /// - `Err(NvJpegDecode::Fatal)` — a real error to surface.
+    /// - `Err(NvJpegDecode::Fatal)` — an error to surface.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn try_decode<T: ImagePixel>(
         &mut self,
@@ -388,9 +349,8 @@ impl NvJpegProbe {
             return Ok(None);
         };
 
-        // Only CUDA-backed (PBO/DMA-with-handle) destinations can be decoded
-        // into zero-copy; anything else falls through to V4L2/CPU. Checked
-        // before any reconfigure so a non-CUDA tensor is left untouched.
+        // Only CUDA-backed destinations are decoded into; anything else is
+        // left untouched.
         if !dst.is_cuda_attached() {
             return Ok(None);
         }
@@ -405,14 +365,12 @@ impl NvJpegProbe {
                 ctx.failures = ctx.failures.saturating_add(1);
                 Err(NvJpegDecode::Fallback(why))
             }
-            // A config we don't drive: fall back but do NOT count it — nvJPEG
-            // is healthy, the CPU handles this image.
+            // Unsupported configuration: fall back without counting a failure.
             Err(DecodeErr::Unsupported(why)) => Err(NvJpegDecode::Fallback(why)),
             Err(DecodeErr::Fatal(e)) => Err(NvJpegDecode::Fatal(e)),
         };
 
-        // Circuit breaker: demote a persistently failing decoder for the session
-        // so it stops costing per-image latency.
+        // Demote a decoder that reached the failure limit.
         if let NvJpegProbe::Ready(ctx) = self {
             if ctx.failures >= MAX_CONSECUTIVE_FAILURES {
                 log::warn!(
@@ -431,9 +389,8 @@ mod tests {
     use super::*;
     use edgefirst_tensor::TensorMemory;
 
-    /// A plain `Mem` tensor has no CUDA handle, so `try_decode` returns
-    /// `Ok(None)` and leaves the tensor's format untouched for the V4L2/CPU
-    /// fall-through — regardless of whether libnvjpeg is present.
+    /// A `Mem` tensor has no CUDA handle: `try_decode` returns `Ok(None)` and
+    /// leaves the tensor's format untouched.
     #[test]
     fn mem_tensor_falls_through_untouched() {
         let mut probe = NvJpegProbe::default();
@@ -445,9 +402,6 @@ mod tests {
             edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
-        // The `cuda()` gate fires before the headers are consulted, but parse the
-        // fixture unconditionally so a broken `MINIMAL_JPEG` fails the test loudly
-        // instead of silently skipping the `try_decode` call.
         let headers =
             crate::jpeg::markers::parse_markers(MINIMAL_JPEG).expect("MINIMAL_JPEG must parse");
         let r = probe.try_decode::<u8>(
@@ -460,11 +414,10 @@ mod tests {
             16,
         );
         assert!(matches!(r, Ok(None)));
-        // Format must be unchanged (still Nv12) for the fall-through.
         assert_eq!(dst.format(), Some(PixelFormat::Nv12));
     }
 
-    // 8x8 grayscale baseline JPEG (smallest valid stream) for header parsing.
+    // 8x8 grayscale baseline JPEG.
     const MINIMAL_JPEG: &[u8] = &[
         0xFF, 0xD8, 0xFF, 0xDB, 0x00, 0x43, 0x00, 0x08, 0x06, 0x06, 0x07, 0x06, 0x05, 0x08, 0x07,
         0x07, 0x07, 0x09, 0x09, 0x08, 0x0A, 0x0C, 0x14, 0x0D, 0x0C, 0x0B, 0x0B, 0x0C, 0x19, 0x12,
@@ -477,9 +430,7 @@ mod tests {
         0x08, 0x01, 0x01, 0x00, 0x00, 0x3F, 0x00, 0xD2, 0xCF, 0x20, 0xFF, 0xD9,
     ];
 
-    /// `NvJpegProbe::Unavailable` returns `Ok(None)` on every call — it never
-    /// touches the tensor (no reconfigure, no CUDA map). This covers the
-    /// post-circuit-breaker code path without needing CUDA/libnvjpeg.
+    /// `NvJpegProbe::Unavailable` returns `Ok(None)` without touching the tensor.
     #[test]
     fn unavailable_probe_returns_none_without_touching_tensor() {
         let mut probe = NvJpegProbe::Unavailable;
@@ -506,35 +457,21 @@ mod tests {
             matches!(r, Ok(None)),
             "Unavailable probe must return Ok(None)"
         );
-        // Format must be unchanged — the probe must not have touched the tensor.
         assert_eq!(dst.format(), Some(PixelFormat::Nv12));
     }
 
-    /// The circuit breaker demotes a `Ready` context to `Unavailable` after
-    /// `MAX_CONSECUTIVE_FAILURES` `Reset` failures. This exercises that threshold
-    /// without CUDA/libnvjpeg: a `Mem` tensor has no CUDA handle, so `try_decode`
-    /// returns `Ok(None)` before the failure counter is incremented. We instead
-    /// drive the counter directly by injecting a pre-fabricated `Ready` context
-    /// with `failures` just below the threshold and confirming the gate.
+    /// `MAX_CONSECUTIVE_FAILURES` allows at least one retry.
     #[test]
     fn circuit_breaker_threshold_constant_is_positive() {
-        // Compile-time contract: the threshold must allow at least one retry
-        // (>= 2, which also implies > 0), so a single transient GPU error never
-        // permanently demotes the decoder. A `const` assertion enforces this at
-        // build time; a runtime `assert!` on a constant would trip
-        // `clippy::assertions_on_constants`.
         const _: () = assert!(MAX_CONSECUTIVE_FAILURES >= 2);
     }
 
-    /// A freshly-created `NvJpegProbe` is `Unprobed`. On a host without
-    /// CUDA/libnvjpeg the first `try_decode` call probes and immediately
-    /// transitions to `Unavailable`; all subsequent calls return `Ok(None)`.
-    /// This is the self-skip path on macOS / headless Linux CI.
+    /// Without CUDA/libnvjpeg the first `try_decode` call leaves the probe
+    /// `Unavailable` and returns `Ok(None)`.
     #[test]
     fn unprobed_probe_degrades_to_unavailable_without_nvjpeg() {
         if is_nvjpeg_available() {
-            // On a CUDA host this test's premise is false — skip rather than
-            // mischaracterize the behaviour.
+            // Skip on a CUDA host.
             return;
         }
         let mut probe = NvJpegProbe::default();
@@ -552,7 +489,6 @@ mod tests {
         .unwrap();
         let headers =
             crate::jpeg::markers::parse_markers(MINIMAL_JPEG).expect("MINIMAL_JPEG must parse");
-        // First call probes; without CUDA the library is absent → Unavailable.
         let r = probe.try_decode::<u8>(
             MINIMAL_JPEG,
             &headers,
@@ -562,10 +498,7 @@ mod tests {
             8,
             16,
         );
-        // Either the non-CUDA Mem-tensor gate fires (Ok(None)) or the library is
-        // truly absent and the probe returns Unavailable. Both produce Ok(None).
         assert!(matches!(r, Ok(None)), "no-CUDA probe must return Ok(None)");
-        // After the probe the state must be Unavailable (not left as Unprobed).
         assert!(
             matches!(probe, NvJpegProbe::Unavailable),
             "probe must be Unavailable after first call on a non-CUDA host"

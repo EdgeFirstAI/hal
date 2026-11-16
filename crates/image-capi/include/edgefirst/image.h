@@ -11,17 +11,16 @@
  * Hardware-accelerated image processing: conversion, scaling and colour
  * handling across GL, G2D and CPU backends.
  *
- * This library MINTS tensors. `ef_image_processor_create_image` returns an
- * `ef_tensor`, and allocating a PBO is the one operation that genuinely
- * requires a processor, because only the GL context owner can create one.
+ * `ef_image_processor_create_image` returns an `ef_tensor`. A PBO-backed
+ * tensor is allocated only through a processor.
  *
  * A tensor from here is an ordinary `ef_tensor`. There is one tensor
  * header, `edgefirst/tensor.h`. Detection primitives used when drawing
  * masks live in header-only `edgefirst/detect.h`.
  *
  * Platform-specific entry points. Both are declared on every platform and
- * refuse at run time off their platform, so linking never depends on the
- * host. The tie is stated per function with a "Platforms:" line:
+ * refuse at run time off their platform. Each function states its
+ * platforms on a "Platforms:" line:
  *   - Linux, macOS, iOS, Android: ef_image_processor_convert_fence
  *     (sync-fence fd)
  *   - Windows: ef_image_processor_convert_fence_handle (event handle)
@@ -42,9 +41,6 @@ extern "C" {
 
 /**
  * @brief An opaque image processor.
- *
- * Forward-declared so callers write `ef_image_processor *` without the `struct`
- * keyword. Its definition is private: processor state is not part of the ABI.
  */
 typedef struct ef_image_processor ef_image_processor;
 
@@ -251,33 +247,6 @@ extern "C" {
 
 /**
  * ABI version of this library's C surface.
- *
- * 5: the alpha byte of each `ef_image_processor_set_class_colors` colour now
- * sets the box outline's coverage as well as the mask's, where boxes were
- * drawn opaque after that call. Same symbols and layouts, read differently.
- * `ef_image_processor_set_box_line_width` sets the outline thickness.
- *
- * 4: `ef_tiling_config` lost `pad` and `fit` (24 bytes, was 32) and
- * `ef_image_processor_plan_tiles`, `ef_image_processor_tile_into` and
- * `ef_image_processor_tile_one` take a trailing `const ef_convert_options *`
- * that says how each tile is converted. `EF_FIT_*` and
- * `EF_LETTERBOX_PLACEMENT_*` moved to `edgefirst/detect.h` with their values
- * unchanged, `ef_image_processor_set_interpolation` accepts
- * `EF_INTERPOLATION_BICUBIC` and `EF_INTERPOLATION_AREA`, and
- * `ef_convert_options_set_interpolation` sets a per-convert interpolation.
- *
- * 3: the convert functions take a `const ef_convert_options *` (built with
- * the `ef_convert_options_*` setters) in place of `rotation`, `flip` and a
- * `const ef_crop *`, and `ef_crop` is gone. A caller built against
- * generation 2 fails to compile; one linked against it passes arguments the
- * functions no longer read the same way.
- *
- * 2: an unknown `color_mode` passed to `ef_image_processor_draw_decoded_masks`
- * or `ef_image_processor_draw_proto_masks` returns `EINVAL` (it was drawn as
- * `EF_COLOR_MODE_CLASS`), and an unknown `ef_tiling_config.fit` fails the
- * tiling functions (any non-zero value meant letterbox). No symbol or layout
- * changed, so a caller built against generation 1 gets no link error; the
- * probe is the only signal.
  */
 uint32_t ef_image_abi_version(void);
 
@@ -285,12 +254,10 @@ uint32_t ef_image_abi_version(void);
  * Draw boxes and decoded masks onto `dst`.
  *
  * On Windows the destination's `ef_tensor_gpu_completion` reflects this draw
- * afterwards, as it does after a convert, so another device can wait on the
- * drawn frame instead of the CPU.
+ * afterwards, as it does after a convert.
  *
  * A `BGRA` background onto a zero-copy destination (a D3D11 texture, an
- * IOSurface, a dma-buf) returns `ENOTSUP`: the GL base-layer draw has no
- * `BGRA` arm and the CPU backend renders only `RGBA`/`RGB`.
+ * IOSurface, a dma-buf) returns `ENOTSUP`.
  *
  * `content_region` is `NULL` or four floats: where the image sits in the
  * model input as normalized `[xmin, ymin, xmax, ymax]`
@@ -298,8 +265,8 @@ uint32_t ef_image_abi_version(void);
  * to the image.
  *
  * `color_mode` is an `EF_COLOR_MODE_*` code; any other value is `EINVAL`.
- * A CPU draw blends into `dst`, so one not declared `EF_CPU_ACCESS_READ_WRITE`
- * (or a `background` not declared readable) is `EACCES`.
+ * A CPU draw into a `dst` not declared `EF_CPU_ACCESS_READ_WRITE`, or with a
+ * `background` not declared readable, is `EACCES`.
  *
  * @return 0 on success, `EINVAL` for an invalid argument or aliased
  * buffers, `ENOTSUP` for a format no backend draws, `EACCES` as above,
@@ -389,7 +356,7 @@ void ef_mask_list_free(ef_mask_list *l);
 ef_image_processor *ef_image_processor_new(void);
 
 /**
- * Free a processor. Freeing `NULL` is a no-op, matching `free(3)`.
+ * Free a processor. `NULL` is a no-op.
  *
  * # Safety
  * `p` must be `NULL` or have come from [`ef_image_processor_new`].
@@ -399,13 +366,13 @@ void ef_image_processor_free(ef_image_processor *p);
 /**
  * Allocate an image, returning a tensor.
  *
- * `format` is the wire descriptor (`"NV12"`, `"rgb8"`), matching
- * `ef_tensor_builder_format` rather than introducing a second vocabulary.
- * `dtype` and `access` are the shared integer codes.
+ * `format` is the wire descriptor (`"NV12"`, `"rgb8"`) that
+ * `ef_tensor_builder_format` takes. `dtype` and `access` are the shared
+ * integer codes.
  *
- * `storage` selects the backing; pass `EF_STORAGE_KIND_PBO` for the case that
- * actually needs a processor. The result is an ordinary `ef_tensor` — read it
- * with `ef_tensor_shape`, release it with `ef_tensor_free`.
+ * `storage` selects the backing; `EF_STORAGE_KIND_PBO` allocates a PBO. The
+ * result is an `ef_tensor`: read it with `ef_tensor_shape`, release it with
+ * `ef_tensor_free`.
  *
  * The returned tensor's `ef_tensor_cpu_access` may be wider than `access`:
  * what this processor's own convert may do to it as a destination on the
@@ -462,11 +429,7 @@ ef_tensor *ef_image_processor_create_image(ef_image_processor *p,
 /**
  * Allocate the image an `ef_tensor_image_desc` request describes.
  *
- * The request comes from `libedgefirst-tensor`, the type's single
- * implementation home (see `edgefirst_tensor_capi::desc`); this library
- * never dereferences the handle itself, only the scalar view
- * `ef_tensor_image_desc_get` fills. The request is not consumed and may be
- * reused, so one description can fill a pool.
+ * The request is not consumed and may be reused.
  *
  * The declared access is widened as for `ef_image_processor_create_image`,
  * except for a compression request, which keeps `EF_CPU_ACCESS_NONE`.
@@ -644,10 +607,8 @@ int ef_convert_options_content_region(const ef_convert_options *o,
 /**
  * Convert `src` into `dst`, scaling, converting colour and rotating as needed.
  *
- * `src`/`dst` may have been minted by any EdgeFirst library -- every library
- * links the same shared tensor implementation, so both are read the same
- * way regardless of which one minted them. `options` may be `NULL` for the
- * defaults.
+ * `src` and `dst` may come from any EdgeFirst library. `options` may be
+ * `NULL` for the defaults.
  *
  * @return 0 on success; `EINVAL` for options that cannot apply to `dst`
  * (such as a normalization on an integer destination without quantization),
@@ -699,9 +660,8 @@ uintptr_t ef_align_width_for_pixel_format(uintptr_t width, const char *format, u
 /**
  * Create a processor forced to one backend.
  *
- * `backend` is an `EF_COMPUTE_BACKEND_*` code. A forced backend
- * disables the fallback chain entirely — if it is unavailable the call fails
- * rather than quietly using another, which is the point of forcing one.
+ * `backend` is an `EF_COMPUTE_BACKEND_*` code. A forced backend disables the
+ * fallback chain: the call fails when the backend is unavailable.
  *
  * @return `NULL` when the backend is unknown or unavailable here.
  */
@@ -710,7 +670,7 @@ ef_image_processor *ef_image_processor_new_with_backend(uint32_t backend);
 /**
  * Set the RGBA palette used when drawing class masks and boxes.
  *
- * Copied, not borrowed, so the caller may free its array immediately.
+ * The palette is copied; the caller may free its array after the call.
  *
  * The alpha byte sets the coverage of both the mask fill and the box
  * outline: each is blended over `dst` with `alpha / 255` scaled by the
@@ -779,10 +739,9 @@ int ef_image_processor_flush(ef_image_processor *p);
  *
  * Convert, returning a sync-fence fd instead of blocking on the GPU.
  *
- * The GL to NPU handoff. `*fence_fd` receives a descriptor the caller owns and
- * must close, or `-1` when the platform has no native fence and the convert
- * therefore completed synchronously — in which case the destination is already
- * safe to read.
+ * `*fence_fd` receives a descriptor the caller owns and must close, or `-1`
+ * when the platform has no native fence and the convert completed
+ * synchronously.
  *
  * `options` as for [`ef_image_processor_convert`].
  *
@@ -888,8 +847,7 @@ void ef_tile_placement_list_free(ef_tile_placement_list *list);
  * Allocate a tall packed batch that stacks `n` tiles.
  *
  * The declared access is widened as for `ef_image_processor_create_image`;
- * tiles are written through views, so any predicted CPU write is added as
- * `EF_CPU_ACCESS_READ_WRITE`.
+ * any predicted CPU write is added as `EF_CPU_ACCESS_READ_WRITE`.
  *
  * # Safety
  * `format` is a NUL-terminated wire code.

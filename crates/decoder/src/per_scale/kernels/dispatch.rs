@@ -25,9 +25,9 @@ use edgefirst_tensor::DType;
 /// for 16-bit inputs into f32 on FP16 tiers) and dist2bbox four anchors per step; their `f16`
 /// outputs are the f32 boxes rounded once on `neon`, and native FP16 distances and boxes on
 /// `neon_fp16`. LTRB on NEON is `prim::neon_ltrb`'s fused dequantize and dist2bbox on every tier;
-/// its `f16` outputs are the f32 boxes rounded once, which beat native FP16 boxes on Cortex-A55.
+/// its `f16` outputs are the f32 boxes rounded once.
 #[derive(Debug, Clone, Copy)]
-#[allow(clippy::enum_variant_names)] // tier suffix is meaningful
+#[allow(clippy::enum_variant_names)]
 pub(crate) enum BoxLevelDispatch {
     // ── DFL encoding (yolov8, yolo11) ────────────────────
     DflI8ToF32Lut,
@@ -107,7 +107,7 @@ pub(crate) enum BoxLevelDispatch {
     #[cfg(target_arch = "aarch64")]
     LtrbF32ToF16Neon,
 
-    // NEON FP16 (`neon_fp16`, Cortex-A55+); see the enum doc for which cells use it.
+    // NEON FP16 (`neon_fp16`).
     #[cfg(target_arch = "aarch64")]
     DflI16ToF32NeonFp16,
     #[cfg(target_arch = "aarch64")]
@@ -239,8 +239,8 @@ impl BoxLevelDispatch {
 }
 
 #[derive(Debug, Clone, Copy)]
-#[allow(dead_code)] // Wired by Task 15.
-#[allow(clippy::enum_variant_names)] // tier suffix is meaningful
+#[allow(dead_code)]
+#[allow(clippy::enum_variant_names)]
 pub(crate) enum ScoreLevelDispatch {
     I8ToF32Scalar,
     U8ToF32Scalar,
@@ -264,8 +264,7 @@ pub(crate) enum ScoreLevelDispatch {
     #[cfg(target_arch = "aarch64")]
     U16ToF32NeonBase,
 
-    // Tier 1-fused: NEON fused dequant+sigmoid in one pass (no intermediate
-    // store/reload). Same CpuFeatures gate as NeonBase.
+    // NEON fused dequant+sigmoid in one pass (`neon_baseline`).
     #[cfg(target_arch = "aarch64")]
     I8ToF32NeonFused,
     #[cfg(target_arch = "aarch64")]
@@ -413,11 +412,10 @@ impl ScoreLevelDispatch {
     }
 }
 
-/// Mask-coefficient dispatch — same (I, F) matrix as scores but
-/// `run()` takes no activation parameter. Newtype around
-/// `ScoreLevelDispatch` to share the variant list.
+/// Mask-coefficient dispatch: the same (I, F) matrix as scores, with no
+/// activation. Newtype around `ScoreLevelDispatch`.
 #[derive(Debug, Clone, Copy)]
-#[allow(dead_code)] // Wired by Task 15.
+#[allow(dead_code)]
 pub(crate) struct MaskCoefDispatch(pub(crate) ScoreLevelDispatch);
 
 impl MaskCoefDispatch {
@@ -426,15 +424,14 @@ impl MaskCoefDispatch {
         output: DecodeDtype,
         f: &CpuFeatures,
     ) -> DecoderResult<Self> {
-        // Pure dequant (no activation) — skip FP16 sigmoid and fused
-        // dequant+sigmoid tiers.
+        // Dequant only.
         ScoreLevelDispatch::select_dequant_only(input, output, f).map(Self)
     }
 }
 
 /// Proto dispatch — single-tensor dequant; same (I, F) matrix.
 #[derive(Debug, Clone, Copy)]
-#[allow(dead_code)] // Wired by Task 15.
+#[allow(dead_code)]
 pub(crate) struct ProtoDispatch(pub(crate) ScoreLevelDispatch);
 
 impl ProtoDispatch {
@@ -443,13 +440,12 @@ impl ProtoDispatch {
         output: DecodeDtype,
         f: &CpuFeatures,
     ) -> DecoderResult<Self> {
-        // Pure dequant (no activation) — skip FP16 sigmoid and fused tiers.
+        // Dequant only.
         ScoreLevelDispatch::select_dequant_only(input, output, f).map(Self)
     }
 }
 
-/// Per-channel DFL box kernels: one scale and zero point per bin, which the per-tensor
-/// [`BoxLevelDispatch`] cannot carry.
+/// Per-channel DFL box kernels: one scale and zero point per bin.
 ///
 /// `Neon` dequantizes each bin exactly as the scalar cell does, then runs the f32 NEON softmax
 /// and weighted sum and dist2bbox four anchors per step; its `f16` boxes are the f32 boxes
@@ -478,7 +474,7 @@ impl DflPerChannelDispatch {
         Self::Scalar
     }
 
-    /// Decodes one level; integer inputs only, as NPUs emit per-channel quantization on those.
+    /// Decodes one level; integer inputs only.
     /// `scales` must hold one scale per bin and `zps` none (all zero) or one per bin
     /// (`InvalidConfig`), and the slices `level.h · level.w` anchors (`InvalidShape`), both
     /// checked before anything is written.
@@ -760,8 +756,7 @@ impl BoxLevelDispatch {
         Ok(())
     }
 
-    /// Whether this cell decodes LTRB distances (four values per anchor); exhaustive, so a new
-    /// variant must state its encoding.
+    /// Whether this cell decodes LTRB distances (four values per anchor).
     pub(crate) fn is_ltrb(&self) -> bool {
         use BoxLevelDispatch::*;
         match self {
@@ -809,9 +804,8 @@ impl BoxLevelDispatch {
     ///
     /// Returns `InvalidShape`, before writing anything, unless `input`, `dst` and the grids hold
     /// the values of `level.h · level.w` anchors, and `KernelDispatchUnreachable` if the variant
-    /// tag and (input, dst) dtypes disagree, an internal logic bug at construction time. The
-    /// `*Lut` cells weigh bins through `table` when it was built for `q.scale`, and build their
-    /// own otherwise.
+    /// tag and (input, dst) dtypes disagree. The `*Lut` cells weigh bins through `table` when it
+    /// was built for `q.scale`, and build their own otherwise.
     pub(crate) fn run(
         &self,
         input: InputView<'_>,
@@ -1048,7 +1042,7 @@ use super::level_score::{
 use crate::per_scale::Activation;
 
 impl ScoreLevelDispatch {
-    #[allow(dead_code)] // Wired in Task 21.
+    #[allow(dead_code)]
     pub(crate) fn run(
         &self,
         input: InputView<'_>,
@@ -1096,9 +1090,7 @@ impl ScoreLevelDispatch {
             (F32ToF16Scalar, InputView::F32(i), DstSliceMut::F16(d)) => {
                 decode_score_level_f32_to_f16(i, q, num_classes, level, activation, d)
             }
-            // Tier-1 NEON-base arms. Reachable only when select() picked
-            // the *NeonBase variant, which only happens with
-            // CpuFeatures::neon_baseline true on aarch64.
+            // NEON-base arms.
             #[cfg(target_arch = "aarch64")]
             (I8ToF32NeonBase, InputView::I8(i), DstSliceMut::F32(d)) => {
                 decode_score_level_i8_to_f32_neon(i, q, num_classes, level, activation, d)
@@ -1116,9 +1108,7 @@ impl ScoreLevelDispatch {
                 decode_score_level_u16_to_f32_neon(i, q, num_classes, level, activation, d)
             }
 
-            // Tier-2 NEON FP16 score arms.
-
-            // Tier 1-fused: fused dequant+sigmoid NEON arms.
+            // Fused dequant+sigmoid NEON arms.
             #[cfg(target_arch = "aarch64")]
             (I8ToF32NeonFused, InputView::I8(i), DstSliceMut::F32(d)) => {
                 decode_score_level_i8_to_f32_neon_fused(i, q, num_classes, level, activation, d)
@@ -1224,7 +1214,7 @@ use super::level_mc::{
 };
 
 impl MaskCoefDispatch {
-    #[allow(dead_code)] // Wired in Task 21.
+    #[allow(dead_code)]
     pub(crate) fn run(
         &self,
         input: InputView<'_>,
@@ -1327,7 +1317,7 @@ impl MaskCoefDispatch {
 
 impl ProtoDispatch {
     /// Single-tensor dequant — no per-level structure. Takes flat input/output slices.
-    #[allow(dead_code)] // Wired in Task 21.
+    #[allow(dead_code)]
     pub(crate) fn run(
         &self,
         input: InputView<'_>,
@@ -1473,8 +1463,7 @@ mod tests {
         assert!(!d.uses_exp_table());
     }
 
-    /// A scale the exp table cannot represent (negative, zero, NaN) decodes
-    /// through the max-subtracted softmax instead, finite and equal to it.
+    /// A scale the exp table cannot represent (negative, zero, NaN) decodes through the max-subtracted softmax.
     #[test]
     fn box_dispatch_lut_falls_back_for_unusable_scales() {
         use crate::per_scale::kernels::level_box::{
@@ -1556,7 +1545,7 @@ mod tests {
                 );
             }
         }
-        // The reviewer's case: the softmax puts every side at distance 8.
+        // The softmax puts every side at distance 8.
         let q = Quantization::new(-0.5, 0);
         let mut got = [0.0_f32; 4];
         BoxLevelDispatch::select(
@@ -1577,8 +1566,7 @@ mod tests {
         assert!(got.iter().all(|v| v.is_finite()), "{got:?}");
     }
 
-    /// A table built for another scale is not used: the kernel builds one
-    /// for the scale it is given.
+    /// A table built for another scale is not used: the kernel builds one for the scale it is given.
     #[test]
     fn box_dispatch_lut_ignores_a_stale_table() {
         let f = CpuFeatures::default();
@@ -1678,7 +1666,6 @@ mod tests {
         use crate::Quantization;
         use edgefirst_kernels::prim::grids::make_anchor_grid;
 
-        // Same fixture as the level_box test but routed through dispatch.
         let mut logits = [0.0_f32; 64];
         for side in 0..4 {
             logits[side * 16 + 5] = 100.0;

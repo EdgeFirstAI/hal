@@ -1,39 +1,12 @@
 // SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! The zero-copy float render targets (`convert_float_to_zero_copy`,
-//! `convert_nv_to_float_two_pass`) import their destination through
-//! `get_or_create_egl_image_rgb` -> `import_buffer_packed`, which on ANGLE
-//! over IOSurface binds the whole buffer from its origin -- the same
-//! problem `bind_dst` and `convert_via_engine` already gate on
-//! `dst_import_places` for their own destination imports.
+//! A `PlanarRgb` F16 destination reconstructed from a descriptor (a plane
+//! offset, no `view_origin`) is refused by the GL backend, and
+//! `ImageProcessor`'s convert lands the bytes at that offset through the CPU
+//! fallback.
 //!
-//! This pins the float dispatch's own gate: a `PlanarRgb` F16 destination
-//! reconstructed from a descriptor (a plane offset, no `view_origin`) must
-//! be refused by the GL backend directly, and `ImageProcessor`'s convert
-//! (CPU fallback) must still land the bytes at that offset, not at the
-//! buffer's origin.
-//!
-//! macOS/iOS only: a D3D11 descriptor import accepts only packed windows, so
-//! a narrowed planar destination cannot exist on Windows, and Linux's
-//! DMA-BUF import expresses the offset itself, so `dst_import_places`
-//! defaults to `true` there and this reconstruction hits the ordinary
-//! zero-copy path.
-//!
-//! Two halves, so the gate cannot pass vacuously: first `GLProcessorThreaded`
-//! is driven directly and asserted to *refuse* the destination (the gate
-//! actually firing, not just "some path happened to place the bytes
-//! correctly"); the GL context is dropped before `ImageProcessor` opens its
-//! own, since nothing here establishes that two live ANGLE contexts coexist
-//! safely, and only one is ever needed at a time. Then `ImageProcessor`
-//! drives the same convert, which falls back to CPU on the same refusal, and
-//! its placement is checked.
-//!
-//! The decoded `f16` value check is intentionally coarse (32 ULPs): native
-//! FP16 widening on Apple silicon and an `f32`-divide-then-round golden can
-//! disagree by more than a couple of bits, and the untouched/written
-//! byte-range checks above it are the assertions this file actually exists
-//! to make.
+//! macOS/iOS only.
 
 #![cfg(all(any(target_os = "macos", target_os = "ios"), feature = "opengl"))]
 
@@ -59,18 +32,13 @@ use outcome::report_skip as skip;
 #[test]
 fn reconstructed_planar_f16_destination_receives_its_convert_at_its_offset() {
     let require_gl = std::env::var("HAL_TEST_REQUIRE_GL").is_ok_and(|v| v == "1");
-    // The macOS coverage lane runs pass 1 with the ANGLE dlopen gate closed;
-    // the same guard `gl_backend_available_canary` carries.
     #[cfg(target_os = "macos")]
     if require_gl && std::env::var_os("HAL_TEST_ALLOW_DLOPEN_ANGLE").is_none() {
-        skip("ANGLE dlopen gate closed (coverage pass 1)");
+        skip("ANGLE dlopen gate closed");
         return;
     }
 
-    // `supported_render_dtypes` is only public on `ImageProcessor`; this
-    // instance exists only to ask the question and is dropped immediately
-    // after, before either of the two convert halves below opens its own
-    // GL context.
+    // A processor used only to query `supported_render_dtypes`, dropped before the converts below.
     let support = {
         let proc = ImageProcessor::new().expect("ImageProcessor::new");
         proc.supported_render_dtypes()
@@ -89,11 +57,7 @@ fn reconstructed_planar_f16_destination_receives_its_convert_at_its_offset() {
     };
 
     // The RGBA16F packing stores the planar `[3, H, W]` stream at `(W/4, 3H)`
-    // texels of 4 `f16`s each, so one planar row is one surface row. The
-    // exact byte count is a platform packing/alignment detail, not something
-    // this test should pin: only that it is at least 64 `f16`s wide (`W`
-    // samples, 2 bytes each) and a multiple of the packing's 4-wide texel
-    // (`4 * 2 * 8` bytes) in that unit.
+    // texels of 4 `f16`s each, so one planar row is one surface row.
     let pitch = canvas
         .effective_row_stride()
         .expect("planar f16 surface pitch");
@@ -106,11 +70,8 @@ fn reconstructed_planar_f16_destination_receives_its_convert_at_its_offset() {
         m.as_mut_slice().fill(BLANK);
     }
 
-    // A destination window rebuilt the way a capsule consumer rebuilds one:
-    // the descriptor carries the whole surface, then it is narrowed to the
-    // 15 rows past the first (skipping row 0) and the offset put back --
-    // `PlanarRgb`/`PlanarRgba` reject `Tensor::view()`, so a real capsule
-    // consumer narrows this way rather than through a view.
+    // A destination rebuilt from the whole surface's descriptor, narrowed to
+    // the 15 rows past the first, with the offset set.
     let mut rebuilt = TensorDyn::import_descriptor(&canvas.descriptor_pinned(None))
         .expect("reconstruct the destination from its descriptor");
     rebuilt
@@ -144,9 +105,8 @@ fn reconstructed_planar_f16_destination_receives_its_convert_at_its_offset() {
         }
     }
 
-    // First half: the GL backend itself must refuse this destination, not
-    // merely happen to place the bytes correctly. Scoped so the GL context
-    // is dropped before `ImageProcessor` opens its own below.
+    // First half: the GL backend refuses this destination. The GL context is
+    // dropped at the end of the scope.
     {
         let mut gl = match GLProcessorThreaded::new(None) {
             Ok(gl) => gl,
@@ -167,17 +127,14 @@ fn reconstructed_planar_f16_destination_receives_its_convert_at_its_offset() {
             "expected Error::NotSupported, got {err:?}"
         );
         let msg = err.to_string();
-        // Only pin the stable prefix: the tail names whichever placement
-        // rule declined (ANGLE's whole-buffer binding with no view origin,
-        // or a driver whose import rejects the offset), which isn't asserted.
+        // Only the message's prefix is asserted.
         assert!(
             msg.contains("GL float destination at plane offset"),
             "expected the float dispatch gate's refusal message, got: {msg}"
         );
     }
 
-    // Second half: `ImageProcessor`'s CPU fallback on that same refusal must
-    // still land the convert at the reconstructed tensor's own offset.
+    // Second half: `ImageProcessor` converts through the CPU fallback.
     let mut proc = ImageProcessor::new().expect("ImageProcessor::new");
     proc.convert(&src, &mut rebuilt, None)
         .expect("convert into the reconstructed planar destination");
@@ -196,10 +153,7 @@ fn reconstructed_planar_f16_destination_receives_its_convert_at_its_offset() {
          its plane offset -- must have received the convert"
     );
 
-    // Row 1's first f16 is the R plane's first packed texel, channel 0: the
-    // source is one constant RGBA pixel, so it must be near R/255 regardless
-    // of which of the 4 packed positions it is. Coarse on purpose -- see the
-    // module doc comment.
+    // Row 1's first f16 is the R plane's first packed texel, channel 0.
     let actual = half::f16::from_le_bytes([bytes[pitch], bytes[pitch + 1]]);
     let expected = half::f16::from_f32(PIXEL[0] as f32 / 255.0);
     assert!(

@@ -294,7 +294,7 @@ fn lut_boxes<T: LutBin>(
     neon: bool,
     dst: &mut [f32],
 ) {
-    // The table kernels need exact lengths; the block guarantees them.
+    // The table kernels need exact lengths.
     if src.len() != geom.anchors * 4 * geom.reg_max || dst.len() != 4 * geom.anchors {
         return;
     }

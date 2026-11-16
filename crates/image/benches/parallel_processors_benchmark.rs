@@ -5,23 +5,17 @@
 //!
 //! Measures aggregate convert throughput with {1, 2, 4} `ImageProcessor`
 //! instances running concurrently, each on its own thread with its own GL
-//! context. On `LifecycleOnly` platforms (Mali, V3D, Tegra, llvmpipe) the
-//! processors execute GL work in parallel and the aggregate rate should
-//! scale above 1×; on Vivante (`Full` serialization policy) the rate stays
-//! ≈1× by design. The scaling factor S(n) is the demonstration evidence
-//! for the per-driver GL serialization policy — evidence, not a hard gate.
+//! context.
 //!
 //! Cells:
 //! - `gpu_bound`: NV12 1280×720 → RGB 640×640 letterbox (DMA where
-//!   available) — a realistic model-input convert dominated by GPU work.
-//! - `overhead`: RGBA 64×64 → RGB 64×64 (heap) — dominated by per-message
-//!   dispatch, exposing channel-hop / lock overhead.
+//!   available).
+//! - `overhead`: RGBA 64×64 → RGB 64×64 (heap).
 //!
 //! Each cell runs a fixed wall-clock window; every thread counts completed
-//! converts. The recorded `BenchResult` carries ONE synthetic sample: the
+//! converts. The recorded `BenchResult` carries one synthetic sample: the
 //! effective aggregate per-convert latency `window / total_converts`
-//! (lower = better; `S(n) = t(1) / t(n)`), which keeps the `--json` output
-//! compatible with `scripts/bench_compare.py`.
+//! (`S(n) = t(1) / t(n)`).
 //!
 //! ## Run (on-target)
 //! ```bash
@@ -75,9 +69,7 @@ const CELLS: [Cell; 6] = [
         letterbox: false,
         use_dma: false,
     },
-    // macOS-meaningful zero-copy cells (IOSurface src+dst): RGBA dst —
-    // PlanarRgb-u8 dsts are Linux-only — and the profiler's F16 hot
-    // path. Skip cleanly where unsupported (the per-cell error prints).
+    // Zero-copy cells with an RGBA destination and a PlanarRgb F16 destination.
     Cell {
         tag: "gpu_bound_rgba",
         src_fmt: PixelFormat::Nv12,
@@ -100,11 +92,7 @@ const CELLS: [Cell; 6] = [
         letterbox: true,
         use_dma: true,
     },
-    // The RGBA→PlanarF16 DIRECT path (not the fused NV two-pass): the only
-    // cells that exercise per-frame float SOURCE feeding — zero-copy source
-    // import vs CPU map+upload (`feed_float_src`). Two sizes because the
-    // upload cost scales with source bytes (~2.5 GB/s): 720p ≈ 3.7 MB,
-    // 1080p ≈ 8.3 MB per frame on the upload path.
+    // RGBA → PlanarRgb F16 at two source sizes.
     Cell {
         tag: "f16_rgba_src",
         src_fmt: PixelFormat::Rgba,
@@ -131,19 +119,13 @@ const CELLS: [Cell; 6] = [
 
 /// Run one (cell, n_procs) configuration; returns per-thread convert counts.
 fn run_config(cell: Cell, n_procs: usize) -> Result<Vec<usize>, String> {
-    // Zero-copy probe covers IOSurface on macOS too — is_dma_available()
-    // is false there and would silently measure CPU-heap converts.
+    // A zero-copy source where a GPU buffer is available.
     let mem = if cell.use_dma && edgefirst_tensor::is_gpu_buffer_available() {
         Some(TensorMemory::DmaBuf)
     } else {
         Some(TensorMemory::Mem)
     };
-    // The DESTINATION auto-selects: explicit Some(Dma) now errors loudly
-    // for (format, dtype) combos with no zero-copy mapping (the
-    // explicit-Dma contract) — e.g. the gpu_bound cell's packed-RGB dst on
-    // macOS, which historically byte-bagged and silently measured the CPU
-    // fallback. Auto-select keeps every platform on its honest best path
-    // (Linux: Dma; macOS packed-RGB: Mem + CPU convert).
+    // The destination memory auto-selects.
     let dst_mem = if cell.use_dma && edgefirst_tensor::is_gpu_buffer_available() {
         None
     } else {
@@ -180,9 +162,7 @@ fn run_config(cell: Cell, n_procs: usize) -> Result<Vec<usize>, String> {
                 } else {
                     Crop::default()
                 };
-                // Pre-allocate and REUSE the destination: real pipelines pool
-                // buffers, and per-iteration allocation would measure the
-                // allocator (PBO/DMA churn) instead of convert dispatch.
+                // Pre-allocate and reuse the destination.
                 let dst_dtype = if cell.tag.starts_with("f16_") {
                     DType::F16
                 } else {

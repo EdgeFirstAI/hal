@@ -10,11 +10,10 @@
 //! can do. There is no CPU video codec in HAL: a codec the platform cannot
 //! run fails with [`CodecError::Unsupported`].
 //!
-//! On Linux both are V4L2 stateful memory-to-memory devices (i.MX 8M Plus
-//! `vsi_v4l2`, i.MX 95 Wave6, …), discovered by capability. Source tensors in
-//! DMA-BUF memory are imported without a copy, and decoded pictures are
-//! returned in the DMA-BUF buffers the device wrote; only the compressed
-//! bitstream is copied.
+//! On Linux both are V4L2 stateful memory-to-memory devices, discovered by
+//! capability. Source tensors in DMA-BUF memory are imported without a copy,
+//! and decoded pictures are returned in the DMA-BUF buffers the device wrote;
+//! only the compressed bitstream is copied.
 //!
 //! On Windows both are Media Foundation transforms (feature
 //! `media-foundation`): a hardware encoder where the GPU driver registers
@@ -68,7 +67,7 @@
         all(windows, feature = "media-foundation")
     )),
     allow(dead_code)
-)] // backend use only
+)]
 pub(crate) mod h264;
 #[cfg(all(windows, feature = "media-foundation"))]
 pub(crate) mod mf;
@@ -323,8 +322,7 @@ pub struct EncoderConfig {
     /// Frames from one key frame to the next. `None` keeps the device
     /// default.
     pub gop: Option<u32>,
-    /// Emit the SPS and PPS with every key frame, so a receiver can start
-    /// decoding at any key frame.
+    /// Emit the SPS and PPS with every key frame.
     pub repeat_headers: bool,
     /// Profile. `None` selects High where the device offers it, and keeps
     /// the device default where it does not. See
@@ -602,8 +600,8 @@ pub enum OutputPool {
         /// Frames the caller may hold at once. The device's own minimum
         /// (the reference pictures it keeps) and one buffer for it to
         /// decode into are added to this. A V4L2 device grants a bounded
-        /// number of buffers in all (31 on the i.MX 95's Wave6); a count
-        /// it cannot cover makes [`VideoDecoder::decode`] fail with
+        /// number of buffers in all; a count it cannot cover makes
+        /// [`VideoDecoder::decode`] fail with
         /// [`CodecError::InvalidConfig`] when the stream's size becomes
         /// known.
         count: usize,
@@ -613,18 +611,18 @@ pub enum OutputPool {
     ///
     /// On Windows pictures are copied into the pool (on the GPU), and each
     /// tensor must be an NV12 image of exactly the stream's visible size;
-    /// such a pool cannot follow a change of size. The rest of this description is about
-    /// devices that decode in place.
+    /// such a pool cannot follow a change of size. The rest of this
+    /// description is about devices that decode in place.
     ///
     /// There must be at least one more than the device keeps for reference
     /// pictures and no more than it takes in all, and each must be large
     /// enough for the stream's coded picture at the row stride the device
-    /// asks for; otherwise
-    /// [`VideoDecoder::decode`] fails with [`CodecError::InvalidConfig`] when
-    /// the stream's size becomes known. A tensor's own shape and format are
-    /// not used: the decoded frames describe the device's layout over the
-    /// same memory. Across a change of stream format the same tensors are
-    /// used again, each once the frames still showing it have dropped.
+    /// asks for; otherwise [`VideoDecoder::decode`] fails with
+    /// [`CodecError::InvalidConfig`] when the stream's size becomes known. A
+    /// tensor's own shape and format are not used: the decoded frames
+    /// describe the device's layout over the same memory. Across a change of
+    /// stream format the same tensors are used again, each once the frames
+    /// still showing it have dropped.
     Provided(Vec<TensorDyn>),
 }
 
@@ -715,7 +713,7 @@ pub enum OutputMemory {
     /// caller), imported by the device, or on Windows written by copying
     /// each picture out of the decoder, on the GPU where it decodes there.
     Imported,
-    /// The device's own buffers, exported as DMA-BUFs because it would not
+    /// The device's own buffers, exported as DMA-BUFs, when it does not
     /// import the pool's. CPU reads of these may be uncached and slow.
     Exported,
 }
@@ -746,7 +744,7 @@ impl Returns {
             all(windows, feature = "media-foundation")
         )),
         allow(dead_code)
-    )] // backend use only
+    )]
     pub(crate) fn take(&self, generation: u64) -> Vec<u32> {
         let mut returned = self.0.lock().unwrap_or_else(|e| e.into_inner());
         returned
@@ -782,7 +780,7 @@ impl DecodedFrame {
             all(windows, feature = "media-foundation")
         )),
         allow(dead_code)
-    )] // backend use only
+    )]
     pub(crate) fn new(
         tensor: Arc<TensorDyn>,
         pts: u64,
@@ -870,9 +868,10 @@ impl VideoDecoder {
     /// # Errors
     ///
     /// [`CodecError::InvalidConfig`] when a provided pool is empty, holds one
-    /// buffer twice or is not in DMA-BUF memory, [`CodecError::Unsupported`] when the engine (or, for
-    /// [`Engine::Auto`], every engine here) does not decode the codec, and
-    /// [`CodecError::NoDevice`] when there is no decoder.
+    /// buffer twice or is not in DMA-BUF memory, [`CodecError::Unsupported`]
+    /// when the engine (or, for [`Engine::Auto`], every engine here) does not
+    /// decode the codec, and [`CodecError::NoDevice`] when there is no
+    /// decoder.
     pub fn new(config: DecoderConfig) -> Result<Self> {
         if let OutputPool::Provided(pool) = &config.output {
             if pool.is_empty() {
@@ -880,9 +879,7 @@ impl VideoDecoder {
                     "the provided pool is empty".into(),
                 ));
             }
-            // Each provided tensor starts at the beginning of its buffer, so
-            // two with one buffer identity are the same memory: one slot would
-            // decode over a picture still shown from the other.
+            // Reject a pool that holds one buffer twice.
             let mut seen = std::collections::HashMap::with_capacity(pool.len());
             for (i, t) in pool.iter().enumerate() {
                 if let Some(first) = seen.insert(t.buffer_identity().id(), i) {
@@ -912,9 +909,8 @@ impl VideoDecoder {
     ///
     /// Returns, in order, every event ready by the time the device has taken
     /// the access unit; it may be empty, and frames may belong to earlier
-    /// access units, since devices hold pictures back for reordering. The
-    /// first access unit yields [`DecodeEvent::Reconfigured`] once the
-    /// headers are parsed.
+    /// access units. The first access unit yields
+    /// [`DecodeEvent::Reconfigured`] once the headers are parsed.
     ///
     /// # Errors
     ///
@@ -1043,7 +1039,6 @@ mod tests {
             L::lowest_for(High, 1920, 1080, 30.0, 40_000_000),
             Some(L::L4_1)
         );
-        // Main has no 1.25 bitrate allowance: 24 Mbps exceeds level 4.0's 20.
         assert_eq!(
             L::lowest_for(Main, 1920, 1080, 30.0, 24_000_000),
             Some(L::L4_1)
@@ -1067,8 +1062,6 @@ mod tests {
     fn levels_cover_each_frame_dimension() {
         use H264Level as L;
         use H264Profile::High;
-        // 256 macroblocks wide fits level 3.2's frame size but not its
-        // sqrt(8 * 5120) = 202 macroblock side; level 4.0 allows 256.
         assert_eq!(
             L::lowest_for(High, 4096, 256, 30.0, 5_000_000),
             Some(L::L4_0)
@@ -1077,7 +1070,6 @@ mod tests {
             L::lowest_for(High, 256, 4096, 30.0, 5_000_000),
             Some(L::L4_0)
         );
-        // 257 macroblocks exceed level 4.1's side; 4.2 allows sqrt(8 * 8704) = 263.
         assert_eq!(
             L::lowest_for(High, 4112, 256, 30.0, 5_000_000),
             Some(L::L4_2)

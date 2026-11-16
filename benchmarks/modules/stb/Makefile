@@ -7,15 +7,13 @@
 #   make aarch64          cross build for boards -> build/stb_bench.aarch64
 #   make x86_64           cross build (zig)      -> build/stb_bench.x86_64
 #
-# stb_image.h is not vendored: `make deps` (run automatically) fetches it at a
-# pinned commit and verifies its sha256, keeping the 280 KB header out of git
-# while keeping the build reproducible. stb_image is public domain / MIT.
+# `make deps` (run automatically) fetches stb_image.h at a pinned commit and
+# verifies its sha256. stb_image is public domain / MIT.
 
 CC      ?= cc
 CFLAGS  ?= -O2 -g -Wall -Wextra -std=c11
 UNAME_S := $(shell uname -s)
-# libdl is separate from libm on Linux (both live in libSystem on Darwin);
-# cbench.h's --parity mode dlopens libturbojpeg.
+# libdl and libm are separate libraries on Linux; on Darwin both live in libSystem.
 ifeq ($(UNAME_S),Darwin)
 LDLIBS  :=
 else
@@ -25,7 +23,7 @@ BUILD   := build
 
 INCLUDES := -I../cbench -I$(BUILD)
 
-# stb_image v2.30, pinned to the last commit touching stb_image.h (2024-07).
+# stb_image v2.30.
 STB_URL    := https://raw.githubusercontent.com/nothings/stb/013ac3beddff3dbffafd5177e7972067cd2b5083/stb_image.h
 STB_SHA256 := 594c2fe35d49488b4382dbfaec8f98366defca819d916ac95becf3e75f4200b3
 

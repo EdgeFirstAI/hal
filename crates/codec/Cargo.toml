@@ -14,12 +14,9 @@ categories = ["multimedia::images", "embedded"]
 documentation = "https://docs.rs/edgefirst-codec"
 
 [features]
-# v4l2 and nvjpeg are on by default but their backend code is fully gated
-# `#[cfg(all(target_os = "linux", feature = "..."))]`, so off Linux they compile
-# to nothing. nvjpeg is pure dlopen (no link-time CUDA dependency) — it loads
-# libnvjpeg.so.12 at runtime and degrades to the V4L2/CPU decoders when absent.
-# media-foundation is likewise Windows-only, and loads mfplat.dll at runtime so
-# Windows N editions without the Media Feature Pack still load the crate.
+# The v4l2 and nvjpeg backends are gated to Linux and media-foundation to
+# Windows. nvjpeg loads libnvjpeg.so.12 and media-foundation loads mfplat.dll
+# at runtime.
 default = ["v4l2", "nvjpeg", "png", "media-foundation"]
 v4l2 = ["dep:edgefirst-v4l2"]
 media-foundation = ["dep:windows", "dep:libloading"]
@@ -40,14 +37,13 @@ tracing = { workspace = true }
 turbojpeg = { version = "1.4", optional = true }
 zune-png = { workspace = true, optional = true }
 
-# Hardware JPEG decode (v4l2 feature). Linux-only: edgefirst-v4l2 provides
-# device discovery, the buffer queues and events.
+# Hardware JPEG decode (v4l2 feature), Linux only: device discovery, the
+# buffer queues and events.
 [target.'cfg(target_os = "linux")'.dependencies]
 edgefirst-v4l2 = { workspace = true, optional = true }
 
 # H.264 encode and decode through the Media Foundation transforms
-# (media-foundation feature). Interfaces only: the flat mfplat.dll functions
-# are resolved at runtime.
+# (media-foundation feature).
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true, optional = true, features = [
     "Win32_Media_MediaFoundation",
@@ -60,9 +56,9 @@ windows = { workspace = true, optional = true, features = [
 edgefirst-bench = { workspace = true }
 env_logger = { workspace = true }
 image = { workspace = true }
-# zune-jpeg is used only by parity tests and the comparison benchmark.
+# Used by parity tests and the comparison benchmark.
 zune-jpeg = { workspace = true }
-# Comparison arm in codec_benchmark; independent of our own `png` feature.
+# Comparison arm in codec_benchmark.
 zune-png = { workspace = true }
 
 

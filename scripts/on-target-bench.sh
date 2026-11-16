@@ -19,10 +19,10 @@
 #                    summary.json for the fleet roll-up
 #
 # Each case writes <case>.json (the harness's --json output) and <case>.txt.
-# system.txt records what the numbers depend on: CPU, governors, GPU clocks
-# and temperatures. Governors are read, never changed: a benchmark measures
-# the board as it ships. summary.json lists every case's exit status and wall
-# time. Exits non-zero if any case failed or its binary is missing.
+# system.txt records the CPU, governors, GPU clocks and temperatures.
+# Governors are read, never changed. summary.json lists every case's exit
+# status and wall time. Exits non-zero if any case failed or its binary is
+# missing.
 
 set -uo pipefail
 
@@ -35,10 +35,9 @@ mkdir -p "${RESULTS}"
 RESULTS="$(cd "${RESULTS}" && pwd)"
 export EDGEFIRST_TESTDATA_DIR="${BUNDLE}/testdata"
 
-# name|environment|binary. The -opengl and -cpu pairs force one backend each,
-# so a GL case that silently fell back to the CPU fails instead of reporting a
-# CPU number as a GPU one. The names match the JSON files BENCHMARKS.md's
-# tables are generated from (benchmarks/<platform>/<name>.json).
+# name|environment|binary. The -opengl and -cpu pairs force one backend each.
+# The names match the JSON files BENCHMARKS.md's tables are generated from
+# (benchmarks/<platform>/<name>.json).
 CASES=(
   "tensor||tensor_benchmark"
   "codec||codec_benchmark"
@@ -63,9 +62,8 @@ CASES=(
   "nvjpeg|EDGEFIRST_ENABLE_NVJPEG=1|nvjpeg_benchmark"
 )
 
-# nvJPEG is opt-in (EDGEFIRST_ENABLE_NVJPEG, set on its case) and engages only
-# where CUDA and libnvjpeg load, so the case measures on a Jetson and skips
-# cleanly elsewhere. libnvjpeg is not on a Jetson's default loader path.
+# Adds the CUDA library directories that exist to the loader path, for the
+# nvJPEG case.
 for cuda in /usr/local/cuda/lib64 /usr/local/cuda/targets/aarch64-linux/lib; do
   [[ -d "${cuda}" ]] && export LD_LIBRARY_PATH="${cuda}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 done
@@ -114,14 +112,13 @@ for c in "${CASES[@]}"; do
   fi
   echo "=== ${name}${envs:+ (${envs})}"
   t0=$(date +%s)
-  # shellcheck disable=SC2086  # envs is empty or one KEY=VALUE word
+  # shellcheck disable=SC2086
   env ${envs} "${exe}" --bench --json "${RESULTS}/${name}.json" > "${RESULTS}/${name}.txt" 2>&1
   rc=$?
   secs=$(( $(date +%s) - t0 ))
   echo "    rc=${rc} ${secs}s"
   records+=("${name}|${rc}|${secs}")
   [[ ${rc} -eq 0 ]] || status=1
-  # Let the GPU and CPU clocks settle between cases.
   sleep 5
 done
 

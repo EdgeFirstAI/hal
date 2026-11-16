@@ -1,6 +1,5 @@
 /* Links libedgefirst_tensor and exercises every exported accessor through
- * the opaque handle — the C-side proof that the header's declarations, the
- * exported symbols, and the behavior agree. */
+ * the opaque handle. */
 #include <edgefirst/tensor.h>
 #include <assert.h>
 #include <string.h>
@@ -43,7 +42,7 @@ int main(void) {
     assert(ef_tensor_view_origin(t, &origin) == 0);
     assert(origin.has_origin == 0);
 
-    /* Null-safety: documented benign results, not crashes. */
+    /* NULL handles return benign results. */
     assert(ef_tensor_ndim(NULL) == 0);
     assert(ef_tensor_colorimetry(NULL) == 0);
     assert(ef_tensor_contiguity(NULL) == EF_CONTIGUITY_UNKNOWN);

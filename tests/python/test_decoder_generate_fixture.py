@@ -1,8 +1,6 @@
 """Tests for scripts/decoder_generate_fixture.py.
 
-Generator-internal pure functions are tested with synthetic inputs;
-end-to-end generation with a real model lives in CI on dev hosts that
-have the TFLite blobs.
+Generator-internal pure functions are tested with synthetic inputs.
 """
 
 import importlib
@@ -390,7 +388,7 @@ def test_patch_schema_dshape_synthesizes_missing_entries():
                 "name": "protos",
                 "type": "protos",
                 "shape": [1, 160, 160, 32],
-                # no children, no dshape — must be untouched
+                # no children, no dshape
             },
         ]
     }
@@ -425,7 +423,6 @@ def test_patch_schema_dshape_is_idempotent():
         ]
     }
     patched = mod._patch_schema_dshape(pre_patched)
-    # Should be unchanged.
     assert patched["outputs"][0]["dshape"] == pre_patched["outputs"][0]["dshape"]
 
 
@@ -442,7 +439,6 @@ def test_patch_schema_dshape_does_not_mutate_input():
         ]
     }
     patched = mod._patch_schema_dshape(raw)
-    # Original should not have gained dshape.
     assert "dshape" not in raw["outputs"][0]
     assert "dshape" in patched["outputs"][0]
 
@@ -450,8 +446,6 @@ def test_patch_schema_dshape_does_not_mutate_input():
 def test_assemble_and_write_safetensors_round_trips(tmp_path):
     import numpy as np
 
-    # safetensors is an optional test dependency (installed in CI); skip cleanly
-    # when it is absent so a local `make test` does not hard-fail.
     safetensors = pytest.importorskip("safetensors")
 
     mod = _import_generator()
@@ -521,7 +515,7 @@ def test_build_stage_intermediates_includes_protos():
 
     mod = _import_generator()
     layout = _synthetic_layout_three_levels()
-    # Tiny spatial dims so DFL intermediates stay cheap.
+    # Tiny spatial dims.
     layout.fpn_levels = [
         {
             "stride": 8.0,

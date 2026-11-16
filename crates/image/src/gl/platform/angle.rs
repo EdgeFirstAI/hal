@@ -4,29 +4,17 @@
 //! macOS and iOS implementation of [`GlPlatform`]: ANGLE (GLES→Metal)
 //! display bring-up and IOSurface buffer import.
 //!
-//! Owns the **process-global** shared ANGLE display ([`SharedAngleDisplay`]
-//! / [`shared_display`]) — `eglTerminate` is ref-counted but never safely
-//! terminable mid-process (ANGLE's Metal device is a per-process
-//! singleton), exactly the reason Linux keeps a `SharedEglDisplay` in
-//! `context.rs`. Both the legacy `MacosGlProcessor` (shared-context model,
-//! deleted at the end of the convergence) and the per-processor
-//! [`AngleDisplay`] below initialize through this one entry point.
+//! Owns the process-global shared ANGLE display ([`SharedAngleDisplay`] /
+//! [`shared_display`]).
 //!
-//! [`AngleDisplay`] is the convergence-model display: each processor's
-//! dedicated worker thread creates ITS OWN EGL context (plus a small dummy
-//! pbuffer so the context can be current without a convert in flight),
-//! makes it current ONCE, and holds it for the thread's life — the same
-//! shape as the Linux `GlContext`. Contexts on one shared ANGLE display
-//! scale across threads (A0 spike: render S(4)≈5.1 at 720p, per-convert
-//! `eglBindTexImage`/`eglReleaseTexImage` S(4)≈3.5 — ANGLE's EGL
-//! entry-point lock is not a practical serializer; cold imports serialize
-//! at ~0.7 µs each on the cache-miss path only).
+//! [`AngleDisplay`] is the per-processor display: each processor's
+//! dedicated worker thread creates its own EGL context (plus a small dummy
+//! pbuffer), makes it current once, and holds it for the thread's life.
 //!
 //! Buffer import wraps the tensor's IOSurface as an EGL pbuffer via
 //! `EGL_ANGLE_iosurface_client_buffer` (see `iosurface_import.rs` for the
 //! attribute assembly). The owned [`IoSurfacePbuffer`] destroys the
-//! pbuffer on drop; the [`super::super::cache::ImportCache`] holds these
-//! exactly like Linux `EglImage`s.
+//! pbuffer on drop; the [`super::super::cache::ImportCache`] holds these.
 
 use super::super::iosurface_import;
 use super::super::Egl;
@@ -41,7 +29,7 @@ use std::sync::OnceLock;
 
 // ---------------------------------------------------------------------------
 // EGL constants shared by the display bring-up and per-processor context
-// creation (from EGL/eglext headers; edgefirst_egl does not export these).
+// creation (from EGL/eglext headers).
 // ---------------------------------------------------------------------------
 
 const EGL_OPENGL_ES3_BIT: i32 = 0x0040;
@@ -56,12 +44,8 @@ pub(in crate::opengl_headless) const EGL_CONTEXT_CLIENT_VERSION: i32 = 0x3098;
 const EGL_BACK_BUFFER: i32 = 0x3084;
 
 // ---------------------------------------------------------------------------
-// One-shot GL function-pointer table.
-//
-// `edgefirst_gl::load_with` populates global function pointers — exists once per
-// process. We load via EGL's `eglGetProcAddress` so the symbols come
-// from ANGLE's libGLESv2.dylib. The pointers are display-global, so a
-// single load serves every context created on the shared display.
+// One-shot GL function-pointer table, loaded through EGL's
+// `eglGetProcAddress` once per process.
 // ---------------------------------------------------------------------------
 
 static GL_LOADED: OnceLock<()> = OnceLock::new();
@@ -81,20 +65,15 @@ fn load_gl_once(egl: &Egl) {
 
 /// All process-global EGL state. Use [`shared_display`] to access.
 pub(in crate::opengl_headless) struct SharedAngleDisplay {
-    /// Static-lifetime EGL handle. The actual ANGLE libEGL.dylib is
-    /// leaked at first dlopen and never closed.
+    /// Static-lifetime EGL handle. The ANGLE libEGL.dylib is leaked at
+    /// first dlopen and never closed.
     pub(in crate::opengl_headless) egl: Egl,
     pub(in crate::opengl_headless) display: egl::Display,
     pub(in crate::opengl_headless) config: egl::Config,
-    /// The legacy shared context used by `MacosGlProcessor` (every
-    /// instance serializes on it behind that module's `GL_MUTEX`).
-    /// The convergence model does not use it — each [`AngleDisplay`]
-    /// creates a private context — and it is deleted together with
-    /// `MacosGlProcessor` at the end of the convergence.
+    /// The shared display's own context, made current at init to load GL
+    /// and probe the extensions.
     pub(in crate::opengl_headless) context: egl::Context,
-    /// Tiny scratch surface kept alive so the shared context can be made
-    /// current outside of a `convert` call (e.g. for shader compile,
-    /// resource allocation, or `Drop`-time cleanup).
+    /// Tiny scratch surface the shared context is made current on.
     pub(in crate::opengl_headless) dummy_pbuffer: egl::Surface,
     /// `GL_EXT_color_buffer_float` is exposed by this ANGLE/Metal
     /// configuration. Gates F32 destination tensors on the IOSurface
@@ -106,19 +85,17 @@ pub(in crate::opengl_headless) struct SharedAngleDisplay {
     pub(in crate::opengl_headless) supports_f16_color: bool,
 }
 
-// SAFETY: every member is either a leak'd static, an EGL handle (which
-// the ANGLE driver synchronises internally), or a pointer to driver-
-// owned state. Display-level EGL entry points are internally
-// synchronized by ANGLE; the legacy shared `context` is only made
-// current under `macos_processor`'s GL_MUTEX.
+// SAFETY: every member is a leaked static, an EGL handle, or a pointer to
+// driver-owned state. ANGLE synchronizes display-level EGL entry points
+// internally.
 unsafe impl Send for SharedAngleDisplay {}
 unsafe impl Sync for SharedAngleDisplay {}
 
 static SHARED_DISPLAY: OnceLock<std::result::Result<SharedAngleDisplay, String>> = OnceLock::new();
 
 /// Acquire a reference to the process-global ANGLE display, initialising
-/// it on first call. Subsequent calls return the same handle. The error
-/// case is cached too — once ANGLE fails to load we don't keep retrying.
+/// it on first call. Subsequent calls return the same handle or the same
+/// cached error.
 pub(in crate::opengl_headless) fn shared_display() -> Result<&'static SharedAngleDisplay> {
     SHARED_DISPLAY
         .get_or_init(|| init_shared_display().map_err(|e| e.to_string()))
@@ -157,13 +134,6 @@ fn init_shared_display() -> Result<SharedAngleDisplay> {
 
     // 3. Choose an EGL config that supports GLES 3 + PBUFFER +
     //    EGL_BIND_TO_TEXTURE_TARGET_ANGLE = EGL_TEXTURE_2D.
-    //
-    // 8-bit RGBA color sizes are explicit but the config doesn't
-    // restrict half-float IOSurface texture binding — ANGLE's
-    // `EGL_TEXTURE_INTERNAL_FORMAT_ANGLE` overrides at pbuffer
-    // creation time. Verified by reading ANGLE's
-    // `EGLIOSurfaceClientBufferTest::RenderToRGBA16FIOSurface` which
-    // also binds u8 surfaces in the same context.
     let cfg_attribs = [
         EGL_RENDERABLE_TYPE,
         EGL_OPENGL_ES3_BIT,
@@ -188,7 +158,7 @@ fn init_shared_display() -> Result<SharedAngleDisplay> {
             Error::NotSupported("no EGL config with GLES3+PBUFFER+TEXTURE_2D bind".into())
         })?;
 
-    // 4. GLES3 context (the legacy shared one — see the field docs).
+    // 4. GLES3 context.
     let ctx_attribs = [EGL_CONTEXT_CLIENT_VERSION, 3, egl::NONE];
     let context = egl
         .create_context(display, config, None, &ctx_attribs)
@@ -199,15 +169,14 @@ fn init_shared_display() -> Result<SharedAngleDisplay> {
     let dummy_pbuffer = egl
         .create_pbuffer_surface(display, config, &dummy_attribs)
         .map_err(|e| {
-            // Clean up the context we just created before bailing.
+            // Destroy the context created above.
             let _ = egl.destroy_context(display, context);
             Error::Io(std::io::Error::other(format!(
                 "eglCreatePbufferSurface(dummy): {e:?}"
             )))
         })?;
 
-    // 6. Load GL function pointers via the now-initialised display.
-    //    Make-current is required for some drivers to expose GLES symbols.
+    // 6. Make the context current and load the GL function pointers.
     if let Err(e) = egl.make_current(
         display,
         Some(dummy_pbuffer),
@@ -223,9 +192,7 @@ fn init_shared_display() -> Result<SharedAngleDisplay> {
     load_gl_once(&egl);
 
     // Probe the float-color-buffer extensions while the context is
-    // still current. ANGLE's Metal backend exposes both extensions on
-    // Apple Silicon + recent ANGLE bundles; on older configurations
-    // either or both may be missing — consumers fall back per dtype.
+    // current.
     let extensions = unsafe {
         let ptr = edgefirst_gl::gl::GetString(edgefirst_gl::gl::EXTENSIONS);
         if ptr.is_null() {
@@ -264,26 +231,22 @@ fn init_shared_display() -> Result<SharedAngleDisplay> {
 // Per-processor display: a private context on the shared ANGLE display.
 // ---------------------------------------------------------------------------
 
-/// One processor's GL bring-up state: a PRIVATE EGL context (plus dummy
+/// One processor's GL bring-up state: a private EGL context (plus dummy
 /// pbuffer) on the process-global shared ANGLE display.
 ///
 /// Created on the processor's dedicated worker thread, made current there
-/// ONCE, and held current for the thread's life — the Linux `GlContext`
-/// model. NOT `Send`: the context is current on its creating thread and
-/// must be dropped there too (the dispatch wrapper guarantees both).
+/// once, and held current for the thread's life. Not `Send`: the context is
+/// current on its creating thread and must be dropped there.
 pub(in crate::opengl_headless) struct AngleDisplay {
     pub(in crate::opengl_headless) shared: &'static SharedAngleDisplay,
     context: egl::Context,
     dummy_pbuffer: egl::Surface,
-    /// Duck-typed counterparts of the two `GlContext` members the
-    /// portable engine reads. IOSurface is the only transfer backend on
-    /// macOS; ANGLE's Metal backend exposes GLES 3.0 (no 3.1 compute).
+    /// Counterparts of the two `GlContext` members the portable engine
+    /// reads: the IOSurface transfer backend, and no GLES 3.1 compute.
     pub(in crate::opengl_headless) transfer_backend: super::super::TransferBackend,
     pub(in crate::opengl_headless) has_compute: bool,
     /// Texture attachments made via `eglBindTexImage` since the last
-    /// `GlPlatform::end_gpu_pass` — released there, after the engine's
-    /// sync point (rendering must complete before release per the EGL
-    /// pbuffer contract). Single-threaded access (the owning worker).
+    /// `GlPlatform::end_gpu_pass`, which releases them.
     active_binds: std::cell::RefCell<Vec<egl::Surface>>,
 }
 
@@ -291,13 +254,6 @@ impl AngleDisplay {
     /// Assemble the capability surface for this display (see
     /// `PlatformCaps`): IOSurface transfer and float render support from the
     /// shared display's extension probes.
-    ///
-    /// **Not the live capability surface** — the worker reads
-    /// `GLProcessorST::platform_caps`, which is the single implementation on
-    /// every platform. Kept as the display-level view; note in particular
-    /// that the serialization policy is decided there, by
-    /// `requires_full_serialization`, and is `Full` on ANGLE. This method's
-    /// `serialize_gl` is not consulted.
     #[allow(dead_code)]
     pub(in crate::opengl_headless) fn platform_caps(&self) -> super::PlatformCaps {
         super::PlatformCaps {
@@ -316,8 +272,7 @@ impl AngleDisplay {
 
 impl Drop for AngleDisplay {
     fn drop(&mut self) {
-        // Runs on the owning worker thread (the only place the wrapper
-        // drops it): release the context from this thread, then destroy.
+        // Release the context from this thread, then destroy it.
         let d = self.shared;
         let _ = d.egl.make_current(d.display, None, None, None);
         let _ = d.egl.destroy_surface(d.display, self.dummy_pbuffer);
@@ -325,10 +280,8 @@ impl Drop for AngleDisplay {
     }
 }
 
-/// An owned IOSurface→EGL-pbuffer import. Dropping destroys the pbuffer
-/// (display-level op; ANGLE synchronizes internally). Cached in
-/// `ImportCache<IoSurfacePbuffer>` keyed by `BufferImportKey`, exactly
-/// like Linux `EglImage`s.
+/// An owned IOSurface→EGL-pbuffer import. Dropping destroys the pbuffer.
+/// Cached in `ImportCache<IoSurfacePbuffer>` keyed by `BufferImportKey`.
 pub(in crate::opengl_headless) struct IoSurfacePbuffer {
     shared: &'static SharedAngleDisplay,
     pub(in crate::opengl_headless) surface: egl::Surface,
@@ -351,19 +304,8 @@ impl GlPlatform for AngleClientBuffer {
     type Import = IoSurfacePbuffer;
     type ImportHandle = egl::Surface;
 
-    /// `EGL_ANGLE_iosurface_client_buffer` binds the whole surface from its
-    /// origin: the pbuffer is described by plane, width and height, and there
-    /// is no byte-offset attribute. A destination that carries a plane offset
-    /// but no `view_origin` -- one rebuilt from a descriptor, since a
-    /// `TensorDesc` transports the offset and not the origin -- therefore has
-    /// nothing to place it by, and attaching it renders the tile at the
-    /// surface's top-left instead of the window that was asked for.
-    ///
-    /// Declining sends the engine down the mapped-texture path, whose
-    /// readback writes through `map()` at the offset. The same rule as
-    /// `AngleD3d11`, for the same reason, and pinned by case E of
-    /// `reconstructed_view_convert.rs`, which fails with the tile at the
-    /// canvas's origin without this.
+    /// A destination that carries a plane offset and no `view_origin` is
+    /// not placed by a zero-copy import.
     fn dst_import_places<T>(img: &Tensor<T>) -> bool
     where
         T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync + edgefirst_tensor::Element,
@@ -371,20 +313,16 @@ impl GlPlatform for AngleClientBuffer {
         super::unplaced_destination(img).is_none()
     }
 
-    // eglBindTexImage attachments are released at end_gpu_pass — the
-    // engine's binding-skip cache must stay cold on macOS.
+    // eglBindTexImage attachments are released at end_gpu_pass.
     const PERSISTENT_TEX_BINDINGS: bool = false;
 
-    /// As Linux and Android: the planar F16 zero-copy render only. The
-    /// packed-surface import here reconstructs a three-plane stack, so the
-    /// wider set would need its own on-target run before it is claimed.
+    /// The planar F16 zero-copy render only.
     const ZERO_COPY_FLOAT: super::super::float_dispatch::ZeroCopyFloatSet =
         super::super::float_dispatch::ZeroCopyFloatSet::PlanarF16;
     const EXTERNAL_OES: bool = false;
 
     fn load_gl_once(_display: &AngleDisplay) {
-        // Loaded once at shared-display init (`load_gl_once` above runs
-        // inside `init_shared_display`, before any context exists).
+        // Loaded once at shared-display init.
     }
 
     fn import_handle(import: &IoSurfacePbuffer) -> egl::Surface {
@@ -392,8 +330,8 @@ impl GlPlatform for AngleClientBuffer {
     }
 
     fn import_extent(_import: &IoSurfacePbuffer) -> Option<(u32, u32)> {
-        // The pbuffer is created with explicit EGL_WIDTH/EGL_HEIGHT, so it is
-        // the tensor's logical image however large the IOSurface is.
+        // The pbuffer is created with explicit EGL_WIDTH/EGL_HEIGHT: the
+        // import is the tensor's logical image.
         None
     }
 
@@ -411,8 +349,6 @@ impl GlPlatform for AngleClientBuffer {
         _display: &AngleDisplay,
         _handle: egl::Surface,
     ) -> Result<()> {
-        // Unreachable in practice: PlatformCaps::external_oes is false on
-        // macOS, so path selection never picks the external-sampler path.
         Err(Error::NotSupported(
             "GL_TEXTURE_EXTERNAL_OES is not available on ANGLE/Metal".into(),
         ))
@@ -430,8 +366,6 @@ impl GlPlatform for AngleClientBuffer {
     }
 
     fn native_fence_sync(_display: &AngleDisplay) -> bool {
-        // ANGLE's Metal backend has no EGL_ANDROID_native_fence_sync;
-        // CoreML consumers rely on convert() returning ⇒ GPU done.
         false
     }
 
@@ -447,24 +381,19 @@ impl GlPlatform for AngleClientBuffer {
         _dst: &mut TensorDyn,
         _submit: bool,
     ) -> Option<u64> {
-        // No device fence on ANGLE/Metal — convert() returning means the
-        // GPU work is complete.
         None
     }
 
     fn submit_recorded(_display: &AngleDisplay) {
-        // Nothing is ever queued unsubmitted: there is no device fence.
+        // No device fence: nothing to submit.
     }
 
     fn begin_gpu_pass(_display: &AngleDisplay) {
-        // ANGLE/Metal keeps per-context command state; contexts current on
-        // different threads do not need re-syncing (the D3D11 leaf does).
+        // No-op on ANGLE/Metal.
     }
 
     fn end_gpu_pass(display: &AngleDisplay) {
-        // Called after the engine's sync point: every recorded pbuffer
-        // attachment can now be released (EGL requires release before the
-        // pbuffer may be rebound elsewhere or destroyed).
+        // Release every pbuffer attachment recorded during the pass.
         for surface in display.active_binds.borrow_mut().drain(..) {
             let _ = display.shared.egl.release_tex_image(
                 display.shared.display,
@@ -487,11 +416,9 @@ impl GlPlatform for AngleClientBuffer {
         let surface_ref = img.iosurface_ref().ok_or_else(|| {
             Error::NotSupported("packed import: tensor is not IOSurface-backed".into())
         })?;
-        // The caller passes PACKED surface dims. ImageLayout speaks
-        // logical dims, so map each packed format onto the layout arm
-        // that produces exactly this surface: RGBA8 maps 1:1; the
-        // RGBA16F planar packing is (W/4, 3·H) — reconstruct the
-        // logical (W, H) the (PlanarRgb, F16) arm derives it from.
+        // Map the packed surface dims back onto the logical image layout:
+        // RGBA8 maps 1:1; the RGBA16F planar packing (W/4, 3·H) maps to the
+        // logical (W, H) of a (PlanarRgb, F16) image.
         let (pf, dt, w, h) = match fmt {
             super::PackedImportFormat::Rgba8888 => (PixelFormat::Rgba, DType::U8, width, height),
             super::PackedImportFormat::Rgba16161616F => {
@@ -531,8 +458,7 @@ impl GlPlatform for AngleClientBuffer {
         }
         let shared = shared_display()?;
         let ctx_attribs = [EGL_CONTEXT_CLIENT_VERSION, 3, egl::NONE];
-        // No share-list: each processor owns its programs/VAOs/FBOs, the
-        // same isolation Linux contexts have.
+        // No share-list: each processor owns its programs, VAOs and FBOs.
         let context = shared
             .egl
             .create_context(shared.display, shared.config, None, &ctx_attribs)
@@ -551,9 +477,8 @@ impl GlPlatform for AngleClientBuffer {
                     "eglCreatePbufferSurface (per-processor dummy): {e:?}"
                 )))
             })?;
-        // Made current ONCE on the calling (worker) thread and held for
-        // the thread's life — per-message make-current was the legacy
-        // shared-context model's cost, not this one's.
+        // Made current once on the calling thread and held for the thread's
+        // life.
         if let Err(e) = shared.egl.make_current(
             shared.display,
             Some(dummy_pbuffer),
@@ -585,9 +510,6 @@ impl GlPlatform for AngleClientBuffer {
         let surface_ref = img.iosurface_ref().ok_or_else(|| {
             Error::NotSupported("GL convert: tensor is not IOSurface-backed".into())
         })?;
-        // Semi-planar YUV has no multi-plane pbuffer binding on ANGLE —
-        // the engine selects the ShaderR8 strategy (import_buffer_nv_r8)
-        // for NV sources on this platform.
         if matches!(
             fmt,
             PixelFormat::Nv12 | PixelFormat::Nv16 | PixelFormat::Nv24
@@ -596,22 +518,11 @@ impl GlPlatform for AngleClientBuffer {
                 "ANGLE IOSurface import has no multi-plane NV binding — use the R8 path".into(),
             ));
         }
-        // `EGL_ANGLE_iosurface_client_buffer` binds plane 0 from the
-        // surface's origin: the pbuffer is described by width and height
-        // only, with no byte-offset attribute. A *source* whose pixels start
-        // elsewhere -- a `view()`, or a tensor carrying a plane offset --
-        // cannot be attached, and is refused so the engine uploads it through
-        // `map()`, which honours the offset. Without this a fresh `view()`
-        // converted the parent's origin on the zero-copy path, exactly as it
-        // did on Windows before #164. The destination side is handled by
-        // `dst_import_places`. Issue #161's Apple half at the convert
-        // level; pinned by case A of `reconstructed_view_convert.rs`.
+        // A source whose pixels start at a plane offset is refused.
         if !for_dst {
             super::refuse_offset_source(img, "source", "EGL_ANGLE_iosurface_client_buffer")?;
         }
-        // A destination view()/batch() tile imports its PARENT surface
-        // (the per-tile offset is viewport state, mirroring the Linux
-        // dst-view collapse in DmaImportAttrs/BufferImportKey).
+        // A destination view()/batch() tile imports its parent surface.
         let (w, h) = match (for_dst, img.view_origin()) {
             (true, Some(vo)) => (vo.parent_width, vo.parent_height),
             _ => (
@@ -622,8 +533,7 @@ impl GlPlatform for AngleClientBuffer {
             ),
         };
         let shared = display.shared;
-        // SAFETY: surface_ref borrowed from a live tensor; the import
-        // cache entry's `guard` ties the pbuffer's lifetime to it.
+        // SAFETY: `surface_ref` is borrowed from a live tensor.
         let surface = unsafe {
             iosurface_import::create_iosurface_pbuffer(
                 &shared.egl,
@@ -648,10 +558,8 @@ impl GlPlatform for AngleClientBuffer {
         let surface_ref = img.iosurface_ref().ok_or_else(|| {
             Error::NotSupported("GL convert: NV source is not IOSurface-backed".into())
         })?;
-        // Bind the WHOLE physical IOSurface as one R8 (`L008`) texture so
-        // a single cached pbuffer serves every frame of a reused pool
-        // surface; the shader addresses Y/UV texels within it (same
-        // rationale as the legacy NV binding in `macos_processor`).
+        // Bind the whole physical IOSurface as one R8 (`L008`) texture; the
+        // shader addresses Y/UV texels within it.
         let (pw, ph) = img.iosurface_physical_dims().ok_or_else(|| {
             Error::NotSupported("GL convert: NV source has no IOSurface physical dims".into())
         })?;
@@ -679,15 +587,11 @@ mod tests {
     use super::*;
     use std::time::Instant;
 
-    /// Per-processor context bring-up latency (PR-A A4 gate: each
-    /// processor now creates its own context — document the cost,
-    /// budget <50 ms each). Ignored: needs ANGLE + a GPU; run on demand:
-    /// `cargo test -p edgefirst-image --release --lib angle::tests -- --ignored --nocapture`
+    /// Per-processor context bring-up takes under 50 ms each.
     #[test]
     #[ignore = "needs ANGLE + Apple GPU; run on demand"]
     fn per_processor_context_bring_up_latency() {
-        // First call pays shared-display init (dlopen + eglInitialize);
-        // measure it separately from the steady per-processor cost.
+        // The first call also pays shared-display init; it is timed separately.
         let t0 = Instant::now();
         let first = AngleClientBuffer::init_display(None).expect("first display");
         let first_ms = t0.elapsed().as_secs_f64() * 1e3;

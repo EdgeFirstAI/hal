@@ -27,10 +27,8 @@ const ELEMENTWISE: &[&str] = &[
 /// Fixtures whose `rhs` is one element, broadcast over `lhs`.
 const SCALAR: &[&str] = &["mul_i8_scalar", "mul_i8_scalar_odd"];
 
-/// The kernels a fixture's resolver ran. The fixtures come from LiteRT's x86_64 wheel, which
-/// defines `USE_NEON` (SSE4.1 through `NEON_2_SSE`), so its optimized `ADD` and `MUL` are the
-/// NEON-block arithmetic of an aarch64 build (`NeonGemmlowp`, which `NeonRuy` equals for these
-/// ops); the reference resolver runs the scalar code.
+/// The kernels a fixture's resolver ran: `NeonGemmlowp` for the optimized resolver, `Reference`
+/// for the reference one.
 fn kernels(g: &Graph) -> TfliteKernels {
     match g.meta("kernels") {
         "optimized" => TfliteKernels::NeonGemmlowp,
@@ -118,8 +116,7 @@ fn fixtures_load() {
     }
 }
 
-/// Every tier gives the fixture's bytes with the fixture's kernels; without `USE_NEON` the
-/// optimized resolver would equal the reference one.
+/// Every tier gives the fixture's bytes with the fixture's kernels.
 #[test]
 fn every_tier_matches_tflite_bit_exact() {
     for name in ELEMENTWISE.iter().chain(SCALAR) {
@@ -148,9 +145,7 @@ fn every_tier_matches_tflite_bit_exact() {
     }
 }
 
-/// These fixtures tell TFLite's NEON-block arithmetic from its scalar code, so the variant
-/// that matches them is a finding, not a coincidence: `ADD` over every input pair (the two
-/// kernels differ on one) and `MUL` with a multiplier above one (on about 4% of elements).
+/// The other kernels variant does not reproduce these fixtures.
 #[test]
 fn fixtures_distinguish_neon_blocks_from_the_scalar_code() {
     for name in [
@@ -372,8 +367,7 @@ fn run_rejects_aliasing_output_rows() {
     }
 }
 
-/// Transposed inputs, a padded output, a broadcast row and a broadcast column give the dense
-/// result on every tier, and the padding is never written.
+/// Transposed, padded and broadcast views give the dense result on every tier.
 #[test]
 fn strided_views_match_contiguous() {
     let (rows, cols) = (7usize, 37usize);
@@ -472,8 +466,7 @@ fn strided_views_match_contiguous() {
                         None,
                     )
                     .unwrap();
-                    // Elementwise blocks follow the flat output index, so a broadcast operand
-                    // equals its dense expansion.
+                    // A broadcast operand equals its dense expansion.
                     assert_eq!(o, dense(&expanded), "{op:?} broadcast");
                 }
             }

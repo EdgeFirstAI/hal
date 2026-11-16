@@ -4,7 +4,7 @@
 /*!
 ## EdgeFirst HAL - Decoders
 This crate provides decoding utilities for YOLOobject detection and segmentation models, and ModelPack detection and segmentation models.
-It supports both floating-point and quantized model outputs, allowing for efficient processing on edge devices. The crate includes functions
+It supports both floating-point and quantized model outputs. The crate includes functions
 for efficient post-processing model outputs into usable detection boxes and segmentation masks, as well as utilities for dequantizing model outputs..
 
 For general usage, use the `Decoder` struct which provides functions for decoding various model outputs based on the model configuration.
@@ -52,12 +52,11 @@ The primary components of this crate are:
 - `yolo` module: Contains functions specific to decoding YOLO model outputs.
 - `modelpack` module: Contains functions specific to decoding ModelPack model outputs.
 
-The `Decoder` supports both floating-point and quantized model outputs, allowing for efficient processing on edge devices.
+The `Decoder` supports both floating-point and quantized model outputs.
 It also supports mixed integer types for quantized outputs, such as when one output tensor is int8 and another is uint8.
 When decoding quantized outputs, the appropriate quantization parameters must be provided for each output tensor.
 If the integer types used in the model output is not supported by the decoder, the user can manually dequantize the model outputs using
-the `dequantize` functions provided in this crate, and then use the floating-point decoding functions. However, it is recommended
-to not dequantize the model outputs manually before passing them to the decoder, as the quantized decoder functions are optimized for performance.
+the `dequantize` functions provided in this crate, and then use the floating-point decoding functions.
 
 The `yolo` and `modelpack` modules provide lower-level functions for decoding model outputs directly,
 which can be used if the model type and output formats are known in advance.
@@ -90,15 +89,10 @@ mod instance_mask;
 mod neon_dispatch;
 pub use decoder::*;
 
-// The detection vocabulary lives in edgefirst-tensor so edgefirst-image can
-// render from it without depending on this crate. Re-exported here so the
-// decoder's own modules keep resolving `crate::Segmentation`.
+// The detection vocabulary, re-exported from edgefirst-tensor.
 pub use edgefirst_tensor::{BoundingBox, DetectBox, ProtoData, ProtoLayout, Segmentation};
 
-// TilePlacement is the contract between edgefirst-image (producer) and this
-// crate (consumer); it lives in edgefirst-decoder-abi so image can name it
-// without linking decoder. Re-exported here so the decoder's own modules
-// keep resolving `crate::tiling::TilePlacement`.
+// `TilePlacement`, re-exported from edgefirst-decoder-abi.
 pub use edgefirst_decoder_abi::TilePlacement;
 
 pub use configs::{DecoderVersion, Nms};
@@ -112,12 +106,6 @@ use crate::{
 
 /// Materialise an ndarray mask into the [`TensorDyn`] that
 /// [`Segmentation`] carries.
-///
-/// The decoder computes mask values with ndarray and converts once, here at
-/// the boundary. `Segmentation` holds a `TensorDyn` rather than an
-/// `Array3<u8>` so that `edgefirst-tensor` can own the type without taking an
-/// ndarray dependency, which is what lets `edgefirst-image` render masks
-/// without depending on this crate.
 fn mask_to_tensor(mask: ndarray::ArrayView3<'_, u8>) -> DecoderResult<edgefirst_tensor::TensorDyn> {
     edgefirst_tensor::Tensor::from_arrayview3(mask)
         .map(edgefirst_tensor::TensorDyn::from)
@@ -125,12 +113,6 @@ fn mask_to_tensor(mask: ndarray::ArrayView3<'_, u8>) -> DecoderResult<edgefirst_
 }
 
 /// Float-epsilon comparison for `DetectBox`, as a test-only extension trait.
-///
-/// This is a TEST ASSERTION helper -- all 98 call sites are in this crate's
-/// test modules and there are none in production code -- so it does not belong
-/// on `edgefirst-tensor`'s public API, where the type move briefly put it. An
-/// extension trait keeps every call site written as
-/// `a.equal_within_delta(b, eps)` while confining the method to tests.
 #[cfg(test)]
 pub(crate) trait DetectBoxTestExt {
     fn equal_within_delta(&self, rhs: &DetectBox, eps: f32) -> bool;
@@ -278,9 +260,6 @@ impl Quantization {
     }
 
     /// Returns a quantization that's a no-op: scale=1.0, zero_point=0.
-    ///
-    /// Used by the per-scale pipeline as a sentinel for float-to-float
-    /// passthrough cells where no affine transform is required.
     /// # Examples
     /// ```
     /// # use edgefirst_decoder::Quantization;
@@ -400,11 +379,7 @@ pub fn dequant_detect_box<SCORE: PrimInt + AsPrimitive<f32>>(
 }
 /// A detection box with a f32 bbox and quantized score
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct DetectBoxQuantized<
-    // BOX: Signed + PrimInt + AsPrimitive<f32>,
-    SCORE: PrimInt + AsPrimitive<f32>,
-> {
-    // pub bbox: BoundingBoxQuantized<BOX>,
+pub struct DetectBoxQuantized<SCORE: PrimInt + AsPrimitive<f32>> {
     pub bbox: BoundingBox,
     /// model-specific score for this detection, higher implies more
     /// confidence.
@@ -529,8 +504,7 @@ pub(crate) fn dequantize_cpu_on<T: AsPrimitive<F>, F: Float + 'static>(
 }
 
 /// Dequantizes a slice from quantized values to float values using the given
-/// quantization parameters, using chunked processing. This is around 5% faster
-/// than `dequantize_cpu` for large slices.
+/// quantization parameters, using chunked processing.
 ///
 /// An unavailable or unknown tier forced by `EDGEFIRST_DECODER_FORCE_KERNEL` runs the scalar
 /// code, which gives the same result.
@@ -683,8 +657,7 @@ mod decoder_tests {
             );
             let shape = m_i8.segmentation.shape().to_vec();
             assert_eq!(shape, m_f32.segmentation.shape());
-            // `Segmentation` carries a TensorDyn, so compare the mapped bytes
-            // rather than going through ndarray element ops.
+            // Compare the mapped bytes of the two masks.
             let (t_i8, t_f32) = (
                 m_i8.segmentation.as_u8().expect("mask must be U8"),
                 m_f32.segmentation.as_u8().expect("mask must be U8"),
@@ -717,8 +690,7 @@ mod decoder_tests {
         }
     }
 
-    /// Rebuild an owned `Array3<u8>` from a `Segmentation`'s `TensorDyn`, for
-    /// the ndarray-shaped test helpers that still want a view.
+    /// Rebuild an owned `Array3<u8>` from a `Segmentation`'s `TensorDyn`.
     fn seg_view(s: &Segmentation) -> ndarray::Array3<u8> {
         let t = s.segmentation.as_u8().expect("mask must be U8");
         let m = t.map_read().expect("map mask");
@@ -1070,11 +1042,8 @@ mod decoder_tests {
             )
             .unwrap();
 
-        // not expected for float decoder to have same values as quantized decoder, as
-        // float decoder ensures the data fills 0-255, quantized decoder uses whatever
-        // the model output. Thus the float output is the same as the quantized output
-        // but scaled differently. However, it is expected that the mask after argmax
-        // will be the same.
+        // The float and quantized outputs scale differently; the masks are
+        // compared after argmax.
         compare_outputs((&[], &output_boxes), (&[], &[]));
         let mask0 = segmentation_to_mask(seg_view(&mask[0]).view()).unwrap();
         let mask1 = segmentation_to_mask(seg_view(&output_masks[0]).view()).unwrap();
@@ -1281,11 +1250,8 @@ mod decoder_tests {
             )
             .unwrap();
 
-        // not expected for float segmentation decoder to have same values as quantized
-        // segmentation decoder, as float decoder ensures the data fills 0-255,
-        // quantized decoder uses whatever the model output. Thus the float
-        // output is the same as the quantized output but scaled differently.
-        // However, it is expected that the mask after argmax will be the same.
+        // The float and quantized outputs scale differently; the masks are
+        // compared after argmax.
         compare_outputs((&correct_boxes, &output_boxes), (&[], &[]));
         let mask0 = segmentation_to_mask(seg_view(&mask[0]).view()).unwrap();
         let mask1 = segmentation_to_mask(seg_view(&output_masks[0]).view()).unwrap();
@@ -1420,11 +1386,8 @@ mod decoder_tests {
             )
             .unwrap();
 
-        // not expected for float segmentation decoder to have same values as quantized
-        // segmentation decoder, as float decoder ensures the data fills 0-255,
-        // quantized decoder uses whatever the model output. Thus the float
-        // output is the same as the quantized output but scaled differently.
-        // However, it is expected that the mask after argmax will be the same.
+        // The float and quantized outputs scale differently; the masks are
+        // compared after argmax.
         compare_outputs((&correct_boxes, &output_boxes), (&[], &[]));
         let mask0 = segmentation_to_mask(seg_view(&mask[0]).view()).unwrap();
         let mask1 = segmentation_to_mask(seg_view(&output_masks[0]).view()).unwrap();
@@ -1435,7 +1398,7 @@ mod decoder_tests {
     #[test]
     fn test_dequant_chunked() {
         let mut out = load_yolov8s_det().into_raw_vec_and_offset().0;
-        out.push(123); // make sure to test non multiple of 16 length
+        out.push(123); // length not a multiple of 16
 
         let mut out_dequant = vec![0.0; 84 * 8400 + 1];
         let mut out_dequant_simd = vec![0.0; 84 * 8400 + 1];
@@ -1455,9 +1418,8 @@ mod decoder_tests {
     #[test]
     fn test_dequant_ground_truth() {
         // Formula: output = (input - zero_point) * scale
-        // Verify both dequantize_cpu and dequantize_cpu_chunked against hand-computed values.
 
-        // Case 1: scale=0.1, zero_point=-128 (from doc example)
+        // Case 1: scale=0.1, zero_point=-128
         let quant = Quantization::new(0.1, -128);
         let input: Vec<i8> = vec![0, 127, -128, 64];
         let mut output = vec![0.0f32; 4];
@@ -1631,7 +1593,7 @@ mod decoder_tests {
 
         for (b, m) in output_boxes.iter().zip(&output_masks) {
             // Mask region is the proto-grid-aligned crop (floor for min,
-            // ceil for max), so it encloses the post-NMS bbox (EDGEAI-1304).
+            // ceil for max) and encloses the post-NMS bbox.
             assert!(b.bbox.xmin >= m.xmin);
             assert!(b.bbox.ymin >= m.ymin);
             assert!(b.bbox.xmax <= m.xmax);
@@ -1648,7 +1610,7 @@ mod decoder_tests {
                 score: 0.91537374,
                 label: 23
             },
-            1.0 / 160.0, // wider range because mask will expand the box
+            1.0 / 160.0,
         ));
 
         assert!(output_boxes[1].equal_within_delta(
@@ -1662,7 +1624,7 @@ mod decoder_tests {
                 score: 0.91537374,
                 label: 23
             },
-            1.0 / 160.0, // wider range because mask will expand the box
+            1.0 / 160.0,
         ));
 
         let full_mask = edgefirst_bench::testdata::read("yolov8_mask_results.bin");
@@ -1679,15 +1641,8 @@ mod decoder_tests {
         );
     }
 
-    /// Regression test: config-driven path with physically-NCHW protos.
-    /// Simulates YOLOv8-seg ONNX outputs where the producer emits protos
-    /// as `(1, 32, 160, 160)` in CHW memory order — the caller declares
-    /// shape and dshape matching that physical order and HAL permutes to
-    /// canonical HWC via `swap_axes_if_needed`.
-    ///
-    /// This is the counterpart to the NHWC-producer case (TFLite /
-    /// Ara-2) where shape+dshape are `(1, 160, 160, 32)` +
-    /// `[batch, height, width, num_protos]` and no reordering is needed.
+    /// Config-driven decode with physically-NCHW protos `(1, 32, 160, 160)`
+    /// matches the direct decode with HWC protos.
     #[test]
     fn test_decoder_masks_nchw_protos() {
         let score_threshold = 0.45;
@@ -1702,7 +1657,7 @@ mod decoder_tests {
         let quant_protos = Quantization::new(0.02491161972284317, -117);
         let protos_f32_hwc = dequantize_ndarray::<_, _, f32>(protos_hwc.view(), quant_protos);
 
-        // ---- Reference: direct call with HWC protos (known working) ----
+        // ---- Reference: direct call with HWC protos ----
         let seg = dequantize_ndarray::<_, _, f32>(boxes_2d.view(), quant_boxes);
         let mut ref_boxes: Vec<_> = Vec::with_capacity(10);
         let mut ref_masks: Vec<_> = Vec::with_capacity(10);
@@ -1719,10 +1674,7 @@ mod decoder_tests {
         assert_eq!(ref_boxes.len(), 2);
 
         // ---- Config-driven path: NCHW protos declared in physical order ----
-        // Permute the HWC test data to CHW memory order — this is what an
-        // ONNX-style producer would emit into the tensor buffer.
-        // `to_owned` materialises a C-contiguous Array3<f32> with CHW
-        // strides, matching a producer that writes channels-outer.
+        // Permute the HWC test data to a C-contiguous CHW array.
         let protos_f32_chw_view = protos_f32_hwc.view().permuted_axes([2, 0, 1]); // [32, 160, 160]
         let protos_f32_chw = protos_f32_chw_view.to_owned();
         let protos_nchw = protos_f32_chw.insert_axis(ndarray::Axis(0)); // [1, 32, 160, 160]
@@ -1730,9 +1682,8 @@ mod decoder_tests {
         // Build boxes as [1, 116, 8400] f32
         let seg_3d = seg.insert_axis(ndarray::Axis(0)); // [1, 116, 8400]
 
-        // Declare shape and dshape in physical memory order (outermost
-        // first). `swap_axes_if_needed` uses dshape role lookup to
-        // permute the stride tuple into canonical HWC.
+        // Shape and dshape are declared in physical memory order (outermost
+        // first).
         let decoder = DecoderBuilder::default()
             .with_config_yolo_segdet(
                 configs::Detection {
@@ -1775,7 +1726,6 @@ mod decoder_tests {
             )
             .unwrap();
 
-        // Must produce the same number of detections
         assert_eq!(
             cfg_boxes.len(),
             ref_boxes.len(),
@@ -1784,7 +1734,6 @@ mod decoder_tests {
             ref_boxes.len()
         );
 
-        // Boxes must match
         for (i, (cb, rb)) in cfg_boxes.iter().zip(&ref_boxes).enumerate() {
             assert!(
                 cb.equal_within_delta(rb, 0.01),
@@ -1792,7 +1741,6 @@ mod decoder_tests {
             );
         }
 
-        // Masks must match pixel-for-pixel
         for (i, (cm, rm)) in cfg_masks.iter().zip(&ref_masks).enumerate() {
             let cm_arr = segmentation_to_mask(seg_view(cm).view()).unwrap();
             let rm_arr = segmentation_to_mask(seg_view(rm).view()).unwrap();
@@ -2415,14 +2363,7 @@ mod decoder_tests {
         assert_eq!(xyxy, [10.0_f32, 20.0, 20.0, 20.0]);
     }
 
-    /// Covers the slice conversion directly. It is the single implementation
-    /// per type now that the hand-inlined `ndarray_to_xyxy_float` overrides
-    /// are gone, so the float postprocessors reach it through the trait
-    /// default; while those overrides existed nothing reached it at all, which
-    /// is why its twenty mutants survived.
-    ///
-    /// Centre 10,20 with a 6x8 box gives a distinct value in all four slots,
-    /// so no swapped operator lands on the same answer.
+    /// Centre 10,20 with a 6x8 box converts to four distinct corner values.
     #[test]
     fn to_xyxy_float_converts_centre_and_size_to_corners() {
         let xyxy: [f32; 4] = XYWH::to_xyxy_float(&[10.0_f32, 20.0, 6.0, 8.0]);
@@ -2432,9 +2373,7 @@ mod decoder_tests {
         assert_eq!(xyxy, [7.0_f32, 16.0, 13.0, 24.0]);
     }
 
-    /// `arg_max` documents that the last index wins on ties, which is the
-    /// semantics the NEON row kernels mirror on aarch64. A strict `>` is what makes
-    /// the fold take the later index; `>=` would keep the earlier one.
+    /// `arg_max` returns the last index on a tie.
     #[test]
     fn arg_max_returns_the_last_index_on_a_tie() {
         let scores = array![1_i32, 5, 5, 2];
@@ -2472,7 +2411,7 @@ mod decoder_tests {
             },
         ];
 
-        // Class-aware NMS should keep both boxes (different classes, IoU ~0.47 >
+        // Class-aware NMS keeps both boxes (different classes, IoU ~0.47 >
         // threshold 0.3)
         let result = nms_class_aware_float(0.3, None, boxes.clone());
         assert_eq!(
@@ -2481,7 +2420,7 @@ mod decoder_tests {
             "Class-aware NMS should keep both boxes with different classes"
         );
 
-        // Now test with same class - should suppress one
+        // Same class: one is suppressed
         let same_class_boxes = vec![
             DetectBox {
                 bbox: BoundingBox {
@@ -2543,7 +2482,7 @@ mod decoder_tests {
             },
         ];
 
-        // Class-agnostic should suppress one (IoU ~0.47 > threshold 0.3)
+        // Class-agnostic suppresses one (IoU ~0.47 > threshold 0.3)
         let agnostic_result = nms_float(0.3, None, boxes.clone());
         assert_eq!(
             agnostic_result.len(),
@@ -2551,7 +2490,7 @@ mod decoder_tests {
             "Class-agnostic NMS should suppress overlapping boxes"
         );
 
-        // Class-aware should keep both (different classes)
+        // Class-aware keeps both (different classes)
         let aware_result = nms_class_aware_float(0.3, None, boxes);
         assert_eq!(
             aware_result.len(),
@@ -2588,7 +2527,7 @@ mod decoder_tests {
             },
         ];
 
-        // Should keep both (different classes)
+        // Keeps both (different classes)
         let result = nms_class_aware_int(0.5, None, boxes);
         assert_eq!(
             result.len(),
@@ -2599,14 +2538,12 @@ mod decoder_tests {
 
     #[test]
     fn test_nms_enum_default() {
-        // Test that Nms enum has the correct default
         let default_nms: configs::Nms = Default::default();
         assert_eq!(default_nms, configs::Nms::ClassAware);
     }
 
     #[test]
     fn test_decoder_nms_mode() {
-        // Test that decoder properly stores NMS mode
         let decoder = DecoderBuilder::default()
             .with_config_yolo_det(
                 configs::Detection {
@@ -2628,7 +2565,6 @@ mod decoder_tests {
 
     #[test]
     fn test_decoder_nms_bypass() {
-        // Test that decoder can be configured with nms=None (bypass)
         let decoder = DecoderBuilder::default()
             .with_config_yolo_det(
                 configs::Detection {
@@ -2650,7 +2586,6 @@ mod decoder_tests {
 
     #[test]
     fn test_decoder_normalized_boxes_true() {
-        // Test that normalized_boxes returns Some(true) when explicitly set
         let decoder = DecoderBuilder::default()
             .with_config_yolo_det(
                 configs::Detection {
@@ -2671,8 +2606,6 @@ mod decoder_tests {
 
     #[test]
     fn test_decoder_normalized_boxes_false() {
-        // Test that normalized_boxes returns Some(false) when config specifies
-        // unnormalized
         let decoder = DecoderBuilder::default()
             .with_config_yolo_det(
                 configs::Detection {
@@ -2693,7 +2626,6 @@ mod decoder_tests {
 
     #[test]
     fn test_decoder_normalized_boxes_unknown() {
-        // Test that normalized_boxes returns None when not specified in config
         let decoder = DecoderBuilder::default()
             .with_config_yolo_det(
                 configs::Detection {
@@ -2806,7 +2738,7 @@ mod decoder_tests {
                     ndarray::Array4::from_shape_vec((1, 160, 160, 32), raw_protos.to_vec())
                         .unwrap();
 
-                // Pre-split (unused for combined, but harmless)
+                // Pre-split
                 let mask_split = boxes_i8.slice(s![.., 84.., ..]).to_owned();
                 let scores_split = boxes_i8.slice(s![.., 4..84, ..]).to_owned();
                 let boxes_split = boxes_i8.slice(s![.., ..4, ..]).to_owned();
@@ -3647,22 +3579,12 @@ outputs:
     }
 
     // =========================================================================
-    // Physical-order contract regression tests
-    //
-    // These cover the TFLite VX-delegate vertical-stripe mask bug and the
-    // Ara-2-via-overlay anchor-first split-tensor bug. The core claim:
-    // declaring shape+dshape in physical memory order produces correct
-    // strides at wrap time, and `swap_axes_if_needed` permutes the stride
-    // tuple into canonical logical order without touching bytes.
+    // Physical-order contract tests
     // =========================================================================
 
-    /// TFLite YOLOv8-seg protos arrive as physically-NHWC bytes with
-    /// NNStreamer dim string `"32:160:160:1"` (innermost-first). The
-    /// overlay's 2026-04-22 workaround declares `[1, 160, 160, 32]` with
-    /// dshape `[batch, height, width, num_protos]` — shape matches
-    /// physical order, so no permutation is needed and the view is
-    /// already in canonical HWC after the batch-dim slice. This test
-    /// confirms that path matches the reference (direct-HWC) decode.
+    /// TFLite YOLOv8-seg protos declared as `[1, 160, 160, 32]` with dshape
+    /// `[batch, height, width, num_protos]` decode the same as the direct
+    /// HWC decode.
     #[test]
     fn test_physical_order_tflite_nhwc_protos() {
         let score_threshold = 0.45;
@@ -3714,7 +3636,7 @@ outputs:
                     decoder: configs::DecoderType::Ultralytics,
                     quantization: None,
                     shape: vec![1, 160, 160, 32],
-                    // Physical NHWC — matches the TFLite buffer layout.
+                    // Physical NHWC
                     dshape: vec![
                         (DimName::Batch, 1),
                         (DimName::Height, 160),
@@ -3756,14 +3678,8 @@ outputs:
         }
     }
 
-    /// Ara-2 split-tensor boxes arrive physically anchor-first: NNStreamer
-    /// dim string `"4:1:8400:1"` means innermost axis is 4 (coords), next
-    /// is 1 (padding), next is 8400 (anchors), outermost is 1 (batch).
-    /// The correct physical-order declaration is `[1, 8400, 1, 4]` with
-    /// dshape `[batch, num_boxes, padding, box_coords]`. This test
-    /// confirms that declaration produces the same decoded boxes as the
-    /// canonical features-first TFLite declaration over the same logical
-    /// data.
+    /// Anchor-first split boxes and scores decode the same as the
+    /// features-first declaration over the same logical data.
     #[test]
     fn test_physical_order_ara2_anchor_first_split_boxes() {
         use configs::{Boxes, Scores};
@@ -3827,10 +3743,8 @@ outputs:
             .unwrap();
         assert_eq!(ref_boxes.len(), 1, "reference should produce one box");
 
-        // Ara-2 physical layout: transpose axes 1↔2 so the innermost
-        // axis is BoxCoords / NumClasses. Materialise to get a
-        // C-contiguous Array3 with strides matching the physical order
-        // the Ara-2 backend would write into the tensor.
+        // Ara-2 physical layout: transpose axes 1↔2 into a C-contiguous
+        // array whose innermost axis is BoxCoords / NumClasses.
         let boxes_ara2 = boxes_canonical.view().permuted_axes([0, 2, 1]).to_owned(); // [1, 8400, 4]
         let scores_ara2 = scores_canonical.view().permuted_axes([0, 2, 1]).to_owned(); // [1, 8400, 80]
 
@@ -3888,9 +3802,7 @@ outputs:
         }
     }
 
-    /// Dshape whose per-axis sizes disagree with shape (the exact
-    /// failure mode that caused the TFLite stripe bug — shape declared
-    /// in one order, dshape in another) is rejected with a clear error.
+    /// A dshape whose per-axis sizes disagree with shape is rejected.
     #[test]
     fn test_physical_order_rejects_shape_dshape_mismatch() {
         let result = DecoderBuilder::default()
@@ -3936,8 +3848,7 @@ outputs:
         }
     }
 
-    /// Duplicate dim name in dshape is rejected (two axes mapping to the
-    /// same canonical slot would break the permutation).
+    /// A duplicate dim name in dshape is rejected.
     #[test]
     fn test_physical_order_rejects_duplicate_dshape_axis() {
         let result = DecoderBuilder::default()
@@ -3949,7 +3860,7 @@ outputs:
                     dshape: vec![
                         (DimName::Batch, 1),
                         (DimName::BoxCoords, 4),
-                        (DimName::BoxCoords, 4), // duplicate (size matches shape[2]=8400? no)
+                        (DimName::BoxCoords, 4), // duplicate
                     ],
                     normalized: Some(true),
                 },
@@ -3966,10 +3877,8 @@ outputs:
             )
             .build();
 
-        // Shape[2] = 8400 ≠ dshape[2] size 4, so the positional-mismatch
-        // check fires first — which is fine: any mis-shaped dshape
-        // should be rejected. Check for either error as long as it's a
-        // clear InvalidConfig.
+        // Shape[2] = 8400 ≠ dshape[2] size 4: either the positional or the
+        // duplicate-axis InvalidConfig error is accepted.
         match result {
             Err(DecoderError::InvalidConfig(msg)) => {
                 assert!(
@@ -3980,10 +3889,8 @@ outputs:
             other => panic!("expected InvalidConfig, got {other:?}"),
         }
 
-        // Separate case: size-consistent duplicate to exercise the
-        // duplicate-axis code path explicitly. Use `Batch` (no size
-        // constraint, can repeat with size 1 against a shape that
-        // carries two singleton dims).
+        // A size-consistent duplicate: `Batch` repeated with size 1 against
+        // a shape with two singleton dims.
         let result = DecoderBuilder::default()
             .with_config_yolo_split_det(
                 configs::Boxes {
@@ -4022,9 +3929,7 @@ outputs:
     }
 
     /// Canonical (dshape-omitted) high-level decode produces the same
-    /// numeric result as the dshape-populated form. This closes a
-    /// coverage gap flagged during review: dshape omission had been
-    /// exercised only at the builder level, not through the full
+    /// numeric result as the dshape-populated form through the full
     /// `decode_float` pipeline.
     #[test]
     fn test_physical_order_dshape_omitted_decodes_numerically() {
@@ -4092,8 +3997,7 @@ outputs:
             )
             .unwrap();
 
-        // Variant: dshape omitted — caller asserts shape is already in
-        // the decoder's canonical order.
+        // Variant: dshape omitted.
         let bare = build_decoder(vec![], vec![]);
         let mut bare_boxes = Vec::new();
         let mut bare_masks = Vec::new();
@@ -4121,21 +4025,13 @@ outputs:
         }
     }
 
-    /// 4D anchor-first boxes schema with a trailing `padding` axis — the
-    /// exact Ara-2 DVM shape (`"4:1:8400:1"` innermost-first = physical
-    /// `[1, 8400, 1, 4]`). Exercises the schema path's
-    /// `squeeze_padding_dims`: the caller declares a 4D physical-order
-    /// layout including `padding`, HAL squeezes the size-1 axis during
-    /// `to_legacy_config_outputs`, and the decoder sees the resulting
-    /// 3D shape. Callers feed HAL a 3D squeezed view of the same bytes.
-    /// Complements the 3D `test_physical_order_ara2_anchor_first_split_boxes`
-    /// which exercises the programmatic-builder path.
+    /// A 4D anchor-first boxes schema with a `padding` axis (physical
+    /// `[1, 8400, 1, 4]`) is squeezed by `to_legacy_config_outputs` and
+    /// decodes a 3D view of the same bytes.
     #[test]
     fn test_physical_order_ara2_4d_anchor_first_with_padding() {
-        // Build synthetic data in anchor-first 3D layout (the shape HAL
-        // actually operates on after squeezing). The 4D-with-padding
-        // declaration in the schema is a producer-side convention; the
-        // caller is expected to present HAL with a squeezed view.
+        // Synthetic data in the anchor-first 3D layout the decoder sees
+        // after squeezing.
         const N: usize = 8400;
         let mut boxes = Array3::<f32>::zeros((1, N, 4));
         let target = 42usize;
@@ -4146,11 +4042,8 @@ outputs:
         let mut scores = Array3::<f32>::zeros((1, N, 80));
         scores[[0, target, 0]] = 0.9;
 
-        // Schema JSON declares shape+dshape in physical anchor-first
-        // order including padding — mirrors `ara2_int8_edgefirst.json`'s
-        // feature-first declaration but with the axes in physical
-        // anchor-first order. `to_legacy_config_outputs` squeezes
-        // padding before the decoder's rank-3 verification.
+        // The schema declares shape+dshape in physical anchor-first order
+        // including padding.
         let json = r#"{
           "schema_version": 2,
           "decoder_version": "yolov8",
@@ -4269,7 +4162,7 @@ mod decoder_tracked_tests {
             .with_nms(Some(Nms::ClassAgnostic))
             .build()
             .unwrap();
-        let mut rng = rand::rngs::StdRng::seed_from_u64(0xAB_BEEF); // fixed seed for reproducibility
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xAB_BEEF); // fixed seed
 
         let expected_boxes = [
             crate::DetectBox {
@@ -4322,7 +4215,7 @@ mod decoder_tracked_tests {
 
         for i in 1..=100 {
             let mut out = out.clone();
-            // introduce jitter into the XY coordinates to simulate movement and test tracking stability
+            // introduce jitter into the XY coordinates
             let mut x_values = out.slice_mut(s![0, 0, ..]);
             for x in x_values.iter_mut() {
                 let r: f32 = rng.sample(StandardNormal);
@@ -4340,7 +4233,7 @@ mod decoder_tracked_tests {
             decoder
                 .decode_tracked_quantized(
                     &mut tracker,
-                    100_000_000 * i / 3, // simulate 33.333ms between frames
+                    100_000_000 * i / 3, // 33.333ms between frames
                     &[out.view().into()],
                     &mut output_boxes,
                     &mut output_masks,
@@ -4511,7 +4404,7 @@ mod decoder_tracked_tests {
                     ndarray::Array4::from_shape_vec((1, 160, 160, 32), raw_protos.to_vec())
                         .unwrap();
 
-                // Pre-split (unused for combined, but harmless)
+                // Pre-split
                 let mask_split = boxes_i8.slice(s![.., 84.., ..]).to_owned();
                 let mut scores_split = boxes_i8.slice(s![.., 4..84, ..]).to_owned();
                 let boxes_split = boxes_i8.slice(s![.., ..4, ..]).to_owned();
@@ -4888,8 +4781,7 @@ mod decoder_tracked_tests {
 
     // ─── End-to-end tracked test macro ──────────────────────────────
     //
-    // Generates tests with synthetic data to exercise all tracked
-    // decode paths without needing real model output files.
+    // Generates tests with synthetic data for every tracked decode path.
 
     const E2E_COMBINED_CONFIG: &str = "
 decoder_version: yolo26
@@ -5657,7 +5549,7 @@ outputs:
                     ];
                     let detect = detect.insert_axis(Axis(0));
                     assert_eq!(detect.shape(), &[1, 10, 38]);
-                    // Ensure contiguous layout after concatenation for as_slice()
+                    // Rebuild as a contiguous array
                     let detect =
                         Array3::from_shape_vec(detect.raw_dim(), detect.iter().copied().collect())
                             .unwrap();
@@ -5878,7 +5770,7 @@ outputs:
                     ];
                     let detect = detect.insert_axis(Axis(0));
                     assert_eq!(detect.shape(), &[1, 10, 38]);
-                    // Ensure contiguous layout after concatenation for as_slice()
+                    // Rebuild as a contiguous array
                     let mut detect =
                         Array3::from_shape_vec(detect.raw_dim(), detect.iter().copied().collect())
                             .unwrap();
@@ -6093,7 +5985,7 @@ outputs:
             decoder
                 .decode_tracked_quantized(
                     &mut tracker,
-                    100_000_000 * i / 3, // simulate 33.333ms between frames
+                    100_000_000 * i / 3, // 33.333ms between frames
                     &[out.view().into()],
                     &mut output_boxes,
                     &mut output_masks,
@@ -6120,10 +6012,10 @@ outputs:
         assert!(predicted_boxes[0].equal_within_delta(&expected_boxes[0], 1e-3));
         assert!(predicted_boxes[1].equal_within_delta(&expected_boxes[1], 1e-3));
 
-        // give the decoder a final frame with no detections to ensure tracks are properly predicting forward when detection is missing
+        // a final frame with no detections
         let mut scores_values = out.slice_mut(s![0, 4.., ..]);
         for score in scores_values.iter_mut() {
-            *score = i8::MIN; // set all scores to minimum to simulate no detections
+            *score = i8::MIN; // all scores at minimum: no detections
         }
         decoder
             .decode_tracked_quantized(
@@ -6217,10 +6109,10 @@ outputs:
         assert_eq!(output_boxes.len(), 1);
         assert!(output_boxes[0].equal_within_delta(&expected_boxes[0], 1e-6));
 
-        // give the decoder a final frame with no detections to ensure tracks are properly predicting forward when detection is missing
+        // a final frame with no detections
 
         for score in detect.slice_mut(s![.., .., 4]).iter_mut() {
-            *score = 0.0; // set all scores to minimum to simulate no detections
+            *score = 0.0; // all scores at minimum: no detections
         }
 
         decoder

@@ -36,8 +36,7 @@ use super::transpose::{nchw_to_nhwc, TransposeElement};
 /// Pixels per vector block.
 const BLOCK: usize = 16;
 
-/// Pixels per pass of the planar kernels over the class planes: the running best or sum of a
-/// strip stays in L1 while each class's row segment streams in.
+/// Pixels per pass of the planar kernels over the class planes.
 const STRIP: usize = 256;
 
 /// Bytes of interleaved scores transposed into one planar tile.
@@ -57,7 +56,7 @@ fn planar_fits(len: usize, cs: usize, classes: usize, n: usize) -> bool {
 }
 
 /// Runs `block(at)` for the 16-pixel blocks covering `n >= 16` pixels, the last one overlapping
-/// its predecessor so no pixel is left over.
+/// its predecessor.
 #[inline(always)]
 fn for_blocks(n: usize, mut block: impl FnMut(usize)) {
     let mut at = 0;
@@ -1108,7 +1107,6 @@ fn gather_columns<S: LoadF32 + Into<f32>>(
             prefetch_span(src.as_ptr().wrapping_add(row + cs + lo as usize * xs), span);
         }
         for (j, &x) in cols.iter().enumerate() {
-            // `last` bounds every class's columns, and `out` holds `cols.len() * classes`.
             out[j * classes + c] = src[row + x as usize * xs].into();
         }
     }

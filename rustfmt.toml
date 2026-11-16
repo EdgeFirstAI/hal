@@ -4,5 +4,5 @@
 # Use field init shorthand: `{ x }` instead of `{ x: x }`
 use_field_init_shorthand = true
 
-# Format edition (must match Cargo.toml workspace edition)
+# Format edition
 edition = "2021"

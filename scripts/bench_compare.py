@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 # SPDX-License-Identifier: Apache-2.0
-"""Compare edgefirst-bench --json outputs for refactor perf gates.
+"""Compare edgefirst-bench --json outputs against regression gates.
 
 Each side is one or more JSON files produced by a benchmark binary's
 ``--json`` flag (repetitions of the same benchmark). Per benchmark case the
 median-of-medians (and p95) across repetitions is compared and the ratio
 reported. Exit code is non-zero when any case regresses past the gate
-thresholds, so this can run directly in CI or a pre-merge checklist.
+thresholds.
 
-Gates (from the GL convergence refactor plan):
+Gates:
   * median: >3% regression fails
   * p95:    >5% regression fails
 
@@ -18,9 +18,8 @@ Usage:
                    --after  new.r1.json new.r2.json new.r3.json \
                    [--median-gate 3.0] [--p95-gate 5.0]
 
-Cases present on only one side are listed as added/removed but never fail
-the gate (cells legitimately appear when a refactor adds coverage, e.g.
-macOS letterbox cells after the platform convergence).
+Cases present on only one side are listed as added/removed and do not fail
+the gate.
 """
 
 import argparse

@@ -137,7 +137,7 @@ def test_dma_zero_copy_perf():
                 dst[i] = src[i]
         elapsed_copy += time.perf_counter() - start
 
-    # Skip timing assertion if both are under 1ms (measurement noise dominates)
+    # Skip the timing assertion when both are under 1 ms.
     if elapsed > 0.001 or elapsed_copy > 0.001:
         assert elapsed < elapsed_copy * 1.5, (
             f"zero-copy ({elapsed:.4f}s) not faster than copy ({elapsed_copy:.4f}s)"
@@ -207,7 +207,7 @@ def test_shm_zero_copy_perf():
                 dst[i] = src[i]
         elapsed_copy += time.perf_counter() - start
 
-    # Skip timing assertion if both are under 1ms (measurement noise dominates)
+    # Skip the timing assertion when both are under 1 ms.
     if elapsed > 0.001 or elapsed_copy > 0.001:
         assert elapsed < elapsed_copy * 1.5, (
             f"zero-copy ({elapsed:.4f}s) not faster than copy ({elapsed_copy:.4f}s)"
@@ -269,17 +269,15 @@ def test_shm_no_fd_leaks():
 def tensor_from_fd_func(mem_type: TensorMemory):
     try:
         original = tensor_or_skip_dma([100, 100, 3], dtype="uint8", mem=mem_type)
-        # Probe .fd here too: some backends for this memory type construct
-        # fine but have no fd (e.g. macOS DMA is IOSurface-backed, whose
-        # clone_fd is NotImplemented — use surface_id() instead).
+        # Probe that this memory type has an fd.
         os.close(original.fd)
     except (AttributeError, RuntimeError):
         pytest.skip(f"{mem_type} memory not supported on this platform")
 
     for _ in range(100):
-        fd = original.fd  # .fd returns a dup — caller must close
+        fd = original.fd  # .fd returns a dup
         tensor_fd = Tensor.from_fd(fd, original.shape, original.dtype)
-        os.close(fd)  # close the dup from .fd (from_fd dups again internally)
+        os.close(fd)
         with tensor_fd.map() as m:
             m[0] = 3
         del tensor_fd
@@ -379,7 +377,6 @@ def test_from_numpy_contiguous_dtypes(dtype):
 
 def test_from_numpy_contiguous_large():
     """Path 1 parallel (>=256 KiB): contiguous float32 above the parallelism threshold."""
-    # 256 KiB = 262144 bytes; float32 = 4 bytes → 65536 elements minimum
     rows, cols = 256, 512  # 131072 float32 elements = 524288 bytes
     arr = np.arange(rows * cols, dtype="float32").reshape(rows, cols)
     t = Tensor([rows, cols], dtype="float32")
@@ -410,7 +407,6 @@ def test_from_numpy_strided_3d_subvolume():
 
 def test_from_numpy_strided_large():
     """Path 2 parallel (>=256 KiB): large column slice exercises parallel row-copy."""
-    # 512 rows x 400 uint16 columns = 400 KiB
     big = np.arange(512 * 512, dtype="uint16").reshape(512, 512)
     src = big[:, :400]  # 512 * 400 * 2 = 409600 bytes > 256 KiB
     t = Tensor(list(src.shape), dtype="uint16")
@@ -471,7 +467,6 @@ def test_from_numpy_step_2d():
 
 def test_from_numpy_large_transposed():
     """Path 3 parallel (>=256 KiB): large transposed float32 array."""
-    # 512 x 512 float32 transposed = 1 MiB
     arr = np.arange(512 * 512, dtype="float32").reshape(512, 512)
     src = arr.T  # (512, 512) fully strided
     t = Tensor(list(src.shape), dtype="float32")
@@ -481,12 +476,7 @@ def test_from_numpy_large_transposed():
 
 
 def test_from_numpy_hailort_shape():
-    """Path 3 regression: (1, 116, 8400) transposed view of a (1, 8400, 116)
-    contiguous backing buffer — the layout HailoRT returns natively. Before
-    the np.ascontiguousarray fast path this case was ~12× slower than the
-    contiguous baseline; this test asserts correctness and is paired with
-    the perf sanity check below.
-    """
+    """Path 3: a (1, 116, 8400) transposed view of a contiguous buffer round-trips."""
     backing = np.arange(1 * 8400 * 116, dtype="float32").reshape(1, 8400, 116)
     src = backing.transpose(0, 2, 1)  # shape (1, 116, 8400), non-contiguous
     assert not src.flags["C_CONTIGUOUS"]
@@ -499,19 +489,7 @@ def test_from_numpy_hailort_shape():
 
 
 def test_from_numpy_hailort_shape_perf_sanity():
-    """Path 3 perf sanity: the internal fast path for a strided HailoRT-shape
-    source must be no slower than the manual `np.ascontiguousarray` + contiguous
-    `from_numpy` workaround.
-
-    Prior to this fix the strided path was ~12× slower than the workaround on
-    rpi5-hailo (27 ms vs 6.5 ms) because it fell back to per-element strided
-    iteration. With the np.ascontiguousarray fast path the two are within
-    measurement noise of each other (the internal path skips one Python
-    round-trip but does the same numpy materialization work).
-
-    The test is wall-clock based and skipped under coverage instrumentation
-    where timings are not representative.
-    """
+    """Path 3: a strided source is no slower than a contiguous copy of it."""
     import os
     import time
 
@@ -530,20 +508,18 @@ def test_from_numpy_hailort_shape_perf_sanity():
 
     n = 30
 
-    # Internal fast path — passes the strided view directly.
+    # Time the strided view passed directly.
     start = time.perf_counter()
     for _ in range(n):
         t.from_numpy(strided)
     fast_ms = (time.perf_counter() - start) * 1000.0 / n
 
-    # Manual workaround — caller pre-applies np.ascontiguousarray.
+    # Time the copy through np.ascontiguousarray.
     start = time.perf_counter()
     for _ in range(n):
         t.from_numpy(np.ascontiguousarray(strided))
     manual_ms = (time.perf_counter() - start) * 1000.0 / n
 
-    # Allow up to 1.5× slack for measurement noise. A regression to
-    # per-element iteration would make this ratio ≥ 10×.
     ratio = fast_ms / max(manual_ms, 1e-6)
     assert ratio < 1.5, (
         f"strided fast path is {ratio:.2f}× slower than the manual "
@@ -616,11 +592,6 @@ def test_from_numpy_non_array():
 # ============================================================================
 # macOS IOSurface bindings
 # ============================================================================
-#
-# These tests exercise the macOS IOSurface tensor path
-# (`Tensor.from_iosurface`, `Tensor.iosurface_id`, `Tensor.iosurface_ref`,
-# and the four `is_*_available` probes). They skip silently on non-macOS
-# platforms so the same test suite runs on Linux CI without modification.
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="IOSurface is macOS-only")
@@ -630,8 +601,6 @@ def test_iosurface_probes_dispatch_per_platform():
 
     assert hal.is_shm_available() is True, "macOS has POSIX shm"
     assert hal.is_dma_available() is False, "macOS has no Linux DMA-BUF heap"
-    # IOSurface may be unavailable in sandboxed or degraded contexts;
-    # only assert the dispatch relationship (gpu_buffer delegates to iosurface).
     assert hal.is_gpu_buffer_available() == hal.is_iosurface_available()
 
 
@@ -662,25 +631,7 @@ def test_iosurface_id_is_none_for_mem_tensor():
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="IOSurface is macOS-only")
 def test_iosurface_roundtrip_via_from_iosurface():
-    """from_iosurface(t.iosurface_ref) recovers a tensor sharing the same surface.
-
-    "The same surface" is the IOSurfaceID plus the pixels, not the
-    ``IOSurfaceRef`` pointer. The wheel ships the `dynamic` backend, whose C
-    ABI carries the *id* rather than a raw ref -- deliberately, because
-    splitting "look the surface up" from "retain it" across the ABI boundary
-    would leave a window in which the surface can be freed. So the import runs
-    ``IOSurfaceGetID`` then ``IOSurfaceLookup``, and CoreFoundation's
-    ``IOSurfaceLookup`` returns a fresh +1 object every call -- never the
-    caller's pointer, even for a surface already live in this process. Each
-    tensor then owns its own retain, which is what ``iosurface_ref``'s
-    "borrowed, lifetime tied to this tensor" contract describes.
-
-    Asserting pointer equality here therefore tested an accident of the
-    `static` backend (which keeps the ref it was handed) rather than anything
-    the API offers, and failed on every wheel. Assert the documented identity
-    -- same ID, same bytes -- and only that the borrowed ref is a usable
-    non-null pointer of its own.
-    """
+    """from_iosurface(t.iosurface_ref) returns a tensor sharing the same surface."""
     import edgefirst.tensor as hal
 
     if not hal.is_iosurface_available():
@@ -696,9 +647,7 @@ def test_iosurface_roundtrip_via_from_iosurface():
     assert imported.iosurface_ref is not None
     assert imported.iosurface_ref != 0, "the import holds its own live ref"
 
-    # The surface is shared, not copied: a write through the original is
-    # visible through the import. This is the property the pointer comparison
-    # was standing in for, and it holds on both backends.
+    # A write through the original is visible through the import.
     with t.map() as original:
         original[0] = 0xAB
         original[1] = 0xCD
@@ -725,7 +674,7 @@ def test_iosurface_unavailable_on_non_macos():
 
 
 def test_is_cuda_available_returns_bool():
-    """is_cuda_available() must be callable and return a bool (True or False)."""
+    """is_cuda_available() returns a bool."""
     import edgefirst.tensor as hal
 
     result = hal.is_cuda_available()
@@ -734,18 +683,12 @@ def test_is_cuda_available_returns_bool():
 
 def test_cuda_map_falls_back_to_map():
     """cuda_map() on a Mem tensor returns None; map() fallback still works."""
-    # Force an explicit Mem tensor so cuda_map() always returns None regardless
-    # of platform (memory=None may select DMA on Linux, where a CUDA-capable host
-    # could attach a handle — making the "no CUDA handle" assertion flaky).
     t = Tensor([4, 4], dtype="float32", mem=TensorMemory.MEM)
 
     cm = t.cuda_map()
-    # A Mem tensor has no CUDA handle registered — must return None
     assert cm is None
 
-    # The CPU fallback path must still work
     with t.map() as host:
-        # len(TensorMap) == total number of elements
         assert len(host) == 16  # 4 * 4
 
 
@@ -769,7 +712,6 @@ def test_colorimetry_roundtrip():
     assert got.encoding == hal.ColorEncoding.Bt709
     assert got.range == hal.ColorRange.Full
 
-    # Clearing roundtrips back to None.
     t.colorimetry = None
     assert t.colorimetry is None
 
@@ -808,14 +750,12 @@ def test_colorimetry_construct_and_repr():
 
 
 # ---------------------------------------------------------------------------
-# view()/batch() tests — zero-copy image sub-regions (the byte-offset
-# subview/plane_offset Python API was replaced by these pixel-region views).
+# view()/batch() tests: zero-copy image sub-regions.
 # ---------------------------------------------------------------------------
 
 
 def test_view_partitions_image_via_numpy():
-    """Two row-band views of one RGBA image are written independently through
-    numpy and partition the parent buffer (zero-copy, no aliasing)."""
+    """Two row-band views of one RGBA image partition the parent buffer."""
     from edgefirst.tensor import Region
 
     # 4x2 RGBA image → shape [H=2, W=4, C=4]; each row is one band.
@@ -830,7 +770,6 @@ def test_view_partitions_image_via_numpy():
     top.from_numpy(np.full((1, 4, 4), 10, dtype="uint8"))
     bot.from_numpy(np.full((1, 4, 4), 20, dtype="uint8"))
 
-    # Each band sees only its own window, and the parent is partitioned.
     parent_arr = _read_tensor(parent, "uint8").reshape(2, 4, 4)
     assert np.array_equal(parent_arr[0], np.full((4, 4), 10, dtype="uint8"))
     assert np.array_equal(parent_arr[1], np.full((4, 4), 20, dtype="uint8"))
@@ -850,22 +789,11 @@ def test_view_rejects_out_of_bounds():
 
 
 # ─── mapped CPU-access direction ────────────────────────────────────────────
-#
-# `map()` owns its coherency bracket in both directions. Until this was
-# plumbed through, Python could only ever take a ReadWrite bracket, so a
-# reader paid a full-buffer cache writeback on release that it never needed
-# -- invisible on coherent x86/macOS, real per-frame cost on Arm DMA-BUF.
 
 
 @pytest.mark.parametrize("mem", [TensorMemory.MEM, TensorMemory.DMABUF])
 def test_map_read_yields_a_readonly_view(mem):
-    """A read-only map must advertise itself as such to the buffer protocol.
-
-    Not cosmetic: releasing a `"read"` map deliberately skips the cache
-    writeback, so a write through such a view would be silently discarded on
-    a non-coherent backing. Advertising it read-only is what turns that
-    silent data loss into an exception at the point of the mistake.
-    """
+    """A read-only map advertises itself as read-only to the buffer protocol."""
     t = image_or_skip_dma(8, 4, format=PixelFormat.Rgb, mem=mem, access="readwrite")
     with t.map("read") as view:
         assert memoryview(view).readonly is True
@@ -876,29 +804,20 @@ def test_map_read_yields_a_readonly_view(mem):
 
 
 def test_map_readwrite_is_the_default_and_is_writable():
-    """The default direction stays ReadWrite, so existing code is unaffected."""
+    """The default map direction is ReadWrite."""
     t = Tensor.image(
         8, 4, format=PixelFormat.Rgb, mem=TensorMemory.MEM, access="readwrite"
     )
     with t.map() as view:  # no argument
         assert memoryview(view).readonly is False
         np.asarray(view)[0, 0, 0] = 7
-    with t.map("readwrite") as view:  # explicit, same thing
+    with t.map("readwrite") as view:  # explicit
         assert memoryview(view).readonly is False
         assert np.asarray(view)[0, 0, 0] == 7
 
 
 def test_map_read_refuses_a_writable_buffer_request():
-    """PEP 3118: a consumer asking for a writable buffer over a read-only map
-    must be refused, not quietly handed a read-only one.
-
-    Differential rather than absolute: the *same* `readinto` call must fail on
-    a `"read"` map and succeed on a `"readwrite"` one. That matters because
-    CPython's argument converter catches our BufferError and substitutes its
-    own TypeError, so asserting a specific exception type would be asserting
-    CPython's behaviour rather than ours -- and asserting "it raises" alone
-    would still pass if `__getbuffer__` were broken for every map.
-    """
+    """A read map refuses a writable buffer request that a readwrite map grants."""
     t = Tensor.image(
         8, 4, format=PixelFormat.Rgb, mem=TensorMemory.MEM, access="readwrite"
     )
@@ -915,8 +834,7 @@ def test_map_read_refuses_a_writable_buffer_request():
 
 
 def test_map_rejects_access_none_and_garbage():
-    """`none` is not a mapping, and an unknown direction is not silently
-    coerced to the permissive default."""
+    """`none` and an unknown direction are rejected as map access."""
     t = Tensor.image(
         8, 4, format=PixelFormat.Rgb, mem=TensorMemory.MEM, access="readwrite"
     )
@@ -967,8 +885,7 @@ def test_declared_cpu_access_reports_the_declaration(declared):
 
 
 def test_from_numpy_only_needs_a_declared_write():
-    """from_numpy is a pure fill: a write-only tensor accepts it, a
-    read-only one refuses it."""
+    """from_numpy fills a write-only tensor and is refused by a read-only one."""
     data = np.arange(96, dtype=np.uint8).reshape(4, 8, 3)
     t = Tensor.image(8, 4, format=PixelFormat.Rgb, mem=TensorMemory.MEM, access="write")
     t.from_numpy(data)
@@ -980,13 +897,8 @@ def test_from_numpy_only_needs_a_declared_write():
 
 
 # ---------------------------------------------------------------------------
-# The read-only contract, on every door that reaches the buffer.
-#
-# `__getbuffer__` refused a writable request from the start; these cover the
-# two paths that did not. `numpy()` matters most: on the abi3 wheel
-# `__getbuffer__` is compiled out entirely and `numpy()` is the ONLY buffer
-# path, so a hard-coded writable flag there means no enforcement at all on the
-# artifact users actually install.
+# The read-only contract on every path that reaches the buffer.
+# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("mem", [TensorMemory.MEM, TensorMemory.DMABUF])
@@ -1002,7 +914,7 @@ def test_numpy_of_a_read_map_is_not_writable(mem):
 
 @pytest.mark.parametrize("mem", [TensorMemory.MEM, TensorMemory.DMABUF])
 def test_numpy_of_a_readwrite_map_is_writable(mem):
-    """The other half: the guard must not have broken the normal path."""
+    """numpy() of a readwrite map is writable."""
     t = image_or_skip_dma(8, 4, format=PixelFormat.Rgb, mem=mem, access="readwrite")
     m = t.map("readwrite")
     arr = np.asarray(m.numpy())
@@ -1013,8 +925,7 @@ def test_numpy_of_a_readwrite_map_is_writable(mem):
 
 @pytest.mark.parametrize("mem", [TensorMemory.MEM, TensorMemory.DMABUF])
 def test_setitem_on_a_read_map_raises_a_catchable_error(mem):
-    """Not a PanicException: that derives from BaseException, so an ordinary
-    `except Exception` would not catch it and a frame loop would die."""
+    """Writing through a read map raises an error that `except Exception` catches."""
     t = image_or_skip_dma(8, 4, format=PixelFormat.Rgb, mem=mem, access="readwrite")
     m = t.map("read")
     with pytest.raises(Exception, match="read-only"):

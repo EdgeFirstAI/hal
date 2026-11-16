@@ -320,10 +320,9 @@ class SoftmaxDotI8Plan:
 
     Stands for ``SoftmaxI8Plan`` then ``projection`` with ``weights`` as its
     ``[n, 1]`` right-hand side (a YOLO DFL head: ``SOFTMAX`` then a 1x1
-    ``CONV_2D`` onto one channel), without rounding the probabilities to 8 bits:
-    within one LSB of the float result, closer to it than TFLite's pair.
-    ``projection`` must have one requantization, at most one bias, and the
-    probabilities' zero point as its ``lhs_zero_point``.
+    ``CONV_2D`` onto one channel), without rounding the probabilities to 8
+    bits. ``projection`` must have one requantization, at most one bias, and
+    the probabilities' zero point as its ``lhs_zero_point``.
     """
 
     def __init__(

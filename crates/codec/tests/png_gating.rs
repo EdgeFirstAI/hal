@@ -1,20 +1,13 @@
 //! PNG feature gating.
 //!
-//! Format *detection* stays compiled in when the decoder is gated out, so a
-//! valid PNG must report `PngNotEnabled` rather than `InvalidData`. Reporting a
-//! good file as corrupt is the failure this gate would otherwise introduce.
-//!
-//! There are three separate sniffing sites in `decoder.rs` (`decode_into`,
-//! `decode_into_inner`, `peek_info`), and `decode_from_reader` goes through a
-//! different one than `peek_info`. Exercising only `peek_info` would let a
-//! missed site ship green, so both paths are covered.
+//! Format detection stays compiled in when the decoder is gated out: a valid
+//! PNG reports `PngNotEnabled`, through both `peek_info` and
+//! `decode_from_reader`.
 
 use edgefirst_codec::peek_info;
 
 fn png_bytes() -> Vec<u8> {
-    // `EDGEFIRST_TESTDATA_DIR` wins when set. A CWD-relative path works only
-    // when cargo happens to run from the crate dir; on target the CWD is the
-    // deploy dir, so the relative form finds nothing.
+    // `EDGEFIRST_TESTDATA_DIR` when set, else a CWD-relative path.
     let root = std::env::var("EDGEFIRST_TESTDATA_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| {

@@ -78,8 +78,7 @@ fn bench_quant_decode_boxes(suite: &mut BenchSuite) {
     suite.record(&result);
 }
 
-/// Multi-label candidate selection on the transposed score view a DMA-BUF
-/// output produces, at a deployment and a validation score threshold.
+/// Multi-label candidate selection on the transposed score view, at a deployment and a validation score threshold.
 fn bench_quant_decode_boxes_multilabel(suite: &mut BenchSuite) {
     let out = edgefirst_bench::testdata::read("yolov8s_80_classes.bin");
     let out = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const i8, out.len()) };
@@ -212,9 +211,7 @@ fn bench_quant_nms(suite: &mut BenchSuite) {
 }
 
 fn bench_yolo_f32(suite: &mut BenchSuite) {
-    // Pre-dequantize once outside the timed loop. The bench measures
-    // the float decode path; mixing dequant cost into each iteration
-    // (as the legacy version did) inflated wall-time by the dequant.
+    // Dequantizes once outside the timed loop.
     let raw = edgefirst_bench::testdata::read("yolov8s_80_classes.bin");
     let raw = unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const i8, raw.len()) };
     let quant = Quantization {
@@ -401,8 +398,7 @@ fn bench_f32_decode_boxes(suite: &mut BenchSuite) {
     suite.record(&result);
 }
 
-/// Argmax candidate selection on the transposed f16 and f32 views (no per-iteration copy) and
-/// multi-label on the f32 one.
+/// Argmax candidate selection on the transposed f16 and f32 views, and multi-label on the f32 one.
 fn bench_float_decode_boxes_views(suite: &mut BenchSuite) {
     let out = edgefirst_bench::testdata::read("yolov8s_80_classes.bin");
     let out = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const i8, out.len()) };
@@ -609,8 +605,8 @@ fn bench_modelpack_split_u8(suite: &mut BenchSuite) {
     suite.record(&result);
 }
 
-/// `n` detection candidates in clusters of about eight overlapping boxes (realistic NMS input),
-/// or all disjoint (every box survives: the full O(N²) scan), labels from 4 classes.
+/// `n` detection candidates in clusters of about eight overlapping boxes, or all disjoint, with
+/// labels from 4 classes.
 fn nms_candidates(n: usize, disjoint: bool) -> Vec<edgefirst_decoder::DetectBox> {
     let mut rng = XorShift(0x9e37_79b9_7f4a_7c15);
     let unit = |rng: &mut XorShift| rng.next() as f32 / u32::MAX as f32;
@@ -642,8 +638,7 @@ fn nms_candidates(n: usize, disjoint: bool) -> Vec<edgefirst_decoder::DetectBox>
         .collect()
 }
 
-/// Greedy NMS over 300 candidates (the default `pre_nms_top_k`), capped at 300 survivors:
-/// clustered class-agnostic, class-aware and quantized, and disjoint (all survive); and over 6.
+/// Greedy NMS over 300 candidates capped at 300 survivors (clustered class-agnostic, class-aware and quantized, and disjoint), and over 6.
 fn bench_nms_300(suite: &mut BenchSuite) {
     use edgefirst_decoder::float::nms_class_aware_float;
     let clustered = nms_candidates(300, false);
@@ -710,8 +705,7 @@ fn modelpack_split_config(
     }
 }
 
-/// ModelPack split decode of one 40×40 output with 3 anchors and 80 classes (40×40×3×85), `u8`
-/// and `f32`.
+/// ModelPack split decode of one 40×40 output with 3 anchors and 80 classes (40×40×3×85), `u8` and `f32`.
 fn bench_modelpack_split_40x40(suite: &mut BenchSuite) {
     let (h, w, nc) = (40, 40, 80);
     let n = h * w * 3 * (nc + 5);
@@ -750,9 +744,7 @@ fn bench_modelpack_split_40x40(suite: &mut BenchSuite) {
     }
 }
 
-/// ModelPack segmentation: decode of a `(1, 8, 240, 320)` NCHW output as `i8` (to `u8`) and
-/// `f32` and `f16` (normalized to `u8`), and `segmentation_to_mask` (the per-pixel argmax) of
-/// 240×320×8, 240×320×21 and 160×160×2 maps.
+/// ModelPack segmentation: decode of a `(1, 8, 240, 320)` NCHW output as `i8`, `f32` and `f16`, and `segmentation_to_mask` of three map sizes.
 fn bench_modelpack_seg(suite: &mut BenchSuite) {
     let (c, h, w) = (8, 240, 320);
     let mut rng = XorShift(0x5e9_5e9);
@@ -813,9 +805,7 @@ fn bench_modelpack_seg(suite: &mut BenchSuite) {
 }
 
 fn bench_masks_f32(suite: &mut BenchSuite) {
-    // Pre-dequantize boxes + protos once outside the timed loop. The bench
-    // measures the float seg-det decode + mask materialization; the legacy
-    // version dequantized each iteration which masked the actual decode time.
+    // Dequantizes boxes and protos once outside the timed loop.
     let boxes_raw = edgefirst_bench::testdata::read("yolov8_boxes_116x8400.bin");
     let boxes_raw =
         unsafe { std::slice::from_raw_parts(boxes_raw.as_ptr() as *const i8, boxes_raw.len()) };
@@ -988,8 +978,7 @@ fn seg_protos_i8() -> Vec<i8> {
     raw.iter().map(|&b| b as i8).collect()
 }
 
-/// `decode` masks for 10, 50 and 100 detections at 160x160 protos and K = 32, as i8, u8 and
-/// f32 tensors, and `decode_proto` with i8 protos (kept raw) and u8 protos (dequantized).
+/// `decode` masks for 10, 50 and 100 detections as i8, u8 and f32 tensors, and `decode_proto` with i8 and u8 protos.
 fn bench_masks_counts(suite: &mut BenchSuite) {
     let protos = seg_protos_i8();
     let dq = |v: &[i8], (scale, zp): (f32, i32)| -> Vec<f32> {
@@ -1076,14 +1065,10 @@ fn bench_masks_counts(suite: &mut BenchSuite) {
     }
 }
 
-/// Build a per-scale-capable decoder for benchmarking, plus the 6
-/// zero-int8 input tensors (3 box levels + 3 score levels) with
-/// attached quantization.
+/// Build a per-scale decoder for benchmarking, plus the 6 zero-int8 input
+/// tensors (3 box levels + 3 score levels) with attached quantization.
 ///
-/// Schema: yolov8n-style 3-level DFL detection-only (no mc, no
-/// protos). Detection-only avoids the legacy validator's mc/protos
-/// dshape requirements while still exercising the full DFL kernel
-/// path on a realistic 8400-anchor workload.
+/// Schema: yolov8n-style 3-level DFL detection-only (no mc, no protos).
 fn build_dfl_per_scale_bench_inputs(
     out_dtype: DecodeDtype,
     nchw: bool,
@@ -1366,9 +1351,7 @@ fn process_cpu_time() -> Option<std::time::Duration> {
     None
 }
 
-/// `run_bench`, also printing the process CPU time per iteration, which
-/// counts rayon workers (including their idle spinning) alongside the
-/// calling thread.
+/// `run_bench`, also printing the process CPU time per iteration (all threads).
 fn run_bench_cpu<F: FnMut()>(
     suite: &mut BenchSuite,
     name: &str,
@@ -1404,9 +1387,7 @@ impl XorShift {
 }
 
 /// Per-scale int8 DFL detection model with a `width x height` input, three
-/// levels at strides 8/16/32 and `nc` classes, as the EdgeFirst converter
-/// declares it. Quantization matches captures of yolov8n smart exports on
-/// the i.MX 95 (boxes about 0.12-0.15 per step, scores about 0.2).
+/// levels at strides 8/16/32 and `nc` classes.
 fn realistic_per_scale_schema(width: usize, height: usize, nc: usize) -> SchemaV2 {
     serde_json::from_value(realistic_per_scale_json(width, height, nc, false))
         .expect("schema parse")
@@ -1498,11 +1479,10 @@ fn realistic_per_scale_json(
     schema
 }
 
-/// Synthetic int8 outputs for [`realistic_per_scale_schema`], shaped like
-/// captured yolov8n frames: each DFL side peaks at one bin and falls off
-/// by about 0.4-1.2 logits per bin, about 0.3% of anchors carry a class
-/// above 0.25, another 2% sit between about 0.05 and 0.25, and the rest
-/// score below 0.02.
+/// Synthetic int8 outputs for [`realistic_per_scale_schema`]: each DFL side
+/// peaks at one bin and falls off by about 0.4-1.2 logits per bin, about 0.3%
+/// of anchors carry a class above 0.25, another 2% sit between about 0.05 and
+/// 0.25, and the rest score below 0.02.
 fn realistic_per_scale_inputs(schema: &SchemaV2) -> Vec<TensorDyn> {
     let mut rng = XorShift(0x9E37_79B9_7F4A_7C15);
     let mut tensors = Vec::new();
@@ -1573,11 +1553,7 @@ fn realistic_per_scale_inputs(schema: &SchemaV2) -> Vec<TensorDyn> {
     tensors
 }
 
-/// The per-scale DFL pipeline on realistic int8 outputs, for the 960x544
-/// four-class model (levels of 8160/2040/510 anchors, none a multiple of
-/// the prefilter's pack) and the 640x640 COCO model. `dense` decodes every
-/// anchor; `prefilter` passes the 0.25 score threshold the way `decode`
-/// does; `decode` adds the candidate filter and NMS.
+/// The per-scale DFL pipeline on realistic int8 outputs for a 960x544 four-class model and a 640x640 COCO model: `dense`, `prefilter` and `decode`.
 fn bench_per_scale_realistic(suite: &mut BenchSuite) {
     for (label, width, height, nc) in [("960x544", 960, 544, 4), ("640x640", 640, 640, 80)] {
         let schema = realistic_per_scale_schema(width, height, nc);
@@ -1628,8 +1604,7 @@ fn bench_per_scale_realistic(suite: &mut BenchSuite) {
     }
 }
 
-/// The 640x640 COCO yolov8-seg model through `decode_proto` with f32 and
-/// f16 outputs: every per-scale role, the prefilter, and the f16 widen.
+/// The 640x640 COCO yolov8-seg model through `decode_proto` with f32 and f16 outputs.
 fn bench_per_scale_seg(suite: &mut BenchSuite) {
     let schema: SchemaV2 =
         serde_json::from_value(realistic_per_scale_json(640, 640, 80, true)).expect("schema");
@@ -1723,9 +1698,7 @@ impl CellData {
     }
 }
 
-/// Every score, mask-coefficient and proto cell the audit flagged, per tier:
-/// 8400 anchors x 80 classes of scores, x 32 mask coefficients, and the
-/// 160x160x32 protos.
+/// Score, mask-coefficient and proto cells per tier: 8400 anchors x 80 classes of scores, x 32 mask coefficients, and the 160x160x32 protos.
 fn bench_per_scale_cells(suite: &mut BenchSuite) {
     use edgefirst_decoder::per_scale::bench::{Cell, CellKind, Dst};
     use edgefirst_tensor::DType;
@@ -1842,8 +1815,7 @@ fn bench_per_scale_cells(suite: &mut BenchSuite) {
     }
 }
 
-/// Every per-scale box cell per tier over one 105x80 level (8400 anchors): DFL `reg_max` 16
-/// per-tensor and per-channel, DFL `reg_max` 8, and LTRB.
+/// Every per-scale box cell per tier over one 105x80 level (8400 anchors): DFL `reg_max` 16 per-tensor and per-channel, DFL `reg_max` 8, and LTRB.
 fn bench_per_scale_box_cells(suite: &mut BenchSuite) {
     use edgefirst_decoder::per_scale::bench::{BoxCell, BoxKind, Dst};
     use edgefirst_tensor::DType;
@@ -1995,8 +1967,7 @@ fn bench_per_scale_select(suite: &mut BenchSuite) {
     }
 }
 
-/// One 120x68 level (the largest of a 960x544 input) of realistic DFL bins
-/// through each 8-bit DFL box kernel, reported per anchor.
+/// One 120x68 level of realistic DFL bins through each 8-bit DFL box kernel, reported per anchor.
 fn bench_per_scale_dfl_kernels(suite: &mut BenchSuite) {
     use edgefirst_decoder::per_scale::bench::{DflKernel, DflLevel};
     let level = DflLevel::new(120, 68, 8.0, 0.147, 8);
@@ -2038,9 +2009,9 @@ fn bench_per_scale_dfl_kernels(suite: &mut BenchSuite) {
 }
 
 /// SegFormer-B1-shaped logits (150 classes, 128x168, NCHW) over a Voronoi
-/// class field. Calibrated to SegFormer-B1 on ADE20K val: about 7% of
-/// low-resolution cells straddle a class boundary, where a few classes score
-/// close to the winner (near -2) and the rest sit far below.
+/// class field: about 7% of low-resolution cells straddle a class boundary,
+/// where a few classes score close to the winner (near -2) and the rest sit
+/// far below.
 fn semantic_logits() -> Vec<f32> {
     const C: usize = 150;
     const H: usize = 128;

@@ -8,8 +8,7 @@
 //! which backend fired (RGB ⇒ nvJPEG, NV12/Grey ⇒ V4L2/CPU), verifies the
 //! decoded pixels are non-trivial, and times the steady-state decode.
 //!
-//! nvJPEG is opt-in (off by default, to avoid contending with CUDA inference),
-//! so `EDGEFIRST_ENABLE_NVJPEG=1` is required for the GPU path to engage:
+//! `EDGEFIRST_ENABLE_NVJPEG=1` enables the GPU path:
 //!
 //! ```bash
 //! EDGEFIRST_ENABLE_NVJPEG=1 \
@@ -22,8 +21,7 @@ use edgefirst_image::{Crop, ImageProcessor, ImageProcessorTrait};
 use edgefirst_tensor::{DType, PixelFormat, TensorDyn, TensorMemory, TensorTrait};
 use std::time::Instant;
 
-/// min / max / mean over every 7th byte — a cheap "is this a real image?" check.
-/// A coherency failure (stale/zero buffer) shows up as min==max or all-zero.
+/// min / max / mean over every 7th byte.
 fn stats(bytes: &[u8]) -> (u8, u8, f64) {
     let mut min = u8::MAX;
     let mut max = 0u8;
@@ -63,7 +61,6 @@ fn main() {
             PixelFormat::Rgb,
             DType::U8,
             None,
-            // CUDA writes device-side; Write covers the CPU decode fallback.
             edgefirst_tensor::CpuAccess::Write,
         )
         .expect("create_image");
@@ -88,7 +85,7 @@ fn main() {
     );
 
     // Correctness 1: read back what the decoder wrote into the device buffer
-    // (CUDA-write correctness). cuda_map → cudaMemcpy DeviceToHost.
+    // (cuda_map → cudaMemcpy DeviceToHost).
     if let Some(map) = tensor.cuda_map() {
         let bytes = info.width * info.height * 3;
         let n = bytes.min(map.len());
@@ -113,9 +110,8 @@ fn main() {
         );
     }
 
-    // Correctness 2: full zero-copy chain — convert() consumes the RGB PBO
-    // source (GL-read of the CUDA-written buffer) and letterboxes to a CPU
-    // tensor we can verify.
+    // Correctness 2: convert() consumes the RGB PBO source and letterboxes to
+    // a CPU tensor.
     let mut dst = processor
         .create_image(
             640,
@@ -123,7 +119,7 @@ fn main() {
             PixelFormat::Rgb,
             DType::U8,
             Some(TensorMemory::Mem),
-            // Only mapped to verify the pixels below.
+            // Mapped to verify the pixels below.
             edgefirst_tensor::CpuAccess::Read,
         )
         .expect("create dst");

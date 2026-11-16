@@ -98,16 +98,15 @@ mod gl_norm_tests {
             .collect()
     }
 
-    /// Run `opts` through forced GL and through the CPU converter and compare.
-    /// The content is placed 1:1 (16x8 source, 16x16 destination), so both
-    /// sample texel centres and differ only by arithmetic precision.
+    /// Run `opts` through forced GL and through the CPU converter on a 16x8 source placed
+    /// 1:1 in a 16x16 destination, and compare.
     fn compare(fmt: PixelFormat, dtype: DType, opts: ConvertOptions, quant: Option<Quantization>) {
         if let Some(mut proc) = gl_processor() {
             compare_on(&mut proc, fmt, dtype, opts, quant);
         }
     }
 
-    /// [`compare`] on a given processor, so one processor can run a sequence.
+    /// [`compare`] on a given processor.
     fn compare_on(
         proc: &mut ImageProcessor,
         fmt: PixelFormat,
@@ -138,12 +137,10 @@ mod gl_norm_tests {
             crate::test_support::report_skip(&format!("{fmt:?} {dtype:?}: no GL float render"));
             return;
         }
-        // With no memory requested, create_image falls back to host memory, so it cannot fail.
         let mut gl_dst = proc
             .create_image(16, 16, fmt, dtype, None, CpuAccess::ReadWrite)
             .unwrap_or_else(|e| panic!("{fmt:?} {dtype:?}: create_image: {e}"));
-        // Float renders reach a PBO, or a DMA-BUF only as F16 PlanarRgb
-        // (Linux has no other float DMA-BUF format).
+        // GL is expected for integer outputs, PBO floats and F16 PlanarRgb in a DMA-BUF.
         let mem = gl_dst.memory();
         let expect_gl = !float
             || mem == TensorMemory::Pbo
@@ -197,9 +194,7 @@ mod gl_norm_tests {
             .unwrap();
         let (g, c) = (values(&gl_dst), values(&cpu_dst));
         assert_eq!(g.len(), c.len());
-        // GPU filtering resolves sub-texel weights to about 1/256, which on a
-        // steep gradient is a few hundredths of a pixel value: compare to
-        // within one ImageNet pixel step (1/57.12), plus f16 rounding.
+        // Tolerance: one ImageNet pixel step (1/57.12), plus f16 rounding.
         let (abs, rel) = match dtype {
             DType::F32 => (0.02, 0.0),
             DType::F16 => (0.02, 2e-3),
@@ -213,8 +208,7 @@ mod gl_norm_tests {
         }
     }
 
-    /// One processor alternating default and mapped int8 converts, each with
-    /// its own program build; a planar alpha plane keeps the raw byte.
+    /// One processor alternates default and mapped int8 converts and each matches the CPU.
     #[test]
     fn gl_int8_default_and_mapped_converts_alternate() {
         let Some(mut proc) = gl_processor() else {
@@ -274,24 +268,21 @@ mod gl_norm_tests {
             ] {
                 compare(fmt, dtype, pixel_pad, Some(q.clone()));
             }
-            // An output-domain pad needs the single-pass route (pass 1 of the
-            // planar two-pass route can only pad with a pixel colour).
+            // Output-domain pad on the single-pass formats.
             for fmt in [PixelFormat::Rgb, PixelFormat::Rgba] {
                 compare(fmt, dtype, segformer(), Some(q.clone()));
             }
         }
-        // Per-channel zero points with equal scales: each plane draw takes
-        // its own channel's coefficients.
+        // Per-channel zero points with equal scales.
         let zp =
             Quantization::per_channel(vec![1.0 / 255.0; 3], vec![-128, -127, -126], 0).unwrap();
         let unsigned = ConvertOptions::new().normalization(Normalization::unsigned());
         compare(PixelFormat::PlanarRgb, DType::I8, unsigned, Some(zp));
-        // A pad whose channels differ fills each plane with its own value.
+        // A pad whose channels differ.
         let colour_pad = ConvertOptions::new().letterbox([0, 64, 255, 255]);
         compare(PixelFormat::PlanarRgb, DType::U8, colour_pad, None);
         compare(PixelFormat::PlanarRgb, DType::I8, colour_pad, None);
-        // Default normalization with the implicit quantization stays the
-        // plain i8 bias on both backends.
+        // Default normalization with the implicit quantization.
         compare(
             PixelFormat::Rgb,
             DType::I8,
@@ -309,7 +300,7 @@ mod gl_norm_tests {
             crate::test_support::report_skip("no GL F16 render");
             return;
         }
-        // Flat chroma: GL and CPU interpolate NV chroma differently at edges.
+        // Gradient luma with flat chroma.
         let (w, h) = (32, 16);
         let src = proc
             .create_image(
@@ -355,7 +346,7 @@ mod gl_norm_tests {
             return;
         }
         let g = values(&gl_dst);
-        // Top-left placement: rows 16.. of each plane are pad, written as 0.0.
+        // Rows 16.. of each plane are pad, written as 0.0.
         for c in 0..3 {
             let plane = &g[c * 32 * 32..(c + 1) * 32 * 32];
             assert!(plane[16 * 32..].iter().all(|&v| v == 0.0), "plane {c} pad");

@@ -82,14 +82,14 @@ Small objects vanish when a high-resolution frame is squeezed into a 640×640 mo
 
 ## Interoperability
 
-`convert()`, `draw_decoded_masks()`, `draw_proto_masks()`, `materialize_masks()` and the other `ImageProcessor` entry points accept a tensor or `ProtoData` from *any* `edgefirst.*` package. Fused decode+draw lives on `Decoder.draw_onto`. Each extension module registers its own type objects ([PyO3 issue #1444](https://github.com/PyO3/pyo3/issues/1444) — `isinstance` across packages is always `False`), so acceptance goes through duck-typed capsule protocols instead:
+`convert()`, `draw_decoded_masks()`, `draw_proto_masks()`, `materialize_masks()` and the other `ImageProcessor` entry points accept a tensor or `ProtoData` from *any* `edgefirst.*` package. Fused decode+draw lives on `Decoder.draw_onto`. Each extension module registers its own type objects (a [known PyO3 limitation](https://github.com/PyO3/pyo3/issues/1444) — `isinstance` across packages is always `False`), so acceptance goes through duck-typed capsule protocols instead:
 
 ```python
-# CORRECT — works regardless of which edgefirst.* package produced obj
+# Correct — works regardless of which edgefirst.* package produced obj
 if hasattr(obj, "__edgefirst_tensor__"):
     ...
 
-# WRONG — always False for a tensor from a sibling package
+# Wrong — always False for a tensor from a sibling package
 if isinstance(obj, edgefirst.codec.Tensor):
     ...
 ```

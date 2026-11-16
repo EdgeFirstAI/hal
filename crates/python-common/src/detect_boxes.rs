@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Shared DetectBox ↔ numpy conversions used by image drawing and decoder
-//! tiling merge. Lives here so neither module depends on the other.
+//! tiling merge.
 
 use edgefirst_tensor::{BoundingBox, DetectBox, Segmentation};
 use ndarray::parallel::prelude::{IntoParallelIterator, ParallelIterator};

@@ -1,12 +1,6 @@
-//! Exercises `ef_vocabulary!` through the `#[doc(hidden)]` demo vocabulary
-//! rather than a real one -- the first few tests only prove the mechanism:
-//! explicit, non-contiguous discriminants round-trip through the code, the
-//! string form, and the generated wire module. `DType`, `PixelFormat` and
-//! `TensorMemory` (below) are converted onto the macro directly. `DType`
-//! and `PixelFormat` had values that already shipped, so their tests pin
-//! the macro's output against those; `TensorMemory` had three disagreeing
-//! numberings and no shipped Rust one, so its test pins the canonical
-//! assignment this vocabulary establishes.
+//! Exercises `ef_vocabulary!` through the `#[doc(hidden)]` demo vocabulary,
+//! and pins the codes and wire strings of `DType`, `PixelFormat` and
+//! `TensorMemory`.
 
 use edgefirst_tensor::vocabulary_demo::{demo_code, Demo};
 use edgefirst_tensor::{
@@ -23,18 +17,13 @@ fn code_and_from_code_round_trip_every_variant() {
 
 #[test]
 fn discriminants_are_the_declared_values_not_declaration_order() {
-    // The bug this macro exists to prevent: implicit ordering means a
-    // cfg-gated variant in the middle shifts everything after it.
     assert_eq!(Demo::Beta.code(), 7);
     assert_eq!(demo_code::BETA, 7);
 }
 
 #[test]
 fn wire_module_constants_match_code_for_every_variant() {
-    // The property that actually matters: the free-standing wire constant
-    // and `.code()` are generated from the same declared literal, so a
-    // const-only consumer (cbindgen, FFI) and the Rust API cannot silently
-    // disagree about a variant's number.
+    // The wire constant and `.code()` agree.
     assert_eq!(Demo::Alpha.code(), demo_code::ALPHA);
     assert_eq!(Demo::Beta.code(), demo_code::BETA);
 }
@@ -59,9 +48,7 @@ fn all_lists_every_variant_exactly_once() {
 
 #[test]
 fn dtype_codes_are_unchanged_by_the_macro() {
-    // Pinned against the values that ship today (protocol.rs `mod dtype`,
-    // hal.h `hal_dtype`). If the macro changes any of these, it has silently
-    // broken a wire format and a C ABI at once.
+    // Pins every `DType` code.
     let expect = [
         (DType::U8, 0),
         (DType::I8, 1),
@@ -87,13 +74,7 @@ fn dtype_codes_are_unchanged_by_the_macro() {
 
 #[test]
 fn pixel_format_codes_are_unchanged_by_the_macro() {
-    // Pinned against the values that ship today (protocol.rs `mod format`,
-    // the Rust `#[repr(u8)]` discriminants that predated the macro, and
-    // Python). If the macro changes any of these, it has silently broken a
-    // wire format and cross-package value equality at once. `hal_pixel_format`
-    // is deliberately NOT pinned here -- it is the one surface that keeps its
-    // own, differently-numbered values; see `to_hal_pixel_format` in the capi
-    // crate.
+    // Pins every `PixelFormat` code.
     let expect = [
         (PixelFormat::Rgb, 1),
         (PixelFormat::Rgba, 2),
@@ -119,11 +100,7 @@ fn pixel_format_codes_are_unchanged_by_the_macro() {
 
 #[test]
 fn pixel_format_wire_strings_match_the_hal_format_table() {
-    // Pinned against `format.rs`'s doc comment, which is the format table
-    // `Tensor.msg` in the schemas repo cites as canonical. These strings are
-    // deliberately NOT `Display` (FourCC-derived) or the `serde` output
-    // (PascalCase variant names) -- see that doc comment for why unifying
-    // them would be a breaking change to two formats that are not this one.
+    // Pins every `PixelFormat` wire string.
     let expect = [
         (PixelFormat::Rgb, "rgb8"),
         (PixelFormat::Rgba, "rgba8"),
@@ -156,12 +133,7 @@ fn every_pixel_format_round_trips_through_its_string() {
 
 #[test]
 fn tensor_memory_defines_every_variant_on_every_platform() {
-    // A vocabulary is a namespace of codes, not a capability list. A blob
-    // recorded on Linux and replayed on macOS carries storage kind
-    // "dmabuf"; the consumer must be able to NAME it to report "cannot
-    // materialise here" instead of failing with an unknown code. That is
-    // why no variant here is `cfg`-gated -- `Shm` used to be, which made
-    // every variant after it shift by one on a non-unix build.
+    // Pins every `TensorMemory` code. No variant is `cfg`-gated.
     let expect = [
         (TensorMemory::Mem, 0),
         (TensorMemory::Shm, 1),
@@ -216,12 +188,7 @@ fn tensor_memory_wire_strings_round_trip() {
 
 #[test]
 fn tensor_memory_availability_is_a_runtime_question_not_a_compile_time_one() {
-    // Never asserts a specific answer -- it depends on the host's dma_heap
-    // permissions, whether a GL context is current, and whether libcuda is
-    // installed. It asserts only that ASKING is possible for every variant,
-    // including ones this platform cannot allocate: a variant that is
-    // merely unavailable must still be nameable and queryable, never a
-    // compile error or a panic.
+    // Asserts only that every variant can be queried, not a specific answer.
     for &v in TensorMemory::all() {
         let _ = v.is_available();
     }
@@ -229,8 +196,7 @@ fn tensor_memory_availability_is_a_runtime_question_not_a_compile_time_one() {
 
 #[test]
 fn tensor_memory_wire_constants_match_code_for_every_variant() {
-    // The const-only form (for cbindgen and match-free FFI) and `.code()`
-    // are generated from the same declared literal, so they cannot drift.
+    // The const-only form and `.code()` agree.
     use edgefirst_tensor::tensor_memory_wire as w;
     assert_eq!(TensorMemory::Mem.code(), w::MEM);
     assert_eq!(TensorMemory::Shm.code(), w::SHM);
@@ -243,15 +209,7 @@ fn tensor_memory_wire_constants_match_code_for_every_variant() {
 
 #[test]
 fn every_vocabulary_variant_round_trips_through_its_wire_string() {
-    // The wire strings are a public contract -- `format` is a string on the
-    // wire -- and unlike the numbers they have no compile-time link to any
-    // other surface at all. The pinning tests above name the exact spelling
-    // of each; this one is driven by `all()`, so a variant added later is
-    // covered without anyone remembering to extend a list.
-    //
-    // Uniqueness is the property being checked, not just round-tripping:
-    // two variants sharing a string would make `from_str_code` pick one and
-    // silently mistranslate the other, and the same holds for the codes.
+    // Every variant's code and wire string round-trip and are unique.
     fn check<V: Copy + std::fmt::Debug + PartialEq>(
         all: &[V],
         code: impl Fn(V) -> u32,
@@ -334,8 +292,6 @@ fn every_vocabulary_variant_round_trips_through_its_wire_string() {
 
 #[test]
 fn cpu_access_codes_and_strings_are_pinned() {
-    // The C header's `ef_cpu_access` enumerators and the Python `access=`
-    // strings both read these.
     use edgefirst_tensor::cpu_access_wire as w;
     let expect = [
         (CpuAccess::None, 0, w::NONE, "none"),
@@ -357,9 +313,7 @@ fn cpu_access_codes_and_strings_are_pinned() {
 
 #[test]
 fn protocol_kind_is_the_tensor_memory_numbering() {
-    // A descriptor's `kind` and `TensorMemory::code()` are one numbering:
-    // every `TensorMemory` code is the descriptor kind for that backing,
-    // and `protocol::kind` adds no code of its own.
+    // A descriptor's `kind` and `TensorMemory::code()` are one numbering.
     use edgefirst_tensor::protocol::kind;
     let expect = [
         (TensorMemory::Mem, kind::MEM),
@@ -378,11 +332,8 @@ fn protocol_kind_is_the_tensor_memory_numbering() {
 
 #[test]
 fn a_defined_but_unbacked_code_errors_instead_of_panicking() {
-    // `IoSurface` and `Cuda` are codes with no backend behind them yet, so
-    // every match arm handling them is unreachable *today* -- which is
-    // exactly when `unreachable!()` reads as correct and becomes a panic in
-    // library code the day Plan 3 makes a backend report one. Pinning a
-    // request to them must come back as an error a caller can handle.
+    // `IoSurface`, `Cuda` and `D3d11Texture` are codes with no backend:
+    // requesting one returns an error.
     for v in [
         TensorMemory::IoSurface,
         TensorMemory::Cuda,

@@ -1,28 +1,9 @@
 #!/usr/bin/env python3
 """Assert every Mach-O we ship has an 8-byte-aligned LINKEDIT string pool.
 
-`[profile.release] strip = true` makes rustc strip the symbol
-table in-process on Apple targets rather than shelling out to Apple's
-`strip(1)`, and its Mach-O writer places the string table immediately after
-the indirect symbol table with no padding. Indirect symbol entries are four
-bytes each, so a binary whose `nindirectsyms` is odd gets an `stroff` that is
-4-byte aligned, and dyld on macOS 26+ refuses to load it:
-
-    ImportError: dlopen(..._tensor.cpython-314-darwin.so, 0x0002):
-    mis-aligned LINKEDIT string pool, fileOffset=0x0019070C
-
-The parity is a coin flip, which is what makes this worth a gate rather than
-a one-time fix: at 0.31.0 two of the five Python extensions were odd and
-unloadable while the other three were even and fine by luck, so a build that
-imports cleanly today proves nothing about the next one. The workaround lives
-in `.cargo/config.toml` (`-C strip=none -C link-arg=-Wl,-x`, handing the strip
-back to Apple's linker, which pads); this script is what notices if it is ever
-dropped, reordered behind a `RUSTFLAGS` environment override, or defeated by a
-toolchain bump.
-
-Checks are pure file parsing -- no `dlopen`, no `otool` -- so a Linux or
-Windows runner validates macOS artifacts just as well as a Mac does, and a
-cross-built or fat binary is checked per-slice.
+dyld on macOS 26+ refuses to load a binary whose string table offset
+(`stroff`) is not 8-byte aligned. Checks are pure file parsing, with no
+`dlopen` and no `otool`; a fat binary is checked per slice.
 
 Usage:
 
@@ -40,9 +21,7 @@ import struct
 import sys
 import zipfile
 
-# Mach-O magic numbers. Only the 64-bit forms matter for anything this
-# project ships (arm64 and x86_64), but the 32-bit ones are recognised so a
-# stray i386 slice is reported as unchecked rather than silently passing.
+# Mach-O magic numbers, 64-bit and 32-bit.
 MH_MAGIC_64 = 0xFEEDFACF  # 64-bit, host-endian
 MH_CIGAM_64 = 0xCFFAEDFE  # 64-bit, byte-swapped
 MH_MAGIC_32 = 0xFEEDFACE
@@ -52,11 +31,10 @@ FAT_MAGIC_64 = 0xCAFEBABF
 
 LC_SYMTAB = 0x2
 
-# dyld requires the string pool to start on a pointer-size boundary.
+# Required alignment of the string pool, in bytes.
 REQUIRED_ALIGNMENT = 8
 
-# Extensions worth opening as archives. A wheel is a zip; so is the zip the
-# macOS C-API `make package` archive ships as.
+# Extensions opened as archives.
 ARCHIVE_SUFFIXES = {".whl", ".zip"}
 
 
@@ -67,8 +45,7 @@ def _u32(data: bytes, offset: int, big_endian: bool) -> int:
 def _symtab_stroff(data: bytes, base: int) -> tuple[int, int] | None:
     """Return ``(stroff, strsize)`` of the slice at ``base``, or None.
 
-    None means the slice has no LC_SYMTAB at all, which is legitimate for a
-    fully stripped object and simply leaves nothing to check.
+    None means the slice has no LC_SYMTAB.
     """
     magic = struct.unpack_from("<I", data, base)[0]
     if magic in (MH_MAGIC_64, MH_MAGIC_32):
@@ -89,7 +66,7 @@ def _symtab_stroff(data: bytes, base: int) -> tuple[int, int] | None:
         cmd = _u32(data, offset, big_endian)
         cmdsize = _u32(data, offset + 4, big_endian)
         if cmdsize == 0:
-            # Malformed; refuse to keep walking into arbitrary bytes.
+            # Malformed.
             return None
         if cmd == LC_SYMTAB:
             # symtab_command: cmd, cmdsize, symoff, nsyms, stroff, strsize
@@ -107,9 +84,7 @@ def _slices(data: bytes) -> list[int]:
     magic_be = struct.unpack_from(">I", data, 0)[0]
     if magic_be in (FAT_MAGIC, FAT_MAGIC_64):
         nfat = _u32(data, 4, big_endian=True)
-        # A corrupt or non-Mach-O file can claim an absurd slice count (the
-        # magic is shared with Java class files, among others). Cap the walk
-        # at what the file could actually hold rather than trusting it.
+        # Cap the slice count at what the file can hold.
         entry_size = 20 if magic_be == FAT_MAGIC else 32
         nfat = min(nfat, max(0, (len(data) - 8) // entry_size))
         offsets = []
@@ -220,18 +195,13 @@ def main(*args: str) -> int:
         errors.extend(target_errors)
         total += checked
         if not target_errors and checked == 0:
-            # Not fatal on its own -- a Linux wheel directory legitimately has
-            # no Mach-O in it -- but say so, so a silently empty run is never
-            # mistaken for a passing one.
+            # Reports an argument with no Mach-O in it.
             print(f"note: no Mach-O symbol tables found under {target}")
 
     for error in errors:
         print(f"ERROR: {error}")
     if errors:
         return 1
-    # ASCII on purpose, same reason as scripts/check_wheel_layout.py: a
-    # Windows subprocess pipe is cp1252 and a U+2713 would raise
-    # UnicodeEncodeError, turning a passing check into exit status 1.
     print(f"OK: {total} Mach-O symbol tables, string pools 8-byte aligned")
     return 0
 

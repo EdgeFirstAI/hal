@@ -3,13 +3,8 @@
 
 """Tests for the mutation-testing roll-up report.
 
-The roll-up reads every shard's ``mutants.out/outcomes.json`` and renders one
-markdown summary for the GitHub Actions step summary. These tests pin what the
-nightly lane depends on: the counts are the sum of the shards, a surviving
-mutant is reported with the diff that no test noticed, and a mutant in code a
-leg does not compile (cfg'd out, or left Fresh by the build) is classified as
-unbuilt rather than counted as a survivor -- while a leg that fails to build a
-file its target compiles fails the roll-up.
+Covers the summed shard counts, the survivor diffs, and the classification of mutants a
+leg did not build.
 """
 
 import importlib.util
@@ -269,7 +264,7 @@ def test_survivors_are_grouped_by_file_and_function(tmp_path, shards):
     assert md.count("crates/decoder/src/lib.rs") >= 1
     assert "`arg_max`" in md
     assert "`decode`" in md
-    # arg_max holds two survivors and must say so rather than repeat the heading.
+    # arg_max holds two survivors under one heading.
     assert "2 survivors" in md
     assert md.count("**`arg_max`**") == 1
 
@@ -433,9 +428,7 @@ def test_survivor_is_labelled_with_the_architecture_it_survived_on(tmp_path, sha
 
 
 def test_two_mutants_sharing_a_line_and_description_stay_distinct(tmp_path, shards):
-    """cargo-mutants names a mutant `file:line:col: what`, and a line holding
-    two of the same operator yields two mutants with the same name. Merging
-    them would quietly drop half the corpus."""
+    """Two mutants sharing a line and description are both reported."""
     name = "crates/decoder/src/modelpack.rs:409:30: replace * with + in split_float"
     write_shard(
         shards,
@@ -467,9 +460,7 @@ def test_two_mutants_sharing_a_line_and_description_stay_distinct(tmp_path, shar
 
 
 def test_mutant_caught_on_one_architecture_is_not_a_survivor(tmp_path, shards):
-    """The same source line is swept on both architectures. `#[cfg]`-gated code
-    is absent from one of the builds, so it cannot be caught there; catching it
-    anywhere means the tests do assert on it."""
+    """A mutant caught on one architecture is not a survivor."""
     name = "crates/decoder/src/lib.rs:595:5: replace arg_max_i8 with (0, 0)"
     write_shard(
         shards,
@@ -567,8 +558,7 @@ def test_github_actions_mode_appends_to_the_step_summary(tmp_path, shards, monke
 
 
 def test_architecture_label_names_only_the_ones_that_ran_it(tmp_path, shards):
-    """`unviable` means the mutant never compiled, so that architecture did not
-    test it and must not appear in the survivor's label."""
+    """A survivor's label omits an architecture where the mutant was unviable."""
     only_x86 = "crates/decoder/src/lib.rs:100:5: replace + with - in f"
     both = "crates/decoder/src/lib.rs:200:5: replace * with / in g"
     write_shard(
@@ -597,8 +587,7 @@ def test_architecture_label_names_only_the_ones_that_ran_it(tmp_path, shards):
 
 
 def test_gap_ranking_is_by_survival_rate_not_raw_count(tmp_path, shards):
-    """A file where everything tested survived is a worse gap than one with more
-    survivors but far more coverage."""
+    """Gaps are ranked by survival rate, not survivor count."""
     wide = [
         mutant("missed", "crates/decoder/src/byte.rs", "b", i, f"b{i}", diff="-x\n")
         for i in range(5)
@@ -665,7 +654,7 @@ def write_repo(tmp_path, files):
 
 
 def build_log(name, package, state, changed=None):
-    """A mutant log in cargo-mutants' layout, trimmed from a real shard.
+    """A mutant log in cargo-mutants' layout.
 
     `state` is what cargo printed for the mutated package in the build phase:
     "fresh" (nothing rebuilt) or "dirty" (rebuilt because `changed` changed).
@@ -776,8 +765,7 @@ def test_cfg_evaluator_treats_tooling_flags_as_off(flag):
 
 
 def test_cfg_evaluator_leaves_unknown_predicates_undecided():
-    """Undecided is treated as built, so an unknown predicate can only keep a
-    survivor counted, never hide one."""
+    """An unknown cfg predicate is left undecided."""
     assert evaluate('target_feature = "neon"') is None
     assert evaluate('all(unix, target_feature = "neon")') is None
     assert evaluate('all(windows, target_feature = "neon")') is False
@@ -899,7 +887,7 @@ def test_module_chain_decides_whether_a_file_is_compiled(tmp_path):
     assert index.reachable(adapter, LINUX_X86, feats)[0] is False
     assert index.reachable(adapter, WINDOWS, feats)[0] is True
     assert index.reachable("crates/tensor/src/mem.rs", LINUX_X86, feats)[0] is True
-    # A file whose declaration cannot be found is undecided, never cfg'd out.
+    # A file whose declaration cannot be found is undecided.
     assert index.reachable("crates/tensor/src/orphan.rs", LINUX_X86, feats)[0] is None
 
 
@@ -1019,8 +1007,7 @@ def test_feature_gated_region_uses_the_features_the_leg_built_with(tmp_path, sha
 
 
 def test_a_fresh_build_marks_the_mutant_unbuilt(tmp_path, shards):
-    """cargo leaving the crate Fresh means the mutated file is not in its
-    dependency graph, whatever the source scan could or could not decide."""
+    """A Fresh crate build marks the mutant unbuilt."""
     write_repo(tmp_path, {"crates/tensor/Cargo.toml": TENSOR_TOML})
     what = "replace f -> u32 with 0"
     file = "crates/tensor/src/unscanned.rs"
@@ -1044,8 +1031,7 @@ def test_a_fresh_build_marks_the_mutant_unbuilt(tmp_path, shards):
 def test_a_rebuild_caused_by_another_file_does_not_prove_the_mutant_built(
     tmp_path, shards
 ):
-    """The first mutant in a new file rebuilds because the previous file was
-    just restored; the module scan still decides that the file is cfg'd out."""
+    """A rebuild caused by another file leaves the module scan's verdict standing."""
     cfg_repo(tmp_path)
     what = "replace pick -> u32 with 0"
     log = build_log(f"{D3D}:2:5: {what}", "edgefirst-tensor", "dirty", changed=LIB)
@@ -1066,8 +1052,7 @@ def test_a_rebuild_caused_by_another_file_does_not_prove_the_mutant_built(
 
 
 def test_a_leg_that_leaves_an_expected_file_unbuilt_fails_the_roll_up(tmp_path, shards):
-    """A Windows leg that never compiles d3d11 is misconfigured: its results
-    there mean nothing, so the roll-up must not pass."""
+    """A leg that leaves a file its target compiles unbuilt fails the roll-up."""
     cfg_repo(tmp_path)
     what = "replace pick -> u32 with 0"
     log = build_log(f"{D3D}:2:5: {what}", "edgefirst-tensor", "fresh")
@@ -1085,7 +1070,7 @@ def test_a_leg_that_leaves_an_expected_file_unbuilt_fails_the_roll_up(tmp_path, 
     assert code == 1, md
     assert "Broken legs" in md
     assert f"| windows-x86_64 | `{D3D}` | 1 |" in md
-    # The mutant itself never counts as a survivor.
+    # The mutant does not count as a survivor.
     assert "| missed | 0 |" in md
 
 
@@ -1121,9 +1106,7 @@ def test_a_fresh_build_where_the_target_does_not_compile_the_file_is_fine(
     ids=["workspace-relative", "windows", "crate-relative", "absolute"],
 )
 def test_a_rebuild_of_the_mutated_file_overrules_the_scan(tmp_path, shards, changed):
-    """If cargo rebuilt because this very file changed, the file is compiled
-    and the scan was wrong: count the survivor and say so, whichever form
-    cargo printed the path in."""
+    """A rebuild of the mutated file counts the survivor whatever the scan decided."""
     cfg_repo(tmp_path)
     what = "replace pick -> u32 with 0"
     log = build_log(f"{D3D}:2:5: {what}", "edgefirst-tensor", "dirty", changed=changed)
@@ -1140,7 +1123,7 @@ def test_a_rebuild_of_the_mutated_file_overrules_the_scan(tmp_path, shards, chan
 
 
 def test_a_rebuild_of_another_file_does_not_overrule_the_scan(tmp_path, shards):
-    """cargo naming the previously restored file says nothing about this one."""
+    """A rebuild naming another file does not overrule the scan."""
     cfg_repo(tmp_path)
     what = "replace pick -> u32 with 0"
     log = build_log(f"{D3D}:2:5: {what}", "edgefirst-tensor", "dirty", changed=LIB)
@@ -1276,8 +1259,7 @@ def test_unknown_runner_is_never_discounted(tmp_path, shards):
 
 
 def test_windows_backslash_log_paths_are_read(tmp_path, shards):
-    """The Windows leg records log paths with backslashes; the roll-up runs on
-    Linux and must still read the build phase from them."""
+    """Log paths recorded with backslashes are read."""
     cfg_repo(tmp_path)
     what = "replace pick -> u32 with 0"
     log = build_log(f"{D3D}:2:5: {what}", "edgefirst-tensor", "fresh")

@@ -3,13 +3,11 @@
 //! The process-wide D3D11 device every texture tensor lives on and ANGLE
 //! renders with, plus the shared fence that orders GPU consumers.
 //!
-//! One process gets one device. Independently linked copies of this crate
-//! find each other through a named file mapping (the rendezvous) keyed on
-//! the process id, so a texture allocated by one copy is usable by the
-//! others. The rendezvous carries the device pointer, the fence's shared NT
-//! handle and the signal counter, so every copy signals one fence from one
-//! sequence of values. A host that already owns a device installs it with
-//! [`use_external_device`] before the first [`device`] call.
+//! One process gets one device. Independently linked copies of this crate find
+//! each other through a named file mapping (the rendezvous) keyed on the
+//! process id. The rendezvous carries the device pointer, the fence's shared
+//! NT handle and the signal counter. A host that already owns a device
+//! installs it with [`use_external_device`] before the first [`device`] call.
 
 use super::adapter::{select_adapter, AdapterSelection};
 use super::com;
@@ -42,29 +40,22 @@ use windows::Win32::System::Threading::{
 };
 
 /// Layout version of the rendezvous mapping. A copy of this crate built
-/// against a different layout reads the mismatch and creates its own device
-/// instead of trusting the bytes.
+/// against a different layout creates its own device.
 const RENDEZVOUS_VERSION: u64 = 2;
 /// Written into the version word between claiming the record and filling it
-/// in. A reader that sees it waits for the claim holder instead of reading
-/// the half-written record behind it.
+/// in. A reader that sees it waits for the claim holder.
 const RENDEZVOUS_CLAIMING: u64 = u64::MAX;
-/// Turns a reader or a would-be publisher takes while another copy's claim is
-/// in flight. The claim holder writes two words between its CAS and its
-/// release store, so this only has to outlast a preemption.
+/// Turns a reader or a publisher takes while another copy's claim is in
+/// flight.
 const RENDEZVOUS_CLAIM_SPINS: u32 = 1024;
-/// How many of those turns yield before the rest start sleeping. The common
-/// wait is a few stores by a runnable thread, which a yield covers; the budget
-/// past that is for a claim holder the scheduler has taken off a core.
+/// How many of those turns yield before the rest sleep.
 const RENDEZVOUS_CLAIM_YIELDS: u32 = 64;
-/// How long each turn past [`RENDEZVOUS_CLAIM_YIELDS`] sleeps, making the
-/// whole budget roughly 50 ms rather than a few microseconds of spinning.
+/// Microseconds each turn past [`RENDEZVOUS_CLAIM_YIELDS`] sleeps.
 const RENDEZVOUS_CLAIM_SLEEP_US: u64 = 50;
 /// Bytes in the rendezvous mapping:
 /// `[version: u64, device_ptr: u64, fence_handle_value: u64, signal_counter: u64]`.
 const RENDEZVOUS_BYTES: usize = 32;
-/// Byte offset of the shared signal counter inside the mapping. The view is
-/// page-aligned, so the `AtomicU64` there is aligned.
+/// Byte offset of the shared signal counter inside the mapping.
 const COUNTER_OFFSET: usize = 24;
 /// The DXGI description WARP reports.
 const WARP_DESCRIPTION: &str = "Microsoft Basic Render Driver";
@@ -72,8 +63,7 @@ const WARP_DESCRIPTION: &str = "Microsoft Basic Render Driver";
 const ADOPTED_LABEL: &str = "adopted from another copy in this process";
 
 /// A point in the shared fence's timeline plus a duplicate of the fence's
-/// shared NT handle, so a consumer in another API can wait for the GPU work
-/// a tensor's producer queued.
+/// shared NT handle, for a consumer in another API to wait on.
 pub struct GpuCompletion {
     pub fence: OwnedHandle,
     pub value: u64,
@@ -82,7 +72,7 @@ pub struct GpuCompletion {
 /// Where the newest allocated fence value is kept.
 enum Counter {
     /// The word inside a rendezvous view this process keeps mapped for its
-    /// lifetime, so every copy of this crate allocates from one sequence.
+    /// lifetime, shared by every copy of this crate.
     Shared(&'static AtomicU64),
     /// No usable rendezvous: this copy counts on its own.
     Local(AtomicU64),
@@ -100,12 +90,6 @@ impl Counter {
 /// The process device: the `ID3D11Device` and immediate context every
 /// texture tensor is created on, with the shared fence used to order
 /// consumers behind the work queued on that context.
-///
-/// The COM interfaces below are read only by the texture storage
-/// (`super::texture`), which the `dynamic` backend does not compile -- it
-/// forwards every tensor call to the C ABI instead. The device itself is still
-/// built there, because the adapter and fence probes are part of the public
-/// surface on both backends.
 #[cfg_attr(edgefirst_tensor_dynamic, allow(dead_code))]
 pub struct D3d11Device {
     dev: ID3D11Device,
@@ -118,8 +102,7 @@ pub struct D3d11Device {
     fence_handle: Option<OwnedHandle>,
     adapter: Option<IDXGIAdapter>,
     counter: Counter,
-    /// Orders signals when the device has no `ID3D11Multithread`. Only ever
-    /// held inside `signal`.
+    /// Orders signals when the device has no `ID3D11Multithread`.
     signal_lock: Mutex<()>,
     adapter_label: String,
     luid: (i32, u32),
@@ -130,9 +113,8 @@ pub struct D3d11Device {
 static DEVICE: OnceLock<std::result::Result<D3d11Device, String>> = OnceLock::new();
 static EXTERNAL: Mutex<Option<usize>> = Mutex::new(None);
 
-/// The process device, created on first call. A failed creation is cached
-/// too, so a host that cannot make a device is told the same thing every
-/// time instead of retrying on every allocation.
+/// The process device, created on first call. A failed creation is cached and
+/// returned to every later call.
 pub fn device() -> crate::Result<&'static D3d11Device> {
     DEVICE
         .get_or_init(|| create().map_err(|e| e.to_string()))
@@ -141,26 +123,17 @@ pub fn device() -> crate::Result<&'static D3d11Device> {
 }
 
 /// Installs a host-owned device before the first `device()` call. It is
-/// published through the rendezvous so every copy of this crate in the
+/// published through the rendezvous and every copy of this crate in the
 /// process adopts it.
 ///
 /// # Ordering
 ///
 /// This must run before any call that reaches [`device()`], which caches the
-/// process device on first use and returns
-/// [`Error::InvalidOperation`](crate::Error::InvalidOperation) here once it
-/// has. In practice that means before
+/// process device on first use: before
 /// [`is_gpu_buffer_available`](crate::is_gpu_buffer_available), before
 /// `Tensor::image` with `TensorMemory::DmaBuf`, and before the image
-/// processor -- each of which creates the device as a side effect of doing
-/// its job.
-///
-/// "Already initialized" is a question about the *process*, not about this
-/// copy of the crate: a copy whose sibling already created the device has an
-/// empty `DEVICE` of its own but finds the device published in the
-/// rendezvous, and installing an external one there would write a pointer
-/// that no copy ever adopts -- `device()` prefers the published device, so
-/// the host's would be silently ignored rather than refused. Both are
+/// processor. Once this copy of the crate or another copy in the process has a
+/// device, or device creation has failed, this returns
 /// [`Error::InvalidOperation`](crate::Error::InvalidOperation).
 ///
 /// # Safety
@@ -176,10 +149,6 @@ pub unsafe fn use_external_device(ptr: *mut c_void) -> crate::Result<()> {
     }
     if let Some(cached) = DEVICE.get() {
         return Err(crate::Error::InvalidOperation(match cached {
-            // A cached failure is not "too late", it is "impossible here":
-            // this process will never get a device, so a host that reads
-            // "already initialized" would keep looking for the call it lost
-            // the race to.
             Err(e) => format!(
                 "use_external_device: D3D11 device creation already failed in this process \
                  and the failure is cached: {e}"
@@ -187,9 +156,7 @@ pub unsafe fn use_external_device(ptr: *mut c_void) -> crate::Result<()> {
             Ok(_) => "use_external_device: the D3D11 device is already initialized".into(),
         }));
     }
-    // The cross-copy half of the same question. Read after `DEVICE` because
-    // this one maps and unmaps a file mapping, and the common case is a
-    // second call in the copy that made the first.
+    // Checks for a device another copy of this crate published.
     if read_rendezvous().is_some() {
         return Err(crate::Error::InvalidOperation(
             "use_external_device: the D3D11 device is already initialized by another \
@@ -197,9 +164,7 @@ pub unsafe fn use_external_device(ptr: *mut c_void) -> crate::Result<()> {
                 .into(),
         ));
     }
-    // Checked here rather than at adoption so a caller that passes the wrong
-    // pointer is told at the call it can still fix. No reference is taken;
-    // `adopt` clones on first use.
+    // No reference is taken; `adopt` clones on first use.
     if !device_pointer_is_live(ptr as usize) {
         return Err(crate::Error::InvalidArgument(
             "use_external_device: pointer is not a live ID3D11Device".into(),
@@ -212,10 +177,8 @@ pub unsafe fn use_external_device(ptr: *mut c_void) -> crate::Result<()> {
 /// Takes a counted reference on a device pointer this process owns but this
 /// copy of the crate does not hold a reference to yet.
 fn adopt(ptr: usize) -> crate::Result<ID3D11Device> {
-    // SAFETY: `ptr` is a live `ID3D11Device*` in this process -- either
-    // published through the rendezvous by another copy of this crate, or
-    // handed over by the host through `use_external_device`. Borrowing and
-    // then cloning AddRefs without consuming the caller's reference.
+    // SAFETY: `ptr` is a live `ID3D11Device*` in this process; borrowing and
+    // then cloning takes a reference without consuming the caller's.
     unsafe { ID3D11Device::from_raw_borrowed(&(ptr as *mut c_void)) }
         .cloned()
         .ok_or_else(|| crate::Error::InvalidArgument("D3D11 device pointer is null".into()))
@@ -239,8 +202,7 @@ fn create() -> crate::Result<D3d11Device> {
     } else {
         D3D11_CREATE_DEVICE_FLAG(0)
     };
-    // Video support is what Media Foundation needs; WARP refuses it, so fall
-    // back in order and record which flags took.
+    // Tried in order, with fewer flags each time.
     let attempts = [
         base | D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
         base | D3D11_CREATE_DEVICE_BGRA_SUPPORT,
@@ -268,9 +230,9 @@ fn create() -> crate::Result<D3d11Device> {
         } else {
             D3D_DRIVER_TYPE_HARDWARE
         };
-        // SAFETY: documented creation call; both out-parameters are valid
-        // locals, and the adapter reference, when given, is a live
-        // `IDXGIAdapter1` `selected` holds for the whole call.
+        // SAFETY: both out-parameters are valid locals, and the adapter
+        // reference, when given, is a live `IDXGIAdapter1` `selected` holds
+        // for the whole call.
         let result = unsafe {
             D3D11CreateDevice(
                 adapter,
@@ -291,9 +253,9 @@ fn create() -> crate::Result<D3d11Device> {
                         "D3D11CreateDevice returned no device",
                     ))
                 })?;
-                // Only an explicit WARP selection settles the question; an
-                // adapter picked by LUID or description is left to detection,
-                // which reads the DXGI description back off the device.
+                // An explicit WARP selection is recorded; any other adapter is
+                // classified from the DXGI description read back off the
+                // device.
                 let d = finish(dev, selected.label.clone(), warp.then_some(true))?;
                 log::info!(
                     "D3D11 device up on {} (flags {:#x}, feature level {:#x})",
@@ -363,8 +325,7 @@ fn wrap(
     })?;
     let ctx4 = ctx.cast::<ID3D11DeviceContext4>().ok();
     let mt = dev.cast::<ID3D11Multithread>().ok();
-    // Non-GL threads copy, map and signal on this context while the GL
-    // worker renders; the runtime's own lock makes each call atomic.
+    // Turns on the runtime's own lock around each context call.
     if let Some(mt) = &mt {
         // SAFETY: `mt` is live. The return value is the previous setting.
         let _ = unsafe { mt.SetMultithreadProtected(true) };
@@ -395,9 +356,8 @@ fn wrap(
 /// The fence this copy signals and the counter it allocates values from.
 ///
 /// When the rendezvous names a fence this device can open, both are the
-/// published ones, so completions recorded by one copy mean the same thing
-/// to every other. Otherwise this copy gets a fence and a counter of its
-/// own, and says so.
+/// published ones. Otherwise this copy creates a fence and a counter of its
+/// own.
 fn fence_and_counter(
     dev5: Option<&ID3D11Device5>,
     published: Option<&RendezvousView>,
@@ -437,9 +397,7 @@ fn fence_and_counter(
     ))
 }
 
-/// Opens the fence the rendezvous names, keeping a duplicate of its handle
-/// so this copy's `fence_shared_handle` and `fence_handle_value` behave the
-/// same as the publisher's.
+/// Opens the fence the rendezvous names and duplicates its handle.
 fn open_published_fence(
     d5: &ID3D11Device5,
     view: &RendezvousView,
@@ -463,9 +421,8 @@ fn open_published_fence(
 }
 
 /// The device's adapter LUID, whether that adapter is WARP, and the adapter
-/// itself, kept so `adapter_ptr` can hand it to CUDA. A device whose DXGI
-/// chain does not answer reports a zero LUID and no adapter rather than
-/// failing creation.
+/// itself. A device whose DXGI chain does not answer reports a zero LUID and
+/// no adapter.
 fn adapter_identity(dev: &ID3D11Device) -> ((i32, u32), bool, Option<IDXGIAdapter>) {
     let Ok(dxgi) = dev.cast::<IDXGIDevice>() else {
         return ((0, 0), false, None);
@@ -502,8 +459,7 @@ fn rendezvous_name() -> Vec<u16> {
     com::wide(&format!("Local\\edgefirst-d3d11-device-{pid}"))
 }
 
-/// A rendezvous mapping opened and left mapped for the process lifetime, so
-/// `counter` stays valid for as long as any `D3d11Device` can signal.
+/// A rendezvous mapping opened and left mapped for the process lifetime.
 struct RendezvousView {
     device_ptr: usize,
     fence_handle: usize,
@@ -516,27 +472,19 @@ enum Published {
     Ours(&'static AtomicU64),
     /// Another copy published a live device first; what it published.
     Other(RendezvousView),
-    /// The rendezvous could not be created or mapped. The device still works;
-    /// other copies of this crate will just not find it.
+    /// The rendezvous could not be created, mapped or claimed.
     Unavailable,
 }
 
-/// The device pointer another copy of this crate published, after checking
-/// it still answers QueryInterface. Stale or foreign mappings read as `None`.
+/// The device pointer another copy of this crate published, after checking it
+/// answers QueryInterface. Stale or foreign mappings read as `None`.
 ///
-/// This is the read-only peek; it unmaps before returning. Use
-/// [`open_rendezvous`] to take the fence and counter with it.
-///
-/// The creation path needs the fence and counter too, so it opens; this
-/// answers "what is published" for callers that only want the device.
+/// Unmaps before returning. [`open_rendezvous`] returns the fence and counter
+/// with it.
 pub(crate) fn read_rendezvous() -> Option<usize> {
     let name = rendezvous_name();
-    // SAFETY: documented call with a NUL-terminated name; an error means no
-    // copy of this crate has published in this process.
+    // SAFETY: `name` is NUL-terminated.
     let map = unsafe { OpenFileMappingW(FILE_MAP_READ.0, false, PCWSTR(name.as_ptr())) }.ok()?;
-    // A mapping shorter than `RENDEZVOUS_BYTES` -- an older layout, or another
-    // program on the same name -- maps to a null view and so reads as "no
-    // rendezvous" rather than as bytes to trust.
     // SAFETY: `map` is a live mapping; a view shorter than the request fails.
     let view = unsafe { MapViewOfFile(map, FILE_MAP_READ, 0, 0, RENDEZVOUS_BYTES) };
     let result = if view.Value.is_null() {
@@ -545,15 +493,9 @@ pub(crate) fn read_rendezvous() -> Option<usize> {
         // SAFETY: the view is `RENDEZVOUS_BYTES` readable bytes laid out by
         // `publish_rendezvous`, page-aligned, and live until the unmap below.
         let version = unsafe { settled_version(&*(view.Value as *const AtomicU64)) };
-        // Nothing else is read until the version says a record is there. A
-        // version still at 0 or at the claiming marker means the holder is
-        // mid-`write_unaligned` of exactly the word below, and reading it
-        // would race that write; the acquire load above is what makes the
-        // published record visible, as `published_record` relies on too.
+        // Nothing else is read until the version says a record is there.
         let ptr = if version == RENDEZVOUS_VERSION {
-            // Only the pointer: reading the whole record would overlap the
-            // counter word at `COUNTER_OFFSET`, which other copies mutate
-            // atomically.
+            // Reads only the pointer word.
             // SAFETY: as above; the pointer word follows the version word.
             unsafe { std::ptr::read_unaligned(view.Value.byte_add(8) as *const u64) as usize }
         } else {
@@ -568,16 +510,9 @@ pub(crate) fn read_rendezvous() -> Option<usize> {
     result
 }
 
-/// Reads the version word until it holds a published version, waiting out the
-/// two transient values a publisher passes through.
-///
-/// `CreateFileMappingW` zero-fills a new section and the record is written
-/// several stores later, so `0` on a section that exists means "a copy is
-/// about to claim this" and [`RENDEZVOUS_CLAIMING`] means "a copy is filling
-/// it in now". A reader that treated either as stale would conclude no device
-/// is published and mint a second one, which is exactly what the rendezvous
-/// exists to prevent. Returns the word as it stands after
-/// [`RENDEZVOUS_CLAIM_SPINS`] yields when it never settles.
+/// Reads the version word until it holds a published version, waiting out `0`
+/// and [`RENDEZVOUS_CLAIMING`]. Returns the word as it stands after
+/// [`RENDEZVOUS_CLAIM_SPINS`] turns when it never settles.
 fn settled_version(version: &AtomicU64) -> u64 {
     for turn in 0..RENDEZVOUS_CLAIM_SPINS {
         let seen = version.load(Ordering::Acquire);
@@ -589,8 +524,8 @@ fn settled_version(version: &AtomicU64) -> u64 {
     version.load(Ordering::Acquire)
 }
 
-/// One turn of the claim wait: yields while the holder is likely still
-/// running, sleeps after that so a preempted holder gets its core back.
+/// One turn of the claim wait: yields for the first
+/// [`RENDEZVOUS_CLAIM_YIELDS`] turns, sleeps after that.
 fn claim_backoff(turn: u32) {
     if turn < RENDEZVOUS_CLAIM_YIELDS {
         std::thread::yield_now();
@@ -599,16 +534,13 @@ fn claim_backoff(turn: u32) {
     }
 }
 
-/// Opens the rendezvous for writing and keeps the view mapped, so the shared
-/// counter can be handed out as `&'static`. Returns `None` when nothing is
-/// published, the layout does not match, or the device named is gone.
+/// Opens the rendezvous for writing and keeps the view mapped. Returns `None`
+/// when nothing is published, the layout does not match, or the device named
+/// is gone.
 fn open_rendezvous() -> Option<RendezvousView> {
     let name = rendezvous_name();
-    // SAFETY: documented call with a NUL-terminated name; an error means no
-    // copy of this crate has published in this process.
+    // SAFETY: `name` is NUL-terminated.
     let map = unsafe { OpenFileMappingW(FILE_MAP_WRITE.0, false, PCWSTR(name.as_ptr())) }.ok()?;
-    // A mapping shorter than `RENDEZVOUS_BYTES` maps to a null view, so an
-    // older layout on the same name reads as "no rendezvous".
     // SAFETY: `map` is a live mapping; a view shorter than the request fails.
     let view = unsafe { MapViewOfFile(map, FILE_MAP_WRITE, 0, 0, RENDEZVOUS_BYTES) };
     if view.Value.is_null() {
@@ -635,9 +567,8 @@ fn open_rendezvous() -> Option<RendezvousView> {
 /// the version does not match this build, no claim ever completed, or the
 /// device named has gone.
 ///
-/// The view is kept mapped by the caller on the `Some` path: `counter` points
-/// into it, and every copy of this crate on this device allocates fence values
-/// from that one word.
+/// On the `Some` path `counter` points into the view, which the caller keeps
+/// mapped.
 ///
 /// # Safety
 ///
@@ -650,10 +581,8 @@ unsafe fn published_record(view: MEMORY_MAPPED_VIEW_ADDRESS) -> Option<Rendezvou
     if version != RENDEZVOUS_VERSION {
         return None;
     }
-    // Read after the acquire load above, which pairs with the publisher's
-    // release store of the version word, so both are the values it wrote.
-    // Only these two: the counter word at `COUNTER_OFFSET` is mutated
-    // atomically by other copies and is taken by reference instead.
+    // Reads the device and fence words; the counter word is taken by
+    // reference.
     // SAFETY: as above; both words are inside the view.
     let (device_ptr, fence_handle) = unsafe {
         (
@@ -677,25 +606,16 @@ unsafe fn published_record(view: MEMORY_MAPPED_VIEW_ADDRESS) -> Option<Rendezvou
 /// Publishes `device_ptr` and `fence_handle` under this process's rendezvous
 /// name and returns the shared counter.
 ///
-/// `CreateFileMappingW` succeeds on an existing name and reports
-/// `ERROR_ALREADY_EXISTS`, but that flag is not what decides the winner: the
-/// section is zero-filled at creation and the record is written several stores
-/// later, so two copies can both see "already exists" or both see "created".
-/// The version word is the claim instead -- one interlocked move off `0` (or
-/// off a version naming a device that has gone), the record written by the
-/// winner alone, and the version release-stored last so a reader either sees
-/// the whole record or waits for it. When another copy holds a live device,
-/// that device is returned and its record is left alone, counter word
-/// included: zeroing a counter another copy has already allocated from would
-/// make its next `signal` non-increasing, which `ID3D11DeviceContext4::Signal`
-/// rejects.
+/// The version word is the claim: one interlocked move off `0`, or off a
+/// version naming a device that has gone, then the record written by the
+/// winner, then the version release-stored last. When another copy holds a
+/// live device, that device is returned and its record is left as it is.
 ///
-/// A rendezvous that cannot be created, mapped or claimed is a warning, never
-/// a failure: the device this copy holds still works.
+/// Returns [`Published::Unavailable`], with a warning, when the rendezvous
+/// cannot be created, mapped or claimed.
 fn publish_rendezvous(device_ptr: usize, fence_handle: usize) -> Published {
     let name = rendezvous_name();
-    // SAFETY: documented call; an anonymous, page-file-backed mapping named
-    // for this process.
+    // SAFETY: `name` is NUL-terminated; the mapping is page-file-backed.
     let map = unsafe {
         CreateFileMappingW(
             INVALID_HANDLE_VALUE,
@@ -745,15 +665,12 @@ fn publish_rendezvous(device_ptr: usize, fence_handle: usize) -> Published {
             0 | RENDEZVOUS_CLAIMING => claim_backoff(turn),
             seen if seen == RENDEZVOUS_VERSION => {
                 // Any live entry is adopted, including one that names the
-                // device this copy is publishing: two copies adopting the same
-                // host device race here, and overwriting would replace a live
-                // fence handle and counter with this copy's own.
+                // device this copy is publishing.
                 // SAFETY: as above; the view is kept mapped on the `Some` path.
                 if let Some(record) = unsafe { published_record(view) } {
                     return Published::Other(record);
                 }
-                // The record names a device that has gone. Take the claim back
-                // off it; if another copy got there first the loop re-reads.
+                // The record names a device that has gone: claim it.
                 if version
                     .compare_exchange(
                         seen,
@@ -796,20 +713,8 @@ fn unmapped(view: MEMORY_MAPPED_VIEW_ADDRESS, map: HANDLE) -> Published {
 }
 
 /// Fills in a rendezvous record this copy has claimed and publishes it with a
-/// release store of the version word.
-///
-/// The counter word is left exactly as it stands: a section this copy created
-/// is zero-filled, and one taken over from a departed device may already have
-/// handed out values, so zeroing it would make the next `signal` allocate a
-/// value the fence has already passed --
-/// `ID3D11DeviceContext4::Signal` rejects a non-increasing value, and
-/// `event_for` on one returns an already-set event, a false completion.
-///
-/// The view and the mapping handle stay open for the process lifetime: the
-/// handle is what keeps the name resolvable for copies that initialize later,
-/// and the view is what the returned counter points into. `HANDLE` has no
-/// destructor, so leaving both alone is all that takes. The device named stays
-/// alive because `DEVICE` is a static that is never dropped.
+/// release store of the version word. The counter word is left as it stands.
+/// The view and the mapping handle stay open for the process lifetime.
 ///
 /// # Safety
 ///
@@ -834,21 +739,19 @@ unsafe fn write_claimed_record(
             &*(view.Value.byte_add(COUNTER_OFFSET) as *const AtomicU64),
         )
     };
-    // Stored last, so a reader that sees this version sees the two writes
-    // above with it.
+    // Stored last: publishes the two writes above.
     version.store(RENDEZVOUS_VERSION, Ordering::Release);
     Published::Ours(counter)
 }
 
 fn device_pointer_is_live(ptr: usize) -> bool {
-    // SAFETY: the pointer was published by a copy of this crate in this
-    // process. The version field and this QueryInterface reduce, but cannot
-    // eliminate, the risk of reading one whose publisher has gone.
+    // SAFETY: `ptr` is a device pointer published in this process or handed
+    // over by the host.
     unsafe { IUnknown::from_raw_borrowed(&(ptr as *mut c_void)) }
         .is_some_and(|u| u.cast::<ID3D11Device>().is_ok())
 }
 
-#[cfg_attr(edgefirst_tensor_dynamic, allow(dead_code))] // see the struct's own note
+#[cfg_attr(edgefirst_tensor_dynamic, allow(dead_code))]
 impl D3d11Device {
     /// The `ID3D11Device*` itself, borrowed: no reference is transferred, so
     /// a caller that keeps it must AddRef.
@@ -874,16 +777,13 @@ impl D3d11Device {
         &self.ctx
     }
 
-    /// The context's `ID3D11DeviceContext4`, for the GPU-side `Wait` a
-    /// texture opened from a shared handle issues on the producer's fence.
+    /// The context's `ID3D11DeviceContext4`, when it has one.
     pub(crate) fn ctx4(&self) -> Option<&ID3D11DeviceContext4> {
         self.ctx4.as_ref()
     }
 
     /// This copy's fence, the one `signal` advances and `last_gpu_write`
-    /// values name. For a GPU-side `ID3D11DeviceContext4::Wait` on a
-    /// locally recorded write, which a CPU map queues before its staging
-    /// refresh. `None` on a device with no fence at all.
+    /// values name. `None` on a device with no fence.
     pub(crate) fn fence(&self) -> Option<&ID3D11Fence> {
         self.fence.as_ref()
     }
@@ -911,27 +811,15 @@ impl D3d11Device {
 
     /// Queues a fence signal after everything issued so far on the immediate
     /// context, submits the context, and returns the value. Call it on the
-    /// thread that just issued the GPU work you want the value to cover.
-    ///
-    /// The submission is part of the contract, not an optimisation: a consumer
-    /// in another process waits on this fence with nothing of ours queued
-    /// behind it, so an unsubmitted Signal would leave it waiting on a value
-    /// that never arrives.
+    /// thread that just issued the GPU work the value is to cover.
     pub fn signal(&self) -> Option<u64> {
         self.signal_with(true)
     }
 
-    /// [`signal`](Self::signal) without the submission: the value is
-    /// allocated and its `Signal` queued, but the immediate context is left
-    /// for the caller to submit with [`flush`](Self::flush).
-    ///
-    /// For a producer issuing several pieces of work that end in one
-    /// submission -- the image crate's deferred convert batch -- where one
-    /// `Flush` per item would undo the batching the caller asked for. The
-    /// values are still allocated in order under the device lock, so they
-    /// order the items among themselves; what they do not carry until the
-    /// flush is the promise a `signal` makes, that a waiter in another
-    /// process sees the value arrive.
+    /// [`signal`](Self::signal) without the submission: the value is allocated
+    /// and its `Signal` queued, but the immediate context is left for the
+    /// caller to submit with [`flush`](Self::flush). Values are allocated in
+    /// order under the device lock.
     pub fn signal_deferred(&self) -> Option<u64> {
         self.signal_with(false)
     }
@@ -946,13 +834,9 @@ impl D3d11Device {
 
     fn signal_with(&self, submit: bool) -> Option<u64> {
         let (fence, ctx4) = (self.fence.as_ref()?, self.ctx4.as_ref()?);
-        // Allocating the value and issuing its Signal must be one step: two
-        // threads that allocate 1 and 2 and then issue Signal(2) first drive
-        // the fence timeline backwards. `ID3D11Multithread`'s critical section
-        // is the device's own -- one object shared by every copy of this crate
-        // on the device -- so it orders signals across copies as well as
-        // threads. A device without the interface gets a process-local lock,
-        // which is all this copy can do on its own.
+        // The value is allocated and its Signal issued under one lock: the
+        // device's `ID3D11Multithread` section, or `signal_lock` on a device
+        // without it.
         let _local = self
             .mt
             .is_none()
@@ -964,13 +848,7 @@ impl D3d11Device {
         let value = self.counter.word().fetch_add(1, Ordering::AcqRel) + 1;
         // SAFETY: both interfaces are live; the value is fresh.
         let signalled = unsafe { ctx4.Signal(fence, value) };
-        // Submitted inside the same bracket as the Signal it flushes. A queued
-        // Signal is not visible to anyone until the context is submitted, so a
-        // waiter in another process -- which has no unrelated work of ours to
-        // ride along with -- would block on a value this device has recorded
-        // but never sent. Flushing here is what makes the value the caller
-        // returns mean "queued and submitted"; `signal_deferred` moves that
-        // promise to the caller's own `flush`.
+        // The submit runs inside the same lock as the Signal.
         if submit && signalled.is_ok() {
             // SAFETY: the immediate context is live for the process's lifetime.
             unsafe { self.ctx().Flush() };
@@ -986,10 +864,8 @@ impl D3d11Device {
         Some(value)
     }
 
-    /// The newest value allocated on the shared counter. Its `Signal` was
-    /// issued under the device lock and succeeded, unless `signal` returned
-    /// `None` for that value: a `Signal` the immediate context rejects is not
-    /// recoverable, so the counter keeps the value and the fence never
+    /// The newest value allocated on the shared counter. When `signal`
+    /// returned `None` for a value, the counter keeps it and the fence never
     /// reaches it.
     pub fn last_signalled(&self) -> u64 {
         self.counter.word().load(Ordering::Acquire)
@@ -1021,34 +897,23 @@ impl D3d11Device {
         duplicate_handle(src)
     }
 
-    /// The fence's own NT handle value, whichever fence this copy holds. For
-    /// the rendezvous, which publishes it precisely so the other copies can
-    /// open it. Zero without a fence.
+    /// The fence's own NT handle value, whichever fence this copy holds. Zero
+    /// without a fence.
     pub(crate) fn fence_handle_value(&self) -> usize {
         self.fence_handle
             .as_ref()
             .map_or(0, |h| h.as_raw_handle() as usize)
     }
 
-    /// Whether this copy signals the fence the process agreed on, rather than
-    /// one of its own.
-    ///
-    /// False in the degraded case `fence_and_counter` warns about: a copy that
-    /// adopted a published device but could not open its fence, or one with no
-    /// rendezvous at all. Its values come from a counter no other copy reads.
+    /// Whether this copy signals the fence the process shares. False for a
+    /// copy that adopted a published device but could not open its fence, and
+    /// for one with no rendezvous.
     pub(crate) fn fence_is_shared(&self) -> bool {
         matches!(self.counter, Counter::Shared(_))
     }
 
-    /// The fence handle value to hand to a consumer outside this copy, or `0`.
-    ///
-    /// Zero whenever the fence is not the shared one: a completion *value*
-    /// recorded by another copy paired with this copy's private fence names a
-    /// point that fence never reaches, so a consumer's
-    /// `ID3D11DeviceContext4::Wait` would block its context forever -- or,
-    /// past the value, return at once and read a texture still being written.
-    /// A zero handle is what `from_parts` and `reference_handle_bytes` read as
-    /// "nothing to wait on", which is the honest answer here.
+    /// The fence handle value to hand to a consumer outside this copy: zero
+    /// when the fence is not the shared one.
     pub(crate) fn exported_fence_handle_value(&self) -> usize {
         if self.fence_is_shared() {
             self.fence_handle_value()
@@ -1057,7 +922,8 @@ impl D3d11Device {
         }
     }
 
-    /// The `IDXGIAdapter*` of this device, borrowed, for `cudaD3D11GetDevice`.
+    /// The `IDXGIAdapter*` of this device, borrowed. Null when the device has
+    /// no adapter.
     #[allow(dead_code)]
     pub(crate) fn adapter_ptr(&self) -> *mut c_void {
         self.adapter
@@ -1087,13 +953,7 @@ fn event_on(fence: &ID3D11Fence, value: u64) -> std::io::Result<OwnedHandle> {
 
 /// Blocks the calling thread until `fence` reaches `value`, or `timeout_ms`
 /// elapses.
-///
-/// The CPU-side stand-in for the GPU-side `ID3D11DeviceContext4::Wait` a
-/// device without that interface cannot issue: an importer that cannot order
-/// the producer's work behind its own has to be sure the work is done before
-/// it hands the tensor back. Bounded rather than infinite so a value the
-/// producer never signals costs a warning instead of a hung thread.
-#[cfg_attr(edgefirst_tensor_dynamic, allow(dead_code))] // only the texture storage waits
+#[cfg_attr(edgefirst_tensor_dynamic, allow(dead_code))]
 pub(crate) fn wait_cpu_for(
     fence: &ID3D11Fence,
     value: u64,
@@ -1152,10 +1012,7 @@ mod tests {
         let b = device().unwrap();
         assert!(std::ptr::eq(a, b));
         assert_ne!(a.raw(), std::ptr::null_mut());
-        assert!(
-            a.signal_supported(),
-            "ID3D11Device5 is Windows 10 1703+; this box has it"
-        );
+        assert!(a.signal_supported(), "ID3D11Device5 is available");
         assert!(
             a.creation_flags() & D3D11_CREATE_DEVICE_BGRA_SUPPORT.0 != 0,
             "BGRA_SUPPORT requested"
@@ -1171,8 +1028,6 @@ mod tests {
         let w = unsafe { WaitForSingleObject(HANDLE(ev.as_raw_handle()), 5000) };
         assert_eq!(w, WAIT_OBJECT_0);
         assert!(d.completed_value() >= v);
-        // The shared counter, which the sibling tests in this binary also
-        // allocate from, so the newest value is at least this one.
         assert!(d.last_signalled() >= v);
     }
 
@@ -1185,13 +1040,7 @@ mod tests {
         assert!(matches!(err, crate::Error::InvalidOperation(_)));
     }
 
-    /// The second half of that refusal, the one a *sibling* copy of this
-    /// crate hits: its own `DEVICE` is empty, but the device this process
-    /// already has is published in the rendezvous. This binary is a single
-    /// copy, so `DEVICE` short-circuits before the rendezvous check is
-    /// reached -- what this pins is that the state the check reads is
-    /// genuinely there once the device exists, which is the whole premise of
-    /// the branch.
+    /// The published device is readable from the rendezvous, and an external device is refused.
     #[test]
     fn use_external_device_sees_the_device_a_sibling_copy_published() {
         let d = device().unwrap();
@@ -1213,8 +1062,7 @@ mod tests {
         assert_eq!(published, d.raw() as usize);
     }
 
-    /// What a second, independently linked copy of this crate does: adopt the
-    /// published device and get the published fence and counter with it.
+    /// A second copy that adopts the published device shares its fence and counter.
     #[test]
     fn adopted_device_shares_the_fence_and_counter() {
         let first = device().unwrap();
@@ -1249,10 +1097,7 @@ mod tests {
         assert!(first.completed_value() >= value);
     }
 
-    /// The claim window the atomic publication closes: a reader that saw the
-    /// marker (or the zero-filled word a fresh section starts at) and called
-    /// the record stale would publish a device of its own, and the process
-    /// would run two.
+    /// `settled_version` waits out a claim marker and returns an unsettled word as it stands.
     #[test]
     fn a_reader_waits_out_a_claim_instead_of_calling_the_record_stale() {
         let word = std::sync::Arc::new(AtomicU64::new(RENDEZVOUS_CLAIMING));
@@ -1263,14 +1108,11 @@ mod tests {
         });
         assert_eq!(settled_version(&word), RENDEZVOUS_VERSION);
         publisher.join().unwrap();
-        // A word that never settles is reported as it stands rather than spun
-        // on forever.
+        // A word that never settles is returned as it stands.
         assert_eq!(settled_version(&AtomicU64::new(0)), 0);
     }
 
-    /// Two copies publishing at once converge on one device. Both find the
-    /// device this process already published, which is the outcome the claim
-    /// guarantees whichever order they arrive in.
+    /// Two threads publishing at once both end on the device the process published.
     #[test]
     fn two_threads_racing_to_publish_end_on_one_device() {
         let d = device().unwrap();
@@ -1293,18 +1135,7 @@ mod tests {
         assert_eq!(seen, vec![Some(ptr), Some(ptr)]);
     }
 
-    /// The degraded state `fence_and_counter` falls back to: a copy that could
-    /// not open the published fence signals one of its own, whose values no
-    /// other copy can compare with. It exports no fence handle, so a consumer
-    /// reads "no completion" rather than a value paired with the wrong fence.
-    ///
-    /// This is the device half. The transport half -- that a zero handle takes
-    /// the recorded *value* with it, since `blob::import` refuses a value with
-    /// no fence beside it -- is `blob::tests::
-    /// a_reference_plane_drops_the_value_with_the_fence`, tested against the
-    /// rule rather than through `export`: the export path reads the process
-    /// device (`crate::d3d11::device()`), which a locally wrapped copy cannot
-    /// stand in for.
+    /// A copy with a fence of its own exports no fence handle.
     #[test]
     fn a_copy_with_a_private_fence_exports_no_fence_handle() {
         let d = device().unwrap();
@@ -1312,8 +1143,8 @@ mod tests {
         assert_eq!(d.exported_fence_handle_value(), d.fence_handle_value());
         assert_ne!(d.exported_fence_handle_value(), 0);
 
-        // `wrap` with no published record is exactly what a copy gets when the
-        // published fence cannot be opened: its own fence, its own counter.
+        // `wrap` with no published record builds a copy with its own fence and
+        // counter.
         let private = wrap(d.dev().clone(), "private fence".into(), None, None).unwrap();
         assert!(!private.fence_is_shared());
         assert_ne!(
@@ -1326,8 +1157,6 @@ mod tests {
             0,
             "a descriptor or a blob from this copy carries no completion at all"
         );
-        // And the value it would have paired with is real, which is exactly
-        // why the transport has to drop it too.
         assert!(private.signal().is_some_and(|v| v > 0));
     }
 

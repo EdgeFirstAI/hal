@@ -479,8 +479,8 @@ void run_s5(GlSession& s) {
         report("S5.4", Verdict::Fail, "CreateSharedHandle: %s", hr_str(hr));
         continue;
       }
-      // D3D11 has no allocation-size query; try the tight size, the
-      // 128-byte-pitch size, a generous overestimate, and zero.
+      // Try the tight size, the 128-byte-pitch size, twice the tight size,
+      // and zero.
       size_t sizes[] = {(size_t)W * H * 4, (size_t)((W * 4 + 127) & ~127u) * H, (size_t)W * H * 4 * 2, 0};
       const char* size_names[] = {"tight", "pitch128", "2x", "zero"};
       for (int si = 0; si < 4; si++) {
@@ -552,7 +552,7 @@ void run_s5(GlSession& s) {
       rt.Malloc(&dlinear, (size_t)CW * CH * bpp);
       std::vector<uint8_t> host((size_t)CW * CH * bpp);
 
-      // Register path needs a texture without NT-handle sharing (S5.3).
+      // Register path: a texture without NT-handle sharing.
       GlTarget reg;
       if (!reg.init(s, CW, CH, fmt, 0)) {
         report("S5.5", Verdict::Fail, "%s register-path target setup failed", fmt_name(fmt));
@@ -750,7 +750,7 @@ void run_s5(GlSession& s) {
                  "GL render + %-28s then CUDA map/copy: %d stale, %d garbage of %d",
                  mode == 0 ? "nothing" : mode == 1 ? "glFlush" : mode == 2 ? "glFinish" : "glFlush + fence -> CUDA wait", stale, garbage, N);
         }
-        // Same, through the external-memory array (no map call to order things).
+        // Same, through the external-memory array.
         if (ext_t.fbo) {
           HRESULT hr;
           HANDLE h = create_shared_handle(ext_t.tex.Get(), nullptr, &hr);
@@ -793,7 +793,7 @@ void run_s5(GlSession& s) {
                 wp.params.fence.value = fence_value;
                 rt.WaitExternalSemaphoresAsync(&sem, &wp, 1, stream);
               }
-              rt.MemcpyAsync(dlinear, dlinear, 0, cudaMemcpyDeviceToDevice, stream);  // keep stream ordering explicit
+              rt.MemcpyAsync(dlinear, dlinear, 0, cudaMemcpyDeviceToDevice, stream);
               rt.Memcpy2DFromArray(dlinear, (size_t)CW * 4, level0, 0, 0, (size_t)CW * 4, CH, cudaMemcpyDeviceToDevice);
               rt.MemcpyAsync(host.data(), dlinear, host.size(), cudaMemcpyDeviceToHost, stream);
               rt.StreamSynchronize(stream);

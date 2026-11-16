@@ -3,71 +3,42 @@
 
 //! AHardwareBuffer-backed tensor storage for Android.
 //!
-//! `AHardwareBufferTensor<T>` is the Android counterpart to `DmaTensor<T>`
-//! on Linux and `IoSurfaceTensor<T>` on macOS/iOS: a zero-copy GPU↔CPU
-//! buffer that the OpenGL backend imports directly via
-//! `EGL_ANDROID_image_native_buffer` (`eglGetNativeClientBufferANDROID` →
-//! `eglCreateImageKHR`). All three fit into the `TensorMemory::DmaBuf` slot —
-//! the variant name is shared, the inner storage type differs per platform.
+//! `AHardwareBufferTensor<T>` is the Android counterpart to `DmaTensor<T>` on
+//! Linux and `IoSurfaceTensor<T>` on macOS/iOS: a zero-copy GPU↔CPU buffer that
+//! the OpenGL backend imports directly via `EGL_ANDROID_image_native_buffer`
+//! (`eglGetNativeClientBufferANDROID` → `eglCreateImageKHR`). All three fit
+//! into the `TensorMemory::DmaBuf` slot.
 //!
-//! ## Bindings approach
-//!
-//! Raw FFI to `libnativewindow.so`, the public NDK library whose
-//! AHardwareBuffer C ABI is stable since API 26 (the HAL's Android floor).
-//! This mirrors `iosurface.rs`'s direct `#[link]` to the IOSurface
-//! framework — no `ndk`/`ndk-sys` crate dependency.
+//! The bindings are raw FFI to `libnativewindow.so`.
 //!
 //! ## CPU access
 //!
-//! `map()` returns `AHardwareBufferMap<T>` which holds the buffer locked
-//! (`AHardwareBuffer_lock`) and exposes the base address as a slice;
-//! `unmap()`/`Drop` performs the matching unlock. The lock/unlock pair
-//! carries the CPU **cache-coherency** contract (invalidate on lock,
-//! flush on unlock) — like IOSurface, and unlike Linux DMA-BUF's explicit
-//! `DMA_BUF_IOCTL_SYNC`.
+//! A map holds the buffer locked (`AHardwareBuffer_lock`) and exposes the base
+//! address as a slice; dropping it performs the matching unlock. The lock
+//! invalidates CPU caches and the unlock flushes them. The lock does not wait
+//! for GPU completion.
 //!
-//! **Completion is NOT the lock's job.** For GLES-produced content the
-//! lock's implicit fencing (`fence = -1`) is driver-dependent — plain GL
-//! rendering into an EGLImage sibling does not reliably register a
-//! release fence with gralloc. GPU completion is guaranteed upstream: the
-//! GL worker issues `finish_via_fence()`/`glFinish` before `convert()`
-//! returns, and only then may the CPU map the destination. Do not remove
-//! that GL-side barrier on the assumption that the lock waits.
+//! The shared handle serializes CPU locks: the first live map issues the FFI
+//! lock, further maps of the same buffer (e.g. a parent tensor and a `view()`
+//! sibling) reuse the same base address, and the last unmap issues the FFI
+//! unlock.
 //!
-//! The NDK lock contract does not document refcounted nesting (unlike
-//! `IOSurfaceLock`), and locking an already-locked buffer is undefined —
-//! so the shared handle serializes CPU locks itself: the first live map
-//! issues the FFI lock, further maps of the same buffer (e.g. a parent
-//! tensor and a `view()` sibling) reuse the same base address, and only
-//! the last unmap issues the FFI unlock.
-//!
-//! The lock usage flags must be a subset of what the buffer was allocated
-//! with (they are enum values under `CPU_READ_MASK`/`CPU_WRITE_MASK`, not
-//! independent bits). The tensor records its allocation-time CPU flags;
-//! at lock time the map's requested [`CpuAccess`](crate::CpuAccess)
-//! selects the DIRECTION (read-only maps skip the writeback, write-only
-//! maps can take a write-combined path) while the recorded VALUES
-//! (RARELY/OFTEN) replay exactly. A buffer allocated `CpuAccess::None`
-//! (hardware-only — NPU-direct targets, compressed layouts) refuses
-//! `map()` (`CpuAccessDenied` from the tensor's declaration check),
-//! and a read-only map or read-only import panics on `as_mut_slice()` —
-//! writing through a read-only lock is undefined behaviour per the NDK
-//! contract.
+//! The tensor records its allocation-time CPU usage flags. At lock time the
+//! map's requested [`CpuAccess`](crate::CpuAccess) selects the direction and
+//! the recorded RARELY/OFTEN values are replayed. A buffer allocated
+//! `CpuAccess::None` refuses `map()` with `CpuAccessDenied`, and a read-only
+//! map or read-only import panics on `as_mut_slice()`.
 //!
 //! ## Geometry
 //!
-//! `AHardwareBuffer_Desc.stride` is an **output** parameter in **pixels**:
-//! gralloc chooses the row pitch at allocation. The tensor caches the
-//! derived byte pitch and allocation size at construction — CPU consumers
-//! must never recompute a row as `width × bpe`.
+//! `AHardwareBuffer_Desc.stride` is an output parameter in pixels: gralloc
+//! chooses the row pitch at allocation. The tensor caches the derived byte
+//! pitch and allocation size at construction.
 //!
-//! Generic byte-bag allocations use `AHARDWAREBUFFER_FORMAT_BLOB` (a
-//! 1-"row" byte buffer, the layout NNAPI itself uses for tensors and the
-//! analog of `iosurface.rs`'s 1-row `L008` surface). Image-formatted
-//! allocations use the real pixel formats so the GL backend can bind them
-//! as textures; the `(PixelFormat, DType) → format` table is
-//! [`image_ahardwarebuffer_layout`], the single source of truth shared
-//! with the image crate's import path.
+//! Generic byte allocations use `AHARDWAREBUFFER_FORMAT_BLOB` (a 1-row byte
+//! buffer). Image-formatted allocations use the real pixel formats so the GL
+//! backend can bind them as textures; the `(PixelFormat, DType) → format` table
+//! is [`image_ahardwarebuffer_layout`].
 
 #![cfg(target_os = "android")]
 
@@ -104,22 +75,17 @@ struct ARect {
     bottom: i32,
 }
 
-// The AHardwareBuffer_Desc struct, format constants, and the pure layout
-// math (format table, descriptor geometry, checked shape footprints) live
-// in `ahardwarebuffer_layout.rs` — compiled and unit-tested on every host
-// (this FFI module is cfg(android) and no CI lane executes it).
+// The `AHardwareBuffer_Desc` struct, format constants, and the layout math live
+// in `ahardwarebuffer_layout.rs`.
 
-// AHardwareBuffer_UsageFlags GPU bits (subset used by the HAL). The CPU
-// usage bits + the lock-usage decision live in `ahardwarebuffer_layout.rs`
-// (host-compiled + unit-tested).
+// AHardwareBuffer_UsageFlags GPU bits (subset used by the HAL).
 /// Sampleable as a GPU texture (`glEGLImageTargetTexture2DOES`).
 const USAGE_GPU_SAMPLED_IMAGE: u64 = 0x100;
-/// Renderable as a GPU color attachment (FBO render target). Named
-/// `AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT` in current NDK headers;
-/// `GPU_FRAMEBUFFER` is the original (still-valid) alias, same value.
+/// Renderable as a GPU color attachment (FBO render target):
+/// `AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT`, of which `GPU_FRAMEBUFFER` is an
+/// alias.
 const USAGE_GPU_FRAMEBUFFER: u64 = 0x200;
-/// Usable as a GPU data buffer; kept on BLOB allocations for the future
-/// NNAPI/LiteRT zero-copy handoff.
+/// Usable as a GPU data buffer; set on BLOB allocations.
 const USAGE_GPU_DATA_BUFFER: u64 = 0x1000000;
 
 /// CPU usage bits for a declared [`CpuAccess`](crate::CpuAccess).
@@ -160,11 +126,10 @@ extern "C" {
     ) -> i32;
 }
 
-/// `AHardwareBuffer_getId` (API 31+): the system's stable 64-bit id for
-/// a buffer, identical across every wrap/import of the same allocation
-/// in the process. Resolved lazily via `dlsym` so the HAL keeps its
-/// API-26 link floor — `None` on API 26–30 (symbol absent) and every
-/// wrap keeps today's fresh-identity behavior.
+/// `AHardwareBuffer_getId` (API 31+): the system's stable 64-bit id for a
+/// buffer, identical across every wrap/import of the same allocation in the
+/// process. Resolved lazily via `dlsym`; `None` on API 26–30, where the symbol
+/// is absent.
 fn ahardwarebuffer_get_id(buffer: AHardwareBufferRef) -> Option<u64> {
     type GetIdFn = unsafe extern "C" fn(AHardwareBufferRef, *mut u64) -> i32;
     static GET_ID: std::sync::OnceLock<Option<GetIdFn>> = std::sync::OnceLock::new();
@@ -193,21 +158,8 @@ fn ahardwarebuffer_get_id(buffer: AHardwareBufferRef) -> Option<u64> {
     (unsafe { get_id(buffer, &mut id) } == 0).then_some(id)
 }
 
-/// Derive the [`BufferIdentity`] for `buffer`.
-///
-/// API 31+: derive from `AHardwareBuffer_getId`, the system's own id for the
-/// allocation. It is stable across every wrap of the same buffer (CameraX/
-/// ImageReader re-wraps, export → re-import), so two independently-linked
-/// copies of this crate agree on it — without this, a re-wrap crossing a
-/// library boundary would mint a fresh identity and the GL backend's
-/// EGLImage import cache would miss (and re-import) every frame instead of
-/// reusing the bound import.
-///
-/// Pre-API-31: no system-wide id exists. The buffer POINTER is unique among
-/// live buffers in this process, which is all a per-process cache needs. A
-/// shared constant would give every pre-31 buffer the same identity and let
-/// the cache match one buffer's texture to another's — `derived` is
-/// `(kind << 56) ^ key`, so a constant key is a constant id.
+/// Derive the [`BufferIdentity`] for `buffer`: from `AHardwareBuffer_getId` on
+/// API 31+, and from the buffer pointer before API 31.
 fn buffer_identity(buffer: &OwnedAHardwareBuffer) -> BufferIdentity {
     crate::ahardwarebuffer_layout::identity_from_parts(
         ahardwarebuffer_get_id(buffer.as_ptr()),
@@ -216,9 +168,8 @@ fn buffer_identity(buffer: &OwnedAHardwareBuffer) -> BufferIdentity {
 }
 
 /// The device's native tile-compression scheme, classified from the
-/// `ro.hardware.egl` system property (`scheme_for_egl_vendor`). Cached:
-/// `ro.*` properties are fixed at boot. `None` on emulators and
-/// unrecognized vendors — compression requests then resolve linear.
+/// `ro.hardware.egl` system property (`scheme_for_egl_vendor`) and cached.
+/// `None` on emulators and unrecognized vendors.
 pub(crate) fn device_compression_scheme() -> Option<crate::CompressionScheme> {
     static SCHEME: std::sync::OnceLock<Option<crate::CompressionScheme>> =
         std::sync::OnceLock::new();
@@ -245,30 +196,15 @@ pub(crate) fn device_compression_scheme() -> Option<crate::CompressionScheme> {
 }
 
 /// Owned AHardwareBuffer handle. Releases on Drop via
-/// `AHardwareBuffer_release`. Cloneable via Arc — every clone shares the
-/// same underlying buffer (mirrors `OwnedIoSurface`).
+/// `AHardwareBuffer_release`. Cloneable via Arc: every clone shares the same
+/// underlying buffer.
 #[derive(Debug, Clone)]
 pub(crate) struct OwnedAHardwareBuffer {
     inner: Arc<AhbHandle>,
 }
 
-/// Inner wrapper running the actual release in Drop. The Arc means the
-/// buffer is released exactly once when the last clone drops.
-///
-/// Also owns the process-side CPU-lock state: the NDK lock contract does
-/// not document refcounted nesting (unlike `IOSurfaceLock`), and locking
-/// an already-locked buffer is undefined — so the first live map issues
-/// the FFI lock, further concurrent maps of the same buffer (a parent
-/// tensor and its `view()` siblings share this handle) reuse the recorded
-/// base address, and only the last unmap issues the FFI unlock. Nested
 /// Keepalive holding an AHardwareBuffer's CPU lock for a [`HostPin`]'s life.
-///
-/// The NDK gives no address outside `AHardwareBuffer_lock`, so — as with a PBO
-/// — the lock IS the lifetime. Releasing here, when the last clone of the pin
-/// drops, reproduces `AHardwareBufferMap`'s unlock through `Arc`.
-// Staged for the HostView collapse (Plan 2b Task 4): constructed once
-// map_with migrates to HostView. Kept compiling and reviewable rather than
-// landing the whole collapse in one unverifiable change.
+/// The lock is released when the last clone of the pin drops.
 #[allow(dead_code)]
 pub(crate) struct AhbMapLock {
     buffer: OwnedAHardwareBuffer,
@@ -280,8 +216,13 @@ impl Drop for AhbMapLock {
     }
 }
 
-/// maps reuse the live lock only when its usage direction covers theirs
-/// (the lock cannot be widened while held — see `lock_shared`).
+/// Inner wrapper that releases the buffer on drop, once, when the last clone
+/// drops.
+///
+/// Also owns the CPU-lock state: the first live map issues the FFI lock,
+/// further concurrent maps of the same buffer reuse the recorded base address,
+/// and the last unmap issues the FFI unlock. A nested map reuses the live lock
+/// only when its usage direction covers the request.
 #[derive(Debug)]
 struct AhbHandle {
     ptr: AHardwareBufferRef,
@@ -294,16 +235,14 @@ struct LockState {
     count: usize,
     /// Base address returned by the (single) FFI lock while `count > 0`.
     base: *mut c_void,
-    /// CPU usage bits of the live FFI lock. A nested map may reuse the
-    /// lock only when its requested direction is covered by these bits —
-    /// widening would require re-locking, which the NDK contract does not
-    /// allow while locked.
+    /// CPU usage bits of the live FFI lock. A nested map may reuse the lock
+    /// only when its requested direction is covered by these bits.
     usage: u64,
 }
 
 // SAFETY: AHardwareBuffer is a thread-safe, refcounted kernel object; the
-// pointer may be shared and released from any thread (same contract as
-// `IoSurfaceHandle`). The lock state is Mutex-guarded.
+// pointer may be shared and released from any thread. The lock state is
+// Mutex-guarded.
 unsafe impl Send for AhbHandle {}
 unsafe impl Sync for AhbHandle {}
 
@@ -386,16 +325,14 @@ impl OwnedAHardwareBuffer {
         self.inner.ptr
     }
 
-    /// Acquire the (refcounted) CPU lock — see [`AhbHandle`]. Returns the
-    /// buffer's base address. Every successful call must be balanced by
-    /// exactly one [`Self::unlock_shared`].
+    /// Acquire the refcounted CPU lock (see [`AhbHandle`]). Returns the
+    /// buffer's base address. Every successful call must be balanced by exactly
+    /// one [`Self::unlock_shared`].
     fn lock_shared(&self, cpu_usage: u64) -> Result<*mut c_void> {
         let mut st = self.inner.lock.lock().unwrap_or_else(|e| e.into_inner());
         if st.count > 0 {
-            // Nested maps reuse the live lock ONLY when its direction
-            // covers the request — the NDK lock cannot be widened while
-            // held, and pretending otherwise would hand out a base whose
-            // cache maintenance does not match the promised access.
+            // A nested map reuses the live lock only when its direction covers
+            // the request.
             if cpu_usage & st.usage != cpu_usage {
                 return Err(Error::InvalidOperation(format!(
                     "concurrent AHardwareBuffer map with wider access \
@@ -408,10 +345,7 @@ impl OwnedAHardwareBuffer {
             return Ok(st.base);
         }
         let mut base: *mut c_void = std::ptr::null_mut();
-        // fence = -1: no explicit acquire fence. This is a cache-coherency
-        // barrier only — GPU completion for GLES-produced content is
-        // guaranteed by the GL worker's finish/fence before convert()
-        // returns, NOT by this lock (see the module docs).
+        // fence = -1: no explicit acquire fence.
         let rc = unsafe {
             AHardwareBuffer_lock(self.inner.ptr, cpu_usage, -1, std::ptr::null(), &mut base)
         };
@@ -463,18 +397,14 @@ where
     pub shape: Vec<usize>,
     pub _marker: PhantomData<T>,
     identity: BufferIdentity,
-    /// CPU-accessible allocation size in bytes: `bytes_per_row × height`
-    /// (BLOB: the requested length). Cached at construction from the
-    /// allocator-filled descriptor — never re-derived per map.
+    /// CPU-accessible allocation size in bytes: `bytes_per_row × height` (BLOB:
+    /// the requested length). Cached at construction from the allocator-filled
+    /// descriptor.
     pub(crate) buf_size: usize,
-    /// Row pitch in bytes (`desc.stride` pixels × bytes-per-element), the
-    /// authoritative stride for CPU row iteration. For BLOB byte-bags this
-    /// equals the whole allocation (single-row semantics, like the
-    /// IOSurface `L008` byte-bag).
+    /// Row pitch in bytes (`desc.stride` pixels × bytes-per-element). For BLOB
+    /// buffers this equals the whole allocation.
     pub(crate) bytes_per_row: usize,
-    /// Physical descriptor dimensions in texels, fixed for the buffer's
-    /// life (a reused pool buffer keeps these while `configure_image`
-    /// changes the logical shape).
+    /// Physical descriptor dimensions in texels, fixed for the buffer's life.
     physical_dims: (usize, usize),
     /// CPU usage flags (`CPU_READ_*`/`CPU_WRITE_*` values) the buffer was
     /// allocated/imported with; replayed by `AHardwareBuffer_lock`.
@@ -490,9 +420,6 @@ where
     T: Num + Clone + fmt::Debug + Send + Sync,
 {
     /// Acquire a host address valid for as long as the returned pin lives.
-    ///
-    /// Private on purpose: this is NOT `pin_host`, which refuses
-    /// AHardwareBuffer precisely because the address cannot outlive the lock.
     #[allow(dead_code)]
     pub(crate) fn scoped_pin<'a>(&self, access: crate::CpuAccess) -> Result<crate::pin::HostPin<'a>>
     where
@@ -537,9 +464,6 @@ where
     }
 
     fn memory(&self) -> TensorMemory {
-        // Unified variant: Android reports Dma, same as Linux DMA-BUF and
-        // macOS IOSurface. The variant name is shared; the inner storage
-        // type differs per platform.
         TensorMemory::DmaBuf
     }
 
@@ -552,9 +476,7 @@ where
     }
 
     fn reshape(&mut self, shape: &[usize]) -> Result<()> {
-        // Overflow-checked byte footprints: a wrapped product that happens
-        // to collide with the current count must not smuggle in a bogus
-        // shape (same rule as `set_logical_shape`/`view`).
+        // Overflow-checked byte footprints.
         let new_bytes = checked_shape_bytes::<T>(shape)?;
         let cur_bytes = checked_shape_bytes::<T>(&self.shape)?;
         if new_bytes != cur_bytes {
@@ -589,9 +511,7 @@ where
             return Err(Error::InvalidSize(0));
         }
         let needed = checked_shape_bytes::<T>(shape)?;
-        // A viewed tensor's window is what remains past its offset — a
-        // shape that fits the whole buffer but not the window would then
-        // fail at map() time; reject it here instead.
+        // A viewed tensor's capacity is what remains past its offset.
         let capacity = self.buf_size.saturating_sub(self.view_offset);
         if needed > capacity {
             return Err(Error::InsufficientCapacity { needed, capacity });
@@ -600,11 +520,9 @@ where
         Ok(())
     }
 
-    /// Zero-copy sub-region view sharing this buffer (acquired via the
-    /// `Arc`-backed `OwnedAHardwareBuffer`) and [`BufferIdentity`],
-    /// positioned at `offset_bytes` from this tensor's own window with
-    /// logical `shape`. Mirrors [`IoSurfaceTensor::view`] /
-    /// [`DmaTensor::view`](crate::TensorTrait::view).
+    /// Zero-copy sub-region view sharing this buffer and [`BufferIdentity`],
+    /// positioned at `offset_bytes` from this tensor's own window with logical
+    /// `shape`.
     ///
     /// # Errors
     ///
@@ -652,11 +570,9 @@ impl<T> AHardwareBufferTensor<T>
 where
     T: Num + Clone + fmt::Debug + Send + Sync,
 {
-    /// Allocate a BLOB buffer large enough to hold `byte_size` bytes
-    /// arranged as `shape`. The GL backend separately allocates
-    /// properly-formatted image buffers via [`Self::new_image`]; BLOB
-    /// buffers carry `GPU_DATA_BUFFER` for the NNAPI-style tensor handoff
-    /// but cannot bind as GL textures.
+    /// Allocate a BLOB buffer large enough to hold `byte_size` bytes arranged
+    /// as `shape`. BLOB buffers carry `GPU_DATA_BUFFER` usage and cannot bind
+    /// as GL textures.
     pub(crate) fn new_with_byte_size(
         shape: &[usize],
         byte_size: usize,
@@ -704,25 +620,18 @@ where
         })
     }
 
-    /// Allocate an image-formatted AHardwareBuffer — real pixel format +
-    /// 2D dimensions, suitable for EGLImage import on the GL backend
+    /// Allocate an image-formatted AHardwareBuffer (pixel format and 2D
+    /// dimensions) for EGLImage import on the GL backend
     /// (`eglGetNativeClientBufferANDROID` → `eglCreateImageKHR`).
     ///
-    /// For planar F16 formats (`PlanarRgb`, `PlanarRgba`) the buffer is
-    /// an RGBA16F surface sized `(W/4, C*H)` via `packed_rgba16f_layout`
-    /// — 4 contiguous f16 elements of the planar `[C, H, W]` byte stream
-    /// per pixel, the same geometry as the macOS IOSurface path. Whether
-    /// the locked base address is consumable FLAT as `&[f16]` shaped
-    /// `[1, C, H, W]` depends on gralloc: when the allocator pads the
-    /// pixel stride (Qualcomm SnapAlloc does, observed on the S26 Ultra),
-    /// `Tensor::image` records the padded pitch and CPU consumers must
-    /// iterate rows via `effective_row_stride()`; flat consumers (the
-    /// future NPU handoff) must check `row_stride()` and repack when set.
+    /// For planar F16 formats (`PlanarRgb`, `PlanarRgba`) the buffer is an
+    /// RGBA16F surface sized `(W/4, C*H)` via `packed_rgba16f_layout`: 4
+    /// contiguous f16 elements of the planar `[C, H, W]` byte stream per pixel.
+    /// When the allocator pads the pixel stride, `Tensor::image` records the
+    /// padded pitch.
     ///
-    /// Buffers are allocated with GPU sample + render + CPU read/write
-    /// usage (the combination validated on-device by the Phase-1 probe).
-    /// Role-tuned usage (e.g. dropping CPU flags for NPU-direct targets)
-    /// is a planned follow-up alongside fence export.
+    /// Buffers are allocated with GPU sample and render usage plus the CPU
+    /// usage of `access`.
     pub(crate) fn new_image(
         width: usize,
         height: usize,
@@ -748,12 +657,10 @@ where
             ))
         })?;
 
-        // Surface geometry per (format, dtype) — same scheme as the macOS
-        // IOSurface path (see `iosurface.rs::new_image`): packed formats
-        // use (width, height); planar F16 packs into RGBA16F at
-        // `(W/4, C*H)` via the canonical `packed_rgba16f_layout`; packed
-        // RGB u8 packs into RGBA8888 at `(W*3/4, H)` via
-        // `packed_rgb888_layout`.
+        // Surface geometry per (format, dtype): packed formats use (width,
+        // height); planar F16 packs into RGBA16F at `(W/4, C*H)` via
+        // `packed_rgba16f_layout`; packed RGB u8 packs into RGBA8888 at
+        // `(W*3/4, H)` via `packed_rgb888_layout`.
         let (surface_width, surface_height) = match (format, dtype) {
             (PixelFormat::PlanarRgb | PixelFormat::PlanarRgba, DType::F16) => {
                 let layout =
@@ -786,11 +693,8 @@ where
                 .map_err(|_| Error::InvalidSize(surface_height))?,
             layers: 1,
             format: ahb_format,
-            // Hardware access is implied (GPU sample + render covers
-            // source, destination, and intermediate roles); CPU usage
-            // bits come from the caller's declared CpuAccess. A
-            // hardware-only allocation (CpuAccess::None) is what makes
-            // the buffer eligible for gralloc's vendor tile compression.
+            // GPU sample and render usage, plus the CPU usage bits of the
+            // declared `CpuAccess`.
             usage: USAGE_GPU_SAMPLED_IMAGE | USAGE_GPU_FRAMEBUFFER | cpu_usage_bits_for(access),
             stride: 0,
             rfu0: 0,
@@ -799,11 +703,7 @@ where
         let (buffer, desc) = match OwnedAHardwareBuffer::allocate(desc) {
             Ok(ok) => ok,
             Err(e) if access == crate::CpuAccess::None => {
-                // Some gralloc implementations reject hardware-only image
-                // allocations for certain formats (observed risk class on
-                // budget-tier devices). Retry once with CPU r/w bits so
-                // the allocation degrades to linear-but-working rather
-                // than failing outright — loudly, never silently.
+                // Retry once with CPU read/write usage bits.
                 log::warn!(
                     "AHardwareBuffer hardware-only allocation failed for \
                      {format:?}/{dtype:?} {width}x{height} ({e:?}); retrying \
@@ -853,29 +753,21 @@ where
         })
     }
 
-    /// Wrap an existing AHardwareBuffer as a tensor. Used to import
-    /// externally-allocated buffers (CameraX/ImageReader frames handed
-    /// through JNI, NNAPI blobs, cross-process buffers received via
-    /// binder).
+    /// Wrap an existing AHardwareBuffer as a tensor.
     ///
-    /// The buffer is acquired for the tensor's lifetime; the external
-    /// owner keeps its own reference and must release it independently.
+    /// The buffer is acquired for the tensor's lifetime; the external owner
+    /// keeps its own reference and must release it independently. The public
+    /// entry point is [`crate::Tensor::from_hardware_buffer`].
     ///
-    /// The type-erased/typed public entry point is
-    /// [`crate::Tensor::from_hardware_buffer`]; most callers should
-    /// prefer that over this inner constructor.
+    /// # Errors
+    ///
+    /// `InvalidShape` if the shape footprint exceeds the buffer's derived
+    /// allocation size. `NotImplemented` for multi-planar YUV formats (camera
+    /// NV12/YUV_420_888).
     ///
     /// # Safety
     ///
-    /// The caller must ensure `buffer_ptr` is a valid live AHardwareBuffer
-    /// pointer. Passing a stale or invalid pointer is UB.
-    ///
-    /// The shape footprint is validated against the buffer's derived
-    /// allocation size and the constructor returns `Err(InvalidShape)` if
-    /// it does not fit. Multi-planar YUV formats (camera NV12/YUV_420_888)
-    /// are refused with `NotImplemented` for now: their CPU mapping needs
-    /// `AHardwareBuffer_lockPlanes` (API 29) and their GL sampling needs
-    /// the external-OES path — both planned follow-ups.
+    /// `buffer_ptr` must be a valid live AHardwareBuffer pointer.
     pub unsafe fn from_hardware_buffer(
         buffer_ptr: *mut c_void,
         shape: &[usize],
@@ -891,8 +783,7 @@ where
                 ))
             })?;
 
-            // Overflow-checked: the element product itself can wrap before a
-            // checked byte multiply would notice.
+            // Overflow-checked byte footprint.
             let requested = checked_shape_bytes::<T>(shape)?;
             if requested > buf_size {
                 return Err(Error::InvalidShape(format!(
@@ -923,34 +814,30 @@ where
     }
 
     /// Row pitch in bytes derived from the allocator-chosen `desc.stride`
-    /// (pixels × bytes-per-element). For image-formatted buffers this is
-    /// the authoritative row stride; CPU consumers must iterate rows by
-    /// this value, never `width × bpe`.
+    /// (pixels × bytes-per-element). For image-formatted buffers this is the
+    /// row stride.
     pub(crate) fn bytes_per_row(&self) -> usize {
         self.bytes_per_row
     }
 
     /// Physical buffer dimensions in texels (`AHardwareBuffer_Desc`
-    /// width/height), independent of the tensor's current logical shape.
-    /// Fixed for the buffer's life — a reused pool buffer keeps these
-    /// while `configure_image` changes the logical frame shape per decode.
+    /// width/height), independent of the tensor's current logical shape and
+    /// fixed for the buffer's life.
     pub(crate) fn physical_surface_dims(&self) -> (usize, usize) {
         self.physical_dims
     }
 
-    /// Row pitch to honour as an *image* stride when a tensor is
-    /// reconfigured to a smaller image (`Tensor::configure_image`), or
-    /// `None` for a BLOB byte-bag whose single "row" is the whole
-    /// allocation (same rule as the IOSurface `L008` byte-bag).
+    /// Row pitch to honour as an image stride when a tensor is reconfigured to
+    /// a smaller image (`Tensor::configure_image`), or `None` for a BLOB buffer
+    /// whose single row is the whole allocation.
     pub(crate) fn image_backing_row_stride(&self) -> Option<usize> {
         let (_w, h) = self.physical_dims;
         (h > 1).then_some(self.bytes_per_row)
     }
 
-    /// Lock and map exposing `byte_size` bytes via `as_slice()` for
-    /// strided row iteration. The caller (`Tensor::map`) validates
-    /// `byte_size <= buf_size` first. The lock yields the full buffer base
-    /// address, so the strided view is genuinely zero-copy.
+    /// Lock and map exposing `byte_size` bytes via `as_slice()` for strided row
+    /// iteration. The caller (`Tensor::map`) validates `byte_size <= buf_size`
+    /// first.
     pub(crate) fn map_with_byte_size<'a>(
         &self,
         byte_size: usize,
@@ -962,9 +849,8 @@ where
         self.map_inner(Some(byte_size), access)
     }
 
-    /// Shared map constructor. Keeps the window check the map types performed
-    /// and acquires the CPU lock through `scoped_pin`, whose keepalive unlocks
-    /// on drop.
+    /// Shared map constructor: checks the window and acquires the CPU lock
+    /// through `scoped_pin`, whose keepalive unlocks on drop.
     fn map_inner<'a>(
         &self,
         byte_size_override: Option<usize>,
@@ -1031,20 +917,17 @@ where
         }
     }
 
-    /// Wrap an externally-allocated AHardwareBuffer as a tensor (Android
-    /// only). Used to import buffers from CameraX/ImageReader (via JNI),
-    /// NNAPI, or cross-process binder transfers. The buffer is acquired
-    /// for the tensor's lifetime; the external owner keeps its own
-    /// reference and must release it independently.
+    /// Wrap an externally-allocated AHardwareBuffer as a tensor (Android only).
+    /// The buffer is acquired for the tensor's lifetime; the external owner
+    /// keeps its own reference and must release it independently.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidShape` if the shape footprint exceeds the buffer's allocation.
     ///
     /// # Safety
     ///
-    /// `buffer_ptr` must be a valid live AHardwareBuffer pointer. Passing
-    /// a stale or invalid pointer is UB.
-    ///
-    /// HAL validates that the shape footprint fits within the buffer's
-    /// allocation and returns `Err(InvalidShape)` otherwise. The
-    /// pointer-validity requirement above is the caller's responsibility.
+    /// `buffer_ptr` must be a valid live AHardwareBuffer pointer.
     pub unsafe fn from_hardware_buffer(
         buffer_ptr: *mut c_void,
         shape: &[usize],
@@ -1055,9 +938,7 @@ where
     {
         let inner =
             unsafe { AHardwareBufferTensor::<T>::from_hardware_buffer(buffer_ptr, shape, name)? };
-        // The imported buffer's usage bits ARE its CPU-access declaration:
-        // derive it so `map_with` treats wrapped external buffers (camera,
-        // NNAPI) with the same declared-vs-requested telemetry as ours.
+        // Derive the declared CPU access from the imported buffer's usage bits.
         let declared = match (
             inner.cpu_usage & USAGE_CPU_READ_MASK != 0,
             inner.cpu_usage & USAGE_CPU_WRITE_MASK != 0,
@@ -1074,20 +955,13 @@ where
 }
 
 // ---------------------------------------------------------------------------
-// AHardwareBufferMap — locked-for-CPU view.
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
 // (PixelFormat, DType) → AHardwareBuffer format mapping
 // ---------------------------------------------------------------------------
 
-/// Public re-export of the `(PixelFormat, DType) → (AHardwareBuffer
-/// format, bytes-per-element)` mapping for callers in other crates
-/// (specifically the `edgefirst-image` Android GL backend). Returns `None`
-/// when the pair has no AHardwareBuffer mapping. The table itself lives in
-/// the host-tested [`ahardwarebuffer_layout`](crate::ahardwarebuffer_layout)
-/// module (single source of truth — see its docs for the per-format
-/// rationale).
+/// The `(PixelFormat, DType) → (AHardwareBuffer format, bytes-per-element)`
+/// mapping, for callers in other crates. Returns `None` when the pair has no
+/// AHardwareBuffer mapping. The table lives in the
+/// [`ahardwarebuffer_layout`](crate::ahardwarebuffer_layout) module.
 pub fn image_ahardwarebuffer_layout(format: PixelFormat, dtype: DType) -> Option<(u32, usize)> {
     image_format_and_bpe(format, dtype)
 }

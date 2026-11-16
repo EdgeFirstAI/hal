@@ -22,29 +22,22 @@ SUMMARY_RE = re.compile(
 )
 
 # The start of a single test's line: "test some::name ... ".
-# `test result: ok.` cannot match: after the name it needs a literal " ... ".
 TEST_START_RE = re.compile(r'^test ([\w:]+) \.\.\. ?', re.M)
 
 # A verdict, either immediately after the "... " or at the start of a later
-# line. With --test-threads=1 libtest prints "test NAME ... ", then the test
-# runs and its own log output lands on the same stream, then the verdict is
-# printed. So the verdict can be many lines below the name it belongs to.
+# line.
 VERDICT_RE = re.compile(r'(?:\A|^)(ok|FAILED|ignored)\b', re.M)
 
-# Boundaries that a verdict search must never run past.
+# Boundaries of a verdict search.
 STOP_RE = re.compile(r'^(?:test result:|failures:|running \d+ tests?)', re.M)
 
 
 def _parse_tests(content: str, test_binary: str) -> list:
     """Extract one entry per `test NAME ... VERDICT`, tolerating log noise.
 
-    The naive single-line pattern `test ([\\w:]+) \\.\\.\\. (ok|FAILED|ignored)`
-    silently drops every test that logs between its name and its verdict,
-    which on the hardware lane is most of the GL suite. Here the name and the
-    verdict are matched separately and paired by position, with the search
-    for a verdict bounded by the next test's name or the suite summary so a
-    test that produces no verdict at all (a process abort mid-run) cannot
-    steal the next test's.
+    The name and the verdict are matched separately and paired by position.
+    The search for a verdict is bounded by the next test's name or the suite
+    summary.
     """
     starts = list(TEST_START_RE.finditer(content))
     tests = []
@@ -56,11 +49,8 @@ def _parse_tests(content: str, test_binary: str) -> list:
             window = window[:stop.start()]
         verdict = VERDICT_RE.search(window)
         if verdict is None:
-            # No verdict before the next test or the summary: the test did
-            # not report (e.g. the process died inside it). Counted by the
-            # summary line if libtest got far enough to print one; not
-            # inventable here, so it is left out of the testcase list rather
-            # than guessed at.
+            # No verdict before the next test or the summary: the test is
+            # left out of the testcase list.
             continue
         tests.append({
             'name': start.group(1),
@@ -107,8 +97,7 @@ def generate_junit_xml(results_dir: str, output_file: str, min_tests: int = 0) -
         with open(txt_file, 'r') as f:
             content = f.read()
 
-        # Every summary line in the file, not just the first: one output file
-        # can hold more than one suite.
+        # Every summary line in the file.
         summaries = list(SUMMARY_RE.finditer(content))
         if not summaries:
             continue
@@ -119,9 +108,7 @@ def generate_junit_xml(results_dir: str, output_file: str, min_tests: int = 0) -
 
         tests.extend(_parse_tests(content, test_binary))
 
-    # The authoritative count of tests that actually ran. It comes from
-    # libtest's own summary lines, so unlike a per-test scrape it cannot move
-    # when a test becomes more or less chatty.
+    # The count of tests that ran, from libtest's summary lines.
     executed = total_passed + total_failed
 
     # Generate JUnit XML
@@ -148,9 +135,7 @@ def generate_junit_xml(results_dir: str, output_file: str, min_tests: int = 0) -
           f"({total_passed} passed, {total_failed} failed, "
           f"{total_ignored} ignored), {len(tests)} named test cases")
 
-    # The testcase list is a scrape and the summaries are authoritative, so
-    # say so when they disagree instead of letting the smaller number pass
-    # for the truth.
+    # Report a disagreement between the testcase list and the summaries.
     named_expected = executed + total_ignored
     if len(tests) != named_expected:
         print(f"::warning::named {len(tests)} test cases but the summary lines "

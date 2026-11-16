@@ -13,26 +13,18 @@ use four_char_code::FourCharCode;
 use g2d_sys::{G2DFormat, G2DPhysical, G2DSurface, G2D};
 use std::{os::fd::AsRawFd, time::Instant};
 
-/// Pure colorimetry-eligibility predicate for the G2D backend.
+/// Colorimetry-eligibility predicate for the G2D backend.
 ///
-/// G2D is **matrix-only**: the g2d-sys API exposes `set_bt601_colorspace()` and
-/// `set_bt709_colorspace()` (the YCbCr matrix selection) but has **no control
-/// over quantization range** — the hardware is effectively limited-range only —
-/// and exposes **no BT.2020 matrix**. Therefore:
-///
-/// - A YUV conversion whose resolved range is `Full` must be DECLINED so the
-///   `ImageProcessor` dispatch falls through to the OpenGL / CPU backends,
-///   which honour full vs limited range correctly.
-/// - Any `Bt2020`-encoded conversion must be DECLINED (G2D cannot express it),
-///   again falling through to GL / CPU.
+/// G2D selects a YCbCr matrix (BT.601 or BT.709) and has no control over
+/// quantization range (limited-range only) and no BT.2020 matrix. A YUV
+/// conversion whose resolved range is `Full`, and any `Bt2020`-encoded
+/// conversion, is declined.
 ///
 /// `src_is_yuv` is `true` when the conversion has a YUV side whose colorimetry
 /// matters (YUV→RGB uses the source colorimetry, RGB→YUV uses the destination).
-/// For RGB→RGB (no YUV side) the full-range rule is N/A and only the BT.2020
-/// matrix restriction applies.
+/// For RGB→RGB only the BT.2020 restriction applies.
 pub(crate) fn g2d_can_handle(cm: &Colorimetry, src_is_yuv: bool) -> bool {
-    // G2D matrix-only (no range control) and no BT.2020: decline full-range YUV
-    // and BT.2020.
+    // Declines full-range YUV and BT.2020.
     !(src_is_yuv && cm.range == Some(ColorRange::Full))
         && cm.encoding != Some(ColorEncoding::Bt2020)
 }
@@ -48,8 +40,7 @@ const G2D_SOURCES: [PixelFormat; 4] = [
     PixelFormat::Bgra,
 ];
 
-/// Whether G2D blits a `src` image into a `dst` image. VYUY is absent: the
-/// i.MX8MP G2D rejects VYUY blits, so `ImageProcessor` falls through to CPU.
+/// Whether G2D blits a `src` image into a `dst` image. VYUY is absent.
 fn g2d_supports(src: PixelFormat, dst: PixelFormat) -> bool {
     use PixelFormat::*;
     matches!(
@@ -73,8 +64,7 @@ pub(crate) fn dst_cpu_access(
 
 /// The CPU access G2D's own post-passes need on a destination: `ReadWrite`
 /// for `I8` (the bias reads back the blit) and for an `Rgb` letterbox border
-/// (`g2d_clear` has no 3-byte formats, and a CPU write of part of a
-/// device-written buffer needs a cache-invalidating map), else `None`.
+/// (a CPU fill), else `None`.
 pub(crate) fn g2d_post_pass_access(
     format: PixelFormat,
     dtype: DType,
@@ -119,7 +109,7 @@ fn pixelfmt_to_fourcc(fmt: PixelFormat) -> FourCharCode {
         PixelFormat::Vyuy => four_char_code!("VYUY"),
         PixelFormat::Nv12 => four_char_code!("NV12"),
         PixelFormat::Nv16 => four_char_code!("NV16"),
-        // Planar formats have no standard FourCC; use RGBA as fallback
+        // Planar formats map to RGBA.
         _ => four_char_code!("RGBA"),
     }
 }
@@ -138,18 +128,12 @@ unsafe impl Sync for G2DProcessor {}
 impl G2DProcessor {
     /// Creates a new G2DConverter instance.
     ///
-    /// The BT.709 matrix set here is only a safe default; each `convert()` call
-    /// re-programs the matrix from the resolved colorimetry of the YUV side of
-    /// that conversion (see `convert_impl`). G2D is matrix-only — it has no
-    /// range control (limited-range only) and no BT.2020 matrix — so full-range
-    /// YUV and BT.2020 conversions are declined and fall through to GL/CPU.
+    /// Each `convert()` call programs the colorspace matrix from the resolved
+    /// colorimetry of the YUV side of that conversion. Full-range YUV and
+    /// BT.2020 conversions are declined.
     pub fn new() -> Result<Self> {
         let mut g2d = G2D::new(G2D_LIBRARY)?;
-        // Safe initial default only: every `convert()` re-programs the matrix
-        // from the resolved colorimetry of that conversion (see `convert_impl`).
-        // The g2d-sys API selects only the matrix, not full-vs-limited range, so
-        // G2D is limited-range only — full-range and BT.2020 are declined and
-        // fall through to GL/CPU (a structural hardware limit, not a stop-gap).
+        // Initial matrix; every `convert()` programs its own.
         g2d.set_bt601_colorspace()?;
 
         log::debug!("G2DConverter created with version {:?}", g2d.version());
@@ -160,9 +144,8 @@ impl G2DProcessor {
     }
 
     /// Sets how resizing converts resample (see [`crate::Interpolation`]).
-    /// G2D scales with a fixed hardware filter, so under
-    /// [`crate::Interpolation::Nearest`] it declines converts that resize and
-    /// leaves them to a backend that can sample nearest-neighbour.
+    /// Under [`crate::Interpolation::Nearest`] G2D declines converts that
+    /// resize.
     pub fn set_interpolation(&mut self, mode: crate::Interpolation) {
         self.interpolation = mode;
     }
@@ -222,16 +205,10 @@ impl G2DProcessor {
         require_post_pass_access(dst_dyn, &crop)?;
 
         // ── Per-conversion colorspace matrix ─────────────────────────
-        // G2D is matrix-only (no range control, no BT.2020). Resolve the
-        // colorimetry of the YUV side of this conversion and program the
-        // matching matrix before the blit. YUV→RGB uses the *source*
-        // colorimetry; RGB→YUV uses the *destination*. RGB→RGB has no YUV side
-        // so the matrix is irrelevant and left untouched.
-        //
-        // Full-range YUV and BT.2020 are declined by `g2d_can_handle` in the
-        // ImageProcessor dispatch (lib.rs) BEFORE we get here, so those fall
-        // through to the GL / CPU backends which honour range and BT.2020. We
-        // still gate here defensively so a direct G2DProcessor caller behaves.
+        // Programs the matrix for the colorimetry of the YUV side of this
+        // conversion: the source for YUV→RGB, the destination for RGB→YUV.
+        // RGB→RGB leaves the matrix untouched. Full-range YUV and BT.2020 are
+        // declined.
         let src_is_yuv = src_fmt.is_yuv();
         let dst_is_yuv = dst_fmt.is_yuv();
         if src_is_yuv || dst_is_yuv {
@@ -250,24 +227,18 @@ impl G2DProcessor {
             match cm.encoding {
                 Some(ColorEncoding::Bt601) => self.g2d.set_bt601_colorspace()?,
                 Some(ColorEncoding::Bt709) => self.g2d.set_bt709_colorspace()?,
-                // BT.2020 already declined above; any future encoding falls
-                // back to the BT.709 matrix (closest HD-grade approximation).
+                // Any other encoding uses the BT.709 matrix.
                 _ => self.g2d.set_bt709_colorspace()?,
             }
         }
 
-        // Source/placement already validated by `Crop::resolve` at the entry.
         let src = src_dyn.as_typed::<u8>().unwrap();
-        // For i8 destinations, reinterpret as u8 for G2D (same byte layout).
-        // The XOR 0x80 post-pass is applied after the blit completes.
+        // An i8 destination is blitted as u8; the XOR 0x80 post-pass follows
+        // the blit.
         let dst = if is_int8_dst {
-            // SAFETY: Tensor<i8> and Tensor<u8> have identical memory layout.
-            // The T parameter only affects PhantomData<T> (zero-sized) in
-            // TensorStorage variants and the typed view from map(). The chroma
-            // field (Option<Box<Tensor<T>>>) is also layout-identical. This
-            // reinterpreted reference is used only for shape/fd access and the
-            // G2D blit (which operates on raw DMA bytes). It does not outlive
-            // dst_dyn and is never stored.
+            // SAFETY: `Tensor<i8>` and `Tensor<u8>` have identical memory layout.
+            // The reinterpreted reference does not outlive `dst_dyn` and is not
+            // stored.
             let i8_tensor = dst_dyn.as_typed_mut::<i8>().unwrap();
             unsafe { &mut *(i8_tensor as *mut Tensor<i8> as *mut Tensor<u8>) }
         } else {
@@ -300,11 +271,9 @@ impl G2DProcessor {
         let dst_w = dst.width().unwrap();
         let dst_h = dst.height().unwrap();
 
-        // Clear the destination with the letterbox color before blitting the
-        // image into the sub-region.
-        //
-        // g2d_clear does not support 3-byte-per-pixel formats (RGB888, BGR888).
-        // For those formats, fall back to CPU fill after the blit.
+        // Clears the destination with the letterbox color before blitting the
+        // image into the sub-region. `g2d_clear` does not take
+        // 3-byte-per-pixel formats; those are filled on the CPU after the blit.
         let needs_clear = fills_border(&crop, dst_w, dst_h);
 
         if needs_clear && dst_fmt != PixelFormat::Rgb {
@@ -316,9 +285,8 @@ impl G2DProcessor {
         }
 
         if let Some(crop_rect) = crop.dst_rect {
-            // stride is in pixels; multiply by bytes-per-pixel (== channels()
-            // for u8 data) to get the byte offset.  All G2D destination
-            // formats are packed, so channels() == bpp always holds here.
+            // The stride is in pixels; times bytes-per-pixel (channels() for u8
+            // data) gives the byte offset.
             dst_surface.planes[0] += ((crop_rect.top * dst_surface.stride as usize
                 + crop_rect.left)
                 * dst_fmt.channels()) as u64;
@@ -330,18 +298,11 @@ impl G2DProcessor {
         }
 
         // ── i.MX95 DPU even-dimension workaround ──────────────────────────
-        // The i.MX95 DPU G2D backend garbles a chroma-subsampled blit whose
-        // width or height is odd — it drops the partial trailing chroma sample
-        // and corrupts the ENTIRE output (max_diff ~255); the i.MX8MP Vivante
-        // backend tolerates it. When either side is a chroma-subsampled YUV
-        // format, round BOTH blit rectangles up to even on each *subsampled*
-        // axis so the DPU's chroma geometry is exact. The width pad always lands
-        // in the 64-aligned row stride (both sides). The height pad reads the
-        // source's chroma plane (within its allocation) and writes ONE extra
-        // destination row — applied only when the destination's (page-aligned)
-        // DMA allocation can hold it; otherwise G2D declines so the caller falls
-        // back to GL/CPU, which convert odd dimensions natively. Only the
-        // logical w×h region is consumed downstream, so the padding is unused.
+        // When either side is a chroma-subsampled YUV format, both blit
+        // rectangles are rounded up to even on each subsampled axis. The width
+        // pad lands in the 64-aligned row stride. The height pad writes one
+        // extra destination row, applied only when the destination's DMA
+        // allocation can hold it; otherwise G2D declines.
         let (sx_src, sy_src) = chroma_subsample_shifts(src_fmt);
         let (sx_dst, sy_dst) = chroma_subsample_shifts(dst_fmt);
         let pad_w = (sx_src | sx_dst) > 0;
@@ -349,16 +310,9 @@ impl G2DProcessor {
         if pad_w || pad_h {
             let even = |v: i32| v + (v & 1);
             if pad_h && even(dst_surface.bottom) != dst_surface.bottom {
-                // The padded blit writes one extra destination row. It is safe
-                // only when the blit starts at the destination's top (no crop
-                // placement offset) and the extra row stays within the
-                // destination's DMA mapping. A self-allocated DMA-BUF is mapped
-                // at page granularity, so its strided allocation
-                // (row_bytes × height) is physically backed up to the next page
-                // boundary. Query the runtime page size — aarch64 kernels may use
-                // 16 KiB or 64 KiB pages, and hard-coding 4 KiB would
-                // under-estimate the mapping and needlessly reject a destination
-                // that is in fact page-backed.
+                // The padded blit writes one extra destination row: allowed when
+                // the blit starts at the destination's top and the extra row
+                // stays within the destination's page-rounded DMA mapping.
                 let page = match unsafe { libc::sysconf(libc::_SC_PAGESIZE) } {
                     n if n > 0 => n as usize,
                     _ => 4096,
@@ -393,7 +347,7 @@ impl G2DProcessor {
         self.g2d.finish()?;
         log::trace!("G2D blit complete");
 
-        // CPU fallback for RGB888 (unsupported by g2d_clear)
+        // CPU fill for RGB888.
         if needs_clear && dst_fmt == PixelFormat::Rgb {
             if let (Some(dst_color), Some(dst_rect)) = (crop.dst_color, crop.dst_rect) {
                 let start = Instant::now();
@@ -402,18 +356,8 @@ impl G2DProcessor {
             }
         }
 
-        // Apply XOR 0x80 for int8 output (u8→i8 bias conversion), confined to
-        // each row's pixel bytes: the destination's pitch may exceed its pixels
-        // (a padded allocation, or a `view()` tile whose trailing bytes are the
-        // parent's neighbouring pixels), and a flat walk of the mapping would
-        // bias those bytes too.
-        // The helper's map issues DMA_BUF_IOCTL_SYNC(START) on the dst fd; for
-        // self-allocated CMA buffers this performs cache invalidation via the
-        // DrmAttachment. For foreign fds (e.g. the Neutron NPU DMA-BUF imported
-        // via from_fd()), the DrmAttachment is None and the sync ioctl is
-        // handled by the NPU driver. The map drop issues DMA_BUF_IOCTL_SYNC(END)
-        // so the NPU DMA engine sees the CPU-written XOR'd data on the next
-        // Invoke().
+        // Applies XOR 0x80 for int8 output (u8→i8 bias conversion), confined to
+        // each row's pixel bytes.
         if is_int8_dst {
             let start = Instant::now();
             crate::cpu::apply_int8_xor_bias_rows(dst, dst_fmt)?;
@@ -437,11 +381,6 @@ impl ImageProcessorTrait for G2DProcessor {
             options.get_flip(),
             options.get_crop(),
         );
-        // A view()/batch() destination needs no special handling here: G2D blits
-        // to the destination's `plane_offset` + parent `row_stride`, so a sub-view
-        // (the tile) lands in its window of the parent buffer natively — the same
-        // mechanism a whole-tensor blit uses. (The cache-key/glViewport batch
-        // path is GL-specific; G2D addresses the tile by offset+stride.)
         let crop = crop.resolve(
             src.width().unwrap_or(0),
             src.height().unwrap_or(0),
@@ -479,9 +418,8 @@ impl ImageProcessorTrait for G2DProcessor {
         segmentation: &[crate::Segmentation],
         overlay: crate::MaskOverlay<'_>,
     ) -> Result<()> {
-        // G2D can produce the *frame* (background or cleared canvas) via
-        // hardware primitives — but has no rasterizer for boxes / masks.
-        // If detections are present, defer to another backend.
+        // G2D produces the frame (background or cleared canvas) only;
+        // detections return `NotImplemented`.
         if !detect.is_empty() || !segmentation.is_empty() {
             return Err(Error::NotImplemented(
                 "G2D does not support drawing detection or segmentation overlays".to_string(),
@@ -497,8 +435,7 @@ impl ImageProcessorTrait for G2DProcessor {
         _proto_data: &crate::ProtoData,
         overlay: crate::MaskOverlay<'_>,
     ) -> Result<()> {
-        // Same logic as draw_decoded_masks: G2D handles empty-detection
-        // frames (clear or blit background) via the 2D hardware.
+        // G2D handles empty-detection frames only.
         if !detect.is_empty() {
             return Err(Error::NotImplemented(
                 "G2D does not support drawing detection or segmentation overlays".to_string(),
@@ -524,16 +461,13 @@ impl ImageProcessorTrait for G2DProcessor {
 
 /// Produce the zero-detection frame on `dst` using G2D hardware ops.
 ///
-/// `background == None` → `g2d_clear(dst, 0x00000000)` — actively fills the
-/// destination with transparent black using the 2D engine (no CPU touch).
+/// `background == None` → `g2d_clear(dst, 0x00000000)`: fills the
+/// destination with transparent black.
 ///
-/// `background == Some(bg)` → `g2d_blit(bg → dst)` — hardware copy of bg
-/// into dst. This is the "draw the cleared overlay onto the background"
-/// path; G2D has no pure copy primitive, so we use the blit engine with a
-/// 1:1 same-format surface pair, which is the hardware equivalent.
+/// `background == Some(bg)` → `g2d_blit(bg → dst)`: a 1:1 same-format
+/// copy of bg into dst.
 ///
-/// Both paths `finish()` before returning so dst is coherent for any
-/// downstream reader.
+/// Both paths `finish()` before returning.
 fn draw_empty_frame_g2d(
     g2d: &mut G2D,
     dst_dyn: &mut TensorDyn,
@@ -546,15 +480,7 @@ fn draw_empty_frame_g2d(
     }
     let dst = dst_dyn.as_typed_mut::<u8>().ok_or(Error::NotAnImage)?;
 
-    // DMA-only: G2D operates on physical addresses. A Mem-backed dst means
-    // we're on the wrong backend — surface a dispatch error so the caller
-    // can fall back.
-    // A capability probe, so it asks the backend-agnostic question.
-    // `as_dma()` answers `None` for EVERY tensor on the `dynamic` backend
-    // -- `DmaTensor<T>` is `static`-internal storage it never constructs --
-    // so this used to decline G2D unconditionally there, silently giving up
-    // the i.MX hardware path on the exact tensors it was written for. See
-    // task P2b's review, F3.
+    // The destination must be DMA memory.
     if TensorTrait::memory(dst) != TensorMemory::DmaBuf {
         return Err(Error::NotImplemented(
             "g2d only supports Dma memory".to_string(),
@@ -565,19 +491,15 @@ fn draw_empty_frame_g2d(
 
     match background {
         None => {
-            // Case 1 — no background, no detections: hardware clear to
-            // transparent black. Every byte of dst is written by the 2D
-            // engine; no reliance on prior state.
+            // No background: hardware clear to transparent black.
             let start = Instant::now();
             g2d.clear(&mut dst_surface, [0, 0, 0, 0])?;
             g2d.finish()?;
             log::trace!("g2d clear (empty frame) takes {:?}", start.elapsed());
         }
         Some(bg_dyn) => {
-            // Case 2 — background, no detections: hardware blit bg → dst.
-            // Validate shape/format equivalence; if the caller handed us
-            // mismatched surfaces we return a structured error rather than
-            // silently producing wrong output.
+            // Background: hardware blit bg → dst, after checking that shape
+            // and format match.
             if bg_dyn.shape() != dst.shape() {
                 return Err(Error::InvalidShape(
                     "background shape does not match dst".into(),
@@ -594,7 +516,7 @@ fn draw_empty_frame_g2d(
                 ));
             }
             let bg = bg_dyn.as_typed::<u8>().ok_or(Error::NotAnImage)?;
-            // Backend-agnostic probe -- see the `dst` check above.
+            // The background must be DMA memory.
             if TensorTrait::memory(bg) != TensorMemory::DmaBuf {
                 return Err(Error::NotImplemented(
                     "g2d background must be Dma-backed".to_string(),
@@ -611,8 +533,7 @@ fn draw_empty_frame_g2d(
 }
 
 /// Chroma subsampling of `fmt` as `(shift_x, shift_y)` — 1 = half resolution on
-/// that axis, 0 = full. Drives the i.MX95 DPU even-dimension workaround: a blit
-/// dimension that the format subsamples must be even or the DPU garbles it.
+/// that axis, 0 = full.
 fn chroma_subsample_shifts(fmt: PixelFormat) -> (u32, u32) {
     match fmt.chroma_layout() {
         Some(cl) => (cl.shift_x, cl.shift_y),
@@ -628,19 +549,14 @@ fn chroma_subsample_shifts(fmt: PixelFormat) -> (u32, u32) {
 /// The tensor must be backed by DMA memory and must have a pixel format set.
 fn tensor_to_g2d_surface(img: &Tensor<u8>) -> Result<G2DSurface> {
     let fmt = img.format().ok_or(Error::NotAnImage)?;
-    // `dmabuf()`, not `as_dma().fd`: same file descriptor, but reachable on
-    // both backends. See the probe above.
     let fd = img
         .dmabuf()
         .map_err(|e| Error::NotImplemented(format!("g2d only supports Dma memory ({e})")))?;
     let phys: G2DPhysical = fd.as_raw_fd().try_into()?;
 
-    // NV12 is a two-plane format: Y plane followed by interleaved UV plane.
-    // planes[0] = Y plane start, planes[1] = UV plane start (Y size = width * height)
-    //
-    // plane_offset is the byte offset within the DMA-BUF where pixel data
-    // starts.  G2D works with raw physical addresses so we must add the
-    // offset ourselves — the hardware has no concept of a per-plane offset.
+    // NV12 is a two-plane format: planes[0] = Y plane start, planes[1] = UV
+    // plane start. `plane_offset` is the byte offset within the DMA-BUF where
+    // pixel data starts and is added to the physical address.
     let base_addr = phys.address();
     let luma_offset = img.plane_offset().unwrap_or(0) as u64;
     let planes = if fmt == PixelFormat::Nv12 {
@@ -672,8 +588,8 @@ fn tensor_to_g2d_surface(img: &Tensor<u8>) -> Result<G2DSurface> {
     let h = img.height().unwrap();
     let fourcc = pixelfmt_to_fourcc(fmt);
 
-    // G2D stride is in pixels.  effective_row_stride() returns bytes, so
-    // divide by the bytes-per-pixel (channels for u8 data) to convert.
+    // G2D stride is in pixels: `effective_row_stride()` bytes divided by the
+    // bytes-per-pixel.
     let stride_pixels = match img.effective_row_stride() {
         Some(s) => {
             let channels = fmt.channels();
@@ -760,8 +676,7 @@ mod g2d_predicate_tests {
         assert!(!g2d_supports(PixelFormat::Vyuy, PixelFormat::Rgba));
     }
 
-    /// A destination whose declaration cannot cover the post-passes is
-    /// refused before any blit.
+    /// A destination whose declaration cannot cover the post-passes is refused before any blit.
     #[test]
     fn post_passes_are_checked_against_the_destination_up_front() {
         use edgefirst_tensor::{CpuAccess, Error as TensorError};
@@ -794,8 +709,7 @@ mod g2d_predicate_tests {
         require_post_pass_access(&rgba, &border).unwrap();
     }
 
-    /// The `Rgb` border is a CPU write of part of a G2D-written buffer, so a
-    /// write-only destination is refused: its map would not invalidate.
+    /// The `Rgb` border post-pass refuses a write-only destination.
     #[test]
     fn rgb_border_post_pass_needs_readwrite() {
         use edgefirst_tensor::CpuAccess;
@@ -840,12 +754,7 @@ mod g2d_tests {
     };
     use image::buffer::ConvertBuffer;
 
-    /// G2D is usable only where `libg2d.so.2` loads — the NXP i.MX boards. On
-    /// V3D/Tegra/x86 the library is absent, so `G2DProcessor::new()` and the
-    /// surface physical-address resolution these tests exercise both fail. DMA
-    /// being available does NOT imply G2D (e.g. rpi5/V3D has DMA but no G2D), so
-    /// these tests must gate on G2D, not just DMA, or they panic/fail on
-    /// non-G2D hardware instead of skipping.
+    /// The reason the G2D tests skip on this host, or `None` when G2D initialises.
     #[cfg(target_os = "linux")]
     fn g2d_skip_reason() -> Option<&'static str> {
         crate::test_support::g2d_skip_reason(G2DProcessor::new().is_ok())
@@ -907,7 +816,6 @@ mod g2d_tests {
         let file = edgefirst_bench::testdata::read("zidane.jpg").to_vec();
         let src = crate::load_image_test_helper(&file, Some(PixelFormat::Rgb), None)?;
 
-        // Create DMA buffer for G2D input
         let mut src2 = TensorDyn::image(
             1280,
             720,
@@ -919,7 +827,7 @@ mod g2d_tests {
 
         let mut cpu_converter = CPUProcessor::new();
 
-        // For PixelFormat::Nv12 input, load from file since CPU doesn't support PixelFormat::Rgb→PixelFormat::Nv12
+        // Nv12 input is loaded from file.
         if g2d_in_fmt == PixelFormat::Nv12 {
             let nv12_bytes = edgefirst_bench::testdata::read("zidane.nv12");
             src2.as_typed::<u8>()
@@ -1049,7 +957,6 @@ mod g2d_tests {
         )?;
         cpu_converter.convert(&src, &mut reference, None)?;
 
-        // Create DMA buffer for G2D input
         let mut src2 = TensorDyn::image(
             1280,
             720,
@@ -1059,7 +966,7 @@ mod g2d_tests {
             edgefirst_tensor::CpuAccess::ReadWrite,
         )?;
 
-        // For PixelFormat::Nv12 input, load from file since CPU doesn't support PixelFormat::Rgb→PixelFormat::Nv12
+        // Nv12 input is loaded from file.
         if g2d_in_fmt == PixelFormat::Nv12 {
             let nv12_bytes = edgefirst_bench::testdata::read("zidane.nv12");
             src2.as_typed::<u8>()
@@ -1114,10 +1021,8 @@ mod g2d_tests {
     ) -> Result<(), crate::Error> {
         let dst_width = 600;
         let dst_height = 400;
-        // The destination sub-rectangle is now expressed as a `view()` of the
-        // destination (the old `Crop.dst_rect` was removed); G2D blits into the
-        // view's window via its offset + parent stride. Region is (x=left, y=top,
-        // width, height).
+        // The destination sub-rectangle is a `view()` of the destination. Region
+        // is (x=left, y=top, width, height).
         let region = crate::Region::new(100, 100, 200, 100);
         let file = edgefirst_bench::testdata::read("zidane.jpg").to_vec();
         let src = crate::load_image_test_helper(&file, Some(PixelFormat::Rgb), None)?;
@@ -1141,7 +1046,6 @@ mod g2d_tests {
             .fill(128);
         cpu_converter.convert(&src, &mut reference.view(region)?, None)?;
 
-        // Create DMA buffer for G2D input
         let mut src2 = TensorDyn::image(
             1280,
             720,
@@ -1151,7 +1055,7 @@ mod g2d_tests {
             edgefirst_tensor::CpuAccess::ReadWrite,
         )?;
 
-        // For PixelFormat::Nv12 input, load from file since CPU doesn't support PixelFormat::Rgb→PixelFormat::Nv12
+        // Nv12 input is loaded from file.
         if g2d_in_fmt == PixelFormat::Nv12 {
             let nv12_bytes = edgefirst_bench::testdata::read("zidane.nv12");
             src2.as_typed::<u8>()
@@ -1318,7 +1222,6 @@ mod g2d_tests {
         if !dma_and_g2d_or_skip() {
             return Ok(());
         }
-        // Load PixelFormat::Nv12 source
         let src = load_raw_image(
             1280,
             720,
@@ -1327,7 +1230,6 @@ mod g2d_tests {
             &edgefirst_bench::testdata::read("camera720p.nv12"),
         )?;
 
-        // Load PixelFormat::Rgba reference (ffmpeg-generated)
         let reference = load_raw_image(
             1280,
             720,
@@ -1336,7 +1238,6 @@ mod g2d_tests {
             &edgefirst_bench::testdata::read("camera720p.rgba"),
         )?;
 
-        // Convert using G2D
         let mut dst = TensorDyn::image(
             1280,
             720,
@@ -1356,7 +1257,6 @@ mod g2d_tests {
             TensorDyn::from(__t)
         };
 
-        // Copy to CPU for comparison
         let cpu_dst = TensorDyn::image(
             1280,
             720,
@@ -1382,7 +1282,6 @@ mod g2d_tests {
         if !dma_and_g2d_or_skip() {
             return Ok(());
         }
-        // Load PixelFormat::Nv12 source
         let src = load_raw_image(
             1280,
             720,
@@ -1391,7 +1290,6 @@ mod g2d_tests {
             &edgefirst_bench::testdata::read("camera720p.nv12"),
         )?;
 
-        // Load PixelFormat::Rgb reference (ffmpeg-generated)
         let reference = load_raw_image(
             1280,
             720,
@@ -1400,7 +1298,6 @@ mod g2d_tests {
             &edgefirst_bench::testdata::read("camera720p.rgb"),
         )?;
 
-        // Convert using G2D
         let mut dst = TensorDyn::image(
             1280,
             720,
@@ -1420,7 +1317,6 @@ mod g2d_tests {
             TensorDyn::from(__t)
         };
 
-        // Copy to CPU for comparison
         let cpu_dst = TensorDyn::image(
             1280,
             720,
@@ -1446,7 +1342,6 @@ mod g2d_tests {
         if !dma_and_g2d_or_skip() {
             return Ok(());
         }
-        // Load PixelFormat::Yuyv source
         let src = load_raw_image(
             1280,
             720,
@@ -1455,7 +1350,6 @@ mod g2d_tests {
             &edgefirst_bench::testdata::read("camera720p.yuyv"),
         )?;
 
-        // Load PixelFormat::Rgba reference (ffmpeg-generated)
         let reference = load_raw_image(
             1280,
             720,
@@ -1464,7 +1358,6 @@ mod g2d_tests {
             &edgefirst_bench::testdata::read("camera720p.rgba"),
         )?;
 
-        // Convert using G2D
         let mut dst = TensorDyn::image(
             1280,
             720,
@@ -1484,7 +1377,6 @@ mod g2d_tests {
             TensorDyn::from(__t)
         };
 
-        // Copy to CPU for comparison
         let cpu_dst = TensorDyn::image(
             1280,
             720,
@@ -1510,7 +1402,6 @@ mod g2d_tests {
         if !dma_and_g2d_or_skip() {
             return Ok(());
         }
-        // Load PixelFormat::Yuyv source
         let src = load_raw_image(
             1280,
             720,
@@ -1519,7 +1410,6 @@ mod g2d_tests {
             &edgefirst_bench::testdata::read("camera720p.yuyv"),
         )?;
 
-        // Load PixelFormat::Rgb reference (ffmpeg-generated)
         let reference = load_raw_image(
             1280,
             720,
@@ -1528,7 +1418,6 @@ mod g2d_tests {
             &edgefirst_bench::testdata::read("camera720p.rgb"),
         )?;
 
-        // Convert using G2D
         let mut dst = TensorDyn::image(
             1280,
             720,
@@ -1548,7 +1437,6 @@ mod g2d_tests {
             TensorDyn::from(__t)
         };
 
-        // Copy to CPU for comparison
         let cpu_dst = TensorDyn::image(
             1280,
             720,
@@ -1567,8 +1455,7 @@ mod g2d_tests {
         compare_images(&reference, &cpu_dst, 0.98, "g2d_yuyv_to_rgb_reference")
     }
 
-    /// Test G2D native PixelFormat::Bgra conversion for all supported source formats.
-    /// Compares G2D src→PixelFormat::Bgra against G2D src→PixelFormat::Rgba by verifying R↔B swap.
+    /// G2D src→Bgra equals G2D src→Rgba with R and B swapped, for all supported source formats.
     #[test]
     #[cfg(target_os = "linux")]
     #[ignore = "G2D on i.MX 8MP rejects BGRA as destination format; re-enable when supported"]
@@ -1589,7 +1476,6 @@ mod g2d_tests {
         let file = edgefirst_bench::testdata::read("zidane.jpg").to_vec();
         let src = crate::load_image_test_helper(&file, Some(PixelFormat::Rgb), None)?;
 
-        // Create DMA buffer for G2D input
         let mut src2 = TensorDyn::image(
             1280,
             720,
@@ -1613,7 +1499,6 @@ mod g2d_tests {
 
         let mut g2d = G2DProcessor::new()?;
 
-        // Convert to PixelFormat::Bgra via G2D
         let mut bgra_dst = TensorDyn::image(
             1280,
             720,
@@ -1632,7 +1517,6 @@ mod g2d_tests {
             TensorDyn::from(__t)
         };
 
-        // Reconstruct src2 from dyn for PixelFormat::Rgba conversion
         let src2 = {
             let mut __t = src2_dyn.into_u8().unwrap();
             __t.set_format(g2d_in_fmt)
@@ -1640,7 +1524,6 @@ mod g2d_tests {
             TensorDyn::from(__t)
         };
 
-        // Convert to PixelFormat::Rgba via G2D as reference
         let mut rgba_dst = TensorDyn::image(
             1280,
             720,
@@ -1659,7 +1542,6 @@ mod g2d_tests {
             TensorDyn::from(__t)
         };
 
-        // Copy both to CPU memory for comparison
         let bgra_cpu = TensorDyn::image(
             1280,
             720,
@@ -1690,7 +1572,6 @@ mod g2d_tests {
             .as_mut_slice()
             .copy_from_slice(rgba_dst.as_typed::<u8>().unwrap().map()?.as_slice());
 
-        // Verify PixelFormat::Bgra output has R↔B swapped vs PixelFormat::Rgba output
         let bgra_map = bgra_cpu.as_typed::<u8>().unwrap().map()?;
         let rgba_map = rgba_cpu.as_typed::<u8>().unwrap().map()?;
         let bgra_buf = bgra_map.as_slice();
@@ -1726,14 +1607,10 @@ mod g2d_tests {
 
     // =========================================================================
     // tensor_to_g2d_surface offset & stride unit tests
-    //
-    // These tests verify that plane_offset and effective_row_stride are
-    // correctly propagated into the G2DSurface.  They require DMA memory
-    // but do NOT require G2D hardware — only the DMA_BUF_IOCTL_PHYS ioctl.
     // =========================================================================
 
-    /// Helper: build a DMA-backed Tensor<u8> with an optional plane_offset
-    /// and an optional row stride, then return the G2DSurface.
+    /// Builds a DMA-backed Tensor<u8> with an optional plane_offset and an
+    /// optional row stride, and returns its G2DSurface.
     fn surface_for(
         width: usize,
         height: usize,
@@ -1764,7 +1641,6 @@ mod g2d_tests {
             return;
         }
         let s = surface_for(640, 480, PixelFormat::Rgba, None, None).unwrap();
-        // planes[0] must be non-zero (valid physical address), no offset
         assert_ne!(s.planes[0], 0);
         assert_eq!(s.stride, 640);
     }
@@ -1806,7 +1682,6 @@ mod g2d_tests {
         let s_none = tensor_to_g2d_surface(&t).unwrap();
         t.set_plane_offset(0);
         let s_zero = tensor_to_g2d_surface(&t).unwrap();
-        // offset=0 should produce the same address as no offset
         assert_eq!(s_none.planes[0], s_zero.planes[0]);
     }
 
@@ -1842,7 +1717,6 @@ mod g2d_tests {
         if !dma_and_g2d_or_skip() {
             return;
         }
-        // Grey (Y800) may not be supported by all G2D hardware versions
         let s = match surface_for(640, 480, PixelFormat::Grey, None, Some(1024)) {
             Ok(s) => s,
             Err(e @ crate::Error::G2D(..)) => {
@@ -1876,11 +1750,8 @@ mod g2d_tests {
         t.set_plane_offset(8192);
         let s1 = tensor_to_g2d_surface(&t).unwrap();
 
-        // Luma plane should shift by offset
         assert_eq!(s1.planes[0], s0.planes[0] + 8192);
         // UV plane = base + offset + stride * height
-        // Without offset: UV = base + 640 * 480 = base + 307200
-        // With offset 8192: UV = base + 8192 + 640 * 480 = base + 315392
         assert_eq!(s1.planes[1], s0.planes[1] + 8192);
     }
 
@@ -1905,13 +1776,12 @@ mod g2d_tests {
         }
         use edgefirst_tensor::TensorMemory;
 
-        // Create luma and chroma as separate DMA tensors
         let mut luma =
             Tensor::<u8>::new(&[480, 640], Some(TensorMemory::DmaBuf), Some("luma")).unwrap();
         let mut chroma =
             Tensor::<u8>::new(&[240, 640], Some(TensorMemory::DmaBuf), Some("chroma")).unwrap();
 
-        // Get baseline physical addresses with no offsets
+        // Baseline physical addresses with no offsets.
         let luma_base = {
             let dma = luma.as_dma().unwrap();
             let phys: G2DPhysical = dma.fd.as_raw_fd().try_into().unwrap();
@@ -1923,33 +1793,17 @@ mod g2d_tests {
             phys.address()
         };
 
-        // Set offsets and build multiplane tensor
         luma.set_plane_offset(4096);
         chroma.set_plane_offset(2048);
         let combined = Tensor::<u8>::from_planes(luma, chroma, PixelFormat::Nv12).unwrap();
         let s = tensor_to_g2d_surface(&combined).unwrap();
 
-        // Luma should include its offset
         assert_eq!(s.planes[0], luma_base + 4096);
-        // Chroma should include its offset
         assert_eq!(s.planes[1], chroma_base + 2048);
     }
 
     // =========================================================================
-    // Odd-dimension end-to-end cells (Deliverable C)
-    //
-    // Design contract:
-    //   • Source is a patterned NV12 tensor (Dma) filled stride-aware with a
-    //     pattern varying in both X and Y.  A Mem copy carries the same fill for
-    //     the CPU reference (trusted oracle from odd_dim_cpu.rs).
-    //   • G2D output (Dma RGBA) is compared against the CPU output pixel-by-pixel
-    //     at each tensor's own `effective_row_stride`.
-    //   • Tolerance: ±4 (same as GL).  G2D BT.601 is limited-range on the matrix
-    //     but historically matches within ±4 on real hardware; the tolerance is
-    //     tightened to ±6 only if on-target validation shows it is needed.
-    //   • If G2D rejects the dimensions (returns Err), the test documents the
-    //     behaviour via `assert!` rather than silently passing.
-    //   • Both test cells skip at runtime if DMA is unavailable or G2D init fails.
+    // Odd-dimension end-to-end cells
     // =========================================================================
 
     /// Fill a Nv12 tensor (any memory type) with a patterned, stride-aware
@@ -1959,9 +1813,6 @@ mod g2d_tests {
     /// Chroma column `cc`, chroma row `cr_row` (NV12: 4:2:0 — half in both dims):
     ///   `Cb = (cc*7 + cr_row*11 + 40) % 256`
     ///   `Cr = (cc*13 + cr_row*3 + 80) % 256`
-    ///
-    /// This matches `make_odd_both_source` in `odd_dim_cpu.rs` so the two test
-    /// suites share an analytic ground truth.
     #[cfg(target_os = "linux")]
     fn fill_patterned_nv12(t: &TensorDyn) {
         let w = t.width().unwrap();
@@ -2021,7 +1872,7 @@ mod g2d_tests {
         for row in 0..h {
             for col in 0..w {
                 for ch in 0..3usize {
-                    // Compare RGB channels only; alpha is hardware-defined
+                    // RGB channels only.
                     let gi = row * g2d_stride + col * channels + ch;
                     let ci = row * cpu_stride + col * channels + ch;
                     let d = (g2d_px[gi] as i32 - cpu_px[ci] as i32).unsigned_abs();
@@ -2038,29 +1889,19 @@ mod g2d_tests {
     }
 
     // -------------------------------------------------------------------------
-    // D-01: NV12 odd-W (65×64) → RGBA via G2D vs CPU reference
+    // NV12 odd-W (65×64) → RGBA via G2D vs CPU reference
     // -------------------------------------------------------------------------
 
-    /// D-01: NV12 odd-width (65×64) → RGBA via G2D, compared to CPU reference.
-    ///
-    /// Asserts:
-    ///   (a) G2D accepts odd-width NV12 without returning an error.
-    ///   (b) G2D output matches CPU reference within ±4 on RGB channels.
-    ///       (Alpha is hardware-defined and excluded from the comparison.)
-    ///
-    /// On-target validation has since run: the G2D-vs-CPU residual on an
-    /// i.MX8MP is 23–24 across widths 63–81, so the ±4 tolerance only warns and
-    /// the `max_diff <= 35` assertion is what actually fails. Do not relax
-    /// either without a new measurement on the board.
+    /// NV12 odd-width (65×64) → RGBA via G2D matches the CPU reference on RGB channels.
     #[test]
     #[cfg(target_os = "linux")]
-    fn d01_nv12_odd_w_g2d_vs_cpu() {
+    fn nv12_odd_w_g2d_vs_cpu() {
         if !is_dma_available() {
-            crate::test_support::report_skip("d01_nv12_odd_w_g2d_vs_cpu - DMA not available");
+            crate::test_support::report_skip("nv12_odd_w_g2d_vs_cpu - DMA not available");
             return;
         }
         if let Some(why) = crate::test_support::g2d_skip_reason(true) {
-            crate::test_support::report_skip(&format!("d01_nv12_odd_w_g2d_vs_cpu - {why}"));
+            crate::test_support::report_skip(&format!("nv12_odd_w_g2d_vs_cpu - {why}"));
             return;
         }
         let (w, h) = (65usize, 64usize);
@@ -2086,7 +1927,6 @@ mod g2d_tests {
         fill_patterned_nv12(&src_dma);
         fill_patterned_nv12(&src_mem);
 
-        // CPU reference: Nv12 → Rgba.
         let mut cpu_dst = TensorDyn::image(
             w,
             h,
@@ -2100,7 +1940,6 @@ mod g2d_tests {
             .convert(&src_mem, &mut cpu_dst, None)
             .unwrap();
 
-        // G2D convert: Nv12 → Rgba.
         let mut g2d_dst = TensorDyn::image(
             w,
             h,
@@ -2115,71 +1954,46 @@ mod g2d_tests {
             Err(e) => {
                 crate::test_support::g2d_required_or(false);
                 crate::test_support::report_skip(&format!(
-                    "d01_nv12_odd_w_g2d_vs_cpu - G2D not available: {e}"
+                    "nv12_odd_w_g2d_vs_cpu - G2D not available: {e}"
                 ));
                 return;
             }
         };
 
-        // (a) G2D must accept odd-width NV12 without error.
         g2d.convert(&src_dma, &mut g2d_dst, None)
             .unwrap_or_else(|e| {
-                panic!("D-01: G2D rejected odd-width (65) NV12 source: {e}");
+                panic!("G2D rejected odd-width (65) NV12 source: {e}");
             });
 
-        // (b) G2D output ≈ CPU reference ±4 on RGB channels.
         let tol = 4u32;
         let (max_diff, first_fail) = compare_g2d_vs_cpu_rgba(&g2d_dst, &cpu_dst, w, h, tol);
-        eprintln!("D-01 NV12 odd-W G2D vs CPU: max_diff={max_diff}");
-        // Both CPU and G2D resolve this untagged odd-W NV12 source to
-        // limited-range BT.601 (G2D is limited-range matrix-only), so the
-        // YUV-matrix delta that once forced the loose >64 bound has closed. What
-        // remains is G2D's own fixed-point rounding; its exact mechanism has not
-        // been characterised, only its magnitude, measured below.
-        //
-        // Measured on an i.MX8MP (the only G2D board): max_diff 23 at 63×64,
-        // 64×64, 65×64 and 65×63, and 24 at 80×64 and 81×64. The >35 bound has
-        // ~11 of headroom over that and still trips a real geometry/stride
-        // regression — the odd-W stride handling this test guards.
-        //
-        // History: this bound was tightened 64 → 35 without a hardware run (the
-        // imx8mp lane had stopped executing), and the first run that reached it
-        // read 255. That was NOT G2D: the pattern's `% 256` ramps synthesise
-        // super-white luma, which the CPU reference's fast kernel wrapped to
-        // black. See `fast_path_luma` in `cpu/convert.rs`. The full-range
-        // pattern is deliberate — it is what caught that bug — so keep it.
+        eprintln!("NV12 odd-W G2D vs CPU: max_diff={max_diff}");
         if max_diff > tol {
             eprintln!(
-                "WARNING: D-01 NV12 odd-W G2D vs CPU max_diff={max_diff} > {tol} \
+                "WARNING: NV12 odd-W G2D vs CPU max_diff={max_diff} > {tol} \
                  (G2D fixed-point rounding; first bad at {first_fail:?})"
             );
         }
         assert!(
             max_diff <= 35,
-            "D-01: gross NV12 odd-W G2D vs CPU mismatch max_diff={max_diff} (>35); first bad at {first_fail:?}"
+            "gross NV12 odd-W G2D vs CPU mismatch max_diff={max_diff} (>35); first bad at {first_fail:?}"
         );
     }
 
     // -------------------------------------------------------------------------
-    // D-03: NV12 odd-both (65×63) → RGBA via G2D vs CPU reference
+    // NV12 odd-both (65×63) → RGBA via G2D vs CPU reference
     // -------------------------------------------------------------------------
 
-    /// D-03: NV12 odd-width AND odd-height (65×63) → RGBA via G2D vs CPU reference.
-    ///
-    /// This is the strictest G2D odd-dimension cell: it exercises both the
-    /// stride-boundary at the last luma row AND the half-height chroma plane
-    /// boundary.  If the G2D hardware rejects the conversion (e.g. hardware
-    /// alignment requirement on chroma height), this test documents that via a
-    /// panic rather than passing silently.
+    /// NV12 odd-width and odd-height (65×63) → RGBA via G2D matches the CPU reference on RGB channels.
     #[test]
     #[cfg(target_os = "linux")]
-    fn d03_nv12_odd_both_g2d_vs_cpu() {
+    fn nv12_odd_both_g2d_vs_cpu() {
         if !is_dma_available() {
-            crate::test_support::report_skip("d03_nv12_odd_both_g2d_vs_cpu - DMA not available");
+            crate::test_support::report_skip("nv12_odd_both_g2d_vs_cpu - DMA not available");
             return;
         }
         if let Some(why) = crate::test_support::g2d_skip_reason(true) {
-            crate::test_support::report_skip(&format!("d03_nv12_odd_both_g2d_vs_cpu - {why}"));
+            crate::test_support::report_skip(&format!("nv12_odd_both_g2d_vs_cpu - {why}"));
             return;
         }
         let (w, h) = (65usize, 63usize);
@@ -2205,7 +2019,6 @@ mod g2d_tests {
         fill_patterned_nv12(&src_dma);
         fill_patterned_nv12(&src_mem);
 
-        // CPU reference: Nv12 → Rgba.
         let mut cpu_dst = TensorDyn::image(
             w,
             h,
@@ -2219,7 +2032,6 @@ mod g2d_tests {
             .convert(&src_mem, &mut cpu_dst, None)
             .unwrap();
 
-        // G2D convert: Nv12 → Rgba.
         let mut g2d_dst = TensorDyn::image(
             w,
             h,
@@ -2234,48 +2046,32 @@ mod g2d_tests {
             Err(e) => {
                 crate::test_support::g2d_required_or(false);
                 crate::test_support::report_skip(&format!(
-                    "d03_nv12_odd_both_g2d_vs_cpu - G2D not available: {e}"
+                    "nv12_odd_both_g2d_vs_cpu - G2D not available: {e}"
                 ));
                 return;
             }
         };
 
-        // G2D must accept odd-both NV12 without error (documented behaviour).
-        // If hardware rejects it, the panic message is the intended failure report.
         g2d.convert(&src_dma, &mut g2d_dst, None)
             .unwrap_or_else(|e| {
-                panic!("D-03: G2D rejected odd-both (65×63) NV12 source: {e}");
+                panic!("G2D rejected odd-both (65×63) NV12 source: {e}");
             });
 
         let tol = 4u32;
         let (max_diff, first_fail) = compare_g2d_vs_cpu_rgba(&g2d_dst, &cpu_dst, w, h, tol);
-        eprintln!("D-03 NV12 odd-both G2D vs CPU: max_diff={max_diff}");
-        // The YUV-matrix delta has closed — see d01 above for the measured
-        // per-width figures behind the >35 bound, and for why this pattern's
-        // super-white luma must stay. Warn above ±tol on G2D fixed-point
-        // rounding, fail only on a gross >35 geometry/stride regression.
+        eprintln!("NV12 odd-both G2D vs CPU: max_diff={max_diff}");
         if max_diff > tol {
             eprintln!(
-                "WARNING: D-03 NV12 odd-both G2D vs CPU max_diff={max_diff} > {tol} \
+                "WARNING: NV12 odd-both G2D vs CPU max_diff={max_diff} > {tol} \
                  (G2D fixed-point rounding; first bad at {first_fail:?})"
             );
         }
         assert!(
             max_diff <= 35,
-            "D-03: gross NV12 odd-both G2D vs CPU mismatch max_diff={max_diff} (>35); first bad at {first_fail:?}"
+            "gross NV12 odd-both G2D vs CPU mismatch max_diff={max_diff} (>35); first bad at {first_fail:?}"
         );
     }
-    /// An `I8` destination gets its bias from a CPU post-pass after the blit,
-    /// and that pass must stay inside each row's pixels: the bytes between one
-    /// row's pixels and the next are an allocation pad or a `view()` parent's
-    /// neighbouring tile, and a flat walk of the mapping biased both.
-    ///
-    /// The oracle is the same blit into a `U8` destination at the same pitch,
-    /// G2D being deterministic for an identical blit: every pixel byte of the
-    /// `I8` result must be that byte XOR 0x80 (alpha excepted), and both
-    /// destinations' pads must still hold the poison they were filled with.
-    /// The `U8` pad is asserted first, so a DPU that writes the pad is not
-    /// misread as a bias-pass regression.
+    /// The `I8` bias post-pass changes only each row's pixel bytes and leaves the row padding untouched.
     #[test]
     #[cfg(target_os = "linux")]
     fn g2d_int8_dst_biases_only_the_pixel_bytes_at_the_declared_stride() {
@@ -2288,7 +2084,7 @@ mod g2d_tests {
         let fmt = PixelFormat::Rgba;
         let bpp = fmt.channels();
         let row_bytes = W * bpp;
-        // 64 bytes of pad past the pixels keeps the pitch 64-aligned for G2D.
+        // 64 bytes of pad past the pixels.
         let stride = row_bytes + 64;
 
         let src = TensorDyn::image(
@@ -2333,9 +2129,7 @@ mod g2d_tests {
         )
         .expect("padded I8 destination");
         assert_eq!(i8_dst.effective_row_stride(), Some(stride));
-        // Both destinations are poisoned: the `U8` pad is what says whether
-        // G2D itself wrote past the pixels, and without it a DPU that does
-        // would look like the bias pass over-reaching.
+        // Both destinations are poisoned.
         u8_dst
             .as_typed::<u8>()
             .unwrap()
@@ -2372,9 +2166,6 @@ mod g2d_tests {
             .iter()
             .map(|&v| v as u8)
             .collect();
-        // Both mappings are indexed to the end of the last row's pad below;
-        // say so here rather than failing on an index panic that names no
-        // stride.
         assert!(
             got.len() >= H * stride && want.len() >= H * u8_stride,
             "a {stride} B pitch over {H} rows needs {} B, mapped {} (I8) and {} (U8)",
@@ -2382,9 +2173,7 @@ mod g2d_tests {
             got.len(),
             want.len()
         );
-        // The blit's own pad first: everything below reads the `U8`
-        // destination as the oracle, so a G2D write past the pixels has to be
-        // named as G2D's rather than surface as a bias-pass failure.
+        // The `U8` destination's pad still holds the poison.
         for y in 0..H {
             assert!(
                 want[y * u8_stride + row_bytes..(y + 1) * u8_stride]

@@ -14,21 +14,8 @@ use std::os::windows::io::AsRawHandle;
 #[path = "support/cuda_require.rs"]
 mod cuda_require;
 
-/// The WARP exclusion for the three CUDA interop tests, reporting
-/// `SKIPPED: {what}: ...` through `report_skip` and returning `true` when the
-/// caller must return early.
-///
-/// `cudaD3D11GetDevice` has no ordinal for the WARP adapter, so no amount of
-/// working CUDA runtime can give a WARP device a CUDA import: the skip is a
-/// property of the adapter, not a missing precondition, and it is deliberately
-/// checked *before* `cuda_require::cuda_available_or_skip`. Ordered the other
-/// way, a WARP run with `HAL_TEST_REQUIRE_CUDA=1` (which
-/// `scripts/test-windows.ps1` can arm from host detection alone) would panic
-/// on the absent runtime before reaching this skip, contradicting the
-/// documented promise that the WARP path is unaffected by the gate.
-///
-/// A failure to create the device at all is not treated as WARP: that host has
-/// no D3D11 at all, and the CUDA gate below is the one that should speak.
+/// Reports `SKIPPED: {what}: ...` and returns `true` when the process device
+/// is WARP, which has no CUDA device.
 fn warp_has_no_cuda_device(what: &str) -> bool {
     let warp = edgefirst_tensor::d3d11::device().is_ok_and(|d| d.is_warp());
     if warp {
@@ -37,12 +24,7 @@ fn warp_has_no_cuda_device(what: &str) -> bool {
     warp
 }
 
-/// Reports a test skip with `reason`, writing `SKIPPED: {reason}` directly
-/// to stderr (not via `eprintln!`) so libtest's output capture cannot hide
-/// it -- see `edgefirst_tensor`'s (crate-internal) `test_support` module
-/// for the same mechanism in the library's own `#[cfg(test)]` code; this
-/// integration test binary is a separate compilation unit and cannot reach
-/// that `pub(crate)` helper, so it carries a local copy.
+/// Reports a test skip by writing `SKIPPED: {reason}` directly to stderr.
 fn report_skip(reason: &str) {
     use std::io::Write;
     let _ = writeln!(&mut std::io::stderr(), "WARNING: SKIPPED: {reason}");
@@ -51,7 +33,7 @@ fn report_skip(reason: &str) {
 #[test]
 fn image_with_dmabuf_on_windows_is_a_texture_tensor() {
     if !edgefirst_tensor::is_gpu_buffer_available() {
-        report_skip("no D3D11 device on this box");
+        report_skip("no D3D11 device");
         return;
     }
     let t = Tensor::<u8>::image(
@@ -132,8 +114,7 @@ fn try_map_returns_would_block_or_succeeds_and_other_backings_alias_map() {
     assert!(m.try_map().is_ok());
 }
 
-/// A texture tensor's non-blocking map makes progress: retried, it hands back
-/// the bytes a preceding CPU write put there.
+/// A texture tensor's non-blocking map, retried, returns the bytes a CPU write put there.
 #[test]
 fn try_map_makes_progress_and_sees_the_written_bytes() {
     let t = Tensor::<u8>::image(
@@ -159,9 +140,6 @@ fn try_map_makes_progress_and_sees_the_written_bytes() {
             std::time::Instant::now() < deadline,
             "try_map_with never succeeded"
         );
-        // On WARP the threads that finish the staging copy are CPU threads
-        // competing with this one for the same cores, so a tight retry starves
-        // the very copy it waits for.
         std::thread::yield_now();
     };
     assert_eq!(&mapped.as_slice()[..4], &[9, 8, 7, 6]);
@@ -182,7 +160,7 @@ fn tensordyn_exposes_the_same_surface() {
     assert!(t.gpu_completion().unwrap().is_none());
     let h = t.d3d11_shared_handle().unwrap();
     // SAFETY: `h` is a shared NT handle this process owns and keeps alive for
-    // the rest of the test; the constructor duplicates what it keeps.
+    // the rest of the test.
     let again = unsafe {
         TensorDyn::from_d3d11_shared_handle(
             h.as_raw_handle() as _,
@@ -200,8 +178,7 @@ fn tensordyn_exposes_the_same_surface() {
     assert!(again.d3d11_texture().is_some());
 }
 
-/// The pointer constructor adopts a texture the HAL allocated, and a recorded
-/// fence value surfaces through `gpu_completion`.
+/// The pointer constructor wraps an HAL texture, and `gpu_completion` reports a recorded write.
 #[test]
 fn from_d3d11_texture_wraps_and_gpu_write_is_recorded() {
     let t = Tensor::<u8>::image(
@@ -221,20 +198,13 @@ fn from_d3d11_texture_wraps_and_gpu_write_is_recorded() {
     .unwrap();
     assert_eq!(wrapped.memory(), TensorMemory::DmaBuf);
     assert_eq!(wrapped.d3d11_texture(), Some(ptr));
-    // A wrapped texture keys on the texture pointer, so it aliases the
-    // original; the same texture reopened from its NT handle would not.
+    // A wrapped texture has the original's identity.
     assert_eq!(
         wrapped.buffer_identity().id(),
         t.buffer_identity().id(),
         "a pointer-wrapped texture shares the original's identity"
     );
-    // The exact key, not just "the two agree": this is the formula
-    // `dynamic_primitives.rs`'s
-    // `a_texture_handles_identity_names_its_texture_not_its_recyclable_handle_address`
-    // pins for the dynamic backend, and `edgefirst-image`'s `texture_of`
-    // recomputes before it will import. Asserting it on both sides is what
-    // stops the backends drifting apart -- when they did, the image crate's
-    // EGLImage cache served dropped textures.
+    // The identity's kind and its exact id.
     assert_eq!(
         t.buffer_identity().kind(),
         edgefirst_tensor::IdentityKind::D3d11Texture,
@@ -252,19 +222,13 @@ fn from_d3d11_texture_wraps_and_gpu_write_is_recorded() {
     assert_eq!(completion.value, 7);
 }
 
-/// Two handle imports of *different* textures with the same geometry get
-/// different identities even when the caller's handle values are recycled: the
-/// tensor keys on the `ID3D11Texture2D` its own open produced, and a live COM
-/// object's address cannot be handed to another object.
-///
-/// The first import's source handle is closed before the second is opened,
-/// which is what makes Windows free to hand the same numeric value back.
+/// Handle imports of different textures with the same geometry get different identities.
 #[test]
 fn handle_imports_of_different_textures_do_not_share_an_identity() {
     let open = |t: &TensorDyn| {
         let h = t.d3d11_shared_handle().unwrap();
         // SAFETY: `h` is a shared NT handle this process owns for the length
-        // of this closure; the constructor duplicates what it keeps.
+        // of this closure.
         let imported = unsafe {
             TensorDyn::from_d3d11_shared_handle(
                 h.as_raw_handle() as _,
@@ -301,9 +265,7 @@ fn handle_imports_of_different_textures_do_not_share_an_identity() {
     );
 }
 
-/// A write-only map has to publish the whole texture, so a window shorter than
-/// the backing is refused rather than silently overwriting the rows outside
-/// it. `ReadWrite` is the same window with the refresh, and it is accepted.
+/// A write-only map of a window shorter than the backing is refused; `ReadWrite` is accepted.
 #[test]
 fn write_only_map_of_a_narrowed_window_is_refused_and_names_readwrite() {
     let mut t = Tensor::<u8>::image(
@@ -324,10 +286,7 @@ fn write_only_map_of_a_narrowed_window_is_refused_and_names_readwrite() {
     assert!(t.map_mut().is_ok(), "the read-write window is accepted");
 }
 
-/// `gpu_write_value` is the recorded value alone, with no duplicated fence
-/// handle: 0 before any write, then the number `gpu_completion` carries, on
-/// the typed tensor and on `TensorDyn` alike. A host tensor answers 0 rather
-/// than an error.
+/// `gpu_write_value` is 0 before any write, then the value `gpu_completion` carries.
 #[test]
 fn d3d11_gpu_write_value_matches_the_completion_value() {
     let t = Tensor::<u8>::image(
@@ -354,8 +313,7 @@ fn d3d11_gpu_write_value_matches_the_completion_value() {
     assert_eq!(TensorDyn::from(host).gpu_write_value(), 0);
 }
 
-/// The Windows accessors are `None`/`NotImplemented` for a tensor that is not
-/// a texture, rather than panicking or lying.
+/// The Windows accessors are `None`/`NotImplemented` for a tensor that is not a texture.
 #[test]
 fn non_texture_tensors_report_no_d3d11_backing() {
     let m = Tensor::<u8>::new(&[16], None, None).unwrap();
@@ -368,8 +326,7 @@ fn non_texture_tensors_report_no_d3d11_backing() {
     assert!(matches!(m.gpu_completion(), Err(Error::NotImplemented(_))));
 }
 
-/// `Tensor::new` with an explicit `DmaBuf` request says why a texture tensor
-/// cannot serve it instead of silently allocating host memory.
+/// `Tensor::new` with a `DmaBuf` request fails with a message naming the image constructor.
 #[test]
 fn plain_new_with_dmabuf_names_the_image_constructor() {
     let err = Tensor::<u8>::new(&[16], Some(TensorMemory::DmaBuf), None).unwrap_err();
@@ -379,9 +336,7 @@ fn plain_new_with_dmabuf_names_the_image_constructor() {
     );
 }
 
-/// A texture tensor's descriptor names the texture's own NT handle, the
-/// device fence and the value of the last recorded write, and importing it
-/// rebuilds a tensor over the same texture.
+/// A texture descriptor carries the NT handle, fence and last write, and imports as that texture.
 #[test]
 fn descriptor_round_trips_a_texture_with_its_completion() {
     let t = TensorDyn::image(
@@ -413,9 +368,7 @@ fn descriptor_round_trips_a_texture_with_its_completion() {
         &[9, 8, 7, 6]
     );
 
-    // A pinned capsule (Python's `access="read"`) pins a texture tensor too.
-    // `ptr` is the fence under this kind, so the pin's host address must not
-    // displace it -- a consumer would open that address as a fence.
+    // A pinned descriptor keeps the fence in `ptr`.
     let pin = t.pin_host(CpuAccess::Read).unwrap();
     assert!(!pin.as_mut_ptr().is_null(), "a texture tensor does pin");
     let pinned = t.descriptor_pinned(Some(&pin));
@@ -424,9 +377,7 @@ fn descriptor_round_trips_a_texture_with_its_completion() {
     assert!(TensorDyn::import_descriptor(&pinned).is_ok());
 }
 
-/// A semi-planar texture is as wide as its padded row pitch, so the import's
-/// image width can only come from the descriptor's shape. Both spellings of
-/// that shape are accepted and the producer's own is what the consumer sees.
+/// A semi-planar texture's descriptor round-trips in both spellings of its shape.
 #[test]
 fn descriptor_round_trips_a_semi_planar_texture() {
     let mut t = TensorDyn::image(
@@ -446,26 +397,21 @@ fn descriptor_round_trips_a_semi_planar_texture() {
     assert_eq!(imported.shape(), t.shape());
     assert_eq!(imported.row_stride(), t.row_stride());
 
-    // The addressing spelling of the same image: the producer's logical shape
-    // is restored onto the import, not the allocation shape it opens at.
+    // The addressing spelling of the same image.
     t.set_logical_shape(&[481, 640]).unwrap();
     let imported = TensorDyn::import_descriptor(&t.descriptor_pinned(None)).unwrap();
     assert_eq!(imported.shape(), &[481, 640]);
     assert_eq!(imported.row_stride(), t.row_stride());
 }
 
-/// Copies `src`'s tight rows into a destination whose rows are `dst_stride`
-/// bytes apart, so a texture tensor whose backing pitch exceeds its image row
-/// is written row by row rather than as one flat block.
+/// Copies `src`'s tight rows into a destination whose rows are `dst_stride` bytes apart.
 fn copy_rows(dst: &mut [u8], src: &[u8], row_bytes: usize, dst_stride: usize) {
     for (i, row) in src.chunks(row_bytes).enumerate() {
         dst[i * dst_stride..i * dst_stride + row.len()].copy_from_slice(row);
     }
 }
 
-/// CUDA reads a texture tensor's pixels through the external-memory import
-/// attached at allocation, and a writable CUDA map publishes its buffer back
-/// into the texture when the guard drops.
+/// A CUDA map reads the texture's pixels, and a writable CUDA map publishes back into it.
 #[test]
 fn cuda_map_matches_the_cpu_map_and_map_mut_writes_back() {
     if warp_has_no_cuda_device("cuda_map_matches_the_cpu_map_and_map_mut_writes_back") {
@@ -495,7 +441,7 @@ fn cuda_map_matches_the_cpu_map_and_map_mut_writes_back() {
         );
     }
     let v = device.signal().unwrap();
-    // A CPU write needs no fence, but the map must tolerate a recorded value.
+    // Records a fence value before the CUDA map.
     t.set_gpu_write(v).unwrap();
     let cm = t.cuda_map().expect("CUDA handle attached at allocation");
     assert_eq!(cm.len(), 256 * 128 * 4);
@@ -514,8 +460,8 @@ fn cuda_map_matches_the_cpu_map_and_map_mut_writes_back() {
     {
         let cm = t.cuda_map_mut().unwrap();
         let ones = vec![1u8; cm.len()];
-        // SAFETY: mirror of the read above -- `ones` holds `cm.len()` readable
-        // bytes and the device pointer is live for the guard's lifetime.
+        // SAFETY: `ones` holds `cm.len()` readable bytes and the device
+        // pointer is live for the guard's lifetime.
         assert!(unsafe {
             edgefirst_tensor::memcpy_host_to_device(
                 cm.device_ptr(),
@@ -524,8 +470,7 @@ fn cuda_map_matches_the_cpu_map_and_map_mut_writes_back() {
             )
         });
     }
-    // Every row, not just the first: a release that copies the wrong row count
-    // or the wrong row length leaves the tail of the image untouched.
+    // Checks every row.
     let m = t.map_read().unwrap();
     let stride = t.row_stride().unwrap_or(256 * 4);
     for row in 0..128 {
@@ -537,10 +482,7 @@ fn cuda_map_matches_the_cpu_map_and_map_mut_writes_back() {
     }
 }
 
-/// A geometry whose D3D11 allocation the driver pads still imports: the
-/// declared external-memory size has to cover that padding, and 640x480 is one
-/// of the shapes whose padding-free byte count the driver rejects (the brief's
-/// 256x128 is one it accepts, so only this test covers the fallback).
+/// A CUDA map covers a 640x480 texture, whose allocation the driver pads.
 #[test]
 fn cuda_map_covers_a_texture_whose_allocation_the_driver_padded() {
     if warp_has_no_cuda_device("cuda_map_covers_a_texture_whose_allocation_the_driver_padded") {
@@ -585,10 +527,7 @@ fn cuda_map_covers_a_texture_whose_allocation_the_driver_padded() {
     assert_eq!(host, pattern);
 }
 
-/// CUDA reads an NV12 texture tensor as the combined plane a CPU map shows:
-/// luma rows, then interleaved chroma rows. An even NV12 image is a native
-/// two-plane texture, imported as a CUDA NV12 array whose planes are copied
-/// one after the other; `map_mut` writes both planes back.
+/// A CUDA map reads an NV12 texture as the combined plane, and `map_mut` writes both planes back.
 #[test]
 fn cuda_map_reads_the_nv12_combined_plane() {
     if warp_has_no_cuda_device("cuda_map_reads_the_nv12_combined_plane") {
@@ -657,9 +596,7 @@ fn cuda_map_reads_the_nv12_combined_plane() {
     }
 }
 
-/// Reference-mode blob transport of a texture, in one process: there is no fd
-/// table to carry an NT handle, so the handle values ride in the plane record
-/// and the header's pid says whose handle table they belong to.
+/// Reference-mode blob transport shares a texture within one process.
 #[test]
 fn blob_export_import_shares_a_texture_in_process() {
     let t = TensorDyn::image(
@@ -698,11 +635,7 @@ fn blob_export_import_shares_a_texture_in_process() {
     );
 }
 
-/// A texture import keeps the pitch its own device reports, not the producer's
-/// that the blob happens to carry: the two are facts about different drivers,
-/// and `from_d3d11_shared_handle` has already recorded the local one. The
-/// descriptor path makes the same exclusion (`restore_imported_row_stride`
-/// skips `D3D11_TEXTURE`), so a blob stride saying otherwise must not move it.
+/// A blob import keeps the pitch its own device reports, not the stride the blob carries.
 #[test]
 fn blob_import_keeps_the_local_pitch_not_the_blobs_stride() {
     let (w, h) = (37usize, 16usize);
@@ -717,8 +650,7 @@ fn blob_import_keeps_the_local_pitch_not_the_blobs_stride() {
     .unwrap();
     let (blob, _) = edgefirst_tensor::blob::export(&t, TransportMode::Reference).unwrap();
 
-    // What a fresh open of this very texture records for itself -- the answer
-    // the import has to match, whatever the blob says.
+    // What a fresh open of this texture records for itself.
     let handle = t.d3d11_shared_handle().unwrap();
     // SAFETY: `handle` is a live shared NT handle of this process's texture
     // and `t` holds the texture alive across the call.
@@ -736,8 +668,7 @@ fn blob_import_keeps_the_local_pitch_not_the_blobs_stride() {
     }
     .unwrap();
 
-    // A plausible but wrong pitch in the blob's plane 0 record, whose `stride`
-    // is the third of its six scalars.
+    // Overwrites `stride`, the third of the six scalars in the blob's plane 0 record.
     let view = edgefirst_tensor::blob::BlobView::parse(&blob).unwrap();
     let regions = edgefirst_tensor::blob::region_offsets(&view.header()).unwrap();
     let carried = view.planes().unwrap()[0].stride;
@@ -752,9 +683,6 @@ fn blob_import_keeps_the_local_pitch_not_the_blobs_stride() {
         direct.row_stride(),
         "the import keeps the pitch this device reports for the texture"
     );
-    // Through `effective_row_stride`, which is a real number on every adapter:
-    // WARP pads nothing at this width, so `row_stride()` is `None` there and
-    // comparing it alone would prove nothing.
     assert_eq!(
         back.effective_row_stride(),
         direct.effective_row_stride(),
@@ -767,7 +695,7 @@ fn blob_import_keeps_the_local_pitch_not_the_blobs_stride() {
     );
 }
 
-/// Removes the blob file on every path out of the parent, panic included.
+/// Removes the blob file on drop.
 struct TempBlob(std::path::PathBuf);
 
 impl Drop for TempBlob {
@@ -776,16 +704,7 @@ impl Drop for TempBlob {
     }
 }
 
-/// The cross-process half: the child re-runs this test binary with
-/// `EF_D3D11_CHILD` naming the blob file. Its D3D11 device is its own, so the
-/// import can only work by duplicating both NT handles out of the exporting
-/// process the header names and opening the texture on the child's device.
-///
-/// The parent records a GPU write before exporting, so the child's import
-/// opens the *fence* out of the parent too and waits on it -- which is only
-/// reachable because `signal()` submits the context it signalled on. The
-/// child then re-signals its own fence behind that wait, so what it reports
-/// is a value on its own timeline rather than the parent's.
+/// A child process imports the blob by duplicating both NT handles out of the exporter.
 #[test]
 fn blob_import_from_another_process_duplicates_the_handles() {
     if let Ok(path) = std::env::var("EF_D3D11_CHILD") {
@@ -823,8 +742,7 @@ fn blob_import_from_another_process_duplicates_the_handles() {
         .env("EF_D3D11_CHILD", &file.0)
         .status()
         .unwrap();
-    // Export borrows: the handle values in the blob are this process's, so
-    // the exporting tensor has to outlive the child that reads them.
+    // The exporting tensor is dropped after the child has run.
     drop(t);
     assert!(
         status.success(),
@@ -837,11 +755,7 @@ fn child_imports_the_exported_blob(path: &str) {
     let t = edgefirst_tensor::blob::import(&blob, &[]).expect("import in the child");
     assert_eq!(t.memory(), TensorMemory::DmaBuf);
 
-    // The parent's fence handle was duplicated out of it and reopened here, so
-    // the import could wait on the parent's value -- and then record a value
-    // of its *own* device's timeline, which is the only one the fence this
-    // completion names ever reaches. The two numbers are unrelated: asserting
-    // equality would pin the cross-process hang the local re-signal removes.
+    // The import records a value on its own device's timeline.
     let completion = t
         .gpu_completion()
         .expect("gpu_completion")
@@ -851,9 +765,7 @@ fn child_imports_the_exported_blob(path: &str) {
         "the import recorded a value on this process's fence"
     );
 
-    // Reachable on the fence it came back with, which is the pairing every
-    // consumer relies on: the parent's value on the child's fence would never
-    // arrive.
+    // The value is reachable on the fence it came back with.
     let d = edgefirst_tensor::d3d11::device().unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while d.completed_value() < completion.value {
@@ -871,8 +783,7 @@ fn child_imports_the_exported_blob(path: &str) {
         &[5, 6]
     );
 
-    // With CUDA present the same ordering has to hold for the device path: a
-    // completion on a foreign timeline made this wait forever.
+    // With CUDA present, the imported texture maps on the device path too.
     if edgefirst_tensor::is_cuda_available() {
         match t.cuda_map() {
             Some(m) => assert!(
@@ -885,20 +796,10 @@ fn child_imports_the_exported_blob(path: &str) {
 }
 
 // ---------------------------------------------------------------------------
-// Plane offset on a reconstructed tensor -- issue #161, the Windows half.
-//
-// `TensorDesc` has no field for the plane offset, so a consumer rebuilding a
-// `view()` from a descriptor opens the whole texture and puts the offset back
-// with `Tensor::set_plane_offset`. That was a silent no-op on this backing:
-// the `Dma` arm was `cfg(target_os = "linux")` and `TensorStorage::Dma` is a
-// cfg-multiplexed *name* rather than one type, so Windows fell through to the
-// catch-all. And it could not even be reached: the import refused a window
-// shape outright. Each test below pins one piece of the fix and was seen to
-// fail without it.
+// Plane offset on a reconstructed tensor.
 // ---------------------------------------------------------------------------
 
-/// A ramp so byte `i` holds `i & 0xff`: a window that lands at the wrong
-/// origin cannot coincidentally match the expected bytes.
+/// An RGBA texture tensor ramped so byte `i` holds `i & 0xff`.
 fn ramped_rgba(w: usize, h: usize) -> TensorDyn {
     let t = TensorDyn::image(
         w,
@@ -918,10 +819,7 @@ fn ramped_rgba(w: usize, h: usize) -> TensorDyn {
     t
 }
 
-/// A view's descriptor imports at the window's shape, over the whole
-/// texture, keeping the texture's pitch as its row stride. Before the fix
-/// this import failed with "neither the allocation shape nor the addressing
-/// shape", which is the *loud* half of the Windows bug.
+/// A view's descriptor imports at the window's shape, over the whole texture, at its pitch.
 #[test]
 fn d3d11_view_descriptor_imports_at_the_window_with_the_textures_pitch() {
     let parent = ramped_rgba(64, 64);
@@ -945,16 +843,12 @@ fn d3d11_view_descriptor_imports_at_the_window_with_the_textures_pitch() {
         None,
         "the descriptor cannot carry the offset; the capsule restores it"
     );
-    // Before the offset is put back, the window sits at the texture's
-    // origin -- the state `apply_plane_offset` corrects.
+    // Before the offset is put back, the window sits at the texture's origin.
     let m = rebuilt.map_bytes(CpuAccess::Read).expect("map rebuilt");
     assert_eq!(m.as_slice()[0], 0);
 }
 
-/// A window is the only third spelling: a semi-planar sub-rectangle is not
-/// one (`Tensor::view` makes packed views only), nor a window with a
-/// different channel count, nor an empty one. Untrusted descriptor input
-/// keeps failing loudly.
+/// A window descriptor that is semi-planar, of another channel count, empty or too tall is refused.
 #[test]
 fn d3d11_window_descriptor_is_packed_and_non_empty_only() {
     let nv12 = TensorDyn::image(
@@ -988,9 +882,7 @@ fn d3d11_window_descriptor_is_packed_and_non_empty_only() {
     }
 }
 
-/// Restoring a plane offset onto a reconstructed texture tensor must move
-/// where `map()` starts. The Windows twin of
-/// `set_plane_offset_moves_the_iosurface_map_window`.
+/// Restoring a plane offset onto a reconstructed texture tensor moves where `map()` starts.
 #[test]
 fn set_plane_offset_moves_the_d3d11_map_window() {
     let parent = ramped_rgba(64, 64);
@@ -1001,7 +893,6 @@ fn set_plane_offset_moves_the_d3d11_map_window() {
     let mut rebuilt =
         TensorDyn::import_descriptor(&view.descriptor_pinned(None)).expect("reconstruct");
 
-    // The restore under test: what `interop::apply_plane_offset` does.
     rebuilt.set_plane_offset(offset);
     assert_eq!(rebuilt.plane_offset(), Some(offset));
 
@@ -1012,7 +903,7 @@ fn set_plane_offset_moves_the_d3d11_map_window() {
     assert_ne!(
         s[0], 0,
         "map() still starts at the texture's origin -- set_plane_offset was a \
-         no-op on D3D11 storage (issue #161)"
+         no-op on D3D11 storage"
     );
     let pitch = rebuilt.effective_row_stride().expect("pitch");
     for row in 0..16 {
@@ -1028,13 +919,7 @@ fn set_plane_offset_moves_the_d3d11_map_window() {
     }
 }
 
-/// A nested `subview` must not compound its offset now that
-/// `set_plane_offset` writes through to the texture storage: `Tensor::subview`
-/// sets the offset twice by two routes (`D3d11TextureTensor::view` computes
-/// `view_offset + offset_bytes`, then `subview` writes `plane_offset +
-/// offset_bytes` back), which agree only while the wrapper and storage fields
-/// stay in sync. Two levels, because one level cannot tell an idempotent
-/// write from one that compounds from zero.
+/// A nested `subview` does not compound its plane offset.
 #[test]
 fn nested_d3d11_subviews_do_not_compound_their_plane_offset() {
     let parent = ramped_rgba(64, 64);
@@ -1060,9 +945,7 @@ fn nested_d3d11_subviews_do_not_compound_their_plane_offset() {
     );
 }
 
-/// `set_format` must clear the texture storage offset, not just the wrapper
-/// field, or `plane_offset()` reports `None` while `map()` still starts at
-/// the old offset -- a stale window instead of a lost one.
+/// `set_format` clears the texture storage offset as well as the wrapper field.
 #[test]
 fn set_format_clears_the_d3d11_map_window() {
     let parent = ramped_rgba(64, 64);
@@ -1077,21 +960,18 @@ fn set_format_clears_the_d3d11_map_window() {
         "precondition: the offset is live before the format change"
     );
 
-    // A different packed format of the same channel count keeps the shape
-    // valid; changing it drops the offset it cannot vouch for.
+    // A different packed format of the same channel count.
     t.set_format(PixelFormat::Bgra).expect("new format");
     assert_eq!(t.plane_offset(), None, "the wrapper field is cleared");
     assert_eq!(
         t.map_bytes(CpuAccess::Read).expect("map after").as_slice()[0],
         0,
         "map() still starts at the old offset -- set_format cleared the wrapper \
-         field but not the D3D11 storage (issue #161)"
+         field but not the D3D11 storage"
     );
 }
 
-/// `reshape` is the other clear site, and unlike `IoSurfaceTensor::reshape`
-/// the D3D11 storage's own `reshape` leaves `view_offset` alone, so the
-/// wrapper's arm is what clears it.
+/// `reshape` clears the texture storage offset.
 #[test]
 fn reshape_clears_the_d3d11_map_window() {
     let parent = ramped_rgba(64, 64);
@@ -1110,20 +990,11 @@ fn reshape_clears_the_d3d11_map_window() {
     assert_eq!(
         t.map_bytes(CpuAccess::Read).expect("map after").as_slice()[0],
         0,
-        "map() still starts at the old offset after reshape (issue #161)"
+        "map() still starts at the old offset after reshape"
     );
 }
 
-/// `set_plane_offset` takes any value -- a descriptor's restored offset is
-/// untrusted -- so the pins bound it rather than offsetting a base pointer
-/// past the backing.
-///
-/// The bound is the whole image, not just its first byte. A pin's length is
-/// the backing less the offset, so an offset near the end leaves a map
-/// shorter than the image while the tensor still reports its full width and
-/// height, and a consumer reading `width x height` through the map's pointer
-/// runs past the allocation -- which the GL upload path does, since GL takes
-/// a raw pointer and cannot see a slice's length.
+/// A map refuses a plane offset that leaves less than the whole image in the backing.
 #[test]
 fn d3d11_map_refuses_a_plane_offset_past_the_backing() {
     let parent = ramped_rgba(64, 64);
@@ -1135,17 +1006,14 @@ fn d3d11_map_refuses_a_plane_offset_past_the_backing() {
         .expect_err("a window past the backing");
     assert!(matches!(err, Error::InsufficientCapacity { .. }), "{err}");
 
-    // Exactly the backing is a legal one-past-the-end pointer, but it is an
-    // empty window for a tensor that still calls itself 64x64 -- the shape
-    // that fed a short map to `TexImage2D`. Refused, not handed back empty.
+    // An offset equal to the backing is refused.
     t.set_plane_offset(backing);
     let err = t
         .map_bytes(CpuAccess::Read)
         .expect_err("an empty window for a non-empty tensor");
     assert!(matches!(err, Error::InsufficientCapacity { .. }), "{err}");
 
-    // One byte short of the whole image is refused for the same reason: the
-    // map would be a byte shy of what width x height reads.
+    // One byte short of the whole image is refused.
     t.set_plane_offset(1);
     let err = t
         .map_bytes(CpuAccess::Read)
@@ -1157,14 +1025,7 @@ fn d3d11_map_refuses_a_plane_offset_past_the_backing() {
     assert!(!t.map_bytes(CpuAccess::Read).expect("origin").is_empty());
 }
 
-/// A single-row view records a tight row stride (`Tensor::view`) while its
-/// offset is measured in the texture's pitch. The descriptor round trip
-/// keeps the two apart: the window imports at one row with the same tight
-/// stride, and the offset put back is the producer's own, so the rebuilt
-/// window maps the same texels -- including in the texture's last row,
-/// where one pitched row would run past the backing. Dividing the offset by
-/// the descriptor's stride, as a pitch translation once did, named row 32
-/// for a view of row 8.
+/// A single-row view's descriptor round-trips to the same texels, in the last row too.
 #[test]
 fn one_row_d3d11_view_descriptor_maps_the_producers_texels() {
     let parent = ramped_rgba(64, 64);

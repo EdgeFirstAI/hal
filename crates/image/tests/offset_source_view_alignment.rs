@@ -1,42 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! A source at a byte offset inside a DMA-BUF must convert to its own window
-//! through the GL backend at every offset, not only at the ones that happen to
-//! be 64-byte aligned. Issue #165.
+//! A source at a byte offset inside a DMA-BUF converts to its own window
+//! through the GL backend at every offset, 64-byte aligned or not.
 //!
-//! On Mali (i.MX 95) the DMA-BUF import silently samples zeros when
-//! `EGL_DMA_BUF_PLANE0_OFFSET_EXT` is not a multiple of 64 -- no EGL error,
-//! the import succeeds -- so a 16x16 view at (8, 8) of a 256-byte-pitched RGBA
-//! surface (offset 2080) came back all `[0, 0, 0, 255]` while (0, 8) (offset
-//! 2048) and (16, 0) (offset 64) were fine; V3D converts all of them. The
-//! engine imports such a source from the 64-byte-aligned base below its
-//! offset, widened by the remainder in pixels, and folds that shift into the
-//! sampling rectangle -- so the view stays zero-copy on Mali (issue #170).
-//! The NV12 case below still declines and uploads: its combined-plane R8
-//! import has no room to widen, its pitch being its width.
-//!
-//! The NV12 case also pins #166: a declined NV source must reach the R8
-//! *upload*, not the CPU converter -- `GLProcessorThreaded` is driven
-//! directly, so a CPU fallback cannot pass this file.
-//!
-//! **The NV12 case is a plane offset, not a `view()`.** `Tensor::view` is
-//! packed-only (`view() supports packed formats only (got Nv12)`), so a
-//! semi-planar sub-rectangle does not exist as an API. The offset a real NV
-//! source arrives at is a whole frame inside a bigger buffer -- a pool slot,
-//! or the window `interop::apply_plane_offset` hands back -- which is what
-//! `set_plane_offset` builds here, on a real DMA-BUF NV12 surface so the
-//! zero-copy R8 import is the path actually under test.
-//!
-//! Every offset here is asserted, including the aligned ones, so a regression
-//! on the drivers that handle unaligned offsets natively (V3D, Vivante) is
-//! caught by the same file.
-//!
-//! The ANGLE leaves (`platform/angle.rs`, `platform/windows.rs`) refuse an
-//! offset source through the same `refuse_offset_source` import-failure arms
-//! this file pins, but this file is Linux-only, so an IOSurface or D3D11
-//! offset NV source is not built here -- that upload is covered separately
-//! by `offset_nv_source_upload.rs`, which drives `Mem`.
+//! `GLProcessorThreaded` is driven directly. The NV12 case sets a plane offset
+//! on a DMA-BUF NV12 surface with `set_plane_offset`.
 
 #![cfg(all(target_os = "linux", feature = "opengl"))]
 
@@ -51,13 +20,11 @@ const H: usize = 64;
 const SIDE: usize = 16;
 const BPP: usize = 4;
 
-/// The alignment Mali's DMA-BUF import needs; mirrored from the engine so the
-/// NV12 case can build one offset on either side of it, and reused by the
-/// destination case to say which of its two offsets is the aligned one.
+/// The alignment Mali's DMA-BUF import needs.
 const MALI_ALIGN: usize = 64;
 
-/// The origins the imx95 probe classified; the two unaligned ones (offsets 32
-/// and 2080 at a 256-byte pitch) are the regression, the rest the control.
+/// The view origins under test. Two give unaligned offsets (32 and 2080 at a
+/// 256-byte pitch); the rest are aligned.
 const ORIGINS: [(usize, usize); 6] = [(0, 0), (8, 8), (0, 8), (8, 0), (16, 0), (0, 1)];
 
 #[path = "../../tensor/tests/support/dma_require.rs"]
@@ -90,10 +57,7 @@ fn gl_or_skip() -> Option<GLProcessorThreaded> {
     }
 }
 
-/// A DMA-BUF image: it must allocate where the host has a usable heap (or
-/// where [`zero_copy::expect`] otherwise requires one), since a heap that
-/// cannot serve it would let the whole file pass without importing anything;
-/// elsewhere the test skips with a warning.
+/// A DMA-BUF image, or `None` after a skip warning where the host has no usable heap.
 fn dmabuf_image_or_skip(w: usize, h: usize, fmt: PixelFormat) -> Option<TensorDyn> {
     zero_copy::image(w, h, fmt, DType::U8)
 }
@@ -149,7 +113,7 @@ fn rgba_source_views_convert_their_own_tile_at_every_origin() {
         }
         if got != expected {
             let kind = if got.chunks(BPP).all(|p| p == [0, 0, 0, 255]) {
-                "ZEROS (issue #165: the import sampled nothing)"
+                "ZEROS (the import sampled nothing)"
             } else {
                 "wrong pixels"
             };
@@ -171,33 +135,16 @@ fn rgba_source_views_convert_their_own_tile_at_every_origin() {
     let imports = after.src_imports - before.src_imports;
     let uploads = after.src_uploads - before.src_uploads;
     let pbo = after.src_pbo_uploads - before.src_pbo_uploads;
-    // A driver with no DMA-BUF import at all feeds every one of them by
-    // copy and there is no route to assert -- the desktop NVIDIA GPU is
-    // exactly that: it has a DMA heap, so the allocation above is a real
-    // DMA-BUF and the file does not skip, but its EGL has no working
-    // DMA-BUF import. The copy is a `map()` upload on some drivers and a
-    // PBO on others, so both count here; leaving PBO out let a PBO-fed
-    // desktop fall past this guard into the assertions below. The pixels
-    // above are the whole assertion on such a driver.
+    // Skips the route assertions on a driver that feeds every source by copy.
     if imports == 0 && (uploads + pbo) as usize == ORIGINS.len() {
         skip("this GL driver cannot import DMA-BUF at all; the pixels above are the assertion");
         return;
     }
-    // Issue #170: an unaligned source is no longer declined into an upload.
-    // It imports from a 64-byte-aligned base widened by the remainder in
-    // pixels, and the engine folds the shift into the sampling rectangle --
-    // so every one of these origins is a zero-copy import on every driver
-    // with a DMA-BUF import, Mali included, where offsets 32 and 2080 used
-    // to take the upload path.
-    //
-    // Asserted alongside the pixels, not instead of them: an engine that
-    // silently uploaded would still produce the right tile and pass the
-    // loop above, which is exactly how #170 could regress unnoticed.
     assert_eq!(
         uploads + pbo,
         0,
         "{uploads} of {} source views were uploaded and {pbo} went by PBO, \
-         not imported (issue #170: the aligned-base rebase must keep them \
+         not imported (the aligned-base rebase must keep them \
          zero-copy); imports={imports}",
         ORIGINS.len()
     );
@@ -212,30 +159,11 @@ fn rgba_source_views_convert_their_own_tile_at_every_origin() {
     );
 }
 
-/// A whole RGBA frame at a byte offset inside a bigger DMA-BUF -- the shape a
-/// pool slot or an `interop::apply_plane_offset` window arrives in -- on a
-/// surface whose pitch has no room to widen.
-///
-/// This is the case a Mali decline keyed on the FORMAT gets wrong. 64 RGBA
-/// pixels is a 256-byte row, already 64-byte aligned, so nothing is padded on
-/// and the pitch is tight; folding a 32-byte offset would need the import
-/// widened to 72 pixels (288 bytes), which runs past that pitch, so
-/// `from_tensor` keeps the frame's own unaligned offset and Mali must go on
-/// declining it into the upload. Exempt it because "RGBA is a format the fold
-/// covers" and it imports unaligned and comes back black (issue #170).
-///
-/// The pixels are the assertion that separates the drivers, and they have to
-/// be: nothing here can name the renderer. On Mali a wrongly-exempted import
-/// samples zeros and this fails; on V3D and Vivante the same import is read
-/// correctly and it passes, which is the behaviour those two must keep. The
-/// counters pin the other half -- exactly one source feed per convert, so a
-/// silent CPU fallback cannot pass either.
+/// An RGBA frame at an aligned and an unaligned plane offset matches the CPU reference.
 #[test]
 fn rgba_offset_frames_convert_at_a_pitch_with_no_room_to_rebase() {
     let Some(mut gl) = gl_or_skip() else { return };
-    // Three frames' worth of rows so a window can start past the first frame
-    // and still be fully backed, then re-tagged to one frame's geometry at an
-    // offset, which keeps the surface pitch -- as in the NV12 case below.
+    // Three frames' worth of rows, later re-tagged to one frame's geometry at an offset.
     let Some(mut src) = dmabuf_image_or_skip(W, H * 3, PixelFormat::Rgba) else {
         return;
     };
@@ -247,9 +175,7 @@ fn rgba_offset_frames_convert_at_a_pitch_with_no_room_to_rebase() {
          surface pitch is tight and the rebase has no room to widen into",
         W * BPP
     );
-    // A pattern whose period (31) is coprime with both the pitch and 64, so a
-    // window read at the wrong offset cannot coincide with the right one.
-    // Written BEFORE the re-tag, while the map still covers every row.
+    // A pattern with period 31, written before the re-tag while the map covers every row.
     {
         let mut m = src.map_bytes(CpuAccess::Write).expect("map src");
         let s = m.as_mut_slice();
@@ -303,7 +229,7 @@ fn rgba_offset_frames_convert_at_a_pitch_with_no_room_to_rebase() {
                 let got = bytes(&dst);
                 if got != want {
                     let kind = if got.chunks(BPP).all(|p| p == [0, 0, 0, 255]) {
-                        "ZEROS (issue #170: an unrebased offset was imported anyway)"
+                        "ZEROS (an unrebased offset was imported anyway)"
                     } else {
                         "wrong pixels"
                     };
@@ -331,29 +257,17 @@ fn rgba_offset_frames_convert_at_a_pitch_with_no_room_to_rebase() {
     );
 }
 
-/// An NV12 DMA-BUF frame at a 64-aligned and at an unaligned plane offset,
-/// each against a CPU reference over the same tensor. On Mali the unaligned
-/// one is declined by the zero-copy R8 import and must come back through the
-/// R8 *upload* (issue #166's routing), which `GLProcessorThreaded` proves by
-/// returning `Ok` at all: the old failure arm called `draw_src_texture`, which
-/// has no NV arm and returned `NotSupported`.
+/// An NV12 DMA-BUF frame at an aligned and an unaligned plane offset matches the CPU reference.
 #[test]
 fn nv12_offset_sources_convert_through_gl_at_aligned_and_unaligned_offsets() {
     let Some(mut gl) = gl_or_skip() else { return };
-    // Three frames' worth of rows so a window can start past the first frame
-    // and still be fully backed. Allocated as a real NV12 surface, then
-    // re-tagged to one frame's geometry at an offset, which keeps the driver's
-    // pitch -- the shape a pool slot arrives in.
+    // Three frames' worth of rows, later re-tagged to one frame's geometry at an offset.
     let Some(mut src) = dmabuf_image_or_skip(W, H * 3, PixelFormat::Nv12) else {
         return;
     };
     let pitch = src.effective_row_stride().unwrap_or(W);
-    // A pattern whose period (31) is coprime with both the pitch and 64, so a
-    // window read at the wrong offset cannot coincide with the right one.
-    // Kept inside 112..=142 so neither the luma nor the chroma it also feeds
-    // drives any RGB channel into clamping, where two different reads could
-    // agree by saturation. Written BEFORE the re-tag: afterwards the map is one
-    // frame long and every window this test reads would stay at zero.
+    // A pattern with period 31 inside 112..=142, written before the re-tag
+    // while the map covers every row.
     {
         let mut m = src.map_bytes(CpuAccess::Write).expect("map src");
         let s = m.as_mut_slice();
@@ -369,9 +283,7 @@ fn nv12_offset_sources_convert_through_gl_at_aligned_and_unaligned_offsets() {
         Some(pitch),
         "precondition: the re-tag kept the surface pitch"
     );
-    // Full-range BT.601 so both converters resolve the same matrix instead of
-    // the untagged SD heuristic (which is limited-range and would still agree,
-    // but says so by accident rather than by contract).
+    // Tags the source full-range BT.601.
     src.set_colorimetry(Some(
         Colorimetry::default()
             .with_encoding(ColorEncoding::Bt601)
@@ -410,7 +322,7 @@ fn nv12_offset_sources_convert_through_gl_at_aligned_and_unaligned_offsets() {
         match gl.convert(&src, &mut dst, None) {
             Err(e) => failures.push(format!(
                 "offset {offset}: GL refused the NV12 source: {e} \
-                 (issue #166: the declined import must reach the R8 upload)"
+                 (the declined import must reach the R8 upload)"
             )),
             Ok(()) => {
                 let got = bytes(&dst);
@@ -421,15 +333,12 @@ fn nv12_offset_sources_convert_through_gl_at_aligned_and_unaligned_offsets() {
                     .count();
                 if bad > 0 {
                     // A flat output means the import sampled one constant.
-                    // Issue #165's zero-sampling reads Y=U=V=0, which
-                    // full-range BT.601 turns into [0, 136, 0, 255] -- not the
-                    // [0, 0, 0, 255] the RGBA case above looks for.
                     let flat = got.chunks(BPP).all(|p| p == &got[..BPP]);
                     failures.push(format!(
                         "offset {offset}: {bad} bytes differ from the CPU reference{}; \
                          first got={:?} want={:?}",
                         if flat {
-                            " (FLAT: issue #165, the import sampled a constant)"
+                            " (FLAT: the import sampled a constant)"
                         } else {
                             ""
                         },
@@ -441,8 +350,6 @@ fn nv12_offset_sources_convert_through_gl_at_aligned_and_unaligned_offsets() {
         }
         references.push(want);
     }
-    // The two windows must actually differ, or "GL matches CPU" would hold for
-    // an engine that ignored the offset entirely.
     assert_ne!(
         references[0], references[1],
         "precondition: offsets {aligned} and {unaligned} name different windows"
@@ -454,28 +361,7 @@ fn nv12_offset_sources_convert_through_gl_at_aligned_and_unaligned_offsets() {
     );
 }
 
-/// A DESTINATION at a plane offset Mali cannot *sample* from. Rendering into an
-/// unaligned base is a different operation from sampling one, and the
-/// destination exemption in `get_or_create_egl_image` claims it is safe, so it
-/// is measured here rather than assumed.
-///
-/// Measured: Mali (i.MX 95) and V3D render into offset 2080 correctly, so their
-/// import succeeds and the destination stays zero-copy. Vivante does NOT —
-/// `eglCreateImage` returns `EGL_BAD_ACCESS` at 2080 while 2048 renders — and
-/// since issue #175 that refusal is itself the trigger rather than something a
-/// per-driver predicate has to predict: the convert falls back to the
-/// mapped-texture readback, which writes through `map()` at the offset, and
-/// still lands the correct pixels. Both offsets are asserted on every driver,
-/// and so is the route (`dst_import_fallbacks`), so a regression on either
-/// half is caught here whichever way it falls.
-///
-/// The destination is rebuilt from a `view()`'s descriptor, which is the only
-/// shape that reaches the import at a nonzero offset: a fresh `view()` collapses
-/// onto its parent's key at offset 0 (`cache.rs`'s `for_dst` arm), while a
-/// rebuilt one carries the offset and no `view_origin`, so on Linux
-/// `dst_import_places` keeps it zero-copy and the import base IS the offset.
-/// Same pattern as `reconstructed_view_convert.rs` case E, at both an aligned
-/// and an unaligned offset.
+/// A convert into an RGBA destination at a plane offset, aligned or not, lands its tile there.
 #[test]
 fn rgba_offset_destinations_place_their_tile_at_aligned_and_unaligned_offsets() {
     const BLANK: u8 = 0x55;
@@ -487,9 +373,7 @@ fn rgba_offset_destinations_place_their_tile_at_aligned_and_unaligned_offsets() 
 
     let mut failures = Vec::new();
     let mut routes: Vec<(usize, usize, usize, u64)> = Vec::new();
-    // (0, 8) is 8 * pitch, aligned whenever the pitch is; (8, 8) adds
-    // 8 * BPP = 32, which is never 64-aligned. Same construction as the source
-    // test, so the two halves are measured at the same two offsets.
+    // (0, 8) is 8 * pitch; (8, 8) adds 8 * BPP = 32, which is not 64-aligned.
     for (x0, y0) in [(0usize, 8usize), (8, 8)] {
         let offset = y0 * pitch + x0 * BPP;
         {
@@ -518,8 +402,7 @@ fn rgba_offset_destinations_place_their_tile_at_aligned_and_unaligned_offsets() 
             "precondition: rebuilt, so no viewport to place it by"
         );
 
-        // The source carries the tile's ABSOLUTE canvas colours, so a tile that
-        // lands at the wrong origin is wrong in value, not just in place.
+        // The source carries the tile's absolute canvas colours.
         let src = rgba_dst(SIDE, SIDE);
         {
             let mut m = src.map_bytes(CpuAccess::Write).expect("map src");
@@ -538,12 +421,8 @@ fn rgba_offset_destinations_place_their_tile_at_aligned_and_unaligned_offsets() 
             failures.push(format!("({x0},{y0}) offset {offset}: convert failed: {e}"));
             continue;
         }
-        // The route this destination took. A driver that imports it renders
-        // into the buffer directly (0); one that refuses it — Vivante at an
-        // unaligned offset — falls back to the mapped-texture readback (1),
-        // and the pixel assertions below must hold either way. What is NOT
-        // acceptable is a fallback at an offset the driver imports happily:
-        // that would mean the convert quietly stopped being zero-copy.
+        // Destination-import fallbacks this convert took: 0 when the driver
+        // imported the destination, 1 when the mapped-texture readback served it.
         let took = gl
             .convert_stats()
             .expect("convert stats")

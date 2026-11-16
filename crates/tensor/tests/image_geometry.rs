@@ -4,12 +4,10 @@
 //! Image geometry of a formatted tensor whose shape carries a leading batch
 //! dimension.
 //!
-//! `set_logical_shape` keeps the pixel format, so an `[N*H, W, C]` image
-//! re-viewed as `[N, H, W, C]` is a formatted rank-4 tensor reachable through
-//! the public API alone. Its width, height and row stride must describe one
-//! element `[H, W, C]`, and `batch(n)` must snapshot the tall `(W, N*H)`
-//! parent at the element's real row pitch -- not at `H * C` bytes, which is
-//! what reading `shape[1]` as the width produces.
+//! An `[N*H, W, C]` image re-viewed as `[N, H, W, C]` through
+//! `set_logical_shape` is a formatted rank-4 tensor. Its width, height and row
+//! stride describe one element `[H, W, C]`, and `batch(n)` views the parent at
+//! the element's row pitch.
 
 #![cfg(not(edgefirst_tensor_dynamic))]
 
@@ -18,8 +16,7 @@ use edgefirst_tensor::{
 };
 
 /// A `[4, 3, 5, 4]` RGBA batch: four 5-wide, 3-tall tiles stacked in one
-/// `5 x 12` image allocation. Width and height differ so the two cannot be
-/// confused.
+/// `5 x 12` image allocation.
 fn rgba_batch<T>() -> Tensor<T>
 where
     T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync + 'static,
@@ -145,9 +142,7 @@ fn batch_of_an_unbatched_packed_image_is_refused() {
 
 #[test]
 fn flattened_image_has_no_image_geometry() {
-    // A caller may flatten an image and leave the format behind; the
-    // geometry accessors must then say "unknown" rather than index a
-    // dimension that is not there.
+    // On a flattened image the geometry accessors report `None`.
     let mut t = Tensor::<u8>::image(
         5,
         3,

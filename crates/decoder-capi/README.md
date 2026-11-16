@@ -50,9 +50,7 @@ ef_decoder_free(d);
 
 ## Exactly one configuration source
 
-JSON, YAML or a file — supplying none, or more than one, is an error rather than
-a precedence rule nobody remembers. Two sources that disagree have no defined
-resolution, so the API refuses instead of picking.
+JSON, YAML or a file — supplying none, or more than one, is an error. Two sources that disagree have no defined resolution, so the API refuses instead of picking.
 
 ## Detections cross as plain values
 
@@ -74,20 +72,7 @@ The default merge metric is Intersection-over-Smaller, not IoU. An object split
 across a tile seam has *low* IoU with its own fragment, so an IoU default would
 keep both halves as separate detections.
 
-The default merge **mode** is keep-best: the highest-scoring box of each matched
-group is kept and the rest are dropped. The enclosing-union merge measured about
-0.05 AP50 worse on every frame of the Ocean Cleanup ADIS 4K validation
-(TOP2-836), so it is opt-in: fill an `ef_merge_config` with
-`ef_merge_config_default`, set `mode = 1`, and pass it to
-`ef_tiled_frame_accumulator_new` or `ef_merge_tiled_detections`.
-
-`mode` was added to `ef_merge_config` in the 4-byte tail pad it already had, so
-the struct is still 32 bytes and no other field moved. `ef_decoder_abi_version` moved to `2` for it: `sizeof` did not change, but a caller built against version 1 never writes `mode`, so gate on the probe rather than on a link succeeding.
-
-**This is a minor-version ABI break.** `ef_merge_config` shipped without `mode`
-in 0.29.x, and a caller built against that header never initialised the tail
-pad this release now reads. Rebuild against the 0.30 header; do not mix a 0.29
-consumer with a 0.30 `libedgefirst_decoder`.
+The default merge **mode** is keep-best: the highest-scoring box of each matched group is kept and the rest are dropped. The enclosing-union merge is opt-in: fill an `ef_merge_config` with `ef_merge_config_default`, set `mode = 1`, and pass it to `ef_tiled_frame_accumulator_new` or `ef_merge_tiled_detections`.
 
 `finalize` is destructive and returns `NULL` on a second call, rather than an
 empty list that would be indistinguishable from a frame which genuinely found
@@ -159,7 +144,7 @@ cannot be allocated or holds an embedded NUL, so test `err` before printing
 it. Freeing `NULL` is a no-op, so the error path above is correct in every
 case.
 
-The dtype codes are `edgefirst/tensor.h`'s `EF_DTYPE_*`: dtype has one numbering across the stack, so pass the code a tensor already reports. `EF_INFER_DTYPE_*` remain as aliases of them (`EF_INFER_DTYPE_FLOAT32` is `EF_DTYPE_F32`). Before `ef_decoder_abi_version` 3 these were `0x100`-based codes; a caller compiled against that header must be rebuilt. A model's logical I/O carries no `u64` or `f64`, so `EF_DTYPE_U64` and `EF_DTYPE_F64` are `EINVAL`. `source` is an `EF_MODEL_SOURCE_*` code. `EF_MODEL_SOURCE_OTHER` is accepted by `ef_infer_signals_new` but refused by inference — whether boxes are pixel-space or `[0, 1]` follows the exporter, is not derivable from shapes, and guessing scales every box by the input size.
+The dtype codes are `edgefirst/tensor.h`'s `EF_DTYPE_*`: dtype has one numbering across the stack, so pass the code a tensor already reports. `EF_INFER_DTYPE_*` are aliases of them (`EF_INFER_DTYPE_FLOAT32` is `EF_DTYPE_F32`). A model's logical I/O carries no `u64` or `f64`, so `EF_DTYPE_U64` and `EF_DTYPE_F64` are `EINVAL`. `source` is an `EF_MODEL_SOURCE_*` code. `EF_MODEL_SOURCE_OTHER` is accepted by `ef_infer_signals_new` but refused by inference — whether boxes are pixel-space or `[0, 1]` follows the exporter, is not derivable from shapes, and guessing scales every box by the input size.
 
 An inferred schema pins the NMS *mode* and leaves the *thresholds* to you. Ultralytics runs NMS class-aware (`agnostic=False`), so a pre-NMS YOLOv8/11 schema says so explicitly. `ef_decoder_params_new` defaults to `EF_NMS_AUTO`, which takes the config's mode and otherwise resolves to class-aware; `ef_decoder_params_set_nms` still overrides. Thresholds are not inferable from shapes, and the library's defaults (`0.5`/`0.5`) are not Ultralytics' (`0.25`/`0.45`), so set them explicitly as above. YOLO26 end-to-end exports apply their own NMS in-graph and carry no mode at all.
 

@@ -8,12 +8,10 @@
 use super::Isa;
 use crate::BoundingBox;
 
-/// Boxes below which NMS runs the scalar loop on every tier: gathering them costs more than the
-/// loop (measured crossover on a Cortex-A55 with clustered boxes).
+/// Boxes below which NMS runs the scalar loop on every tier.
 pub(crate) const NMS_MIN_BOXES: usize = 16;
 
-/// Boxes below which the public NMS functions run the scalar loop without resolving the tier:
-/// reading `EDGEFIRST_DECODER_FORCE_KERNEL` moves their crossover up from [`NMS_MIN_BOXES`].
+/// Boxes below which the public NMS functions run the scalar loop without resolving the tier.
 pub(crate) const NMS_LOOKUP_MIN_BOXES: usize = 20;
 
 /// The tier a public NMS over `n` boxes runs: [`Isa::current_or_scalar`], or the scalar code
@@ -26,8 +24,7 @@ pub(crate) fn nms_isa(n: usize) -> Isa {
     }
 }
 
-/// Boxes up to which NMS sorts in place and tests every pair in one f32 pass over stack arrays:
-/// grouping by label and FP16 only repay themselves above it.
+/// Boxes up to which NMS sorts in place and tests every pair in one f32 pass over stack arrays.
 const SMALL_NMS_BOXES: usize = 64;
 
 /// Boxes from which the score sort runs on the rayon pool.
@@ -44,8 +41,7 @@ pub(crate) fn sort_by_score_desc<T>(boxes: &mut Vec<T>, score: impl Fn(&T) -> f3
         boxes.sort_by(|a, b| score(b).total_cmp(&score(a)));
         return;
     }
-    // Descending score in the high half, the position in the low half: unique keys, so an
-    // unstable sort gives the stable order.
+    // Keys: descending score in the high half, the position in the low half.
     let mut keys: Vec<u64> = boxes
         .iter()
         .enumerate()
@@ -71,8 +67,8 @@ pub(crate) fn sort_by_score_desc<T>(boxes: &mut Vec<T>, score: impl Fn(&T) -> f3
     );
 }
 
-/// Labels a class-aware NMS groups with a counting sort: above it (relative to the box count)
-/// the label table would cost more than sorting the boxes.
+/// A class-aware NMS groups with a counting sort when its largest label is at most four times
+/// the box count plus this.
 #[cfg(target_arch = "aarch64")]
 const COUNTING_SORT_SPARE_LABELS: usize = 1024;
 
@@ -117,8 +113,8 @@ fn group_by_label<T>(boxes: &[T], label: impl Fn(&T) -> usize) -> (Vec<u32>, Vec
     (order, ends)
 }
 
-/// The power of two that brings coordinates of magnitude up to `max` into `(32, 64]`, where
-/// box areas and their sums are finite and normal in f16; `None` for a zero or non-finite `max`.
+/// The power of two that brings coordinates of magnitude up to `max` into `(32, 64]`; `None` for
+/// a zero or non-finite `max`.
 #[cfg(target_arch = "aarch64")]
 fn f16_coordinate_scale(max: f32) -> Option<f32> {
     if !(max.is_finite() && max >= f32::MIN_POSITIVE) {
@@ -139,7 +135,7 @@ struct Overlap {
     f16_scale: Option<f32>,
 }
 
-/// The smallest scaled box side the FP16 tests take: its half and its areas stay normal in f16.
+/// The smallest scaled box side the FP16 tests take.
 #[cfg(target_arch = "aarch64")]
 const F16_MIN_SIDE: f32 = 1.0 / 64.0;
 
@@ -314,9 +310,8 @@ fn single_pass_dead<T>(
 /// at a time (each label's pass stopping at `cap` survivors of its own), and with
 /// [`Isa::f16_nms`] and finite coordinates a pass over more than [`SMALL_NMS_BOXES`] boxes runs
 /// its overlap tests in FP16 on centres and sizes scaled by a power of two (a pass holding a box
-/// too thin for f16 areas keeps the f32 tests). A live box the caller does not keep (a NaN
-/// score) takes a survivor's place in the scalar scan, so those boxes run the one pass over
-/// every box instead.
+/// too thin for f16 areas takes the f32 tests). Boxes that include a live one the caller does
+/// not keep (a NaN score) run the one pass over every box.
 ///
 /// `None` when the caller runs its scalar loop: the scalar tier, fewer than [`NMS_MIN_BOXES`]
 /// boxes, or a label above `u32::MAX` in the one pass over every box.
@@ -362,7 +357,7 @@ pub(crate) fn nms_dead<T>(
                 f16_scale: isa.f16_nms().then(f16_scale).flatten(),
             };
             if overlap.f16_scale.is_none() {
-                // One group of f32 tests is the one pass.
+                // Without an FP16 scale the tests run as the one f32 pass.
                 return single_pass_dead(boxes, bbox, false, label, dead, iou, cap);
             }
             let mut flags: Vec<bool> = boxes.iter().map(&dead).collect();
@@ -384,7 +379,7 @@ pub(crate) fn nms_dead<T>(
         let ran = ends.iter().all(|&end| {
             let group = order.get(start..end as usize).unwrap_or(&[]);
             start = end as usize;
-            // A small group gains nothing from eight boxes per vector and keeps the f32 tests.
+            // A group of at most `SMALL_NMS_BOXES` boxes takes the f32 tests.
             let overlap = Overlap {
                 iou,
                 cap,

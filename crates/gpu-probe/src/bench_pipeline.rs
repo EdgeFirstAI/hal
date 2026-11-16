@@ -3,10 +3,9 @@
 
 //! DMA-buf pipeline verification and rebinding benchmarks.
 //!
-//! Isolates EGLImage rebinding cost — the operation the HAL's `convert()` path
-//! performs every frame when a new DMA-buf arrives. Verifies pixel correctness
-//! of the full dmabuf→GL→dmabuf pipeline and compares solid-fill versus
-//! synthetic-pattern texture sources.
+//! Measures the EGLImage rebinding cost, verifies pixel correctness of the
+//! dmabuf→GL→dmabuf pipeline, and compares solid-fill and synthetic-pattern
+//! texture sources.
 
 use crate::bench::{run_bench, BenchResult};
 use crate::bench_render;
@@ -32,8 +31,6 @@ fn fill_solid(tensor: &Tensor<u8>, pixel: [u8; 4]) {
 /// Fill a DMA tensor with a synthetic RGBA gradient pattern.
 ///
 /// R increases left→right, G increases top→bottom, B=128 constant, A=255.
-/// Produces non-uniform pixel data that exercises the bilinear filter during
-/// resize.
 fn fill_gradient(tensor: &Tensor<u8>, width: u32, height: u32) {
     let mut map = tensor
         .map()
@@ -73,11 +70,8 @@ fn verify_pixels(tensor: &Tensor<u8>, expected: [u8; 4], tolerance: u8) -> bool 
     true
 }
 
-/// Verify that the destination tensor has non-zero, varied data.
-///
-/// For the gradient resize test where exact values depend on resize filtering,
-/// we check that the center pixel is non-zero and that at least two different
-/// pixel values exist.
+/// Verify that the destination tensor has non-zero, varied data: the center
+/// pixel is non-zero and at least two different pixel values exist.
 fn verify_not_zero(tensor: &Tensor<u8>) -> bool {
     let map = tensor
         .map()

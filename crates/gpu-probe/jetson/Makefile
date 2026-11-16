@@ -1,23 +1,18 @@
 # SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 # SPDX-License-Identifier: Apache-2.0
 #
-# On-device build for the Jetson CUDA/TensorRT NvBufSurface probe (O4-O7).
-# Build on orin-nano (L4T R36.4, CUDA 12.6, TensorRT 10.3):
+# On-device build for the Jetson CUDA/TensorRT NvBufSurface probe:
 #     make
 #     ./jetson_cuda_probe
-#
-# This is on-device tooling — it is NOT cross-compiled from the x86 host
-# (no aarch64 NVIDIA sysroot). nvcc compiles the CUDA/EGL/TRT interop.
 
 NVCC      ?= /usr/local/cuda-12.6/bin/nvcc
 
-# NvBufSurface + CUDA + TensorRT headers. NvInfer.h ships under the
-# arch triplet include dir on this image.
+# NvBufSurface, CUDA and TensorRT headers.
 INCLUDES  := -I/usr/src/jetson_multimedia_api/include \
              -I/usr/local/cuda/include \
              -I/usr/include/aarch64-linux-gnu
 
-# nvbufsurface lives under the nvidia subdir; the rest are standard.
+# nvbufsurface is under the nvidia subdirectory.
 LIBDIRS   := -L/usr/lib/aarch64-linux-gnu/nvidia \
              -L/usr/lib/aarch64-linux-gnu
 LIBS      := -lnvbufsurface -lcudart -lcuda -lnvinfer -lEGL -lGLESv2 -lgbm

@@ -50,16 +50,7 @@ sidesteps that by being the *only* library that exports `ef_tensor_shape` and
 the rest of the accessors — there is nothing else to interpose, no dynamic-linker
 ambiguity to resolve.
 
-`libedgefirst-image` still mints its own tensors internally rather than linking
-against this library for construction, so under the hood each exported accessor
-dispatches through a small internal table the handle carries rather than
-assuming its own layout — `free` goes through the same table, since the
-allocation belongs to whichever library made it. That dispatch is a transition
-detail, not API: it is never declared in the header, and it goes away once every
-EdgeFirst library mints tensors through this one instead of its own copy.
-
-This is written down because it explains why `ef_tensor_free` works uniformly on
-a handle from either library, not because a caller has to think about it.
+The other EdgeFirst libraries link `libedgefirst_tensor` dynamically instead of embedding their own copy of the tensor code, so the process holds one implementation of `ef_tensor_free` and of every accessor, and each works on a handle from any of the libraries.
 </details>
 
 ## Allocating

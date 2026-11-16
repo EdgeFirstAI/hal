@@ -178,9 +178,7 @@ fn nms_matches_the_scalar_tier_on_every_tier() {
     }
 }
 
-/// Every NEON tier runs the NMS kernel for class-agnostic and class-aware boxes and the scalar
-/// tier leaves it to the scalar loop. Among at most `SMALL_NMS_BOXES` a label above `u32::MAX`
-/// runs scalar; above it, labels too sparse for the counting sort flag the boxes dense labels do.
+/// Every NEON tier runs the NMS kernel and the scalar tier leaves it to the scalar loop.
 #[test]
 fn every_neon_tier_runs_the_nms_kernel() {
     let mut rng = Rng(42);
@@ -224,8 +222,7 @@ fn every_neon_tier_runs_the_nms_kernel() {
     }
 }
 
-/// `sort_by_score_desc` is the stable descending sort in IEEE total order: NaN of either sign,
-/// infinities, signed zeros and ties included, for sizes on both sides of the parallel cut.
+/// `sort_by_score_desc` is the stable descending sort in IEEE total order.
 #[test]
 fn score_sort_is_the_stable_total_order_sort() {
     let mut rng = Rng(0xfeed_beef);
@@ -263,8 +260,7 @@ fn score_sort_is_the_stable_total_order_sort() {
     }
 }
 
-/// FP16 overlap tests flag the boxes the f32 tests flag when no overlap is near the threshold,
-/// at pixel and normalized scales, and non-finite coordinates take the f32 tests.
+/// FP16 overlap tests flag the boxes the f32 tests flag when no overlap is near the threshold.
 #[test]
 fn f16_nms_agrees_with_f32_away_from_the_threshold() {
     for (name, isa) in tiers() {
@@ -273,8 +269,7 @@ fn f16_nms_agrees_with_f32_away_from_the_threshold() {
         }
         assert!(isa.with_f16_nms().f16_nms() && !isa.f16_nms(), "{name}");
         for scale in [1.0 / 640.0, 1.0, 3.0] {
-            // Disjoint cells, each holding a box and two near copies of it; two labels, so a
-            // class-aware pass is long enough for the FP16 tests.
+            // Disjoint cells, each holding a box and two near copies of it, over two labels.
             let mut boxes = Vec::new();
             for cell in 0..144 {
                 let (x, y) = ((cell % 12) as f32 * 100.0, (cell / 12) as f32 * 100.0);
@@ -320,9 +315,7 @@ fn f16_nms_agrees_with_f32_away_from_the_threshold() {
     }
 }
 
-/// FP16 overlap tests keep the extent of small boxes far from the origin: 65 copies of a box a
-/// quarter pixel wide at 640 leave one, as in f32, and boxes too thin for f16 areas take the
-/// f32 tests.
+/// FP16 overlap tests keep the extent of small boxes far from the origin.
 #[test]
 fn f16_nms_keeps_small_boxes_far_from_the_origin() {
     for (name, isa) in tiers() {

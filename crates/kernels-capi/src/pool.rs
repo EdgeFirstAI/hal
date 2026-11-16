@@ -49,7 +49,7 @@ struct Call<'a> {
 unsafe extern "C" fn trampoline(arg: *mut c_void, index: usize) {
     // SAFETY: `arg` is the address of the `Call` that `CPool::run` keeps alive across the call.
     let call = unsafe { &*arg.cast::<Call<'_>>() };
-    // A panic must not unwind into C; it is recorded so `plan_run` reports the unfinished block.
+    // A panic is caught and recorded.
     if catch_unwind(AssertUnwindSafe(|| (call.task)(index))).is_err() {
         call.panicked.store(true, Ordering::Release);
     }

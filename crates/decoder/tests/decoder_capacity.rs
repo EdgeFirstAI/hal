@@ -1,14 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! Regression test for EDGEAI-1302: `Decoder::decode()` and
-//! `Decoder::decode_proto()` must respect the decoder's own `max_det`
-//! regardless of the caller's `Vec::capacity()` — capacity is purely
-//! an allocation hint.
-//!
-//! Before the fix, both entrypoints computed the post-NMS truncate as
-//! `self.max_det.min(output_boxes.capacity())`, which silently
-//! truncated everything to zero when callers passed `Vec::new()`.
+//! `Decoder::decode()` and `Decoder::decode_proto()` respect the
+//! decoder's own `max_det` regardless of the caller's `Vec::capacity()`:
+//! capacity is purely an allocation hint.
 
 use edgefirst_decoder::{
     configs::{self, DecoderType, DimName, QuantTuple},
@@ -17,9 +12,8 @@ use edgefirst_decoder::{
 use edgefirst_tensor::{Tensor, TensorDyn, TensorMapTrait, TensorMemory, TensorTrait};
 
 /// Build a YOLOv8-seg-shaped synthetic decoder with N=256 anchors of
-/// which 10 (anchors 10..20) carry plausible class-0 detections that
-/// should survive score-filter and NMS. NMS is class-agnostic with a
-/// near-1.0 IoU threshold so all 10 survive separately.
+/// which 10 (anchors 10..20) carry class-0 detections. NMS is
+/// class-agnostic with a near-1.0 IoU threshold.
 fn build_synthetic_segdet_decoder() -> (
     edgefirst_decoder::Decoder,
     Vec<TensorDyn>,
@@ -68,7 +62,7 @@ fn build_synthetic_segdet_decoder() -> (
     let set = |d: &mut [f32], r: usize, c: usize, v: f32| d[r * N + c] = v;
     for t in 0..n_targets {
         let anchor = target_start + t;
-        // Non-overlapping boxes along x-axis so NMS doesn't suppress.
+        // Non-overlapping boxes along the x-axis.
         let xc = 0.05 + 0.08 * t as f32;
         set(&mut det_data, 0, anchor, xc);
         set(&mut det_data, 1, anchor, 0.5);
@@ -85,7 +79,7 @@ fn build_synthetic_segdet_decoder() -> (
         TensorDyn::F32(t)
     };
 
-    // Protos tensor (1, NM, PH, PW): zero-initialised, doesn't affect bbox path.
+    // Protos tensor (1, NM, PH, PW), zero-initialised.
     let proto_data = vec![0.0f32; NM * PH * PW];
     let protos_tensor: TensorDyn = {
         let t = Tensor::<f32>::new(&[1, NM, PH, PW], Some(TensorMemory::Mem), None).unwrap();
@@ -112,7 +106,7 @@ fn decode_with_empty_vec_returns_detections() {
 
     assert!(
         !output_boxes.is_empty(),
-        "decode with capacity-0 output Vec dropped all detections (EDGEAI-1302); \
+        "decode with capacity-0 output Vec dropped all detections; \
          expected {expected}, got {}",
         output_boxes.len()
     );
@@ -145,7 +139,7 @@ fn decode_proto_with_empty_vec_returns_detections() {
     );
     assert!(
         !output_boxes.is_empty(),
-        "decode_proto with capacity-0 output Vec dropped all detections (EDGEAI-1302); \
+        "decode_proto with capacity-0 output Vec dropped all detections; \
          expected {expected}, got {}",
         output_boxes.len()
     );

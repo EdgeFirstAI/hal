@@ -37,7 +37,7 @@ def region_bilinear(logits, rh, rw):
 
 def main():
     g = torch.Generator().manual_seed(2164)
-    # Rounded to 1/64 so the values are exact in JSON and in f16.
+    # Rounded to 1/64.
     logits = torch.round(torch.randn(1, C, H, W, generator=g) * 64) / 64
     cases = []
     for crop in (False, True):

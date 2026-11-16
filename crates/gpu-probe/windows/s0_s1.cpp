@@ -57,8 +57,7 @@ void run_s0(GlSession& s) {
     glClear(GL_COLOR_BUFFER_BIT);
     std::vector<uint8_t> px;
     read_fbo_rgba8(64, 32, px);
-    // 0.5 * 255 = 127.5 lands on either side depending on the driver's
-    // UNORM rounding; both are correct.
+    // 0.5 * 255 = 127.5 may round to 127 or 128.
     bool ok = px.size() == 64 * 32 * 4 && px[0] == 64 && (px[1] == 127 || px[1] == 128) &&
               px[2] == 191 && px[3] == 255;
     report("S0.8", ok ? Verdict::Pass : Verdict::Fail, "plain FBO clear + glReadPixels (%d,%d,%d,%d)",
@@ -239,8 +238,7 @@ static std::string check_dest(GlSession& s, Programs& pr, Quad& quad, Import& im
   glFlush();
   GLenum ge = glGetError();
   if (im.route == Route::Pbuffer) {
-    // The texture contents are defined only after the pbuffer stops being
-    // the current draw surface.
+    // Make the dummy surface current in place of the pbuffer.
     s.restore_current();
   } else {
     glFinish();
@@ -326,8 +324,7 @@ void run_s1(GlSession& s, const char* prefix) {
         report(ID("3"), starts_ok(rb) ? Verdict::Pass : Verdict::Fail,
                "%-8s %-20s as renderbuffer target: %s", route_name(route), fmt_name(fmt), rb.c_str());
       }
-      // After the destination test the texture holds the gradient; sample it
-      // once more to confirm the same import object sees the new contents.
+      // Sample the import again after the destination test wrote the gradient.
       if (route == Route::EglImage && fmt == DXGI_FORMAT_R8G8B8A8_UNORM) {
         upload_tex(s.d3d, tex.Get(), pat);
         std::string again = check_source(s, pr, quad, im, fmt, W, H, 7);
@@ -409,9 +406,9 @@ void run_s1(GlSession& s, const char* prefix) {
     auto pat = make_pattern(DXGI_FORMAT_R8G8B8A8_UNORM, W, H, 11);
     std::string line;
     for (Route route : {Route::Pbuffer, Route::EglImage}) {
-      // Keyed-mutex textures: the owner holds key 0 across the GL work too.
+      // Hold key 0 of a keyed-mutex texture across the GL work.
       KeyedLock lock(tex.Get());
-      // The previous route's destination test overwrote the texture.
+      // Re-upload the pattern.
       upload_tex(s.d3d, tex.Get(), pat);
       Import im = import_texture(s, route, tex.Get(), GL_RGBA);
       line += route_name(route);
@@ -423,8 +420,7 @@ void run_s1(GlSession& s, const char* prefix) {
           snprintf(b, sizeof b, "/gl0x%04x", im.gl_error);
           line += b;
         }
-        // An EGLImage over a texture without SHADER_RESOURCE cannot back a
-        // GL texture but may still back a renderbuffer.
+        // Check the EGLImage as a renderbuffer.
         if (route == Route::EglImage && im.image != EGL_NO_IMAGE_KHR && (fc.bind & D3D11_BIND_RENDER_TARGET)) {
           std::string rb = check_dest(s, pr, quad, im, tex.Get(), DXGI_FORMAT_R8G8B8A8_UNORM, W, H, true, nullptr);
           line += " rb-dst[" + rb + "]";

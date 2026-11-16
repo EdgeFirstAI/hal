@@ -131,7 +131,7 @@ impl PyTileSpec {
 
 /// How one tile was cut from the full frame and fed to the model. Produced by
 /// the tiling grid; consumed by :func:`edgefirst.decoder.lift_tile_boxes`.
-/// All fields are full-frame **pixels** except ``content_region``, the
+/// All fields are full-frame pixels except ``content_region``, the
 /// normalized ``(xmin, ymin, xmax, ymax)`` image content of a letterboxed
 /// tile on the model input (``None`` when the tile was stretched).
 #[pyclass(name = "TilePlacement", from_py_object, module = "edgefirst.image")]
@@ -197,10 +197,7 @@ impl PyTilePlacement {
         )
     }
 
-    /// Constructor args as a single tuple so a decoder in another extension
-    /// can extract placement without six cross-module ``getattr`` hops.
-    // The tuple IS the pickle constructor arg list `__new__` expects; a type
-    // alias would only rename it, not simplify it.
+    /// Constructor args as a single tuple.
     #[allow(clippy::type_complexity)]
     fn __getnewargs__(
         &self,
@@ -228,8 +225,7 @@ impl PyTilePlacement {
 /// the tile on an axis, in which case that axis yields a single whole-frame
 /// crop.
 ///
-/// Python args are **width-first** to match :class:`Region` and
-/// :meth:`ImageProcessor.create_image`.
+/// Arguments are width-first.
 #[pyfunction]
 #[pyo3(name = "tile_grid", signature = (frame_w, frame_h, tile_w, tile_h, overlap = 0.2))]
 pub fn py_tile_grid(

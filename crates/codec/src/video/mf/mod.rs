@@ -6,8 +6,7 @@
 //! The encoder prefers a hardware MFT (NVENC, Quick Sync, AMF) and falls back
 //! to Microsoft's software encoder; the decoder uses Microsoft's H.264
 //! decoder. Both run on the caller's thread: an asynchronous (hardware)
-//! transform is driven by polling its event queue rather than through
-//! callbacks, so no D3D11 work ever runs on a Media Foundation thread.
+//! transform is driven by polling its event queue.
 //!
 //! Pixels stay on the GPU where the transform takes a DXGI device manager,
 //! which is given HAL's own D3D11 device. An encoder reads a native NV12
@@ -18,9 +17,8 @@
 //! through system memory instead.
 //!
 //! The flat Media Foundation functions are resolved from `mfplat.dll` at
-//! run time, so the crate loads on a system without Media Foundation
-//! (Windows N without the Media Feature Pack), where the codecs report
-//! [`CodecError::NoDevice`].
+//! run time. On a system without Media Foundation (Windows N without the
+//! Media Feature Pack) the codecs report [`CodecError::NoDevice`].
 
 pub(crate) mod copy;
 pub(crate) mod decoder;
@@ -225,8 +223,7 @@ fn load() -> std::result::Result<Api, String> {
                  Windows N editions need the Media Feature Pack"
             )
         })?;
-    // The library stays loaded for the life of the process, so the
-    // function pointers below never dangle.
+    // The library stays loaded for the life of the process.
     let lib: &'static Library = Box::leak(Box::new(lib));
     fn get<T: Copy>(lib: &'static Library, name: &str) -> std::result::Result<T, String> {
         let symbol = format!("{name}\0");

@@ -35,14 +35,14 @@ lives in each sub-crate's `TESTING.md`:
 | `make test` | Run all tests (Rust + Python + C API) with coverage |
 | `make test-rust` | Run Rust tests only with `cargo-llvm-cov nextest` |
 | `make test-python` | Run Python tests with pytest (and slipcover if available) |
-| `make install-python` | Install the bindings from their source directories (the PEP 517 path `make test-python` uses). `PYTHON_PACKAGES=tensor` narrows it to one package — hal-full.yml's macOS job runs exactly that as the regression gate for issue #199 |
+| `make install-python` | Install the bindings from their source directories (the PEP 517 path `make test-python` uses). `PYTHON_PACKAGES=tensor` narrows it to one package — hal-full.yml's macOS job runs exactly that |
 | `make test-capi-modular` | Build and test the modular C libraries |
 | `make test-capi-link` | Compile headers as C11/C++17 and link-run one consumer per library |
 | `make test-ontarget` | Run the suite on the board fleet over SSH. Not part of `make test` — needs the boards reachable — but it is the **only** evidence that counts for DMA, G2D and embedded-GL work. `BOARDS='imx95-frdm rpi5-hailo'` selects a subset |
 | `make test-cuda` | CUDA device-pointer tests. Not part of `make test` — needs a CUDA GPU and `libcudart` at runtime, and skips cleanly without them |
 | `make bench` | Run the workspace Rust benchmarks (custom `harness = false` binaries backed by [`crates/bench`](https://github.com/EdgeFirstAI/hal/tree/main/crates/bench); not Criterion) |
 | `make build` | Build with coverage instrumentation (profiling profile) |
-| `make check-macho` | Assert every shipped Mach-O has an 8-byte-aligned LINKEDIT string pool (issue #200). Pure file parsing, so it is meaningful on any OS; `make wheel` and `make package` already run it over what they produce |
+| `make check-macho` | Assert every shipped Mach-O has an 8-byte-aligned LINKEDIT string pool. Pure file parsing, so it is meaningful on any OS; `make wheel` and `make package` already run it over what they produce |
 | `make format lint check` | Pre-commit gate — required before every commit |
 
 Each modular C library also has C tests under `crates/{tensor,codec,image,decoder,tracker,kernels}-capi/tests/`.
@@ -216,7 +216,7 @@ because its CPU threads *are* the GPU.
 
 The exception is CUDA. WARP has no CUDA device — `cudaD3D11GetDevice` fails,
 the tensor simply has no CUDA handle, and `cuda_map()` answers `None` — so the
-CUDA tests need the RTX 3070 (or another CUDA-capable adapter). The runtime is
+CUDA tests need a CUDA-capable adapter. The runtime is
 loaded by name, newest first: `cudart64_13.dll`, `cudart64_12.dll`,
 `cudart64_110.dll`, then the same three under `%CUDA_PATH%\bin` (where the
 installer puts the one that is not on `PATH`).
@@ -259,8 +259,8 @@ failure.
 
 The script arms the gate without the switch when the host looks like an NVIDIA
 box (`nvidia-smi` on PATH and exiting zero, or `CUDA_PATH` set), printing
-"NVIDIA driver or toolkit present: requiring CUDA coverage". Read that for what
-it is: evidence about the *host*, not about the adapter the D3D11 device is
+"NVIDIA driver or toolkit present: requiring CUDA coverage". That is
+evidence about the *host*, not about the adapter the D3D11 device is
 created on. That adapter comes from `EDGEFIRST_D3D11_ADAPTER` (or the
 `EDGEFIRST_ANGLE_ADAPTER` alias), and unset means DXGI adapter 0, which on a
 hybrid laptop can be the integrated GPU. Auto-detection is therefore suppressed
@@ -272,13 +272,7 @@ substring such as `RTX 3070`) or pass `-NoRequireCuda`. `-RequireCuda` passed
 explicitly, and an inherited `HAL_TEST_REQUIRE_CUDA=1`, arm the gate whatever
 the adapter; `-NoRequireCuda` disarms it whatever the environment.
 
-One variable picks the adapter for both the device and ANGLE's display, since
-ANGLE builds its display on the HAL's device: `EDGEFIRST_D3D11_ADAPTER` is the
-current name and `EDGEFIRST_ANGLE_ADAPTER` its alias, which is why the script
-still sets the older one. Setting both to different values is not a way to
-drive them apart — the D3D11 name wins and the HAL logs the disagreement once
-— so clear a leftover `EDGEFIRST_ANGLE_ADAPTER` from the shell before reading
-too much into an adapter line.
+One variable picks the adapter for both the device and ANGLE's display, since ANGLE builds its display on the HAL's device: `EDGEFIRST_D3D11_ADAPTER` is the name and `EDGEFIRST_ANGLE_ADAPTER` its alias, which is the one the script sets. Setting both to different values is not a way to drive them apart — the D3D11 name wins and the HAL logs the disagreement once — so clear a leftover `EDGEFIRST_ANGLE_ADAPTER` from the shell before reading too much into an adapter line.
 
 Running a GL test from a bare shell rather than through the script needs the
 same two variables the script sets: `EDGEFIRST_ANGLE_PATH` pointing at the
@@ -289,7 +283,7 @@ The C programs under each leaf's `tests/c/` run on Windows too: the leaf
 tests compile, link and execute them with MSVC, and a compile, link or
 run failure fails the test. `tests/c/test_d3d11.c` and image-capi's
 `tests/c/test_cross_library.c` exercise the D3D11 exports this way on
-the RTX and on WARP. See "Per-language workflows" below for the harness,
+a hardware adapter and on WARP. See "Per-language workflows" below for the harness,
 the variables a host without a GPU needs, and how a skip is reported.
 
 After an ANGLE upgrade or a graphics-driver update, re-run the interop probe
@@ -467,10 +461,7 @@ Three independent constraints each require it:
 is still required to prevent DMA and GPU contention across test
 processes.
 
-This constraint applies to CI, the Makefile, and local development.
-[`crates/image/ARCHITECTURE.md`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/ARCHITECTURE.md#gl-concurrency-model-serialization-policy)
-documents the serialization policy that makes the single-threaded rule
-load-bearing.
+This constraint applies to CI, the Makefile, and local development. [`crates/image/ARCHITECTURE.md`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/ARCHITECTURE.md#gl-concurrency-model-serialization-policy) documents the serialization policy behind the single-threaded rule.
 
 ---
 
@@ -750,7 +741,7 @@ CRATES="edgefirst-tensor" ./scripts/on-target-test.sh imx95-frdm
 [`scripts/on-target-test.sh`](https://github.com/EdgeFirstAI/hal/blob/main/scripts/on-target-test.sh)
 probes each host, cross-builds one bundle per architecture with
 [`scripts/on-target-bundle.sh`](https://github.com/EdgeFirstAI/hal/blob/main/scripts/on-target-bundle.sh)
-(test binaries, the C-API libraries and the G3 binary, merged
+(test binaries, the C-API libraries and the two-library C program, merged
 `testdata/`), copies it to each host (rsync, or tar over ssh on an image
 without rsync), and runs the bundle's own
 [`scripts/on-target-run.sh`](https://github.com/EdgeFirstAI/hal/blob/main/scripts/on-target-run.sh)
@@ -761,9 +752,7 @@ ignored test totals. Logs, `capabilities.txt` and `summary.json` land in
 
 A few details worth knowing:
 
-- **Binaries come from cargo's JSON output**, not a `<hash>` glob. Globbing
-  picks up stale binaries from earlier builds, which is how you end up
-  confidently testing code you did not just change.
+- **Binaries come from cargo's JSON output**, not a `<hash>` glob. Globbing picks up stale binaries from earlier builds, so a run can test code other than what was just built.
 - **Builds use the project's declared glibc floor** (2.35 — see
   [README § Toolchain and Platform Floors](https://github.com/EdgeFirstAI/hal/blob/main/README.md#toolchain-and-platform-floors)),
   so one binary set runs on every supported target. It is a chosen policy,
@@ -873,7 +862,7 @@ plain `edgefirst-tensor` rlib. Under the dynamic cfg, `crates/tensor/build.rs`
 links the crate's test binaries against it, honouring `EDGEFIRST_TENSOR_LIB_DIR` when set,
 otherwise it derives the search path from `OUT_DIR` (the
 `target/<target-triple>/<profile>` layout `cargo-zigbuild` itself produces)
-— so cross-building this lane no longer needs a hand-rolled `RUSTFLAGS`:
+— so cross-building this lane needs no hand-rolled `RUSTFLAGS`:
 
 ```bash
 cargo-zigbuild build --target aarch64-unknown-linux-gnu.2.35 \
@@ -946,20 +935,9 @@ Look for the final line:
 EglImageCache stats: 999 hits, 1 misses, 1 entries remaining
 ```
 
-A correctly-tuned camera pipeline reaches steady state with **misses ≈
-pool depth** (one miss per unique physical buffer) and **hits ≈ frame
-count**. If `misses` grows linearly with frame count, the calling code
-is creating new tensor objects per frame — review the cache key (Rule 3
-in the Optimization Guide).
+A correctly-tuned camera pipeline reaches steady state with **misses ≈ pool depth** (one miss per unique physical buffer) and **hits ≈ frame count**. If `misses` grows linearly with frame count, review the cache key (Rule 3 in the Optimization Guide).
 
-Churned tensor objects are no longer a source of misses: identities are
-derived from the buffer's system key and entries outlive the tensor
-that produced them, so a buffer re-imported fresh every frame hits the
-entry the first frame created. Misses that keep climbing now point at
-the *key* rather than the tensor's lifetime — a geometry change
-(`configure_image` reusing a pool buffer at a new size), or a working
-set larger than `EDGEFIRST_EGL_CACHE_CAPACITY` evicting entries before
-they are reused.
+Churned tensor objects are not a source of misses: identities are derived from the buffer's system key and entries outlive the tensor that produced them, so a buffer re-imported fresh every frame hits the entry the first frame created. Misses that keep climbing point at the *key* rather than the tensor's lifetime — a geometry change (`configure_image` reusing a pool buffer at a new size), or a working set larger than `EDGEFIRST_EGL_CACHE_CAPACITY` evicting entries before they are reused.
 
 ### Verifying backend selection
 
@@ -1011,13 +989,7 @@ cargo test -p edgefirst-image --lib -- --exact \
   opengl_headless::tests::gl_tests::a_padded_pbo_destination_is_written_at_its_own_pitch
 ```
 
-An earlier revision of these gates entered through `ImageProcessor::convert`
-with `ComputeBackend::OpenGl`, which leaves `forced_backend` at `None` — a GL
-decline logged at debug and the CPU fallback produced a bit-exact answer, so
-the gate went green with zero GL coverage. That is the hazard the route
-assertion exists to remove; a GL test that compares against a CPU-computable
-expectation without asserting `convert_fallback_count()` or its route can pass
-without ever touching the GPU.
+A GL test that compares against a CPU-computable expectation must assert `convert_fallback_count()` or its route, or it can pass without touching the GPU.
 
 ### Warm up before measuring
 
@@ -1122,7 +1094,7 @@ pin this:
 | Test | What it verifies |
 |------|------------------|
 | `test_from_numpy_hailort_shape` | Correctness on the HailoRT-shaped `(1, 116, 8400)` f32 transposed view (Path 3 of `copy_numpy_to_tensor_dyn`). Destination matches source element-by-element. |
-| `test_from_numpy_hailort_shape_perf_sanity` | Perf bound: automatic fast path runs no more than 1.5× the manual `np.ascontiguousarray + from_numpy(contig)` workaround. Prior to PR #58 the ratio was ≈ 10×. |
+| `test_from_numpy_hailort_shape_perf_sanity` | Perf bound: automatic fast path runs no more than 1.5× the manual `np.ascontiguousarray + from_numpy(contig)` workaround. |
 
 Both run in CI. If the perf-sanity test fails, suspect a regression in
 `numpy.ascontiguousarray` behaviour or in the Path-3 dispatch logic in
@@ -1281,7 +1253,7 @@ On Jetson/Orin `libcudart` is already on the system path, so `make test-cuda`
 
 ### On-target validation
 
-Full-pipeline validation was performed on:
+The full pipeline is validated on:
 
 | Platform | OS / CUDA / TensorRT | What was validated |
 |----------|----------------------|--------------------|
@@ -1409,7 +1381,7 @@ descriptor geometry, the vendor classifier, identity interning — is additional
 host-tested in `crates/tensor/src/ahardwarebuffer_layout.rs`, so drift is caught
 on every CI run even though the FFI itself only runs on-device.
 
-**Run-level PASSED is not the gate.** Device Farm reports the RUN as
+**Run-level PASSED is not the gate.** Device Farm reports the run as
 passed when the app harness completes; always pull the artifacts
 (logcat + the exported `halvalidation-results.json`) and judge the
 `GATE|`/`SWEEP|` lines and JSON.
@@ -1419,12 +1391,12 @@ passed when the app harness completes; always pull the artifacts
 | Cell | Entry point | Gate |
 |---|---|---|
 | GL-vs-CPU correctness (F16 planar, RGBA8, packed RGB u8, fence handoff, wrapped import) | `_verify` | exact/tolerance oracle vs the CPU engine |
-| Convert bench (pooled) | `_bench(fresh_dst=false)` | steady-state import-cache misses == 0 AND `src_uploads == 0` |
+| Convert bench (pooled) | `_bench(fresh_dst=false)` | steady-state import-cache misses == 0 and `src_uploads == 0` |
 | Convert bench (fresh dst) | `_bench(fresh_dst=true)` | re-import churn recorded (expected misses == iters) |
 | CPU-usage sweep | `_usage_sweep` | per-`CpuAccess` map/render medians — the device's layout signature (reported) |
 | Write-combined mapping | `_wc_mapping_bench` | Write vs ReadWrite rewrite medians (reported) |
 | Hardware-only map contract | `_map_on_none` | deterministic `CpuAccessDenied` refusal |
-| getId interning | `_getid_interning` | re-wrap window misses == 0 on API 31+; honest growth pre-31 |
+| getId interning | `_getid_interning` | re-wrap window misses == 0 on API 31+; misses grow pre-31 |
 | Compressed render | `_compressed_render` | `Compression::Any` destination renders and samples back to pixel parity; scheme recorded |
 | QNN UBWC end-to-end | *(planned)* | UBWC-tagged context binary consumes a `Scheme(Ubwc)` destination (needs QAIRT SDK integration) |
 | CL compressed-image interop | *(planned)* | `cl_qcom_compressed_image` read of the convert output (needs CL harness) |
@@ -1445,7 +1417,7 @@ alternatives freely against Device Farm inventory:
 | Samsung Galaxy A54/A55 | Exynos 1380/1480 | Mali-G68 / Xclipse 530 | ENN or NNAPI | Non-QTI Samsung gralloc; midrange bandwidth (compression wins larger, thermals tighter) |
 | Galaxy S22/S23 Exynos (EU SKU) | Exynos 2200+ | Xclipse (RDNA) / DCC | ENN | DCC policy on an RDNA-derived mobile GPU |
 | Dimensity 8xxx/9xxx device | MediaTek | Mali/Immortalis / AFBC | MediaTek APU / NeuroPilot | MTK gralloc AFBC policy; Neuron SDK linear zero-copy import |
-| Budget floor (Galaxy A1x class) | entry Exynos/MTK/SD 6xx | Mali-G5x / Adreno 6xx | NNAPI-only | API-26/28-era gralloc; devices where compression may NOT engage — proves the linear fallback + telemetry honesty |
+| Budget floor (Galaxy A1x class) | entry Exynos/MTK/SD 6xx | Mali-G5x / Adreno 6xx | NNAPI-only | API-26/28-era gralloc; devices where compression may not engage — proves the linear fallback and its telemetry |
 
 The sweep runs identically on every pool; per-device results become the
 "compression engages for these (format, usage) classes on this silicon"
@@ -1468,5 +1440,5 @@ devices where the optimization silently can't engage.
 | GL tests all skip | No EGL display available | Expected on headless CI; set `DISPLAY` or use a virtual framebuffer |
 | `EDGEFIRST_TESTDATA_DIR not set` panic | Running cross-compiled bench without env | Export `EDGEFIRST_TESTDATA_DIR=$(pwd)/testdata` on target |
 | CI fmt / clippy failure | Local gate skipped | Run `make format lint check` before committing |
-| macOS: `Cannot repair wheel, because required library @rpath/libedgefirst_tensor.0.dylib could not be located` | maturin's wheel-repair step ran. It resolves `@rpath/...` against link-time search paths and cannot see the library `crates/python-tensor/build.rs` stages into `python-source`, so it calls an already self-contained wheel unrepairable | `make test-python` now sets `MATURIN_PEP517_ARGS="--auditwheel skip"`; pass the same when running `pip install crates/python-*/` by hand (issue #199) |
-| macOS: `ImportError: dlopen(...): mis-aligned LINKEDIT string pool` | rustc strips Apple binaries with its own in-process Mach-O writer, leaving the string pool 4-byte aligned whenever the binary's `nindirectsyms` is odd; dyld on macOS 26+ rejects it | `.cargo/config.toml` hands the strip back to Apple's linker (`-C strip=none -C link-arg=-Wl,-x`). Confirm with `make check-macho`; if it is red, check nothing has overridden `RUSTFLAGS` (issue #200) |
+| macOS: `Cannot repair wheel, because required library @rpath/libedgefirst_tensor.0.dylib could not be located` | maturin's wheel-repair step ran. It resolves `@rpath/...` against link-time search paths and cannot see the library `crates/python-tensor/build.rs` stages into `python-source`, so it calls an already self-contained wheel unrepairable | `make test-python` sets `MATURIN_PEP517_ARGS="--auditwheel skip"`; pass the same when running `pip install crates/python-*/` by hand |
+| macOS: `ImportError: dlopen(...): mis-aligned LINKEDIT string pool` | rustc strips Apple binaries with its own in-process Mach-O writer, leaving the string pool 4-byte aligned whenever the binary's `nindirectsyms` is odd; dyld on macOS 26+ rejects it | `.cargo/config.toml` hands the strip back to Apple's linker (`-C strip=none -C link-arg=-Wl,-x`). Confirm with `make check-macho`; if it is red, check nothing has overridden `RUSTFLAGS` |

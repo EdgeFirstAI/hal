@@ -1,19 +1,12 @@
 // SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! Build a [`Decoder`] from the four ModelPack schema-v2 fixtures shipped
-//! by ModelPack 4.0.
+//! Build a [`Decoder`] from the four ModelPack schema-v2 fixtures.
 //!
-//! ModelPack always exports raw per-FPN-scale anchor-grid outputs
+//! ModelPack exports raw per-FPN-scale anchor-grid outputs
 //! (``type: detection``, ``encoding: anchor``, ``decoder: modelpack``),
-//! optionally accompanied by a single ``type: segmentation`` output for
-//! multi-task models. Each FPN scale is its own top-level output — both
-//! before and after conversion — so the "smart" layout differs from the
-//! Ultralytics case: converters do NOT introduce per-scale physical
-//! children, they just fill in `quantization` + `dtype` on each scale in
-//! place. The fixtures cover both the float (pre-conversion, no
-//! quantization) and the quantized INT8 (post-conversion) variants for
-//! detection, segmentation, and multi-task.
+//! optionally with a single ``type: segmentation`` output. Each FPN scale is
+//! its own top-level output, with no per-scale physical children.
 //!
 //! [`Decoder`]: edgefirst_decoder::Decoder
 
@@ -40,9 +33,8 @@ fn build_from_fixture(stem: &str) -> (SchemaV2, edgefirst_decoder::Decoder) {
     (schema, decoder)
 }
 
-/// Shared invariants: ModelPack v2 must NOT set `decoder_version`
-/// (that field is Ultralytics-only per the metadata spec), and the
-/// expected 320x320 input geometry comes through unchanged.
+/// Asserts that the schema sets no `decoder_version` and that the 320x320
+/// input geometry comes through unchanged.
 fn assert_modelpack_invariants(
     stem: &str,
     schema: &SchemaV2,
@@ -66,7 +58,7 @@ fn build_decoder_from_modelpack_det_logical() {
     assert_modelpack_invariants(stem, &schema, &decoder);
 
     // Detection-only ModelPack: one logical output per FPN scale, no
-    // per-scale children (this is the float / logical layout).
+    // per-scale children.
     assert_eq!(
         schema.outputs.len(),
         2,
@@ -126,12 +118,8 @@ fn build_decoder_from_modelpack_det_smart() {
     let (schema, decoder) = build_from_fixture(stem);
     assert_modelpack_invariants(stem, &schema, &decoder);
 
-    // Post-conversion (INT8 quantized) ModelPack layout: each FPN scale
-    // is still a top-level `type: detection` output (no nested physical
-    // children — ModelPack's anchor-grid outputs are already per-scale,
-    // so converters fill in `quantization` + `dtype` in place rather
-    // than introducing per-scale children). Each output carries a
-    // non-null `quantization` block and `dtype: int8`.
+    // INT8 quantized ModelPack layout: each FPN scale is a top-level
+    // `type: detection` output with a `quantization` block and `dtype: int8`.
     assert_eq!(
         schema.outputs.len(),
         2,

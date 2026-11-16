@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# EDGEAI-1244 native-f16 codegen auditor.
+# Native-f16 codegen auditor.
 #
 # Dumps the disassembly of the HAL's f16 mask kernel and checks for
 # native-FP16 instructions (fcvt / vcvtph2ps), failing if the compiler
@@ -41,8 +41,7 @@ esac
 echo "==> Auditing $SYMBOL on $TARGET"
 echo "==> Expected instructions: $EXPECTED_INSTRS"
 
-# Portable temp file with a stable suffix — BSD `mktemp` (macOS default) does
-# not support `--suffix=`, so allocate the temp first then rename.
+# Temp file with a stable suffix: allocated, then renamed.
 TMP_BASE=$(mktemp)
 TMP_ASM="${TMP_BASE}.asm"
 mv "$TMP_BASE" "$TMP_ASM"

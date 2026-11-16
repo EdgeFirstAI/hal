@@ -5,9 +5,7 @@ use crate::error::{KernelError, Result};
 
 /// Detected CPU instruction-set features.
 ///
-/// Probe once when building a plan and cache the result.
-/// [`CpuFeatures::from_env_or_probe`] reads `EDGEFIRST_KERNELS_FORCE_TIER` for
-/// debugging and benchmarking overrides.
+/// [`CpuFeatures::from_env_or_probe`] applies the `EDGEFIRST_KERNELS_FORCE_TIER` override.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CpuFeatures {
     pub neon_baseline: bool,
@@ -51,10 +49,7 @@ impl CpuFeatures {
         )
     }
 
-    /// The tier rules, with the environment factored out.
-    ///
-    /// An environment is per process, so taking the tier as an argument lets
-    /// the rules be tested without a process-wide side effect.
+    /// The features of the forced tier `forced`, or the probed features for `None`.
     pub fn from_forced_tier(forced: Option<&str>) -> Result<Self> {
         let probed = Self::probe();
         let Some(forced) = forced else {
@@ -108,7 +103,7 @@ impl CpuFeatures {
     }
 
     /// Whether FP16 arithmetic may run: NEON and FEAT_FP16 requested, and FEAT_FP16 detected
-    /// at run time, so features built by hand cannot reach an FP16 kernel on a CPU without it.
+    /// at run time.
     pub fn fp16_usable(&self) -> bool {
         #[cfg(target_arch = "aarch64")]
         {
@@ -198,31 +193,11 @@ mod tests {
         assert!(!CpuFeatures::default().dotprod_usable());
     }
 
-    /// Serializes every test that overrides an env var.
-    ///
-    /// An environment is per process, not per thread, and plain `cargo test`
-    /// runs tests as threads in one process. Two tests setting
-    /// `EDGEFIRST_KERNELS_FORCE_TIER` could interleave between one's `set`
-    /// and its read, so `from_env_or_probe_reads_the_documented_variable` would see the
-    /// other's `wibble` and unwrap an `Err`. It is intermittent and invisible
-    /// under nextest, which gives each test its own process, and under the
-    /// mutation lane's `--test-threads=1`.
-    ///
-    /// Poisoning is ignored: the lock guards an env var that the guard below
-    /// restores on unwind anyway, so a panicking test should fail on its own
-    /// assertion rather than take every later test with it.
+    /// Serializes every test that overrides an env var; poisoning is ignored.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-    /// RAII guard that overrides an env var for the lifetime of the
-    /// guard, capturing the prior value on construction and restoring it
-    /// on drop. Restores even on panic, and treats "unset" as a distinct
-    /// state from "set to empty string" so we don't accidentally leave a
-    /// stray empty value behind.
-    ///
-    /// Holding [`ENV_LOCK`] for the guard's lifetime is what makes the
-    /// override safe against other tests; restoring on drop is what keeps it
-    /// from leaking to the tests that follow, or to a developer's shell when
-    /// the variable was already set before `cargo test`.
+    /// Overrides an env var while it lives, holding [`ENV_LOCK`], and restores the prior
+    /// value, or its absence, on drop.
     struct EnvGuard {
         key: &'static str,
         prev: Option<String>,
@@ -317,8 +292,7 @@ mod tests {
         );
     }
 
-    /// A tier the CPU cannot provide is refused rather than silently downgraded.
-    /// On x86_64 no NEON tier is available; on aarch64 the baseline always is.
+    /// A tier the CPU cannot provide is refused.
     #[test]
     fn forced_neon_tier_matches_what_the_cpu_can_do() {
         let r = CpuFeatures::from_forced_tier(Some("neon"));
@@ -335,11 +309,7 @@ mod tests {
         }
     }
 
-    /// The only test that touches the process environment, and the one place
-    /// the variable's name is load-bearing. `scalar` is chosen deliberately:
-    /// it is a valid tier, so a plan built concurrently on another thread sees
-    /// a different-but-valid dispatch rather than the `Err` an unknown tier
-    /// would hand it.
+    /// `from_env_or_probe` reads `EDGEFIRST_KERNELS_FORCE_TIER`.
     #[test]
     fn from_env_or_probe_reads_the_documented_variable() {
         let _g = EnvGuard::set("EDGEFIRST_KERNELS_FORCE_TIER", "scalar");

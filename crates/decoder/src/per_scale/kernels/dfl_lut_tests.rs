@@ -101,8 +101,7 @@ fn max_err(got: &[f32], want: &[f64]) -> f64 {
         .fold(0.0, f64::max)
 }
 
-/// The table kernel is at least as close to an f64 reference as the f32
-/// dequant-then-softmax kernel, and within a few f32 rounding steps.
+/// The table kernel is within a few f32 rounding steps of an f64 reference and no further from it than the f32 softmax kernel.
 #[test]
 fn matches_f64_reference_closer_than_f32_softmax() {
     for (scale, zp) in [(0.147, 8), (0.1, -40), (0.02, 0), (0.6, 100)] {

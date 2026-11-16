@@ -7,12 +7,10 @@
 //! manager on HAL's device, and always reads a texture. A native NV12
 //! texture source of the configured size is handed to it in place when the
 //! encoder returns each frame's access unit at once: `encode` then waits for
-//! it, so the encoder has read the source by the time the call returns.
-//! Otherwise the source is copied into one of a ring of scratch textures --
-//! on the GPU from a texture (a crop, or a source for an encoder that holds
-//! frames), on the CPU from a host tensor -- which stays the encoder's until
-//! its access unit comes back. The first frame takes the copy and measures
-//! which kind of encoder this is.
+//! it. Otherwise the source is copied into one of a ring of scratch textures
+//! (on the GPU from a texture, on the CPU from a host tensor), which stays
+//! the encoder's until its access unit comes back. The first frame takes the
+//! copy and measures which kind of encoder this is.
 //!
 //! An encoder without D3D11 support (Microsoft's software encoder) gets each
 //! source copied, tightly packed, into a system-memory sample instead.
@@ -157,7 +155,7 @@ pub(crate) struct MfEncoder {
     codec_api: Option<ICodecAPI>,
     /// `Some` when the encoder reads D3D11 textures.
     textures: Option<TextureInput>,
-    /// Kept for the transform, which holds its own reference.
+    /// The device manager given to the transform.
     _manager: Option<IMFDXGIDeviceManager>,
     config: EncoderConfig,
     device: String,
@@ -182,8 +180,7 @@ pub(crate) struct MfEncoder {
     restart: bool,
     /// Access units queued since the sequence started.
     queued: u64,
-    /// Last, so Media Foundation stays started until the transform is
-    /// released.
+    /// Keeps Media Foundation started; dropped last.
     platform: Platform,
 }
 
@@ -224,7 +221,7 @@ impl MfEncoder {
             }
             return Err(CodecError::UnsupportedFormat(config.input_format));
         }
-        // Only NV12 has a texture an encoder reads in place.
+        // A device manager is used for NV12 input only.
         let manager = (subtype == MFVideoFormat_NV12)
             .then(|| platform.device_manager())
             .flatten();
@@ -297,8 +294,7 @@ impl MfEncoder {
                 }
                 Err(e) => {
                     log::debug!("{name}: {e}");
-                    // A refused profile or level says more than a later
-                    // transform's failure to take the input format.
+                    // Keep the first error, or a later `InvalidConfig`.
                     if rejected.is_none() || matches!(e, CodecError::InvalidConfig(_)) {
                         rejected = Some(e);
                     }
@@ -317,11 +313,10 @@ impl MfEncoder {
         subtype: GUID,
         manager: Option<&IMFDXGIDeviceManager>,
     ) -> Result<(Transform, Option<ICodecAPI>, bool)> {
-        // Before the media types, which the encoder checks against its
-        // device.
+        // Set the device manager before the media types.
         let d3d = manager.is_some_and(|m| transform.set_device_manager(m));
         let codec_api = transform.mft().cast::<ICodecAPI>().ok();
-        // Rate control has to be chosen before the output type is set.
+        // Set rate control before the output type.
         if let Some(api) = &codec_api {
             apply_codec_api(api, config, transform.name());
         }
@@ -508,8 +503,7 @@ impl MfEncoder {
         let whole = origin == (0, 0) && src.width() == Some(size.0) && src.height() == Some(size.1);
         if texture_source && whole && textures.in_place == Some(true) {
             let texture = tensor_texture(src)?;
-            // Submits whatever the source's producer queued, which the
-            // encoder reads behind on the same device.
+            // Submit the commands queued on the context.
             // SAFETY: a live context.
             unsafe { textures.context.Flush() };
             return Ok((self.platform.texture_sample(&texture)?, true));
@@ -682,9 +676,8 @@ impl MfEncoder {
         if au.parameter_sets {
             self.parameter_sets = h264::parameter_sets(&data);
         } else if au.idr && !self.parameter_sets.is_empty() {
-            // Some encoders send the headers only on the first IDR, or in
-            // the output type; every IDR gets them when headers repeat, and
-            // the first one always does.
+            // Every IDR gets the parameter sets when headers repeat, and the
+            // first one always does.
             let first = self.queued == 0;
             if self.config.repeat_headers || first {
                 data = h264::with_parameter_sets(&data, &self.parameter_sets);
@@ -763,8 +756,8 @@ impl EncoderBackend for MfEncoder {
         self.restart = false;
         let measure = self.textures.as_ref().is_some_and(|t| t.in_place.is_none());
         if in_place || measure {
-            // An encoder reads a texture after `ProcessInput` returns, so the
-            // frame's own access unit is what says it has.
+            // The frame's access unit shows that the encoder has read the
+            // texture.
             let returned = match self.wait_for_frame(time) {
                 Ok(returned) => returned,
                 Err(e) => {
@@ -791,9 +784,7 @@ impl EncoderBackend for MfEncoder {
                      draining it, and copying sources from now on",
                     self.device
                 );
-                // The caller may reuse the source once `encode` returns, so
-                // the encoder must be done reading it: a drained encoder has
-                // consumed every input, and a flushed one releases them.
+                // Drain the encoder, so it has consumed the source.
                 let drained = self
                     .transform
                     .drain(&self.platform, DRAIN_TIMEOUT, &mut out);
@@ -837,7 +828,7 @@ impl EncoderBackend for MfEncoder {
             self.in_flight.clear();
         }
         self.headers.clear();
-        // The next frame opens a new sequence, as after a drain on V4L2.
+        // The next frame opens a new sequence.
         self.restart = true;
         self.queued = 0;
         Ok(self.pending.drain(..).collect())

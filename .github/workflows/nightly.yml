@@ -1,5 +1,5 @@
-# Nightly Full + G13. Skips when main has not moved since the last nightly
-# that reached a verdict. Advisory scanning runs either way.
+# Nightly Full and differential runs. Skips when main has not moved since the
+# last nightly that reached a verdict. Advisory scanning runs either way.
 #
 # Shared workflows: EdgeFirstAI/.github, pinned in the `uses:` lines below.
 
@@ -16,8 +16,6 @@ on:
         required: false
         default: false
 
-# A manual dispatch must not interleave with the scheduled run: both would race
-# on the same self-hosted board and the same Sonar `main` baseline.
 concurrency:
   group: nightly-${{ github.ref }}
   cancel-in-progress: false
@@ -26,18 +24,9 @@ jobs:
   changed:
     uses: EdgeFirstAI/.github/.github/workflows/nightly-gate.yml@c7876194b9fe9f7f72daf0efadaf32d7dff1b257
     with:
-      # `inputs` is null on the schedule trigger, so the fallback is required;
-      # without it the expression is an empty string and the gate's boolean
-      # input rejects it.
       force: ${{ inputs.force || false }}
 
-  # Deliberately not `needs: changed`. Every other lane here asks a question
-  # about the code, so skipping an unchanged commit loses nothing. cargo audit
-  # asks a question about the RustSec database, which changes daily whether the
-  # code does or not -- the 2026-09-15 nightly failed on RUSTSEC-2026-0204
-  # against a Cargo.lock nobody had touched. It parses Cargo.lock without
-  # building, on a free standard runner, so running it every night costs
-  # nothing. See the exception in the shared copilot-instructions.md.
+  # Runs every night.
   advisories:
     uses: EdgeFirstAI/.github/.github/workflows/advisories.yml@c7876194b9fe9f7f72daf0efadaf32d7dff1b257
 
@@ -48,18 +37,13 @@ jobs:
     with:
       lanes: all
       nightly: true
-      # The PyO3 crates need a target interpreter; opencv/turbojpeg need system libraries; egl's EGL-version features do not compose.
       hack-args: >-
         --workspace --feature-powerset --depth 2
         --exclude-features opencv,turbojpeg --exclude edgefirst-egl
         --exclude edgefirst-python-tensor --exclude edgefirst-python-codec
         --exclude edgefirst-python-image --exclude edgefirst-python-decoder
         --exclude edgefirst-python-tracker --exclude edgefirst-python-kernels --exclude edgefirst-python-common
-      # One job per board identity, each run on that specific board: the NXP
-      # EVKs carry the vendor BSP (G2D, galcore on the 8M Plus) the hardware
-      # tests are written against, where a bare family label could land on a
-      # carrier without it. orin-nano is Ubuntu 22.04 (glibc 2.35), the floor
-      # the archive is built for.
+      # One job per board identity.
       boards: imx8mp-evk,imx95-evk,rpi5,orin-nano
       archive-glibc: "2.35"
       lfs: true
@@ -70,23 +54,12 @@ jobs:
       skip-windows: true
       timeout-minutes: 45
       board-timeout-minutes: 45
-      # Same class as Full: a nightly that takes twice as long delays the
-      # failure signal by a working morning. Flip to `hosted` here if the
-      # monthly larger-runner spend needs trimming; nothing blocks on nightly.
       runner-class-linux: larger
       runner-class-linux-arm: larger
       pre-command: bash .github/scripts/ci-setup.sh
       board-pre-command: BOARD=1 SKIP_PACKAGES=1 SKIP_TESTDATA=1 bash .github/scripts/ci-setup.sh
-      # One process per binary, not per test. nextest's process-per-test model
-      # costs a full EGL init/teardown per test on a board -- 6 to 22s each,
-      # measured -- and writes one profraw per process, which exhausted the
-      # eMMC at 307 files / 2.8 GB. Running each binary once is what test.yml
-      # did, and it is why the same suite took 16 minutes.
-      #
-      # The selection is the routing test.yml used: the image and tensor lib
-      # binaries filtered to the hardware tests, plus the integration binaries
-      # that are whole-binary GPU/DMA tests. Everything else is CPU-only and
-      # already covered by the aarch64 host lane.
+      # One process per binary: the image and tensor lib binaries filtered to
+      # the hardware tests, and the whole-binary GPU/DMA integration binaries.
       board-binaries: |
         edgefirst_image=g2d,opengl
         edgefirst_tensor=dma
@@ -104,14 +77,9 @@ jobs:
         protocol_roundtrip
         identity
         vocabulary
-      # A floor, not a target. Guards against a selection that matches nothing
-      # and reports success; tighten once a green run reports the real count.
+      # Minimum number of tests the board selection must match.
       board-min-tests: "100"
       nextest-args: --workspace --locked --features default,edgefirst-decoder/model-files --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-kernels --exclude edgefirst-python-common -j 1
-      # The boards are storage-constrained (the smallest root filesystem is
-      # 12 GB). profiling is thin-LTO with debug = "line-tables-only", which is
-      # what kept the on-target payload shippable before the migration; the
-      # dev profile's full debug info fills the disk.
       archive-profile: profiling
       archive-args: --locked --package edgefirst-image --features opengl --package edgefirst-tensor
     secrets: inherit

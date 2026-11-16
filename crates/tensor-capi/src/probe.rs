@@ -79,7 +79,8 @@ pub unsafe extern "C" fn ef_platform_compression_support(
     }
 }
 
-/// `HAL_COMPRESSION_ANY` requests that fell back to a linear layout.
+/// Number of `EF_COMPRESSION_REQUEST_ANY` requests that fell back to a
+/// linear layout.
 #[no_mangle]
 pub extern "C" fn ef_compression_fallback_count() -> u64 {
     catch_unwind(edgefirst_tensor::compression_fallback_count).unwrap_or(0)

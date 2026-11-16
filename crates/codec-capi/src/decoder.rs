@@ -3,9 +3,8 @@
 
 //! Decoding into an existing tensor.
 //!
-//! The decoder is a reusable object rather than a free function because it
-//! holds backend state — the V4L2 or nvJPEG handle, the chosen DCT method —
-//! and re-creating that per frame is what a decode loop must not do.
+//! The decoder is a reusable object that holds backend state: the V4L2 or
+//! nvJPEG handle and the chosen DCT method.
 
 use std::ffi::{c_char, c_int, CStr};
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -30,7 +29,7 @@ pub extern "C" fn ef_image_decoder_new() -> *mut EfImageDecoder {
     .unwrap_or(std::ptr::null_mut())
 }
 
-/// Free a decoder. Freeing `NULL` is a no-op, matching `free(3)`.
+/// Free a decoder. Freeing `NULL` is a no-op.
 ///
 /// # Safety
 /// `d` must be `NULL` or have come from [`ef_image_decoder_new`].
@@ -47,7 +46,7 @@ pub unsafe extern "C" fn ef_image_decoder_free(d: *mut EfImageDecoder) {
 /// Decode JPEG or PNG bytes into `dst`, sizing and formatting it to the image.
 ///
 /// The container is detected from magic bytes. `dst` must be large enough;
-/// a smaller allocation is an error rather than a truncated image.
+/// a smaller allocation is an error.
 ///
 /// @return 0 on success, `ENOSPC` when `dst` is too small, `EACCES` when the
 ///         CPU decoder must write a `dst` not declared CPU-writable,
@@ -238,8 +237,7 @@ pub unsafe extern "C" fn ef_image_decoder_reset_output_format(d: *mut EfImageDec
 /// `quant` is full range for an RGB/HSV format, whatever the colorspace, and
 /// for `V4L2_COLORSPACE_JPEG`; limited for a YUV format in any other
 /// recognised colorspace; and unset (range byte 0) for a YUV format in a
-/// `DEFAULT` or unrecognised colorspace, so the at-use height heuristic
-/// decides.
+/// `DEFAULT` or unrecognised colorspace.
 ///
 /// # Safety
 /// `out` must be writable.
@@ -435,7 +433,7 @@ mod tests {
     }
 
     /// Decoding into a destination not declared CPU-writable, and saving one
-    /// not declared CPU-readable, are `EACCES`, as a tensor map is.
+    /// not declared CPU-readable, are `EACCES`.
     #[test]
     fn a_cpu_access_refusal_is_eacces() {
         use edgefirst_tensor::{CpuAccess, DType, PixelFormat, TensorMemory};
@@ -493,8 +491,6 @@ mod tests {
 
     #[test]
     fn the_availability_probes_do_not_crash_on_any_host() {
-        // Both are 0 or 1 everywhere; the point is that probing a device that
-        // is absent must not fault.
         assert!(matches!(ef_codec_v4l2_available(), 0 | 1));
         assert!(matches!(ef_codec_nvjpeg_available(), 0 | 1));
     }

@@ -6,9 +6,7 @@
 //!
 //! A split detector with four classes has scores the shape of its boxes
 //! (`[1, 4, anchors]`); a segmentation model with as many classes as protos
-//! has scores the shape of its mask coefficients. Binding those by shape
-//! alone hands one role the other's tensor and decodes garbage without an
-//! error.
+//! has scores the shape of its mask coefficients.
 
 use edgefirst_decoder::{
     configs::{self, DecoderType, DimName},
@@ -47,8 +45,7 @@ fn scores_data(classes: usize) -> Vec<f32> {
     scores
 }
 
-/// The planted boxes, each with its own class. A swapped binding returns
-/// the right count with the wrong corners and labels, so both are checked.
+/// Asserts the planted boxes, each with its own class: corners and labels.
 fn assert_planted(mut boxes: Vec<DetectBox>, classes: usize, tolerance: f32) {
     assert_eq!(boxes.len(), TARGETS, "{boxes:?}");
     boxes.sort_by(|a, b| a.bbox.xmin.total_cmp(&b.bbox.xmin));
@@ -109,8 +106,7 @@ fn decode(
     Ok(boxes)
 }
 
-/// Four classes: scores and boxes are both `[1, 4, N]`. Whichever the
-/// configuration lists first, tensors passed in that order decode correctly.
+/// Four classes: scores and boxes are both `[1, 4, N]` and bind in the configured order, whichever is listed first.
 #[test]
 fn same_shape_outputs_bind_in_configured_order() {
     let boxes = tensor(None, &[1, 4, N], &boxes_data());
@@ -154,8 +150,7 @@ fn named_schema() -> String {
     )
 }
 
-/// Tensors named like the schema's outputs are bound by name: in any order,
-/// and with another tensor of the same shape among them.
+/// Tensors named like the schema's outputs are bound by name, in any order and with another tensor of the same shape among them.
 #[test]
 fn named_outputs_bind_by_name_in_any_order() {
     let decoder = builder()
@@ -174,9 +169,7 @@ fn named_outputs_bind_by_name_in_any_order() {
     );
 }
 
-/// With no names and a tensor count that is not the configured one, nothing
-/// says which `[1, 4, N]` tensor is the boxes. That is an error naming the
-/// roles and the shape, not a decode of whichever came first.
+/// With no names and a tensor count that is not the configured one, same-shape outputs are an error naming the roles and the shape.
 #[test]
 fn same_shape_outputs_that_nothing_tells_apart_are_refused() {
     let decoder = builder()
@@ -211,8 +204,7 @@ fn a_missing_output_names_its_role() {
     assert!(message.contains("scores"), "{message}");
 }
 
-/// As many classes as protos: scores and mask coefficients are both
-/// `[1, 32, N]`, and are told apart by their configured order.
+/// As many classes as protos: scores and mask coefficients are both `[1, 32, N]` and bind in the configured order.
 #[test]
 fn scores_and_mask_coefficients_of_one_shape_bind_in_configured_order() {
     const NM: usize = 32;
@@ -261,9 +253,7 @@ fn scores_and_mask_coefficients_of_one_shape_bind_in_configured_order() {
     );
 }
 
-/// The merge path dequantizes split outputs into one tensor per logical
-/// output, in schema order, and those are bound to roles the same way: a
-/// schema that lists the scores before boxes of the same shape still decodes.
+/// Merged outputs of one shape bind to roles: a schema that lists the scores before boxes of the same shape decodes.
 #[test]
 fn merged_outputs_of_one_shape_bind_in_schema_order() {
     let child = |name: &str, kind: &str| {
@@ -315,9 +305,7 @@ fn merged_outputs_of_one_shape_bind_in_schema_order() {
     assert_planted(decode(&decoder, &[&scores, &xy, &wh]).unwrap(), 4, 0.01);
 }
 
-/// A tensor that carries an output's name belongs to that output, whichever
-/// role is bound first: unnamed boxes passed after the named scores are not
-/// given the scores tensor for standing at the boxes' configured position.
+/// A tensor that carries an output's name is not taken by position for another output.
 #[test]
 fn a_named_tensor_is_not_taken_by_position_for_another_output() {
     let decoder = builder()
@@ -330,8 +318,7 @@ fn a_named_tensor_is_not_taken_by_position_for_another_output() {
     assert_planted(decode(&decoder, &[&scores, &boxes]).unwrap(), 4, 1e-4);
 }
 
-/// ModelPack's `masks` head is not decoded, so a model whose other outputs
-/// share a shape still decodes without it.
+/// A model whose other outputs share a shape decodes without ModelPack's undecoded `masks` head.
 #[test]
 fn an_unread_masks_head_is_not_required() {
     const SIDE: usize = 8;
@@ -400,8 +387,7 @@ fn mask_bytes(decoder: &edgefirst_decoder::Decoder, outputs: &[&TensorDyn]) -> V
     }
 }
 
-/// A ModelPack segmentation head shaped like the boxes (`[1, rows, 1, 4]`)
-/// is decoded from its own tensor, not from the boxes found first.
+/// A ModelPack segmentation head shaped like the boxes (`[1, rows, 1, 4]`) is decoded from its own tensor.
 #[test]
 fn modelpack_segmentation_shaped_like_the_boxes_reads_its_own_tensor() {
     const ROWS: usize = 16;
@@ -469,8 +455,7 @@ fn modelpack_segmentation_shaped_like_the_boxes_reads_its_own_tensor() {
     }
 }
 
-/// Two ModelPack detection heads of one shape are each decoded from their
-/// own tensor, with their own anchors, in the configured order.
+/// Two ModelPack detection heads of one shape are each decoded from their own tensor, with their own anchors, in the configured order.
 #[test]
 fn modelpack_detection_heads_of_one_shape_bind_in_configured_order() {
     const GRID: usize = 4;

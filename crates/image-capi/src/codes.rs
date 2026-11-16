@@ -3,21 +3,17 @@
 
 //! The image option vocabularies, as named C enumerators.
 //!
-//! Each enumerator's value is asserted against the `code()` of the
-//! `edgefirst_image` vocabulary it names, at compile time, so the header
-//! cannot drift from the Rust declaration. The functions that take one keep
-//! a plain `uint32_t` parameter: an out-of-range value is rejected with
-//! `EINVAL` rather than transmuted into a Rust enum, which would be
-//! undefined behaviour for a value no variant names.
+//! Each enumerator's value is asserted at compile time against the `code()`
+//! of the `edgefirst_image` vocabulary it names. The functions that take one
+//! have a `uint32_t` parameter and reject an out-of-range value with `EINVAL`.
 
 use edgefirst_image::{
     ColorMode, ComputeBackend, FitMode, Flip, Interpolation, LetterboxPlacement,
     NormalizationPreset, PadSpace, Rotation,
 };
 
-/// The preprocessing vocabularies `ef_preprocess_spec` carries, declared once
-/// in header-only `edgefirst/detect.h` so `decoder.h` and `image.h` share
-/// them; asserted against this library's codes below.
+/// The preprocessing vocabularies `ef_preprocess_spec` carries, declared in
+/// `edgefirst/detect.h`.
 pub use edgefirst_decoder_abi::{EfFit, EfInterpolation, EfLetterboxPlacement, EfPadSpace};
 
 /// A quarter-turn rotation, for `ef_image_processor_convert` and friends.
@@ -126,9 +122,8 @@ mod tests {
     use super::*;
 
     /// The C enumerator for a variant, spelled the way cbindgen's
-    /// `ScreamingSnakeCase` spells the matching `Ef*` variant (which shares
-    /// the Rust variant's name): `CounterClockwise90` ->
-    /// `COUNTER_CLOCKWISE90`.
+    /// `ScreamingSnakeCase` spells the matching `Ef*` variant:
+    /// `CounterClockwise90` -> `COUNTER_CLOCKWISE90`.
     fn enumerator(prefix: &str, v: impl std::fmt::Debug) -> String {
         let mut out = format!("{prefix}_");
         for (i, c) in format!("{v:?}").chars().enumerate() {
@@ -140,8 +135,7 @@ mod tests {
         out
     }
 
-    /// `(C enumerator name, code)` for every enumerator the header must
-    /// declare, built from the Rust vocabularies rather than restated.
+    /// `(C enumerator name, code)` for every enumerator the header must declare.
     fn expected_enumerators() -> Vec<(String, u32)> {
         let mut out = Vec::new();
         out.extend(
@@ -194,8 +188,6 @@ mod tests {
 
     #[test]
     fn every_vocabulary_variant_has_a_c_enumerator() {
-        // The const block proves the listed values agree; this proves the
-        // lists are complete.
         assert_eq!(Rotation::all().len(), 4, "add the EfRotation enumerator");
         assert_eq!(Flip::all().len(), 3, "add the EfFlip enumerator");
         assert_eq!(ColorMode::all().len(), 3, "add the EfColorMode enumerator");
@@ -223,8 +215,7 @@ mod tests {
         );
     }
 
-    /// `image.h` and the `detect.h` it includes: the preprocessing
-    /// vocabularies are declared in the latter.
+    /// The text of `image.h` and the `detect.h` it includes.
     fn headers_text() -> String {
         let image = std::fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),

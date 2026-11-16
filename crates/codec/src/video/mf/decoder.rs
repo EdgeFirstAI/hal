@@ -7,9 +7,7 @@
 //! so it decodes on the GPU (DXVA) into a texture array of its own. Each
 //! picture is copied, GPU to GPU, into a free native NV12 tensor of the pool
 //! and returned as a [`DecodedFrame`], whose recorded fence value orders a
-//! consumer behind the copy. The decoder's sample is released at once: its
-//! array has a handful of slices, and a decoder whose samples are all held
-//! stops for good.
+//! consumer behind the copy. The decoder's sample is released at once.
 //!
 //! A picture finished while every pool tensor is held is copied into a
 //! parking texture and waits there for a frame to drop; the next call fails
@@ -21,12 +19,10 @@
 //!
 //! The pool is allocated at the stream's visible size: D3D11 tensors where
 //! the process has a D3D11 device, host memory otherwise. A provided pool
-//! must hold NV12 images of exactly that size, since a D3D11 texture cannot
-//! be described as a smaller image.
+//! must hold NV12 images of exactly that size.
 //!
 //! Sample times are the access unit's sequence number; the caller's PTS is
-//! looked up again by the time of each decoded picture, which the decoder
-//! carries through its reordering.
+//! looked up again by the time of each decoded picture.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
@@ -233,10 +229,9 @@ pub(crate) struct MfDecoder {
     next_seq: i64,
     /// The caller's PTS by sample time.
     times: BTreeMap<i64, u64>,
-    /// Kept for the transform, which holds its own reference.
+    /// The device manager given to the transform.
     _manager: Option<IMFDXGIDeviceManager>,
-    /// Last, so Media Foundation stays started until the samples above are
-    /// released.
+    /// Keeps Media Foundation started; dropped last.
     platform: Platform,
 }
 
@@ -266,8 +261,8 @@ impl MfDecoder {
             )));
         }
         let manager = platform.device_manager();
-        // MJPEG decoders need a frame size before the first picture says
-        // which; the first picture of another size replaces it.
+        // MJPEG decoders are opened with a placeholder frame size; the first
+        // picture of another size replaces it.
         let input_size = (codec == Codec::Mjpeg).then_some(PLACEHOLDER_SIZE);
         let mut last = None;
         for candidate in candidates {
@@ -339,8 +334,7 @@ impl MfDecoder {
         size: Option<(u32, u32)>,
         manager: Option<&IMFDXGIDeviceManager>,
     ) -> Result<(Transform, bool)> {
-        // Before the media types: the decoder chooses its output
-        // allocation from whether it has a device.
+        // Set the device manager before the media types.
         let dxva = manager.is_some_and(|m| transform.set_device_manager(m));
         if let Ok(api) = transform.mft().cast::<ICodecAPI>() {
             // SAFETY: a live codec interface and a VT_UI4 value.
@@ -393,10 +387,8 @@ impl MfDecoder {
         Ok(())
     }
 
-    /// Gives back the buffers of frames the caller has dropped. A frame
-    /// returns its slot before it drops its tensor, so a slot becomes free
-    /// only once the pool holds the tensor's last reference: a free slot's
-    /// tensor can then always be updated in place.
+    /// Gives back the buffers of frames the caller has dropped. A slot becomes
+    /// free once the pool holds the last reference to its tensor.
     fn reclaim(&mut self) {
         let mut returned = std::mem::take(&mut self.releasing);
         returned.extend(self.returns.take(self.generation));
@@ -490,8 +482,7 @@ impl MfDecoder {
     }
 
     /// A new buffer, when the pool is full of frames this call is about to
-    /// return: the decoder released more pictures at once than the pool
-    /// holds, and the caller cannot drop frames it has not been given.
+    /// return.
     fn grow(&mut self) -> Result<Option<u32>> {
         if self.held_by_caller() > 0 {
             return Ok(None);
@@ -519,9 +510,7 @@ impl MfDecoder {
     /// Makes the pool fit `layout` and reports the new stream format.
     fn apply(&mut self, layout: Layout) -> Result<()> {
         let (w, h) = layout.frame_size();
-        // A pool of the same size is kept: a tensor a held frame still shows
-        // keeps its colorimetry, and each takes the new one when `picture`
-        // reuses its slot.
+        // A pool of the same size is kept.
         let same_size = self.layout.as_ref().map(Layout::frame_size) == Some((w, h));
         if !same_size || self.pool.is_empty() {
             let mut tensors = match &mut self.output {
@@ -578,8 +567,8 @@ impl MfDecoder {
     }
 
     /// Moves every decoder texture still waiting for a pool buffer into a
-    /// parking texture, so the decoder gets its sample back. A picture whose
-    /// size has no native NV12 texture stays in its sample.
+    /// parking texture, releasing the decoder's sample. A picture whose size has
+    /// no native NV12 texture stays in its sample.
     fn park_waiting(&mut self) -> Result<()> {
         let Some(context) = self.context.clone() else {
             return Ok(());
@@ -686,8 +675,7 @@ impl DecoderBackend for MfDecoder {
             return Err(CodecError::InvalidInput("empty access unit".into()));
         }
         com();
-        // Pictures still waiting for a buffer go first; until they have one,
-        // the access unit is not taken.
+        // Pictures waiting for a buffer are delivered before the access unit is taken.
         self.deliver(true)?;
         if self.input_size.is_some() {
             self.follow_picture_size(access_unit)?;
@@ -876,9 +864,7 @@ fn copy_parked(context: &ID3D11DeviceContext, parked: &TensorDyn, dst: &TensorDy
 }
 
 /// Records a fence value on `t` behind the copy just queued, so CPU maps,
-/// CUDA and other devices wait for it. Every copy of the tensor crate in the
-/// process shares one device and fence, so the value means the same thing to
-/// the copy that allocated `t`.
+/// CUDA and other devices wait for it.
 fn record_write(t: &TensorDyn) {
     if let Some(value) = edgefirst_tensor::d3d11::device()
         .ok()
@@ -1070,8 +1056,7 @@ mod tests {
         assert!(!fits(&raw, 640, 480));
     }
 
-    /// A parked picture reaches a pool tensor the GPU cannot copy into, such
-    /// as one in host memory, plane by plane through CPU maps.
+    /// A parked picture is copied into a host-memory pool tensor through CPU maps.
     #[test]
     fn a_parked_picture_is_copied_into_a_host_pool_tensor() {
         let size = (64usize, 48usize);

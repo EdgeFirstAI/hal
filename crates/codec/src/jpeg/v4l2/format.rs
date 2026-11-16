@@ -21,7 +21,7 @@ pub(crate) enum CapKind {
     Nv12,
 }
 
-/// Classify a CAPTURE FourCC, or `None` if we cannot consume it.
+/// Classify a CAPTURE FourCC, or `None` if the codec does not consume it.
 pub(crate) fn classify(fourcc: u32) -> Option<CapKind> {
     match fourcc {
         uapi::V4L2_PIX_FMT_YUV24 => Some(CapKind::Yuv444Packed),

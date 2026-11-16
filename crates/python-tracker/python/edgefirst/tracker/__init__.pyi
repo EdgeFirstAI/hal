@@ -1,7 +1,7 @@
 """Type stubs for ``edgefirst.tracker``.
 
-ByteTrack lives here, not on ``edgefirst.decoder``. The decoder wheel's
-``decode_tracked`` accepts any object with an ``update`` method.
+``edgefirst.decoder``'s ``decode_tracked`` accepts any object with an
+``update`` method.
 """
 
 def version() -> str:

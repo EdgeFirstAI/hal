@@ -5,16 +5,13 @@
 //!
 //! Four orthogonal axes mirroring V4L2's `struct v4l2_format` colorimetry
 //! fields and `libcamera::ColorSpace`, named to match the EdgeFirst
-//! `CameraFrame.msg` schema so values round-trip through the ROS layer.
-//! Each enum is `#[non_exhaustive]`; unknown/`_DEFAULT` values map to `None`.
+//! `CameraFrame.msg` schema. Each enum is `#[non_exhaustive]`;
+//! unknown/`_DEFAULT` values map to `None`.
 
 use core::fmt;
 use serde::{Deserialize, Serialize};
 
-// V4L2 UAPI constants (stable kernel ABI) from <linux/videodev2.h>. Declared
-// here because this crate builds on every platform and `edgefirst-v4l2` is
-// Linux-only; `v4l2_uapi_tests` below asserts each against
-// `edgefirst_v4l2::uapi` on Linux.
+// V4L2 UAPI constants from <linux/videodev2.h>.
 const V4L2_COLORSPACE_SMPTE170M: u32 = 1;
 const V4L2_COLORSPACE_REC709: u32 = 3;
 const V4L2_COLORSPACE_470_SYSTEM_M: u32 = 5;
@@ -35,11 +32,9 @@ const V4L2_QUANTIZATION_FULL_RANGE: u32 = 1;
 const V4L2_QUANTIZATION_LIM_RANGE: u32 = 2;
 
 // Each axis is declared through `ef_vocabulary!` (see `vocabulary.rs`):
-// `.code()` is the per-axis byte `Colorimetry::pack` writes and `from_code`
-// the one `unpack` reads; `as_str` is the EdgeFirst schema label. Code 0 is
-// reserved on every axis for "unspecified", which this crate spells
-// `Option::None`. The codes cross a package boundary inside
-// `TensorDesc::colorimetry`: append, never renumber.
+// `.code()` is the per-axis byte `Colorimetry::pack` writes and `from_code` the
+// one `unpack` reads; `as_str` is the EdgeFirst schema label. Code 0 on every
+// axis means unspecified, which this crate spells `Option::None`.
 crate::ef_vocabulary! {
     /// Color primaries (`color_space` in the EdgeFirst schema).
     #[non_exhaustive]
@@ -57,22 +52,18 @@ crate::ef_vocabulary! {
 crate::ef_vocabulary! {
     /// Transfer function (`color_transfer` in the EdgeFirst schema).
     ///
-    /// **Limitation:** this axis is stored, propagated, and round-tripped, but it is
-    /// **not applied** by any conversion backend. All YUV↔RGB paths operate only on
-    /// the matrix ([`ColorEncoding`]) and range ([`ColorRange`]); the transfer
-    /// function (gamma / TRC) is assumed to be the platform-native curve and is left
-    /// unchanged. HDR transfer curves ([`Self::Pq`] / [`Self::Hlg`]) are therefore
-    /// *not* tone-mapped — consumers needing linear-light or HDR handling must apply
-    /// the curve themselves.
+    /// This axis is stored, propagated, and round-tripped, but no conversion
+    /// backend applies it: YUV↔RGB paths use only the matrix
+    /// ([`ColorEncoding`]) and range ([`ColorRange`]). HDR transfer curves
+    /// ([`Self::Pq`] / [`Self::Hlg`]) are not tone-mapped.
     #[non_exhaustive]
     #[derive(Serialize, Deserialize)]
     pub enum ColorTransfer {
         Bt709 = 1, "bt709", BT709,
         Srgb = 2, "srgb", SRGB,
         Pq = 3, "pq", PQ,
-        /// Hybrid Log-Gamma. Present for EdgeFirst-schema / libcamera parity; the
-        /// V4L2 UAPI defines no `V4L2_XFER_FUNC_HLG`, so `from_v4l2` never yields
-        /// this variant.
+        /// Hybrid Log-Gamma. `from_v4l2` never yields this variant: the V4L2
+        /// UAPI defines no `V4L2_XFER_FUNC_HLG`.
         Hlg = 4, "hlg", HLG,
         Linear = 5, "linear", LINEAR,
     }
@@ -114,7 +105,8 @@ impl ColorSpace {
         match v {
             V4L2_COLORSPACE_SMPTE170M => Some(Self::Smpte170m),
             V4L2_COLORSPACE_REC709 => Some(Self::Bt709),
-            // legacy NTSC (470M) / PAL-SECAM (470BG): close enough to SMPTE 170M primaries for conversion
+            // Legacy NTSC (470M) and PAL-SECAM (470BG) map to the SMPTE 170M
+            // primaries.
             V4L2_COLORSPACE_470_SYSTEM_M | V4L2_COLORSPACE_470_SYSTEM_BG => Some(Self::Smpte170m),
             V4L2_COLORSPACE_JPEG | V4L2_COLORSPACE_SRGB => Some(Self::Srgb),
             V4L2_COLORSPACE_BT2020 => Some(Self::Bt2020),
@@ -129,9 +121,8 @@ impl ColorTransfer {
     /// Returns `None` for `V4L2_XFER_FUNC_DEFAULT` (0) and any
     /// unrecognised value.
     ///
-    /// Note: OPRGB (3), SMPTE240M (4), and DCI_P3 (6) have no HAL equivalent
-    /// and map to `None`. [`ColorTransfer::Hlg`] is never produced because the
-    /// V4L2 UAPI defines no `V4L2_XFER_FUNC_HLG` value.
+    /// OPRGB (3), SMPTE240M (4), and DCI_P3 (6) have no HAL equivalent and map
+    /// to `None`. [`ColorTransfer::Hlg`] is never produced.
     pub fn from_v4l2(v: u32) -> Option<Self> {
         match v {
             V4L2_XFER_FUNC_709 => Some(Self::Bt709),
@@ -183,12 +174,8 @@ macro_rules! display_via_as_str {
 }
 display_via_as_str!(ColorSpace, ColorTransfer, ColorEncoding, ColorRange);
 
-/// YCbCr matrix luma weights `(kr, kb)`; the green weight is `kg = 1 - kr - kb`.
-///
-/// This is the single source of the BT.601/709/2020 coefficients. Every
-/// YUV↔RGB path (the in-shader GL coefficients and the hand-rolled fixed-point
-/// CPU encoders) derives its matrix from here so a coefficient change is made
-/// in exactly one place.
+/// YCbCr matrix luma weights `(kr, kb)`; the green weight is `kg = 1 - kr -
+/// kb`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MatrixWeights {
     pub kr: f64,
@@ -203,8 +190,8 @@ impl MatrixWeights {
 }
 
 impl ColorEncoding {
-    /// The matrix luma weights `(kr, kb)` for this encoding — the canonical
-    /// BT.601/709/2020 coefficients shared by every YUV↔RGB conversion path.
+    /// The matrix luma weights `(kr, kb)` for this encoding: the
+    /// BT.601/709/2020 coefficients.
     pub fn luma_weights(self) -> MatrixWeights {
         match self {
             Self::Bt601 => MatrixWeights {
@@ -237,9 +224,8 @@ pub struct RangeScaling {
 }
 
 impl ColorRange {
-    /// The luma/chroma quantization swings for this range — the canonical
-    /// 0/255/255 (full) or 16/219/224 (limited) studio-swing constants shared
-    /// by every YUV↔RGB conversion path.
+    /// The luma/chroma quantization swings for this range: 0/255/255 (full) or
+    /// 16/219/224 (limited).
     pub fn scaling(self) -> RangeScaling {
         match self {
             Self::Full => RangeScaling {
@@ -256,9 +242,8 @@ impl ColorRange {
     }
 }
 
-/// Full 4-axis colorimetry. Each axis is `Option`; `None` means "undefined"
-/// and is never auto-filled — consumers (e.g. `convert()`) resolve missing
-/// axes at use-time without mutating the value.
+/// Full 4-axis colorimetry. Each axis is `Option`; `None` means undefined and
+/// is never auto-filled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub struct Colorimetry {
     pub space: Option<ColorSpace>,
@@ -284,17 +269,14 @@ impl Colorimetry {
     /// `true` (see [`PixelFormat::is_rgb_or_hsv`]).
     ///
     /// Explicit values map directly. For `ycbcr_enc`/`quantization`, the V4L2
-    /// `DEFAULT` (0) sentinel does NOT mean "unknown" — it means "derive"
-    /// (kernel `V4L2_MAP_YCBCR_ENC_DEFAULT` / `V4L2_MAP_QUANTIZATION_DEFAULT`),
-    /// and those axes are resolved here rather than left `None` for the
-    /// at-use height heuristic (which would wrongly pick BT.709/limited for an
-    /// HD JPEG frame):
+    /// `DEFAULT` (0) sentinel is resolved as the kernel's
+    /// `V4L2_MAP_YCBCR_ENC_DEFAULT` / `V4L2_MAP_QUANTIZATION_DEFAULT` macros
+    /// resolve it:
     ///
     /// - `quantization = DEFAULT` is full range for an RGB/HSV format,
     ///   whatever the colorspace, and for `V4L2_COLORSPACE_JPEG`; limited for
     ///   a YUV format in any other recognised colorspace; and unset (`None`)
-    ///   for a YUV format in a `DEFAULT` or unrecognised colorspace, so the
-    ///   at-use height heuristic decides.
+    ///   for a YUV format in a `DEFAULT` or unrecognised colorspace.
     /// - `ycbcr_enc = DEFAULT` is the encoding the colorspace implies, and
     ///   unset (`None`) for a `DEFAULT` or unrecognised colorspace.
     ///
@@ -393,12 +375,10 @@ impl Colorimetry {
     /// Pack all four axes into one `u32` for
     /// [`crate::protocol::TensorDesc::colorimetry`].
     ///
-    /// One byte per axis, `space` in the low byte through `range` in the
-    /// high byte; `0` on an axis means "undefined", so an all-`None`
-    /// `Colorimetry` packs to `0`. Each byte is that axis's `code()`, the
-    /// same word the C API's `ef_tensor_colorimetry` returns. This crosses a
-    /// package boundary like `TensorDesc` itself: codes are appended, never
-    /// renumbered.
+    /// One byte per axis, `space` in the low byte through `range` in the high
+    /// byte; `0` on an axis means undefined, so an all-`None` `Colorimetry`
+    /// packs to `0`. Each byte is that axis's `code()`, the same word the C
+    /// API's `ef_tensor_colorimetry` returns.
     pub fn pack(&self) -> u32 {
         let space = self.space.map_or(0, ColorSpace::code);
         let transfer = self.transfer.map_or(0, ColorTransfer::code);
@@ -407,14 +387,9 @@ impl Colorimetry {
         space | (transfer << 8) | (encoding << 16) | (range << 24)
     }
 
-    /// Inverse of [`Self::pack`]: rebuild a `Colorimetry` from a packed
-    /// `u32`, e.g. [`crate::protocol::TensorDesc::colorimetry`] on
-    /// import. `0` on an axis byte (undefined, including a build that
-    /// predates the axis) maps to `None` rather than erroring, the same
-    /// forward-compatibility rule [`crate::protocol::dtype_to_dtype`]
-    /// applies to another wire-coded axis -- a code this build does not
-    /// recognise (e.g. one a newer producer added) also maps to `None`
-    /// instead of guessing.
+    /// Inverse of [`Self::pack`]: rebuild a `Colorimetry` from a packed `u32`,
+    /// e.g. [`crate::protocol::TensorDesc::colorimetry`] on import. An axis
+    /// byte of `0`, or a code this build does not recognise, maps to `None`.
     pub fn unpack(bits: u32) -> Self {
         let space = ColorSpace::from_code(bits & 0xFF);
         let transfer = ColorTransfer::from_code((bits >> 8) & 0xFF);
@@ -445,21 +420,18 @@ mod tests {
         assert_eq!(ColorSpace::from_v4l2(7), Some(ColorSpace::Srgb)); // JPEG→sRGB
         assert_eq!(ColorTransfer::from_v4l2(5), Some(ColorTransfer::Linear)); // NONE→linear
 
-        // ColorSpace: additional arms
         assert_eq!(ColorSpace::from_v4l2(1), Some(ColorSpace::Smpte170m)); // SMPTE170M
         assert_eq!(ColorSpace::from_v4l2(3), Some(ColorSpace::Bt709)); // REC709
         assert_eq!(ColorSpace::from_v4l2(10), Some(ColorSpace::Bt2020)); // BT2020
         assert_eq!(ColorSpace::from_v4l2(5), Some(ColorSpace::Smpte170m)); // 470_SYSTEM_M
         assert_eq!(ColorSpace::from_v4l2(6), Some(ColorSpace::Smpte170m)); // 470_SYSTEM_BG
 
-        // ColorTransfer: additional arms and unmapped values
         assert_eq!(ColorTransfer::from_v4l2(1), Some(ColorTransfer::Bt709)); // XFER_FUNC_709
         assert_eq!(ColorTransfer::from_v4l2(2), Some(ColorTransfer::Srgb)); // XFER_FUNC_SRGB
         assert_eq!(ColorTransfer::from_v4l2(7), Some(ColorTransfer::Pq)); // XFER_FUNC_SMPTE2084
         assert_eq!(ColorTransfer::from_v4l2(3), None); // OPRGB — no HAL equivalent
         assert_eq!(ColorTransfer::from_v4l2(6), None); // DCI_P3 — no HAL equivalent
 
-        // Hlg is never produced by from_v4l2 — no V4L2_XFER_FUNC_HLG exists in the kernel UAPI
         for v in 0u32..=10 {
             assert_ne!(ColorTransfer::from_v4l2(v), Some(ColorTransfer::Hlg));
         }
@@ -487,24 +459,18 @@ mod tests {
 
     #[test]
     fn from_v4l2_default_enc_quant_derive_from_colorspace() {
-        // COLORSPACE_JPEG (7) with DEFAULT ycbcr_enc/quant must resolve to
-        // BT.601 full-range per V4L2_MAP_*_DEFAULT — NOT be left None (which
-        // would let the height heuristic wrongly pick BT.709/limited for HD).
         let jpeg = Colorimetry::from_v4l2(7, 0, 0, 0, false);
         assert_eq!(jpeg.encoding, Some(ColorEncoding::Bt601));
         assert_eq!(jpeg.range, Some(ColorRange::Full));
 
-        // REC709 colorspace, DEFAULT enc/quant → BT.709 limited.
         let rec709 = Colorimetry::from_v4l2(3, 0, 0, 0, false);
         assert_eq!(rec709.encoding, Some(ColorEncoding::Bt709));
         assert_eq!(rec709.range, Some(ColorRange::Limited));
 
-        // Explicit ycbcr_enc/quant still win over the colorspace default.
         let explicit = Colorimetry::from_v4l2(7, 0, 2, 2, false); // JPEG but enc=709, quant=limited
         assert_eq!(explicit.encoding, Some(ColorEncoding::Bt709));
         assert_eq!(explicit.range, Some(ColorRange::Limited));
 
-        // Unrecognised non-default values stay None (not derived).
         let unknown_enc = Colorimetry::from_v4l2(7, 0, 99, 0, false);
         assert_eq!(unknown_enc.encoding, None);
         assert_eq!(unknown_enc.range, Some(ColorRange::Full)); // quant still defaulted from JPEG
@@ -533,7 +499,6 @@ mod tests {
                 kb: 0.0593
             }
         );
-        // kg = 1 - kr - kb (BT.709 green weight ≈ 0.7152).
         assert!((ColorEncoding::Bt709.luma_weights().kg() - 0.7152).abs() < 1e-9);
     }
 
@@ -561,8 +526,6 @@ mod tests {
 
     #[test]
     fn as_str_and_from_str_code_are_inverses_for_every_variant() {
-        // The wire round-trip depends on this, and `as_str` alone cannot show
-        // it: a parser missing one arm silently degrades that axis to None.
         for v in [
             ColorSpace::Bt709,
             ColorSpace::Bt2020,
@@ -614,10 +577,6 @@ mod tests {
 
     #[test]
     fn pack_unpack_round_trips() {
-        // The exact round trip the cross-package import path relies on:
-        // `TensorDyn::import_descriptor` unpacks what `descriptor_pinned`
-        // packed. All-None must round-trip through 0, and every populated
-        // axis must survive.
         assert_eq!(
             Colorimetry::unpack(Colorimetry::default().pack()),
             Colorimetry::default()
@@ -638,9 +597,6 @@ mod tests {
 
     #[test]
     fn unpack_maps_unrecognised_codes_to_none() {
-        // A code this build does not recognise (e.g. from a newer producer)
-        // must not panic or guess -- same forward-compat rule as
-        // `dtype_to_dtype`/`format_from_code`.
         let bits = 0xFFu32 | (0xFFu32 << 8) | (0xFFu32 << 16) | (0xFFu32 << 24);
         assert_eq!(Colorimetry::unpack(bits), Colorimetry::default());
     }
@@ -667,8 +623,6 @@ mod tests {
 
     #[test]
     fn pack_places_each_axis_code_in_its_own_byte() {
-        // The per-axis codes are a cross-package wire contract: pin them,
-        // for every variant.
         assert_eq!(SPACES.len(), ColorSpace::all().len());
         assert_eq!(TRANSFERS.len(), ColorTransfer::all().len());
         assert_eq!(ENCODINGS.len(), ColorEncoding::all().len());
@@ -743,7 +697,6 @@ mod tests {
                 range: Some(ColorRange::Full),
             }
         );
-        // Each builder leaves the other axes as they were.
         let base = Colorimetry::jfif();
         assert_eq!(
             base.with_space(ColorSpace::Bt709),
@@ -793,7 +746,6 @@ mod tests {
             assert_eq!(c.encoding, Some(encoding), "colorspace {colorspace}");
             assert_eq!(c.range, Some(range), "colorspace {colorspace}");
         }
-        // Unrecognised colorspaces leave both axes to the at-use heuristic.
         for colorspace in [0, 2, 4, 9, 11, 99] {
             let c = Colorimetry::from_v4l2(colorspace, 0, 0, 0, false);
             assert_eq!(
@@ -859,8 +811,6 @@ mod tests {
             Some(ColorRange::Limited)
         );
         assert_eq!(range(V4L2_COLORSPACE_JPEG, false), Some(ColorRange::Full));
-        // The kernel ignores the colorspace for an RGB/HSV format, so an
-        // unrecognised or DEFAULT one is still full range.
         assert_eq!(range(0, true), Some(ColorRange::Full));
         assert_eq!(range(V4L2_COLORSPACE_REC709, true), Some(ColorRange::Full));
     }
@@ -868,8 +818,7 @@ mod tests {
     #[test]
     fn from_v4l2_encoding_matches_the_kernel_for_every_recognised_colorspace() {
         // `V4L2_MAP_YCBCR_ENC_DEFAULT`: REC709 and DCI_P3 → 709, BT2020 →
-        // BT2020, SMPTE240M → SMPTE240M, else 601. DCI_P3 and SMPTE240M are
-        // not colorspaces `ColorSpace` recognises, so they stay `None`.
+        // BT2020, SMPTE240M → SMPTE240M, else 601.
         for colorspace in ALL_V4L2_COLORSPACES {
             for is_rgb_or_hsv in [false, true] {
                 let encoding = Colorimetry::from_v4l2(colorspace, 0, 0, 0, is_rgb_or_hsv).encoding;

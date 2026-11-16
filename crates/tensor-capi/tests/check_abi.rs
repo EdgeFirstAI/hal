@@ -1,30 +1,13 @@
 // SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! check-abi: every symbol `edgefirst-tensor-ffi` declares is a real export
-//! of the built libedgefirst_tensor. A declaration without an export is a
-//! load-time failure waiting in every consumer of the dynamic backend.
+//! check-abi: every symbol `edgefirst-tensor-ffi` declares is an export of
+//! the built libedgefirst_tensor, and every `ef_` export is declared.
 
-// The nm/freshness helpers below are copied from `src/lib.rs`'s `#[cfg(test)]`
-// module rather than shared: integration tests are a separate compilation
-// unit and cannot see `#[cfg(test)]` items from the library crate, and this
-// crate has no non-test module to hold them without exposing test-only
-// plumbing as part of the public API. Keep any behavioral fix in step with
-// the other copy.
-
-/// Is this build artifact newer than the crate's sources?
+/// Whether this build artifact is at least as new as the crate's sources.
 ///
-/// Every test here that reads a compiled artifact needs this check, because
-/// neither `cargo test` nor `cargo test --all-targets` builds the
-/// `staticlib`/`cdylib` targets — only `cargo build` does. A test that skips
-/// it silently validates a library built *before* the change under test.
-///
-/// Default is a **loud skip**, not a panic: panicking would make plain
-/// `cargo test` fail for everyone after any edit, and a clearly-reported
-/// skip does not carry the failure mode being guarded — nobody reads
-/// "NOT CHECKED" as a pass. Set `EF_REQUIRE_FRESH_ARTIFACTS=1` where build
-/// order is guaranteed (the Makefile's `test-capi-modular` lane and CI) to
-/// turn the skip into a hard failure.
+/// A stale artifact prints a `SKIPPED` warning and returns `false`, or
+/// panics when `EF_REQUIRE_FRESH_ARTIFACTS` is set.
 fn artifact_is_fresh(artifact: &std::path::Path) -> bool {
     let art = match std::fs::metadata(artifact).and_then(|m| m.modified()) {
         Ok(t) => t,
@@ -52,23 +35,16 @@ fn artifact_is_fresh(artifact: &std::path::Path) -> bool {
     if std::env::var("EF_REQUIRE_FRESH_ARTIFACTS").is_ok() {
         panic!("{msg}");
     }
-    // Straight to stderr: libtest swallows `eprintln!` for passing tests,
-    // and a skip nobody sees is indistinguishable from a pass. `SKIPPED:` is
-    // the wire format `scripts/on-target-test.sh` counts; written out here
-    // rather than through `artifacts::skip` for the reason this file's
-    // header gives -- an integration test cannot see the library crate's
-    // `#[cfg(test)]` items.
+    // Written directly to stderr.
     use std::io::Write;
     let _ = writeln!(std::io::stderr(), "WARNING: SKIPPED: {msg}");
     false
 }
 
-/// Symbols the built cdylib actually exports.
+/// Symbols the built cdylib exports.
 ///
-/// Returns `None` when the platform's symbol tool is unavailable, or when
-/// the artifact is stale, so the check skips loudly rather than passing on
-/// an empty list -- a test that asserts "X is absent" against an empty
-/// vector always passes.
+/// Returns `None` when the library is missing or stale, the platform's
+/// symbol tool is unavailable, or it lists no symbol.
 fn exported_symbols_fresh() -> Option<Vec<String>> {
     let mut dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     dir.pop();
@@ -80,15 +56,10 @@ fn exported_symbols_fresh() -> Option<Vec<String>> {
         .map(|n| dir.join(n))
         .find(|p| p.exists())?;
 
-    // `cargo test` builds the rlib/test harness for this crate but does NOT
-    // relink the cdylib, so this can easily read a library built before the
-    // change under test. A stale read is worse than no read, so staleness
-    // is checked explicitly rather than trusted.
     if !artifact_is_fresh(&lib) {
         return None;
     }
-    // -g: external symbols only. -U/--defined-only: skip undefined ones,
-    // which would otherwise include every libc symbol we merely call.
+    // -g: external symbols only. -U/--defined-only: skip undefined ones.
     let args: &[&str] = if cfg!(target_os = "macos") {
         &["-gU"]
     } else {
@@ -117,7 +88,7 @@ fn exported_symbols_fresh() -> Option<Vec<String>> {
 #[test]
 fn every_ffi_declaration_is_a_real_export() {
     let Some(symbols) = exported_symbols_fresh() else {
-        return; // helper already panics/prints if the artifact is stale/missing
+        return;
     };
     let missing: Vec<_> = edgefirst_tensor_ffi::DECLARED
         .iter()
@@ -131,15 +102,8 @@ fn every_ffi_declaration_is_a_real_export() {
 
 #[test]
 fn every_exported_ef_symbol_is_declared() {
-    // The other half of set equality: `every_ffi_declaration_is_a_real_export`
-    // (above) checks DECLARED subset-of exports; this checks the exported
-    // ef_-prefixed symbols subset-of DECLARED. Together they pin DECLARED to
-    // be exactly the library's `ef_` export surface, so a new export cannot
-    // land without a matching `edgefirst-tensor-ffi` declaration. Non-`ef_`
-    // symbols are out of scope here -- `the_dynamic_symbol_table_carries_
-    // only_ef_symbols` in `src/lib.rs` owns that hygiene check.
     let Some(symbols) = exported_symbols_fresh() else {
-        return; // helper already panics/prints if the artifact is stale/missing
+        return;
     };
     let undeclared: Vec<_> = symbols
         .iter()
@@ -154,28 +118,14 @@ fn every_exported_ef_symbol_is_declared() {
 
 #[test]
 fn the_ffi_declaration_count_matches_the_header() {
-    // Both directions: DECLARED subset-of exports (above) and |DECLARED| ==
-    // the number of function declarations in the shipped header, so a new
-    // export cannot land without its Rust declaration.
     let header = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/include/edgefirst/tensor.h"
     ))
     .expect("header exists");
 
-    // A naive `ends_with(';') && contains('(')` line filter miscounts: several
-    // declarations here wrap across lines (e.g. `ef_tensor_builder_add_plane`,
-    // `ef_tensor_export`), so only their *first* line ends in `,` rather than
-    // `;`, and every continuation line also contains `(` or `)` without being
-    // a declaration of its own. What is uniform across every declaration --
-    // wrapped or not -- is that the line where it *starts* is flush left (no
-    // leading whitespace): every doc-comment line in this header (including
-    // the ones that quote a call like `ef_tensor_new()` in prose) is indented
-    // with a leading ` * `, and every continuation line of a wrapped
-    // declaration is indented to align with the parameter list. So: a
-    // top-level, non-indented line naming an `ef_` symbol and opening a
-    // parameter list is exactly one declaration's start, regardless of where
-    // it ends.
+    // A declaration starts on a non-indented line that names an `ef_`
+    // symbol and opens a parameter list.
     let declared_in_header = header
         .lines()
         .filter(|l| {

@@ -46,17 +46,16 @@ enum Kernel {
 /// A validated int8 softmax-then-dot over the last axis: `[.., n]` logits to `[.., 1]`
 /// outputs, every other axis indexing independent rows.
 ///
-/// The pair rounds every probability to a byte before the product; this plan does not. Its
-/// accumulator is the expectation `Σⱼ pⱼ·(wⱼ − zr)` in units of the probability scale, rounded
-/// once, then biased, requantized and clamped as the projection does. Against the pair it is
-/// closer to the float model: TFLite's rounding drops the mass of tiny probabilities and clamps
-/// a near-certain one to 255/256, which pulls its result toward zero by up to about one LSB.
+/// The probabilities are not rounded to a byte before the product, so the result is not the
+/// [`SoftmaxI8Plan`] and [`MatMulI8Plan`] pair's bit for bit. The accumulator is the
+/// expectation `Σⱼ pⱼ·(wⱼ − zr)` in units of the probability scale, rounded once, then biased,
+/// requantized and clamped as the projection does.
 ///
 /// The scalar tier takes the exponentials from TFLite's f32 softmax table and sums in f32. The
 /// NEON kernel (rows of 16) takes them as 12-bit fixed-point products of two 16-entry tables
 /// and sums them exactly in integers; it agrees with the scalar tier within ±1 LSB. Plans
 /// whose weight spread and requantization could carry the 12-bit rounding past one output
-/// step run the scalar tier instead, as [`SoftmaxDotI8Plan::tier`] reports.
+/// step run the scalar tier, as [`SoftmaxDotI8Plan::tier`] reports.
 ///
 /// ```
 /// use edgefirst_kernels::{
@@ -112,17 +111,11 @@ fn exp12_tables(scale: f32) -> [[u8; 16]; 4] {
     split_exp_tables(scale, EXP12_ONE)
 }
 
-/// The largest error of one 12-bit exponential, in its units (4095 is 1): each table entry
-/// is within 0.5 of `EXP12_ONE` times its factor, which moves `2·A·B / 2¹⁶` by at most
-/// `2·(EXP12_ONE + 0.25) / 2¹⁶`, and the product rounds by up to 0.5.
+/// The largest error of one 12-bit exponential, in its units (4095 is 1).
 const EXP12_ERROR: f64 = 2.0 * (EXP12_ONE + 0.25) / 65536.0 + 0.5;
 
 /// Whether the 12-bit exponentials keep a result within ±1 LSB of the f32 ones for these
-/// weights (less their zero point) and this projection. A row's maximum contributes 4095 to
-/// its sum, so the expectation moves by at most `n·EXP12_ERROR·(max w − min w) / 4095`. Both
-/// paths round it to the accumulator (up to one unit apart besides), and the requantization,
-/// monotone, stays within one output step while that gap times its multiplier, plus the
-/// rounding of a double-rounding right shift, stays below 1.
+/// weights (less their zero point) and this projection.
 fn exp12_within_one_lsb(weights: &[i16], unit: f32, requant: Requant) -> bool {
     let (lo, hi) = weights
         .iter()
@@ -421,8 +414,6 @@ pub(super) mod tests {
 
     #[test]
     fn dfl_heads_differ_from_the_pair_only_by_its_rounding_and_sit_closer_to_float() {
-        // The pair rounds every probability to a byte: that loses mass (with weights ≥ 0 it
-        // reads low on balance) and adds noise either way, up to a few LSB on flat rows.
         let mut rng = rand::rngs::StdRng::seed_from_u64(0xD0F1);
         let rows = 2048;
         let (mut off, mut net) = (0usize, 0i64);

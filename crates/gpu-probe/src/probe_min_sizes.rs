@@ -1,11 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! Minimum EGLImage size probe — determines the smallest texture dimensions
-//! each DRM fourcc format supports via EGLImage import. Some GPU drivers
-//! (notably ARM Mali) reject small R8 and RG88 EGLImages, so knowing the
-//! minimum accepted size is essential for choosing the right format at the
-//! right resolution.
+//! Minimum EGLImage size probe: determines the smallest texture dimensions
+//! each DRM fourcc format supports via EGLImage import.
 
 use crate::egl_context::GpuContext;
 use edgefirst_tensor::{Tensor, TensorMemory, TensorTrait};
@@ -104,8 +101,7 @@ pub fn run(ctx: &GpuContext) {
         println!("]");
     }
 
-    // Test the actual R8 output dimensions used by RGB packing strategies
-    // at standard pipeline resolutions.
+    // R8 at the output dimensions of the RGB packing strategies.
     println!();
     println!("  R8 EGLImage at pipeline output dimensions:");
     let r8_fourcc = gbm::drm::buffer::DrmFourcc::R8 as u32;
@@ -122,7 +118,7 @@ pub fn run(ctx: &GpuContext) {
         println!("    {:<42} {}", label, if ok { "ok" } else { "FAIL" });
     }
 
-    // Test RGBA at the non-square output dimensions used by packing strategies
+    // RGBA at the non-square output dimensions of the packing strategies.
     println!();
     println!("  RGBA EGLImage at pipeline output dimensions:");
     let rgba_fourcc = gbm::drm::buffer::DrmFourcc::Abgr8888 as u32;

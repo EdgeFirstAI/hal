@@ -1,19 +1,10 @@
 #!/usr/bin/env bash
-# Optional upload of each new PyPI distribution with a local API token.
-#
-# A new distribution normally needs no upload: add a pending publisher at
-# https://pypi.org/manage/account/publishing/ and the first tagged release
-# creates the project. A pending publisher does not reserve the name, so run
-# this only to claim a name before that release, then configure the project's
-# Trusted Publisher; the release workflow needs no token after that.
-#
-#   Owner: EdgeFirstAI   Repository: hal
-#   Workflow: publish.yml   Environment: pypi
+# Optional upload of each new PyPI distribution with a local API token, to
+# claim the name before its first tagged release.
 #
 # Usage:
 #   export TWINE_USERNAME=__token__
-#   export TWINE_PASSWORD=pypi-...        # account-scoped token; project-scoped
-#                                         # tokens cannot create a new project
+#   export TWINE_PASSWORD=pypi-...        # account-scoped token
 #   scripts/bootstrap_pypi_projects.sh [--dry-run]
 #   PACKAGES=<pkg> scripts/bootstrap_pypi_projects.sh   # one distribution, e.g. kernels
 set -euo pipefail
@@ -32,8 +23,7 @@ fi
 
 [[ -d target/wheels ]] || { echo "ERROR: no target/wheels; run 'make wheel' first" >&2; exit 1; }
 
-# Dependency order, same as the release workflow: the core first, since every
-# sibling declares a ~= dependency on it.
+# Dependency order: the core first.
 for pkg in ${PACKAGES:-tensor codec image decoder tracker kernels}; do
     files=(target/wheels/edgefirst_${pkg}-*)
     if [[ ! -e "${files[0]}" ]]; then

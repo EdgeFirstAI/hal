@@ -3,9 +3,9 @@
 
 //! Single FEAT_FP16 instructions on `.8h` vectors carried as `uint16x8_t` / `int16x8_t`.
 //!
-//! Stable Rust has no f16 intrinsics, so each helper is one inline-asm instruction under
-//! `.arch_extension fp16`. Every helper is `unsafe`: CPUs without FEAT_FP16 fault on them, so
-//! callers run them only after `CpuFeatures::fp16_usable` (or `is_aarch64_feature_detected!`).
+//! Each helper is one inline-asm instruction under `.arch_extension fp16`. Every helper is
+//! `unsafe`: CPUs without FEAT_FP16 fault on them, so callers run them only after
+//! `CpuFeatures::fp16_usable` (or `is_aarch64_feature_detected!`).
 
 #![cfg(target_arch = "aarch64")]
 

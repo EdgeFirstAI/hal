@@ -3,10 +3,9 @@
 
 //! Physical-to-logical tensor merge path for schema v2.
 //!
-//! When a v2 metadata document declares that a logical output has been
-//! split into physical children (for quantization-error minimisation),
-//! the HAL must reassemble the logical tensor before handing it to the
-//! existing float-path decoders.
+//! When a v2 metadata document declares that a logical output is split into
+//! physical children, the logical tensor is reassembled before it is handed
+//! to the float-path decoders.
 //!
 //! A [`DecodeProgram`] captures the per-logical recipe derived from the
 //! schema at build time. At decode time the program runs against the
@@ -20,26 +19,20 @@
 //! | [`LogicalMerge::Direct`] | logical has no children | find tensor by shape, dequantize to f32 |
 //! | [`LogicalMerge::ChannelConcat`] | children lack `stride` (e.g. ARA-2 `boxes_xy` + `boxes_wh`) | dequantize each, concat along channel axis |
 //!
-//! Per-scale FPN splits (children carrying `stride`, e.g. Hailo
-//! YOLOv8/v11 with `encoding: dfl`) are NOT handled here: the
-//! `per_scale` subsystem ([`crate::per_scale::PerScalePlan`]) claims
-//! those schemas in full at builder time, so the merge program is only
-//! ever built for flat or channel-sub-split schemas.
+//! Per-scale FPN splits (children carrying `stride`) are handled by
+//! [`crate::per_scale::PerScalePlan`], not here.
 //!
-//! # Not yet supported
+//! # Not supported
 //!
-//! - **Per-channel quantization** on split children — the HAL
-//!   currently only consumes per-tensor scalar `(scale, zero_point)`.
-//! - **Activation flags on floats** — when a child carries
-//!   `activation_required: sigmoid` the HAL does not yet apply it
-//!   during merge. For split ARA-2 typical usage the NPU applies
-//!   sigmoid on-chip (`activation_applied`), so this is not blocking.
+//! - Per-channel quantization on split children: only per-tensor scalar
+//!   `(scale, zero_point)` is consumed.
+//! - `activation_required: sigmoid` on a child is not applied during merge.
 
 use ndarray::{Array, ArrayD, Axis, IxDyn};
 
 use crate::configs::DimName;
 use crate::schema::{self, padding_axes, squeeze_padding_dims, LogicalOutput, SchemaV2};
-// `squeeze_padding_dims` is re-used by plan_channel_concat below.
+
 use super::tensor_bridge::{padded_strides, strided_view};
 use crate::neon_dispatch::Isa;
 use crate::{dequantize_cpu_on, DecoderError, DecoderResult, Quantization};
@@ -59,18 +52,15 @@ pub(crate) struct DecodeProgram {
 /// One merge recipe per logical output.
 #[derive(Debug, Clone)]
 enum LogicalMerge {
-    /// Logical IS the physical tensor. No merge step required beyond
-    /// optional dequantization to `f32` and an optional squeeze of
-    /// `padding` axes the v2 schema declares explicitly but the v1
-    /// legacy dispatch does not understand.
+    /// The logical output is the physical tensor: dequantized to `f32`, with
+    /// its `padding` axes squeezed.
     Direct {
-        #[allow(dead_code)] // Reserved for future name-keyed decoding
+        #[allow(dead_code)]
         name: Option<String>,
         /// Physical tensor shape — used to bind the input tensor.
         shape: Vec<usize>,
-        /// Axes (in the physical shape) to drop after dequant. Ordered
-        /// descending so `remove_axis` calls can apply sequentially
-        /// without index-shift bookkeeping.
+        /// Axes (in the physical shape) to drop after dequant, in descending
+        /// order.
         padding_axes: Vec<usize>,
         quant: Option<Quantization>,
     },
@@ -97,18 +87,14 @@ impl DecodeProgram {
     /// Build a decode program for a schema v2 document, if any logical
     /// output has physical children.
     ///
-    /// Returns `Ok(None)` when the schema is flat (no children
-    /// anywhere) — callers can then feed the input tensors through the
-    /// legacy decode path directly. Returns an error if the schema
-    /// uses unsupported features (per-channel quantization, missing
-    /// dshape, DFL encoding on split boxes).
+    /// Returns `Ok(None)` when the schema is flat (no children anywhere).
+    /// Returns an error if the schema uses unsupported features
+    /// (per-channel quantization, missing dshape, DFL encoding on split
+    /// boxes).
     ///
-    /// Typeless logical outputs are skipped: they're carried in the
-    /// schema as user-managed / auxiliary tensors and do not participate
-    /// in decoder dispatch. The returned program emits one merged
-    /// tensor per *typed* logical output in schema order — this keeps
-    /// it aligned with [`SchemaV2::to_legacy_config_outputs`], which
-    /// applies the same filter.
+    /// Typeless logical outputs are skipped. The returned program emits one
+    /// merged tensor per typed logical output in schema order, as
+    /// [`SchemaV2::to_legacy_config_outputs`] does.
     pub fn try_from_schema(schema: &SchemaV2) -> DecoderResult<Option<Self>> {
         let needs_merge = schema
             .outputs
@@ -129,10 +115,10 @@ impl DecodeProgram {
     /// Run the program against the provided tensors, producing one
     /// merged `ArrayD<f32>` per logical output in schema order.
     ///
-    /// Tensor binding: each `Direct` or physical child consumes one
-    /// input from `inputs` by shape match. When multiple children share
-    /// a shape (e.g. ARA-2 xy/wh), the first un-consumed tensor is used
-    /// — callers must pass inputs in the declared schema-child order.
+    /// Each `Direct` output or physical child consumes one input from
+    /// `inputs` by shape match. When several children share a shape, each
+    /// takes the first un-consumed tensor, so `inputs` must be in the
+    /// declared schema-child order.
     pub fn execute(&self, inputs: &[&TensorDyn]) -> DecoderResult<Vec<ArrayD<f32>>> {
         let mut used: Vec<usize> = Vec::new();
         self.merges
@@ -159,12 +145,6 @@ fn plan_logical(logical: &LogicalOutput) -> DecoderResult<LogicalMerge> {
 
     let first_has_stride = logical.outputs[0].stride.is_some();
     if first_has_stride {
-        // Per-scale FPN splits are owned end-to-end by the `per_scale`
-        // subsystem, which claims such schemas at builder time before the
-        // merge program is built (see `DecoderBuilder::build_from_schema`).
-        // Reaching here means a schema mixes a per-scale logical with
-        // flat/channel-sub-split siblings such that `PerScalePlan` declined
-        // it — a decomposition the merge path does not support.
         Err(DecoderError::NotSupported(format!(
             "logical `{}` has per-scale (strided) children but the schema was \
              not claimed by the per-scale subsystem; mixed per-scale + \
@@ -183,10 +163,7 @@ fn plan_channel_concat(logical: &LogicalOutput) -> DecoderResult<LogicalMerge> {
         .map(physical_binding)
         .collect::<DecoderResult<Vec<_>>>()?;
     let channel_axis = channel_axis_in_logical(logical)?;
-    // Padding axes (always 1) are squeezed out of the merged output so
-    // the shape matches what the legacy decoder's `verify_yolo_*`
-    // expects. Record their positions (descending) so the executor can
-    // drop them deterministically.
+    // Positions of the padding axes, descending, for the executor to drop.
     let pad = padding_axes(&logical.dshape);
     let (squeezed_shape, _) = squeeze_padding_dims(logical.shape.clone(), logical.dshape.clone());
     Ok(LogicalMerge::ChannelConcat {
@@ -286,11 +263,8 @@ fn execute_merge(
     }
 }
 
-/// Locate the first un-consumed input tensor with the given shape.
-/// Consumed indices (already bound to an earlier child) are excluded,
-/// which correctly handles channel sub-splits where siblings share a
-/// shape (e.g. ARA-2 `boxes_xy` and `boxes_wh` at `[1, 2, 8400, 1]`).
-/// The first match is recorded via `used`.
+/// Locate the first un-consumed input tensor with the given shape and record
+/// its index in `used`.
 fn find_unused_tensor_by_shape<'a>(
     inputs: &'a [&'a TensorDyn],
     shape: &[usize],
@@ -315,27 +289,22 @@ fn find_unused_tensor_by_shape<'a>(
 /// Find tensor by shape, dequantize to f32, and transpose to match the
 /// expected shape if needed.
 ///
-/// Tries exact shape match first. When that fails (common in GStreamer /
-/// NNStreamer pipelines where the framework reports dimensions in
-/// innermost-first order while the v2 schema uses standard row-major
-/// shapes), falls back to element-count matching with axis permutation.
-///
-/// The permutation is derived by matching dimension sizes between the
-/// tensor's natural shape and the expected shape. When the tensor has
-/// fewer dimensions (e.g. trailing unit dims were stripped), it is
-/// padded with trailing 1s before matching.
+/// Tries an exact shape match first, then an element-count match with an
+/// axis permutation derived by matching dimension sizes between the tensor's
+/// shape and the expected shape. A tensor with fewer dimensions is padded
+/// with trailing 1s before matching.
 fn find_and_dequantize(
     inputs: &[&TensorDyn],
     expected_shape: &[usize],
     quant: Option<Quantization>,
     used: &mut Vec<usize>,
 ) -> DecoderResult<ArrayD<f32>> {
-    // Fast path: exact shape match
+    // Exact shape match
     if let Ok(t) = find_unused_tensor_by_shape(inputs, expected_shape, used) {
         return tensor_to_f32(t, quant);
     }
 
-    // Fallback: element-count match with axis permutation
+    // Element-count match with axis permutation
     let expected_count: usize = expected_shape.iter().product();
     for (i, t) in inputs.iter().enumerate() {
         if used.contains(&i) {
@@ -360,9 +329,8 @@ fn find_and_dequantize(
             } else {
                 arr
             };
-            // Transpose axes to match expected shape. permuted_axes
-            // reorders strides (zero-copy view), then as_standard_layout
-            // produces a C-contiguous copy with data in the new order.
+            // Transposes the axes to the expected shape and copies into
+            // standard layout.
             arr = arr.permuted_axes(IxDyn(&perm));
             arr = arr.as_standard_layout().to_owned();
             debug_assert_eq!(arr.shape(), expected_shape);
@@ -380,9 +348,8 @@ fn find_and_dequantize(
 /// Find the axis permutation that transforms `from` into `to`.
 ///
 /// Returns `None` if no permutation exists (different multiset of
-/// dimension sizes or different lengths). When repeated dimension
-/// sizes occur (e.g. 160×160 spatial dims), they are matched in order
-/// which preserves their relative axis positions.
+/// dimension sizes or different lengths). Repeated dimension sizes are
+/// matched in order.
 fn find_axis_permutation(from: &[usize], to: &[usize]) -> Option<Vec<usize>> {
     if from.len() != to.len() {
         return None;
@@ -408,12 +375,7 @@ fn find_axis_permutation(from: &[usize], to: &[usize]) -> Option<Vec<usize>> {
 }
 
 /// Dequantize (if integer) or cast (if float) a TensorDyn to an owned
-/// `ArrayD<f32>` matching the tensor's shape.
-///
-/// Schema-v2 merge always widens to f32 because logical outputs may
-/// concatenate children of heterogeneous dtypes (e.g. an i8 physical child
-/// with a f32 sibling). This is the one place in the decoder where f16 is
-/// intentionally promoted rather than kept native.
+/// `ArrayD<f32>` matching the tensor's shape. f16 is widened to f32.
 fn tensor_to_f32(t: &TensorDyn, quant: Option<Quantization>) -> DecoderResult<ArrayD<f32>> {
     let shape = t.shape().to_vec();
     let strides = padded_strides(t)?;
@@ -429,7 +391,7 @@ fn tensor_to_f32(t: &TensorDyn, quant: Option<Quantization>) -> DecoderResult<Ar
                 let view = strided_view(&shape, strides.as_deref(), m.as_slice())?;
                 return Ok(view.mapv(half::f16::to_f32));
             }
-            // Vectorized f16 → f32 widening via the `half` crate.
+            // f16 → f32 widening via the `half` crate.
             use half::slice::HalfFloatSliceExt;
             let total: usize = shape.iter().product();
             let src = m.as_slice().get(..total).ok_or_else(|| {
@@ -584,8 +546,7 @@ fn execute_channel_concat(
     let views: Vec<_> = parts.iter().map(|a| a.view()).collect();
     let mut merged =
         ndarray::concatenate(Axis(channel_axis), &views).map_err(DecoderError::NDArrayShape)?;
-    // Drop padding axes (descending order, so earlier removes do not
-    // shift later indices).
+    // Drop padding axes, in descending order.
     for &ax in padding_axes {
         if ax < merged.ndim() && merged.shape()[ax] == 1 {
             merged = merged.remove_axis(Axis(ax));
@@ -651,10 +612,6 @@ mod tests {
 
     #[test]
     fn tensor_to_f32_widens_f16_natively() {
-        // Direct check of the schema-v2 merge helper: f16 values must be
-        // exactly widened to f32 via `half` crate conversion. Picks values
-        // representable exactly in both f16 and f32 so the comparison is
-        // bit-exact (no tolerance needed).
         let t = make_f16_tensor(&[2, 3], &[1.0, -2.0, 0.5, 0.25, -0.125, 4.0]);
         let arr = super::tensor_to_f32(&t, None).unwrap();
         assert_eq!(arr.shape(), &[2, 3]);
@@ -719,8 +676,7 @@ mod tests {
         assert_eq!(got.iter().copied().collect::<Vec<_>>(), values);
     }
 
-    /// The strided dequantize equals gathering the view and dequantizing it, on every tier,
-    /// for padded rows over several dimension splits; a short source is an error.
+    /// The strided dequantize equals gathering the view and dequantizing it on every tier; a short source is an error.
     #[test]
     fn dequantize_strided_matches_the_gathered_view_on_every_tier() {
         let src: Vec<i16> = (0..400).map(|v| (v * 37 % 2001) as i16 - 1000).collect();
@@ -756,8 +712,7 @@ mod tests {
         }
     }
 
-    /// An integer tensor's dequantize fails with `ForcedKernelUnavailable` under a tier the CPU
-    /// lacks or does not know, padded rows or not.
+    /// An integer tensor's dequantize fails with `ForcedKernelUnavailable` under a tier the CPU lacks or does not know.
     #[test]
     fn integer_tensor_dequantize_fails_on_an_unavailable_forced_tier() {
         use crate::per_scale::kernels::{decoder_cpu_features_from, forced_for_test};
@@ -790,12 +745,7 @@ mod tests {
         }
     }
 
-    /// Typeless logical outputs are filtered from the DecodeProgram,
-    /// keeping it aligned with `to_legacy_config_outputs` (which applies
-    /// the same filter). Without this, `decode()` would pass N merged
-    /// tensors to a decode path expecting N-k — corrupting downstream
-    /// decoding when a user adds a custom output alongside a decoded
-    /// YOLO model.
+    /// Typeless logical outputs are left out of the DecodeProgram, as `to_legacy_config_outputs` leaves them out.
     #[test]
     fn typeless_logical_not_included_in_decode_program() {
         let schema = SchemaV2 {
@@ -866,13 +816,10 @@ mod tests {
             .unwrap()
             .expect("typed boxes has children → program must be Some");
 
-        // Legacy config filters typeless outputs; the program must
-        // apply the identical filter so positional alignment holds.
         let legacy = schema.to_legacy_config_outputs().unwrap();
         assert_eq!(legacy.outputs.len(), 1);
 
-        // Program emits one merged tensor (for the typed `boxes`), not
-        // two (which would include the user_custom placeholder).
+        // The program emits one merged tensor, for the typed `boxes`.
         let boxes_tensor = make_f32_tensor(&[1, 4, 3], &[1.0; 12]);
         let inputs: Vec<&TensorDyn> = vec![&boxes_tensor];
         let merged = program.execute(&inputs).unwrap();
@@ -887,7 +834,6 @@ mod tests {
 
     #[test]
     fn flat_schema_has_no_decode_program() {
-        // Logical outputs with no children => no merge needed.
         let schema = SchemaV2 {
             schema_version: 2,
             outputs: vec![LogicalOutput {
@@ -976,11 +922,7 @@ mod tests {
             activation_required: None,
             semantic: Default::default(),
         };
-        // Two i16 tensors with the same shape: the merge path binds by
-        // shape, so the first match is used for the first child. To keep
-        // the test deterministic we give the two children distinct shapes
-        // by using 3 vs 2 columns below. Update shapes for the test
-        // only:
+        // A schema whose two children have distinct shapes.
         let mut schema = SchemaV2::default();
         schema.outputs.push(LogicalOutput {
             shape: vec![1, 3, 3],
@@ -1028,8 +970,6 @@ mod tests {
 
         let program = DecodeProgram::try_from_schema(&schema).unwrap().unwrap();
 
-        // Synthetic inputs: xy is [1, 1, 3] i16 with values [100, 200, 300]
-        // wh is [1, 2, 3] i16 with values [10, 20, 30, 40, 50, 60]
         let xy = make_i16_tensor(&[1, 1, 3], &[100, 200, 300]);
         let wh = make_i16_tensor(&[1, 2, 3], &[10, 20, 30, 40, 50, 60]);
         let inputs: Vec<&TensorDyn> = vec![&xy, &wh];
@@ -1052,8 +992,6 @@ mod tests {
     #[test]
     fn direct_logical_with_float_tensor_pass_through() {
         // A flat logical (no children) with a float32 tensor.
-        // try_from_schema returns None (no merge); we directly call the
-        // Direct path via a single-element program.
         let schema = SchemaV2 {
             schema_version: 2,
             outputs: vec![
@@ -1079,7 +1017,7 @@ mod tests {
                     activation_required: None,
                     semantic: Default::default(),
                 },
-                // Force at least one split to enable DecodeProgram
+                // A split logical.
                 LogicalOutput {
                     name: Some("scores".into()),
                     type_: Some(LogicalType::Scores),
@@ -1164,11 +1102,8 @@ mod tests {
 
     #[test]
     fn dequantize_affine_reference_values_match_validator() {
-        // Validator-parity: `(q - zp) × scale` with scale=0.130,
-        // zp=70 produces (0 - 70)×0.130 = -9.10, (70 - 70)×0.130 = 0,
-        // (255 - 70)×0.130 = 24.05. Exercised end-to-end through the
-        // `Direct` merge path (non-DFL) so the assertion holds against
-        // the same dequant kernel the DFL path uses.
+        // `(q - zp) × scale` with scale=0.130, zp=70: (0 - 70)×0.130 = -9.10,
+        // (70 - 70)×0.130 = 0, (255 - 70)×0.130 = 24.05.
         let schema = SchemaV2 {
             schema_version: 2,
             outputs: vec![
@@ -1195,9 +1130,7 @@ mod tests {
                     semantic: Default::default(),
                 },
                 LogicalOutput {
-                    // Second logical forces a DecodeProgram so the Direct
-                    // branch actually runs (try_from_schema short-circuits
-                    // when nothing needs merging).
+                    // A second logical, which gives the schema a DecodeProgram.
                     name: Some("boxes".into()),
                     type_: Some(LogicalType::Boxes),
                     shape: vec![1, 4, 3],
@@ -1285,7 +1218,6 @@ mod tests {
 
     #[test]
     fn find_and_dequantize_exact_match_preferred() {
-        // When the tensor shape matches exactly, no permutation is applied.
         let t = make_f32_tensor(&[1, 3, 4], &[1.0; 12]);
         let inputs: Vec<&TensorDyn> = vec![&t];
         let mut used = Vec::new();
@@ -1296,8 +1228,7 @@ mod tests {
 
     #[test]
     fn find_and_dequantize_permuted_nchw_to_nhwc() {
-        // Tensor is NCHW [1, 3, 2, 2] but expected is NHWC [1, 2, 2, 3].
-        // The fallback should detect the axis permutation and transpose.
+        // Tensor is NCHW [1, 3, 2, 2]; expected is NHWC [1, 2, 2, 3].
         //
         // Data in C-contiguous NCHW order (channel-major):
         //   C0: [[1, 2], [3, 4]]
@@ -1313,8 +1244,7 @@ mod tests {
         let mut used = Vec::new();
         let arr = find_and_dequantize(&inputs, &[1, 2, 2, 3], None, &mut used).unwrap();
         assert_eq!(arr.shape(), &[1, 2, 2, 3]);
-        // After NCHW→NHWC, pixel (0,0) should have channels [1, 5, 9],
-        // pixel (0,1) should be [2, 6, 10], etc.
+        // Pixel (0,0) has channels [1, 5, 9]; pixel (0,1) has [2, 6, 10].
         assert_eq!(arr[[0, 0, 0, 0]], 1.0);
         assert_eq!(arr[[0, 0, 0, 1]], 5.0);
         assert_eq!(arr[[0, 0, 0, 2]], 9.0);
@@ -1328,9 +1258,7 @@ mod tests {
 
     #[test]
     fn find_and_dequantize_stripped_trailing_unit_dim() {
-        // Tensor reported as [1, 6] (trailing unit dim stripped) but
-        // expected shape is [1, 6, 1]. The fallback should pad with
-        // trailing 1s and find an identity permutation.
+        // Tensor shape [1, 6]; expected shape [1, 6, 1].
         let t = make_f32_tensor(&[1, 6], &[10.0, 20.0, 30.0, 40.0, 50.0, 60.0]);
         let inputs: Vec<&TensorDyn> = vec![&t];
         let mut used = Vec::new();
@@ -1342,8 +1270,7 @@ mod tests {
 
     #[test]
     fn find_and_dequantize_skips_already_used() {
-        // Two tensors with same element count; the first is already
-        // consumed so the fallback must select the second.
+        // Two tensors with the same element count; the first is consumed.
         let t0 = make_f32_tensor(&[2, 3], &[0.0; 6]);
         let t1 = make_f32_tensor(&[3, 2], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         let inputs: Vec<&TensorDyn> = vec![&t0, &t1];
@@ -1362,7 +1289,6 @@ mod tests {
 
     #[test]
     fn find_and_dequantize_no_match_returns_error() {
-        // Element count doesn't match any candidate.
         let t = make_f32_tensor(&[2, 5], &[0.0; 10]);
         let inputs: Vec<&TensorDyn> = vec![&t];
         let mut used = Vec::new();
@@ -1390,7 +1316,6 @@ mod tests {
 
     #[test]
     fn find_axis_permutation_no_match() {
-        // Different dimension multisets
         assert_eq!(find_axis_permutation(&[1, 3, 4], &[1, 4, 5]), None);
     }
 

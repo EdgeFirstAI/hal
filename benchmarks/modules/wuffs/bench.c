@@ -1,28 +1,18 @@
 /* SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
  * SPDX-License-Identifier: Apache-2.0
  *
- * Wuffs (Google) JPEG decode-only benchmark — the memory-safe C arm of the
+ * Wuffs (Google) JPEG decode-only benchmark: the memory-safe C arm of the
  * EdgeFirst decoder A/B (vs hal_cpu --decode-fmt rgb and the other RGB arms).
  *
  * Wuffs transpiles to a single C file (Apache-2.0), fetched at a pinned
- * release tag by `make deps` (see the Makefile). Its JPEG decoder has a
- * single fixed IDCT with no accurate/fast knob — measured **bit-exact**
- * against djpeg (libjpeg-turbo, accurate IDCT) over 4:4:4/4:2:0/DRI/
- * greyscale/large samples (max abs diff 0; 2026-08-13 parity check), so its
- * row compares within the accurate class with zero accuracy caveat. Output goes through Wuffs'
+ * release tag by `make deps` (see the Makefile). Output goes through Wuffs'
  * swizzler; this arm asks for 3-byte RGB and falls back through BGR and the
- * 4-byte formats if the swizzler refuses, recording the format actually used
- * in the CSV notes (a 4-byte destination writes 33% more bytes than the
- * other RGB arms and must be read accordingly).
+ * 4-byte formats if the swizzler refuses, recording the format used in the
+ * CSV notes.
  *
- * Steady-state allocation: the destination and work buffers grow to their
- * high-water mark and are reused, like the HAL and turbo arms. Wuffs decoder
- * objects are single-use per image, so the per-image reset
- * (wuffs_jpeg__decoder__initialize, which zeroes the decoder struct) is
- * inside the timed region — it is a cost every Wuffs user pays per frame.
- *
- * Harness choices that move the number live in ../cbench/cbench.h and are
- * identical across the C arms; see the three rules in benchmarks/README.md.
+ * The destination and work buffers grow to their high-water mark and are
+ * reused. The per-image decoder reset (wuffs_jpeg__decoder__initialize) is
+ * inside the timed region.
  *
  * Build: make -C benchmarks/modules/wuffs
  */
@@ -54,7 +44,7 @@ typedef struct {
 
 #define WUFFS_CANDIDATE_COUNT 4
 
-/* Default probe order: 3-byte formats first (matches the other RGB arms). */
+/* Default probe order: 3-byte formats first. */
 static const WuffsCandidate wuffs_candidates_3bpp_first[WUFFS_CANDIDATE_COUNT] = {
     {WUFFS_BASE__PIXEL_FORMAT__RGB, 3, "RGB"},
     {WUFFS_BASE__PIXEL_FORMAT__BGR, 3, "BGR"},
@@ -62,8 +52,7 @@ static const WuffsCandidate wuffs_candidates_3bpp_first[WUFFS_CANDIDATE_COUNT] =
     {WUFFS_BASE__PIXEL_FORMAT__BGRA_NONPREMUL, 4, "BGRA_NONPREMUL"},
 };
 
-/* EDGEFIRST_WUFFS_FORCE_4BPP=1 order: 4-byte formats first, to measure
- * Wuffs' native (non-swizzled) output path directly. */
+/* EDGEFIRST_WUFFS_FORCE_4BPP=1 order: 4-byte formats first. */
 static const WuffsCandidate wuffs_candidates_4bpp_first[WUFFS_CANDIDATE_COUNT] = {
     {WUFFS_BASE__PIXEL_FORMAT__RGBA_NONPREMUL, 4, "RGBA_NONPREMUL"},
     {WUFFS_BASE__PIXEL_FORMAT__BGRA_NONPREMUL, 4, "BGRA_NONPREMUL"},
@@ -119,11 +108,9 @@ static const char *wuffs_decode_one(WuffsBench *b, const CbenchImage *img) {
     return NULL;
 }
 
-/* --parity: matches CbenchParityDecodeFn. Always forces 3-byte RGB (not
- * whichever candidate the perf probe order picks) — the like-for-like
- * output layout every other RGB arm's parity check compares. Lazily
- * allocates its own WuffsBench decoder/scratch on first call, reused across
- * the corpus the same way the timed loop reuses its own. */
+/* --parity: matches CbenchParityDecodeFn. Always decodes to 3-byte RGB.
+ * Lazily allocates its own WuffsBench decoder/scratch on first call and
+ * reuses it across the corpus. */
 static int wuffs_parity_decode(const CbenchImage *img, unsigned char **out, size_t *out_cap,
                                int *w, int *h) {
     static WuffsBench b = {0};
@@ -166,11 +153,8 @@ int main(int argc, char **argv) {
     if (!b.dec) cbench_die("wuffs_jpeg__decoder__alloc failed");
 
     /* Pick the destination format once, before anything is timed: prefer the
-     * 3-byte formats that match the other RGB arms, fall back to 4-byte.
-     * EDGEFIRST_WUFFS_FORCE_4BPP=1 skips straight to the 4-byte candidates,
-     * for an isolated 3-byte-swizzle-vs-4-byte-native A/B on Wuffs' own
-     * decoder (not a comparison against another arm) — see BENCHMARKS.md
-     * § JPEG Decode's Wuffs accuracy/performance note. */
+     * 3-byte formats, fall back to 4-byte. EDGEFIRST_WUFFS_FORCE_4BPP=1 skips
+     * straight to the 4-byte candidates. */
     const char *force_4bpp_env = getenv("EDGEFIRST_WUFFS_FORCE_4BPP");
     int force_4bpp = force_4bpp_env != NULL && strcmp(force_4bpp_env, "1") == 0;
     const WuffsCandidate *candidates = force_4bpp ? wuffs_candidates_4bpp_first
@@ -193,7 +177,7 @@ int main(int argc, char **argv) {
             "===\n",
             fmt_name, sizeof__wuffs_jpeg__decoder(), n);
 
-    /* Warm up on the first image, as every other arm does. */
+    /* Warm up on the first image. */
     for (size_t i = 0; i < args.warmup; i++) {
         const char *err = wuffs_decode_one(&b, &images[0]);
         if (err) cbench_die("warmup decode failed: %s", err);

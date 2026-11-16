@@ -1,45 +1,24 @@
 // SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! Single source of truth for the float render-path decision.
+//! The float render-path decision.
 //!
-//! The "`(PixelFormat, DType, TensorMemory)` → float render path" classification
-//! is a pure, GL-free decision that both platform backends must agree on. It
-//! lives here — compiled on **both** Linux and macOS — so there is exactly one
-//! definition of [`FloatRenderPath`] and [`classify_float_render`] across the
-//! whole crate.
+//! [`classify_float_render`] maps `(PixelFormat, DType, TensorMemory)` and
+//! the reported [`crate::RenderDtypeSupport`] to a [`FloatRenderPath`]. It is
+//! GL-free and compiled on every platform.
 //!
-//! The Linux processor (`gl::processor::float`) re-exports these and dispatches
-//! on [`FloatRenderPath::PboF16Nchw`] / [`PboF32Nhwc`] / [`ZeroCopyF16Nchw`].
+//! [`ZeroCopyF16Nchw`] covers every platform's zero-copy F16 render target:
+//! each platform's zero-copy buffer reports `TensorMemory::DmaBuf`.
 //!
-//! [`ZeroCopyF16Nchw`] deliberately covers BOTH platforms' zero-copy F16
-//! render targets: a macOS IOSurface tensor reports `TensorMemory::DmaBuf`
-//! (IOSurface shares the `Dma` memory slot), so the same
-//! `(Rgba, PlanarRgb, F16, Dma)` tuple that selects the Linux DMA-BUF render
-//! selects the IOSurface render on macOS — which buffer object backs the
-//! render is the platform seam's business (`GlPlatform::import_buffer`),
-//! not the classifier's. The unified engine runs on both platforms, and
-//! this classifier is its single float-path dispatch.
-//!
-//! No GL/EGL/gbm types appear in this module — it matches purely on
-//! [`edgefirst_tensor`] pixel/dtype/memory enums plus the reported
-//! [`crate::RenderDtypeSupport`].
-//!
-//! [`PboF32Nhwc`]: FloatRenderPath::PboF32Nhwc
 //! [`ZeroCopyF16Nchw`]: FloatRenderPath::ZeroCopyF16Nchw
 
-/// Which GL float render path should be used for a given conversion.
+/// Which GL float render path is used for a given conversion.
 ///
-/// `None` means no float GL path applies — fall through to the existing u8
-/// route (which for F16/F32 destinations hits the u8 rejection and therefore
-/// CPU fallback, exactly as before this seam was added).
-///
-/// These are the host-memory-discriminated render targets the classifier can
-/// decide from its inputs alone. `ZeroCopyF16Nchw` covers both platforms'
-/// zero-copy F16 targets (DMA-BUF and IOSurface) — see the module docs.
+/// `None` means no float GL path applies and the caller falls through to the
+/// u8 route.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub(super) enum FloatRenderPath {
-    /// No GL float render path applies; fall through to existing logic.
+    /// No GL float render path applies.
     None,
     /// RGBA → PlanarRgb F16, PBO destination (RGBA16F-packed shader). Linux.
     PboF16Nchw,
@@ -65,43 +44,27 @@ pub(super) enum FloatRenderPath {
     ZeroCopyFloatRgba,
 }
 
-/// Which zero-copy float render paths a platform leaf is known to serve.
-///
-/// The three variants past `ZeroCopyF16Nchw`, and the `PlanarRgba` widening
-/// of `ZeroCopyF16Nchw` itself, are shaders this branch wrote and ran on
-/// Windows only. Every one of those tuples used to classify as
-/// [`FloatRenderPath::None`] on Linux, macOS and Android and fall through to
-/// the CPU converter that produced those platforms' reference output, and
-/// they still do: the leaf says what it has run, and the classifier reads it.
-///
-/// This is a capability, not a `cfg`: the classifier stays pure and testable
-/// against both sets, and widening a leaf becomes a one-line change backed by
-/// an on-target run.
+/// Which zero-copy float render paths a platform leaf serves.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub(super) enum ZeroCopyFloatSet {
-    /// `Rgba -> PlanarRgb` F16 only, the path Linux, macOS and Android have
-    /// always taken.
+    /// `Rgba -> PlanarRgb` F16 only.
     PlanarF16,
     /// Every zero-copy float destination the packed shaders cover: planar
     /// F16 and F32 (`PlanarRgb` and `PlanarRgba`), interleaved `Rgb`, and
-    /// `Rgba`. Validated on Windows.
+    /// `Rgba`.
     All,
 }
 
-/// Classify whether a conversion should use a GL float render target.
+/// Classify whether a conversion uses a GL float render target.
 ///
-/// Gated on source/destination pixel format, destination dtype, destination
-/// memory kind, and the float-render capability reported by the current GPU.
-/// Returns [`FloatRenderPath::None`] when the combination is not supported so
-/// callers can fall through to the existing u8 path.
+/// Decides from the source/destination pixel format, destination dtype,
+/// destination memory kind, the float-render capability reported by the GPU
+/// and the platform's zero-copy float set. Returns [`FloatRenderPath::None`]
+/// when the combination is not supported.
 ///
-/// This is the single definition of the float-path decision. A
-/// [`TensorMemory::DmaBuf`] destination means "the platform's zero-copy GPU
-/// buffer" — a DMA-BUF on Linux, an IOSurface on macOS (they share the
-/// `Dma` slot — see [`edgefirst_tensor::TensorMemory::DmaBuf`]); the platform
-/// seam, not this classifier, resolves which import backs the render.
+/// A [`TensorMemory::DmaBuf`] destination is the platform's zero-copy GPU
+/// buffer.
 ///
-/// [`TensorMemory::Pbo`]: edgefirst_tensor::TensorMemory::Pbo
 /// [`TensorMemory::DmaBuf`]: edgefirst_tensor::TensorMemory::DmaBuf
 pub(super) fn classify_float_render(
     src: edgefirst_tensor::PixelFormat,
@@ -147,9 +110,6 @@ pub(super) fn classify_float_render(
     }
 }
 
-// Shared (NOT cfg(target_os)) so the classifier is exercised on the macOS
-// coverage lane too — the `gl::tests` `dispatch_*` tests are Linux-only, so
-// without this `classify_float_render` is compiled-but-untested on macOS.
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
@@ -217,8 +177,7 @@ mod tests {
 
     #[test]
     fn no_path_when_capability_absent() {
-        // The format/dtype/memory tuple matches, but the GPU does not report
-        // the corresponding float capability -> the guard fails -> None.
+        // The tuple matches but the GPU does not report the float capability.
         assert_eq!(
             classify_float_render(
                 PixelFormat::Rgba,
@@ -245,8 +204,8 @@ mod tests {
 
     #[test]
     fn no_path_for_unhandled_tuples() {
-        // Non-Rgba source, integer dtype, and host-memory destination all fall
-        // through to the catch-all None arm.
+        // Non-Rgba source, integer dtype, and host-memory destination classify
+        // as None.
         let c = |src, dst, dt, mem| classify_float_render(src, dst, dt, mem, YES, ALL);
         assert_eq!(
             c(
@@ -277,8 +236,7 @@ mod tests {
         );
     }
 
-    /// The Windows leaf's set: every zero-copy float destination the packed
-    /// shaders cover.
+    /// The full set covers every zero-copy float destination the packed shaders cover.
     #[test]
     fn the_full_set_covers_every_float_layout() {
         use FloatRenderPath::*;
@@ -317,10 +275,7 @@ mod tests {
         );
     }
 
-    /// The set Linux, macOS and Android report: the planar F16 render and
-    /// nothing else. Every other tuple falls through to the CPU converter
-    /// those platforms' reference output came from, which is what it did
-    /// before the packed float shaders were written.
+    /// The planar set classifies only the planar F16 render; every other tuple is `None`.
     #[test]
     fn the_planar_set_leaves_the_windows_only_shaders_unreachable() {
         let c = |dst, dt| {

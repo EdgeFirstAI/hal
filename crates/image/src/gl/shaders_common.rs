@@ -4,16 +4,8 @@
 //! GL shader sources shared across platform backends (macOS ANGLE + Linux).
 
 // ---------------------------------------------------------------------------
-// Portable `#version 300 es` fragment shaders shared verbatim by both the
-// Linux (PBO/DMA EGLImage) and macOS (IOSurface/ANGLE) render paths, so the
-// GLSL bytes are validated identically on every backend.
-//
-// (YUV→RGB matrix conversion lives in the per-backend NV shaders — Linux
-// `shaders::generate_nv_to_rgba_shader_2d` and the macOS `NV_TO_RGBA_FRAGMENT`,
-// each carrying the six per-tensor colorimetry uniforms from
-// `crate::colorimetry::yuv_to_rgb_coeffs`. Packed YUYV uses the driver Path A
-// EGL color-space/range hints. Only the colorimetry-agnostic float packers
-// are shared here.)
+// Portable `#version 300 es` fragment shaders shared verbatim by the Linux
+// (PBO/DMA EGLImage) and macOS (IOSurface/ANGLE) render paths.
 // ---------------------------------------------------------------------------
 
 /// RGBA8 -> packed planar-float fragment shader (`PlanarRgb` / `PlanarRgba`,
@@ -25,17 +17,11 @@
 /// rendered texture produces a tightly-packed `[C, H, W]` buffer (CHW order,
 /// one plane per row-band). Width `W` must be a multiple of 4.
 ///
-/// The plane index comes from the surface geometry (`floor(oy / H)`), not from
-/// a uniform, so a `PlanarRgba` surface of height `4*H` selects plane 3 on its
-/// own; the sampler carries a branch for each of the four planes and
-/// `pad_color` is a `vec4` so plane 3 pads with the same alpha the CPU
-/// reference writes.
+/// The plane index comes from the surface geometry (`floor(oy / H)`), and
+/// `pad_color` is a `vec4` whose fourth component pads plane 3.
 ///
-/// This is the single source of truth consumed by the Linux (PBO/DMA), macOS
-/// (IOSurface/ANGLE) and Windows (D3D11 texture) render paths. The GLSL bytes
-/// are validated against the CPU converter by the on-target F16 round-trip
-/// tests, the macOS IOSurface integration tests and
-/// `windows_float_destinations_match_the_cpu_converter_for_every_layout`.
+/// Shared by the Linux (PBO/DMA), macOS (IOSurface/ANGLE) and Windows (D3D11
+/// texture) render paths.
 pub(crate) const PLANAR_RGB_F16_PACKED_FRAGMENT: &str = r#"#version 300 es
 precision highp float;
 precision highp int;
@@ -117,15 +103,11 @@ void main() {
 /// The render target is a single `RGBA16F` (F16) or `RGBA32F` (F32) texture
 /// sized `(W*3/4, H)`. Each output texel packs 4 consecutive elements of the
 /// destination's `[H, W, 3]` stream into its four components, so a linear
-/// readout produces a tightly-packed NHWC buffer. `W*3` must divide into whole
-/// texels, which for a 3-channel row means `W % 4 == 0`.
+/// readout produces a tightly-packed NHWC buffer. `W` must be a multiple of 4.
 ///
-/// Same crop and pad contract as the planar packer: the destination element
-/// index gives the pixel and channel, `dst_rect_px` decides whether that pixel
-/// is content or pad, and `src_rect_uv` maps content onto the source. Sampling
-/// the source once per element rather than packing an already-rendered u8
-/// intermediate keeps the result identical to the F32 NHWC PBO path, which
-/// samples the same way.
+/// The destination element index gives the pixel and channel, `dst_rect_px`
+/// decides whether that pixel is content or pad, and `src_rect_uv` maps
+/// content onto the source. The source is sampled once per element.
 pub(crate) const FLOAT_NHWC_PACKED_FRAGMENT: &str = r#"#version 300 es
 precision highp float;
 precision highp int;
@@ -182,13 +164,8 @@ void main() {
 /// contract at one texel per pixel.
 ///
 /// The render target is an `RGBA16F` (F16) or `RGBA32F` (F32) texture sized
-/// `(W, H)` — an `Rgba` float destination needs no packing, so the whole
-/// fetched texel is the output, alpha included.
-///
-/// Addressing comes from `gl_FragCoord`, not the interpolated texcoord: the
-/// other float shaders read the destination row straight off `gl_FragCoord.y`
-/// (framebuffer row 0 is the surface's first row of memory) and the quad's
-/// texcoords run the other way down the viewport.
+/// `(W, H)`. The whole fetched texel is the output, alpha included.
+/// Addressing comes from `gl_FragCoord`.
 pub(crate) const FLOAT_RGBA_FRAGMENT: &str = r#"#version 300 es
 precision highp float;
 precision highp int;
@@ -221,10 +198,9 @@ void main() {
 }
 "#;
 
-/// Fullscreen-quad vertex shader shared by both backends. Position is a `vec3`
-/// (NDC, `z` unused for the 2D quad but carried so the same shader serves the
-/// segmentation passes); passes `fragPos`/`tc` to the fragment stage. The VBO
-/// feeds `pos` (location 0) and `texCoord` (location 1).
+/// Fullscreen-quad vertex shader. Position is a `vec3` (NDC); passes
+/// `fragPos`/`tc` to the fragment stage. The VBO feeds `pos` (location 0) and
+/// `texCoord` (location 1).
 pub(crate) const VERTEX_SHADER: &str = "\
 #version 300 es
 precision mediump float;
@@ -243,29 +219,16 @@ void main() {
 ";
 
 // ---------------------------------------------------------------------------
-// NV12/NV16/NV24 (semi-planar YUV, single R8 plane) -> RGBA, shared across
-// backends. Both the Linux (DMA-BUF EGLImage) and macOS (IOSurface/ANGLE) paths
-// decode the SAME combined-plane byte layout (`PixelFormat::chroma_layout` +
-// `combined_plane_height`) using the **divide-free** addressing form: direct 2D
-// `texelFetch` + a branchless `carry` for NV24's wrapping 2W-byte chroma row.
-// No per-pixel integer divide/modulo — that is pathologically slow on Vivante
-// GC7000UL / V3D and is also the software-emulated slow path on Apple GPUs
-// (variable divisor), so the divide-free form is the right default everywhere.
-//
-// Both backends use the same `VERTEX_SHADER` (above), so the fragment shader is
-// byte-identical on both — ONE source string. The bytes are validated on-target
-// (Linux) and frozen by `nv_fragment_byte_identical` below.
+// NV12/NV16/NV24 (semi-planar YUV, single R8 plane) -> RGBA. Decodes the
+// combined-plane byte layout (`PixelFormat::chroma_layout` +
+// `combined_plane_height`) with direct 2D `texelFetch` and a branchless
+// `carry` for NV24's wrapping 2W-byte chroma row.
 
-/// Declarations shared by the NV->RGBA program and its int8 twin, ending with
-/// `nv_rgb(x, y)`: the exact YUV->RGB conversion of the luma texel at (x, y)
-/// and its co-sited chroma. References the `chroma_shift`/`chroma_lines`/
-/// `tex_width` layout uniforms and the six colorimetry uniforms.
 /// The colorimetry uniforms every NV program reads (see `nv_yuv_to_rgb_fn`).
 macro_rules! nv_colorimetry {
     () => {
         "// Per-tensor colorimetry (YUV→RGB matrix + range), set by draw_nv_texture_2d
-// from the source tensor's resolved colorimetry. Path B applies the matrix in
-// the shader, so it is correct regardless of driver EGL color-hint support.
+// from the source tensor's resolved colorimetry.
 uniform float y_offset;
 uniform float y_scale;
 uniform float c_vr;
@@ -279,10 +242,7 @@ uniform float c_ub;
 /// `nv_yuv_to_rgb`: the exact YUV->RGB matrix every NV program applies.
 macro_rules! nv_yuv_to_rgb_fn {
     () => {
-        "// Floor expanded luma at 0 to match the CPU `yuv` crate's saturating (Y-16)
-// term (limited footroom Y<16 → 0). The top is left uncapped — the crate lets
-// headroom exceed 1.0 and relies on the final RGB clamp, so the GL path must
-// too. No-op for full range (y_offset=0, y_scale=1).
+        "// Floors expanded luma at 0; the top is not capped.
 vec3 nv_yuv_to_rgb(float yv, float u, float v) {
     float yp = max((yv - y_offset) * y_scale, 0.0);
     float up = u - 128.0 / 255.0;
@@ -294,6 +254,9 @@ vec3 nv_yuv_to_rgb(float yv, float u, float v) {
     };
 }
 
+/// Declarations shared by the NV->RGBA programs, ending with `nv_rgb(x, y)`:
+/// the YUV->RGB conversion of the luma texel at (x, y) and its co-sited
+/// chroma.
 macro_rules! nv_rgba_header {
     () => {
         concat!(
@@ -306,7 +269,7 @@ uniform int tex_width;
 uniform ivec2 chroma_shift;
 uniform int chroma_lines;
 // Inclusive texel bounds (x0, y0, x1, y1) of the source crop: every tap is
-// clamped to them, so a crop never reads pixels from outside itself.
+// clamped to them.
 uniform ivec4 src_rect;
 // Hardware-filtered program only: the chroma plane as (U, V) texels on unit 1,
 // the image's share of each texture (`*_scale`), and the crop's half-texel-
@@ -326,8 +289,7 @@ out vec4 color;
 ",
             nv_yuv_to_rgb_fn!(),
             "vec3 nv_rgb(int x, int y) {
-    // Luma: direct 2D texel — no per-pixel integer divide/modulo (very slow on
-    // some embedded GPUs, e.g. Vivante GC7000UL).
+    // Luma: direct 2D texel.
     float yv = texelFetch(src, ivec2(x, y), 0).r;
 
     // Interleaved CbCr plane begins at buffer row `h`. Each image-chroma-row
@@ -350,8 +312,7 @@ out vec4 color;
 }
 
 /// `main()` statements of the single-tap NV programs, for draws that map the
-/// crop 1:1: reads the texel under the fragment and leaves it in `rgb`. `tc`
-/// spans the crop's outer edges, so `tc * size` is the source position.
+/// crop 1:1: reads the texel under the fragment and leaves it in `rgb`.
 macro_rules! nv_rgb_nearest_body {
     () => {
         "    ivec2 i = clamp(ivec2(tc * vec2(img_size)), src_rect.xy, src_rect.zw);
@@ -361,10 +322,8 @@ macro_rules! nv_rgb_nearest_body {
 }
 
 /// `main()` statements of the bilinear NV programs, for draws that rescale
-/// the crop: half-pixel-centred bilinear, the GL_LINEAR / OpenCV INTER_LINEAR
-/// convention, with every tap clamped to the crop. Blending the four texels'
-/// converted RGB equals converting at native resolution and then resizing, as
-/// the CPU backend does.
+/// the crop: half-pixel-centred bilinear over the four texels' converted RGB,
+/// with every tap clamped to the crop.
 macro_rules! nv_rgb_bilinear_body {
     () => {
         "    vec2 p = tc * vec2(img_size) - 0.5;
@@ -380,9 +339,7 @@ macro_rules! nv_rgb_bilinear_body {
 
 /// `main()` statements of the hardware-filtered bilinear NV programs: luma
 /// from the combined plane and chroma from its (U, V) view, each through the
-/// texture unit's LINEAR filter, then the exact YUV->RGB matrix. Filtering
-/// chroma on its own grid centres each chroma sample on the luma pixels it
-/// covers, as JPEG sites it.
+/// texture unit's LINEAR filter, then the YUV->RGB matrix.
 macro_rules! nv_rgb_hw_bilinear_body {
     () => {
         "    vec2 luv = clamp(tc * luma_scale, luma_clamp.xy, luma_clamp.zw);
@@ -421,15 +378,6 @@ highp vec3 quantize(highp vec3 v) {
     };
 }
 
-/// YUYV (sampled as a GL_RG texture: R=Y, G=alternating U/V) → RGBA.
-/// Each output pixel samples its own texel and the horizontal partner to
-/// recover both chroma components; the YUV→RGB matrix + range come from
-/// the per-tensor colorimetry uniforms (same names as the NV program).
-/// `src_size` is the texture's texel grid and `src_extent` the logical
-/// image's rectangle on it (`render::sample_clamp_rect`), which differ when
-/// the import covers more of the texture than the logical image.
-/// Portable `sampler2D` — shared by the IOSurface zero-copy source path
-/// and any future heap-YUYV upload path.
 /// Declarations shared by the YUYV->RGBA program and its int8 twin.
 macro_rules! yuyv_rgba_2d_header {
     () => {
@@ -463,12 +411,7 @@ macro_rules! yuyv_rgb_body {
     bool even = mod(col.x, 2.0) < 0.5;
     vec2 self_uv = (col + vec2(0.5)) * texel;
     // The clamp bounds `col`, not the partner. On an odd logical width the
-    // last column is even, so its partner is one texel past the logical
-    // image: stale pool content on a narrowed import, and the column itself
-    // under CLAMP_TO_EDGE otherwise. Out of scope, and unchanged by the
-    // clamp: a YUYV chroma pair spans two columns, so an odd width has no
-    // partner to read in any layout (the allocation is `width` texels wide,
-    // not rounded up), and the engine's YUYV coverage is even widths only.
+    // partner of the last column is one texel past the logical image.
     vec2 pair_uv = (col + vec2(even ? 1.5 : -0.5, 0.5)) * texel;
 
     vec4 self_rg = texture(tex, self_uv);
@@ -491,6 +434,12 @@ macro_rules! yuyv_rgb_body {
     };
 }
 
+/// YUYV (sampled as a GL_RG texture: R=Y, G=alternating U/V) → RGBA.
+/// Each output pixel samples its own texel and the horizontal partner to
+/// recover both chroma components; the YUV→RGB matrix + range come from
+/// the per-tensor colorimetry uniforms (same names as the NV program).
+/// `src_size` is the texture's texel grid and `src_extent` the logical
+/// image's rectangle on it (`render::sample_clamp_rect`).
 pub(crate) const YUYV_RGBA_2D_FRAGMENT: &str = concat!(
     yuyv_rgba_2d_header!(),
     "void main() {\n",
@@ -499,8 +448,7 @@ pub(crate) const YUYV_RGBA_2D_FRAGMENT: &str = concat!(
 );
 
 /// Int8 variant of [`YUYV_RGBA_2D_FRAGMENT`]: the same pixel, with the XOR
-/// 0x80 bias every int8 program applies (`(q + 128) mod 256`, matching the
-/// CPU `byte ^ 0x80`).
+/// 0x80 bias every int8 program applies (`(q + 128) mod 256`).
 pub(crate) const YUYV_RGBA_2D_INT8_FRAGMENT: &str = concat!(
     yuyv_rgba_2d_header!(),
     int_quantize!(),
@@ -509,9 +457,8 @@ pub(crate) const YUYV_RGBA_2D_INT8_FRAGMENT: &str = concat!(
     "    color = vec4(quantize(vec3(r, g, b)), 1.0);\n}\n"
 );
 
-/// NV->RGBA fragment shader (Path B) for draws that do not rescale. Vertex
-/// stage ([`VERTEX_SHADER`]) provides `fragPos`/`tc`; output is `color`. The
-/// bytes are validated on-target (Linux) and frozen by the golden test below.
+/// NV->RGBA fragment shader for draws that do not rescale. Vertex stage
+/// ([`VERTEX_SHADER`]) provides `fragPos`/`tc`; output is `color`.
 pub(crate) const NV_RGBA_FRAGMENT: &str = concat!(
     nv_rgba_header!(),
     "void main() {\n",
@@ -528,10 +475,7 @@ pub(crate) const NV_RGBA_INT8_FRAGMENT: &str = concat!(
     "    color = vec4(quantize(rgb), 1.0);\n}\n"
 );
 
-/// NV->RGBA fragment shader (Path B) for draws that rescale: bilinear. A
-/// separate program rather than a uniform branch in [`NV_RGBA_FRAGMENT`]:
-/// Vivante GC7000UL does not reliably honour that branch, and on V3D and
-/// Adreno the untaken half still slows 1:1 draws.
+/// NV->RGBA fragment shader for draws that rescale: bilinear.
 pub(crate) const NV_RGBA_BILINEAR_FRAGMENT: &str = concat!(
     nv_rgba_header!(),
     "void main() {\n",
@@ -539,10 +483,9 @@ pub(crate) const NV_RGBA_BILINEAR_FRAGMENT: &str = concat!(
     "    color = vec4(rgb, 1.0);\n}\n"
 );
 
-/// NV->RGBA fragment shader (Path B) for draws that rescale, where the chroma
-/// plane can be bound as its own texture: bilinear through the texture unit,
-/// two filtered fetches per pixel instead of the twelve of
-/// [`NV_RGBA_BILINEAR_FRAGMENT`], which remains the fallback.
+/// NV->RGBA fragment shader for draws that rescale, where the chroma plane
+/// is bound as its own texture: bilinear through the texture unit, two
+/// filtered fetches per pixel.
 pub(crate) const NV_RGBA_HW_BILINEAR_FRAGMENT: &str = concat!(
     nv_rgba_header!(),
     "void main() {\n",
@@ -560,9 +503,8 @@ pub(crate) const NV_RGBA_HW_BILINEAR_INT8_FRAGMENT: &str = concat!(
 );
 
 /// Header of the Y2Y NV programs: `GL_EXT_YUV_target` samples an NV12
-/// import as raw (Y, U, V), filtered by the texture unit but not converted by
-/// the driver, so the exact matrix still applies. `src_extent` is the
-/// rectangle a sample may reach, as in the external-sampler programs.
+/// import as raw (Y, U, V), filtered by the texture unit. `src_extent` is the
+/// rectangle a sample may reach.
 macro_rules! nv_y2y_header {
     () => {
         concat!(
@@ -593,9 +535,8 @@ macro_rules! nv_rgb_y2y_body {
 }
 
 /// NV->RGBA fragment shader for draws that rescale, on GPUs with
-/// `GL_EXT_YUV_target` that cannot bind the chroma plane as its own texture
-/// (Mali lists no two-channel 8-bit import format): bilinear through the
-/// texture unit from a single NV12 import, one fetch per pixel.
+/// `GL_EXT_YUV_target`: bilinear through the texture unit from a single NV12
+/// import, one fetch per pixel.
 pub(crate) const NV_RGBA_Y2Y_FRAGMENT: &str = concat!(
     nv_y2y_header!(),
     "void main() {\n",
@@ -622,14 +563,11 @@ pub(crate) const NV_RGBA_BILINEAR_INT8_FRAGMENT: &str = concat!(
 );
 
 // ---------------------------------------------------------------------------
-// Packed sources from an R8 view of the buffer. No GPU texel format holds a
-// packed 24-bit pixel, so the buffer is presented as one R8 texture
-// `row_stride` texels wide and `height` rows tall, and each pixel is assembled
-// from its bytes. Taps go through `texture()` at texel centres rather than
-// `texelFetch`: same bytes under NEAREST, and Vivante GC7000UL runs it about
-// 1.8x faster. A header supplies `src_px(x, y)`, the exact pixel, and
-// `src_col(x, v)`, the pixel's bytes blended between rows by a LINEAR sampler;
-// the sampling bodies below are shared by every header.
+// Packed sources from an R8 view of the buffer: one R8 texture `row_stride`
+// texels wide and `height` rows tall, each pixel assembled from its bytes
+// through `texture()` taps at texel centres. A header supplies `src_px(x, y)`,
+// the exact pixel, and `src_col(x, v)`, the pixel's bytes blended between rows
+// by a LINEAR sampler; the sampling bodies below are shared by every header.
 
 /// Declarations every packed R8-view program shares: the layout uniforms.
 macro_rules! packed_r8_uniforms {
@@ -642,7 +580,7 @@ uniform ivec2 img_size;
 // Reciprocal of the R8 texture's size: (row stride in bytes, rows).
 uniform vec2 inv_tex;
 // Inclusive texel bounds (x0, y0, x1, y1) of the source crop: every tap is
-// clamped to them, so a crop never reads pixels from outside itself.
+// clamped to them.
 uniform ivec4 src_rect;
 "
     };
@@ -666,9 +604,7 @@ vec3 src_px(int x, int y) {
 }
 
 // Under LINEAR filtering, at texture row coordinate `v`. Each tap sits 1/1024
-// texel right of its byte's centre so the horizontal weight quantizes to zero:
-// a tap computed exactly at the centre can land a hair left of it and blend
-// in a fraction of the previous byte, which belongs to another channel.
+// texel right of its byte's centre.
 vec3 src_col(int x, float v) {
     float b = float(x * 3) + 0.5 + 1.0 / 1024.0;
     return vec3(texture(src, vec2(b * inv_tex.x, v)).r,
@@ -682,7 +618,7 @@ vec3 src_col(int x, float v) {
 }
 
 /// YUYV luma only, for a Grey destination: each pixel's Y byte (byte `2x`),
-/// range-expanded as the CPU's luma copy does, in every channel.
+/// range-expanded, in every channel.
 macro_rules! yuyv_luma_r8_header {
     () => {
         concat!(
@@ -704,8 +640,8 @@ vec3 src_px(int x, int y) {
     return luma(texture(src, vec2(b * inv_tex.x, (float(y) + 0.5) * inv_tex.y)).r);
 }
 
-// Under LINEAR filtering, at texture row coordinate `v`, nudged off the byte
-// centre as in the packed-RGB header so no chroma byte blends in.
+// Under LINEAR filtering, at texture row coordinate `v`, with each tap 1/1024
+// texel right of its byte's centre.
 vec3 src_col(int x, float v) {
     float b = float(x * 2) + 0.5 + 1.0 / 1024.0;
     return luma(texture(src, vec2(b * inv_tex.x, v)).r);
@@ -728,7 +664,7 @@ macro_rules! packed_r8_nearest_body {
 
 /// `main()` statements of the shader-filtered bilinear packed programs:
 /// half-pixel-centred bilinear from four exact pixels, every tap clamped to
-/// the crop — the convention of the NV bilinear programs.
+/// the crop.
 macro_rules! packed_r8_bilinear_body {
     () => {
         "    vec2 p = tc * vec2(img_size) - 0.5;
@@ -743,10 +679,9 @@ macro_rules! packed_r8_bilinear_body {
 }
 
 /// `main()` statements of the hardware-assisted bilinear packed programs:
-/// the texture unit's LINEAR filter blends rows within each byte column, the
-/// shader blends the two columns, half the fetches of the shader-filtered
-/// program. The row coordinate is clamped to the crop's row centres so the
-/// filter never reaches a row outside it.
+/// the texture unit's LINEAR filter blends rows within each byte column and
+/// the shader blends the two columns. The row coordinate is clamped to the
+/// crop's row centres.
 macro_rules! packed_r8_hw_bilinear_body {
     () => {
         "    vec2 p = tc * vec2(img_size) - 0.5;
@@ -778,8 +713,7 @@ pub(crate) const RGB_R8_RGBA_INT8_FRAGMENT: &str = concat!(
 );
 
 /// Packed-RGB->RGBA fragment shader for draws that rescale, filtered in the
-/// shader: the exact program, and the fallback when the texture units may
-/// not filter.
+/// shader.
 pub(crate) const RGB_R8_RGBA_BILINEAR_FRAGMENT: &str = concat!(
     rgb_r8_header!(),
     "void main() {\n",
@@ -868,9 +802,7 @@ pub(crate) const YUYV_LUMA_R8_HW_BILINEAR_INT8_FRAGMENT: &str = concat!(
 
 // ---------------------------------------------------------------------------
 // RGBA -> Grey: the second pass of a colour source into a Grey destination.
-// The first pass rendered the converted image into an RGBA texture at the
-// destination's size; this one samples it 1:1 (NEAREST) and writes BT.601
-// full-range luma, the weights the CPU's RGB -> Grey conversion uses.
+// Samples the first pass's RGBA texture 1:1 and writes BT.601 full-range luma.
 
 macro_rules! luma_2d_header {
     () => {
@@ -911,20 +843,12 @@ pub(crate) const LUMA_2D_INT8_FRAGMENT: &str = concat!(
 
 #[cfg(test)]
 mod nv_shader_golden {
-    /// The golden with CRLF normalized to LF. A checkout made with
-    /// `core.autocrlf=true` (the Git for Windows default) gives
-    /// `include_str!` CRLF line endings while rustc normalizes the string
-    /// literal to LF. `.gitattributes` pins `*.glsl` to LF; this covers
-    /// checkouts made before that attribute existed.
+    /// The golden with CRLF normalized to LF.
     fn golden(src: &str) -> String {
         src.replace("\r\n", "\n")
     }
 
-    /// The NV->RGBA shader source is validated on-target (V3D/Mali/Vivante/Tegra);
-    /// its bytes must not drift. `golden/nv_rgba_linux.glsl` is the frozen
-    /// reference. This test runs on every platform (the module is uncfg'd), so
-    /// byte-identity is enforced on the macOS and Windows hosts too, not just
-    /// the Linux lane.
+    /// The NV->RGBA shader sources match their `golden/*.glsl` references byte for byte.
     #[test]
     fn nv_fragment_byte_identical() {
         assert_eq!(
@@ -949,8 +873,7 @@ mod nv_shader_golden {
         );
     }
 
-    /// The packed-RGB R8 shader sources, validated on-target (Vivante,
-    /// Mali, V3D, Adreno), frozen like the NV ones.
+    /// The packed-RGB R8 shader sources match their goldens byte for byte.
     #[test]
     fn rgb_r8_fragment_byte_identical() {
         assert_eq!(
@@ -970,7 +893,7 @@ mod nv_shader_golden {
         );
     }
 
-    /// The YUYV luma and RGBA->Grey shader sources, frozen like the others.
+    /// The YUYV luma and RGBA->Grey shader sources match their goldens byte for byte.
     #[test]
     fn grey_fragment_byte_identical() {
         assert_eq!(

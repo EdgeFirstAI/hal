@@ -1,8 +1,7 @@
 #!/bin/bash
 # Cross-compile benchmarks with OpenCV for ARM64 using Yocto SDK
 #
-# This script is ONLY needed for cross-compilation from x86_64.
-# For native ARM64 builds (e.g., GitHub Actions ubuntu-22.04-arm), just run:
+# For native ARM64 builds run:
 #   cargo build --examples -p edgefirst-image --features opencv --release
 #
 # Usage:
@@ -44,7 +43,6 @@ fi
 echo "Using SDK: $SDK_ROOT"
 echo "Environment script: $ENV_SCRIPT"
 
-# Source the SDK environment
 source "$ENV_SCRIPT"
 
 # Extract compiler binary (first word) and flags (rest)
@@ -74,7 +72,7 @@ export AR="${AR:-${CC_BIN%gcc}ar}"
 export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER="$CC_PATH"
 export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=--sysroot=$SDKTARGETSYSROOT"
 
-# OpenCV manual linking (avoids pkg-config issues with missing optional modules)
+# OpenCV manual linking
 export OPENCV_LINK_LIBS="opencv_imgproc,opencv_core"
 export OPENCV_LINK_PATHS="$SDKTARGETSYSROOT/usr/lib"
 export OPENCV_INCLUDE_PATHS="$SDKTARGETSYSROOT/usr/include/opencv4"

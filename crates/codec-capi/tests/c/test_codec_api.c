@@ -30,8 +30,7 @@ static int has(const ef_codec_capabilities *list, uint32_t codec, uint32_t direc
     return 0;
 }
 
-/* A gradient, so an encoder has something to code and a decoder something
-   to get wrong. */
+/* Fills `t` with a gradient. */
 static int fill(ef_tensor *t, unsigned seed) {
     ef_tensor_view v = { 0 };
     if (ef_tensor_map(t, EF_CPU_ACCESS_WRITE, &v) != 0) return 0;
@@ -85,7 +84,7 @@ static int jpeg_round_trip(void) {
     if (ef_image_decoder_decode_into(d, jpeg, len, dst) != 0) FAIL("decoding the JPEG");
     if (strcmp(ef_tensor_format(dst), "NV12") != 0) FAIL("decoded as %s", ef_tensor_format(dst));
 
-    /* Bytes that are not an image are malformed data, not an I/O failure. */
+    /* Bytes that are not an image are EBADMSG. */
     static const uint8_t junk[16] = { 0xff, 0xd8, 0xff, 0x00 };
     if (ef_image_decoder_decode_into(d, junk, sizeof junk, dst) != EBADMSG)
         FAIL("a truncated JPEG was not EBADMSG");

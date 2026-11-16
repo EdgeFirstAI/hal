@@ -3,21 +3,14 @@
 
 //! HAL V4L2 mem2mem JPEG (e.g. mxc-jpeg) → NV12 + HAL OpenGL letterbox.
 //!
-//! Forces `EDGEFIRST_FORCE_BACKEND=opengl` and leaves V4L2 enabled. For the
-//! i.MX 95 hardware-decode table:
+//! Forces `EDGEFIRST_FORCE_BACKEND=opengl` and leaves V4L2 enabled.
 //!
-//! - `--decode-only` — V4L2 JPEG → native NV*/GREY, no convert: the row for
-//!   consumers that take NV12 directly.
-//! - `--full-res-convert` — adds the full-resolution NV*→RGB GPU convert:
-//!   the full cost for RGB consumers. The mxc-jpeg block does no
-//!   colour-space conversion (its RGB capture formats serve only
-//!   RGB-encoded JPEGs), so this second pass is not optional for RGB.
+//! - `--decode-only`: V4L2 JPEG → native NV*/GREY, no convert.
+//! - `--full-res-convert`: adds the full-resolution NV*→RGB GPU convert.
 //!   `hal_v4l2_cpu` is the CPU-convert counterpart. The decode/convert
 //!   split is reported per run.
 //!
-//! Startup asserts a V4L2 JPEG device is actually present so the arm fails
-//! loudly off-target instead of silently publishing CPU-decode numbers under
-//! a hardware label.
+//! Startup asserts a V4L2 JPEG device is present.
 
 use clap::Parser;
 use edgefirst_bench_common::{run_hal_module, BenchArgs, DecodeFmt, HalModuleConfig};
@@ -29,10 +22,6 @@ fn main() -> anyhow::Result<()> {
         "no V4L2 JPEG decoder device found; refusing to run the hardware arm \
          on the CPU decoder"
     );
-    // A fused output preference bypasses hardware decode entirely
-    // (`allow_hw = output_fmt == native_fmt` in the codec), so anything but
-    // `native` would silently benchmark the CPU decoder under this label.
-    // Guards the flag AND the EDGEFIRST_BENCH_DECODE_FMT env fallback.
     anyhow::ensure!(
         args.decode_fmt == DecodeFmt::Native,
         "hardware arms require --decode-fmt native (fused outputs route to \

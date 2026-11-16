@@ -4,12 +4,8 @@
 //! Decode → Letterbox pipeline benchmark measuring JPEG decode into a strided
 //! input tensor followed by GPU/CPU letterbox convert to 640×640 output.
 //!
-//! This benchmark measures the full vision preprocessing pipeline:
 //! 1. JPEG decode into an oversized (strided) input tensor
 //! 2. Letterbox convert into model-sized output (640×640)
-//!
-//! Results are compared against the existing `pipeline_benchmark` baselines
-//! which convert from non-strided (tight) inputs.
 //!
 //! ## Run
 //! ```bash
@@ -64,7 +60,7 @@ fn bench_decode_strided(suite: &mut BenchSuite) {
 
     let mut decoder = ImageDecoder::new();
 
-    // Use an oversized tensor to demonstrate strided decode
+    // An oversized tensor, for a strided decode.
     let max_w = TEST_IMAGES.iter().map(|i| i.width).max().unwrap();
     let max_h = TEST_IMAGES.iter().map(|i| i.height).max().unwrap();
     let mut input = TensorDyn::image(
@@ -98,9 +94,8 @@ fn bench_decode_strided(suite: &mut BenchSuite) {
 ///
 /// `decode_fmt` is what the JPEG decodes to: `Nv12`, the native layout,
 /// leaves the colour conversion to the convert; `Rgb` fuses it into the
-/// decode (`ImageDecoder::set_output_format`), as the profiler does where no
-/// hardware decoder takes the frame. The NV12 cells keep their historical
-/// names; the fused ones are prefixed `rgb_`.
+/// decode (`ImageDecoder::set_output_format`). The NV12 cells are unprefixed;
+/// the fused ones are prefixed `rgb_`.
 fn bench_decode_convert(
     proc: &mut ImageProcessor,
     decode_fmt: PixelFormat,
@@ -151,7 +146,7 @@ fn bench_decode_convert(
 
     for img in TEST_IMAGES {
         let data = load_image_data(img.filename);
-        // Full-source letterbox: placement derived internally by `Crop::resolve`.
+        // Full-source letterbox.
         let crop = Crop::letterbox([114, 114, 114, 255]);
 
         // Warmup all paths
@@ -222,7 +217,7 @@ fn main() {
 
     let mut suite = BenchSuite::from_args();
 
-    // Decode-only benchmarks (no ImageProcessor needed)
+    // Decode-only benchmarks
     bench_decode_strided(&mut suite);
 
     // Full pipeline benchmarks

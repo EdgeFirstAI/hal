@@ -1,25 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! A `Mem` NV12 source at a plane offset -- a frame inside a larger buffer,
-//! the shape `interop::apply_plane_offset` hands back -- reaches the GL
-//! engine's NV R8 upload, since it has no zero-copy import.
+//! A `Mem` NV12 source at a plane offset (a frame inside a larger buffer)
+//! reaches the GL engine's NV R8 upload.
 //!
-//! `map()` starts at the plane offset on every backing, so the upload must
-//! read the mapped window from its own start. It used to add `plane_offset`
-//! a second time on top of the map, which read frame `n` at twice its
-//! offset -- or, as here, refused the window as too short -- so an offset NV
-//! source never converted its own frame through GL.
-//!
-//! A zero-copy NV source whose R8 import is refused — by the ANGLE leaves'
-//! `refuse_offset_source`, or by Mali's unaligned-plane-offset rule — now
-//! reaches this same upload: the import's failure arm used to fall to
-//! `draw_src_texture`, which has no NV arm, so `ImageProcessor::convert`
-//! converted on the CPU (issue #166). This file pins the upload itself;
-//! `offset_source_view_alignment.rs` pins the route into it.
-//!
-//! A `GLProcessorThreaded` is driven directly: `ImageProcessor::convert`
-//! would hide the bug behind its CPU fallback.
+//! A `GLProcessorThreaded` is driven directly.
 
 #![cfg(all(
     any(
@@ -38,8 +23,7 @@ use edgefirst_tensor::{CpuAccess, DType, PixelFormat, TensorDyn, TensorMapTrait,
 const W: usize = 32;
 const H: usize = 16;
 const N: usize = 3;
-/// Flat luma per frame, far enough apart that a convert of the wrong frame
-/// cannot pass any tolerance.
+/// Flat luma per frame.
 const LUMA: [u8; N] = [40, 200, 120];
 const CHROMA: u8 = 128;
 
@@ -70,11 +54,9 @@ fn bytes(t: &TensorDyn) -> Vec<u8> {
 #[test]
 fn gl_uploads_an_offset_nv12_frame_from_its_own_offset_not_twice_it() {
     let require_gl = std::env::var("HAL_TEST_REQUIRE_GL").is_ok_and(|v| v == "1");
-    // The macOS coverage lane runs pass 1 with the ANGLE dlopen gate closed;
-    // the same guard `gl_backend_available_canary` carries.
     #[cfg(target_os = "macos")]
     if require_gl && std::env::var_os("HAL_TEST_ALLOW_DLOPEN_ANGLE").is_none() {
-        skip("ANGLE dlopen gate closed (coverage pass 1)");
+        skip("ANGLE dlopen gate closed");
         return;
     }
     let mut gl = match GLProcessorThreaded::new(None) {
@@ -90,10 +72,8 @@ fn gl_uploads_an_offset_nv12_frame_from_its_own_offset_not_twice_it() {
     };
 
     // `N` NV12 frames back to back in one buffer, each a flat-luma frame
-    // with neutral chroma, so frame `n` converts to a flat grey near
-    // `LUMA[n]`. The tensor is given one frame's geometry and a plane
-    // offset onto frame 1, exactly as a capsule consumer sees a window of a
-    // producer's buffer.
+    // with neutral chroma. The tensor is given one frame's geometry and a
+    // plane offset onto frame 1.
     let combined_h = H * 3 / 2;
     let elem = combined_h * W;
     let mut src = TensorDyn::new(&[N * elem], DType::U8, Some(TensorMemory::Mem), None)
@@ -111,12 +91,7 @@ fn gl_uploads_an_offset_nv12_frame_from_its_own_offset_not_twice_it() {
     src.set_format(PixelFormat::Nv12).expect("nv12 format");
     src.set_plane_offset(elem);
     assert_eq!(src.plane_offset(), Some(elem), "precondition: frame 1");
-    // Tag BT.601 full-range so the new frame-1 assertion below can compare
-    // the reference's R byte directly to `LUMA`. Without a tag, the
-    // colorimetry heuristic resolves an untagged SD tensor to BT.601
-    // *limited*, which expands luma (e.g. 200 -> ~215) and would make that
-    // assertion misfire even on a correct read -- the same reason
-    // `odd_dim_cpu.rs`'s analytic reference tags full-range.
+    // Tags the source BT.601 full-range.
     src.set_colorimetry(Some(
         edgefirst_tensor::Colorimetry::default()
             .with_encoding(edgefirst_tensor::ColorEncoding::Bt601)
@@ -128,9 +103,6 @@ fn gl_uploads_an_offset_nv12_frame_from_its_own_offset_not_twice_it() {
         .convert(&src, &mut reference, None)
         .expect("CPU reference convert");
     let want = bytes(&reference);
-    // Both converters read through `map()`, so agreement alone cannot tell
-    // frame 1 from frame 0. The frames are 80 luma apart: the reference's
-    // first pixel must be near LUMA[1], not LUMA[0].
     assert!(
         want[0].abs_diff(LUMA[1]) <= 8,
         "the CPU reference read frame {} (luma {}) instead of frame 1 (luma {})",
@@ -144,8 +116,6 @@ fn gl_uploads_an_offset_nv12_frame_from_its_own_offset_not_twice_it() {
         .expect("GL convert of an offset NV12 frame");
     let got = bytes(&dst);
 
-    // The colour conversion may round differently on the GPU; the frames
-    // are 80 luma apart, so a small tolerance still tells them apart.
     const TOLERANCE: u8 = 8;
     for (i, (g, w)) in got.iter().zip(&want).enumerate() {
         assert!(

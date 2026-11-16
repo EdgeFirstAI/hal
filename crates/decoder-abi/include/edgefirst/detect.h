@@ -9,9 +9,8 @@
  * SPDX-License-Identifier: Apache-2.0
  * Copyright (c) 2026 Au-Zone Technologies. All Rights Reserved.
  *
- * Plain values shared by decoder, image, and tracker. There is no
- * libedgefirst_detect.so — include this header; do not link a detect library.
- * Layout matches crates/decoder-abi.
+ * Plain values shared by decoder, image, and tracker. Header-only: there is
+ * no libedgefirst_detect.so. Layout matches crates/decoder-abi.
  */
 
 #include <stdint.h>
@@ -23,7 +22,7 @@ extern "C" {
 /**
  * A detection: a normalized box, a score, and a label index.
  *
- * Coordinates are normalized to `[0, 1]` against the *model input*, not the
+ * Coordinates are normalized to `[0, 1]` against the model input, not the
  * source image.
  */
 typedef struct ef_detect_box {
@@ -56,18 +55,15 @@ typedef struct ef_segmentation {
 /**
  * How overlapping detections from neighbouring tiles are merged.
  *
- * metric: 0 = IoU, 1 = Intersection-over-Smaller (default for seam splits).
+ * metric: 0 = IoU, 1 = Intersection-over-Smaller (default).
  * mode:   0 = keep-best (default): the highest-scoring box of each matched
  *         group is kept and the boxes it matched are dropped.
  *         1 = union: the group becomes its enclosing union carrying the max
- *         score (the original GREEDYNMM merge; about 0.05 AP50 worse on
- *         every frame of the Ocean Cleanup ADIS 4K validation, TOP2-836).
+ *         score.
  *
- * A zero-initialised struct is NOT the library default: only `mode`'s
- * default is 0. `metric` defaults to 1 (IoS), so an all-zero struct selects
- * IoU -- the metric that leaves a seam-split object as two detections, which
- * is the one thing tiled merging exists to avoid. Always fill the struct with
- * `ef_merge_config_default` and then override what you need.
+ * A zero-initialised struct is not the library default: `metric` defaults to
+ * 1 (IoS), so an all-zero struct selects IoU. Fill the struct with
+ * `ef_merge_config_default`.
  */
 typedef struct ef_merge_config {
     uint32_t metric;
@@ -185,9 +181,9 @@ typedef uint32_t ef_interpolation;
 /**
  * A model's input preprocessing as plain values: produced by
  * `ef_model_config_preprocessing` (libedgefirst_decoder) and consumed by
- * `ef_convert_options_from_spec` (libedgefirst_image), so neither library
- * links the other. Start a hand-built one from `ef_preprocess_spec_default()`:
- * a zeroed struct has a zero `std` and is refused.
+ * `ef_convert_options_from_spec` (libedgefirst_image). Start a hand-built one
+ * from `ef_preprocess_spec_default()`: a zeroed struct has a zero `std` and is
+ * refused.
  *
  * `mean` and `std` normalize as `(x - mean) / std` on 0-255 values (ImageNet
  * is mean 123.675,116.28,103.53, std 58.395,57.12,57.375). `pad` is in the

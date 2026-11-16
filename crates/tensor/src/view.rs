@@ -3,18 +3,9 @@
 
 //! One CPU-access window, for every backend.
 //!
-//! Replaces the six per-backend `*Map<T>` types. They differed in how they
-//! *obtained* an address — `mmap`, `IOSurfaceLock`, `glMapBufferRange`,
-//! `AHardwareBuffer_lock` — but once obtained they all carried the same five
-//! things: a base pointer, the shape, an offset, an optional padded extent, and
-//! whether writes are allowed. [`HostPin`] already absorbs the first and third
-//! (its address is offset-adjusted, its keepalive releases whatever the backend
-//! acquired), which leaves this type holding the other three.
-//!
-//! The acquisition difference does not need a type per backend, only a
-//! constructor per backend: persistent ones hand over a real pin, lock-scoped
-//! ones (PBO, AHardwareBuffer) hand over a pin whose keepalive unlocks on drop.
-//! Either way what the caller gets is the same window.
+//! [`HostView`] pairs a [`HostPin`] (the offset-adjusted base address, and the
+//! keepalive that releases the backend's mapping or lock) with the shape, an
+//! optional padded extent, and whether writes are allowed.
 
 use crate::{pin::HostPin, Num, TensorMapTrait};
 use std::fmt;
@@ -22,17 +13,14 @@ use std::marker::PhantomData;
 
 /// A CPU-accessible window onto a tensor's memory.
 pub struct HostView<'a, T> {
-    /// `None` after [`unmap`](TensorMapTrait::unmap): dropping the pin is what
-    /// releases the backend's mapping or lock, so clearing it *is* the unmap.
+    /// `None` after [`unmap`](TensorMapTrait::unmap); dropping the pin releases
+    /// the backend's mapping or lock.
     pin: Option<HostPin<'a>>,
     shape: Vec<usize>,
     /// When `Some(bytes)`, expose `bytes / size_of::<T>()` elements instead of
-    /// the shape's product — the padded window a stride-aligned image needs so
-    /// CPU row iteration can honour `row_stride` without running past the end.
+    /// the shape's product: the padded window of a stride-aligned image.
     byte_size_override: Option<usize>,
-    /// Whether `as_mut_slice` is permitted. A read-only map keeps the mapping
-    /// itself readable/writable; this enforces the API contract uniformly, as
-    /// the per-backend maps did.
+    /// Whether `as_mut_slice` is permitted.
     writable: bool,
     _marker: PhantomData<T>,
 }
@@ -41,7 +29,7 @@ impl<'a, T> HostView<'a, T>
 where
     T: Num + Clone + fmt::Debug,
 {
-    #[allow(dead_code)] // wired when the first backend migrates
+    #[allow(dead_code)]
     pub(crate) fn new(
         pin: HostPin<'a>,
         shape: Vec<usize>,
@@ -57,11 +45,7 @@ where
         }
     }
 
-    /// Elements exposed by `as_slice`.
-    ///
-    /// Clamped to what the pin actually maps, so a `byte_size_override` larger
-    /// than the mapping cannot produce an out-of-bounds slice — the override is
-    /// a request to expose padding, never permission to invent it.
+    /// Elements exposed by `as_slice`, clamped to what the pin maps.
     fn len_elems(&self) -> usize {
         let Some(pin) = self.pin.as_ref() else {
             return 0;
@@ -77,24 +61,8 @@ where
         requested.min(pin.len() / elem)
     }
 
-    /// Re-view this mapping as raw bytes, type-erased.
-    ///
-    /// Keeps the same pin (so the same platform sync bracket still runs on
-    /// [`Drop`]) and the same writability; only the shape bookkeeping changes,
-    /// from "N elements of `T`" to "this many bytes". Computed directly in
-    /// bytes rather than by calling [`len_elems`](Self::len_elems) and
-    /// multiplying back by `size_of::<T>()`, which would round a
-    /// non-multiple-of-`size_of::<T>()` `byte_size_override` down twice.
-    ///
-    /// `pub(crate)`: this is plumbing for `static`'s `TensorDyn::map_bytes`
-    /// (`tensor_dyn/static_backend.rs`), the type-erased byte-level guard a
-    /// C ABI consumer needs (it does not know `T` and cannot call the typed
-    /// `map_with`); it is not meant as a public entry point in its own
-    /// right. `static`-only: `dynamic` never has a typed `HostView<T>` to
-    /// re-view, since its own `TensorDyn::map_bytes` builds a byte view
-    /// straight from `ef_tensor_map` -- including for a PBO, whose storage
-    /// lives inside `libedgefirst_tensor.so` since Stage B and is mapped by
-    /// the library rather than by a `PboTensor<T>` on this side.
+    /// Re-view this mapping as raw bytes, type-erased. Keeps the same pin and
+    /// the same writability; the shape becomes the byte count.
     #[cfg(not(edgefirst_tensor_dynamic))]
     pub(crate) fn into_bytes(self) -> HostView<'a, u8> {
         let elem = std::mem::size_of::<T>().max(1);
@@ -125,8 +93,7 @@ where
     }
 
     fn unmap(&mut self) {
-        // Idempotent: the pin's keepalive releases exactly once, when the last
-        // clone drops, so a second unmap is a no-op rather than a double free.
+        // Idempotent: a second unmap is a no-op.
         self.pin = None;
     }
 
@@ -136,8 +103,7 @@ where
 
     fn as_slice(&self) -> &[T] {
         let Some(pin) = self.pin.as_ref() else {
-            // Unmapped. The per-backend maps dereferenced a stale pointer here;
-            // an empty slice is the safe reading of "there is no window".
+            // Unmapped: an empty slice.
             return &[];
         };
         let len = self.len_elems();
@@ -164,8 +130,8 @@ where
     }
 }
 
-/// Slice access by deref, as the per-backend maps offered: `map.fill(0)` and
-/// `map.iter()` keep working without an explicit `as_slice()`.
+/// Slice access by deref: `map.fill(0)` and `map.iter()` work without an
+/// explicit `as_slice()`.
 impl<T> std::ops::Deref for HostView<'_, T>
 where
     T: Num + Clone + fmt::Debug,
@@ -202,8 +168,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    /// A view over `pin_len` bytes of a 64-element backing, so even a length
-    /// computed wrongly stays inside real memory.
+    /// A view over `pin_len` bytes of a 64-element backing.
     fn view_u32(
         pin_len: usize,
         shape: Vec<usize>,

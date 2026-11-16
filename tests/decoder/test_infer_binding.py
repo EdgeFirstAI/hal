@@ -3,10 +3,7 @@
 
 """Python binding coverage for edgefirst.decoder.infer_ultralytics_schema.
 
-The Rust classifier itself is covered exhaustively by
-crates/decoder/src/infer.rs and crates/decoder-capi/src/infer.rs; this file
-only exercises the PyO3 boundary: argument marshalling and the
-InferError -> ValueError mapping.
+Covers argument marshalling and the InferError -> ValueError mapping.
 """
 
 import json
@@ -35,8 +32,8 @@ FIXTURE_COREML = (
 
 
 def _load_fixture_call_args(path: Path):
-    """Maps a captured Task-0 fixture's JSON onto the binding's call
-    signature: (source, inputs, outputs, metadata)."""
+    """Maps a captured fixture's JSON onto the binding's call signature:
+    (source, inputs, outputs, metadata)."""
     data = json.loads(path.read_text())
 
     def tensor_arg(t):
@@ -60,7 +57,7 @@ def test_infer_ultralytics_schema_yolov8n():
     assert isinstance(result.description, str)
     assert result.description
 
-    # Named fields and positional unpacking must stay interchangeable.
+    # The result unpacks positionally into the values of its named fields.
     schema, labels, description = result
     assert (schema, labels, description) == (
         result.schema,
@@ -90,9 +87,7 @@ def test_infer_ultralytics_schema_rejects_empty_metadata():
 
 
 def test_infer_ultralytics_schema_labels_are_index_ordered():
-    """`len(labels) == 80` alone passes on a shuffled or wrongly-keyed
-    `names` dict; the order is the whole contract, since `decode()` returns
-    class indices into this list."""
+    """The inferred labels are ordered by class index."""
     source, inputs, outputs, metadata = _load_fixture_call_args(FIXTURE)
     labels = ef.infer_ultralytics_schema(source, inputs, outputs, metadata).labels
     assert labels[0] == "person"
@@ -101,9 +96,7 @@ def test_infer_ultralytics_schema_labels_are_index_ordered():
 
 
 def test_inferred_schema_builds_a_decoder():
-    """The point of the API: the JSON it returns must be something this same
-    package accepts back as a decoder configuration. Nothing else in the
-    Python suite closes that loop."""
+    """The inferred schema is accepted back as a decoder configuration."""
     source, inputs, outputs, metadata = _load_fixture_call_args(FIXTURE)
     schema = ef.infer_ultralytics_schema(source, inputs, outputs, metadata).schema
     decoder = ef.Decoder(schema, score_threshold=0.25, iou_threshold=0.45)
@@ -124,9 +117,7 @@ def test_inferred_segmentation_schema_carries_protos():
 
 
 def test_quantized_output_tuple_is_accepted():
-    """No captured fixture is quantized at the boundary -- every Ultralytics
-    export, int8 included, exposes float32 I/O -- so the 4-tuple quantization
-    slot has no coverage from fixtures alone."""
+    """A 4-tuple output spec carries quantization into the schema."""
     metadata = {
         "names": "{0: 'person', 1: 'bicycle'}",
         "task": "detect",
@@ -136,7 +127,6 @@ def test_quantized_output_tuple_is_accepted():
     outputs = [("output0", [1, 6, 8400], "int8", ([0.02], [-5]))]
     schema = ef.infer_ultralytics_schema("tflite", inputs, outputs, metadata).schema
     quant = schema["outputs"][0]["quantization"]
-    # Scales cross as f32, so a Python float does not survive exactly.
     assert quant["scale"] == pytest.approx([0.02], rel=1e-6)
     assert quant["zero_point"] == [-5]
     # Emitted with the tensor dtype name, whichever spelling came in.
@@ -165,9 +155,7 @@ def test_unknown_dtype_names_every_accepted_spelling():
 
 
 def test_bare_and_explicit_none_quantization_agree():
-    """A 3-tuple and a 4-tuple with `None` both mean unquantized. The binding
-    distinguishes them by tuple arity alone, so the equivalence is worth
-    pinning."""
+    """A 3-tuple and a 4-tuple with `None` both mean unquantized."""
     metadata = {"names": "{0: 'a', 1: 'b'}", "task": "detect", "end2end": "False"}
     inputs = [("images", [1, 3, 640, 640], "float32")]
     bare = ef.infer_ultralytics_schema(
@@ -180,8 +168,7 @@ def test_bare_and_explicit_none_quantization_agree():
 
 
 def test_input_tensors_accept_the_quantization_slot():
-    """`inputs` and `outputs` take the same tensor-spec shape, so a caller
-    can build both from one runtime description."""
+    """`inputs` take the same tensor-spec shape as `outputs`."""
     metadata = {"names": "{0: 'a', 1: 'b'}", "task": "detect", "end2end": "False"}
     outputs = [("output0", [1, 6, 8400], "float32")]
     three = ef.infer_ultralytics_schema(
@@ -232,9 +219,7 @@ def test_unknown_dtype_and_source_strings_are_rejected():
 
 
 def test_dynamic_shape_dimensions_are_refused_by_name():
-    """A model exported with `dynamic=True` reports a symbolic axis (ONNX)
-    or -1 (TFLite). Both are refused with a ValueError naming the tensor and
-    axis, rather than a TypeError/OverflowError out of argument conversion."""
+    """A symbolic or -1 dimension raises ValueError naming the tensor and axis."""
     metadata = {"names": "{0: 'a', 1: 'b'}", "task": "detect", "end2end": "False"}
     outputs = [("output0", [1, 6, 8400], "float32")]
     for dynamic in (-1, "batch"):

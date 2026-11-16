@@ -16,9 +16,6 @@ mod resize;
 mod simd;
 mod tests;
 
-// bilinear_dot removed — masks.rs now uses slice-native bilinear_dot_slice
-// closure-based kernel, invoked through the local dtype dispatch below.
-
 /// Resolved colorimetry parameters for a format conversion, computed once at
 /// the dispatch site (`convert_impl`) from the appropriate tensor:
 /// - YUV→RGB conversions use the **source** tensor's colorimetry.
@@ -33,10 +30,8 @@ pub(crate) struct ColorParams {
     pub matrix: yuv::YuvStandardMatrix,
     /// Range resolved from the YUV side (src for decode, dst for encode).
     pub range: yuv::YuvRange,
-    /// The same matrix/range in HAL's own terms, so the hand-rolled fixed-point
-    /// encoders draw their `(kr, kb)` weights and luma/chroma swings from the
-    /// canonical [`edgefirst_tensor::colorimetry`] source rather than a private
-    /// duplicate table.
+    /// The same matrix/range in HAL's own terms; the hand-rolled fixed-point
+    /// encoders draw their `(kr, kb)` weights and luma/chroma swings from them.
     pub encoding: edgefirst_tensor::ColorEncoding,
     pub range_kind: edgefirst_tensor::ColorRange,
     /// True when the **source** tensor's resolved range is full (decode-side
@@ -56,91 +51,51 @@ pub struct CPUProcessor {
     colors: [[u8; 4]; 20],
     /// Bounding-box outline thickness in pixels; never 0.
     box_line_width: usize,
-    /// Reusable scratch tensor for the U8→float widen path.
-    ///
-    /// Holds a U8 image in the destination's pixel format and dimensions.
-    /// Reallocated only when the format or dimensions change, amortising
-    /// the heap allocation across repeated same-size conversions.
+    /// Reusable scratch tensor for the U8→float widen path. Holds a U8 image
+    /// in the destination's pixel format and dimensions; reallocated when the
+    /// format or dimensions change.
     widen_scratch: Option<TensorDyn>,
-    /// Reusable scratch for de-striding a padded source before resize.
-    ///
-    /// `fast_image_resize` needs a tightly-packed input; a padded source
-    /// (64-aligned stride from codec decode / `create_image`) is copied here
-    /// row-by-row first. Kept on the processor so the steady-state resize loop
-    /// reuses the allocation instead of a fresh `Vec` per call (the stride
-    /// alignment in this release makes that de-stride copy fire far more often).
+    /// Reusable scratch for de-striding a padded source before resize: the
+    /// source is copied here row-by-row into a tightly-packed buffer.
     resize_destride_scratch: Vec<u8>,
-    /// Reusable scratch for de-striding a padded resize *destination* before
-    /// resize.
-    ///
-    /// `fast_image_resize` needs a tightly-packed output buffer; a padded
-    /// destination (a DMA pitch-aligned tensor, or a `view()` narrower than
-    /// its parent's row stride) is resized into this tight scratch first,
-    /// then copied back into the real destination row-by-row at its true
-    /// stride. Kept on the processor so the steady-state resize loop reuses
-    /// the allocation instead of a fresh `Vec` per call — mirrors
-    /// `resize_destride_scratch` on the source side.
+    /// Reusable scratch for a padded resize destination: the resize writes
+    /// this tight buffer, which is then copied into the destination
+    /// row-by-row at its stride.
     resize_dst_destride_scratch: Vec<u8>,
-    /// Reusable cache-resident scratch for the strip-fused NV→planar path
-    /// (`convert_nv_to_planar_fused`): holds a single row strip of packed RGB
-    /// (`STRIP_ROWS * width * 3` bytes). Keeping it on the processor avoids a
-    /// per-frame allocation and lets each strip stay hot in L2 between the YUV
-    /// decode and the deinterleave. Grown on demand; never shrunk.
+    /// Reusable scratch for the strip-fused NV→planar path
+    /// (`convert_nv_to_planar_fused`): one row strip of packed RGB
+    /// (`STRIP_ROWS * width * 3` bytes). Grown on demand; never shrunk.
     nv_strip_scratch: Vec<u8>,
-    /// Reusable cache-resident scratch for the fused NV→planar path's
-    /// **region** case: a tight (stride == width) copy of the current
-    /// strip's luma rows, starting at column 0. The `yuv` crate's row
-    /// iteration processes fixed-`stride`-sized chunks internally, using
-    /// only the first `width` bytes of each — feeding it a slice that starts
-    /// at a mid-row column offset (a source-crop `region` with a nonzero
-    /// `left`) reads past the *source* buffer's true end for the region's
-    /// last row when that row is also the source's last row (the unused
-    /// chunk tail has no next row to alias into there). Packing each row
-    /// into a `stride == width` buffer first sidesteps that read. Unused
-    /// (and zero-cost) for any row-aligned read (`region.left == 0`,
-    /// including the whole-frame `region: None` case): with no column
-    /// shift, every row chunk the crate sees is a real, fully-owned source
-    /// row, so those reads stay fully zero-copy. Grown on demand; never
+    /// Reusable scratch for the fused NV→planar path's region case: a tight
+    /// (stride == width) copy of the current strip's luma rows, starting at
+    /// column 0. Unused when `region.left == 0`. Grown on demand; never
     /// shrunk.
     nv_strip_y_pack: Vec<u8>,
     /// Same as [`Self::nv_strip_y_pack`], for the chroma (UV) rows.
     nv_strip_uv_pack: Vec<u8>,
     /// Test-only counter of `convert` calls that took the fused NV→planar
-    /// strip path (`convert_nv_to_planar_fused`), incremented at the gate in
-    /// `convert_u8`. Exists only under `#[cfg(test)]` — a field that's
-    /// written but (outside tests) never read trips clippy's dead-code lint
-    /// on both OS lanes. Read via [`Self::fused_hits`] so path-selection
-    /// tests assert on the actual gate decision rather than on timing.
+    /// strip path (`convert_nv_to_planar_fused`). Read via
+    /// [`Self::fused_hits`].
     #[cfg(test)]
     fused_hits: u64,
     /// Test-only record of the dimensions of the pre-resize intermediate the
     /// most recent `convert_u8` call allocated, or `None` when that call did
-    /// not need one. Lets the allocation-proportionality tests assert that a
-    /// cropped convert sizes its intermediate to the crop rather than to the
-    /// whole frame, without reaching into the allocator. Reset at the top of
-    /// every `convert_u8`.
+    /// not need one. Reset at the top of every `convert_u8`.
     #[cfg(test)]
     last_tmp_dims: Option<(usize, usize)>,
     /// Reusable intermediate buffers for the multi-step convert pipeline
-    /// (pre-resize format-convert and the resized-RGB scratch). Reused across
-    /// frames when the dimensions/format match so the steady-state
-    /// letterbox/resize loop does not reallocate — and `alloc_zeroed`-clear — a
-    /// full-frame buffer per call. The region each consumer reads is always
-    /// fully overwritten first, so reused (non-zeroed) contents are never read.
+    /// (pre-resize format-convert and the resized-RGB scratch), reused across
+    /// frames when the dimensions and format match. Reused contents are not
+    /// zeroed.
     convert_tmp: Option<Tensor<u8>>,
     convert_tmp2: Option<Tensor<u8>>,
-    /// Reusable crop-sized copy of the source's own pixel format, holding the
-    /// halo-grown crop rectangle extracted by [`Self::extract_nv_region`] for
-    /// the crop-sized pre-resize intermediate. Only allocated for a cropped
-    /// convert that takes that path; the whole-frame path never touches it.
+    /// Reusable crop-sized copy in the source's own pixel format, holding the
+    /// halo-grown crop rectangle extracted by [`Self::extract_nv_region`].
+    /// Allocated only for a cropped convert that takes that path.
     convert_src_sub: Option<Tensor<u8>>,
 }
 
-// `CPUProcessor` was `#[derive(Clone)]` before the `widen_scratch` field was
-// added; `TensorDyn` is not `Clone`, so the derive no longer applies. Restore
-// the public `Clone` impl by hand to avoid a breaking API change. The scratch
-// cache is a private allocation amortiser, not part of the logical value, so a
-// clone starts empty rather than sharing or duplicating it.
+// A clone starts with empty scratch buffers.
 impl Clone for CPUProcessor {
     fn clone(&self) -> Self {
         Self {
@@ -176,13 +131,8 @@ impl Default for CPUProcessor {
 
 /// Write the base layer of `dst` before mask rendering.
 ///
-/// This is the terminal fallback: on CPU we have no 2D hardware, so a
-/// direct buffer write is the appropriate primitive. The invariant is that
-/// every call to the CPU draw_* entry points fully initialises dst — we
-/// never rely on "whatever was in the buffer" from the caller.
-///
-/// - `background == Some(bg)` → byte-for-byte copy bg → dst (after shape /
-///   format validation).
+/// - `background == Some(bg)` → copy bg → dst (after shape / format
+///   validation).
 /// - `background == None` → fill dst with 0x00 (transparent black).
 fn prepare_dst_base_cpu(dst: &mut TensorDyn, background: Option<&TensorDyn>) -> Result<()> {
     match background {
@@ -199,12 +149,7 @@ fn prepare_dst_base_cpu(dst: &mut TensorDyn, background: Option<&TensorDyn>) -> 
             }
             let bg_u8 = bg.as_typed::<u8>().ok_or(Error::NotAnImage)?;
             let dst_u8 = dst.as_typed_mut::<u8>().ok_or(Error::NotAnImage)?;
-            // Row-wise, not a flat copy_from_slice: `bg` and `dst` can each
-            // carry their own row_stride (a padded D3D11/GPU-pitch destination
-            // composited from a tight background, or vice versa), so a single
-            // equal-length check is wrong even when the logical shapes match.
-            // `CPUProcessor::copy_image` already walks both sides at their
-            // own pitch via `logical_surface`/`packed_row_pairs`.
+            // Row-wise copy: `bg` and `dst` each have their own row stride.
             CPUProcessor::copy_image(bg_u8, dst_u8)?;
         }
         None => {
@@ -216,13 +161,9 @@ fn prepare_dst_base_cpu(dst: &mut TensorDyn, background: Option<&TensorDyn>) -> 
     Ok(())
 }
 
-/// Whether a source-crop origin is safe for the fused NV→planar strip path
-/// (`convert_nv_to_planar_fused`'s `region` parameter). NV12 (4:2:0)
-/// subsamples chroma both directions, so an odd `top` would desync the
-/// luma/chroma row pairing; NV16 (4:2:2) subsamples only horizontally, so
-/// only `left` must be even; NV24 (4:4:4) carries full-resolution chroma and
-/// has no alignment constraint. Misaligned origins fall through to the
-/// general path rather than snapping or shifting.
+/// Whether a source-crop origin is chroma-aligned for the fused NV→planar
+/// strip path: NV12 (4:2:0) needs an even `left` and `top`, NV16 (4:2:2) an
+/// even `left`, and NV24 (4:4:4) has no constraint.
 fn chroma_alignment_ok(fmt: PixelFormat, r: Rect) -> bool {
     match fmt {
         PixelFormat::Nv12 => r.left.is_multiple_of(2) && r.top.is_multiple_of(2),
@@ -238,14 +179,12 @@ fn row_stride_for(width: usize, fmt: PixelFormat) -> usize {
     match fmt.layout() {
         PixelLayout::Packed => width * fmt.channels(),
         PixelLayout::Planar | PixelLayout::SemiPlanar => width,
-        _ => width, // fallback for non-exhaustive
+        _ => width,
     }
 }
 
 /// Read the effective row stride from a tensor, falling back to the computed
-/// minimum stride if the tensor has no explicit stride set. This correctly
-/// handles tensors with GPU pitch-alignment padding (e.g., from
-/// `ImageProcessor::create_image()` or codec strided decode).
+/// minimum stride if the tensor has no explicit stride set.
 fn tensor_row_stride(tensor: &Tensor<u8>) -> usize {
     tensor.effective_row_stride().unwrap_or_else(|| {
         let w = tensor.width().unwrap_or(0);
@@ -257,12 +196,9 @@ fn tensor_row_stride(tensor: &Tensor<u8>) -> usize {
 /// The `(rows, row_bytes)` of an image tensor's **logical** pixel surface: how
 /// many rows a converter may write, and how many bytes of each row are pixels.
 ///
-/// Everything between `row_bytes` and [`tensor_row_stride`] is off-limits. For
-/// an allocation-padded tensor those bytes are dead padding; for a
-/// [`Tensor::view`](edgefirst_tensor::Tensor::view) destination they are the
-/// **parent image's neighbouring columns**, so a writer that treats the mapped
-/// slice as one flat buffer both mis-places its own rows and corrupts pixels
-/// that are not its to write.
+/// The bytes between `row_bytes` and [`tensor_row_stride`] are padding or, for
+/// a [`Tensor::view`](edgefirst_tensor::Tensor::view) destination, the parent
+/// image's neighbouring columns.
 fn logical_surface(tensor: &Tensor<u8>) -> Result<(usize, usize)> {
     use edgefirst_tensor::PixelLayout;
     let fmt = tensor.format().ok_or(Error::NotAnImage)?;
@@ -272,15 +208,13 @@ fn logical_surface(tensor: &Tensor<u8>) -> Result<(usize, usize)> {
         PixelLayout::Packed => (h, w * fmt.channels()),
         PixelLayout::Planar => (fmt.channels() * h, w),
         PixelLayout::SemiPlanar => (fmt.combined_plane_height(h).unwrap_or(h), w),
-        // `PixelLayout` is non-exhaustive; treat any future layout as one row
-        // per shape row at the tensor's own pitch (see `row_stride_for`).
+        // Any other layout: one row per shape row at the tensor's own pitch.
         _ => (h, row_stride_for(w, fmt)),
     })
 }
 
 /// Iterate `(src_row, dst_row)` pairs over a pair of image surfaces, each row
-/// clipped to its own logical width so neither side's stride padding — nor a
-/// view destination's neighbouring parent pixels — is read or written.
+/// clipped to its own logical width.
 ///
 /// Callers must have validated both surfaces with [`guard_plane`] first.
 fn packed_row_pairs<'s, 'd>(
@@ -299,10 +233,8 @@ fn packed_row_pairs<'s, 'd>(
 }
 
 /// Split a contiguous semi-planar (NV12/NV16/NV24) tensor's mapped bytes into
-/// `(luma, chroma)` planes at the `stride * src_h` boundary, validating the map
-/// holds the full combined plane first. A bare `split_at` would panic if an
-/// imported tensor's caller-supplied dimensions/stride exceed its actual buffer
-/// (untrusted input), so this returns `Error::InvalidShape` instead.
+/// `(luma, chroma)` planes at the `stride * src_h` boundary. Returns
+/// `Error::InvalidShape` when the map does not hold the full combined plane.
 fn split_semi_planar(
     bytes: &[u8],
     stride: usize,
@@ -326,10 +258,8 @@ fn split_semi_planar(
 
 /// Mutable mirror of [`split_semi_planar`]: split a contiguous semi-planar
 /// destination's mapped bytes into `(luma, chroma)` planes at the
-/// `stride * dst_h` boundary, validating the map holds the full combined plane
-/// first. A bare `split_at_mut` would panic if a caller-supplied (untrusted)
-/// destination's declared dimensions/stride exceed its actual buffer, so this
-/// returns `Error::InvalidShape` instead.
+/// `stride * dst_h` boundary. Returns `Error::InvalidShape` when the map does
+/// not hold the full combined plane.
 fn split_semi_planar_mut(
     bytes: &mut [u8],
     stride: usize,
@@ -353,9 +283,8 @@ fn split_semi_planar_mut(
 
 /// Validate that a mapped plane buffer of `buf_len` bytes can hold `rows` rows
 /// of `stride` bytes each, with `row_bytes` valid bytes per row. Returns
-/// `Error::InvalidShape` (instead of letting a later row slice panic) when a
-/// caller-supplied stride/shape exceeds the actual allocation. `what` labels the
-/// buffer in the error message.
+/// `Error::InvalidShape` otherwise. `what` labels the buffer in the error
+/// message.
 fn guard_plane(
     buf_len: usize,
     stride: usize,
@@ -379,7 +308,7 @@ fn guard_plane(
 /// Apply XOR 0x80 bias to color channels only, preserving alpha.
 ///
 /// Matches GL int8 shader behavior: `vec4(int8_bias(c.rgb), c.a)`.
-/// For formats without alpha, XORs every byte (fast path).
+/// For formats without alpha, XORs every byte.
 pub(crate) fn apply_int8_xor_bias(data: &mut [u8], fmt: PixelFormat) {
     use edgefirst_tensor::PixelLayout;
     if !fmt.has_alpha() {
@@ -405,29 +334,25 @@ pub(crate) fn apply_int8_xor_bias(data: &mut [u8], fmt: PixelFormat) {
 }
 
 /// Row-confined [`apply_int8_xor_bias`] for a destination whose row pitch may
-/// exceed its pixel bytes — an allocation-padded tensor, or a `Tensor::view()`
-/// whose pitch is the parent's and whose trailing bytes are the parent's
-/// neighbouring pixels. The `I8` post-pass of the CPU convert and of the G2D
-/// blit alike.
+/// exceed its pixel bytes. The `I8` post-pass of the CPU convert and of the
+/// G2D blit.
 pub(crate) fn apply_int8_xor_bias_rows(tensor: &mut Tensor<u8>, fmt: PixelFormat) -> Result<()> {
     use edgefirst_tensor::PixelLayout;
     let (rows, row_bytes) = logical_surface(tensor)?;
     let stride = tensor_row_stride(tensor);
-    // A planar alpha channel is a whole trailing plane, so the rows to bias are
-    // the leading `channels - 1` planes rather than a prefix of each row.
+    // A planar alpha channel is a whole trailing plane: the rows to bias are
+    // the leading `channels - 1` planes.
     let color_rows = if fmt.has_alpha() && fmt.layout() == PixelLayout::Planar {
         rows / fmt.channels() * (fmt.channels() - 1)
     } else {
         rows
     };
-    // Within a colour row the packed-alpha skip still applies; a planar row is
-    // all colour, so bias it as a format without alpha.
+    // A packed row skips its alpha byte; a planar colour row is biased whole.
     let row_fmt = if fmt.layout() == PixelLayout::Planar {
         PixelFormat::Grey
     } else {
         fmt
     };
-    // Read-modify-write: a write-only map would not make device writes visible.
     let mut map = tensor.map_mut()?;
     let buf = map.as_mut_slice();
     guard_plane(buf.len(), stride, rows, row_bytes, "int8 bias dst")?;
@@ -444,7 +369,7 @@ impl CPUProcessor {
     }
 
     /// The resampler for `mode`. Bilinear takes two taps per axis at every
-    /// scale, as the GL backend and OpenCV `INTER_LINEAR` sample.
+    /// scale.
     fn resize_alg(mode: crate::Interpolation) -> fast_image_resize::ResizeAlg {
         match mode.supported() {
             crate::Interpolation::Nearest => fast_image_resize::ResizeAlg::Nearest,
@@ -499,14 +424,14 @@ impl CPUProcessor {
         Self::with_interpolation(crate::Interpolation::Nearest)
     }
 
-    /// Test-only accessor for the `fused_hits` counter (see the field doc).
+    /// Test-only accessor for the `fused_hits` counter.
     #[cfg(test)]
     pub(super) fn fused_hits(&self) -> u64 {
         self.fused_hits
     }
 
     /// Test-only accessor for the dimensions of the pre-resize intermediate the
-    /// last `convert_u8` allocated (see the `last_tmp_dims` field doc).
+    /// last `convert_u8` allocated.
     #[cfg(test)]
     pub(super) fn last_tmp_dims(&self) -> Option<(usize, usize)> {
         self.last_tmp_dims
@@ -631,7 +556,6 @@ impl CPUProcessor {
             (Grey, PlanarRgba) => Self::convert_grey_to_prgba(src, dst),
             (Grey, Nv16) => Self::convert_grey_to_nv16(src, dst, cp),
 
-            // the following converts are added for use in testing
             (Nv16, Rgb) => Self::convert_nv16_to_rgb(src, dst, cp),
             (Nv16, Rgba) => Self::convert_nv16_to_rgba(src, dst, cp),
             (Nv24, Rgb) => Self::convert_nv24_to_rgb(src, dst, cp),
@@ -700,9 +624,8 @@ impl CPUProcessor {
         let dst_fmt = dst.format().unwrap();
         let dst_w = dst.width().unwrap();
         let dst_h = dst.height().unwrap();
-        // Resolve the YUV fill encoding from the destination tensor so the
-        // border color matches the same matrix/range as a later YUV→RGB
-        // decode of this image. RGB/Grey fills ignore these params.
+        // The YUV fill encoding is resolved from the destination tensor.
+        // RGB/Grey fills ignore these params.
         let cm = crate::colorimetry::resolve_colorimetry(dst.colorimetry(), dst.height());
         let cp = ColorParams {
             matrix: crate::colorimetry::yuv_matrix(cm.encoding.unwrap()),
@@ -723,9 +646,8 @@ impl CPUProcessor {
     }
 
     /// Common fill dispatch by format. The tuple is
-    /// `(bytes, logical_width, logical_height, row_stride)` — the stride is the
-    /// destination's real byte pitch, which for a `view()` destination is the
-    /// parent image's, not `width × bpp`.
+    /// `(bytes, logical_width, logical_height, row_stride)`; the stride is the
+    /// destination's byte pitch.
     fn fill_outside_crop_dispatch(
         dst: (&mut [u8], usize, usize, usize),
         fmt: PixelFormat,
@@ -742,19 +664,15 @@ impl CPUProcessor {
                 let (bytes, w, h, stride) = dst;
                 let yuyv = Self::rgba_to_yuyv(rgba, cp);
                 // Bulk fill in 4-byte [Y0,U,Y1,V] macropixels; crop bounds in
-                // macropixel units so a shared chroma pair is never split.
+                // macropixel units.
                 Self::fill_image_outside_crop_(
                     (&mut *bytes, w / 2, h, stride),
                     yuyv,
                     Rect::new(crop.left / 2, crop.top, crop.width.div_ceil(2), crop.height),
                 )?;
-                // An odd width leaves a trailing unpaired pixel that the
-                // macropixel walk above (w / 2 units) structurally never
-                // reaches — the same trailing-pixel class the odd-width YUYV
-                // encoders handle. Its 2 bytes are [Y, U] (a row is w × 2
-                // bytes, so there is no room for its V). Fill it on every row
-                // where the last column lies outside the crop, judged in
-                // pixel units against the original crop.
+                // An odd width leaves a trailing unpaired pixel whose 2 bytes are
+                // [Y, U]. It is filled on every row where the last column lies
+                // outside the crop.
                 if w % 2 == 1 {
                     let last = w - 1;
                     let col_outside = last < crop.left || last >= crop.left + crop.width;
@@ -785,10 +703,8 @@ impl CPUProcessor {
 /// Colour parameters for a convert from `src` to `dst`, resolved once from
 /// each tensor's effective colorimetry.
 fn color_params(src: &TensorDyn, dst: &TensorDyn) -> (ColorParams, ColorParams) {
-    // Resolve per-tensor colorimetry once, at the use site, without
-    // mutating either tensor. YUV→RGB conversions take their matrix/range
-    // from the source; RGB→YUV conversions from the destination. The grey/
-    // luma expansion is gated on the resolved range of the relevant side.
+    // YUV→RGB conversions take their matrix/range from the source; RGB→YUV
+    // conversions from the destination.
     let src_cm = crate::colorimetry::effective_colorimetry(src);
     let dst_cm = crate::colorimetry::effective_colorimetry(dst);
     let src_full = src_cm.range == Some(edgefirst_tensor::ColorRange::Full);
@@ -813,8 +729,7 @@ fn color_params(src: &TensorDyn, dst: &TensorDyn) -> (ColorParams, ColorParams) 
 }
 
 /// `ReadWrite` when a convert writes only part of `dst` and keeps the rest (a
-/// view, or a placement with no fill colour), else `None`: such a write needs
-/// a cache-invalidating map.
+/// view, or a placement with no fill colour), else `None`.
 fn partial_dst_access(dst: &TensorDyn, crop: &ResolvedCrop) -> edgefirst_tensor::CpuAccess {
     let full = |r: &Rect| {
         r.left == 0 && r.top == 0 && Some(r.width) == dst.width() && Some(r.height) == dst.height()
@@ -845,8 +760,8 @@ pub(crate) fn convert_dst_access(
     }
 }
 
-/// Mask drawing blends into `dst`, so it needs both directions; the
-/// background is only read.
+/// Checks the CPU access a mask draw needs: read and write on `dst`, read on
+/// the background.
 fn require_draw_access(dst: &TensorDyn, background: Option<&TensorDyn>) -> Result<()> {
     dst.cpu_access()
         .require(edgefirst_tensor::CpuAccess::ReadWrite)?;
@@ -909,9 +824,7 @@ impl ImageProcessorTrait for CPUProcessor {
         segmentation: &[Segmentation],
         overlay: crate::MaskOverlay<'_>,
     ) -> Result<()> {
-        // CPU is the terminal fallback — it must always produce the full
-        // output, never assume the caller cleared dst. Every call writes
-        // the base layer first (bg copy or zero fill) and then the masks.
+        // Writes the base layer (background copy or zero fill), then the masks.
         require_draw_access(dst, overlay.background)?;
         prepare_dst_base_cpu(dst, overlay.background)?;
         let dst = dst.as_typed_mut::<u8>().ok_or(Error::NotAnImage)?;
@@ -1038,28 +951,23 @@ impl CPUProcessor {
                 )
             }
             (DType::U8, DType::I8) => {
-                // Int8 output: reinterpret the i8 destination as u8 (layout-
-                // identical), convert directly into it, then XOR 0x80 in-place.
+                // Int8 output: the i8 destination is converted into as u8, then
+                // XOR 0x80 is applied in place.
                 let src_u8 = src.as_typed::<u8>().unwrap();
                 let dst_i8 = dst.as_typed_mut::<i8>().unwrap();
-                // SAFETY: Tensor<i8> and Tensor<u8> are layout-identical
-                // (same element size, no T-dependent drop glue). Same
-                // rationale as gl::processor::tensor_i8_as_u8_mut.
+                // SAFETY: `Tensor<i8>` and `Tensor<u8>` are layout-identical.
                 let dst_u8 = unsafe { &mut *(dst_i8 as *mut Tensor<i8> as *mut Tensor<u8>) };
                 self.convert_u8(
                     src_u8, dst_u8, src_fmt, dst_fmt, rotation, flip, crop, src_params, dst_params,
                 )?;
-                // Apply XOR 0x80 bias in-place (u8 → i8 conversion)
                 apply_int8_xor_bias_rows(dst_u8, dst_fmt)
             }
             (DType::U8, d @ (DType::F32 | DType::F16)) => {
                 let src_u8 = src.as_typed::<u8>().unwrap();
                 let dw = dst.width().ok_or(Error::NotAnImage)?;
                 let dh = dst.height().ok_or(Error::NotAnImage)?;
-                // Reuse the scratch tensor when format and dimensions match;
-                // otherwise reallocate and cache the new scratch.  Take the
-                // scratch out of `self` so that `convert_u8` can borrow `self`
-                // exclusively, then restore it afterwards.
+                // Takes the scratch out of `self` for the convert and restores it
+                // afterwards.
                 let mut tmp = self.take_scratch(dw, dh, dst_fmt)?;
                 {
                     let tmp_u8 = tmp.as_typed_mut::<u8>().unwrap();
@@ -1068,15 +976,8 @@ impl CPUProcessor {
                         dst_params,
                     )?;
                 }
-                // Widen the u8 scratch into the float destination, then restore
-                // the scratch for reuse on the next call.
-                //
-                // The scratch is tight, but `dst` need not be: an allocation-
-                // padded float tensor, or a `Tensor::view()` whose pitch is the
-                // parent's, has a wider row than its pixels. Widen row by row so
-                // each output row lands at the destination's own pitch and the
-                // bytes past it stay untouched. On a tight destination the two
-                // pitches coincide and this is the previous flat widen.
+                // Widens the u8 scratch into the float destination row by row at
+                // the destination's own pitch, then restores the scratch.
                 {
                     let tmp_u8 = tmp.as_typed::<u8>().unwrap();
                     let (rows, row_len) = logical_surface(tmp_u8)?;
@@ -1103,7 +1004,7 @@ impl CPUProcessor {
                         DType::F32 => {
                             let dst_t = dst.as_typed_mut::<f32>().unwrap();
                             let mut dst_map = dst_t.map_for_write()?;
-                            // Counted in elements, not bytes — same invariant.
+                            // Counted in elements, not bytes.
                             guard_plane(
                                 dst_map.as_slice().len(),
                                 dst_stride,
@@ -1111,9 +1012,7 @@ impl CPUProcessor {
                                 row_len,
                                 "widen f32 dst",
                             )?;
-                            // NEON-accelerated u8→f32 `/255` widen (bit-identical
-                            // to the scalar `b as f32 / 255.0`); the scalar
-                            // iterator form did not vectorise. See cpu::simd.
+                            // u8→f32 `/255` widen.
                             for (s, dr) in
                                 src_rows.zip(dst_map.as_mut_slice().chunks_mut(dst_stride))
                             {
@@ -1130,10 +1029,7 @@ impl CPUProcessor {
                                 row_len,
                                 "widen f16 dst",
                             )?;
-                            // u8→f16 `/255` widen; uses native FP16
-                            // (`ucvtf`+`fdiv`) at runtime on FEAT_FP16 CPUs
-                            // (Orin), scalar `half::f16::from_f32` elsewhere.
-                            // See cpu::simd.
+                            // u8→f16 `/255` widen.
                             for (s, dr) in
                                 src_rows.zip(dst_map.as_mut_slice().chunks_mut(dst_stride))
                             {
@@ -1152,9 +1048,7 @@ impl CPUProcessor {
 
     /// Reuse `cached` if it already has dimensions `(w, h)` and pixel format
     /// `fmt`, otherwise allocate a fresh `Mem` image. The returned buffer's
-    /// contents are **not** zeroed on reuse — callers must fully overwrite the
-    /// region they later read (see the note at the convert pipeline's tmp/tmp2
-    /// site). This amortises the per-frame `Tensor::image` `alloc_zeroed`.
+    /// contents are not zeroed on reuse.
     fn reuse_or_alloc_image(
         cached: Option<Tensor<u8>>,
         w: usize,
@@ -1176,24 +1070,11 @@ impl CPUProcessor {
     }
 
     /// The source sub-rectangle to convert into the pre-resize intermediate for
-    /// a cropped convert, or `None` to keep converting the whole frame.
+    /// a cropped convert: the crop grown by the resize filter's halo (see
+    /// [`Self::filter_halo`]) and clamped to the frame.
     ///
-    /// A cropped convert only ever reads the crop rect plus the resize filter's
-    /// halo (see [`Self::filter_halo`]), so converting the whole frame into the
-    /// intermediate wastes work proportional to the frame — for a 4K frame
-    /// tiled into 640x640 crops, ~22x the pixels actually needed. Returning the
-    /// halo-grown crop lets the pre-resize convert produce a crop-sized
-    /// intermediate instead.
-    ///
-    /// The returned rect only ever *grows* the crop, and is clamped to the
-    /// frame, so the resize reads exactly the same real source pixels — and
-    /// clamps at exactly the same frame edges — as it did with a full-frame
-    /// intermediate. Output is byte-identical; only the buffer size changes.
-    ///
-    /// `None` (unchanged full-frame behaviour) for: an uncropped convert, a
-    /// crop covering the whole frame, a source format that cannot be extracted
-    /// (only the semi-planar NV family can — `Tensor::view` rejects non-packed
-    /// layouts, and NV is what the 4K tiling path feeds in), and a resize
+    /// `None` (whole frame) for an uncropped convert, a crop covering the whole
+    /// frame, a source format outside the semi-planar NV family, and a resize
     /// algorithm whose filter reach is not modelled.
     fn pre_resize_region(
         &self,
@@ -1219,10 +1100,8 @@ impl CPUProcessor {
             return None;
         }
 
-        // The resize maps the source rect onto the destination rect; a quarter
-        // turn swaps which destination extent each source axis is scaled onto
-        // (see `adjust_dest_rect_for_rotate_flip_dims`), and the filter halo
-        // depends on that scale factor.
+        // A quarter turn swaps which destination extent each source axis is
+        // scaled onto; the filter halo depends on that scale factor.
         let d = crop.dst_rect.unwrap_or(Rect {
             left: 0,
             top: 0,
@@ -1241,11 +1120,8 @@ impl CPUProcessor {
         let mut right = (r.left + r.width + halo_x).min(src_w);
         let mut bottom = (r.top + r.height + halo_y).min(src_h);
 
-        // NV12 subsamples chroma on both axes, NV16 on the horizontal one, so
-        // the extracted origin must land on a chroma sample boundary for the
-        // sub-image's chroma to line up with the frame's. Snap the origin DOWN
-        // and the far edge UP — growing only, so every pixel inside `r` keeps
-        // exactly the neighbours it had, whatever the crop's own parity.
+        // NV12 subsamples chroma on both axes, NV16 on the horizontal one: the
+        // origin snaps down and the far edge up to a chroma sample boundary.
         let (align_x, align_y) = match src_fmt {
             Nv12 => (2, 2),
             Nv16 => (2, 1),
@@ -1262,8 +1138,7 @@ impl CPUProcessor {
             width: right - left,
             height: bottom - top,
         };
-        // The halo already reaches the whole frame — extracting would be a pure
-        // copy with no saving.
+        // `None` when the grown rect is the whole frame.
         (grown != full_src).then_some(grown)
     }
 
@@ -1389,8 +1264,8 @@ impl CPUProcessor {
                 }
             });
 
-        // Pick the resolved colorimetry for a single conversion by its YUV
-        // side: YUV→RGB decodes use the source side, RGB→YUV encodes the dest.
+        // The colorimetry of a single conversion comes from its YUV side: the
+        // source for YUV→RGB, the destination for RGB→YUV.
         let direct_is_yuv_src = matches!(src_fmt, Nv12 | Nv16 | Nv24 | Yuyv | Vyuy);
         let direct_params = if direct_is_yuv_src {
             src_params
@@ -1398,22 +1273,12 @@ impl CPUProcessor {
             dst_params
         };
 
-        // Fused NV→planar: decode the YUV source into packed RGB one
-        // cache-resident row strip at a time and NEON-deinterleave each strip
-        // straight into the destination planes, so the full-size packed-RGB
-        // intermediate never round-trips through DRAM and is not reallocated
-        // per frame. JPEG decodes to the NV family and the model wants planar
-        // RGB, so this is the hot Orin CPU-preprocess path.
-        //
-        // Two shapes take this path: the whole-frame case (no crop, dst ==
-        // src size — the original hot path, unchanged) and a **scale-
-        // identity** source crop (crop size == destination size, no rotate/
-        // flip, full destination placement, chroma-aligned origin) — the
-        // primary CPU-fallback path for uniform tiling (e.g. SAHI tiles cut
-        // from one frame). Any other shape (an actual resize, a partial
-        // destination placement, or a chroma-misaligned origin) falls
-        // through to the general pipeline below — never snapped or shifted
-        // into alignment.
+        // Fused NV→planar: decodes the YUV source into packed RGB one row strip
+        // at a time and deinterleaves each strip into the destination planes.
+        // Taken by the whole-frame case (no crop, dst == src size) and by a
+        // scale-identity source crop (crop size == destination size, no
+        // rotate/flip, full destination placement, chroma-aligned origin). Any
+        // other shape continues to the general pipeline below.
         let full_dst_rect = Rect {
             left: 0,
             top: 0,
@@ -1459,7 +1324,6 @@ impl CPUProcessor {
             return Self::convert_format_pf(src, dst, src_fmt, dst_fmt, direct_params);
         }
 
-        // any extra checks
         if dst_fmt == Yuyv && !dst_w.is_multiple_of(2) {
             return Err(Error::NotSupported(format!(
                 "{} destination must have width divisible by 2",
@@ -1467,20 +1331,13 @@ impl CPUProcessor {
             )));
         }
 
-        // Take the cached intermediates out of `self` so the resize step can
-        // borrow `self` exclusively; they are restored before returning on the
-        // success path. Reused buffers are not re-zeroed — every consumer below
-        // fully overwrites the region it later reads (the pre-resize convert
-        // writes all of `tmp`; the resize writes the scaled rect of `tmp2` and
-        // its letterbox border is either pre-filled from `dst` or overwritten in
-        // `dst` by the final `fill_image_outside_crop_u8`).
+        // Takes the cached intermediates out of `self`; they are restored before
+        // returning on the success path. Reused buffers are not re-zeroed.
         let mut cached_tmp = self.convert_tmp.take();
         let mut cached_tmp2 = self.convert_tmp2.take();
 
-        // For a cropped convert, size the pre-resize intermediate to the crop
-        // (grown by the resize filter's halo) instead of the whole frame — see
-        // `pre_resize_region`. `None` keeps the previous full-frame behaviour,
-        // which is also the uncropped hot path.
+        // For a cropped convert the pre-resize intermediate is sized to the crop
+        // grown by the resize filter's halo (see `pre_resize_region`).
         let pre_region = if intermediate != src_fmt {
             self.pre_resize_region(src_fmt, (src_w, src_h), (dst_w, dst_h), rotation, crop)
         } else {
@@ -1529,10 +1386,8 @@ impl CPUProcessor {
             None
         };
 
-        // The intermediate now starts at `grown`'s origin rather than the
-        // frame's, so rebase the source crop into its coordinates for the
-        // resize step. The crop's size — and therefore the resize scale, the
-        // filter coefficients, and every output pixel — is unchanged.
+        // The intermediate starts at `grown`'s origin: the source crop is rebased
+        // into its coordinates for the resize step.
         let crop = match (pre_region, crop.src_rect) {
             (Some(g), Some(r)) => ResolvedCrop {
                 src_rect: Some(Rect {
@@ -1549,7 +1404,6 @@ impl CPUProcessor {
             None => (src, src_fmt),
         };
 
-        // format must be RGB/RGBA/GREY
         debug_assert!(matches!(tmp_fmt, Rgb | Rgba | Grey));
         if tmp_fmt == dst_fmt {
             let _s = tracing::trace_span!("image.convert.cpu.resize_flip_rotate").entered();
@@ -1592,8 +1446,7 @@ impl CPUProcessor {
             }
             cached_tmp2 = Some(tmp2);
         }
-        // Restore the intermediates to the cache for the next call (`tmp` — a
-        // borrow of `tmp_holder` — is no longer used past this point).
+        // Restores the intermediates to the cache.
         if let Some(t) = tmp_holder {
             cached_tmp = Some(t);
         }
@@ -1648,12 +1501,7 @@ impl CPUProcessor {
             return Ok(());
         }
 
-        // Rank guard BEFORE indexing shape()[2]. `Segmentation.segmentation`
-        // is a `TensorDyn` with public fields, so a caller of the public
-        // `draw_decoded_masks` can hand over a rank-2 mask; under the former
-        // `Array3` that was structurally impossible. The guards inside the
-        // render functions are unreachable for bad rank because this dispatch
-        // indexes first.
+        // Rank check before indexing shape()[2].
         if let Some(bad) = segmentation
             .iter()
             .find(|s| s.segmentation.shape().len() != 3)
@@ -1745,7 +1593,7 @@ impl CPUProcessor {
                 "mask_coefficients tensor must be rank-2, got {coeff_shape:?}"
             )));
         }
-        // Genuine "no detections this frame" → nothing to render.
+        // No detections: nothing to render.
         if coeff_shape[0] == 0 {
             return Ok(());
         }
@@ -1964,9 +1812,7 @@ impl CPUProcessor {
                     let px = (lx0 + (x as f32 / dst_w as f32) * lx_range) * proto_w as f32 - 0.5;
                     let py = (ly0 + (y as f32 / dst_h as f32) * ly_range) * proto_h as f32 - 0.5;
 
-                    // Bilinear interpolation with per-load widening. Inline
-                    // bilinear-sample since bilinear_dot_slice takes a
-                    // different closure shape (no `zp` arg).
+                    // Bilinear interpolation with per-load widening.
                     let x0 = (px.floor() as isize).clamp(0, proto_w as isize - 1) as usize;
                     let y0 = (py.floor() as isize).clamp(0, proto_h as isize - 1) as usize;
                     let x1 = (x0 + 1).min(proto_w - 1);
@@ -1995,9 +1841,8 @@ impl CPUProcessor {
                     } else {
                         acc_scale * acc
                     };
-                    // Pass-through: acc_scale=0.0 means "no scaling" (f32/f16
-                    // native); non-zero means "apply scale once" (i8 with
-                    // per-tensor quant).
+                    // `acc_scale == 0.0` means no scaling (f32/f16); a non-zero
+                    // scale is applied once (i8 with per-tensor quant).
                     let mask = 1.0 / (1.0 + (-final_acc).exp());
                     if mask < 0.5 {
                         continue;

@@ -7,7 +7,7 @@
 # the decode-only YUV + RGB A/B matrix (no letterbox).
 #
 # Multi-arch: both stages use official multi-arch bases and everything builds
-# natively in-container, so the same file serves x86 and Graviton queues:
+# natively in-container:
 #
 #   docker build -f benchmarks/docker/Dockerfile -t edgefirst-hal-jpeg-bench .
 #   docker buildx build --platform linux/arm64 -f benchmarks/docker/Dockerfile \
@@ -27,12 +27,7 @@ RUN cargo build --profile profiling -p hal_cpu -p rust_jpeg \
     && cp target/profiling/hal_cpu /usr/local/bin/hal_cpu \
     && cp target/profiling/rust_jpeg /usr/local/bin/rust_jpeg
 
-# The comparator arms are native C binaries for the same reason hal_cpu is a
-# native Rust one: this image measures decoding libraries against each other,
-# so no arm may carry an interpreter inside the timed region. `clean` first,
-# because a host build tree in the context would otherwise satisfy make and
-# ship binaries linked against the host's glibc (stb/wuffs then re-fetch their
-# pinned, sha256-checked single-file sources inside the container).
+# Build the comparator arms as native C binaries, from a clean tree.
 RUN make -C modules/turbojpeg clean \
     && make -C modules/turbojpeg \
     && cp modules/turbojpeg/build/turbojpeg_bench /usr/local/bin/turbojpeg_bench
@@ -43,23 +38,15 @@ RUN make -C modules/wuffs clean \
     && make -C modules/wuffs \
     && cp modules/wuffs/build/wuffs_bench /usr/local/bin/wuffs_bench
 
-# Build/toolchain provenance for the runtime image (see BENCHMARKS.md §1.2/§2.2
-# of the v3.12 review): the runtime stage below is debian-slim with no
-# compilers installed, so this has to be captured here and carried across.
+# Records the build toolchain versions for the runtime image.
 RUN { rustc --version; cargo --version; gcc --version | head -1; } > /opt/build-provenance.txt
 
-# --- Source-built libjpeg-turbo control (review §1.2/§2.2): baked into the
-# same image as an alternate .so, not a separate image variant, so a job
-# opts into it via EDGEFIRST_TURBOJPEG_LIB rather than pulling a different
-# tag. Settles whether the ARM ~1.16x vs ~1.36x split (packaged turbo 3.x vs
-# 2.1.x on the physical boards) is a version confound or coincidence, on
-# Graviton. Version pinned to what BENCHMARKS.md's board provenance table
-# already asks for ("3.1.2 or later"); nasm needed for x86 SIMD, cmake
-# selects the right ASM backend per arch automatically.
+# --- Source-built libjpeg-turbo control: an alternate .so in the same image,
+# selected per job with EDGEFIRST_TURBOJPEG_LIB. nasm provides the x86 SIMD;
+# cmake selects the ASM backend per arch.
 #
-# Pinned by immutable commit (the tag ref is movable) and SHA-256 verified
-# before extraction, same reproducibility bar as the stb/wuffs single-file
-# fetches above (Copilot review on PR #145).
+# The source is fetched at a pinned commit and SHA-256 verified before
+# extraction.
 FROM build AS turbo-src
 RUN apt-get update \
     && apt-get install -y --no-install-recommends cmake nasm \
@@ -80,8 +67,7 @@ RUN curl -fSL -o /tmp/turbo-src.tar.gz \
 
 FROM debian:bookworm-slim AS runtime
 
-# awscli: lets a Batch job pull the corpus with its job-role credentials
-# (DATASET_S3) with no secret handling; curl/unzip for DATASET_URL archives.
+# awscli pulls the corpus for DATASET_S3; curl/unzip handle DATASET_URL archives.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \

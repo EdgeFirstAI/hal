@@ -1,4 +1,4 @@
-"""A3 wheel layout: self-contained, typed, namespace intact."""
+"""Wheel layout: self-contained, typed, namespace intact."""
 
 import pathlib
 import subprocess

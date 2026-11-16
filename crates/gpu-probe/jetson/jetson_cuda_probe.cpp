@@ -1,40 +1,29 @@
 // SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 //
-// Jetson CUDA / TensorRT NvBufSurface interop probe (O4–O7 + O2b/O3b).
+// Jetson CUDA / TensorRT NvBufSurface interop probe.
 //
-// On-device tooling for orin-nano (L4T R36.4, CUDA 12.6, TensorRT 10.3). This
-// is the C++ counterpart to the Rust `probe_nvbufsurface` module. It uses the
-// REAL `nvbufsurface.h`, CUDA, TensorRT and EGL/GLES headers (zero ABI risk)
-// to settle the zero-copy chain:
+// The C++ counterpart to the Rust `probe_nvbufsurface` module. Steps:
 //
-//   O4 — NvBufSurfaceMapEglImage → cudaGraphicsEGLRegisterImage →
-//        cudaGraphicsResourceGetMappedEglFrame → cudaMemcpy to host → verify a
-//        CPU-written pattern. Prints cudaEglFrame frameType/format/pitch.
-//   O5 — cudaImportExternalMemory(OpaqueFd, {fd,size}) →
-//        cudaExternalMemoryGetMappedBuffer → verify.
-//   O6 — build a trivial FP16 NCHW [1,3,H,W] identity TRT engine, bind the
-//        CUDA device pointer via setInputTensorAddress, enqueueV3.
-//   O7 — packed (W/4, 3H) RGBA16F bytes vs [3,H,W] f16 NCHW reconciliation.
-//
-// New this round (the ONE remaining GL gap — O2):
-//   O2b-2 (DECISIVE) — import the NvBufSurface dma-buf as a packed
-//        DRM_FORMAT_ABGR16161616F EGLImage *with the NVIDIA DRM format
-//        modifier* (EGL_EXT_image_dma_buf_import_modifiers), bind to an FBO and
-//        GL-render + readback. PASS ⇒ packed RGBA16F design ports to Jetson via
-//        modifier import (uniform with V3D/Mali).
-//   O2b-1 (fallback) — GL-render into the NvBufSurfaceMapEglImage EGLImage
-//        (the NVIDIA-made one proven CUDA-usable in O4).
-//   O3b — can NvBufSurfaceFromFd wrap an EXTERNAL (GBM) dma-buf, or only
-//        NvBufSurface-originated fds?
-//
-// GL→CUDA bridge (O8 — the remaining hop, since O2b proved you can't GL-render
-// into an NvBufSurface):
-//   O8-a — cudaGraphicsGLRegisterImage on a GL-rendered texture (RGBA16F +
-//        RGBA8); same-thread vs cross-thread (GL ctx current requirement).
-//   O8-b — cudaGraphicsGLRegisterBuffer on a GL PBO (glReadPixels target).
-//   O8-c — EGLStream GL-producer → CUDA-consumer (thread-decoupled path).
-//   O8-d — packed RGBA16F (W/4,3H) GL→CUDA(PBO) vs [3,H,W] f16 NCHW layout.
+//   - NvBufSurfaceMapEglImage → cudaGraphicsEGLRegisterImage →
+//     cudaGraphicsResourceGetMappedEglFrame → cudaMemcpy to host → verify a
+//     CPU-written pattern. Prints cudaEglFrame frameType/format/pitch.
+//   - cudaImportExternalMemory(OpaqueFd, {fd,size}) →
+//     cudaExternalMemoryGetMappedBuffer → verify.
+//   - Build an FP16 NCHW [1,3,H,W] identity TRT engine, bind the CUDA device
+//     pointer via setInputTensorAddress, enqueueV3.
+//   - Compare packed (W/4, 3H) RGBA16F bytes with [3,H,W] f16 NCHW.
+//   - Import the NvBufSurface dma-buf as a packed DRM_FORMAT_ABGR16161616F
+//     EGLImage with the NVIDIA DRM format modifier
+//     (EGL_EXT_image_dma_buf_import_modifiers), bind it to an FBO, GL-render
+//     and read back.
+//   - GL-render into the NvBufSurfaceMapEglImage EGLImage.
+//   - NvBufSurfaceFromFd on an external (GBM) dma-buf.
+//   - cudaGraphicsGLRegisterImage on a GL-rendered texture (RGBA16F and
+//     RGBA8), same-thread and cross-thread.
+//   - cudaGraphicsGLRegisterBuffer on a GL PBO (glReadPixels target).
+//   - EGLStream GL-producer → CUDA-consumer.
+//   - Packed RGBA16F (W/4,3H) GL→CUDA(PBO) vs [3,H,W] f16 NCHW layout.
 //
 // Build on-device: `make` (see Makefile).
 
@@ -53,9 +42,7 @@
 #include <GLES3/gl3.h>
 #include <GLES2/gl2ext.h>
 
-// cuda_gl_interop.h requires GL types (GLuint/GLenum) to be declared first,
-// hence it is included AFTER the GLES headers above.
-#include <cuda_gl_interop.h>  // cudaGraphicsGLRegisterImage/Buffer (O8)
+#include <cuda_gl_interop.h>  // cudaGraphicsGLRegisterImage/Buffer
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -77,7 +64,7 @@
     }                                                                         \
   } while (0)
 
-// DRM fourcc + EGL modifier-import enums (not always in older eglext.h).
+// DRM fourcc and EGL modifier-import enums.
 #ifndef DRM_FORMAT_ABGR16161616F
 #define DRM_FORMAT_ABGR16161616F 0x48344241  // 'AB4H'
 #endif
@@ -106,15 +93,15 @@
 #define EGL_DMA_BUF_PLANE0_PITCH_EXT 0x3274
 #endif
 
-// Representative packed RGBA16F geometry for a 256x256-equivalent NCHW tensor:
-// HAL F16 layout is [3,H,W] packed 4 contiguous f16 per RGBA16F texel ->
-// surface (W/4, 3H). For H=W=256: packed = (64, 768), pitch = 64*8 = 512.
+// Packed RGBA16F geometry for a 256x256 NCHW tensor: [3,H,W] f16, four
+// contiguous f16 per RGBA16F texel, gives a (W/4, 3H) surface. For H=W=256:
+// packed = (64, 768), pitch = 64*8 = 512.
 static const uint32_t kImgH = 256;
 static const uint32_t kImgW = 256;
 static const uint32_t kPackedW = kImgW / 4;   // 64
 static const uint32_t kPackedH = 3 * kImgH;   // 768
 
-// Half-float helpers (host-side) so we can write/verify a known pattern.
+// Host-side half-float helpers.
 static uint16_t f32_to_f16(float f) {
   uint32_t x;
   std::memcpy(&x, &f, 4);
@@ -134,7 +121,7 @@ static PFNGLEGLIMAGETARGETRENDERBUFFERSTORAGEOESPROC
     glEGLImageTargetRenderbufferStorageOES_ = nullptr;
 
 // ---------------------------------------------------------------------------
-// TensorRT trivial logger
+// TensorRT logger
 // ---------------------------------------------------------------------------
 
 class Logger : public nvinfer1::ILogger {
@@ -144,7 +131,7 @@ class Logger : public nvinfer1::ILogger {
 } gLogger;
 
 // ---------------------------------------------------------------------------
-// Headless GLES3 surfaceless context (mirrors gpu-probe egl_context.rs).
+// Headless GLES3 surfaceless context.
 // ---------------------------------------------------------------------------
 
 static EGLDisplay g_dpy = EGL_NO_DISPLAY;
@@ -245,8 +232,8 @@ static bool init_headless_gl() {
   return true;
 }
 
-// Try to make an imported/native EGLImage GL-renderable. Returns a status
-// string and (via out) whether FBO became complete + readback verified.
+// FBO completeness, readback check and status string of a render into an
+// EGLImage.
 struct GlRenderResult {
   bool rbo_complete = false;
   bool tex_complete = false;
@@ -382,9 +369,8 @@ static int alloc_surface(NvBufSurface** out_surf, uint32_t width,
   return 0;
 }
 
-// Sanity control: confirm the headless context can render into a plain
-// (non-EGLImage) RGBA8 renderbuffer + texture FBO and read it back. This
-// isolates "GL render is broken" from "EGLImage attach is rejected".
+// Renders into a plain (non-EGLImage) RGBA8 renderbuffer and texture FBO and
+// reads it back.
 static void gl_sanity_control() {
   printf("  -- GL sanity control (plain renderbuffer/texture, no EGLImage) --\n");
   glGetError();
@@ -415,9 +401,8 @@ static void gl_sanity_control() {
   glDeleteRenderbuffers(1, &rbo);
 }
 
-// Bind an EGLImage as a TEXTURE and sample it (draw into a plain FBO),
-// reading back the sampled value — tests whether the NV EGLImage is usable
-// as a SAMPLE source even if not as a render target.
+// Bind an EGLImage as a texture, draw it into a plain FBO and read back the
+// sampled value.
 static void gl_sample_from_eglimage(EGLImageKHR img) {
   printf("  -- EGLImage-as-sampled-texture test --\n");
   glGetError();
@@ -488,37 +473,36 @@ static void gl_sample_from_eglimage(EGLImageKHR img) {
 }
 
 // ---------------------------------------------------------------------------
-// O2b-2 (DECISIVE) — modifier-based dma-buf import as packed RGBA16F.
+// Modifier-based dma-buf import as packed RGBA16F.
 // ---------------------------------------------------------------------------
 
-static bool probe_o2b2() {
-  printf("  -- O2b-2 (DECISIVE): modifier dma-buf import as ABGR16161616F + "
+static bool probe_modifier_import() {
+  printf("  -- modifier dma-buf import as ABGR16161616F + "
          "GL render --\n");
   if (!eglCreateImageKHR_) {
-    printf("  O2b-2 BLOCKED: eglCreateImageKHR unavailable\n");
+    printf("  BLOCKED: eglCreateImageKHR unavailable\n");
     return false;
   }
   bool has_mod = egl_has_ext(g_dpy, "EGL_EXT_image_dma_buf_import_modifiers");
 
-  // Allocate so that the byte-row matches our packed RGBA16F pitch (512).
-  // RGBA8 width=128 -> 128*4 = 512 byte rows == packed (64,768) @ 8B/texel.
+  // RGBA8 width 128 gives 512-byte rows, the packed (64,768) RGBA16F pitch.
   NvBufSurface* surf = nullptr;
   if (alloc_surface(&surf, 128, kPackedH, NVBUF_COLOR_FORMAT_RGBA, true) != 0) {
-    printf("  O2b-2 BLOCKED: allocation failed\n");
+    printf("  BLOCKED: allocation failed\n");
     return false;
   }
   NvBufSurfaceParams& sp = surf->surfaceList[0];
   int fd = (int)sp.bufferDesc;
-  uint32_t pitch = sp.pitch;  // expect 512
+  uint32_t pitch = sp.pitch;
   uint64_t mod = sp.paramex ? sp.paramex->planeParamsex.drmModifier[0] : 0;
   uint32_t off0 = sp.planeParams.offset[0];
 
-  // Import as packed ABGR16161616F at the logical packed dims (64x768),
+  // Import as packed ABGR16161616F at the packed dims (64x768),
   // reinterpreting the same bytes (8 bytes/texel * 64 = 512 = pitch).
   bool pass = false;
   char last[640] = {0};
   for (int variant = 0; variant < 2 && !pass; ++variant) {
-    // variant 0: WITH modifier ; variant 1: WITHOUT modifier (baseline).
+    // Variant 0 imports with the modifier, variant 1 without.
     bool use_mod = (variant == 0) && has_mod;
     if (variant == 0 && !has_mod) continue;  // skip mod variant if unsupported
 
@@ -557,28 +541,28 @@ static bool probe_o2b2() {
     eglDestroyImageKHR_(g_dpy, img);
   }
 
-  printf("  O2b-2 %s (mod=0x%016lx pitch=%u) %s\n", pass ? "PASS" : "FAIL", mod,
+  printf("  %s (mod=0x%016lx pitch=%u) %s\n", pass ? "PASS" : "FAIL", mod,
          pitch, last);
   NvBufSurfaceDestroy(surf);
   return pass;
 }
 
 // ---------------------------------------------------------------------------
-// O2b-1 (fallback) — GL-render into NvBufSurfaceMapEglImage EGLImage.
+// GL-render into the NvBufSurfaceMapEglImage EGLImage.
 // ---------------------------------------------------------------------------
 
-static void probe_o2b1() {
-  printf("  -- O2b-1 (fallback): GL render into NvBufSurfaceMapEglImage "
+static void probe_egl_image_render() {
+  printf("  -- GL render into NvBufSurfaceMapEglImage "
          "EGLImage --\n");
   NvBufSurface* surf = nullptr;
   if (alloc_surface(&surf, kPackedW, kPackedH, NVBUF_COLOR_FORMAT_RGBA, true) !=
       0) {
-    printf("  O2b-1 BLOCKED: allocation failed\n");
+    printf("  BLOCKED: allocation failed\n");
     return;
   }
   if (NvBufSurfaceMapEglImage(surf, 0) != 0 ||
       !surf->surfaceList[0].mappedAddr.eglImage) {
-    printf("  O2b-1 FAIL: NvBufSurfaceMapEglImage rc!=0 / null eglImage\n");
+    printf("  FAIL: NvBufSurfaceMapEglImage rc!=0 / null eglImage\n");
     NvBufSurfaceDestroy(surf);
     return;
   }
@@ -587,16 +571,15 @@ static void probe_o2b1() {
   printf("     NV EGLImage=%p (native fmt=%d %ux%u pitch=%u)\n", img,
          (int)sp.colorFormat, sp.width, sp.height, sp.pitch);
 
-  // The NVIDIA EGLImage is RGBA8 (native), so read back as unsigned byte.
+  // The EGLImage is RGBA8; read back as unsigned byte.
   GlRenderResult r =
       gl_render_into_eglimage(img, (int)sp.width, (int)sp.height, false);
   printf("     %s\n", r.detail);
   bool pass = r.rbo_complete || r.tex_complete;
-  printf("  O2b-1 %s (native fmt RGBA8 %ux%u pitch=%u; packed-RGBA16F "
+  printf("  %s (native fmt RGBA8 %ux%u pitch=%u; packed-RGBA16F "
          "reinterpretation does NOT apply to this EGLImage)\n",
          pass ? "PASS" : "FAIL", sp.width, sp.height, sp.pitch);
 
-  // Even if not GL-renderable, can it be SAMPLED as a texture?
   gl_sample_from_eglimage(img);
 
   NvBufSurfaceUnMapEglImage(surf, 0);
@@ -604,25 +587,25 @@ static void probe_o2b1() {
 }
 
 // ---------------------------------------------------------------------------
-// O3b — can NvBufSurfaceFromFd wrap an EXTERNAL (GBM) dma-buf?
+// NvBufSurfaceFromFd on an external (GBM) dma-buf.
 // ---------------------------------------------------------------------------
 
-static void probe_o3b() {
-  printf("  -- O3b: NvBufSurfaceFromFd on an EXTERNAL (GBM) dma-buf --\n");
+static void probe_external_from_fd() {
+  printf("  -- NvBufSurfaceFromFd on an EXTERNAL (GBM) dma-buf --\n");
   if (!g_gbm) {
-    // We may have come up via PLATFORM_DEVICE; open GBM standalone for O3b.
+    // Open a standalone GBM device when the display is not GBM-backed.
     if (g_gbm_drm_fd < 0)
       g_gbm_drm_fd = open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
     if (g_gbm_drm_fd >= 0) g_gbm = gbm_create_device(g_gbm_drm_fd);
   }
   if (!g_gbm) {
-    printf("  O3b NOT TESTED: could not create GBM device\n");
+    printf("  NOT TESTED: could not create GBM device\n");
     return;
   }
   struct gbm_bo* bo = gbm_bo_create(g_gbm, 256, 256, GBM_FORMAT_ARGB8888,
                                     GBM_BO_USE_RENDERING);
   if (!bo) {
-    printf("  O3b NOT TESTED: gbm_bo_create failed\n");
+    printf("  NOT TESTED: gbm_bo_create failed\n");
     return;
   }
   int ext_fd = gbm_bo_get_fd(bo);
@@ -634,11 +617,11 @@ static void probe_o3b() {
   NvBufSurface* out = nullptr;
   int rc = NvBufSurfaceFromFd(ext_fd, (void**)&out);
   if (rc == 0 && out) {
-    printf("  O3b PASS (UNEXPECTED): NvBufSurfaceFromFd rc=0 buffer=%p — wraps "
+    printf("  PASS (UNEXPECTED): NvBufSurfaceFromFd rc=0 buffer=%p — wraps "
            "ARBITRARY dma-bufs\n",
            (void*)out);
   } else {
-    printf("  O3b RESULT: NvBufSurfaceFromFd(external_fd) rc=%d buffer=%p — "
+    printf("  RESULT: NvBufSurfaceFromFd(external_fd) rc=%d buffer=%p — "
            "ONLY NvBufSurface-originated fds accepted (external/GBM rejected)\n",
            rc, (void*)out);
   }
@@ -647,19 +630,19 @@ static void probe_o3b() {
 }
 
 // ---------------------------------------------------------------------------
-// O4 — NvBufSurfaceMapEglImage -> CUDA EGL register -> mapped EGL frame.
+// NvBufSurfaceMapEglImage -> CUDA EGL register -> mapped EGL frame.
 // ---------------------------------------------------------------------------
 
-static void probe_o4(NvBufSurface* surf) {
-  printf("  -- O4: NvBufSurfaceMapEglImage -> cudaGraphicsEGLRegisterImage --\n");
+static void probe_cuda_egl_register(NvBufSurface* surf) {
+  printf("  -- NvBufSurfaceMapEglImage -> cudaGraphicsEGLRegisterImage --\n");
 
   if (NvBufSurfaceMapEglImage(surf, 0) != 0) {
-    printf("  O4 FAIL: NvBufSurfaceMapEglImage rc!=0\n");
+    printf("  FAIL: NvBufSurfaceMapEglImage rc!=0\n");
     return;
   }
   EGLImageKHR egl_image = (EGLImageKHR)surf->surfaceList[0].mappedAddr.eglImage;
   if (!egl_image) {
-    printf("  O4 FAIL: mappedAddr.eglImage is null\n");
+    printf("  FAIL: mappedAddr.eglImage is null\n");
     return;
   }
   printf("    NV EGLImage = %p\n", egl_image);
@@ -670,7 +653,7 @@ static void probe_o4(NvBufSurface* surf) {
   if (cr != CUDA_SUCCESS) {
     const char* m = nullptr;
     cuGetErrorString(cr, &m);
-    printf("  O4 FAIL: cuGraphicsEGLRegisterImage: %s\n", m ? m : "?");
+    printf("  FAIL: cuGraphicsEGLRegisterImage: %s\n", m ? m : "?");
     NvBufSurfaceUnMapEglImage(surf, 0);
     return;
   }
@@ -681,7 +664,7 @@ static void probe_o4(NvBufSurface* surf) {
   if (cr != CUDA_SUCCESS) {
     const char* m = nullptr;
     cuGetErrorString(cr, &m);
-    printf("  O4 FAIL: cuGraphicsResourceGetMappedEglFrame: %s\n", m ? m : "?");
+    printf("  FAIL: cuGraphicsResourceGetMappedEglFrame: %s\n", m ? m : "?");
     cuGraphicsUnregisterResource(res);
     NvBufSurfaceUnMapEglImage(surf, 0);
     return;
@@ -710,7 +693,7 @@ static void probe_o4(NvBufSurface* surf) {
   } else {
     printf("    frameType is ARRAY (block-linear); recorded, not copied.\n");
   }
-  printf("  O4 %s (pattern %sverified)\n", verified ? "PASS" : "PARTIAL",
+  printf("  %s (pattern %sverified)\n", verified ? "PASS" : "PARTIAL",
          verified ? "" : "NOT ");
 
   cuGraphicsUnregisterResource(res);
@@ -718,22 +701,20 @@ static void probe_o4(NvBufSurface* surf) {
 }
 
 // ---------------------------------------------------------------------------
-// O5 — direct dma-buf fd -> CUDA external memory.
+// Direct dma-buf fd -> CUDA external memory.
 // ---------------------------------------------------------------------------
 
-static void* probe_o5(NvBufSurface* surf, size_t* out_size) {
-  printf("  -- O5: cudaImportExternalMemory(OpaqueFd) direct --\n");
+static void* probe_cuda_external_memory(NvBufSurface* surf, size_t* out_size) {
+  printf("  -- cudaImportExternalMemory(OpaqueFd) direct --\n");
   NvBufSurfaceParams& sp = surf->surfaceList[0];
   int fd = (int)sp.bufferDesc;
   size_t size = sp.dataSize ? sp.dataSize : (size_t)sp.pitch * sp.height;
 
-  // cudaExternalMemoryHandleTypeOpaqueFd takes OWNERSHIP of the fd on success
-  // (CUDA closes it at cudaDestroyExternalMemory). The NvBufSurface-owned fd
-  // must remain valid for the surface's lifetime, so pass a dup — matching the
-  // Rust import_dma_fd fix that prevents a double-close on the live surface fd.
+  // The OpaqueFd import takes ownership of the fd on success; it is given a
+  // dup.
   int dup_fd = dup(fd);
   if (dup_fd < 0) {
-    printf("  O5 FAIL: dup(fd): %s\n", strerror(errno));
+    printf("  FAIL: dup(fd): %s\n", strerror(errno));
     return nullptr;
   }
 
@@ -746,8 +727,8 @@ static void* probe_o5(NvBufSurface* surf, size_t* out_size) {
   cudaExternalMemory_t extmem = nullptr;
   cudaError_t e = cudaImportExternalMemory(&extmem, &desc);
   if (e != cudaSuccess) {
-    printf("  O5 FAIL: cudaImportExternalMemory: %s\n", cudaGetErrorString(e));
-    // Import failed — CUDA did not take ownership; reclaim and close the dup.
+    printf("  FAIL: cudaImportExternalMemory: %s\n", cudaGetErrorString(e));
+    // The import failed; close the dup.
     close(dup_fd);
     return nullptr;
   }
@@ -759,7 +740,7 @@ static void* probe_o5(NvBufSurface* surf, size_t* out_size) {
   void* dptr = nullptr;
   e = cudaExternalMemoryGetMappedBuffer(&dptr, extmem, &bdesc);
   if (e != cudaSuccess) {
-    printf("  O5 FAIL: GetMappedBuffer: %s\n", cudaGetErrorString(e));
+    printf("  FAIL: GetMappedBuffer: %s\n", cudaGetErrorString(e));
     cudaDestroyExternalMemory(extmem);
     return nullptr;
   }
@@ -767,22 +748,22 @@ static void* probe_o5(NvBufSurface* surf, size_t* out_size) {
   std::vector<uint8_t> host(size, 0);
   e = cudaMemcpy(host.data(), dptr, size, cudaMemcpyDeviceToHost);
   bool verified = (e == cudaSuccess) && host[1] == 1 && host[255] == 255;
-  printf("  O5 %s: device ptr=%p size=%zu (pattern %sverified)\n",
+  printf("  %s: device ptr=%p size=%zu (pattern %sverified)\n",
          verified ? "PASS" : "PARTIAL", dptr, size, verified ? "" : "NOT ");
   if (out_size) *out_size = size;
   return dptr;
 }
 
 // ---------------------------------------------------------------------------
-// O6 — trivial FP16 NCHW identity TRT engine; bind the device ptr.
+// FP16 NCHW identity TRT engine; bind the device pointer.
 // ---------------------------------------------------------------------------
 
-static void probe_o6(void* input_dptr) {
-  printf("  -- O6: FP16 NCHW [1,3,H,W] TRT engine, bind device ptr --\n");
+static void probe_trt_device_binding(void* input_dptr) {
+  printf("  -- FP16 NCHW [1,3,H,W] TRT engine, bind device ptr --\n");
   using namespace nvinfer1;
 
   IBuilder* builder = createInferBuilder(gLogger);
-  if (!builder) { printf("  O6 FAIL: createInferBuilder\n"); return; }
+  if (!builder) { printf("  FAIL: createInferBuilder\n"); return; }
   INetworkDefinition* net = builder->createNetworkV2(0);
 
   Dims4 dims{1, 3, (int)kImgH, (int)kImgW};
@@ -801,11 +782,11 @@ static void probe_o6(void* input_dptr) {
   cfg->setFlag(BuilderFlag::kFP16);
 
   IHostMemory* plan = builder->buildSerializedNetwork(*net, *cfg);
-  if (!plan) { printf("  O6 FAIL: buildSerializedNetwork\n"); return; }
+  if (!plan) { printf("  FAIL: buildSerializedNetwork\n"); return; }
 
   IRuntime* rt = createInferRuntime(gLogger);
   ICudaEngine* eng = rt->deserializeCudaEngine(plan->data(), plan->size());
-  if (!eng) { printf("  O6 FAIL: deserializeCudaEngine\n"); return; }
+  if (!eng) { printf("  FAIL: deserializeCudaEngine\n"); return; }
   IExecutionContext* ctx = eng->createExecutionContext();
 
   uintptr_t addr = (uintptr_t)input_dptr;
@@ -825,20 +806,20 @@ static void probe_o6(void* input_dptr) {
     CK(cudaStreamSynchronize(stream));
     cudaStreamDestroy(stream);
   } else {
-    printf("    no input device ptr from O4/O5; skipping enqueue\n");
+    printf("    no input device ptr; skipping enqueue\n");
   }
-  printf("  O6 %s: enqueueV3 %s\n", ran ? "PASS" : "PARTIAL",
+  printf("  %s: enqueueV3 %s\n", ran ? "PASS" : "PARTIAL",
          ran ? "ran" : "did not run");
 
   cudaFree(out_dptr);
 }
 
 // ---------------------------------------------------------------------------
-// O7 — packed (W/4, 3H) RGBA16F bytes vs [3,H,W] f16 NCHW reconciliation.
+// Packed (W/4, 3H) RGBA16F bytes vs [3,H,W] f16 NCHW.
 // ---------------------------------------------------------------------------
 
-static void probe_o7(NvBufSurface* surf) {
-  printf("  -- O7: packed (W/4,3H) RGBA16F vs [3,H,W] NCHW reconciliation --\n");
+static void probe_packed_layout(NvBufSurface* surf) {
+  printf("  -- packed (W/4,3H) RGBA16F vs [3,H,W] NCHW reconciliation --\n");
   NvBufSurfaceParams& sp = surf->surfaceList[0];
   uint32_t tight_row = kPackedW * 8;  // 64 * 8 = 512 bytes per packed row
   printf("    surface pitch=%u, tightly-packed row=%u -> %s\n", sp.pitch,
@@ -849,13 +830,8 @@ static void probe_o7(NvBufSurface* surf) {
 }
 
 // ===========================================================================
-// O8 — GL-render-output -> CUDA bridge (the ONE remaining unproven hop).
-//
-// Established ground truth: you CANNOT GL-render into an NvBufSurface (O2b all
-// FAIL). So the HAL must render into a NORMAL GL texture/renderbuffer/PBO, then
-// bridge GL->CUDA. O8 tests exactly that bridge with the standard
-// cudaGraphicsGLRegisterImage / cudaGraphicsGLRegisterBuffer interop, plus the
-// decisive threading characterization for the HAL GL-worker-thread model.
+// GL-render output -> CUDA bridge through cudaGraphicsGLRegisterImage and
+// cudaGraphicsGLRegisterBuffer, on the GL thread and on another thread.
 // ===========================================================================
 
 // Render a known per-channel pattern into a normal GL texture via FBO.
@@ -897,9 +873,8 @@ static GLuint gl_render_pattern_texture(GLenum internal_fmt, GLenum type,
   return tex;
 }
 
-// Core O8-a: register a GL texture with CUDA, map, copy to host, verify.
-// `from_cuda_thread_no_gl` only affects the printed label. Returns a status
-// string; sets *ok if the registered array round-trips the expected pattern.
+// Outcome of registering a GL texture with CUDA, mapping it, copying it to
+// the host and checking the pattern.
 struct GlCudaResult {
   bool registered = false;
   bool mapped = false;
@@ -973,7 +948,7 @@ static GlCudaResult cuda_register_gl_texture(GLuint tex, int w, int h,
   return r;
 }
 
-// Args passed to the CUDA-only worker thread (GL context NOT current there).
+// Arguments for the worker thread, which has no GL context current.
 struct CrossThreadArgs {
   GLuint tex = 0;
   int w = 0, h = 0;
@@ -983,16 +958,16 @@ struct CrossThreadArgs {
 
 static void* cross_thread_cuda_entry(void* p) {
   CrossThreadArgs* a = (CrossThreadArgs*)p;
-  // Deliberately do NOT make any EGL context current on this thread.
-  // Bind the same CUDA device so the runtime context is usable.
+  // No EGL context is current on this thread; bind CUDA device 0.
   cudaSetDevice(0);
   a->result = cuda_register_gl_texture(a->tex, a->w, a->h, a->is_f16);
   return nullptr;
 }
 
-// O8-a + threading characterization.
-static void probe_o8a() {
-  printf("  -- O8-a: cudaGraphicsGLRegisterImage on a GL-rendered texture --\n");
+// cudaGraphicsGLRegisterImage on a GL-rendered texture, same-thread and
+// cross-thread.
+static void probe_cuda_gl_register_image() {
+  printf("  -- cudaGraphicsGLRegisterImage on a GL-rendered texture --\n");
 
   struct Fmt {
     const char* name;
@@ -1012,18 +987,18 @@ static void probe_o8a() {
                                            rdetail, sizeof(rdetail));
     printf("    [%s] render-into-tex: %s tex=%u\n", fm.name, rdetail, tex);
     if (!tex) {
-      printf("    [%s] O8-a SKIP: could not render into texture\n", fm.name);
+      printf("    [%s] SKIP: could not render into texture\n", fm.name);
       continue;
     }
 
-    // Same-thread (baseline): GL context current on THIS thread.
+    // Same-thread: the GL context is current on this thread.
     GlCudaResult st = cuda_register_gl_texture(tex, kImgW, kImgH, fm.is_f16);
     printf("    [%s] SAME-THREAD (GL ctx current): %s -> %s\n", fm.name,
            st.detail,
            st.pattern_ok ? "PASS (pattern verified)"
                          : (st.registered ? "PARTIAL" : "FAIL"));
 
-    // Cross-thread: register/map from a thread where GL ctx is NOT current.
+    // Cross-thread: register and map from a thread with no GL context current.
     CrossThreadArgs args;
     args.tex = tex;
     args.w = kImgW;
@@ -1048,9 +1023,9 @@ static void probe_o8a() {
   }
 }
 
-// O8-b: cudaGraphicsGLRegisterBuffer on a GL PBO.
-static void probe_o8b() {
-  printf("  -- O8-b: cudaGraphicsGLRegisterBuffer on a GL PBO --\n");
+// cudaGraphicsGLRegisterBuffer on a GL PBO.
+static void probe_cuda_gl_register_buffer() {
+  printf("  -- cudaGraphicsGLRegisterBuffer on a GL PBO --\n");
 
   // Render an RGBA16F pattern, glReadPixels into a PBO (GL_PIXEL_PACK_BUFFER).
   char rdetail[256] = {0};
@@ -1059,7 +1034,7 @@ static void probe_o8b() {
                                          rdetail, sizeof(rdetail));
   printf("    render-into-tex(RGBA16F): %s tex=%u\n", rdetail, tex);
   if (!tex) {
-    printf("    O8-b SKIP: could not render source texture\n");
+    printf("    SKIP: could not render source texture\n");
     return;
   }
 
@@ -1115,7 +1090,7 @@ static void probe_o8b() {
     cudaGraphicsUnregisterResource(res);
   }
 
-  // --- Cross-thread register (GL ctx not current there) ---
+  // --- Cross-thread register (no GL context current) ---
   struct PboArgs {
     GLuint pbo;
     size_t bytes;
@@ -1151,15 +1126,15 @@ static void probe_o8b() {
                : "FAIL cross-thread (needs GL ctx current)");
   }
 
-  printf("  O8-b %s\n", pass ? "PASS (same-thread PBO->CUDA verified)" : "FAIL");
+  printf("  %s\n", pass ? "PASS (same-thread PBO->CUDA verified)" : "FAIL");
   glDeleteBuffers(1, &pbo);
   glDeleteFramebuffers(1, &fbo);
   glDeleteTextures(1, &tex);
 }
 
-// O8-c (stretch): EGLStream GL-producer -> CUDA-consumer.
-static void probe_o8c() {
-  printf("  -- O8-c (stretch): EGLStream GL-producer -> CUDA-consumer --\n");
+// EGLStream GL-producer -> CUDA-consumer.
+static void probe_egl_stream() {
+  printf("  -- EGLStream GL-producer -> CUDA-consumer --\n");
 
   const char* exts = eglQueryString(g_dpy, EGL_EXTENSIONS);
   auto has = [&](const char* e) {
@@ -1183,23 +1158,21 @@ static void probe_o8c() {
          (void*)createStream, (void*)destroyStream, (void*)createProdSurf);
 
   if (!e_stream || !createStream) {
-    printf("  O8-c PARTIAL: EGL_KHR_stream / eglCreateStreamKHR unavailable; "
+    printf("  PARTIAL: EGL_KHR_stream / eglCreateStreamKHR unavailable; "
            "cannot start EGLStream path\n");
     return;
   }
 
   EGLStreamKHR stream = createStream(g_dpy, nullptr);
   if (stream == EGL_NO_STREAM_KHR) {
-    printf("  O8-c PARTIAL: eglCreateStreamKHR failed egl_err=0x%x\n",
+    printf("  PARTIAL: eglCreateStreamKHR failed egl_err=0x%x\n",
            eglGetError());
     return;
   }
   printf("    eglCreateStreamKHR -> stream=%p\n", (void*)stream);
 
-  // Connect CUDA as consumer FIRST (CUDA consumer connect requires the stream
-  // to be in CREATED state on this driver). cudaEGL.h on R36.4 exposes only the
-  // DRIVER-API EGLStream consumer entry points (cuEGLStreamConsumer*), so we
-  // use those. The runtime already created/bound the device-0 primary context.
+  // Connect CUDA as the consumer through the driver-API entry points
+  // (cuEGLStreamConsumer*).
   CUeglStreamConnection conn = nullptr;
   CUresult cc = cuEGLStreamConsumerConnect(&conn, stream);
   {
@@ -1208,9 +1181,7 @@ static void probe_o8c() {
     printf("    cuEGLStreamConsumerConnect=%s\n", m ? m : "?");
   }
 
-  // Create the GL producer surface. Needs a config; with no_config_context we
-  // must still supply an EGLConfig for a window/stream surface. Try to choose
-  // a renderable config.
+  // Create the GL producer surface with a renderable config.
   bool produced = false;
   if (createProdSurf && e_prod_surf) {
     EGLint cfg_attrs[] = {EGL_SURFACE_TYPE,
@@ -1248,7 +1219,7 @@ static void probe_o8c() {
           // Restore surfaceless current.
           eglMakeCurrent(g_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, g_ctx);
 
-          // Try to acquire on the CUDA consumer (driver API).
+          // Acquire on the CUDA consumer (driver API).
           if (cc == CUDA_SUCCESS) {
             CUgraphicsResource cres = nullptr;
             CUresult ae =
@@ -1269,9 +1240,9 @@ static void probe_o8c() {
                      m ? m : "?", (int)ef.frameType, ef.width, ef.height,
                      (int)ef.eglColorFormat);
               cuEGLStreamConsumerReleaseFrame(&conn, cres, nullptr);
-              printf("  O8-c PASS: GL producer frame reached CUDA consumer\n");
+              printf("  PASS: GL producer frame reached CUDA consumer\n");
             } else {
-              printf("  O8-c PARTIAL: produced a GL frame but CUDA acquire "
+              printf("  PARTIAL: produced a GL frame but CUDA acquire "
                      "did not return a frame\n");
             }
           }
@@ -1281,33 +1252,31 @@ static void probe_o8c() {
         }
         eglDestroySurface(g_dpy, psurf);
       } else {
-        printf("  O8-c PARTIAL: producer surface creation failed (blocking "
+        printf("  PARTIAL: producer surface creation failed (blocking "
                "step: eglCreateStreamProducerSurfaceKHR)\n");
       }
     } else {
-      printf("  O8-c PARTIAL: no EGLConfig with EGL_STREAM_BIT_KHR (blocking "
+      printf("  PARTIAL: no EGLConfig with EGL_STREAM_BIT_KHR (blocking "
              "step: eglChooseConfig for stream producer)\n");
     }
   } else {
-    printf("  O8-c PARTIAL: producer_eglsurface ext / fnptr unavailable "
+    printf("  PARTIAL: producer_eglsurface ext / fnptr unavailable "
            "(blocking step: GL producer surface)\n");
   }
 
   if (cc == CUDA_SUCCESS) cuEGLStreamConsumerDisconnect(&conn);
   if (destroyStream) destroyStream(g_dpy, stream);
   if (!produced)
-    printf("  O8-c PARTIAL (see blocking step above)\n");
+    printf("  PARTIAL (see blocking step above)\n");
 }
 
-// O8-d: with the working GL->CUDA path, render the packed RGBA16F (W/4,3H)
-// pattern, bring it to CUDA via PBO, confirm bytes interpret as [3,H,W] f16.
-static void probe_o8d() {
-  printf("  -- O8-d: packed RGBA16F (W/4,3H) GL->CUDA layout vs [3,H,W] f16 "
+// Render the packed RGBA16F (W/4,3H) pattern, bring it to CUDA via a PBO and
+// compare the bytes with [3,H,W] f16.
+static void probe_gl_cuda_packed_layout() {
+  printf("  -- packed RGBA16F (W/4,3H) GL->CUDA layout vs [3,H,W] f16 "
          "NCHW --\n");
-  // Packed surface: kPackedW x kPackedH RGBA16F. Render a per-row-distinct
-  // pattern so we can detect repack vs zero-copy. We use glReadPixels->PBO
-  // (the proven O8-b path) since it gives a tightly-packed linear device
-  // buffer with a known pitch == kPackedW*8.
+  // Packed surface: kPackedW x kPackedH RGBA16F with a per-row-distinct
+  // pattern, read through glReadPixels into a PBO (pitch == kPackedW*8).
   char rdetail[256] = {0};
   GLuint tex = gl_render_pattern_texture(GL_RGBA16F, GL_HALF_FLOAT, kPackedW,
                                          kPackedH, 0.25f, 0.5f, 0.75f, 1.0f,
@@ -1315,7 +1284,7 @@ static void probe_o8d() {
   printf("    packed render(%ux%u RGBA16F): %s tex=%u\n", kPackedW, kPackedH,
          rdetail, tex);
   if (!tex) {
-    printf("  O8-d SKIP: packed render failed\n");
+    printf("  SKIP: packed render failed\n");
     return;
   }
   size_t bpp = 8;
@@ -1341,7 +1310,7 @@ static void probe_o8d() {
          (row == (size_t)kPackedW * 8 && total == nchw_bytes)
              ? "ZERO-COPY: PBO is tight linear == NCHW byte layout, no repack"
              : "REPACK needed");
-  printf("  O8-d: GL PBO readback yields a tightly-packed linear device buffer "
+  printf("  GL PBO readback yields a tightly-packed linear device buffer "
          "(pitch == W/4*8 == 512); reinterpret-as-[3,H,W]-f16 is byte-exact "
          "(no padding), so the GL->CUDA(PBO) path is zero-copy-to-NCHW.\n");
 
@@ -1353,7 +1322,7 @@ static void probe_o8d() {
 // ---------------------------------------------------------------------------
 
 int main() {
-  printf("=== Jetson CUDA/TensorRT NvBufSurface Probe (O2b/O3b/O4-O8) ===\n");
+  printf("=== Jetson CUDA/TensorRT NvBufSurface Probe ===\n");
 
   int dev = 0;
   CK(cudaSetDevice(dev));
@@ -1366,40 +1335,40 @@ int main() {
   bool gl_ok = init_headless_gl();
   printf("  headless GL: %s\n", gl_ok ? "READY" : "UNAVAILABLE");
 
-  // GL-render gap (O2): test modifier import first (decisive), then fallback.
+  // Modifier import, then rendering into the mapped EGLImage.
   if (gl_ok) {
     gl_sanity_control();
-    probe_o2b2();
-    probe_o2b1();
+    probe_modifier_import();
+    probe_egl_image_render();
   } else {
-    printf("  O2b-2/O2b-1 BLOCKED: no GL context\n");
+    printf("  BLOCKED: no GL context\n");
   }
 
-  // External-fd import direction.
-  probe_o3b();
+  // External fd import.
+  probe_external_from_fd();
 
-  // CUDA/TRT half (re-confirm with the packed-shaped allocation for O7).
+  // CUDA and TensorRT steps on a packed-shaped allocation.
   NvBufSurface* surf = nullptr;
   if (alloc_surface(&surf, kPackedW, kPackedH, NVBUF_COLOR_FORMAT_RGBA, true) !=
       0) {
-    printf("  BLOCKED: allocation failed; cannot run O4-O7\n");
+    printf("  BLOCKED: allocation failed; cannot run the CUDA steps\n");
     return 1;
   }
-  probe_o4(surf);
+  probe_cuda_egl_register(surf);
   size_t sz = 0;
-  void* dptr = probe_o5(surf, &sz);
-  probe_o6(dptr);
-  probe_o7(surf);
+  void* dptr = probe_cuda_external_memory(surf, &sz);
+  probe_trt_device_binding(dptr);
+  probe_packed_layout(surf);
   NvBufSurfaceDestroy(surf);
 
-  // O8 — GL-render-output -> CUDA bridge (the decisive remaining hop).
+  // GL-render output -> CUDA bridge.
   if (gl_ok) {
-    probe_o8a();
-    probe_o8b();
-    probe_o8c();
-    probe_o8d();
+    probe_cuda_gl_register_image();
+    probe_cuda_gl_register_buffer();
+    probe_egl_stream();
+    probe_gl_cuda_packed_layout();
   } else {
-    printf("  O8 BLOCKED: no GL context\n");
+    printf("  BLOCKED: no GL context\n");
   }
 
   printf("=== probe complete ===\n");

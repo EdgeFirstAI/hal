@@ -149,8 +149,7 @@ the number — image selection, preload before timing, `CLOCK_MONOTONIC` around
 decode alone, percentile index, MP/s, CSV schema — so the two harnesses differ
 only in the library they call.
 
-Three rules for any new decode arm, each of which has silently biased a result
-here before:
+Three rules for any new decode arm:
 
 - **No interpreter in the timed region.** It lands on one side of the A/B only,
   and costs 1.5% of decode time on an out-of-order core rising to 5.5% on an
@@ -247,8 +246,7 @@ alternate SSH alias for the same Orin Nano hardware when `orin-nano` is down.
 
 ## Buffer reuse (critical)
 
-HAL modules follow the Studio profiler decode-pool pattern
-(`~/Software/Studio/profiler/.../buffers.rs`):
+HAL modules follow a decode-pool pattern:
 
 1. **One** Grey/R8 source tensor sized `width×(3·max_h)` (NV24 capacity).
 2. **One** 640×640 RGB destination tensor.
@@ -281,13 +279,9 @@ Raw CSVs live under `results/<board>/decode-ab/` (gitignored).
 
 ## Notes from smoke
 
-- **COCO is the primary Article-1 workload.** Full `val2017` is **99.8% 4:4:4 →
-  Nv24** — the custom decoder’s Nv24 path is a first-class optimization target.
-- **`zidane.jpg` (1280×720, 4:2:0 → Nv12)** is a diagnostic / high-res fixture
-  (continuity with May `BENCHMARKS.md`), not a replacement for COCO.
-  Results under `results/<board>/fixtures/`.
-- Host PBO GL still CPU-falls-back on Nv24; DMA-BUF boards run GL with
-  `cpu_fallback_frames=0` after the Grey pool fix.
+- **COCO is the primary workload.** Full `val2017` is **99.8% 4:4:4 → Nv24** — the custom decoder’s Nv24 path is a first-class optimization target.
+- **`zidane.jpg` (1280×720, 4:2:0 → Nv12)** is a diagnostic / high-res fixture, not a replacement for COCO. Results under `results/<board>/fixtures/`.
+- Host PBO GL CPU-falls-back on Nv24; DMA-BUF boards run GL with `cpu_fallback_frames=0`.
 - `hal_g2d` needs `/dev/galcore` (i.MX 8MP). i.MX 95 has no galcore → CPU fallback.
 - SSH aliases: `imx8mp-frdm`, `imx95-frdm`, `imx95-pro`, `rpi5-hailo`,
   `orin-nano` (optional `EDGEFIRST_BENCH_ORIN_FALLBACK` for the same HW).
@@ -345,40 +339,17 @@ generated tables further down that file must not be typed in by hand.
 
 ### Settled — do not re-test
 
-Each of these was measured and rejected; the reasons generalise.
+Alternatives to the current kernels and what each costs:
 
-- **Folding AC EOB/ZRL into `fast_ac` with an in-path terminator test**: −6%.
-  Testing for EOB on every coefficient to save one miss per block loses.
-  What *did* land is the run-0xFF sentinel encoding: EOB resolves through the
-  `k >= 64` bounds branch the loop already executes, so the common exit costs
-  no extra hot-path compare — the lesson is about where the branch lives, not
-  whether the fold is possible.
-- **Passing the bit buffer as a by-value `BitState` struct**: +17% instructions.
-  LLVM would not scalarise the aggregate and copied 24 bytes between stack slots
-  in the loop header. The design that superseded it is the `BitCursor` copy
-  owned by an `#[inline(never)]` `decode_block`: the cursor is a provably
-  non-escaping local of the outlined function, so it lives in registers — and
-  the outlining is load-bearing (inlined into the MCU loop it cost ~20% on the
-  A53 from merged register pressure).
-- **Raising the refill threshold**: refill already early-outs on `avail >= 32`
-  and a bulk refill leaves ≥57 bits, so it touches memory about every fourth
-  coefficient. A higher threshold makes refills more frequent, not fewer.
-- **A 256-bit single-block AVX2 IDCT**: at `i16` a 128-bit register already
-  holds a row of eight, so width only buys lane-crossing shuffles — 21.8 ns/block
-  against SSE2's 21.2. Real width needs *two blocks* side by side, which is a
-  two-block entry point in the MCU loop, not a wider kernel.
-- **Porting NEON's sparse-rows shortcut to x86**: −1.1% YUV / +0.5% RGB, i.e.
-  nothing. Blocks sparse enough to trigger it are mostly already taken by the
-  whole-block DC-only path.
+- **Folding AC EOB/ZRL into `fast_ac` with an in-path terminator test**: −6%. Testing for EOB on every coefficient to save one miss per block loses. The run-0xFF sentinel encoding resolves EOB through the `k >= 64` bounds branch the loop already executes, so the common exit costs no extra hot-path compare.
+- **Passing the bit buffer as a by-value `BitState` struct**: +17% instructions. LLVM does not scalarise the aggregate and copies 24 bytes between stack slots in the loop header. The decoder uses a `BitCursor` copy owned by an `#[inline(never)]` `decode_block`: the cursor is a provably non-escaping local of the outlined function, so it lives in registers. Inlined into the MCU loop it costs ~20% on the A53 from merged register pressure.
+- **Raising the refill threshold**: refill early-outs on `avail >= 32` and a bulk refill leaves ≥57 bits, so it touches memory about every fourth coefficient. A higher threshold makes refills more frequent, not fewer.
+- **A 256-bit single-block AVX2 IDCT**: at `i16` a 128-bit register already holds a row of eight, so width only buys lane-crossing shuffles — 21.8 ns/block against SSE2's 21.2. Real width needs *two blocks* side by side, which is a two-block entry point in the MCU loop, not a wider kernel.
+- **NEON's sparse-rows shortcut on x86**: −1.1% YUV / +0.5% RGB. Blocks sparse enough to trigger it are mostly already taken by the whole-block DC-only path.
 
 ### Methodology cautions
 
-- **Interleave the arms.** This host is shared with a `powersave` governor and
-  turbo enabled; single runs of the same binary drift by up to 40%, and one
-  briefly showed a faster kernel as a regression. Every published number comes
-  from N interleaved rounds with the arms alternating inside one loop, reported
-  as the median across rounds with each round's p50 and the min-max spread
-  (best-of-N favours the low tail and is no longer the claim number).
+- **Interleave the arms.** On a shared host with a `powersave` governor and turbo enabled, single runs of the same binary drift by up to 40%. Every published number comes from N interleaved rounds with the arms alternating inside one loop, reported as the median across rounds with each round's p50 and the min-max spread (best-of-N favours the low tail).
 - **`libturbojpeg` ships stripped.** Group its samples by mapping each IP to the
   nearest preceding `endbr64`/call target on x86, or every `bl` target in the
   disassembly on aarch64. The hot functions then identify as `decode_mcu` and
@@ -387,16 +358,8 @@ Each of these was measured and rejected; the reasons generalise.
 - **Normalise both sides the same way.** HAL's stage buckets include kernel and
   I/O time and Turbo's do not, so comparing raw shares overstates our
   "everything else" by roughly 2×.
-- **Identical codegen is a result, not a null result.** Switching the NEON
-  butterfly to `_laneq_` intrinsics changed nothing on its own: with the
-  constant array visible, LLVM folded each lane back to its literal and re-emitted
-  the same `dup`s, byte for byte. `black_box` on the constant pointers forces one
-  real load (600 → 497 instructions, 64 `dup`s → 1) and is worth 5% of the kernel
-  on in-order cores. If a change produces identical disassembly, check the
-  disassembly before concluding the idea does not pay.
-- **Expect instruction-count wins to be core-dependent.** The same constant
-  hoisting was worth −5.5% / −3.9% on the A55 / A53 kernel and ±0% on the A76:
-  in-order cores pay for every instruction, out-of-order ones hide them.
+- **Identical codegen is a result, not a null result.** With the constant array visible, LLVM folds each `_laneq_` lane of the NEON butterfly back to its literal and emits the same `dup`s, byte for byte. `black_box` on the constant pointers forces one real load (600 → 497 instructions, 64 `dup`s → 1) and is worth 5% of the kernel on in-order cores. If a change produces identical disassembly, check the disassembly before concluding the idea does not pay.
+- **Expect instruction-count wins to be core-dependent.** The same constant hoisting is worth −5.5% / −3.9% on the A55 / A53 kernel and ±0% on the A76: in-order cores pay for every instruction, out-of-order ones hide them.
 
 Reproduce:
 

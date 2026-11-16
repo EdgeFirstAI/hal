@@ -13,8 +13,7 @@
 //!
 //! - **Accurate** upsamples the scores of every class, then takes the argmax.
 //!   Pixels whose low-resolution neighbours agree on the winner skip the
-//!   per-class interpolation, which is exact because bilinear interpolation
-//!   is a convex combination.
+//!   per-class interpolation.
 //! - **Fast** takes the argmax at the score map's resolution, then
 //!   upsamples the class map with nearest-neighbour sampling.
 //!
@@ -281,8 +280,8 @@ impl SemanticConfig {
     }
 
     /// Declares the activation the scores still need. It is applied after
-    /// resampling, as reference pipelines do, so it leaves the class map
-    /// unchanged and sets how [`decode_semantic`] computes confidence.
+    /// resampling: it leaves the class map unchanged and sets how
+    /// [`decode_semantic`] computes confidence.
     ///
     /// # Errors
     ///
@@ -423,7 +422,8 @@ impl SemanticConfig {
         let Some(strides) = crate::decoder::tensor_bridge::padded_strides(input)? else {
             return Ok(grid);
         };
-        // Shapes match up to unit axes, whose strides are never used.
+        // The stride of `axis`, matched to the input's axes by position
+        // among the non-unit axes; `packed` for a unit axis.
         let stride = |axis: usize, packed: usize| {
             squeezed_axis(&self.shape, axis)
                 .and_then(|k| {
@@ -559,9 +559,9 @@ impl SemanticOptions {
     }
 
     /// Sets the content region from the options of the convert that
-    /// prepared the model input, so the class map uses exactly the geometry
-    /// the convert painted. `src` is the source image and `dst` the model
-    /// input, each `(width, height)`. A stretch leaves the region unset.
+    /// prepared the model input. `src` is the source image and `dst` the
+    /// model input, each `(width, height)`. A stretch leaves the region
+    /// unset.
     ///
     /// # Errors
     ///
@@ -637,8 +637,8 @@ pub fn select_output<'a>(
 ///
 /// `confidence`, when given, receives the winning class's probability as an
 /// `[H, W]` map of `f32` in `[0, 1]` or `u8` scaled to 255. It is computed at
-/// the score map's resolution and upsampled, so it is approximate and meant
-/// for overlays. Class-map inputs have no confidence.
+/// the score map's resolution and upsampled, so it is approximate. Class-map
+/// inputs have no confidence.
 ///
 /// # Errors
 ///
@@ -811,15 +811,14 @@ enum Quant {
     },
 }
 
-/// Position of `axis` among the axes of `shape` longer than 1, so axes of
-/// two shapes that differ only in unit axes compare equal.
+/// Position of `axis` among the axes of `shape` longer than 1.
 fn squeezed_axis(shape: &[usize], axis: usize) -> Option<usize> {
     (shape.get(axis)? > &1).then(|| shape[..axis].iter().filter(|&&n| n > 1).count())
 }
 
 /// The real-value map of `input`. `needs_real` marks decodes that compare
 /// against a real threshold or compute a confidence; integer scores without
-/// quantization are then an error rather than taken at face value.
+/// quantization are then an error.
 fn resolve_quant(
     input: &TensorDyn,
     config: &SemanticConfig,

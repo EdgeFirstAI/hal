@@ -3,21 +3,15 @@
 
 //! Batch preprocessing benchmark: deferred view-tile converts vs eager.
 //!
-//! Measures the `convert_deferred` + `flush` batch engine — N tiles rendered
-//! into row-bands of ONE tall destination (on the Linux GL DMA path this is
-//! one parent EGLImage import + per-tile `glViewport`/`glScissor` + a single
-//! sync at `flush`) against N independent eager `convert` calls into N
-//! standalone destinations (N imports + N syncs). The deferred path is the
-//! seam the destination-engine refactor wires through `render.rs`, and this
-//! bench is its before/after gate; it was previously unbenchmarked.
+//! Measures the `convert_deferred` + `flush` batch engine (N tiles rendered
+//! into row-bands of one tall destination) against N independent eager
+//! `convert` calls into N standalone destinations.
 //!
 //! Reports per-batch wall time for N ∈ {1, 4, 8, 16}; per-tile cost is
-//! `median / N`. On backends without a deferred fast path (CPU/G2D fallback,
-//! e.g. when DMA is unavailable) `convert_deferred` degrades to eager and the
-//! two cells converge — the cell names record which backing actually ran.
+//! `median / N`. The cell names record which backing ran.
 //!
-//! Self-contained: sources are synthesized NV12 (camera-shaped) and the
-//! letterbox geometry matches the profiler (1280×720 → 640×640 tiles).
+//! Sources are synthesized NV12 and the letterbox geometry is 1280×720 →
+//! 640×640 tiles.
 //!
 //! ```bash
 //! ./batch_convert_benchmark --json batch.json
@@ -75,9 +69,7 @@ fn mem_name(m: TensorMemory) -> &'static str {
         TensorMemory::Mem => "mem",
         TensorMemory::Shm => "shm",
         TensorMemory::Pbo => "pbo",
-        // Never produced here. `TensorMemory` is `#[non_exhaustive]`, so the
-        // wildcard is required; the known-but-unused variants are still spelled
-        // out so their labels do not silently become "unknown".
+        // Not produced by this benchmark.
         TensorMemory::IoSurface => "iosurface",
         TensorMemory::Cuda => "cuda",
         _ => "unknown",
@@ -88,8 +80,8 @@ fn main() {
     env_logger::init();
     let mut suite = BenchSuite::from_args();
 
-    // Pin the GL backend so the deferred path is measured, not G2D/CPU.
-    // SAFETY: set_var is not thread-safe, but nothing else is running yet.
+    // Pin the GL backend.
+    // SAFETY: nothing else is running yet.
     unsafe { std::env::set_var("EDGEFIRST_FORCE_BACKEND", "opengl") };
     let proc = ImageProcessor::new();
     unsafe { std::env::remove_var("EDGEFIRST_FORCE_BACKEND") };
@@ -115,8 +107,7 @@ fn main() {
     println!("   warmup={WARMUP} iterations={ITERATIONS}\n");
 
     for n in [1usize, 4, 8, 16] {
-        // Tall batched destination: N stacked row-bands of one buffer. DMA
-        // preferred so the GL one-import band path runs where available.
+        // Tall batched destination: N stacked row-bands of one buffer, DMA preferred.
         let parent = match TensorDyn::image(
             TILE_W,
             n * TILE_H,
@@ -146,7 +137,7 @@ fn main() {
         // Deferred: N converts into sibling views + one flush.
         {
             let name = format!("batch/deferred@{parent_mem}/n{n}");
-            // Probe once before timing so an unsupported path reports cleanly.
+            // Probe once before timing.
             let probe = (0..n)
                 .try_for_each(|i| {
                     let mut tile = parent
@@ -185,8 +176,7 @@ fn main() {
             }
         }
 
-        // Eager baseline: N independent converts into N standalone buffers
-        // (N imports + N syncs).
+        // Eager baseline: N independent converts into N standalone buffers.
         {
             let mut dsts: Vec<TensorDyn> = Vec::with_capacity(n);
             let mut alloc_failed = false;

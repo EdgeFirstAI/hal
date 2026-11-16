@@ -9,7 +9,7 @@
 //! `MF_E_TRANSFORM_NEED_MORE_INPUT`. An asynchronous one (every hardware
 //! transform) says when it wants input (`METransformNeedInput`) and when it
 //! has output (`METransformHaveOutput`) through its event queue, which is
-//! polled here rather than served by callbacks on Media Foundation's threads.
+//! polled here.
 
 use std::mem::ManuallyDrop;
 use std::time::{Duration, Instant};
@@ -292,8 +292,8 @@ impl Transform {
                     if self.events.is_some() {
                         self.credits = 0;
                     } else if self.pull_all(platform, out)? == 0 {
-                        // A synchronous transform with no output to give
-                        // and no room for input will not recover.
+                        // A synchronous transform that neither gives output nor
+                        // takes input: fail.
                         return Err(error(e, "IMFTransform::ProcessInput"));
                     }
                 }
@@ -354,11 +354,10 @@ impl Transform {
                 std::thread::sleep(POLL);
                 self.pump(platform, out)?;
             }
-            // Requests for input made before the drain lapse with it.
+            // Drop the input requests made before the drain.
             self.credits = 0;
         }
-        // A drained asynchronous transform asks for input again only once
-        // told a new stream starts.
+        // Notify the start of a new stream.
         self.message(MFT_MESSAGE_NOTIFY_START_OF_STREAM, "restart the stream")
     }
 

@@ -6,18 +6,11 @@
 # sets (62 lossless PNGs, ~2048 px long edge) and encode the JPEG benchmark
 # corpora from them.
 #
-# Why CLIC 2025: the recognized, license-clean large-image set. The CLIC
-# tasks page states "The images are released using the Unsplash license"
-# (free including commercial use, no attribution required), and the download
-# URLs are live — unlike CLIC 2020, whose archive is gone. COCO val2017
-# stays the primary corpus (~0.27 MP); this one covers the ≥2 MP class.
+# The images are released under the Unsplash license.
 #
-# Every standard corpus ships lossless sources, so a JPEG decode benchmark on
-# it is always "sources + an encode recipe". The recipe here is pinned and
-# recorded in each output MANIFEST.txt: libjpeg-turbo cjpeg, fixed quality,
-# one directory per subsampling (4:2:0 and 4:4:4 from identical pixels, so
-# the pair isolates subsampling exactly). For the restart-marker control run
-# make-dri-corpus.sh on an output directory afterwards (lossless jpegtran).
+# The encode recipe is recorded in each output MANIFEST.txt: libjpeg-turbo
+# cjpeg, fixed quality, one directory per subsampling (4:2:0 and 4:4:4 from
+# identical pixels).
 #
 # Usage:
 #   ./benchmarks/scripts/fetch-clic2025.sh [--dest DIR] [--quality N] [--jobs N]
@@ -41,7 +34,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# Pinned downloads (checked 2026-08-13, from https://clic2025.compression.cc/tasks/).
+# Pinned downloads, from https://clic2025.compression.cc/tasks/.
 VAL_URL="https://d152a8jkvz9wzs.cloudfront.net/data/clic2025_image_validation.zip"
 VAL_SHA256="735f8da90c860e872db6b9dc6fac88d42d0ba021a7a5898b89c062f0634b3149"
 TEST_URL="https://storage.googleapis.com/clic_datasets/clic2025_image_test.zip"

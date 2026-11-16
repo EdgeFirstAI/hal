@@ -3,33 +3,16 @@
 
 //! Windows D3D11 texture tensor surface.
 //!
-//! Every export here exists on every platform and refuses with `ENOTSUP` off
-//! Windows, the same rule `ef_tensor_from_iosurface_id` and the
-//! AHardwareBuffer family follow: this library's symbol set is identical
-//! everywhere, so "does this build have it" is never a link-time question
-//! for a consumer.
+//! Every export here exists on every platform and fails with `ENOTSUP` off
+//! Windows.
 //!
-//! # Shapes and geometry
+//! The two constructors take `dims` as the tensor's shape, read
+//! `width`/`height` from the texture, and fail with `EINVAL` when the shape
+//! does not match the texture.
 //!
-//! The two constructors take `dims` as the tensor's shape -- exactly what
-//! `ef_tensor_shape` reports back -- and derive `width`/`height` from the
-//! texture itself rather than from `dims`. The shape is then checked
-//! against the texture: a mismatch is `EINVAL` rather than a silent
-//! reinterpretation, which matters because a semi-planar allocation shape
-//! and an addressing shape are both rank 2 and nothing in the numbers
-//! distinguishes them.
-//!
-//! # Panic-path bookkeeping
-//!
-//! Every export here is shielded, and every one installs the quiet panic hook
-//! before its `catch_unwind` -- through [`shield_int`] where the C return type
-//! is `int`, and by calling [`ensure_hook_installed`] directly where it is
-//! not: a pointer, or [`ef_tensor_gpu_write_value`]'s `uint64_t`. Without the
-//! hook a caught panic writes no thread-local, so a consumer reading
-//! `ef_tensor_last_error_class` after a `NULL` return gets a class some
-//! earlier failure left behind and reports it as this call's. The
-//! off-Windows arms sit inside the shield too, so a caller sees the same
-//! `errno`-and-message contract on every platform.
+//! Every export catches panics and installs the panic hook before its
+//! `catch_unwind`: through [`shield_int`] where the C return type is `int`,
+//! and by calling [`ensure_hook_installed`] where it is not.
 
 use std::ffi::{c_char, c_int, c_void};
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -46,14 +29,12 @@ use crate::last_error::{class_of, set_last_error_classified};
 
 /// Platforms: Windows.
 ///
-/// The process `ID3D11Device*`, created on first call. **Borrowed**: no
-/// reference is transferred, so a caller that keeps the pointer past this
-/// tensor library's lifetime must `AddRef` it, and must never `Release` the
-/// one handed back here.
+/// The process `ID3D11Device*`, created on first call. Borrowed: no
+/// reference is transferred. A caller that keeps the pointer past this
+/// library's lifetime must `AddRef` it, and must not `Release` the pointer
+/// returned here.
 ///
-/// Every texture tensor this library allocates lives on this device, so a
-/// consumer that wants to render into one creates its own resources on the
-/// same device rather than opening a shared handle.
+/// Every texture tensor this library allocates lives on this device.
 ///
 /// @retval `NULL` with `errno` set: `EIO` when no device could be created
 ///         (no adapter, or `D3D11CreateDevice` failed --
@@ -82,7 +63,6 @@ pub extern "C" fn ef_d3d11_device() -> *mut c_void {
         }
     })
     .unwrap_or_else(|_| {
-        // An unwind must not leave a stale errno behind the NULL it returns.
         set_errno(libc::EINVAL);
         std::ptr::null_mut()
     })
@@ -90,13 +70,12 @@ pub extern "C" fn ef_d3d11_device() -> *mut c_void {
 
 /// Platforms: Windows.
 ///
-/// Adopt a host-owned `ID3D11Device*` as the process device, so tensors this
-/// library allocates share the caller's device instead of creating a second
-/// one. The reference stays the caller's; this library takes its own when it
-/// first uses the device.
+/// Adopt a host-owned `ID3D11Device*` as the process device. The reference
+/// stays the caller's; this library takes its own when it first uses the
+/// device.
 ///
-/// Must be called before anything that creates the device as a side effect
-/// -- `ef_d3d11_device`, `ef_is_gpu_buffer_available`, or any texture
+/// Must be called before anything that creates the device --
+/// `ef_d3d11_device`, `ef_is_gpu_buffer_available`, or any texture
 /// allocation. Once the device exists it cannot be replaced.
 ///
 /// @return 0 on success, `EINVAL` for `NULL` or a pointer that is not a live
@@ -110,9 +89,7 @@ pub unsafe extern "C" fn ef_d3d11_use_external_device(device: *mut c_void) -> c_
     shield_int(|| {
         #[cfg(target_os = "windows")]
         {
-            // SAFETY: this entry point's own contract is that `device` is
-            // NULL or a live `ID3D11Device *`; the caller keeps the reference
-            // until the library takes one on first use.
+            // SAFETY: `device` is NULL or a live `ID3D11Device *`.
             match unsafe { edgefirst_tensor::d3d11::use_external_device(device) } {
                 Ok(()) => 0,
                 Err(e) => {
@@ -136,21 +113,9 @@ pub unsafe extern "C" fn ef_d3d11_use_external_device(device: *mut c_void) -> c_
     })
 }
 
-/// Record a real backend error with its class, prefixed by the entry point
-/// that produced it, and set the matching `errno`.
-///
-/// Returns that errno so an `int`-returning entry point can `return
-/// refuse(..)` and a pointer-returning one can ignore it.
-///
-/// [`crate::map::errno_for`] does the translation rather than a blanket
-/// `ENOTSUP`: "this tensor is not a D3D11 texture" really is `ENOTSUP` (it
-/// arrives as `Error::NotImplemented`, which `errno_for` already maps that
-/// way), but a fence duplication that failed on a handle limit is not, and
-/// collapsing the two costs the caller the distinction.
-///
-/// Windows-only, because the off-platform arms have no
-/// [`edgefirst_tensor::Error`] to classify -- they never reach the backend
-/// at all -- and so call [`set_last_error`] directly.
+/// Record a backend error with its class, prefixed by the entry point that
+/// produced it, set the `errno` [`crate::map::errno_for`] maps it to, and
+/// return that errno.
 #[cfg(target_os = "windows")]
 fn refuse(e: &edgefirst_tensor::Error, what: &str) -> c_int {
     note_error(e, what);
@@ -159,13 +124,8 @@ fn refuse(e: &edgefirst_tensor::Error, what: &str) -> c_int {
     rc
 }
 
-/// [`refuse`] without the errno: for the one entry point that chooses its
-/// own code.
-///
-/// `ef_d3d11_use_external_device` answers `EBUSY` for "the device is already
-/// initialized", which arrives as `Error::InvalidOperation` and which
-/// [`crate::map::errno_for`] maps to `EACCES` -- correct for the map path
-/// that conversion was written for, wrong here.
+/// Record a backend error with its class, prefixed by the entry point that
+/// produced it, without setting `errno`.
 #[cfg(target_os = "windows")]
 fn note_error(e: &edgefirst_tensor::Error, what: &str) {
     set_last_error_classified(class_of(e), &format!("{what}: {e}"));
@@ -173,10 +133,9 @@ fn note_error(e: &edgefirst_tensor::Error, what: &str) {
 
 /// Platforms: Windows.
 ///
-/// The `ID3D11Texture2D*` backing this tensor. **Borrowed**: valid while the
-/// tensor lives, and never `Release`d by the caller. Bind it, copy from it,
-/// or `QueryInterface` it; to hand it to another device or process use
-/// [`ef_tensor_d3d11_shared_handle`] instead.
+/// The `ID3D11Texture2D*` backing this tensor. Borrowed: valid while the
+/// tensor lives, and never `Release`d by the caller. To hand the texture to
+/// another device or process use [`ef_tensor_d3d11_shared_handle`].
 ///
 /// @retval `NULL` with `errno` set: `EINVAL` for a `NULL` tensor, `ENOTSUP`
 ///         for a tensor that is not a D3D11 texture and off Windows.
@@ -212,7 +171,6 @@ pub unsafe extern "C" fn ef_tensor_d3d11_texture(t: *const EfTensor) -> *mut c_v
         }
     }))
     .unwrap_or_else(|_| {
-        // An unwind must not leave a stale errno behind the NULL it returns.
         set_errno(libc::EINVAL);
         std::ptr::null_mut()
     })
@@ -222,8 +180,8 @@ pub unsafe extern "C" fn ef_tensor_d3d11_texture(t: *const EfTensor) -> *mut c_v
 ///
 /// The texture geometry the HAL chose for this image: DXGI format, texel
 /// dimensions, bytes per texel, and the matching GL internal format. The
-/// dimensions are the *texture's*, not the image's -- see `ef_d3d11_layout`
-/// for why the two differ for semi-planar and packed-YUV formats.
+/// dimensions are the texture's, which differ from the image's for
+/// semi-planar and packed-YUV formats (see `ef_d3d11_layout`).
 ///
 /// `out` is written only on success.
 ///
@@ -256,8 +214,7 @@ pub unsafe extern "C" fn ef_tensor_d3d11_layout(
                 set_errno(libc::ENOTSUP);
                 return libc::ENOTSUP;
             };
-            // SAFETY: `out` is non-null and the caller contracts it is
-            // writable for one `EfD3d11Layout`.
+            // SAFETY: `out` is non-null and writable for one `EfD3d11Layout`.
             unsafe {
                 *out = EfD3d11Layout {
                     dxgi_format: l.dxgi_format,
@@ -281,15 +238,14 @@ pub unsafe extern "C" fn ef_tensor_d3d11_layout(
 
 /// Platforms: Windows.
 ///
-/// An **owned** duplicate of the texture's NT shared handle; close it with
-/// `CloseHandle`. Open it on a D3D12 device, another D3D11 device, in CUDA,
-/// or duplicate it into another process. Closing it does not affect the
-/// tensor, and the tensor's own handle outlives this duplicate.
+/// An owned duplicate of the texture's NT shared handle; close it with
+/// `CloseHandle`. It can be opened on a D3D12 device, on another D3D11
+/// device, in CUDA, or duplicated into another process. Closing it does not
+/// affect the tensor.
 ///
 /// @retval `NULL` with `errno` set: `EINVAL` for a `NULL` tensor, `ENOTSUP`
 ///         for a tensor that is not a D3D11 texture and off Windows, or
-///         another errno translated from the backend's error -- a
-///         duplication that failed for its own reason keeps that reason.
+///         another errno translated from the backend's error.
 ///
 /// # Safety
 /// `t` must be `NULL` or a live handle.
@@ -322,7 +278,6 @@ pub unsafe extern "C" fn ef_tensor_d3d11_shared_handle(t: *const EfTensor) -> *m
         }
     }))
     .unwrap_or_else(|_| {
-        // An unwind must not leave a stale errno behind the NULL it returns.
         set_errno(libc::EINVAL);
         std::ptr::null_mut()
     })
@@ -333,13 +288,12 @@ pub unsafe extern "C" fn ef_tensor_d3d11_shared_handle(t: *const EfTensor) -> *m
 /// The fence a GPU consumer waits on before reading this texture, and the
 /// timeline value to wait for.
 ///
-/// `*fence` and `*value` are cleared to `NULL`/0 before anything else, so
-/// whatever the caller had in those variables can never be mistaken for an
-/// answer: "no write has been recorded" is return 0 with `*fence == NULL`,
-/// and every failure path leaves them cleared too.
+/// `*fence` and `*value` are set to `NULL`/0 first and stay that way on
+/// every failure path. When no write has been recorded the call returns 0
+/// with `*fence == NULL`.
 ///
-/// When a write *is* recorded, `*fence` is an **owned** duplicate of the
-/// shared fence's NT handle; close it with `CloseHandle`. Open it with
+/// When a write is recorded, `*fence` is an owned duplicate of the shared
+/// fence's NT handle; close it with `CloseHandle`. Open it with
 /// `ID3D12Device::OpenSharedHandle`, `ID3D11Device5::OpenSharedFence`, or
 /// `cudaImportExternalSemaphore`, and wait for `*value`.
 ///
@@ -362,9 +316,7 @@ pub unsafe extern "C" fn ef_tensor_gpu_completion(
             set_errno(libc::EINVAL);
             return libc::EINVAL;
         }
-        // SAFETY: both are non-null and the caller contracts they are
-        // writable. Cleared before any other work so every failure path
-        // leaves the caller's locals in the documented "absent" state.
+        // SAFETY: `fence` and `value` are non-null and writable.
         unsafe {
             *fence = std::ptr::null_mut();
             *value = 0;
@@ -404,15 +356,12 @@ pub unsafe extern "C" fn ef_tensor_gpu_completion(
 ///
 /// The fence value of the newest GPU write recorded on this tensor, or 0 when
 /// there is none: the `*value` [`ef_tensor_gpu_completion`] reports, without
-/// the duplicated fence handle. For a consumer that already holds the process
-/// fence -- one an earlier `ef_tensor_gpu_completion` handed it -- and needs
-/// only the value to wait for, so a query costs no `DuplicateHandle` and no
-/// `CloseHandle`.
+/// the duplicated fence handle.
 ///
 /// @return the recorded value, or 0 with `errno` set: `EINVAL` for a `NULL`
 ///         tensor, `ENOTSUP` for a tensor that is not a D3D11 texture and
-///         off Windows. A texture with no recorded write answers 0 and
-///         leaves `errno` alone.
+///         off Windows. A texture with no recorded write returns 0 and
+///         leaves `errno` unchanged.
 ///
 /// # Safety
 /// `t` must be `NULL` or a live handle.
@@ -442,9 +391,6 @@ pub unsafe extern "C" fn ef_tensor_gpu_write_value(t: *const EfTensor) -> u64 {
             0
         }
     }))
-    // A caught panic is a failure too, and 0 on its own is the "no write
-    // recorded" answer: without an `errno` beside it a caller cannot tell
-    // the two apart. `EINVAL` matches the other unresolvable-input path.
     .unwrap_or_else(|_| {
         set_errno(libc::EINVAL);
         0
@@ -455,15 +401,11 @@ pub unsafe extern "C" fn ef_tensor_gpu_write_value(t: *const EfTensor) -> u64 {
 ///
 /// Record that the GPU work writing this texture completes at `value` of the
 /// process device's shared fence -- the value a later
-/// [`ef_tensor_gpu_completion`] hands a consumer. Monotonic: an older value
-/// never displaces a newer one.
+/// [`ef_tensor_gpu_completion`] reports. Monotonic: an older value never
+/// displaces a newer one.
 ///
-/// The value is a monotonic maximum, recorded into an atomic: it is safe to
-/// call while consumers hold the same handle and are reading the tensor,
-/// which is the situation it exists for -- a producer that has just queued
-/// work publishes the fence value on a tensor it has already shared. Unlike
-/// the geometry setters, this needs no exclusive access. `ef_tensor *` rather
-/// than `const ef_tensor *` only because it changes what the tensor reports.
+/// May be called while other threads hold the same handle and read the
+/// tensor; it needs no exclusive access.
 ///
 /// @return 0 on success, `EINVAL` for a `NULL` tensor, `ENOTSUP` for a
 ///         tensor that is not a D3D11 texture and off Windows, or another
@@ -506,27 +448,20 @@ pub unsafe extern "C" fn ef_tensor_set_gpu_write(t: *mut EfTensor, value: u64) -
 ///
 /// `dims`/`ndim` describe the tensor's grid: the allocation shape --
 /// `[height, width, channels]` packed, `[channels, height, width]` planar,
-/// `[combined_height, width]` semi-planar -- or the (smaller) addressing
-/// shape, which names the same texture. The width and height are read off
-/// the texture description, never derived from `dims`; `dims` is then
-/// checked against them and anything else is `EINVAL`, so a shape cannot
-/// silently reinterpret the texture. The tensor that comes back always
-/// carries the allocation shape, so `ef_tensor_shape` echoes `dims` back
-/// only for that spelling.
+/// `[combined_height, width]` semi-planar -- or the addressing shape. The
+/// width and height are read from the texture description; a `dims` that
+/// matches neither shape is `EINVAL`. The returned tensor carries the
+/// allocation shape.
 ///
-/// `format` is the wire descriptor (`"NV12"`, `"rgba8"`), the same
-/// vocabulary every other entry point takes; `dtype` is an `EF_DTYPE_*`
-/// code; `access` is an `EF_CPU_ACCESS_*` code, and decides whether a CPU
-/// staging texture is created alongside -- `EF_CPU_ACCESS_NONE` included,
-/// which is what a caller that will only touch the texture from the GPU
-/// asks for and costs no staging texture at all. `name` may be `NULL`.
+/// `format` is the wire descriptor (`"NV12"`, `"rgba8"`); `dtype` is an
+/// `EF_DTYPE_*` code; `access` is an `EF_CPU_ACCESS_*` code and decides
+/// whether a CPU staging texture is created alongside: `EF_CPU_ACCESS_NONE`
+/// creates none. `name` may be `NULL`.
 ///
 /// A semi-planar texture (`"NV12"`, `"NV16"`, `"NV24"`) carries the image's
-/// row stride as its width, so it is accepted only when that width is even
+/// row stride as its width, and is accepted only when that width is even
 /// and equal to the staging row pitch the driver gives a texture of that
-/// width; anything else is `EINVAL` with both numbers in the message. The
-/// HAL allocates its own that way. A D3D12 or CUDA producer that needs one
-/// should allocate through the HAL, or match the pitch.
+/// width; anything else is `EINVAL` with both numbers in the message.
 ///
 /// @retval a new tensor the caller must free with `ef_tensor_free`.
 /// @retval `NULL` with `errno` set: `EINVAL` for a `NULL`/unshaped argument,
@@ -549,8 +484,6 @@ pub unsafe extern "C" fn ef_tensor_from_d3d11_texture(
     access: u32,
     name: *const c_char,
 ) -> *mut EfTensor {
-    // The quiet hook, before the catch, and around the off-Windows arm too:
-    // see the module's panic-path note.
     ensure_hook_installed();
     catch_unwind(AssertUnwindSafe(|| {
         #[cfg(target_os = "windows")]
@@ -574,11 +507,9 @@ pub unsafe extern "C" fn ef_tensor_from_d3d11_texture(
                 set_errno(libc::EINVAL);
                 return std::ptr::null_mut();
             }
+            // `dims` supplies the image width of a semi-planar texture.
             // SAFETY: the caller contracts `texture` is a live
             // `ID3D11Texture2D` on the process device.
-            // The shape goes in, not just out: a semi-planar texture is as
-            // wide as its row pitch, so `dims` is where its image width comes
-            // from. `check_geometry` still checks the rest.
             let geometry = unsafe {
                 edgefirst_tensor::d3d11_texture_geometry(texture, args.format, Some(&args.shape))
             };
@@ -608,7 +539,6 @@ pub unsafe extern "C" fn ef_tensor_from_d3d11_texture(
         }
     }))
     .unwrap_or_else(|_| {
-        // An unwind must not leave a stale errno behind the NULL it returns.
         set_errno(libc::EINVAL);
         std::ptr::null_mut()
     })
@@ -616,19 +546,17 @@ pub unsafe extern "C" fn ef_tensor_from_d3d11_texture(
 
 /// Platforms: Windows.
 ///
-/// Open a shared D3D11 texture by its NT handle on the process device --
-/// the consumer half of [`ef_tensor_d3d11_shared_handle`], and the route by
-/// which a texture crosses a process boundary.
+/// Open a shared D3D11 texture by its NT handle on the process device.
 ///
 /// `handle` stays owned by the caller: this opens its own texture from it,
-/// so the caller still closes the handle with `CloseHandle`. `fence` is the
-/// same: when non-`NULL` it names a shared fence whose value `fence_value`
-/// is waited for on the process device's immediate context, so a same-device
-/// reader needs no further ordering; the handle is duplicated, never
-/// consumed. Pass `NULL`/0 when there is nothing to wait for.
+/// and the caller closes the handle with `CloseHandle`. When `fence` is
+/// non-`NULL` it names a shared fence whose value `fence_value` is waited
+/// for on the process device's immediate context; the fence handle is
+/// duplicated and stays owned by the caller. Pass `NULL`/0 when there is
+/// nothing to wait for.
 ///
 /// `dims`, `format`, `dtype`, `access` and `name` follow
-/// [`ef_tensor_from_d3d11_texture`] exactly, geometry check included.
+/// [`ef_tensor_from_d3d11_texture`], geometry check included.
 ///
 /// @retval a new tensor the caller must free with `ef_tensor_free`.
 /// @retval `NULL` with `errno` set, as [`ef_tensor_from_d3d11_texture`].
@@ -639,7 +567,7 @@ pub unsafe extern "C" fn ef_tensor_from_d3d11_texture(
 /// point to `ndim` readable `uint64_t`; `format` and `name` must be `NULL`
 /// or NUL-terminated.
 #[no_mangle]
-#[allow(clippy::too_many_arguments)] // one image description, spelled out
+#[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn ef_tensor_from_d3d11_shared_handle(
     handle: *mut c_void,
     dtype: u32,
@@ -651,7 +579,6 @@ pub unsafe extern "C" fn ef_tensor_from_d3d11_shared_handle(
     fence_value: u64,
     name: *const c_char,
 ) -> *mut EfTensor {
-    // As `ef_tensor_from_d3d11_texture`: see the module's panic-path note.
     ensure_hook_installed();
     catch_unwind(AssertUnwindSafe(|| {
         #[cfg(target_os = "windows")]
@@ -675,10 +602,9 @@ pub unsafe extern "C" fn ef_tensor_from_d3d11_shared_handle(
                 set_errno(libc::EINVAL);
                 return std::ptr::null_mut();
             }
+            // `dims` supplies the image width of a semi-planar texture.
             // SAFETY: the caller contracts `handle` is a live NT shared
-            // handle of a D3D11 texture; this opens and drops its own
-            // texture from it.
-            // As above: `dims` carries the semi-planar image width.
+            // handle of a D3D11 texture.
             let geometry = unsafe {
                 edgefirst_tensor::d3d11_shared_handle_geometry(
                     handle,
@@ -725,18 +651,12 @@ pub unsafe extern "C" fn ef_tensor_from_d3d11_shared_handle(
         }
     }))
     .unwrap_or_else(|_| {
-        // An unwind must not leave a stale errno behind the NULL it returns.
         set_errno(libc::EINVAL);
         std::ptr::null_mut()
     })
 }
 
 /// The arguments the two constructors share, decoded once.
-///
-/// Written once rather than twice: the pair differ only in which geometry
-/// helper reads the texture, and two hand-written copies of "decode the
-/// vocabulary codes, then check the shape" are exactly where the two would
-/// drift into accepting different arguments.
 #[cfg(target_os = "windows")]
 struct ImportArgs {
     shape: Vec<usize>,
@@ -788,10 +708,8 @@ impl ImportArgs {
             set_errno(libc::EINVAL);
             return None;
         };
-        // The declaration decoder, not the map-direction one: these
-        // constructors ask what CPU access to provision, and
-        // `EF_CPU_ACCESS_NONE` -- a texture the caller will only touch from
-        // the GPU -- is a first-class answer that costs no staging texture.
+        // Decode `access` as a declaration, which accepts
+        // `EF_CPU_ACCESS_NONE`.
         let Some(acc) = crate::codes::declared_cpu_access_from_code(access) else {
             set_last_error(&format!("{what}: unknown access code {access}"));
             set_errno(libc::EINVAL);
@@ -816,11 +734,7 @@ impl ImportArgs {
     }
 
     /// Check the caller's `dims` against the geometry read off the texture.
-    ///
-    /// Either the allocation shape or the addressing shape is accepted: the
-    /// two are different grids over the same texture, both legitimate
-    /// answers to "what shape is this", and refusing one would make the
-    /// export unusable from whichever surface reports the other.
+    /// Either the allocation shape or the addressing shape is accepted.
     fn check_geometry(
         &self,
         geometry: edgefirst_tensor::Result<(usize, usize)>,
@@ -878,35 +792,25 @@ mod tests {
     use crate::codes::{EfCpuAccess, EfDtype};
     use edgefirst_tensor_abi::EfTensorView;
 
-    /// Wire codes, spelled by name. The C tests reach these through the
-    /// header's enumerators; a Rust test in this crate reaches the same
-    /// values through `codes.rs`, whose compile-time assertions pin them to
-    /// the Rust vocabulary -- so neither side hard-codes an integer.
+    /// Wire codes, spelled by name.
     const U8: u32 = EfDtype::U8 as u32;
     const READ: u32 = EfCpuAccess::Read as u32;
     const READ_WRITE: u32 = EfCpuAccess::ReadWrite as u32;
-    /// Gated with its users: only the Windows tests allocate a texture, so
-    /// off Windows this is an unused constant and the C leaves' clippy runs
-    /// with `-D warnings`.
     #[cfg(target_os = "windows")]
     const DMA_BUF: u32 = EfStorageKind::DmaBuf as u32;
 
-    /// The calling thread's `errno`, for the entry points whose only failure
-    /// channel is a `NULL` return. Read immediately after the call under
-    /// test, as a C caller would.
+    /// The calling thread's `errno`.
     fn current_errno() -> i32 {
         errno::errno().0
     }
 
-    /// Clear `errno` so a later read cannot pick up a value some earlier
-    /// call left behind and report it as this one's.
+    /// Clear `errno`.
     fn clear_errno() {
         errno::set_errno(errno::Errno(0));
     }
 
-    /// What a `NULL` tensor costs: `EINVAL` where the handle is resolved
-    /// (Windows), `ENOTSUP` where the whole family refuses before ever
-    /// looking at it.
+    /// The errno a `NULL` tensor produces: `EINVAL` on Windows, `ENOTSUP`
+    /// elsewhere.
     fn null_tensor_errno() -> i32 {
         if cfg!(target_os = "windows") {
             libc::EINVAL
@@ -915,9 +819,7 @@ mod tests {
         }
     }
 
-    /// Every export refuses a `NULL` handle rather than dereferencing it --
-    /// asserted on every platform, since the whole point of this family is
-    /// that it is declared everywhere.
+    /// Every export refuses a `NULL` handle, on every platform.
     #[test]
     fn every_export_refuses_a_null_tensor() {
         let mut layout = EfD3d11Layout::default();
@@ -951,9 +853,8 @@ mod tests {
         assert_eq!(current_errno(), null_tensor_errno());
     }
 
-    /// `gpu_completion` clears the caller's out-parameters before doing
-    /// anything else, so a failing call cannot leave stale values that read
-    /// as a recorded write.
+    /// `gpu_completion` clears the caller's out-parameters on a failing
+    /// call.
     #[test]
     fn gpu_completion_clears_its_out_parameters_before_failing() {
         let mut fence = std::ptr::dangling_mut::<c_void>();
@@ -966,8 +867,7 @@ mod tests {
         assert_eq!(value, 0);
     }
 
-    /// A null `fence`/`value` is `EINVAL`, not a write through a null
-    /// pointer.
+    /// A null `fence`/`value` is `EINVAL`.
     #[test]
     fn gpu_completion_rejects_null_out_parameters() {
         let mut value = 0u64;
@@ -977,10 +877,8 @@ mod tests {
         );
     }
 
-    /// A tensor that is not a D3D11 texture refuses the accessors rather
-    /// than answering for some other backing, and says `ENOTSUP` rather than
-    /// returning a bare `NULL`. Runs everywhere: off Windows the same calls
-    /// take the platform arm, which answers `ENOTSUP` too.
+    /// A tensor that is not a D3D11 texture fails the accessors with
+    /// `ENOTSUP`.
     #[test]
     fn a_host_memory_tensor_is_not_a_d3d11_texture() {
         let dims = [4u64, 4, 4];
@@ -1010,8 +908,7 @@ mod tests {
     }
 
     /// `ef_tensor_try_map` behaves as `ef_tensor_map` on a backing with no
-    /// GPU copy to wait for -- the contract that lets a caller use it
-    /// unconditionally.
+    /// GPU copy to wait for.
     #[test]
     fn try_map_succeeds_on_host_memory() {
         let dims = [4u64];
@@ -1029,18 +926,13 @@ mod tests {
         unsafe { crate::handle::ef_tensor_free(t) };
     }
 
-    /// A non-null pointer the constructors under test never dereference:
-    /// every case in `the_constructors_reject_bad_arguments` fails while
-    /// decoding `dims`/`format`/`dtype`/`access`, before either constructor
-    /// looks at the texture or the handle. Non-null on purpose -- a null one
-    /// would be rejected by the null check instead, testing a different arm.
+    /// A non-null pointer the constructors under test never dereference.
     fn not_reached() -> *mut c_void {
         std::ptr::dangling_mut::<c_void>()
     }
 
-    /// What a malformed argument costs: `EINVAL` where the arguments are
-    /// actually decoded (Windows), `ENOTSUP` where the constructor refuses
-    /// before reading any of them.
+    /// The errno a malformed argument produces: `EINVAL` on Windows,
+    /// `ENOTSUP` elsewhere.
     fn bad_argument_errno() -> i32 {
         if cfg!(target_os = "windows") {
             libc::EINVAL
@@ -1049,8 +941,7 @@ mod tests {
         }
     }
 
-    /// The bad-argument arms of the two constructors, which are reached on
-    /// every platform before any texture is touched.
+    /// The two constructors reject bad arguments on every platform.
     #[test]
     fn the_constructors_reject_bad_arguments() {
         let dims = [32u64, 64, 4];
@@ -1124,10 +1015,8 @@ mod tests {
         assert_eq!(current_errno(), bad_argument_errno());
     }
 
-    /// `EF_CPU_ACCESS_NONE` is accepted by both constructors: it is the
-    /// declaration a caller makes when it will only touch the texture from
-    /// the GPU, and the default the Python constructors document. What
-    /// refuses it is the *map*, which needs a direction.
+    /// Both constructors accept `EF_CPU_ACCESS_NONE`, and the map refuses
+    /// it.
     #[cfg(target_os = "windows")]
     #[test]
     fn the_constructors_accept_no_cpu_access_and_the_map_still_refuses_it() {
@@ -1174,8 +1063,7 @@ mod tests {
         };
         assert!(!opened.is_null(), "errno {}", current_errno());
 
-        // And the map still refuses the same code, because there is no
-        // direction to map in.
+        // The map refuses the same code.
         let mut view = EfTensorView {
             ptr: std::ptr::null_mut(),
             len: 0,
@@ -1194,13 +1082,9 @@ mod tests {
         close_handle(handle);
     }
 
-    /// The Windows path end to end: allocate a texture tensor, read its
-    /// layout and texture, share it, record and read a completion, and wrap
-    /// the shared handle back into a second tensor that sees the same bytes.
-    ///
-    /// The C leaf test (`tests/c/test_d3d11.c`) asserts the same contract
-    /// through the generated header; this one runs on a host with no C
-    /// toolchain, which is every Windows developer box in this project.
+    /// Allocate a texture tensor, read its layout and texture, share it,
+    /// record and read a completion, and wrap the shared handle back into a
+    /// second tensor that sees the same bytes.
     #[cfg(target_os = "windows")]
     #[test]
     fn a_texture_tensor_round_trips_through_the_exports() {
@@ -1218,8 +1102,7 @@ mod tests {
         let texture = unsafe { ef_tensor_d3d11_texture(t) };
         assert!(!texture.is_null());
 
-        // Fill through the map window so the re-wrapped tensor has
-        // something recognisable to read back.
+        // Fill through the map window.
         let mut view = EfTensorView {
             ptr: std::ptr::null_mut(),
             len: 0,
@@ -1232,14 +1115,7 @@ mod tests {
         unsafe { std::ptr::write_bytes(view.ptr, 0x3C, view.len) };
         assert_eq!(unsafe { crate::map::ef_tensor_unmap(t) }, 0);
 
-        // No write recorded yet, then one, and the fence comes back owned.
-        //
-        // The `ef_tensor_d3d11_texture` reads bracketing the recording are
-        // the point: `ef_tensor_set_gpu_write` needs only a shared
-        // reference, so a producer can publish a fence value on a tensor
-        // consumers already hold and are reading. Under the exclusive-borrow
-        // route this used to take, this call sequence was the one the
-        // contract forbade.
+        // No write is recorded, then one is, and the fence comes back owned.
         let mut fence = std::ptr::dangling_mut::<c_void>();
         let mut value = 1u64;
         assert_eq!(
@@ -1262,7 +1138,7 @@ mod tests {
         close_handle(fence);
         assert_eq!(unsafe { ef_tensor_gpu_write_value(t) }, value);
 
-        // Monotonic: an older value never displaces the newer one.
+        // An older value does not displace the newer one.
         assert_eq!(unsafe { ef_tensor_set_gpu_write(t, 7) }, 0);
         assert_eq!(
             unsafe { ef_tensor_gpu_completion(t, &mut fence, &mut value) },
@@ -1318,7 +1194,7 @@ mod tests {
         assert_eq!(shape, &[32, 64, 4]);
         unsafe { crate::handle::ef_tensor_free(wrapped) };
 
-        // A shape the texture does not have is refused, not reinterpreted.
+        // A shape the texture does not have is refused.
         let wrong = [16u64, 16, 4];
         clear_errno();
         assert!(unsafe {
@@ -1335,8 +1211,7 @@ mod tests {
         .is_null());
         assert_eq!(current_errno(), libc::EINVAL);
 
-        // `try_map` either succeeds or asks to be retried; it never stalls
-        // and never reports some third thing.
+        // `try_map` returns 0 or `EAGAIN`.
         let rc = unsafe { crate::map::ef_tensor_try_map(t, READ, &mut view) };
         assert!(rc == 0 || rc == libc::EAGAIN, "try_map returned {rc}");
         if rc == 0 {
@@ -1347,15 +1222,9 @@ mod tests {
         unsafe { crate::handle::ef_tensor_free(t) };
     }
 
-    /// Both spellings of `dims` name the same texture, on a format where
-    /// they genuinely differ.
-    ///
-    /// NV12 is the discriminating case: at 64x48 its allocation shape is
-    /// `[72, 64]` (the combined luma + chroma plane height) and its
-    /// addressing shape is `[48, 64]` (the luma grid) -- both rank 2, so
-    /// nothing but the numbers tells them apart. RGBA cannot test this at
-    /// all: its two shapes are identical. A combined height no image height
-    /// produces is refused rather than rounded to a nearby one.
+    /// Both the allocation shape `[72, 64]` and the addressing shape
+    /// `[48, 64]` of a 64x48 NV12 texture are accepted; `[47, 64]` is
+    /// refused.
     #[cfg(target_os = "windows")]
     #[test]
     fn either_shape_spelling_names_the_same_nv12_texture() {
@@ -1401,9 +1270,8 @@ mod tests {
     }
 
     /// Allocate a texture-backed image tensor through the image-desc
-    /// builder, or `None` with a printed reason when this host has no D3D11
-    /// device. Shared by the two Windows tests so neither repeats the
-    /// builder dance.
+    /// builder, or return `None` with a printed reason when this host has no
+    /// D3D11 device.
     #[cfg(target_os = "windows")]
     fn texture_tensor(
         format: &str,
@@ -1432,16 +1300,13 @@ mod tests {
         Some(t)
     }
 
-    /// `CloseHandle` without pulling the `windows` crate into this leaf:
-    /// the handles crossing this ABI are plain `void *`, and the test needs
-    /// exactly one Win32 call to give the owned ones back.
+    /// Close an owned NT handle with `CloseHandle`.
     #[cfg(target_os = "windows")]
     fn close_handle(h: *mut c_void) {
         extern "system" {
             fn CloseHandle(h: *mut c_void) -> i32;
         }
-        // SAFETY: `h` is an owned NT handle this test received from an
-        // export documented to transfer ownership.
+        // SAFETY: `h` is an owned NT handle.
         assert_ne!(unsafe { CloseHandle(h) }, 0);
     }
 }

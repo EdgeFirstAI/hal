@@ -38,7 +38,7 @@ pub fn parse_markers(data: &[u8]) -> crate::Result<JpegHeaders> {
 }
 
 /// Like [`parse_markers`], but reuses Huffman LUTs from `cache` when the DHT
-/// payload matches the previous frame (tables are **moved** out of the cache).
+/// payload matches the previous frame (tables are moved out of the cache).
 pub(crate) fn parse_markers_with_cache(
     data: &[u8],
     mut cache: Option<&mut HuffmanCache>,
@@ -83,11 +83,10 @@ pub(crate) fn parse_markers_with_cache(
             marker::EOI => break,
             marker::SOI => continue,
 
-            // Restart markers — shouldn't appear in marker segments
+            // Restart markers are skipped.
             m if (marker::RST0..=marker::RST7).contains(&m) => continue,
 
-            // Unsupported JPEG modes — surface a typed Unsupported error so
-            // callers can pattern-match instead of string-matching.
+            // Unsupported JPEG modes return a typed `Unsupported` error.
             marker::SOF1 => {
                 return Err(CodecError::Unsupported(
                     UnsupportedFeature::ExtendedSequentialJpeg,
@@ -178,11 +177,8 @@ pub(crate) fn parse_markers_with_cache(
                     });
                 }
 
-                // Validate that every component sampling factor divides the
-                // luma sampling factor evenly. This prevents division-by-zero
-                // (and other absurd subsampling configs) in the chroma
-                // upsampler / NV12 writer when adversarial input declares a
-                // chroma rate that exceeds luma.
+                // Every component sampling factor must divide the maximum
+                // sampling factor.
                 for comp in &components {
                     if !max_h.is_multiple_of(comp.sampling.h)
                         || !max_v.is_multiple_of(comp.sampling.v)
@@ -434,7 +430,7 @@ mod tests {
         buf.push(1); // 1 component
         buf.extend_from_slice(&[1, 0x00]); // comp 1, DC=0 AC=0
         buf.extend_from_slice(&[0, 63, 0]); // Ss=0, Se=63, Ah=0|Al=0
-                                            // Entropy data: we just put a few bytes then EOI
+                                            // Entropy data: a few bytes, then EOI.
         buf.extend_from_slice(&[0x00, 0xFF, marker::EOI]);
         buf
     }

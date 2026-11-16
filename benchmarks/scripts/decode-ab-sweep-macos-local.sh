@@ -2,30 +2,19 @@
 # SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 # SPDX-License-Identifier: Apache-2.0
 #
-# Local (no-SSH) variant of decode-ab-sweep.sh for mbp-m2-max and any other
-# macOS host — the script runs directly on the machine being measured
-# instead of over SSH, since macOS boards in this fleet don't have a
-# separate reachable SSH target the way the Linux boards do. Same
-# methodology: interleaved rounds, n=LIMIT, warmup=WARMUP, median of
-# rounds' p50 with spread, same eight arms, same output format
-# (results/mbp-m2-max/decode-ab-sweep/<corpus>/summary.txt) as the real
-# sweep — see BENCHMARKS.md § JPEG Decode for how these numbers are used.
+# Local (no-SSH) variant of decode-ab-sweep.sh for macOS hosts: the script
+# runs directly on the machine being measured. Interleaved rounds, n=LIMIT,
+# warmup=WARMUP, median of rounds' p50 with spread, the same arms and the
+# same output format (results/mbp-m2-max/decode-ab-sweep/<corpus>/summary.txt).
 #
-# macOS has no taskset-equivalent hard pin; every arm's main() calls an
-# advisory QOS_CLASS_USER_INTERACTIVE hint instead (see
-# benchmarks/common/src/cpu.rs::pin_qos and the matching copies in
-# rust_jpeg/turbojpeg/cbench.h) and this script defaults to 5 rounds instead
-# of 3 to average out more of what the hint can't fix. See BENCHMARKS.md's
-# discussion of this board's spread.
+# Every arm's main() sets an advisory QOS_CLASS_USER_INTERACTIVE hint.
 #
 # Usage:
 #   ./benchmarks/scripts/decode-ab-sweep-macos-local.sh /path/to/coco/val2017
 #   ./benchmarks/scripts/decode-ab-sweep-macos-local.sh /path/to/corpora/val2017-yuv420
 #
 # Env:
-#   LIMIT / WARMUP / ROUNDS   as decode-ab-sweep.sh (default 200 / 20 / 5;
-#                             ROUNDS defaults higher here than the Linux
-#                             boards' 3, to compensate for unpinned scheduling)
+#   LIMIT / WARMUP / ROUNDS   as decode-ab-sweep.sh (default 200 / 20 / 5)
 #   SKIP_BUILD=1              skip the cargo/make build step (binaries already built)
 
 set -euo pipefail
@@ -63,10 +52,8 @@ fi
 out_dir="${RESULTS}/mbp-m2-max/decode-ab-sweep/${CORPUS_NAME}"
 mkdir -p "${out_dir}"
 
-# Provenance (review v3.12 §1.3/§4.10): captured once before the round loop.
-# Power/thermal state matters on a MacBook in a way it doesn't on a plugged
-# board — AC vs battery, Low Power Mode, and chassis thermal state all move
-# these numbers.
+# Provenance, captured once before the round loop: host, toolchain,
+# libjpeg-turbo version, power source, Low Power Mode and thermal state.
 {
   echo "captured: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "host: $(hostname)  macOS $(sw_vers -productVersion 2>/dev/null)  $(uname -m)"

@@ -111,8 +111,7 @@ impl DflKernel {
     /// The kernel for this input and output: the exp table for 8-bit inputs (NEON for every
     /// `reg_max`, with dist2bbox in f16 for `boxes` into `f16` on the FP16 tier); the FP16
     /// softmax for other inputs into `f16` on the FP16 tier; otherwise the f32 softmax, NEON on
-    /// NEON tiers, with the fp16 exp for 16-bit inputs to `f32` on the FP16 tier, as the decoder
-    /// does.
+    /// NEON tiers, with the fp16 exp for 16-bit inputs to `f32` on the FP16 tier.
     pub(crate) fn select(
         input_dtype: DType,
         input: Quant,
@@ -120,7 +119,6 @@ impl DflKernel {
         boxes: bool,
         f: CpuFeatures,
     ) -> Self {
-        // Only the FP16 tier's box kernels depend on it.
         #[cfg(not(target_arch = "aarch64"))]
         let _ = boxes;
         match (input_dtype, Isa::of(f), output_dtype) {
@@ -494,7 +492,6 @@ mod tests {
             return;
         };
         for d in [DType::I8, DType::U8] {
-            // Without box math there is no f16 arithmetic: the f32 distances, rounded once.
             assert!(matches!(
                 kernel(d, DType::F16, h),
                 DflKernel::Lut { neon: true, .. }

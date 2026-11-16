@@ -544,9 +544,7 @@ fn sigmoid_f16_output_is_narrowed_f32_path() {
 /// f16 ulps the FP16 tier's f16 outputs may be from the float64 sigmoid rounded to f16.
 const FP16_ULP_BOUND: i32 = 2;
 
-/// On the FP16 tier, every input type's f16 output is within 2 f16 ulps of the float64
-/// sigmoid of the exactly dequantized input, rounded to f16, at the fixed quantizations and a
-/// seeded random sweep; NaN gives NaN.
+/// On the FP16 tier, f16 outputs are within 2 f16 ulps of the float64 sigmoid rounded to f16.
 #[test]
 fn sigmoid_f16_output_fp16_within_bound() {
     let Some(feats) = common::tiers().into_iter().find(|f| f.neon_fp16) else {

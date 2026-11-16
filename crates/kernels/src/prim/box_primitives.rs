@@ -28,7 +28,7 @@ pub fn weighted_sum_4sides_f32(probs: &[f32], reg_max: usize) -> [f32; 4] {
 
 #[inline]
 pub fn weighted_sum_4sides_f16(probs: &[f16], reg_max: usize) -> [f16; 4] {
-    // Compute in f32 for precision; result fits f16 trivially (max bin=15).
+    // Computed in f32, stored as f16.
     debug_assert_eq!(probs.len(), 4 * reg_max);
     let mut d = [f16::ZERO; 4];
     for (side, slot) in d.iter_mut().enumerate() {

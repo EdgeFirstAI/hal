@@ -1,16 +1,7 @@
 # actionlint configuration.
 #
-# Labels actionlint cannot know about.
-#
-# The boards are reached only from Full and Nightly on same-repository refs;
-# the shared rust-full workflow enforces that. Labels are board identities from
-# the self-hosted runner fleet.
-#
-# The -xlarge labels are GitHub larger runners provisioned by the organisation
-# rather than predefined by GitHub, so they are absent from actionlint's built-in
-# list. Confirmed present via orgs/EdgeFirstAI/actions/hosted-runners; they sit
-# in the Default runner group. Note there is no Windows larger runner in that
-# list, which is why the Windows lanes stay on windows-latest.
+# Labels actionlint cannot know about: the self-hosted board runners and the
+# organisation's larger runners.
 self-hosted-runner:
   labels:
     - imx8mp-evk

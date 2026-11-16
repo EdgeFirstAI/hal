@@ -113,15 +113,15 @@ pub enum PyCodec {
     Png = 1,
     /// H.264, as an Annex B byte stream.
     H264 = 2,
-    /// HEVC. No engine runs it yet.
+    /// HEVC. No engine runs it.
     Hevc = 3,
     /// Motion JPEG: a stream of JPEG pictures.
     Mjpeg = 4,
-    /// VP8. No engine runs it yet.
+    /// VP8. No engine runs it.
     Vp8 = 5,
-    /// VP9. No engine runs it yet.
+    /// VP9. No engine runs it.
     Vp9 = 6,
-    /// AV1. No engine runs it yet.
+    /// AV1. No engine runs it.
     Av1 = 7,
 }
 
@@ -181,7 +181,7 @@ pub enum PyEngine {
     V4l2 = 1,
     /// Windows Media Foundation transforms.
     MediaFoundation = 2,
-    /// Apple VideoToolbox. No backend runs it yet.
+    /// Apple VideoToolbox. No backend runs it.
     VideoToolbox = 3,
     /// NVIDIA nvJPEG (JPEG decoding on Linux).
     NvJpeg = 4,
@@ -393,12 +393,12 @@ pub enum PyOutputMemory {
     /// The pool's buffers (allocated by the decoder or provided by the
     /// caller), which the device imports or the decoder copies into.
     Imported = 0,
-    /// The device's own buffers, exported because it would not import the
+    /// The device's own buffers, exported when the device does not import the
     /// pool's. CPU reads of these may be uncached and slow.
     Exported = 1,
 }
 
-/// A JPEG quality, refused outside 1 to 100 as the codec refuses it.
+/// A JPEG quality, refused outside 1 to 100.
 fn jpeg_quality(quality: i64) -> PyResult<u8> {
     u8::try_from(quality)
         .ok()
@@ -452,8 +452,8 @@ impl PyCapability {
 /// What the codec engines on this machine can do, engine by engine, in the
 /// order ``Engine.Auto`` tries them.
 ///
-/// Probing opens no stream, but it opens device nodes and enumerates (on
-/// Windows, activates) transforms, so it is not free: call it once.
+/// Probing opens device nodes and enumerates (on Windows, activates)
+/// transforms; it opens no stream.
 #[pyfunction]
 pub fn capabilities(py: Python<'_>) -> PyResult<Vec<PyCapability>> {
     py.detach(edgefirst_codec::capabilities)
@@ -504,7 +504,6 @@ fn with_source<R: Send>(
 /// YUYV, GREY, RGB and RGBA images at any row stride.
 #[pyclass(name = "ImageEncoder", module = "edgefirst.codec")]
 pub struct PyImageEncoder {
-    /// Behind a lock because a V4L2 encoder is not `Sync`.
     inner: Mutex<ImageEncoderState>,
 }
 
@@ -879,28 +878,20 @@ impl PyStreamInfo {
     }
 }
 
-/// Frames Python has let go of, given back to the decoder at its next call.
-///
-/// A frame's buffer must not go back while its tensor's handle is still
-/// referenced, or the decoder's CPU writes into that buffer are refused. A
-/// frame's own fields are dropped before its base tensor's, so the frame is
-/// parked here and released by the decoder while it holds the GIL, which
-/// the frame's deallocation also holds.
+/// Frames Python has released, given back to the decoder at its next call.
 type Returned = Mutex<Vec<DecodedFrame>>;
 
 /// A decoded picture: a :class:`Tensor` whose buffer belongs to its
 /// decoder's pool.
 ///
 /// The buffer goes back to the decoder once this frame is no longer
-/// referenced. Hold frames only as long as their pictures are needed: the
-/// pool is bounded, and a decoder whose every buffer is held raises
-/// ``PoolExhaustedError``. A map or pin of a frame keeps the buffer until it
-/// is released; a ``view()`` or ``batch()`` does not.
+/// referenced. The pool is bounded, and a decoder whose every buffer is held
+/// raises ``PoolExhaustedError``. A map or pin of a frame keeps the buffer
+/// until it is released; a ``view()`` or ``batch()`` does not.
 ///
-/// A frame is read-only: its buffer and metadata belong to the decoder.
-/// Changing its shape, format, quantization or colorimetry, or decoding or
-/// writing into it, raises ``TypeError``, and a writable CPU map raises
-/// ``RuntimeError``. Copy the picture to change it.
+/// A frame is read-only. Changing its shape, format, quantization or
+/// colorimetry, or decoding or writing into it, raises ``TypeError``, and a
+/// writable CPU map raises ``RuntimeError``.
 #[pyclass(name = "Frame", extends = PyTensor, module = "edgefirst.codec")]
 pub struct PyFrame {
     frame: Option<DecodedFrame>,
@@ -927,15 +918,10 @@ impl PyFrame {
         frame: DecodedFrame,
         returned: &Arc<Returned>,
     ) -> PyResult<Py<PyAny>> {
-        // Sharing the handle keeps everything the decoder set on the
-        // tensor, a separate chroma plane included. Where tensors are not
+        // The base tensor shares the frame's handle; where tensors are not
         // shared handles, the memory is reconstructed from its descriptor.
         //
         // SAFETY: neither owner changes the metadata while both are alive.
-        // `Frame` refuses every metadata change and every mutable extraction
-        // (`read_only`, `TensorArg::extract_mut`), and the decoder changes a
-        // buffer's metadata only once it has it back, which is after this
-        // frame and its base tensor are gone (see `Returned`).
         let (base, pin) = match unsafe { frame.tensor().share() } {
             Ok(shared) => (shared, None),
             Err(_) => {
@@ -1106,8 +1092,7 @@ impl PyFrame {
 pub struct PyVideoDecoder {
     inner: Mutex<video::VideoDecoder>,
     returned: Arc<Returned>,
-    /// What keeps caller-provided pool tensors valid; after `inner`, so it
-    /// is dropped after the decoder that uses them.
+    /// Keeps caller-provided pool tensors valid; dropped after `inner`.
     _pool: Vec<RawKeepalive>,
 }
 
@@ -1147,10 +1132,9 @@ impl PyVideoDecoder {
     ///         DMA-BUF buffer (an NV12 D3D11 image of the stream's visible
     ///         size on Windows). The decoder writes those tensors: do not
     ///         use them while it is open.
-    ///         A V4L2 device takes a bounded number of buffers (31 on the
-    ///         i.MX 95's Wave6, its own included); a pool beyond that
-    ///         raises ``InvalidConfigError`` from :meth:`decode` once the
-    ///         stream's format is known.
+    ///         A V4L2 device takes a bounded number of buffers; a pool
+    ///         beyond that raises ``InvalidConfigError`` from :meth:`decode`
+    ///         once the stream's format is known.
     ///
     /// Raises:
     ///     NoDeviceError: there is no decoder.
@@ -1172,9 +1156,8 @@ impl PyVideoDecoder {
                 Ok(count) => OutputPool::Allocate { count },
                 Err(_) => {
                     let items = p.try_iter()?.collect::<PyResult<Vec<_>>>()?;
-                    // The same object twice is refused here, before resolving
-                    // it twice; distinct objects over one buffer are refused
-                    // by the decoder, which compares buffer identities.
+                    // The same object given twice is refused here; distinct objects
+                    // over one buffer are refused by the decoder.
                     for (i, item) in items.iter().enumerate() {
                         if let Some(first) = items[..i].iter().position(|o| o.is(item)) {
                             return Err(InvalidConfigError::new_err(format!(

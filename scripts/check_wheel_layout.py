@@ -1,17 +1,11 @@
 #!/usr/bin/env python3
-"""Assert the A3 wheel layout.
+"""Assert the wheel layout.
 
-Single-tensor-home (task P2): the shared tensor library
-(`libedgefirst_tensor.so.<major>` on Linux, `libedgefirst_tensor.<major>.dylib`
-on macOS, `edgefirst_tensor.dll` on Windows) lives in exactly the `tensor`
-wheel -- every other wheel links to it via RPATH (or, on Windows, an
-`os.add_dll_directory()` call in its `__init__.py`) instead of embedding or
-vendoring a copy. Older revisions of this check predated that
-architecture and required every wheel to be fully self-contained, which is
-now exactly backwards for the `tensor` wheel: it is SUPPOSED to carry the
-shared core, precisely because nothing else should have to. Also checks for
-namespace-shadowing `__init__.py` and that stubs are present. Exits non-zero
-on any violation.
+The shared tensor library (`libedgefirst_tensor.so.<major>` on Linux,
+`libedgefirst_tensor.<major>.dylib` on macOS, `edgefirst_tensor.dll` on
+Windows) must be in the `tensor` wheel and in no other; the other wheels
+link to it. Also checks for namespace-shadowing `__init__.py` and that stubs
+are present. Exits non-zero on any violation.
 """
 
 from __future__ import annotations
@@ -32,24 +26,14 @@ def _is_tensor_library(name: str) -> bool:
     """Whether a wheel entry is the shared tensor library itself.
 
     Linux ships ``libedgefirst_tensor.so.<major>``, macOS
-    ``libedgefirst_tensor.<major>.dylib``, Windows ``edgefirst_tensor.dll``
-    (no ``lib`` prefix and no SONAME/version suffix: a DLL is always named by
-    its bare file name).
+    ``libedgefirst_tensor.<major>.dylib``, Windows ``edgefirst_tensor.dll``.
     """
     base = name.rsplit("/", 1)[-1]
     return base.startswith("libedgefirst_tensor") or base == "edgefirst_tensor.dll"
 
 
 def _check_tensor_home(wheel_name: str, pkg: str, names: list[str]) -> list[str]:
-    # A3: single-tensor-home. The shared tensor library lives in exactly the
-    # tensor wheel -- its own home -- and every other wheel links to it
-    # (RPATH $ORIGIN/../tensor on Linux/macOS; os.add_dll_directory() on
-    # edgefirst/tensor/ at import time on Windows) rather than vendoring a
-    # copy. A copy anywhere else is exactly the duplication this
-    # architecture removes, reintroduced invisibly: auditwheel/delocate/
-    # delvewheel vendor external shared libraries by default, which is
-    # precisely how this was found missing here (task P2's report, and
-    # again from a differential run afterward).
+    # The shared tensor library must be in the tensor wheel and in no other.
     tensor_lib = [n for n in names if _is_tensor_library(n)]
     if pkg == "tensor":
         if not tensor_lib:
@@ -99,8 +83,7 @@ def _check_wheel_contents(wheel: pathlib.Path) -> list[str]:
     if not any(n.endswith((".so", ".pyd", ".dylib")) for n in names):
         errors.append(f"{wheel.name} contains no extension module")
 
-    # Apache-2.0 §4(a): the licence must travel with the redistributed work.
-    # maturin + PEP 639 `license-files` puts it under *.dist-info/licenses/.
+    # The licence file is under *.dist-info/licenses/.
     has_license = any(
         "/licenses/" in n or n.endswith(("/LICENSE", "/LICENSE.txt")) for n in names
     )
@@ -111,27 +94,17 @@ def _check_wheel_contents(wheel: pathlib.Path) -> list[str]:
 
 def _check_tag_uniformity(wheels: list[pathlib.Path]) -> list[str]:
     # Tag-set uniformity across the distributions.
-    #
-    # The release builds both abi3-py311 and abi3-py38. If one package fails to
-    # produce a cp311-abi3 wheel for some platform while the others succeed, pip
-    # silently installs a cp38-abi3 build of that package alongside cp311-abi3
-    # siblings. They are independent CPython modules so nothing crashes -- but
-    # the py38 build lacks the zero-copy buffer protocol, so one package behaves
-    # differently from the rest and the documented API quietly forks per user.
     tags: dict[str, set[tuple[str, str, str]]] = {}
     for wheel in wheels:
         parts = wheel.stem.split("-")  # name-version-python-abi-platform
         if len(parts) >= 5:
             pkg = parts[0].replace("edgefirst_", "")
-            # The python tag (index 2) is what distinguishes cp38-abi3 from
-            # cp311-abi3 -- the abi tag is "abi3" for both, so comparing only
-            # (abi, platform) would never see the difference that matters.
+            # Compares the python, abi and platform tags.
             tags.setdefault(pkg, set()).add((parts[2], parts[3], parts[4]))
     if len(tags) <= 1:
         return []
 
-    # Majority wins, so the message names the odd one out rather than an
-    # arbitrary pick.
+    # The majority tag set is the expected one.
     counts = Counter(frozenset(v) for v in tags.values())
     reference = set(counts.most_common(1)[0][0])
     errors: list[str] = []
@@ -167,9 +140,6 @@ def main(wheel_dir: str = "target/wheels") -> int:
     for error in errors:
         print(f"ERROR: {error}")
     if not errors:
-        # ASCII on purpose: a Windows subprocess pipe is cp1252, where a
-        # U+2713 check mark raises UnicodeEncodeError and turns a passing
-        # check into exit status 1 (tests/packaging/test_wheel_layout.py).
         print(f"OK: {len(wheels)} wheels: single tensor home, typed, namespace intact")
     return 1 if errors else 0
 

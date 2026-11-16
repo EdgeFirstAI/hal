@@ -2,45 +2,18 @@
 """
 Reference implementation: per-scale YOLOv8 segmentation decoder.
 
-PURPOSE
--------
-This script is a pure Python / NumPy reference for the per-scale TFLite
-output decoding pipeline.  It demonstrates every algorithmic step that the
-HAL's native Rust ``Decoder`` must implement to support models produced by
-the EdgeFirst tflite-converter with ``quantization_split`` enabled.
-
-The tflite-converter splits each logical output (boxes, scores, mask_coefs)
-along the FPN scale axis so that each spatial scale gets its own
-quantization parameters.  This dramatically improves int8 accuracy — see
-the benchmarks below — but requires a new decode path in the HAL that
-reassembles per-scale tensors before (or interleaved with) DFL + NMS.
-
-BENCHMARK RESULTS  (coco128, imx8mp VX delegate)
---------------------------------------------------
-  yolov8n-seg (encoding: dfl):
-    Standard TFLite (monolithic):  Seg mAP@0.5 = 47.16   Box mAP@0.5 = 48.40
-    Per-scale TFLite (this path):  Seg mAP@0.5 = 52.38   Box mAP@0.5 = 56.10
-    ONNX FP32 reference:           Seg mAP@0.5 = 51.60   Box mAP@0.5 = 57.96
-
-  yolo11n-seg (encoding: dfl):
-    Per-scale TFLite (this path):  Seg mAP@0.5 = 50.03   Box mAP@0.5 = 53.65
-
-  yolo26n-seg (encoding: ltrb):
-    Standard TFLite (monolithic):  Seg mAP@0.5 = 28.60   Box mAP@0.5 = (collapsed)
-    Per-scale TFLite (this path):  Seg mAP@0.5 = 44.60   Box mAP@0.5 = 47.35
-    ONNX FP32 reference:           Seg mAP@0.5 = 60.98
-
-  Per-scale quantization dramatically improves int8 accuracy across all
-  model families.  For yolov8/yolo11 it essentially eliminates the
-  degradation; for yolo26 it recovers +16 pp from the catastrophic
-  monolithic collapse.
+A pure Python / NumPy implementation of the per-scale TFLite output
+decoding pipeline for models produced by the EdgeFirst tflite-converter
+with ``quantization_split`` enabled.  The converter splits each logical
+output (boxes, scores, mask_coefs) along the FPN scale axis, giving each
+spatial scale its own quantization parameters.
 
 METADATA FORMAT  (edgefirst.json schema v2)
 --------------------------------------------
 The per-scale model's ``edgefirst.json`` declares hierarchical outputs.
 Each logical output (``boxes``, ``scores``, ``mask_coefs``) contains an
 ``outputs`` array of per-scale children.  The ``protos`` output has no
-children — it's a single physical tensor.
+children; it is a single physical tensor.
 
 Two box encodings are supported:
 
@@ -78,84 +51,31 @@ Two box encodings are supported:
       ]
     }
 
-  Box channels = 4.  The DFL decode already happened inside the model
-  graph (yolo26 architecture does DFL internally).  The 4 channels are
-  direct LTRB distances in grid units.  Decode: just dist2bbox (no
-  softmax step).
+  Box channels = 4: direct LTRB distances in grid units.  Decode:
+  dist2bbox.
 
-PIPELINE STAGES  (cross-reference with HAL crates)
-----------------------------------------------------
-Each section below is annotated with the HAL Rust module that already
-implements the corresponding functionality for Hailo (flat or merged) paths.
-The per-scale TFLite path differs primarily in:
-
-  1. Physical tensor binding uses shape-matching (like TFLite ``get_tensor``)
-     rather than HailoRT's named output API.
-  2. Dequantization happens here (TFLite returns raw int8), whereas HailoRT
-     can be asked for ``FormatType::FLOAT32`` dequant on-device.
-  3. All 10 physical tensors arrive at once (no streaming); the decoder
-     must sort/join children by stride before DFL decode.
-
-Stage reference::
-
-  ┌───────────────────────────────────────────────────────────────────┐
-  │  Stage              │ HAL module                │ This function   │
-  ├─────────────────────┼───────────────────────────┼─────────────────┤
-  │  1. Bind tensors    │ merge.rs (shape_map)      │ bind_outputs()  │
-  │  2. Dequantize      │ float.rs (dequantize_cpu) │ dequantize()    │
-  │  3a. DFL decode     │ dfl.rs (decode_dfl_level) │ dfl_decode*()   │
-  │  3b. LTRB dist2bbox │ dfl.rs (dist2bbox only)   │ ltrb_decode*()  │
-  │  4. Sigmoid scores  │ postprocess.rs            │ sigmoid()       │
-  │  5. Concat scales   │ merge.rs (PerScale)       │ concat in main  │
-  │  6. NMS             │ yolo.rs (nms_*)           │ nms()           │
-  │  7. Mask decode     │ decoder/mod.rs            │ decode_masks()  │
-  └───────────────────────────────────────────────────────────────────┘
+PIPELINE STAGES
+---------------
+  1. Bind tensors       bind_outputs()
+  2. Dequantize         dequantize()
+  3a. DFL decode        dfl_decode_level()
+  3b. LTRB dist2bbox    ltrb_decode_level()
+  4. Sigmoid scores     sigmoid()
+  5. Concat scales      decode_all_scales()
+  6. NMS                nms_class_agnostic()
+  7. Mask decode        decode_masks()
 
   Stage 3 branches on ``encoding``: "dfl" runs softmax + weighted sum
-  before dist2bbox (yolov8/yolo11); "ltrb" skips straight to dist2bbox
-  (yolo26).  All other stages are identical.
+  before dist2bbox (yolov8/yolo11); "ltrb" runs dist2bbox only (yolo26).
 
 USAGE
 -----
-This script can be run standalone against any per-scale TFLite model with
-embedded edgefirst.json metadata::
+Run against a per-scale TFLite model with embedded edgefirst.json
+metadata::
 
     python per_scale_decode_reference.py model.tflite image.jpg
 
-It prints per-detection output and optionally visualizes results.  More
-importantly, it is intended to be read as documentation — each function
-maps to a HAL stage and is annotated accordingly.
-
-IMPLEMENTATION NOTES FOR THE HAL AGENT
----------------------------------------
-1. The ``Decoder::decode_proto`` path currently rejects per-scale models
-   because ``find_output_by_shape([1, 4, 8400])`` fails — there is no
-   monolithic boxes tensor.  The fix is to detect per-scale children in
-   the schema v2 ``LogicalOutput`` and route through ``merge.rs``'s
-   ``PerScale`` path (which already exists for Hailo) before the
-   downstream float-path decode.
-
-2. The ``merge.rs`` ``PerScale`` strategy already handles DFL decode via
-   ``DflConfig``.  The missing piece is that ``decode_proto`` does not
-   invoke the merge program when the decoder was constructed from v2
-   metadata with per-scale children.  This is the primary integration gap.
-
-3. Sigmoid must be applied to score tensors when ``activation_required:
-   sigmoid`` is declared on the physical child.  The current merge path
-   skips this (see ``merge.rs`` line 30: "Activation flags on floats —
-   not yet supported").  This is required for per-scale TFLite models
-   where the NPU does NOT apply sigmoid.
-
-4. The validator currently falls back to numpy NMS when it detects
-   per-scale children.  Once the HAL implements the pipeline below,
-   the validator should detect HAL support and route through
-   ``process_yolo_hal`` for the full GPU-accelerated path.
-
-5. ``normalized: true`` on the logical ``boxes`` output refers to the
-   original ONNX model (tf_wrapper normalization).  After per-scale DFL
-   decode, boxes are in pixel coordinates (the split happens before
-   the normalization post-processing).  The HAL should treat per-scale
-   DFL-decoded boxes as pixel-coordinate, not normalized.
+Prints the detections.
 """
 
 from __future__ import annotations
@@ -172,8 +92,6 @@ import numpy as np
 # ═══════════════════════════════════════════════════════════════════════
 # Stage 0: Metadata parsing
 # ═══════════════════════════════════════════════════════════════════════
-# HAL equivalent: schema.rs  (SchemaV2, LogicalOutput, PhysicalOutput)
-#
 # Parse the edgefirst.json embedded in the TFLite ZIP trailer and
 # extract the hierarchical output layout.  Each logical output is
 # either a direct physical tensor (no children) or a virtual parent
@@ -185,11 +103,7 @@ def load_metadata(tflite_path: str) -> dict:
 
     The EdgeFirst tflite-converter appends a ZIP archive containing
     ``edgefirst.json`` and ``labels.txt`` to the end of the TFLite
-    flatbuffer.  TFLite runtime ignores the trailer bytes, so the model
-    loads normally.
-
-    HAL equivalent: the Rust decoder's ``new_from_metadata`` path, which
-    deserializes ``SchemaV2`` via serde.
+    flatbuffer.
     """
     with zipfile.ZipFile(tflite_path) as zf:
         with zf.open("edgefirst.json") as f:
@@ -197,8 +111,7 @@ def load_metadata(tflite_path: str) -> dict:
 
 
 class PerScaleLayout:
-    """Parsed per-scale output layout, analogous to HAL's ``DflConfig`` +
-    ``DecodeProgram::PerScale``.
+    """Parsed per-scale output layout.
 
     Attributes
     ----------
@@ -241,14 +154,9 @@ class PerScaleLayout:
         protos_meta = outputs_by_type.get("protos")
 
         # Box encoding: "dfl" (yolov8/yolo11) or "ltrb" (yolo26).
-        # HAL equivalent: merge.rs checks LogicalOutput.encoding to
-        # decide whether to run DFL decode or plain dist2bbox.
         self.box_encoding: str = boxes_meta.get("encoding", "dfl")
 
-        # Index per-scale children by stride for correct pairing.
-        # HAL equivalent: merge.rs plan_per_scale() sorts children by
-        # stride ascending and validates stride-set equality across
-        # boxes/scores/mask_coefs.
+        # Index per-scale children by stride.
         box_by_stride = _index_by_stride(boxes_meta.get("outputs", []))
         score_by_stride = _index_by_stride(scores_meta.get("outputs", []))
         mc_by_stride = (
@@ -357,10 +265,7 @@ def _index_by_stride(children: List[dict]) -> Dict[int, dict]:
 
 
 def _dshape_dict(dshape: Sequence[dict]) -> dict:
-    """Convert a dshape ordered-array into a flat ``{name: size}`` dict.
-
-    HAL equivalent: ``configs::DimName`` parsing in ``schema.rs``.
-    """
+    """Convert a dshape ordered-array into a flat ``{name: size}`` dict."""
     out: dict = {}
     for entry in dshape:
         for k, v in entry.items():
@@ -369,10 +274,7 @@ def _dshape_dict(dshape: Sequence[dict]) -> dict:
 
 
 def _extract_quant(output: dict) -> Optional[Tuple[float, int]]:
-    """Extract ``(scale, zero_point)`` from a physical output's metadata.
-
-    HAL equivalent: ``schema::Quantization`` → ``QuantTuple``.
-    """
+    """Extract ``(scale, zero_point)`` from a physical output's metadata."""
     q = output.get("quantization")
     if q is None:
         return None
@@ -386,12 +288,8 @@ def _extract_quant(output: dict) -> Optional[Tuple[float, int]]:
 # ═══════════════════════════════════════════════════════════════════════
 # Stage 1: Tensor binding
 # ═══════════════════════════════════════════════════════════════════════
-# HAL equivalent: merge.rs execute_merge() → shape_map lookup
-#
-# Match each per-scale child's declared shape to the physical TFLite
-# output tensors.  Unlike HailoRT (which uses named tensor APIs), TFLite
-# outputs are identified by shape matching.  All 10 per-scale shapes are
-# unique, so this is unambiguous.
+# Matches each per-scale child's declared shape to the physical TFLite
+# output tensors.
 
 
 def bind_outputs(
@@ -402,10 +300,6 @@ def bind_outputs(
 
     Returns a dict mapping physical tensor shapes to their integer index
     in the TFLite output tensor list.
-
-    HAL equivalent: ``merge.rs`` uses ``shape_map`` built from the
-    input ``TensorDyn`` slice; here we do the same from TFLite's
-    ``get_output_details()``.
     """
     shape_map: Dict[Tuple[int, ...], int] = {}
     for i, detail in enumerate(output_details):
@@ -421,14 +315,9 @@ def bind_outputs(
 # ═══════════════════════════════════════════════════════════════════════
 # Stage 2: Dequantization
 # ═══════════════════════════════════════════════════════════════════════
-# HAL equivalent: float.rs dequantize_cpu_chunked()
-#
 # Per-tensor affine dequantization:  real = scale * (q - zero_point)
 #
-# Each per-scale child has its own (scale, zero_point) — this is the
-# whole point of per-scale splitting.  The monolithic model has a single
-# scale across all 8400 anchors, which is too coarse for the wide
-# dynamic range across FPN levels.
+# Each per-scale child has its own (scale, zero_point).
 
 
 def dequantize(
@@ -437,10 +326,6 @@ def dequantize(
     zero_point: int,
 ) -> np.ndarray:
     """Per-tensor affine dequantization.
-
-    HAL equivalent: ``float.rs::dequantize_cpu_chunked`` with per-tensor
-    scalar parameters.  The HAL version uses SIMD (NEON on ARM) for the
-    inner loop; this reference uses NumPy broadcasting.
 
     Parameters
     ----------
@@ -462,8 +347,6 @@ def dequantize(
 # ═══════════════════════════════════════════════════════════════════════
 # Stage 3: Box decode — DFL or LTRB
 # ═══════════════════════════════════════════════════════════════════════
-# HAL equivalent: dfl.rs decode_dfl_level() / dist2bbox
-#
 # Two box encoding schemes exist:
 #
 # **DFL** (yolov8, yolo11) — ``encoding: "dfl"``
@@ -472,9 +355,8 @@ def dequantize(
 #   Box tensor shape: (H, W, 4 * reg_max) — typically (H, W, 64).
 #
 # **LTRB** (yolo26) — ``encoding: "ltrb"``
-#   The model already decoded DFL internally (yolo26 architecture
-#   embeds the softmax+weighted-sum in its graph).  The 4 channels
-#   are direct LTRB distances in grid units.  Decode: dist2bbox only.
+#   The 4 channels are direct LTRB distances in grid units.
+#   Decode: dist2bbox only.
 #   Box tensor shape: (H, W, 4).
 #
 # Both encodings share the same dist2bbox step:
@@ -488,11 +370,7 @@ def dequantize(
 
 
 def _stable_softmax(x: np.ndarray, axis: int) -> np.ndarray:
-    """Numerically stable softmax: subtract max before exp.
-
-    HAL equivalent: ``dfl.rs::softmax_inplace`` — the Rust version
-    operates in-place on a scratch buffer for each anchor×side.
-    """
+    """Numerically stable softmax: subtract max before exp."""
     x_max = x.max(axis=axis, keepdims=True)
     e = np.exp(x - x_max)
     return e / e.sum(axis=axis, keepdims=True)
@@ -501,12 +379,8 @@ def _stable_softmax(x: np.ndarray, axis: int) -> np.ndarray:
 def make_anchor_grid(h: int, w: int) -> Tuple[np.ndarray, np.ndarray]:
     """Precompute anchor centre coordinates in grid units.
 
-    Returns ``(grid_x, grid_y)`` each of shape ``(H, W)``.  The +0.5
-    offset matches the Ultralytics ``make_anchors()`` convention —
-    anchors sit at grid-cell centres.
-
-    HAL equivalent: ``dfl.rs::make_anchor_grid`` — returns flat
-    ``Vec<f32>`` of length ``H*W``.
+    Returns ``(grid_x, grid_y)`` each of shape ``(H, W)``, offset by
+    +0.5 so anchors sit at grid-cell centres.
     """
     gx = np.arange(w, dtype=np.float32) + 0.5
     gy = np.arange(h, dtype=np.float32) + 0.5
@@ -522,13 +396,10 @@ def dfl_decode_level(
 ) -> np.ndarray:
     """Decode one FPN level's DFL boxes to xcycwh pixel coordinates.
 
-    HAL equivalent: ``dfl.rs::decode_dfl_level``
-
     Parameters
     ----------
     bbox_tensor : np.ndarray
-        Float32 tensor of shape ``(H, W, 4 * reg_max)`` — already
-        dequantized.
+        Dequantized float32 tensor of shape ``(H, W, 4 * reg_max)``.
     h, w : int
         Spatial dimensions of this FPN level.
     stride : float
@@ -542,7 +413,6 @@ def dfl_decode_level(
         Shape ``(H*W, 4)`` with columns ``[xc, yc, width, height]`` in
         pixel coordinates of the model input (e.g. 640×640).
     """
-    # bins = [0, 1, 2, ..., reg_max - 1]
     bins = np.arange(reg_max, dtype=np.float32)
 
     # Reshape to (H, W, 4, reg_max) and apply softmax along the
@@ -553,7 +423,6 @@ def dfl_decode_level(
     # Weighted sum: expected distance in grid units per side.
     dist = (probs * bins).sum(axis=-1)  # (H, W, 4) — LTRB grid units
 
-    # Unpack the four distances.
     d_left = dist[:, :, 0]
     d_top = dist[:, :, 1]
     d_right = dist[:, :, 2]
@@ -563,8 +432,6 @@ def dfl_decode_level(
     grid_x, grid_y = make_anchor_grid(h, w)
 
     # dist2bbox: LTRB distances → xcycwh in pixel coordinates.
-    # The multiplication order matters for floating-point equivalence
-    # with the Rust implementation.
     xc = (grid_x + (d_right - d_left) / 2.0) * stride
     yc = (grid_y + (d_bottom - d_top) / 2.0) * stride
     bw = (d_left + d_right) * stride
@@ -585,10 +452,8 @@ def dfl_decode_level_with_intermediates(
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """DFL decode for one FPN level, returning per-stage intermediates.
 
-    Same algorithm as :func:`dfl_decode_level` but exposes the
-    dequantized tensor and the post-softmax-weighted-sum ``ltrb`` array
-    so callers can capture them as fixture data. Used only by the
-    fixture generator; production callers use :func:`dfl_decode_level`.
+    Same algorithm as :func:`dfl_decode_level`, also returning the
+    dequantized tensor and the post-softmax-weighted-sum ``ltrb`` array.
 
     Returns
     -------
@@ -622,17 +487,13 @@ def ltrb_decode_level(
 ) -> np.ndarray:
     """Decode one FPN level's LTRB boxes to xcycwh pixel coordinates.
 
-    Used for yolo26 models where DFL decode already happened inside
-    the model graph.  The 4 channels are direct LTRB distances in
-    grid units — we only need the dist2bbox conversion.
-
-    HAL equivalent: the dist2bbox portion of ``dfl.rs::decode_dfl_level``
-    (skip the softmax + weighted-sum, go straight to coordinate transform).
+    The 4 channels are direct LTRB distances in grid units; only the
+    dist2bbox conversion is applied.
 
     Parameters
     ----------
     bbox_tensor : np.ndarray
-        Float32 tensor of shape ``(H, W, 4)`` — already dequantized.
+        Dequantized float32 tensor of shape ``(H, W, 4)``.
         Channels are ``[left, top, right, bottom]`` distances in grid units.
     h, w : int
         Spatial dimensions of this FPN level.
@@ -672,8 +533,8 @@ def ltrb_decode_level_with_intermediates(
 ) -> Tuple[np.ndarray, np.ndarray]:
     """LTRB decode for one FPN level, returning per-stage intermediates.
 
-    Same algorithm as :func:`ltrb_decode_level` but exposes the
-    dequantized tensor for fixture capture.
+    Same algorithm as :func:`ltrb_decode_level`, also returning the
+    dequantized tensor.
 
     Returns
     -------
@@ -697,25 +558,15 @@ def ltrb_decode_level_with_intermediates(
 # ═══════════════════════════════════════════════════════════════════════
 # Stage 4: Sigmoid activation for scores
 # ═══════════════════════════════════════════════════════════════════════
-# HAL equivalent: postprocess.rs (sigmoid is applied during NMS filtering)
-#
-# The TFLite NPU does NOT apply sigmoid to score outputs — the metadata
-# declares ``activation_required: sigmoid`` on each score child.  The
-# HAL merge path (merge.rs line 30) notes this is "not yet supported".
-#
-# Implementation priority: this activation is REQUIRED for correctness.
-# Without sigmoid, raw logits are passed to NMS, resulting in wrong
-# score-based filtering.
+# Applied to score outputs whose metadata declares
+# ``activation_required: sigmoid``.
 
 
 def sigmoid(x: np.ndarray) -> np.ndarray:
     """Element-wise sigmoid activation.
 
-    Uses the numerically stable form: for large negative values, compute
-    via ``exp(x) / (1 + exp(x))`` to avoid overflow.
-
-    HAL equivalent: typically fused into the NMS score threshold check.
-    For the reference implementation we apply it as a separate step.
+    Uses the numerically stable form: ``exp(x) / (1 + exp(x))`` for
+    negative values.
     """
     return np.where(
         x >= 0,
@@ -727,8 +578,6 @@ def sigmoid(x: np.ndarray) -> np.ndarray:
 # ═══════════════════════════════════════════════════════════════════════
 # Stage 5: Scale concatenation
 # ═══════════════════════════════════════════════════════════════════════
-# HAL equivalent: merge.rs execute_per_scale()
-#
 # After per-level box decode (DFL or LTRB), sigmoid (scores), and
 # dequantization (mask_coefs), concatenate all FPN levels along the
 # anchor axis:
@@ -736,10 +585,6 @@ def sigmoid(x: np.ndarray) -> np.ndarray:
 #   boxes:      (80*80 + 40*40 + 20*20, 4)      = (8400, 4)  xcycwh pixels
 #   scores:     (80*80 + 40*40 + 20*20, NC)      = (8400, 80) probabilities
 #   mask_coefs: (80*80 + 40*40 + 20*20, NM)      = (8400, 32) coefficients
-#
-# This is the point where the per-scale path rejoins the monolithic
-# decode pipeline.  The downstream NMS and mask decode stages are
-# identical regardless of whether inputs were per-scale or monolithic.
 
 
 def decode_all_scales(
@@ -748,9 +593,6 @@ def decode_all_scales(
     shape_map: Dict[Tuple[int, ...], int],
 ) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
     """Run stages 2–5: dequantize → box decode → sigmoid → concat.
-
-    This is the core per-scale reassembly function.  In the HAL, this
-    maps to ``DecodeProgram::execute()`` with ``PerScale`` merge recipes.
 
     The box decode step (stage 3) branches on ``layout.box_encoding``:
     - ``"dfl"``: softmax + weighted sum → dist2bbox  (yolov8, yolo11)
@@ -849,14 +691,8 @@ def _dequantize_nhwc(
 # ═══════════════════════════════════════════════════════════════════════
 # Stage 6: Non-Maximum Suppression (NMS)
 # ═══════════════════════════════════════════════════════════════════════
-# HAL equivalent: yolo.rs nms_class_agnostic() / nms_class_aware()
-#
-# Standard IoU-based NMS.  The HAL implements both class-agnostic
-# (suppress across all classes) and class-aware (suppress within each
-# class) modes.  For this reference we implement class-agnostic NMS,
-# which is the simpler variant and the EdgeFirst validator default.
-#
-# Input boxes are xcycwh pixels; NMS operates on xyxy so we convert.
+# Class-agnostic IoU-based NMS.  Input boxes are xcycwh pixels and are
+# converted to xyxy.
 
 
 def xcycwh_to_xyxy(boxes: np.ndarray) -> np.ndarray:
@@ -876,8 +712,6 @@ def nms_class_agnostic(
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray]]:
     """Class-agnostic NMS on per-class score matrix.
 
-    HAL equivalent: ``yolo.rs::nms_class_agnostic``
-
     Parameters
     ----------
     boxes_xcycwh : (N, 4) xcycwh pixel coordinates
@@ -888,8 +722,7 @@ def nms_class_agnostic(
 
     Returns
     -------
-    boxes : (M, 4) xyxy normalized to [0, 1]  ← NOT normalized here,
-            that's the caller's job
+    boxes : (M, 4) xyxy pixel coordinates
     scores : (M,) best class scores
     classes : (M,) best class indices
     indices : (M,) original anchor indices (for mask coefficient selection)
@@ -912,7 +745,7 @@ def nms_class_agnostic(
     # Sort by score descending
     order = filtered_scores.argsort()[::-1]
     if max_detections > 0:
-        order = order[:max_detections * 3]  # generous pre-filter
+        order = order[:max_detections * 3]
 
     keep = []
     x1 = filtered_boxes[:, 0]
@@ -953,8 +786,6 @@ def nms_class_agnostic(
 # ═══════════════════════════════════════════════════════════════════════
 # Stage 7: Mask decode (instance segmentation)
 # ═══════════════════════════════════════════════════════════════════════
-# HAL equivalent: decoder/mod.rs (proto mask materialization path)
-#
 # YOLOv8-seg produces a ``protos`` tensor of shape (1, H_p, W_p, C_p)
 # — typically (1, 160, 160, 32) — which is a spatial basis.  Each
 # detection's mask is decoded as:
@@ -962,9 +793,6 @@ def nms_class_agnostic(
 #   mask_logits = mask_coefficients @ protos.reshape(C_p, H_p * W_p)
 #   mask_logits = mask_logits.reshape(H_p, W_p)
 #   mask = sigmoid(mask_logits) > 0.5   (or > 0.0 on raw logits)
-#
-# The HAL's GPU path uses OpenGL shaders for the matmul + crop; this
-# reference uses NumPy.
 
 
 def decode_masks(
@@ -976,10 +804,6 @@ def decode_masks(
     img_h: int,
 ) -> np.ndarray:
     """Decode instance masks from prototype coefficients.
-
-    HAL equivalent: the GPU mask materialization pipeline, which
-    computes ``coefficients @ protos`` via OpenGL compute shaders and
-    crops to bounding boxes.
 
     Parameters
     ----------
@@ -998,7 +822,6 @@ def decode_masks(
     if mask_coefs is None or mask_coefs.shape[0] == 0:
         return np.empty((0, 0, 0), dtype=np.float32)
 
-    # Dequantize protos
     protos = _dequantize_nhwc(protos_raw, protos_quant)
 
     # protos is (H_p, W_p, C) — transpose to (C, H_p * W_p)
@@ -1046,8 +869,7 @@ def decode_per_scale(
 ) -> dict:
     """Full per-scale decode pipeline: stages 2–7.
 
-    This is the top-level function that the HAL's ``Decoder::decode_proto``
-    should implement natively.  It runs the complete chain:
+    Runs the complete chain:
 
       dequantize → DFL decode → sigmoid → concat → NMS → mask decode
 
@@ -1120,8 +942,7 @@ def main():
 
         python per_scale_decode_reference.py model.tflite [image.jpg]
 
-    If no image is provided, runs with a synthetic random input to
-    verify the pipeline executes without error.
+    If no image is provided, runs with a synthetic random input.
     """
     positional = [a for a in sys.argv[1:] if not a.startswith("--")]
     if len(positional) < 1:
@@ -1131,11 +952,9 @@ def main():
     image_path = positional[1] if len(positional) > 1 else None
     json_out = "--json-out" in sys.argv[1:]
 
-    # When emitting JSON we must keep stdout machine-parseable; route
-    # diagnostic prints to stderr.
+    # With --json-out, diagnostic prints go to stderr.
     log = (lambda *a, **kw: print(*a, file=sys.stderr, **kw)) if json_out else print
 
-    # Load metadata
     metadata = load_metadata(model_path)
     layout = PerScaleLayout(metadata)
 
@@ -1166,10 +985,8 @@ def main():
     input_details = interp.get_input_details()
     output_details = interp.get_output_details()
 
-    # Build shape map
     shape_map = bind_outputs(layout, output_details)
 
-    # Get input shape
     input_shape = input_details[0]["shape"]
     _, in_h, in_w, in_c = input_shape
     input_dtype = input_details[0]["dtype"]
@@ -1200,7 +1017,6 @@ def main():
     interp.invoke()
     outputs = [interp.get_tensor(d["index"]) for d in output_details]
 
-    # Run decode
     result = decode_per_scale(
         outputs, layout, shape_map,
         img_w=in_w, img_h=in_h,

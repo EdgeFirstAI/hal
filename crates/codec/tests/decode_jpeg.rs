@@ -3,10 +3,11 @@
 
 //! Integration tests: JPEG decode into Mem tensors.
 //!
-//! The codec always emits the JPEG's native format — `Nv12`/`Nv16`/`Nv24` for
-//! colour (3-component) JPEGs by subsampling, `Grey` for greyscale. It configures the destination
-//! tensor's dims and format itself; callers allocate a tensor with enough
-//! capacity. `info.width`/`info.height` are the source's true (unrotated) dims.
+//! The codec emits the JPEG's native format: `Nv12`/`Nv16`/`Nv24` for colour
+//! (3-component) JPEGs by subsampling, `Grey` for greyscale. It configures
+//! the destination tensor's dims and format; callers allocate a tensor with
+//! enough capacity. `info.width`/`info.height` are the source's unrotated
+//! dims.
 
 use edgefirst_codec::{peek_info, CodecError, ImageDecoder, ImageLoad, UnsupportedFeature};
 use edgefirst_tensor::{PixelFormat, Tensor, TensorMemory, TensorTrait};
@@ -43,7 +44,6 @@ fn decode_zidane_nv12() {
     assert_eq!(info.height, 720);
     assert_eq!(info.format, PixelFormat::Nv12);
 
-    // The Y plane (first w*h bytes) should have many non-zero bytes.
     let map = tensor.map().unwrap();
     let pixels: &[u8] = &map;
     let nonzero = pixels[..info.width * info.height]
@@ -88,8 +88,7 @@ fn decode_grey_jpeg() {
 #[test]
 fn decode_person_rejected() {
     let jpeg = testdata("person.jpg");
-    // person.jpg is a progressive JPEG — our baseline-only decoder rejects it.
-    // person.jpg is 4256×2532 (even dims) so allocate an Nv12 tensor of that size.
+    // person.jpg is a progressive JPEG, 4256×2532.
     let mut tensor = Tensor::<u8>::image(
         4256,
         2532,
@@ -108,7 +107,6 @@ fn decode_person_rejected() {
 
 #[test]
 fn decode_f32_jpeg_unsupported_dtype() {
-    // NV12/GREY are u8 formats; the codec rejects non-u8 tensors for JPEG.
     let jpeg = testdata("zidane.jpg");
     let mut tensor = Tensor::<f32>::image(
         1280,
@@ -129,7 +127,6 @@ fn decode_f32_jpeg_unsupported_dtype() {
 #[test]
 fn decode_capacity_error() {
     let jpeg = testdata("zidane.jpg"); // 1280×720
-                                       // Allocate far too small.
     let mut tensor = Tensor::<u8>::image(
         100,
         100,
@@ -152,11 +149,8 @@ fn decode_capacity_error() {
 
 #[test]
 fn decode_reuse_pattern() {
-    // The hot-loop reuse pattern: decode multiple different images into the same
-    // tensor. Allocate at the max size (giraffe and zidane are both 1280×720
-    // colour JPEGs → NV12). jaguar.jpg has a smaller odd width and is excluded
-    // here — not because NV12 rejects odd widths (it doesn't), but because a
-    // 1280×720 pool reconfigured for a smaller image exercises configure_image.
+    // Decode different images into the same tensor, allocated at the largest
+    // size (1280×720).
     let mut tensor = Tensor::<u8>::image(
         1280,
         720,
@@ -180,8 +174,7 @@ fn decode_reuse_pattern() {
     }
 }
 
-/// Compare our greyscale JPEG output against the `image` crate. Greyscale JPEG
-/// decodes to a single-plane `Grey` tensor that we can compare directly.
+/// Greyscale JPEG output matches the `image` crate.
 #[test]
 fn pixel_accuracy_grey_vs_image_crate() {
     let jpeg_data = testdata("grey.jpg");
@@ -235,14 +228,12 @@ fn pixel_accuracy_grey_vs_image_crate() {
     assert!(mae < 1.0, "grey MAE {mae:.3} exceeds tolerance 1.0");
 }
 
-/// Test decoding into an oversized tensor with stride padding.
-/// The decoded image (1280×720) goes into a 1920×1080 NV12 tensor.
-/// Verify the Y plane is written and padding bytes are untouched.
+/// A 1280×720 image decoded into a 1920×1080 NV12 tensor writes the Y plane
+/// and leaves the padding bytes untouched.
 #[test]
 fn decode_strided_oversized_tensor() {
     let jpeg = testdata("zidane.jpg");
 
-    // Allocate larger than the image.
     let mut tensor = Tensor::<u8>::image(
         1920,
         1080,
@@ -252,7 +243,6 @@ fn decode_strided_oversized_tensor() {
     )
     .unwrap();
 
-    // Fill tensor with sentinel value.
     {
         let mut map = tensor.map().unwrap();
         let bytes: &mut [u8] =
@@ -271,7 +261,6 @@ fn decode_strided_oversized_tensor() {
     let map = tensor.map().unwrap();
     let bytes: &[u8] = unsafe { std::slice::from_raw_parts(map.as_ptr(), map.len()) };
 
-    // Verify decoded Y-plane rows are non-sentinel within the image width.
     let decoded_row_bytes = 1280;
     for y in 0..720 {
         let row = &bytes[y * stride..y * stride + decoded_row_bytes];
@@ -398,14 +387,12 @@ fn decode_nv12_output() {
     let map = tensor.map().unwrap();
     let bytes: &[u8] = &map;
 
-    // Y plane should have non-zero data.
     let y_nonzero = bytes[..width * height].iter().filter(|&&v| v != 0).count();
     assert!(
         y_nonzero > 1000,
         "Y plane should have many non-zero pixels, got {y_nonzero}"
     );
 
-    // UV plane should have non-128 data (chrominance varies in real images).
     let uv_start = height * width;
     let uv_size = width * height / 2;
     if uv_start + uv_size <= bytes.len() {
@@ -422,9 +409,7 @@ fn decode_nv12_output() {
 
 #[test]
 fn unsupported_progressive_jpeg_returns_typed_variant() {
-    // person.jpg is a progressive JPEG — the codec rejects it with a
-    // typed Unsupported(ProgressiveJpeg). Verifies callers can pattern-match
-    // instead of string-matching.
+    // person.jpg is a progressive JPEG.
     let jpeg = testdata("person.jpg");
     match peek_info(&jpeg) {
         Err(CodecError::Unsupported(UnsupportedFeature::ProgressiveJpeg)) => {}
@@ -453,9 +438,7 @@ fn jpeg_decode_tags_jfif_colorimetry() {
 
 #[test]
 fn odd_width_nv12_jpeg_decodes_with_logical_width() {
-    // jaguar.jpg is 789×384 — odd width.  The tensor carries the LOGICAL width
-    // (789); the row_stride is >= even(789)=790 and 64-byte aligned, ensuring
-    // the interleaved chroma columns are byte-aligned.
+    // jaguar.jpg is 789×384: odd width.
     let jpeg = testdata("jaguar.jpg");
     let info = peek_info(&jpeg).unwrap();
     assert_eq!((info.width, info.height), (789, 384));
@@ -465,7 +448,6 @@ fn odd_width_nv12_jpeg_decodes_with_logical_width() {
         "colour JPEG should report native NV12 format"
     );
 
-    // Allocating at the odd width preserves the logical width.
     let mut tensor = Tensor::<u8>::image(
         789,
         384,
@@ -474,10 +456,8 @@ fn odd_width_nv12_jpeg_decodes_with_logical_width() {
         edgefirst_tensor::CpuAccess::ReadWrite,
     )
     .unwrap();
-    // Contract: width() reports the LOGICAL visible size, not the even-padded buffer width.
     assert_eq!(tensor.width(), Some(789), "logical width must be preserved");
     assert_eq!(tensor.height(), Some(384));
-    // Contract: row_stride is 64-byte aligned AND >= even(789)=790.
     let s = tensor
         .effective_row_stride()
         .expect("semi-planar must always have a stride");
@@ -488,11 +468,9 @@ fn odd_width_nv12_jpeg_decodes_with_logical_width() {
     let info = tensor
         .load_image(&mut decoder, &jpeg)
         .expect("odd-width NV12 JPEG should decode into the strided buffer");
-    // ImageInfo carries the true odd width; both match now.
     assert_eq!((info.width, info.height), (789, 384));
     assert_eq!(tensor.width(), Some(789));
     assert_eq!(tensor.height(), Some(384));
-    // Post-decode stride invariant still holds.
     let s2 = tensor.effective_row_stride().unwrap();
     assert_eq!(s2 % 64, 0, "post-decode stride must be 64-byte aligned");
     assert!(s2 >= 790, "post-decode stride must be >= 790");
@@ -500,16 +478,9 @@ fn odd_width_nv12_jpeg_decodes_with_logical_width() {
 
 // ---------------------------------------------------------------------------
 // Native NV16 (4:2:2) and NV24 (4:4:4) decode.
-//
-// `zidane_422.jpg` / `zidane_444.jpg` are baseline JPEGs re-encoded from
-// `zidane.jpg` (1280×720) at 4:2:2 and 4:4:4 chroma subsampling. These exercise
-// the `write_nv16_nv24_rows` MCU path (full-height chroma), which the 4:2:0
-// fixtures never reach. The decoder must select the matching native format and
-// place both the luma and the interleaved full-height chroma plane correctly.
 // ---------------------------------------------------------------------------
 
-/// BT.601 full-range (JFIF) RGB→CbCr — the colorimetry the codec/`yuv` kernels
-/// assume. Returned as `(Cb, Cr)` in `[0, 255]`.
+/// BT.601 full-range (JFIF) RGB→CbCr. Returned as `(Cb, Cr)` in `[0, 255]`.
 fn rgb_to_cbcr(r: f32, g: f32, b: f32) -> (f32, f32) {
     let cb = 128.0 - 0.168_736 * r - 0.331_264 * g + 0.5 * b;
     let cr = 128.0 + 0.5 * r - 0.418_688 * g - 0.081_312 * b;
@@ -517,10 +488,8 @@ fn rgb_to_cbcr(r: f32, g: f32, b: f32) -> (f32, f32) {
 }
 
 /// Decode a colour JPEG fixture and verify (1) the native format and dims,
-/// (2) the luma plane matches the `image` crate's luma tightly, and (3) the
-/// interleaved chroma plane reconstructs the `image` crate's colour within a
-/// modest tolerance — proving the chroma layout (offset, pitch, Cb/Cr order)
-/// is correct, not merely present.
+/// (2) the luma plane against the `image` crate's luma, and (3) the
+/// interleaved chroma plane against the `image` crate's colour.
 fn check_native_decode(fixture: &str, expect_fmt: PixelFormat) {
     check_native_decode_dims(fixture, expect_fmt, 1280, 720);
 }
@@ -532,8 +501,7 @@ fn check_native_decode_dims(
     expect_h: usize,
 ) {
     let jpeg = testdata(fixture);
-    // Over-allocate generously (NV24 needs 3·H rows); the decoder configures the
-    // real shape/format from the bitstream.
+    // Over-allocate: NV24 needs 3·H rows.
     let alloc_w = expect_w.max(1280);
     let alloc_h = expect_h.max(720);
     let mut tensor = Tensor::<u8>::image(
@@ -577,23 +545,13 @@ fn check_native_decode_dims(
     }
     let y_mae = y_total as f64 / (w * h) as f64;
     eprintln!("{fixture} luma: MAE={y_mae:.3}, max={y_max}");
-    // Fixtures are re-encoded from a 4:2:0 source, so luma sees two lossy passes
-    // plus IDCT-rounding divergence from the image crate; the small MAE is the
-    // real signal (a layout bug would push it into the tens), max is edge-noise.
     assert!(y_max <= 24, "{fixture}: luma max diff {y_max} > 24");
     assert!(y_mae < 2.0, "{fixture}: luma MAE {y_mae:.3} > 2.0");
 
-    // (3) Chroma reconstruction. The chroma plane lives in buffer rows [H, …)
-    // using the documented per-format layout (NV16: full-height, half-width,
-    // one buffer row per image row; NV24: full-res, two buffer rows per image
-    // row). Decode (Cb, Cr) for a sampled grid and compare to CbCr derived from
-    // the image crate's RGB. A transposed/mis-offset plane shows up as a large
-    // diff; smooth chroma keeps the honest tolerance small.
-    //
-    // Index directly from `stride` (the physical row pitch) rather than from
-    // `even_w` so the formula is correct for both even and odd widths. The
-    // `even_w`-based `pos` helper is only correct when `stride == even_w`
-    // (i.e., un-padded Mem tensors at even widths).
+    // (3) Chroma reconstruction. The chroma plane starts at buffer row H
+    // (NV16: one buffer row per image row, half width; NV24: two buffer rows
+    // per image row, full width). Compare (Cb, Cr) on a sampled grid to CbCr
+    // derived from the image crate's RGB.
     let uv_off = h * stride;
     let chroma_at = |x: usize, y: usize| -> (i32, i32) {
         let byte_off = match expect_fmt {
@@ -623,8 +581,6 @@ fn check_native_decode_dims(
     }
     let c_mae = c_total as f64 / samples as f64;
     eprintln!("{fixture} chroma: MAE={c_mae:.3}, max={c_max}");
-    // JPEG chroma is lossy and the image crate upsamples NV16's half-width
-    // chroma, so allow a modest spread; a wrong layout would be ~50+ MAE.
     assert!(
         c_mae < 6.0,
         "{fixture}: chroma MAE {c_mae:.3} > 6.0 (layout?)"
@@ -645,24 +601,19 @@ fn decode_zidane_nv24() {
     check_native_decode("zidane_444.jpg", PixelFormat::Nv24);
 }
 
-/// Odd-width (789×384) NV16 decode — exercises the chroma layout and
-/// stride alignment for 4:2:2 at a non-even width.
+/// Odd-width (789×384) NV16 decode.
 #[test]
 fn decode_jaguar_nv16() {
     check_native_decode_dims("jaguar_422.jpg", PixelFormat::Nv16, 789, 384);
 }
 
-/// Odd-width (789×384) NV24 decode — exercises the chroma layout and
-/// stride alignment for 4:4:4 at a non-even width.
+/// Odd-width (789×384) NV24 decode.
 #[test]
 fn decode_jaguar_nv24() {
     check_native_decode_dims("jaguar_444.jpg", PixelFormat::Nv24, 789, 384);
 }
 
-/// `set_output_format(Rgb)` on a source that isn't 4:4:4-equivalent or
-/// native 4:2:0 must fail, not silently hand back the native semi-planar
-/// format — see `docs/BENCHMARKS_JPEG_REVIEW_v3.13.md` item #3. Covers
-/// 4:2:2 (native `Nv16`) and greyscale (native `Grey`, no chroma at all).
+/// `set_output_format(Rgb)` fails on 4:2:2 and greyscale sources.
 #[test]
 fn rgb_request_errors_on_unsupported_subsampling() {
     for (fixture, w, h) in [("zidane_422.jpg", 1280, 720), ("grey.jpg", 1024, 681)] {
@@ -688,20 +639,12 @@ fn rgb_request_errors_on_unsupported_subsampling() {
 }
 
 // ---------------------------------------------------------------------------
-// Real-world COCO odd-width greyscale fixture. The end-to-end odd-dimension
-// decode+convert coverage for the colour formats (NV12/NV16/NV24) lives in the
-// Python suite (`test_decode_native_odd_dimensions`), which compares the
-// converted RGB to PIL with a robust RMS metric across CPU and GPU backends.
-// This codec-level case guards the specific odd-WIDTH greyscale decode path:
-// the luma-only output decodes into a tight odd-width buffer (stride == img_w),
-// which must NOT trip the even-width grid-stride assertion. Luma is exact, so
-// a tight byte comparison is robust here (unlike point-sampled chroma).
+// Odd-width greyscale fixture.
 // ---------------------------------------------------------------------------
 
 #[test]
 fn decode_coco_grey_odd_width() {
-    // 595×438 — odd-width greyscale. Verify the native Grey format, the odd
-    // logical dims, and that the luma plane matches the image crate tightly.
+    // 595×438: odd-width greyscale.
     let jpeg = testdata("coco_grey_odd.jpg");
     let (w, h) = (595usize, 438usize);
     let mut tensor = Tensor::<u8>::image(
@@ -739,10 +682,8 @@ fn decode_coco_grey_odd_width() {
     assert!(y_mae < 1.0, "grey luma MAE {y_mae:.3} > 1.0");
 }
 
-/// Fast (AAN) DCT mode: opt-in, and its output must stay close to the
-/// accurate default — high cosine similarity and a small worst-case pixel
-/// delta on real images. Also proves the default is untouched: decoding
-/// without the option must be bit-identical to a fresh accurate decoder.
+/// Fast (AAN) DCT output stays close to the accurate default, and the
+/// default decode is bit-identical to an explicit Accurate decode.
 #[test]
 fn fast_dct_mode_close_to_accurate_and_off_by_default() {
     use edgefirst_codec::DctMethod;
@@ -769,9 +710,7 @@ fn fast_dct_mode_close_to_accurate_and_off_by_default() {
         dec.set_dct_method(DctMethod::Accurate);
         let info_a = t_acc.load_image(&mut dec, &jpeg).unwrap();
 
-        // The default really is Accurate: a fresh decoder with no setter (and
-        // without the documented env override) must be bit-identical to the
-        // explicit-Accurate decode.
+        // A fresh decoder with no setter and no environment override.
         std::env::remove_var("EDGEFIRST_CODEC_DCT");
         let mut t_def = Tensor::<u8>::image(
             4096,
@@ -829,15 +768,8 @@ fn fast_dct_mode_close_to_accurate_and_off_by_default() {
 #[allow(dead_code)]
 mod outcome;
 
-/// Profiler decode pools are max-sized Grey surfaces; each JPEG
-/// `configure_image`s a shorter window. On Windows that window is a D3D11
-/// texture sub-region. Covers both real allocations this crate must support:
-/// `CpuAccess::Write` (the tensor crate's documented access for decode
-/// targets, and the cheap no-staging path `map_write` alone now handles) and
-/// `CpuAccess::ReadWrite` (what `edgefirst-profiler`'s own decode pool
-/// actually declares — see `orchestrator/buffers.rs::create_decode_source_pool`
-/// — which keeps a staging texture and needs `map_decode_dst`'s fallback to
-/// `map_mut` for a partial window).
+/// Decodes a JPEG into a shorter window of an oversized Grey D3D11 pool
+/// tensor declared with `access`.
 #[cfg(windows)]
 fn decode_into_oversized_d3d11_pool_with(access: edgefirst_tensor::CpuAccess) {
     let jpeg = testdata("zidane.jpg");

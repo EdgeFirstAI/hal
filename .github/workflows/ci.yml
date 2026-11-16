@@ -1,9 +1,15 @@
 # HAL CI — Quick on every non-draft PR; Full when labeled ci:full / ci:hardware.
 # Shared workflows: EdgeFirstAI/.github, pinned in the `uses:` lines below.
 #
-# The shared commit appears only in the uses: pins below. The shared workflows
-# resolve their own repository and commit from the job context, so there is no
-# second value to keep in sync and Dependabot's bump is complete on its own.
+# Jobs:
+#   changes    reads the changed paths, labels and dispatch inputs and selects the tiers
+#   quick      shared Quick tier (rust-quick.yml)
+#   notice     `make sbom`: NOTICE names every shipped component
+#   capi-lint  clippy and checks on the C-API crates, the tensor backends and the benchmarks
+#   full       shared Full tier (rust-full.yml), including the boards
+#   hal-full   hal's own Full lanes (hal-full.yml)
+#   sonar      SonarCloud scan (sonar.yml)
+#   ci-gate    fails unless every job above succeeded or was skipped
 #
 # Action Versions (hash-pinned):
 # - actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 (v7.0.1)
@@ -78,7 +84,6 @@ jobs:
               hardware="$DISPATCH_HARDWARE"
               ;;
           esac
-          # Sticky: Full re-runs on later pushes while the label is present.
           case ",$LABELS," in *,ci:full,*) full=true ;; esac
           case ",$LABELS," in *,ci:hardware,*) hardware=true ;; esac
           echo "full=$full" >> "$GITHUB_OUTPUT"
@@ -92,18 +97,10 @@ jobs:
       runner: ubuntu-24.04
       timeout-minutes: 20
       lfs: true
-      # ruff lint only. The maturin + pytest pass is Full-tier work and lives in
-      # hal-full.yml, where the nightly toolchain and wheels already exist.
+      # ruff lint only.
       python: true
       ruff-paths: crates/python-tensor crates/python-codec crates/python-image crates/python-decoder crates/python-tracker crates/python-kernels crates/python-common tests
-      # Pin what uvx resolves; unpinned it drifts with the runner's uv cache.
       ruff-version: 0.16.7
-      # The aarch64 pass is back on. It was switched off because the shared
-      # argument list was fixed and hal's seven PyO3 crates cannot cross-compile
-      # without an interpreter for the target -- which cost hal aarch64 lint
-      # coverage entirely, on a repository whose products are aarch64. With
-      # `cross-clippy-args` the pass narrows instead of switching off.
-      #
       cross-clippy-args: --workspace --all-targets --locked --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-kernels --exclude edgefirst-python-common -- -D warnings
       pre-command: bash .github/scripts/ci-setup.sh
       clippy-args: --workspace --all-targets --locked --features default,edgefirst-decoder/model-files --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-kernels --exclude edgefirst-python-common -- -D warnings
@@ -113,10 +110,6 @@ jobs:
   # `make sbom` resolves the dependency graph for every target that reaches a
   # distributed artifact, and for the workspace-excluded C-API leaves, then fails
   # when a component is absent from NOTICE.
-  #
-  # On the Quick trigger rather than in hal-full, against the usual tiering,
-  # because hal-full runs only when the ci:full label is applied. NOTICE ships to
-  # downstream consumers with every release.
   notice:
     name: NOTICE attribution
     needs: changes
@@ -132,16 +125,11 @@ jobs:
       - uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68  # v2.88.1
         with:
           tool: cargo-cyclonedx
-      # No toolchain action: rust-toolchain.toml pins the compiler, and letting
-      # rustup honour it keeps one source of truth.
       - name: Resolve every shipped target and check NOTICE names each component
         run: make sbom
 
-  # The C-API crates build the library crates over the dynamic tensor backend,
-  # which every other Quick pass leaves uncompiled. On the Quick trigger for
-  # the reason NOTICE is: hal-full runs only with the ci:full label. The
-  # benchmarks workspace, excluded from the root workspace like the leaves,
-  # is type-checked here too.
+  # Lints the C-API crates, checks the libraries against both tensor backends,
+  # and type-checks the benchmarks workspace.
   capi-lint:
     name: C-API lint
     needs: changes
@@ -155,7 +143,6 @@ jobs:
         with:
           lfs: false
       - run: sudo apt-get update && sudo apt-get install -y clang libclang-dev pkg-config nasm
-      # No toolchain action: rust-toolchain.toml pins the compiler and clippy.
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
         with:
           shared-key: rust-x86_64-capi-lint
@@ -168,7 +155,6 @@ jobs:
         run: make lint-backend-scope
       - name: Each leaf rejects the wrong tensor backend
         run: make check-backend-guards
-      # Type-check only: the benchmarks are built and run by hand, not in CI.
       - name: The workspace-excluded benchmarks compile against the libraries
         run: make check-benchmarks
 
@@ -178,46 +164,25 @@ jobs:
     uses: EdgeFirstAI/.github/.github/workflows/rust-full.yml@c7876194b9fe9f7f72daf0efadaf32d7dff1b257
     with:
       lanes: ${{ needs.changes.outputs.full == 'true' && 'all' || 'hardware' }}
-      # One job per board identity, each run on that specific board: the NXP
-      # EVKs carry the vendor BSP (G2D, galcore on the 8M Plus) the hardware
-      # tests are written against, where a bare family label could land on a
-      # carrier without it. orin-nano is Ubuntu 22.04 (glibc 2.35), the floor
-      # the archive is built for.
+      # One job per board identity.
       boards: imx8mp-evk,imx95-evk,rpi5,orin-nano
       archive-glibc: "2.35"
       lfs: true
       python: false
-      # hal runs its own Sonar job (sonar.yml) so the nightly gets the same
-      # upload; the shared one would only cover the shared lanes.
       sonar: false
       scancode: true
-      # macOS and Windows lanes live in hal-full.yml: they need codesigning and
-      # a WARP gating pass that a single nextest-args string cannot express.
+      # macOS and Windows lanes live in hal-full.yml.
       skip-macos: true
       skip-windows: true
-      # Safety net, not a budget. Full ran a 37 min median on these same
-      # xlarge runners before the migration; 45 leaves headroom without
-      # normalising a slow tier.
       timeout-minutes: 45
       board-timeout-minutes: 45
-      # Full is speed-optimised and bills for it. Phase 2 moves linux and
-      # linux-arm to the self-hosted build-x86 fleet and these go to zero.
       runner-class-linux: larger
       runner-class-linux-arm: larger
       pre-command: bash .github/scripts/ci-setup.sh
       board-pre-command: BOARD=1 SKIP_PACKAGES=1 SKIP_TESTDATA=1 bash .github/scripts/ci-setup.sh
-      # One process per binary, not per test. nextest's process-per-test model
-      # costs a full EGL init/teardown per test on a board -- 6 to 22s each,
-      # measured -- and writes one profraw per process, which exhausted the
-      # eMMC at 307 files / 2.8 GB. Running each binary once is what test.yml
-      # did, and it is why the same suite took 16 minutes.
-      #
-      # The selection is the routing test.yml used: the image and tensor lib
-      # binaries filtered to the hardware tests, plus the integration binaries
-      # that are whole-binary GPU/DMA tests, plus the codec's V4L2 JPEG and
-      # MJPEG tests, which need a mem2mem JPEG decoder or encoder (i.MX 95
-      # mxc-jpeg) and fall back to the CPU or skip elsewhere. Everything else is CPU-only and already covered
-      # by the aarch64 host lane.
+      # One process per binary: the image and tensor lib binaries filtered to
+      # the hardware tests, the whole-binary GPU/DMA integration binaries, and
+      # the codec's V4L2 JPEG and MJPEG tests.
       board-binaries: |
         edgefirst_image=g2d,opengl
         edgefirst_tensor=dma
@@ -242,14 +207,9 @@ jobs:
         protocol_roundtrip
         identity
         vocabulary
-      # A floor, not a target. Guards against a selection that matches nothing
-      # and reports success; tighten once a green run reports the real count.
+      # Minimum number of tests the board selection must match.
       board-min-tests: "100"
       nextest-args: --workspace --locked --features default,edgefirst-decoder/model-files --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-kernels --exclude edgefirst-python-common -j 1
-      # The boards are storage-constrained (the smallest root filesystem is
-      # 12 GB). profiling is thin-LTO with debug = "line-tables-only", which is
-      # what kept the on-target payload shippable before the migration; the
-      # dev profile's full debug info fills the disk.
       archive-profile: profiling
       archive-args: --locked --package edgefirst-image --features opengl --package edgefirst-tensor --package edgefirst-codec
     secrets: inherit

@@ -4,12 +4,11 @@
 //! Per-channel affine output mapping: normalization and quantization of a
 //! finished 8-bit image into an f32, f16, u8 or i8 destination.
 //!
-//! Every element is `y = x * scale + offset` (unfused, so the NEON and scalar
-//! kernels agree bit for bit). Integer destinations take
-//! `clamp(floor(y + 0.5) + zero_point, lo, hi)` and store its low byte, the
-//! same rounding the GL shaders use. A row's coefficients follow a 12-lane
-//! pattern, which covers 1-, 3- and 4-channel packed rows (12 is a multiple of
-//! each) and a planar plane (one channel, repeated).
+//! Every element is `y = x * scale + offset` (unfused). Integer destinations
+//! take `clamp(floor(y + 0.5) + zero_point, lo, hi)` and store its low byte.
+//! A row's coefficients follow a 12-lane pattern, which covers 1-, 3- and
+//! 4-channel packed rows (12 is a multiple of each) and a planar plane (one
+//! channel, repeated).
 
 use super::{guard_plane, logical_surface, tensor_row_stride};
 use crate::options::OutputMap;
@@ -51,7 +50,6 @@ pub(crate) fn affine_u8_to_f32(src: &[u8], dst: &mut [f32], p: &Pattern) {
     #[cfg(not(target_arch = "aarch64"))]
     let done = 0;
     // `done` is a whole number of 12-lane groups, so each group starts at lane 0.
-    // Fixed-width groups vectorize whatever the caller's inlining; a variable-length chunk did not under fat LTO.
     let (src, dst) = (&src[done..], &mut dst[done..]);
     let mut groups = src.chunks_exact(PERIOD).zip(dst.chunks_exact_mut(PERIOD));
     for (s, d) in &mut groups {
@@ -100,12 +98,11 @@ pub(crate) fn affine_u8_to_int(src: &[u8], dst: &mut [u8], p: &Pattern) {
     }
 }
 
-/// One element of [`affine_u8_to_int`], in float arithmetic that vectorizes
-/// (no `f32::floor` call, no saturating cast).
+/// One element of [`affine_u8_to_int`], in float arithmetic without an
+/// `f32::floor` call or a saturating cast.
 #[inline(always)]
 fn quantize_lane(x: u8, p: &Pattern, l: usize) -> u8 {
-    // Bounded first so the float floor below is exact and the cast cannot
-    // overflow.
+    // Bounded to [-1024, 1024] before the float floor and the cast.
     let t = (x as f32 * p.scale[l] + p.offset[l] + 0.5).clamp(-1024.0, 1024.0);
     let r = (t + 12_582_912.0) - 12_582_912.0;
     let f = if r > t { r - 1.0 } else { r };
@@ -351,7 +348,7 @@ pub(super) fn fill_outside(dst: &mut TensorDyn, rect: Rect, values: [f32; 4]) ->
     // A planar row holds one channel; a packed row cycles through `channels` lanes.
     let lanes = if planar { 1 } else { channels };
     let row_values = |r: usize| if planar { [values[r / h]; 4] } else { values };
-    // Whole-slice fills per row, so the loop stays a memset-like store whatever the caller's inlining.
+    // Whole-slice fills per row.
     fn fill<T: Copy>(
         buf: &mut [T],
         stride: usize,

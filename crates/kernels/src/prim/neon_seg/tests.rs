@@ -35,8 +35,7 @@ fn run(n: usize, f: impl FnOnce(&mut [MaybeUninit<u8>]) -> bool) -> Option<Vec<u
 /// Lengths covering every tail of a 16-element step.
 const LENGTHS: [usize; 12] = [0, 1, 2, 7, 15, 16, 17, 31, 32, 33, 100, 257];
 
-/// Each integer type's top byte equals the decoder's formulas over every 8- and 16-bit value,
-/// random and extreme 32-bit values, and every tail length; a length mismatch writes nothing.
+/// Each integer type's top byte equals the decoder's formulas.
 #[test]
 fn seg_to_u8_matches_the_decoder_formulas() {
     fn check<T: SegToU8 + std::fmt::Debug>(src: &[T], want: impl Fn(T) -> u8) {
@@ -138,8 +137,7 @@ fn seg_normalize_f32_matches_the_scalar_code() {
     }
 }
 
-/// f16 maps normalize to `half` arithmetic bit for bit, emulated and (with FEAT_FP16) native,
-/// over the random maps and maps holding every finite f16 of a range.
+/// f16 maps normalize to `half` arithmetic bit for bit, emulated and (with FEAT_FP16) native.
 #[test]
 fn seg_normalize_f16_matches_half_arithmetic() {
     let fp16 = std::arch::is_aarch64_feature_detected!("fp16");
@@ -203,9 +201,7 @@ fn argmax_scalar(src: &[u8], channels: usize) -> Vec<u8> {
         .collect()
 }
 
-/// The per-pixel argmax equals the scalar first-max for 1–20, 31–33, 64, 255–257 and 300
-/// channels over every tail of 16 pixels, few-valued (ties everywhere) and full-range scores;
-/// zero channels or a pixel count mismatch write nothing.
+/// The per-pixel argmax equals the scalar first-max.
 #[test]
 fn channel_argmax_matches_the_scalar_first_max() {
     let mut rng = Rng(0xfeed_f00d_1234_5678);

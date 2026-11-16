@@ -96,8 +96,7 @@ macro_rules! impl_dfl_level_f16 {
 /// Generate per-cell DFL level kernels with per-channel quantization.
 /// `scales[i]` and `zps[i]` index into the channel axis (`4 * reg_max`
 /// values per anchor); each bin has its own scale and zero-point.
-/// Float inputs never carry per-channel quant from NPUs — only integer
-/// input types are instantiated.
+/// Only integer input types are instantiated.
 macro_rules! impl_dfl_level_f32_per_channel {
     ($name:ident, $i:ty) => {
         #[allow(dead_code)]
@@ -115,9 +114,8 @@ macro_rules! impl_dfl_level_f32_per_channel {
             debug_assert_eq!(dst.len(), 4 * h * w);
             debug_assert!(reg_max <= MAX_REG_MAX);
             debug_assert_eq!(scales.len(), 4 * reg_max);
-            // `zps` is either empty (the "all zero-points = 0" convention used
-            // for symmetric quant) or one entry per channel. A mismatched
-            // length would otherwise silently default missing channels to 0.
+            // `zps` is either empty (every zero point is 0) or one entry per
+            // channel.
             debug_assert!(
                 zps.is_empty() || zps.len() == 4 * reg_max,
                 "per-channel zero-points must be empty or 4*reg_max ({}), got {}",
@@ -171,9 +169,8 @@ macro_rules! impl_dfl_level_f16_per_channel {
             debug_assert_eq!(dst.len(), 4 * h * w);
             debug_assert!(reg_max <= MAX_REG_MAX);
             debug_assert_eq!(scales.len(), 4 * reg_max);
-            // `zps` is either empty (the "all zero-points = 0" convention used
-            // for symmetric quant) or one entry per channel. A mismatched
-            // length would otherwise silently default missing channels to 0.
+            // `zps` is either empty (every zero point is 0) or one entry per
+            // channel.
             debug_assert!(
                 zps.is_empty() || zps.len() == 4 * reg_max,
                 "per-channel zero-points must be empty or 4*reg_max ({}), got {}",
@@ -711,8 +708,6 @@ mod tests {
 
     #[test]
     fn dfl_i8_dequant_then_decode_matches_f32_input() {
-        // Verify the i8→f32 path produces same boxes as f32 passthrough
-        // when the dequantized logits are equivalent.
         let q = Quantization::new(0.1, -128);
         let mut input_i8 = [-128_i8; 64];
         // Set bin 5 of each side to a saturated value that dequants high.

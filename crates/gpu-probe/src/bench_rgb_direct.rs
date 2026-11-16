@@ -4,10 +4,8 @@
 //! Direct RGB render verification and benchmarks.
 //!
 //! Renders an RGBA DMA-buf source through a fullscreen quad into an RGB888
-//! (BGR888 fourcc) DMA-buf renderbuffer, bypassing the texture-based FBO
-//! attachment used elsewhere. This exercises the `GL_OES_EGL_image` →
-//! renderbuffer path and measures EGLImage + RBO + FBO creation cost for the
-//! direct RGB output pipeline.
+//! (BGR888 fourcc) DMA-buf renderbuffer (the `GL_OES_EGL_image` →
+//! renderbuffer path) and measures EGLImage + RBO + FBO creation cost.
 
 use crate::bench::{run_bench, BenchResult};
 use crate::bench_render;

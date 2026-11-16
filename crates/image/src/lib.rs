@@ -67,8 +67,7 @@ The behavior of the `edgefirst_image::ImageProcessor` struct can be influenced b
 following environment variables:
 - `EDGEFIRST_FORCE_BACKEND`: When set to `cpu`, `g2d`, or `opengl` (case-insensitive),
   only that single backend is initialized and no fallback chain is used. If the
-  forced backend fails to initialize, an error is returned immediately. This is
-  useful for benchmarking individual backends in isolation. When this variable is
+  forced backend fails to initialize, an error is returned immediately. When this variable is
   set, the `EDGEFIRST_DISABLE_*` variables are ignored.
 - `EDGEFIRST_DISABLE_GL`: If set to `1`, disables the use of OpenGL for image
   conversion, forcing the use of CPU or other available hardware methods.
@@ -81,14 +80,14 @@ following environment variables:
 
 Additionally the TensorMemory used by default allocations can be controlled using the
 `EDGEFIRST_TENSOR_FORCE_MEM` environment variable. If set to `1`, default tensor memory
-uses system memory. This will disable the use of specialized memory regions for tensors
-and hardware acceleration. However, this will increase the performance of the CPU converter.
+uses system memory. This disables the use of specialized memory regions for tensors
+and hardware acceleration.
 */
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
-/// Retained constructor: installs the coverage flush-on-abort handler for this
-/// crate's instrumented test binary. See `edgefirst_tensor::covguard`. Only
-/// present under coverage on Linux (`.init_array` is ELF-only; flush is Linux-only).
+/// Installs the coverage flush-on-abort handler for this crate's
+/// instrumented test binary. See `edgefirst_tensor::covguard`. Present
+/// under coverage on Linux only.
 #[cfg(all(coverage, target_os = "linux"))]
 #[used]
 #[link_section = ".init_array"]
@@ -99,42 +98,31 @@ static __EDGEFIRST_COV_INSTALL: extern "C" fn() = {
     ctor
 };
 
-/// Pitch alignment requirement for DMA-BUF tensors that may be imported as
-/// EGLImages by the GL backend. Mali Valhall (i.MX 95 / G310) rejects
-/// `eglCreateImageKHR` with `EGL_BAD_ALLOC` for any DMA-BUF whose row pitch
-/// is not a multiple of 64 bytes; Vivante GC7000UL (i.MX 8MP) accepts any
-/// pitch so the constant is harmless on that path. 64 is the smallest
-/// alignment that satisfies every embedded ARM GPU we ship to.
+/// Row pitch alignment, in bytes, for DMA-BUF tensors that may be imported
+/// as EGLImages by the GL backend.
 ///
-/// Applied automatically inside [`ImageProcessor::create_image`] when the
-/// allocation lands on `TensorMemory::DmaBuf`. External callers that allocate
-/// their own DMA-BUF tensors (e.g. GStreamer plugins, video pipelines) can
-/// use [`align_width_for_gpu_pitch`] to compute a width whose resulting row
-/// stride satisfies this requirement.
+/// Applied inside [`ImageProcessor::create_image`] when the allocation is
+/// `TensorMemory::DmaBuf`. [`align_width_for_gpu_pitch`] computes a width
+/// whose row stride satisfies this requirement.
 pub const GPU_DMA_BUF_PITCH_ALIGNMENT_BYTES: usize = 64;
 
 /// Round `width` (in pixels) up so the resulting row stride
 /// `width * bpp` is a multiple of [`GPU_DMA_BUF_PITCH_ALIGNMENT_BYTES`]
-/// AND a multiple of `bpp` (so the rounded width is an integer pixel count).
+/// and a multiple of `bpp`.
 ///
 /// `bpp` must be the per-pixel byte count for the image's primary plane
 /// (e.g. 4 for RGBA8/BGRA8, 3 for RGB888, 1 for Grey/NV12-luma).
 ///
-/// External callers — GStreamer plugins, video pipelines, anyone wrapping a
-/// foreign DMA-BUF — should call this when sizing the destination so that
-/// `eglCreateImageKHR` doesn't reject the import on Mali. Pre-aligned widths
-/// (640, 1280, 1920, 3008, 3840 …) round-trip unchanged; misaligned widths
-/// are bumped up to the next valid value.
+/// Pre-aligned widths (640, 1280, 1920, 3008, 3840 …) are returned
+/// unchanged; misaligned widths are rounded up to the next valid value.
 ///
 /// # Overflow behaviour
 ///
 /// All arithmetic is checked. If the alignment computation or the rounded
 /// width would overflow `usize`, the function logs a warning and returns the
-/// original `width` unchanged rather than wrapping or producing a smaller
-/// value. Callers can rely on the returned width being **at least** the
-/// requested width.
+/// original `width`. The returned width is at least the requested width.
 ///
-/// `bpp == 0` and `width == 0` short-circuit to return the input unchanged.
+/// `bpp == 0` and `width == 0` return the input unchanged.
 ///
 /// # Examples
 ///
@@ -155,14 +143,8 @@ pub fn align_width_for_gpu_pitch(width: usize, bpp: usize) -> usize {
         return width;
     }
 
-    // The minimum aligned stride must be a common multiple of both the
-    // GPU's pitch alignment and the per-pixel byte count. Using the LCM
-    // guarantees the rounded stride is an integer multiple of `bpp`, so
-    // converting back to a pixel count is exact.
-    //
-    // Compute the alignment in pixels (`width_alignment`) so we never need
-    // to multiply `width * bpp`, which is the only operation that could
-    // realistically overflow for large caller-supplied widths.
+    // The aligned stride is a multiple of lcm(pitch alignment, bpp). The
+    // alignment is computed in pixels, without multiplying `width * bpp`.
     let Some(lcm_alignment) = checked_num_integer_lcm(GPU_DMA_BUF_PITCH_ALIGNMENT_BYTES, bpp)
     else {
         log::warn!(
@@ -202,11 +184,6 @@ pub fn align_width_for_gpu_pitch(width: usize, bpp: usize) -> usize {
 /// Round `min_pitch_bytes` up to the next multiple of
 /// [`GPU_DMA_BUF_PITCH_ALIGNMENT_BYTES`]. Returns `None` if the rounded
 /// value would overflow `usize`. Returns `Some(0)` for input 0.
-///
-/// Used internally by [`ImageProcessor::create_image`] to compute the
-/// padded row stride for DMA-backed image allocations. External callers
-/// that need pixel-counted alignment (instead of raw byte pitch) should
-/// use [`align_width_for_gpu_pitch`] instead.
 #[cfg(target_os = "linux")]
 pub(crate) fn align_pitch_bytes_to_gpu_alignment(min_pitch_bytes: usize) -> Option<usize> {
     let alignment = GPU_DMA_BUF_PITCH_ALIGNMENT_BYTES;
@@ -227,8 +204,7 @@ fn checked_num_integer_lcm(a: usize, b: usize) -> Option<usize> {
         return Some(0);
     }
     let g = num_integer_gcd(a, b);
-    // a / g is exact (g divides a by definition) and at most a, so this
-    // division never panics. Only the subsequent multiply can overflow.
+    // `a / g` is exact; only the multiply can overflow.
     (a / g).checked_mul(b)
 }
 
@@ -241,11 +217,10 @@ fn num_integer_gcd(a: usize, b: usize) -> usize {
 }
 
 /// Bytes-per-pixel for the primary plane of `format` at element size `elem`.
-/// Returns `None` for formats that don't have a single packed BPP (semi-planar
-/// chroma is handled separately, returning the luma-plane bpp).
+/// Returns `None` for formats without a single packed BPP. Semi-planar
+/// formats return the luma-plane bpp.
 ///
-/// External callers can use this together with [`align_width_for_gpu_pitch`]
-/// to size their own DMA-BUFs without having to remember per-format BPPs:
+/// Use with [`align_width_for_gpu_pitch`] to size a DMA-BUF:
 ///
 /// ```
 /// use edgefirst_image::{align_width_for_gpu_pitch, primary_plane_bpp};
@@ -260,12 +235,9 @@ pub fn primary_plane_bpp(format: PixelFormat, elem: usize) -> Option<usize> {
     match format.layout() {
         PixelLayout::Packed => Some(format.channels() * elem),
         PixelLayout::Planar => Some(elem),
-        // For NV12/NV16 the luma plane is single-channel so the pitch
-        // matches `elem`; the chroma plane uses the same pitch in bytes
-        // (UV is half-width but two interleaved channels = same pitch).
+        // NV12/NV16: the luma plane is single-channel; the chroma plane has
+        // the same pitch in bytes.
         PixelLayout::SemiPlanar => Some(elem),
-        // `PixelLayout` is non-exhaustive — fall through unaligned for
-        // any future variant we don't yet recognise.
         _ => None,
     }
 }
@@ -274,37 +246,21 @@ pub fn primary_plane_bpp(format: PixelFormat, elem: usize) -> Option<usize> {
 /// `width × fmt` would need row-stride padding, or `None` when the
 /// natural pitch already satisfies `GPU_DMA_BUF_PITCH_ALIGNMENT_BYTES`
 /// or the caller has explicitly requested non-DMA memory.
-///
-/// Mali G310 (i.MX 95) rejects `eglCreateImage` from DMA-BUFs whose
-/// `PLANE0_PITCH_EXT` is not a multiple of 64 bytes, surfacing as
-/// `EGL_BAD_ALLOC`. The `load_image_test_helper` test-only helper
-/// in this crate uses this to decide whether to allocate a tensor
-/// with padded row stride before invoking the decode path; production
-/// callers do the equivalent peek → allocate → decode dance themselves
-/// (see crate-level docs).
 #[cfg(all(target_os = "linux", test))]
 pub(crate) fn padded_dma_pitch_for(
     fmt: PixelFormat,
     width: usize,
     memory: &Option<TensorMemory>,
 ) -> Option<usize> {
-    // Only pad when the caller explicitly requested DMA, or when they
-    // left memory selection to the allocator AND DMA is actually
-    // available. `Tensor::image_with_stride(..., None)` always routes
-    // through DMA allocation, so treating `None` as "DMA wanted"
-    // unconditionally would convert a normally-working image load into
-    // a hard failure on systems where DMA is unavailable (sandboxed
-    // CI, missing `/dev/dma_heap`, permission-denied containers) —
-    // whereas `Tensor::image(..., None)` would have fallen back to
-    // SHM/Mem there.
+    // Pads when the caller requested DMA, or left the choice to the
+    // allocator and DMA is available.
     match memory {
         Some(TensorMemory::DmaBuf) => {}
         None if edgefirst_tensor::is_dma_available() => {}
         _ => return None,
     }
-    // Only packed layouts are padded through this helper:
-    // `Tensor::image_with_stride` rejects semi-planar / planar formats, whose
-    // rows `Tensor::image` pads itself.
+    // Only packed layouts are padded here; `Tensor::image` pads semi-planar
+    // and planar rows itself.
     if fmt.layout() != PixelLayout::Packed {
         return None;
     }
@@ -319,9 +275,8 @@ pub(crate) fn padded_dma_pitch_for(
 }
 
 /// Whether a G2D initialisation failure only says the host has no G2D: the
-/// loader found no file for its library. G2D ships with NXP i.MX BSPs alone,
-/// so that is the ordinary case on every other Linux host. A library that is
-/// installed and does not load, or that lacks a dependency, is a failure.
+/// loader found no file for its library. A library that is installed and
+/// does not load, or that lacks a dependency, is a failure.
 #[cfg(target_os = "linux")]
 fn g2d_is_absent(err: &Error) -> bool {
     match err {
@@ -410,9 +365,7 @@ pub use opengl_headless::Int8InterpolationMode;
 #[cfg(target_os = "linux")]
 #[cfg(feature = "opengl")]
 pub use opengl_headless::{probe_egl_displays, EglDisplayInfo};
-// EGLImage cache counter snapshots (diagnostics): see
-// `GLProcessorThreaded::egl_cache_stats` and the steady-state import gate in
-// `crates/image/ARCHITECTURE.md § image.convert.gl.egl_import`.
+// EGLImage cache counter snapshots (diagnostics).
 #[cfg(all(
     any(
         target_os = "linux",
@@ -439,14 +392,9 @@ mod test_support;
 mod tiling;
 pub use tiling::{tile_grid, TilePlacement, TileSpec, TilingConfig};
 
-// Use `edgefirst_tensor::PixelFormat` variants (Rgb, Rgba, Grey, etc.) and
-// `TensorDyn` / `Tensor<u8>` with `.format()` metadata instead.
-
-// The image option vocabularies are declared through
-// `edgefirst_tensor::ef_vocabulary!`: the discriminant written here is the
-// code every surface uses (`code()`, the `EF_ROTATION_*` / `EF_FLIP_*` /
+// The discriminant of each image option vocabulary is the code every
+// surface uses (`code()`, the `EF_ROTATION_*` / `EF_FLIP_*` /
 // `EF_COLOR_MODE_*` / `EF_FIT_*` C enumerators, and the Python enum values).
-// The C and Python enums assert against `code()` at compile time.
 edgefirst_tensor::ef_vocabulary! {
     /// A quarter-turn rotation applied during [`ImageProcessorTrait::convert`].
     #[derive(Default)]
@@ -505,18 +453,13 @@ edgefirst_tensor::ef_vocabulary! {
     #[derive(Default)]
     pub enum ColorMode {
         /// Color is chosen by object class label (`det.label`). Default.
-        ///
-        /// Preserves backward compatibility and is correct for semantic
-        /// segmentation where colors carry class meaning.
         #[default]
         Class = 0, "class", CLASS,
-        /// Color is chosen by instance order (loop index, zero-based).
-        ///
-        /// Each detected object gets a unique color regardless of class,
-        /// useful for instance segmentation.
+        /// Color is chosen by instance order (loop index, zero-based): each
+        /// detected object gets a unique color regardless of class.
         Instance = 1, "instance", INSTANCE,
-        /// Color is chosen by track ID (future use; currently behaves like
-        /// [`Instance`](Self::Instance)).
+        /// Color is chosen by track ID. Behaves like
+        /// [`Instance`](Self::Instance).
         Track = 2, "track", TRACK,
     }
     #[doc(hidden)]
@@ -539,19 +482,15 @@ impl ColorMode {
 ///
 /// - [`Proto`](Self::Proto) returns per-detection tiles at proto-plane
 ///   resolution (e.g. 48×32 u8 for a typical COCO bbox on a 160×160 proto
-///   plane). This is the historical behavior of `materialize_masks` and the
-///   fastest path because no upsample runs inside HAL. Mask values are
-///   continuous sigmoid output quantized to `uint8 [0, 255]`.
+///   plane). Mask values are continuous sigmoid output quantized to
+///   `uint8 [0, 255]`.
 /// - [`Scaled`](Self::Scaled) returns per-detection tiles at caller-specified
 ///   pixel resolution by upsampling the full proto plane once and cropping by
 ///   bbox after sigmoid. The upsample uses bilinear interpolation with
-///   edge-clamp sampling — semantically equivalent to Ultralytics'
-///   `process_masks_retina` reference. When a `content_region` is also passed
-///   to [`materialize_masks`], the inverse letterbox transform is applied during
-///   the upsample so mask pixels land in original-content coordinates
-///   (drop-in for overlay on the original image). Mask values are binary
-///   `uint8 {0, 255}` after thresholding sigmoid > 0.5 — interchangeable
-///   with `Proto` output via the same `> 127` test.
+///   edge-clamp sampling. When a `content_region` is also passed to
+///   [`materialize_masks`], the inverse letterbox transform is applied during
+///   the upsample so mask pixels land in original-content coordinates. Mask
+///   values are binary `uint8 {0, 255}` after thresholding sigmoid > 0.5.
 ///
 /// [`materialize_masks`]: ImageProcessor::materialize_masks
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -576,10 +515,7 @@ pub enum MaskResolution {
 /// - `background`: when set, the background image is drawn first and masks
 ///   are composited over it (result written to `dst`). When `None`, `dst` is
 ///   cleared to `0x00000000` (fully transparent) before masks are drawn.
-///   **`dst` is always fully overwritten — its prior contents are never
-///   preserved.** Callers who used to pre-load an image into `dst` before
-///   calling `draw_decoded_masks` / `draw_proto_masks` must now supply that
-///   image via `background` instead (behaviour changed in v0.16.4).
+///   `dst` is always fully overwritten.
 /// - `opacity`: scales the alpha of rendered mask and box colors. `1.0`
 ///   (default) preserves the class color's alpha unchanged; `0.5` makes
 ///   masks and boxes twice as transparent.
@@ -668,10 +604,6 @@ impl<'a> MaskOverlay<'a> {
 }
 
 /// Copy a [`Segmentation`], replacing its bounds with `bbox`.
-///
-/// `TensorDyn` is deliberately not `Clone` (it may own an fd), so the mask
-/// bytes are copied explicitly. This is only reached on the letterbox path
-/// where the bounds must be rewritten to match an un-letterboxed detect box.
 fn copy_segmentation(s: &Segmentation, bbox: [f32; 4]) -> Result<Segmentation> {
     use edgefirst_tensor::TensorMapTrait as _;
     let src = s
@@ -679,12 +611,6 @@ fn copy_segmentation(s: &Segmentation, bbox: [f32; 4]) -> Result<Segmentation> {
         .as_typed::<u8>()
         .ok_or_else(|| Error::InvalidShape("segmentation must be a U8 tensor".into()))?;
     let map = src.map_read()?;
-    // `Some(Mem)`, NOT `None`. `None` means auto-select, which prefers DMA on
-    // Linux and IOSurface on macOS -- so this would take a dma_heap ioctl and
-    // hold an fd PER DETECTION PER FRAME for a mask of a few hundred bytes,
-    // and turn every downstream map_read() in the render loop into a
-    // DMA_BUF_IOCTL_SYNC instead of a no-op. A mask copy is CPU-only scratch.
-    // `mask_to_tensor` reaches Mem the same way, via from_arrayview3.
     let dst = edgefirst_tensor::Tensor::<u8>::new(
         s.segmentation.shape(),
         Some(edgefirst_tensor::TensorMemory::Mem),
@@ -707,14 +633,11 @@ fn copy_segmentation(s: &Segmentation, bbox: [f32; 4]) -> Result<Segmentation> {
 /// Apply the inverse letterbox transform to a bounding box.
 ///
 /// `lb` is `[lx0, ly0, lx1, ly1]` — the normalized region of the model input
-/// that contains actual image content ([`MaskOverlay::content_region`]). Converts model-input-normalized
-/// coords to output-image-normalized coords, clamped to `[0.0, 1.0]`, and
-/// canonicalises the bbox (ensures xmin <= xmax).
+/// that contains actual image content ([`MaskOverlay::content_region`]).
+/// Converts model-input-normalized coords to output-image-normalized coords,
+/// clamped to `[0.0, 1.0]`, and canonicalises the bbox (ensures xmin <= xmax).
 ///
-/// Thin wrapper over [`edgefirst_tensor::unletter_norm`]: the single home for
-/// the inverse-letterbox math sits beside the type it transforms, so this mask
-/// path and `edgefirst_decoder::tiling`'s detection lift share one
-/// implementation.
+/// Wraps [`edgefirst_tensor::unletter_norm`].
 #[inline]
 fn unletter_bbox(bbox: DetectBox, lb: [f32; 4]) -> DetectBox {
     DetectBox {
@@ -770,8 +693,7 @@ impl Crop {
     /// Resolve to the effective backend geometry for a `src_w`×`src_h` source
     /// and `dst_w`×`dst_h` destination: the source sampling rect, the
     /// destination placement rect (`None` = whole destination), and the pad
-    /// colour. **The single place letterbox placement is computed** — every
-    /// backend consumes the resolved rects rather than re-deriving them.
+    /// colour.
     pub(crate) fn resolve(
         &self,
         src_w: usize,
@@ -781,8 +703,7 @@ impl Crop {
         placement: LetterboxPlacement,
     ) -> Result<ResolvedCrop, Error> {
         let src_rect = self.source.map(region_to_rect);
-        // The letterbox aspect uses the *effective* source content — the source
-        // crop when set, else the full source.
+        // The letterbox aspect uses the source crop when set, else the full source.
         let (sw, sh) = match self.source {
             Some(r) => (r.width, r.height),
             None => (src_w, src_h),
@@ -821,8 +742,7 @@ impl Crop {
 }
 
 /// Resolved crop geometry consumed by the backends. Produced by
-/// [`Crop::resolve`]; the backends read these fields directly (the same shape
-/// the public `Crop` carried before destination placement moved to the view).
+/// [`Crop::resolve`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct ResolvedCrop {
     pub(crate) src_rect: Option<Rect>,
@@ -832,7 +752,7 @@ pub(crate) struct ResolvedCrop {
 
 impl ResolvedCrop {
     /// A no-op resolved crop (whole source → whole destination, no pad).
-    #[allow(dead_code)] // used by unit tests and the batch render paths
+    #[allow(dead_code)]
     pub(crate) fn no_crop() -> Self {
         Self::default()
     }
@@ -840,7 +760,7 @@ impl ResolvedCrop {
     /// Whether a convert from a `src`-sized source to a `dst`-sized
     /// destination with this crop changes the size of the sampled region. A
     /// quarter-turn rotation swaps the source region's axes.
-    #[allow(dead_code)] // unused when no resampling backend is compiled in
+    #[allow(dead_code)]
     pub(crate) fn resizes(
         &self,
         (src_w, src_h): (usize, usize),
@@ -914,10 +834,9 @@ fn letterbox_rect(
     Rect::new(r.x, r.y, r.width, r.height)
 }
 
-/// Internal placement rectangle (top-left + size). The **public** pixel
-/// sub-region type is [`Region`] (re-exported from `edgefirst-tensor`);
-/// `Rect` is the crate-private resolved-placement representation used by the
-/// CPU/G2D/GL backends after [`Crop::resolve`].
+/// Placement rectangle (top-left + size): the crate-private resolved
+/// placement the CPU/G2D/GL backends use after [`Crop::resolve`]. The
+/// public pixel sub-region type is [`Region`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Rect {
     pub left: usize,
@@ -944,11 +863,9 @@ pub trait ImageProcessorTrait {
     /// then the flip, then the rotation.
     ///
     /// The destination is normally an RGB-family colour — `Grey`, `Rgb`,
-    /// `Rgba`/`Bgra`, packed `HWC` or planar `CHW`. That is what the
-    /// accelerated paths target and what models expect. The CPU backend also
+    /// `Rgba`/`Bgra`, packed `HWC` or planar `CHW`. The CPU backend also
     /// accepts a handful of YUV destinations (`Yuyv`→`Yuyv`, `Yuyv`→`Nv16`,
-    /// and the `Vyuy` equivalents); no GPU or G2D path does, so those pairs
-    /// always land on the CPU.
+    /// and the `Vyuy` equivalents); those pairs always run on the CPU.
     ///
     /// # Arguments
     ///
@@ -966,9 +883,8 @@ pub trait ImageProcessorTrait {
     /// - [`Error::CropInvalid`] if the source crop falls outside `src`.
     /// - [`Error::NotAnImage`] if either tensor carries no `PixelFormat`.
     /// - [`Error::InvalidOptions`] if the options cannot apply to `dst`.
-    /// - [`Error::NoConverter`] if no backend accepts the format pair — the
-    ///   dispatch tries OpenGL, then G2D, then CPU, so this means all three
-    ///   declined.
+    /// - [`Error::NoConverter`] if no backend accepts the format pair; the
+    ///   dispatch tries OpenGL, then G2D, then CPU.
     /// - [`Error::Tensor`] with [`CpuAccessDenied`](edgefirst_tensor::Error::CpuAccessDenied)
     ///   if a CPU pass needs access a tensor's declaration does not cover
     ///   (source `Read`; destination `Write`, or `ReadWrite` for a view or a
@@ -978,8 +894,8 @@ pub trait ImageProcessorTrait {
     ///   finds the refusal in either form.
     ///
     /// Backend-specific failures (EGL import, G2D blit, allocation) surface as
-    /// their own variants. A backend *declining* a pair is not an error while
-    /// another remains in the chain; it silently costs the zero-copy path, and
+    /// their own variants. A backend declining a pair is not an error while
+    /// another remains in the chain;
     /// [`ImageProcessor::convert_fallback_count`] counts those.
     fn convert(
         &mut self,
@@ -1006,8 +922,7 @@ pub trait ImageProcessorTrait {
     ///
     /// # Output contract
     ///
-    /// This function always fully writes `dst` — it never relies on the
-    /// caller having pre-cleared the destination. The four cases are:
+    /// This function always fully writes `dst`. The four cases are:
     ///
     /// | detections | background | output                              |
     /// |------------|------------|-------------------------------------|
@@ -1015,12 +930,6 @@ pub trait ImageProcessorTrait {
     /// | none       | set        | dst ← background                    |
     /// | set        | none       | masks drawn over cleared dst        |
     /// | set        | set        | masks drawn over background         |
-    ///
-    /// Each backend implements this with its native primitives: G2D uses
-    /// `g2d_clear` / `g2d_blit`, OpenGL uses `glClear` / DMA-BUF GPU blit
-    /// plus the mask program, and CPU uses direct buffer fill / memcpy as
-    /// the terminal fallback. CPU-memcpy of DMA buffers is avoided on the
-    /// accelerated paths.
     ///
     /// An empty `segmentation` slice is valid — only bounding boxes are drawn.
     ///
@@ -1031,28 +940,17 @@ pub trait ImageProcessorTrait {
     /// palette, alpha included.
     ///
     /// A `Bgra` background onto a zero-copy destination (a D3D11 texture, an
-    /// IOSurface, a dma-buf) returns [`Error::NotSupported`]: the GL
-    /// base-layer draw has no `Bgra` arm and the CPU backend renders only
-    /// `Rgba`/`Rgb`. It previously returned `Ok` with `dst` unwritten. A
-    /// `Bgra` destination with no background is unaffected.
+    /// IOSurface, a dma-buf) returns [`Error::NotSupported`]. A `Bgra`
+    /// destination with no background is unaffected.
     ///
     /// # Buffer aliasing
     ///
     /// `dst` and `overlay.background` must reference **distinct underlying
     /// buffers**. An aliased pair returns [`Error::AliasedBuffers`] without
-    /// dispatching to any backend — the GL path would otherwise read and
-    /// write the same texture in a single draw, which is undefined behaviour
-    /// on most drivers. Aliasing is detected via
+    /// dispatching to any backend. Aliasing is detected via
     /// [`TensorDyn::aliases`](edgefirst_tensor::TensorDyn::aliases), which
     /// catches both shared-allocation clones and separate imports over the
     /// same dmabuf fd.
-    ///
-    /// # Migration from v0.16.3 and earlier
-    ///
-    /// Prior to v0.16.4 the call silently preserved `dst`'s contents on empty
-    /// detections. That invariant no longer holds — `dst` is always fully
-    /// written. Callers who pre-loaded an image into `dst` before calling this
-    /// function must now pass that image via `overlay.background` instead.
     fn draw_decoded_masks(
         &mut self,
         dst: &mut TensorDyn,
@@ -1063,21 +961,18 @@ pub trait ImageProcessorTrait {
 
     /// Draw masks from proto data onto image (fused decode+draw).
     ///
-    /// For YOLO segmentation models, this avoids materializing intermediate
-    /// `Array3<u8>` masks. The `ProtoData` contains mask coefficients and the
-    /// prototype tensor; the renderer computes `mask_coeff @ protos` directly
-    /// at the output resolution using bilinear sampling.
+    /// The `ProtoData` contains mask coefficients and the prototype tensor;
+    /// the renderer computes `mask_coeff @ protos` at the output resolution
+    /// using bilinear sampling, without materializing intermediate masks.
     ///
-    /// `detect` and `proto_data.mask_coefficients` must have the same length
-    /// (enforced by zip — excess entries are silently ignored). An empty
-    /// `detect` slice is valid and produces the base frame — cleared or
-    /// background-blitted — via the selected backend's native primitive.
+    /// `detect` and `proto_data.mask_coefficients` must have the same length;
+    /// excess entries are ignored. An empty `detect` slice is valid and
+    /// produces the base frame, cleared or background-blitted.
     ///
     /// # Format requirements and output contract
     ///
     /// Same as [`draw_decoded_masks`](Self::draw_decoded_masks), including
-    /// the "always fully writes dst" guarantee across all four
-    /// detection/background combinations.
+    /// that `dst` is always fully written.
     ///
     /// `overlay` controls compositing — see [`draw_decoded_masks`](Self::draw_decoded_masks).
     fn draw_proto_masks(
@@ -1099,9 +994,7 @@ pub trait ImageProcessorTrait {
     /// left as the base layer set it. The default palette's alpha is `0.7`.
     ///
     /// On [`ImageProcessor`] with no forced backend this reaches every
-    /// available backend rather than the first that accepts, because a
-    /// later draw may land on any of them. A forced backend receives the
-    /// colors alone.
+    /// available backend. A forced backend receives the colors alone.
     fn set_class_colors(&mut self, colors: &[[u8; 4]]) -> Result<()>;
 
     /// Sets the thickness, in destination pixels, of the bounding-box
@@ -1109,8 +1002,8 @@ pub trait ImageProcessorTrait {
     /// and [`draw_proto_masks`](Self::draw_proto_masks). The default is
     /// [`DEFAULT_BOX_LINE_WIDTH`] (3 px).
     ///
-    /// The outline is drawn outside the box edges, so the box interior is
-    /// never covered. It is clipped at the image border.
+    /// The outline is drawn outside the box edges and is clipped at the image
+    /// border.
     ///
     /// Reaches every available backend, as
     /// [`set_class_colors`](Self::set_class_colors) does.
@@ -1123,20 +1016,16 @@ pub trait ImageProcessorTrait {
 
     /// Like [`convert`](Self::convert), but does not wait for the GPU to finish.
     ///
-    /// This is the batch-preprocessing primitive: a caller renders `N` tiles
-    /// into one batched destination by looping
+    /// A caller renders `N` tiles into one batched destination by looping
     /// `convert_deferred(&src[n], &mut dst.batch(n)?, …)` and then calling
-    /// [`flush`](Self::flush) **once**. On the OpenGL backend every deferred
+    /// [`flush`](Self::flush) once. On the OpenGL backend every deferred
     /// convert into sibling views of one buffer shares a single EGLImage import
-    /// (the tile is a `glViewport`/`glScissor` ROI into the parent) and skips the
-    /// per-tile `glFinish`; `flush` then issues a single GPU sync. The result of
-    /// a deferred convert is **not** safe to read on the CPU (or map via CUDA)
-    /// until `flush` returns.
+    /// and skips the per-tile `glFinish`; `flush` then issues a single GPU
+    /// sync. The result of a deferred convert is not safe to read on the CPU
+    /// (or map via CUDA) until `flush` returns.
     ///
-    /// The default implementation is eager — it simply calls
-    /// [`convert`](Self::convert), so CPU/G2D and any backend without a deferred
-    /// fast path remain correct (each call completes synchronously and `flush`
-    /// is a no-op).
+    /// The default implementation calls [`convert`](Self::convert): each call
+    /// completes synchronously and `flush` is a no-op.
     fn convert_deferred(
         &mut self,
         src: &TensorDyn,
@@ -1151,7 +1040,7 @@ pub trait ImageProcessorTrait {
     ///
     /// After this returns, every deferred destination is finished and safe to
     /// read back or `cuda_map`. Backends with no deferred path (the default)
-    /// return `Ok(())` immediately, since their converts already completed.
+    /// return `Ok(())` immediately.
     fn flush(&mut self) -> Result<()> {
         Ok(())
     }
@@ -1160,8 +1049,7 @@ pub trait ImageProcessorTrait {
 /// Configuration for [`ImageProcessor`] construction.
 ///
 /// Use with [`ImageProcessor::with_config`] to override the default EGL
-/// display auto-detection and backend selection. The default configuration
-/// preserves the existing auto-detection behaviour.
+/// display auto-detection and backend selection.
 #[derive(Debug, Clone, Default)]
 pub struct ImageProcessorConfig {
     /// Force OpenGL to use this EGL display type instead of auto-detecting.
@@ -1189,14 +1077,15 @@ pub struct ImageProcessorConfig {
     /// Preferred compute backend.
     ///
     /// When set to a specific backend (not [`ComputeBackend::Auto`]), the
-    /// processor initializes that backend with no fallback — returns an error if the conversion is not supported.
-    /// This takes precedence over `EDGEFIRST_FORCE_BACKEND` and the
-    /// `EDGEFIRST_DISABLE_*` environment variables.
+    /// processor initializes that backend with no fallback and returns an
+    /// error if the conversion is not supported. This takes precedence over
+    /// `EDGEFIRST_FORCE_BACKEND` and the `EDGEFIRST_DISABLE_*` environment
+    /// variables.
     ///
     /// - [`ComputeBackend::OpenGl`]: init OpenGL + CPU, skip G2D
     /// - [`ComputeBackend::G2d`]: init G2D + CPU, skip OpenGL
     /// - [`ComputeBackend::Cpu`]: init CPU only
-    /// - [`ComputeBackend::Auto`]: existing env-var-driven selection
+    /// - [`ComputeBackend::Auto`]: env-var-driven selection
     pub backend: ComputeBackend,
 
     /// Colorimetry/performance trade-off for `convert()` (see
@@ -1222,20 +1111,14 @@ pub struct ImageProcessorConfig {
     /// egl_cache_capacity  >  EDGEFIRST_EGL_CACHE_CAPACITY  >  16
     /// ```
     ///
-    /// Config beats the environment deliberately, matching
-    /// [`backend`](Self::backend): an embedder that has measured its own
-    /// pool must not be silently overridden by a stray environment variable
-    /// in the deployment. `Some(0)` is rejected and falls through to the
-    /// environment, then the default, exactly as an unparseable env value
-    /// does.
+    /// `Some(0)` is rejected and falls through to the environment, then the
+    /// default, as an unparseable env value does.
     ///
     /// # This is a buffer *count*, not a size
     ///
-    /// A cached import pins its buffer — the underlying dma-buf or IOSurface
-    /// cannot be freed while an entry names it (that is what makes the cache
-    /// correct as well as fast; see the "EGL image cache inside HAL" section
-    /// of `ARCHITECTURE.md`). So the memory this holds depends entirely on
-    /// how big the caller's buffers are:
+    /// A cached import pins its buffer: the underlying dma-buf or IOSurface
+    /// cannot be freed while an entry names it. The memory held depends on
+    /// the size of the caller's buffers:
     ///
     /// ```text
     /// worst-case pinned bytes                                (upper bound)
@@ -1246,29 +1129,15 @@ pub struct ImageProcessorConfig {
     /// capacity 16, 4K NV12      (12.4 MB)  ->  597 MB per processor
     /// ```
     ///
-    /// A ceiling rather than an exact total: the source and NV R8 caches
-    /// often hold two imports of the *same* buffer, and two entries naming
-    /// one buffer pin it once. The per-cache figure is the exact one.
+    /// This is an upper bound: two entries naming one buffer pin it once.
     ///
-    /// The bound is **per [`ImageProcessor`], times three caches** (source,
-    /// destination, and the NV R8 source cache) — not per process and not
-    /// per library. Two `ImageProcessor`s in one process have six
-    /// independent caches and six independent capacities. A fourth cache,
-    /// the chroma-plane views of hardware-filtered NV resizes, has the same
-    /// capacity but imports only buffers the NV R8 cache also holds, so it
-    /// adds entries without pinning more memory.
+    /// The bound is per [`ImageProcessor`], times three caches (source,
+    /// destination, and the NV R8 source cache). A fourth cache, the
+    /// chroma-plane views of hardware-filtered NV resizes, has the same
+    /// capacity but imports only buffers the NV R8 cache also holds.
     ///
-    /// Whether the worst case is ever approached is up to the caller. A
-    /// pooled producer — V4L2 capture, typically 4–8 buffers over one or two
-    /// sizes — settles at its pool size and never nears the bound. A stream
-    /// that allocates a fresh buffer per frame holds the last `capacity` of
-    /// them outright, which is the difference between "16 is free" and "16
-    /// is 597 MB".
-    ///
-    /// Size it from measurement rather than guesswork:
-    /// [`CacheStats::peak_entries`] reports the working set actually
-    /// reached, and [`CacheStats::evictions`] tells you when the bound is
-    /// costing you re-imports (it should be zero in a steady state).
+    /// [`CacheStats::peak_entries`] reports the working set reached, and
+    /// [`CacheStats::evictions`] the entries the bound evicted.
     ///
     /// Ignored when the OpenGL backend is not in use.
     pub egl_cache_capacity: Option<usize>,
@@ -1277,13 +1146,10 @@ pub struct ImageProcessorConfig {
 /// How `convert()` trades colorimetric exactness against speed on platforms
 /// where the exact path is expensive.
 ///
-/// Today this affects one decision: NV12 sources on Vivante GC7000UL
-/// (i.MX 8M Plus), where the hardware external sampler converts ~12× faster
-/// than the colorimetry-exact in-shader matrix (2.5 ms vs 29 ms at 720p)
-/// but applies the driver's fixed BT.601-limited matrix regardless of the
-/// source's tagged colorimetry. Platforms where the exact path is already
-/// the fastest correct path (Mali, V3D, Tegra, ANGLE) behave identically in
-/// both modes.
+/// This affects NV12 sources on Vivante GC7000UL (i.MX 8M Plus), where the
+/// hardware external sampler applies the driver's fixed BT.601-limited
+/// matrix regardless of the source's tagged colorimetry. Other platforms
+/// (Mali, V3D, Tegra, ANGLE) behave identically in both modes.
 ///
 /// Override at runtime with `EDGEFIRST_COLORIMETRY=fast|exact` (takes
 /// precedence over the config field), or per-source by forcing a path with
@@ -1291,8 +1157,8 @@ pub struct ImageProcessorConfig {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ColorimetryMode {
     /// Prefer the fastest path whose output is correct-enough video RGB
-    /// (default; issue #106 policy). On Vivante, NV12 takes the hardware
-    /// sampler even when the source is not BT.601-limited.
+    /// (default). On Vivante, NV12 takes the hardware sampler even when the
+    /// source is not BT.601-limited.
     #[default]
     Fast,
     /// Prefer bit-exact colorimetry everywhere: the fast path is used only
@@ -1301,8 +1167,7 @@ pub enum ColorimetryMode {
 }
 
 /// `mode` if the backends run it, else [`Interpolation::supported`] with a
-/// warning logged once per mode: bicubic and area describe reference
-/// pipelines this crate does not implement.
+/// warning logged once per mode.
 pub(crate) fn runnable_interpolation(mode: Interpolation) -> Interpolation {
     let run = mode.supported();
     if run != mode && warn_first_fallback(mode) {
@@ -1349,7 +1214,7 @@ edgefirst_tensor::ef_vocabulary! {
     /// Use with [`ImageProcessorConfig::backend`] to select which backend the
     /// processor should prefer. When a specific backend is selected, the
     /// processor initializes that backend plus CPU as a fallback. When `Auto`
-    /// is used, the existing environment-variable-driven selection applies.
+    /// is used, the environment-variable-driven selection applies.
     ///
     /// The code is the one the C `EF_COMPUTE_BACKEND_*` enumerators use.
     #[derive(Default)]
@@ -1381,9 +1246,8 @@ pub(crate) enum ForcedBackend {
 }
 
 /// The CPU fallback's error, carrying the GPU decline reasons when the CPU
-/// was refused for access: the decline is what the caller has to fix.
-/// `declined` pairs each declining backend's name with its error, formatted
-/// only here so a frame the fallback serves pays for no message.
+/// was refused for access. `declined` pairs each declining backend's name
+/// with its error.
 fn with_gpu_declines(e: Error, declined: Vec<(&'static str, Error)>) -> Error {
     match e {
         Error::Tensor(denied @ edgefirst_tensor::Error::CpuAccessDenied { .. })
@@ -1437,25 +1301,20 @@ fn predicted_cpu_access(
 /// Returned by [`ImageProcessor::supported_render_dtypes`]; the two flags
 /// are independent.
 ///
-/// **Linux:** reflects the real probe results from `GL_EXT_color_buffer_half_float`
-/// and `GL_EXT_color_buffer_float`. On V3D (RPi 5) and Mali-G310 (i.MX 95)
-/// both flags are typically `true`; on Vivante GC7000UL both are forced
-/// `false` (float readback measured 170–320 ms — disabled). Tegra Orin
-/// exposes both via PBO; the flags match the GPU report.
+/// **Linux:** reflects the probe results from `GL_EXT_color_buffer_half_float`
+/// and `GL_EXT_color_buffer_float`. On Vivante GC7000UL both are forced
+/// `false`.
 ///
 /// **macOS (ANGLE):** `f16 == true` gates the RGBA16F-packed IOSurface
-/// path for F16 `PlanarRgb` destinations. `f32` reflects the GL
-/// extension probe but is not actionable — ANGLE's
-/// `EGL_ANGLE_iosurface_client_buffer` rejects every `(GL_FLOAT, *)`
-/// combination with `EGL_BAD_ATTRIBUTE`, so there is no F32 IOSurface
-/// path.
+/// path for F16 `PlanarRgb` destinations. `f32` reflects the GL extension
+/// probe; there is no F32 IOSurface path.
 ///
 /// **Windows (ANGLE/D3D11):** `f16` enables the RGBA16F texture paths and
-/// `f32` the RGBA32F ones for every float layout (`float_dispatch.rs`) —
-/// `PlanarRgb` and `PlanarRgba` NCHW, interleaved `Rgb`, and `Rgba`.
+/// `f32` the RGBA32F ones for every float layout: `PlanarRgb` and
+/// `PlanarRgba` NCHW, interleaved `Rgb`, and `Rgba`.
 ///
-/// Regardless of these flags, [`ImageProcessor::convert`] never returns
-/// an error due to float capability — it falls back to CPU when the GPU
+/// Regardless of these flags, [`ImageProcessor::convert`] does not return
+/// an error due to float capability: it falls back to CPU when the GPU
 /// path is unavailable.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RenderDtypeSupport {
@@ -1479,17 +1338,7 @@ pub struct RenderDtypeSupport {
 /// Returns `true` when a float PBO destination should be attempted for `dtype`.
 ///
 /// Only F16 and F32 are eligible, and only when the corresponding flag in
-/// `support` is set. U8/I8 and all other dtypes return `false` — they are
-/// handled by the existing `dtype.size() == 1` PBO gate.
-///
-/// The same question `create_image` asks before trying a zero-copy float
-/// destination, which is why that gate calls this rather than restating it:
-/// a float image is only worth allocating on the GPU where the display can
-/// render into that dtype at all.
-///
-/// Compiled on every platform with a GL backend -- the name is historical
-/// (it began as the float *PBO* gate) and both callers are live everywhere
-/// the `opengl` feature builds a backend.
+/// `support` is set. All other dtypes return `false`.
 #[cfg(all(
     any(
         target_os = "linux",
@@ -1534,23 +1383,17 @@ pub struct ImageProcessor {
         target_os = "windows"
     ))]
     #[cfg(feature = "opengl")]
-    /// OpenGL-based image converter — the same unified
-    /// `GLProcessorThreaded` engine as Linux (its worker owns a
-    /// per-processor context). macOS/iOS run it via ANGLE + IOSurface
-    /// (available when ANGLE's libEGL.dylib can be loaded — see
-    /// README.md § macOS GPU Acceleration); Android runs it via the
-    /// native EGL driver + AHardwareBuffer; Windows runs it via ANGLE +
-    /// Direct3D 11 with PBO transfers (available when ANGLE's libEGL.dll
-    /// can be loaded — see README.md § Windows GPU Acceleration).
+    /// OpenGL-based image converter. macOS/iOS run it via ANGLE + IOSurface
+    /// (available when ANGLE's libEGL.dylib can be loaded), Android via the
+    /// native EGL driver + AHardwareBuffer, Windows via ANGLE + Direct3D 11
+    /// (available when ANGLE's libEGL.dll can be loaded).
     pub opengl: Option<GLProcessorThreaded>,
 
     /// When set, only the specified backend is used — no fallback chain.
     pub(crate) forced_backend: Option<ForcedBackend>,
 
     /// Converts where the GL backend declined and the auto chain fell
-    /// through toward G2D/CPU. Owned by the dispatcher (the GL worker never
-    /// sees these frames), unlike the per-feed counters in
-    /// `GLProcessorThreaded::convert_stats`. Read via
+    /// through toward G2D/CPU. Read via
     /// [`convert_fallback_count`](Self::convert_fallback_count).
     pub(crate) convert_fallbacks: std::sync::atomic::AtomicU64,
 
@@ -1595,33 +1438,23 @@ impl ImageProcessor {
     }
 
     /// Number of converts where the auto chain's GL backend declined and the
-    /// frame fell through toward G2D/CPU — each one silently lost any
-    /// zero-copy guarantee. A pipeline that expects to stay on the GPU
-    /// asserts this stays flat across its steady-state loop; pair with
-    /// `GLProcessorThreaded::convert_stats` to see how the frames that DID
-    /// reach GL were fed. Always 0 under a forced backend (no chain).
+    /// frame fell through toward G2D/CPU. Always 0 under a forced backend.
     pub fn convert_fallback_count(&self) -> u64 {
         self.convert_fallbacks
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Number of [`Compression::Any`](edgefirst_tensor::Compression)
-    /// requests since process start that resolved to a linear layout
-    /// (process-wide mirror of
-    /// [`edgefirst_tensor::compression_fallback_count`], surfaced here
-    /// beside [`convert_fallback_count`](Self::convert_fallback_count)
-    /// so pipeline telemetry reads from one place). A pipeline that
-    /// expects compressed convert destinations asserts this stays flat
-    /// after warmup.
+    /// requests since process start that resolved to a linear layout: the
+    /// process-wide [`edgefirst_tensor::compression_fallback_count`].
     pub fn compression_fallback_count(&self) -> u64 {
         edgefirst_tensor::compression_fallback_count()
     }
 
     /// Convert and return a native fence that signals when the GPU work
-    /// completes, instead of blocking the CPU — the GL→NPU handoff
-    /// (`EGL_ANDROID_native_fence_sync` on Android). On Windows the handle
-    /// is a manual-reset event set when the GPU work completes; wait on it
-    /// with `WaitForSingleObject`.
+    /// completes, without blocking the CPU (`EGL_ANDROID_native_fence_sync`
+    /// on Android). On Windows the handle is a manual-reset event set when
+    /// the GPU work completes; wait on it with `WaitForSingleObject`.
     ///
     /// `Ok(Some(fence))`: the destination buffer is still in flight; hand
     /// the fence to the consumer (e.g.
@@ -1633,12 +1466,10 @@ impl ImageProcessor {
     /// identical to [`convert`](ImageProcessorTrait::convert), including
     /// the GL→G2D→CPU fallback chain.
     ///
-    /// On Windows, **for a texture destination**, the event and the
-    /// destination's own `Tensor::gpu_completion` name the same fence value:
-    /// one flush and one signal cover the convert, and the value recorded on
-    /// `dst` is the one this event waits for, so a consumer may use either.
-    /// A destination that is not a texture records nothing, and the event
-    /// then carries a value of its own that only it can be waited on for.
+    /// On Windows, for a texture destination, the event and the destination's
+    /// own `Tensor::gpu_completion` name the same fence value, and a consumer
+    /// may use either. A destination that is not a texture records nothing,
+    /// and only the event can be waited on.
     pub fn convert_with_fence(
         &mut self,
         src: &TensorDyn,
@@ -1662,9 +1493,7 @@ impl ImageProcessor {
                         Ok(fd) => return Ok(fd),
                         Err(e) if gl_forced => return Err(e),
                         Err(e) => {
-                            // Not counted here: the blocking chain below
-                            // re-runs the dispatcher, whose decline arm
-                            // counts the fallback exactly once.
+                            // The blocking chain below counts the fallback.
                             log::debug!(
                                 "convert_with_fence: opengl declined, \
                                  falling back to the blocking chain: {e}"
@@ -1676,19 +1505,16 @@ impl ImageProcessor {
                 }
             }
         }
-        // Blocking chain (G2D/CPU, forced non-GL, or non-GL builds):
-        // completion == return, so no fence is needed.
+        // Blocking chain: G2D/CPU, forced non-GL, or non-GL builds.
         self.convert(src, dst, Some(options))?;
         Ok(None)
     }
 
     /// Report which float dtypes the GPU can render to.
     ///
-    /// Probes `GL_EXT_color_buffer_half_float` and
-    /// `GL_EXT_color_buffer_float` once at `ImageProcessor::new()` time
-    /// and caches the result. Call this once at startup to decide whether
-    /// to request F16 or F32 destination tensors; [`create_image`] uses
-    /// the result internally to auto-select float PBO when supported.
+    /// `GL_EXT_color_buffer_half_float` and `GL_EXT_color_buffer_float` are
+    /// probed once at `ImageProcessor::new()` time and the result is cached.
+    /// [`create_image`] uses it to select a float PBO when supported.
     ///
     /// Returns `RenderDtypeSupport { f32: false, f16: false }` when no
     /// OpenGL backend is active or the `opengl` feature is disabled.
@@ -1723,8 +1549,8 @@ impl ImageProcessor {
     /// environment variables are ignored and the processor initializes the
     /// requested backend plus CPU as a fallback.
     ///
-    /// When `Auto`, the existing `EDGEFIRST_FORCE_BACKEND` and
-    /// `EDGEFIRST_DISABLE_*` environment variables apply.
+    /// When `Auto`, the `EDGEFIRST_FORCE_BACKEND` and `EDGEFIRST_DISABLE_*`
+    /// environment variables apply.
     pub fn with_config(config: ImageProcessorConfig) -> Result<Self> {
         let interpolation = config.interpolation;
         let mut processor = Self::with_config_backends(config)?;
@@ -1737,8 +1563,7 @@ impl ImageProcessor {
     #[allow(unused_variables)]
     fn with_config_backends(config: ImageProcessorConfig) -> Result<Self> {
         // ── Config-driven backend selection ──────────────────────────
-        // When the caller explicitly requests a backend via the config,
-        // skip all environment variable logic.
+        // An explicit backend in the config skips the environment variables.
         match config.backend {
             ComputeBackend::Cpu => {
                 log::info!("ComputeBackend::Cpu — CPU only");
@@ -2116,7 +1941,7 @@ impl ImageProcessor {
             };
         }
 
-        // ── Existing DISABLE logic (unchanged) ──────────────────────
+        // ── EDGEFIRST_DISABLE_* ─────────────────────────────────────
         #[cfg(target_os = "linux")]
         let g2d = if std::env::var("EDGEFIRST_DISABLE_G2D")
             .map(|x| x != "0" && x.to_lowercase() != "false")
@@ -2220,9 +2045,8 @@ impl ImageProcessor {
         .apply_colorimetry_mode(config.colorimetry))
     }
 
-    /// Apply the configured [`ColorimetryMode`] to whichever backend honours
-    /// it (currently the Linux GL backend); no-op elsewhere. Constructor
-    /// plumbing for [`ImageProcessorConfig::colorimetry`].
+    /// Applies the configured [`ColorimetryMode`] to the backend that honours
+    /// it (the Linux GL backend); no-op elsewhere.
     fn apply_colorimetry_mode(self, _mode: ColorimetryMode) -> Self {
         #[cfg(all(
             any(
@@ -2258,9 +2082,9 @@ impl ImageProcessor {
     }
 
     /// Sets the colorimetry/performance trade-off (see [`ColorimetryMode`])
-    /// on the OpenGL backend. No-op if OpenGL is not available. The
-    /// `EDGEFIRST_COLORIMETRY` environment variable takes precedence — when
-    /// it is set, this call logs and keeps the env-selected mode.
+    /// on the OpenGL backend. No-op if OpenGL is not available. When the
+    /// `EDGEFIRST_COLORIMETRY` environment variable is set, this call logs
+    /// and keeps the env-selected mode.
     #[cfg(all(
         any(
             target_os = "linux",
@@ -2422,21 +2246,18 @@ impl ImageProcessor {
     }
 
     /// Allocate an image tensor from a declarative
-    /// [`ImageDesc`](edgefirst_tensor::ImageDesc) request — the
-    /// full-featured variant of [`create_image`](Self::create_image).
+    /// [`ImageDesc`](edgefirst_tensor::ImageDesc) request.
     ///
-    /// Without a compression or contiguous request this is exactly
-    /// `create_image` (the processor's memory negotiation applies). With
-    /// one, the allocation rides the tensor desc path un-negotiated: the
-    /// layout decision belongs to the platform allocator, and the request's
-    /// guards and fallback counting live there (see
-    /// [`Tensor::image_desc`](edgefirst_tensor::Tensor::image_desc)). A
-    /// contiguous request is a CMA DMA-BUF at the same 64-byte GPU pitch
-    /// `create_image` uses, or an error; it never falls back to a PBO or
-    /// host memory. Its CPU access gets the same widening as `create_image`;
-    /// a compression request's `CpuAccess::None` does not.
+    /// Without a compression or contiguous request this is
+    /// [`create_image`](Self::create_image). With one, the allocation goes
+    /// through [`Tensor::image_desc`](edgefirst_tensor::Tensor::image_desc)
+    /// without the processor's memory negotiation. A contiguous request is a
+    /// CMA DMA-BUF at the same 64-byte GPU pitch `create_image` uses, or an
+    /// error; it never falls back to a PBO or host memory. Its CPU access gets
+    /// the same widening as `create_image`; a compression request's
+    /// `CpuAccess::None` does not.
     pub fn create_image_desc(&self, desc: &edgefirst_tensor::ImageDesc) -> Result<TensorDyn> {
-        // Tile compression requires `CpuAccess::None`, so it gets no widening.
+        // A compression request is allocated without widening.
         if desc.compression().is_some() {
             return Ok(TensorDyn::image_desc(desc)?);
         }
@@ -2464,24 +2285,12 @@ impl ImageProcessor {
     ///
     /// Priority: DMA-buf → float PBO (F16/F32) → u8/i8 PBO → system memory.
     ///
-    /// Use this method instead of [`TensorDyn::image()`] when the tensor will
-    /// be used with [`ImageProcessor::convert()`]. It selects the optimal
-    /// memory backing (including PBO for GPU zero-copy) which direct
-    /// allocation cannot achieve.
-    ///
-    /// This method is on [`ImageProcessor`] rather than [`ImageProcessorTrait`]
-    /// because optimal allocation requires knowledge of the active compute
-    /// backends (e.g. the GL context handle for PBO allocation). Individual
-    /// backend implementations ([`CPUProcessor`], etc.) do not have this
-    /// cross-backend visibility.
-    ///
     /// **Float dtype behaviour:** when `dtype` is `F16` or `F32` and
     /// [`supported_render_dtypes`] reports the GPU supports that type,
-    /// `memory: None` auto-selects a float PBO (Linux) or IOSurface (macOS
-    /// F16 only). If GPU float support is absent the allocation falls through
-    /// to `TensorMemory::Mem`; [`convert`] then uses the CPU path.
-    /// Passing `memory: Some(TensorMemory::DmaBuf)` with `dtype: F32` always
-    /// returns `Error::NotSupported` — no 32-bit-float DRM fourcc exists.
+    /// `memory: None` selects a float PBO (Linux) or IOSurface (macOS, F16
+    /// only). Without GPU float support the allocation is `TensorMemory::Mem`
+    /// and [`convert`] uses the CPU path. `memory: Some(TensorMemory::DmaBuf)`
+    /// with `dtype: F32` returns `Error::NotSupported`.
     ///
     /// [`supported_render_dtypes`]: Self::supported_render_dtypes
     /// [`convert`]: ImageProcessorTrait::convert
@@ -2494,39 +2303,32 @@ impl ImageProcessor {
     /// * `dtype` - Element data type (e.g. `DType::U8`, `DType::F16`, `DType::F32`)
     /// * `memory` - Optional memory type override; when `None`, the best
     ///   available backend is selected automatically.
-    /// * `access` - Declares the CPU access you plan on (`ReadWrite` is the
-    ///   natural choice). Use [`CpuAccess::None`](edgefirst_tensor::CpuAccess)
-    ///   for a destination that only hardware reads (an NPU input).
-    ///   Hardware access is always implied. What this processor's own
-    ///   convert may do to the image as a destination on the CPU is added
-    ///   to the declaration so that convert succeeds: `Write` when it may
-    ///   fill the whole destination on the CPU (the CPU backend, host
+    /// * `access` - The CPU access the caller plans on. Use
+    ///   [`CpuAccess::None`](edgefirst_tensor::CpuAccess) for a destination
+    ///   that only hardware reads (an NPU input). Hardware access is always
+    ///   implied. The access this processor's own convert may need on the
+    ///   image as a destination is added to the declaration: `Write` when it
+    ///   may fill the whole destination on the CPU (the CPU backend, host
     ///   memory, a format or float dtype the GPU path does not render),
     ///   `ReadWrite` when a pass reads back what was written or writes only
     ///   part of the buffer (an `I8` destination through the CPU or G2D, a
     ///   `Bgra` destination through the CPU, a G2D `Rgb` letterbox border).
     ///   The returned tensor's [`cpu_access`](edgefirst_tensor::TensorDyn::cpu_access)
-    ///   may therefore be wider than `access`. Any other CPU map beyond the
-    ///   declaration fails with
-    ///   [`CpuAccessDenied`](edgefirst_tensor::Error::CpuAccessDenied).
-    ///   The widening covers the destination role of convert only: a
-    ///   tensor later used as a convert source needs `Read` declared by the
-    ///   caller, and a CPU mask draw blends into its destination and needs
-    ///   `ReadWrite`, so declare it when the CPU may draw. A destination
+    ///   may be wider than `access`. Any other CPU map beyond the declaration
+    ///   fails with [`CpuAccessDenied`](edgefirst_tensor::Error::CpuAccessDenied).
+    ///   The widening covers the destination role of convert only: a tensor
+    ///   used as a convert source needs `Read` declared by the caller, a CPU
+    ///   mask draw needs `ReadWrite` on its destination, and a destination
     ///   written through views (a batch) needs `ReadWrite` for a CPU convert,
     ///   which [`alloc_tile_batch`](Self::alloc_tile_batch) predicts. A
-    ///   destination left without CPU access (`None` on a GPU-rendered
-    ///   format) is written only by the GPU, so a convert into it needs the
-    ///   GPU to accept the source as well; when it declines, the CPU fallback
-    ///   is refused with [`Error::CpuFallbackDenied`] carrying the GPU's
-    ///   reason. A PBO destination is always `ReadWrite`: the GL readback
-    ///   maps it on the CPU itself, and a narrower declaration would buy no
-    ///   cheaper mapping.
+    ///   destination without CPU access (`None` on a GPU-rendered format) is
+    ///   written only by the GPU; when the GPU declines a convert into it,
+    ///   the CPU fallback is refused with [`Error::CpuFallbackDenied`]
+    ///   carrying the GPU's reason. A PBO destination is always `ReadWrite`.
     ///
     /// # Returns
     ///
-    /// A [`TensorDyn`] backed by the highest-performance memory type
-    /// available on this system.
+    /// A [`TensorDyn`] image in the selected memory type.
     ///
     /// # Examples
     ///
@@ -2547,9 +2349,7 @@ impl ImageProcessor {
     ///
     /// A display canvas the GPU renders and a Wayland compositor shows
     /// (linux-dmabuf), with a CPU-written overlay. Neither is read by the
-    /// CPU, so on Linux both come from uncached CMA where available: the
-    /// compositor's per-frame mapping of the canvas then costs no cache
-    /// maintenance.
+    /// CPU; on Linux both come from uncached CMA where available.
     ///
     /// ```rust,no_run
     /// # use edgefirst_image::{ImageProcessor, ImageProcessorTrait, MaskOverlay};
@@ -2583,40 +2383,26 @@ impl ImageProcessor {
     /// ```
     ///
     /// The returned image's [`cpu_access`](TensorDyn::cpu_access) may be
-    /// wider than `access` when this processor's own convert may need the
-    /// CPU on it (a CPU-only processor, or a format the GPU does not
-    /// render); a wider declaration selects cached memory.
+    /// wider than `access`; a wider declaration selects cached memory.
     ///
     /// # Pitch alignment for DMA-backed allocations
     ///
-    /// DMA-BUF imports into the GL backend (Mali Valhall on i.MX 95
-    /// specifically) require every row pitch to be a multiple of
-    /// [`GPU_DMA_BUF_PITCH_ALIGNMENT_BYTES`] (currently 64). When this
-    /// method lands on `TensorMemory::DmaBuf`, the underlying allocation is
-    /// silently padded so the row stride satisfies that requirement.
+    /// A `TensorMemory::DmaBuf` allocation is padded so every row pitch is a
+    /// multiple of [`GPU_DMA_BUF_PITCH_ALIGNMENT_BYTES`]. `tensor.width()`
+    /// returns the requested `width`; the padding is carried by
+    /// [`TensorDyn::row_stride`] / `effective_row_stride()`. Byte offsets are
+    /// computed from the stride, not `width × bytes_per_pixel`; the CPU
+    /// mapping spans `stride × height` bytes.
     ///
-    /// **The user-requested `width` is preserved** — `tensor.width()`
-    /// returns the same value you passed in. The padding is carried by
-    /// [`TensorDyn::row_stride`] / `effective_row_stride()`, which the
-    /// GL backend reads when importing the buffer as an EGLImage.
-    /// Callers that compute byte offsets from the tensor must use the
-    /// stride, not `width × bytes_per_pixel`; the CPU mapping spans the
-    /// full `stride × height` bytes.
+    /// A planar image pads each row of each plane: a plane is
+    /// `stride × height` bytes and the next plane starts there. A 672×512
+    /// `PlanarRgb` image has a 704-byte pitch and three 704×512 planes.
+    /// [`TensorDyn::copy_to_flat`] copies out the tight `[C, H, W]` bytes.
     ///
-    /// This holds for every layout. A planar image pads each row of each
-    /// plane, so a plane is `stride × height` bytes and the next plane
-    /// starts there, not at `width × height`: a 672×512 `PlanarRgb` image
-    /// has a 704-byte pitch and three 704×512 planes. A consumer that needs
-    /// the tight `[C, H, W]` bytes copies them out with
-    /// [`TensorDyn::copy_to_flat`].
+    /// Pre-aligned widths (640, 1280, 1920, 3008, 3840 …) allocate exactly
+    /// `width × bpp × height` bytes. PBO and Mem allocations are not padded.
     ///
-    /// Pre-aligned widths (640, 1280, 1920, 3008, 3840 …) allocate
-    /// exactly `width × bpp × height` bytes with no padding. PBO and
-    /// Mem fallbacks never pad — they don't go through EGLImage import.
-    ///
-    /// See also [`align_width_for_gpu_pitch`] for an advisory helper
-    /// that external callers (GStreamer plugins, video pipelines) can
-    /// use to size their own DMA-BUFs for GL compatibility.
+    /// See also [`align_width_for_gpu_pitch`].
     ///
     /// # Errors
     ///
@@ -2635,12 +2421,7 @@ impl ImageProcessor {
 
     /// A DMA image for [`create_image_with`](Self::create_image_with), its
     /// rows padded to the GPU pitch alignment when that exceeds the natural
-    /// pitch.
-    ///
-    /// Every layout is padded. Packed rows are padded here, through
-    /// `Tensor::image_with_stride`, which rejects the other layouts;
-    /// `Tensor::image` pads planar and semi-planar rows itself. Either way
-    /// the tensor's `row_stride()` reports the pitch.
+    /// pitch. The tensor's `row_stride()` reports the pitch.
     #[cfg(target_os = "linux")]
     fn create_dma_image(
         &self,
@@ -2678,8 +2459,8 @@ impl ImageProcessor {
     }
 
     /// A u8/i8 PBO image for [`create_image_with`](Self::create_image_with),
-    /// or `None` when the dtype is wider or there is no PBO to be had. A PBO
-    /// stays `ReadWrite`: the GL readback maps it itself.
+    /// or `None` when the dtype is wider or there is no PBO. The image is
+    /// `ReadWrite`.
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     #[cfg(feature = "opengl")]
     fn create_byte_pbo_image(
@@ -2700,21 +2481,17 @@ impl ImageProcessor {
         if dtype != DType::I8 {
             return Some(TensorDyn::from(t));
         }
-        // The int8 shader emulates i8 output via XOR 0x80 on the same u8 buffer.
-        // Invariant: PBO tensors never have chroma (create_pbo_image → Tensor::wrap sets it None).
         debug_assert!(
             t.chroma().is_none(),
             "PBO i8 transmute requires chroma == None"
         );
-        // SAFETY: Tensor<u8> and Tensor<i8> are layout-identical (same element
-        // size, no T-dependent drop glue); same rationale as
-        // gl::processor::tensor_i8_as_u8_mut.
+        // SAFETY: `Tensor<u8>` and `Tensor<i8>` are layout-identical.
         let t_i8: Tensor<i8> = unsafe { std::mem::transmute(t) };
         Some(TensorDyn::from(t_i8))
     }
 
     /// [`create_image`](Self::create_image), for a destination written
-    /// through views when `views` is set (see `producer_access`).
+    /// through views when `views` is set.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn create_image_with(
         &self,
@@ -2729,16 +2506,11 @@ impl ImageProcessor {
         #[cfg(target_os = "linux")]
         let try_dma = || self.create_dma_image(width, height, format, dtype, access, views);
 
-        // If an explicit memory type is requested, honour it directly.
-        // On Linux, `TensorMemory::DmaBuf` gets the padded-stride treatment;
-        // other memory types take the user-requested width verbatim.
-        // On macOS, `TensorMemory::DmaBuf` dispatches through `TensorDyn::image`
-        // which selects the IOSurface allocation path (FourCC-formatted)
-        // for image-mappable formats, or falls back to SHM/Mem otherwise.
+        // An explicit memory type is honoured directly. On Linux
+        // `TensorMemory::DmaBuf` gets a padded stride.
         match memory {
             #[cfg(target_os = "linux")]
             Some(TensorMemory::DmaBuf) => {
-                // F32 has no 32-bit-float DRM fourcc; callers must use PBO instead.
                 if dtype == DType::F32 {
                     return Err(Error::NotSupported(
                         "F32 has no 32-bit-float DRM format for DMA-BUF; \
@@ -2761,12 +2533,9 @@ impl ImageProcessor {
             None => {}
         }
 
-        // macOS/Android/Windows: when the GL backend is active, prefer Dma
-        // (IOSurface on Apple, AHardwareBuffer on Android, a D3D11 texture
-        // on Windows) for zero-copy import. Formats without a zero-copy
-        // mapping now ERROR under explicit Dma (the explicit-Dma
-        // contract), so auto-select catches that error here and falls
-        // back to host storage — loudly, via the debug log below.
+        // macOS, Android, Windows: with the GL backend active, tries a zero-copy
+        // allocation (IOSurface, AHardwareBuffer, D3D11 texture) and continues
+        // to host storage when it is declined.
         #[cfg(any(
             target_os = "macos",
             target_os = "ios",
@@ -2776,10 +2545,7 @@ impl ImageProcessor {
         #[cfg(feature = "opengl")]
         if let Some(gl) = self.opengl.as_ref() {
             let _ = gl;
-            // Float textures only where the display can render into them;
-            // otherwise the float PBO step below applies. The same question
-            // that step asks, asked through the same helper so the two
-            // cannot answer differently.
+            // Float textures only where the display can render into them.
             let support = self.supported_render_dtypes();
             let dtype_ok =
                 !matches!(dtype, DType::F16 | DType::F32) || float_pbo_eligible(dtype, support);
@@ -2794,9 +2560,6 @@ impl ImageProcessor {
                 ) {
                     Ok(img) => return Ok(img),
                     Err(e) => {
-                        // Falling back to a non-zero-copy destination is a real
-                        // perf cliff — never do it silently (on-device triage
-                        // starts from this line).
                         log::debug!(
                             "create_image: zero-copy Dma allocation declined \
                              ({format:?}/{dtype:?} {width}x{height}): {e:?}; using fallback storage"
@@ -2806,8 +2569,7 @@ impl ImageProcessor {
             }
         }
 
-        // Try DMA first on Linux — skip only when GL has explicitly selected PBO
-        // as the preferred transfer path (PBO is better than DMA in that case).
+        // Linux: tries DMA first unless GL selected PBO as its transfer path.
         #[cfg(target_os = "linux")]
         {
             #[cfg(feature = "opengl")]
@@ -2831,8 +2593,7 @@ impl ImageProcessor {
             return Ok(img);
         }
 
-        // Try float PBO when the GPU backend reports support for this dtype.
-        // Falls through to Mem on error (same policy as u8 PBO above).
+        // Tries a float PBO when the GPU backend reports support for this dtype.
         #[cfg(any(target_os = "linux", target_os = "windows"))]
         #[cfg(feature = "opengl")]
         if float_pbo_eligible(dtype, self.supported_render_dtypes()) {
@@ -2863,13 +2624,12 @@ impl ImageProcessor {
     /// Import an external DMA-BUF image.
     ///
     /// Each [`PlaneDescriptor`] owns an already-duped fd; this method
-    /// consumes the descriptors and takes ownership of those fds (whether
-    /// the call succeeds or fails).
+    /// consumes the descriptors and takes ownership of those fds whether
+    /// the call succeeds or fails.
     ///
     /// The caller must ensure the DMA-BUF allocation is large enough for the
     /// specified width, height, format, and any stride/offset on the plane
-    /// descriptors. No buffer-size validation is performed; an undersized
-    /// buffer may cause GPU faults or EGL import failure.
+    /// descriptors. No buffer-size validation is performed.
     ///
     /// # Arguments
     ///
@@ -2888,8 +2648,7 @@ impl ImageProcessor {
     /// # Errors
     ///
     /// * [`Error::NotSupported`] if `chroma` is `Some` for a non-semi-planar
-    ///   format, or multiplane NV16 (not yet supported), or the fd is not
-    ///   DMA-backed
+    ///   format or for NV16, or the fd is not DMA-backed
     /// * [`Error::InvalidShape`] if NV12 height is odd
     ///
     /// # Platform
@@ -2911,8 +2670,6 @@ impl ImageProcessor {
     /// let src = proc.import_image(y_pd, Some(uv_pd), 1920, 1080,
     ///                             PixelFormat::Nv12, DType::U8, None)?;
     /// ```
-    // Import inherently needs plane(s) + geometry + format + dtype + colorimetry;
-    // a params struct would obscure more than it clarifies here.
     #[allow(clippy::too_many_arguments)]
     #[cfg(target_os = "linux")]
     pub fn import_image(
@@ -2927,7 +2684,7 @@ impl ImageProcessor {
     ) -> Result<TensorDyn> {
         use edgefirst_tensor::{Tensor, TensorMemory};
 
-        // Capture stride/offset from descriptors before consuming them
+        // Reads stride and offset from the descriptors before they are consumed.
         let image_stride = image.stride();
         let image_offset = image.offset();
         let chroma_stride = chroma.as_ref().and_then(|c| c.stride());
@@ -2935,9 +2692,8 @@ impl ImageProcessor {
 
         if let Some(chroma_pd) = chroma {
             // ── Multiplane path ──────────────────────────────────────
-            // Multiplane tensors are backed by Tensor<u8> (or transmuted to
-            // Tensor<i8>). Reject other dtypes to avoid silently returning a
-            // tensor with the wrong element type.
+            // Multiplane tensors are `Tensor<u8>` or `Tensor<i8>`; other dtypes
+            // are rejected.
             if dtype != DType::U8 && dtype != DType::I8 {
                 return Err(Error::NotSupported(format!(
                     "multiplane import only supports U8/I8, got {dtype:?}"
@@ -2951,11 +2707,9 @@ impl ImageProcessor {
 
             let chroma_h = match format {
                 PixelFormat::Nv12 => {
-                    // NV12 (4:2:0): ceil(H/2) chroma rows — odd heights are valid.
+                    // NV12 (4:2:0): ceil(H/2) chroma rows.
                     height.div_ceil(2)
                 }
-                // NV16 multiplane will be supported in a future release;
-                // the GL backend currently only handles NV12 plane1 attributes.
                 PixelFormat::Nv16 => {
                     return Err(Error::NotSupported(
                         "multiplane NV16 is not yet supported; use contiguous NV16 instead".into(),
@@ -2985,9 +2739,7 @@ impl ImageProcessor {
                 )));
             }
 
-            // Geometry on the chroma plane must be set before from_planes
-            // consumes it: the combined handle answers chroma() from the
-            // library, and there is no chroma_mut() on the dynamic lens.
+            // Sets the chroma plane's geometry before `from_planes` consumes it.
             if let Some(s) = chroma_stride {
                 if s < width {
                     return Err(Error::InvalidShape(format!(
@@ -3000,8 +2752,7 @@ impl ImageProcessor {
                 chroma_tensor.set_plane_offset(o);
             }
 
-            // from_planes creates the combined tensor with format set,
-            // preserving luma's row_stride (currently None since luma was raw).
+            // `from_planes` creates the combined tensor with the format set.
             let mut tensor = Tensor::<u8>::from_planes(luma, chroma_tensor, format)?;
 
             // Apply stride/offset to the combined tensor (luma plane)
@@ -3013,9 +2764,8 @@ impl ImageProcessor {
             }
 
             if dtype == DType::I8 {
-                // SAFETY: Tensor<u8> and Tensor<i8> have identical layout because
-                // the struct contains only type-erased storage (OwnedFd, shape, name),
-                // no inline T values. This assertion catches layout drift at compile time.
+                // SAFETY: `Tensor<u8>` and `Tensor<i8>` have identical layout; the
+                // assertion checks their size and alignment at compile time.
                 const {
                     assert!(std::mem::size_of::<Tensor<u8>>() == std::mem::size_of::<Tensor<i8>>());
                     assert!(
@@ -3032,9 +2782,8 @@ impl ImageProcessor {
             Ok(dyn_tensor)
         } else {
             // ── Single-plane path ────────────────────────────────────
-            // Canonical shape (Packed [H,W,C] / Planar [C,H,W] / SemiPlanar
-            // [total_h, W]); `allocation_shape` supports NV12/NV16/NV24 (the old
-            // hand-rolled match erroneously rejected NV24).
+            // Canonical shape: Packed [H,W,C], Planar [C,H,W], SemiPlanar
+            // [total_h, W].
             let shape = format.allocation_shape(width, height).ok_or_else(|| {
                 Error::NotSupported(format!(
                     "unsupported pixel format for import_image: {format:?}"
@@ -3062,15 +2811,13 @@ impl ImageProcessor {
     /// Decode model outputs and draw segmentation masks onto `dst`.
     ///
     /// The processor decodes via the provided
-    /// [`Decoder`](edgefirst_decoder::Decoder), selects the optimal rendering
-    /// path (hybrid CPU+GL or fused GPU), and composites masks onto `dst`.
+    /// [`Decoder`](edgefirst_decoder::Decoder), selects the rendering path
+    /// (hybrid CPU+GL or fused GPU), and composites masks onto `dst`.
     ///
     /// Returns the detected bounding boxes.
     ///
-    /// **Requires the `decode` feature**, which is off by default because it
-    /// is the only thing in this crate that needs `edgefirst-decoder`. This
-    /// method sequences a decode and a draw; both halves are available
-    /// unconditionally and are equally fused, so without the feature write:
+    /// **Requires the `decode` feature**, which is off by default. Without
+    /// the feature, sequence the decode and the draw:
     ///
     /// ```ignore
     /// let mut boxes = Vec::new();
@@ -3093,7 +2840,7 @@ impl ImageProcessor {
     ) -> Result<Vec<DetectBox>> {
         let mut output_boxes = Vec::with_capacity(100);
 
-        // Try proto path first (fused rendering without materializing masks)
+        // Tries the proto path first.
         let proto_result = decoder
             .decode_proto(outputs, &mut output_boxes)
             .map_err(|e| Error::Internal(format!("decode_proto: {e:#?}")))?;
@@ -3144,9 +2891,8 @@ impl ImageProcessor {
         if let Some(proto_data) = proto_result {
             self.draw_proto_masks(dst, &output_boxes, &proto_data, overlay)?;
         } else {
-            // Note: decode_proto_tracked returns None for detection-only/ModelPack
-            // models WITHOUT calling the tracker. The else branch below is the
-            // first (and only) tracker call for those model types.
+            // `decode_proto_tracked` returns `None` for detection-only and
+            // ModelPack models without calling the tracker; this branch calls it.
             let mut output_masks = Vec::with_capacity(100);
             decoder
                 .decode_tracked(
@@ -3168,20 +2914,10 @@ impl ImageProcessor {
     /// Computes `mask_coeff @ protos` with sigmoid activation for each detection,
     /// producing compact masks at prototype resolution (e.g., 160×160 crops).
     /// Mask values are continuous sigmoid confidence outputs quantized to u8
-    /// (0 = background, 255 = full confidence), NOT binary thresholded.
+    /// (0 = background, 255 = full confidence), not binary thresholded.
     ///
-    /// The returned [`Vec<Segmentation>`] can be:
-    /// - Inspected or exported for analytics, IoU computation, etc.
-    /// - Passed directly to [`ImageProcessorTrait::draw_decoded_masks`] for
-    ///   GPU-interpolated rendering.
-    ///
-    /// # Performance Note
-    ///
-    /// Calling `materialize_masks` + `draw_decoded_masks` separately prevents
-    /// the HAL from using its internal fused optimization path. For render-only
-    /// use cases, prefer [`ImageProcessorTrait::draw_proto_masks`] which selects
-    /// the fastest path automatically (currently 1.6×–27× faster on tested
-    /// platforms). Use this method when you need access to the intermediate masks.
+    /// The returned [`Vec<Segmentation>`] can be passed to
+    /// [`ImageProcessorTrait::draw_decoded_masks`] for rendering.
     ///
     /// # Errors
     ///
@@ -3211,10 +2947,9 @@ impl ImageProcessor {
 
 impl ImageProcessorTrait for ImageProcessor {
     /// Converts the source image to the destination image format and size. The
-    /// image is cropped first, then flipped, then rotated
+    /// image is cropped first, then flipped, then rotated.
     ///
-    /// Prefer hardware accelerators when available, falling back to CPU if
-    /// necessary.
+    /// Hardware accelerators are tried first, then the CPU.
     fn convert(
         &mut self,
         src: &TensorDyn,
@@ -3333,12 +3068,9 @@ impl ImageProcessorTrait for ImageProcessor {
 
         #[cfg(target_os = "linux")]
         if let Some(g2d) = self.g2d.as_mut() {
-            // G2D is matrix-only (no range control, no BT.2020). For any
-            // conversion with a YUV side, resolve that side's colorimetry and
-            // skip G2D entirely when it cannot be expressed (full-range YUV or
-            // BT.2020), letting the chain fall through to GL/CPU which honour
-            // range and BT.2020. YUV→RGB uses the source colorimetry; RGB→YUV
-            // uses the destination. RGB→RGB has no YUV side and is unaffected.
+            // Skips G2D when the colorimetry of the conversion's YUV side is
+            // full-range or BT.2020. YUV→RGB uses the source colorimetry, RGB→YUV
+            // the destination.
             let src_is_yuv = src.format().is_some_and(|f| f.is_yuv());
             let dst_is_yuv = dst.format().is_some_and(|f| f.is_yuv());
             let g2d_eligible = if src_is_yuv || dst_is_yuv {
@@ -3398,11 +3130,8 @@ impl ImageProcessorTrait for ImageProcessor {
         options: Option<ConvertOptions>,
     ) -> Result<()> {
         let options = self.resolve_interpolation(options.unwrap_or_default());
-        // Deferred batching is an OpenGL optimization (shared parent EGLImage +
-        // no per-tile glFinish). Route to the GL backend's deferred path when GL
-        // is forced or auto-selectable; on a GL decline fall back to an eager
-        // convert (the auto chain), which is correct everywhere — it completes
-        // synchronously and `flush` stays a no-op for non-GL backends.
+        // Uses the GL backend's deferred path when GL is forced or
+        // auto-selectable, and an eager convert when GL declines.
         #[cfg(any(
             target_os = "linux",
             target_os = "macos",
@@ -3419,8 +3148,7 @@ impl ImageProcessorTrait for ImageProcessor {
                         Ok(()) => return Ok(()),
                         Err(e) => {
                             log::trace!("convert_deferred: gl declined: {e}; eager fallback");
-                            // A forced-GL caller gets the GL error, matching
-                            // `convert`'s no-fallback forced-backend contract.
+                            // A forced-GL caller gets the GL error.
                             if gl_forced {
                                 return Err(e);
                             }
@@ -3434,8 +3162,7 @@ impl ImageProcessorTrait for ImageProcessor {
 
     fn flush(&mut self) -> Result<()> {
         let _span = tracing::trace_span!("image.flush").entered();
-        // Only the OpenGL backend defers; flushing it issues the single GPU
-        // sync. CPU/G2D converts already completed, so there is nothing to flush.
+        // Only the OpenGL backend defers.
         #[cfg(any(
             target_os = "linux",
             target_os = "macos",
@@ -3473,21 +3200,15 @@ impl ImageProcessorTrait for ImageProcessor {
             }
         }
 
-        // Un-letterbox detect boxes and segmentation bboxes for rendering when
-        // a letterbox was applied to prepare the model input.
+        // Un-letterboxes detect boxes and segmentation bboxes when the overlay
+        // has a content region.
         let lb_boxes: Vec<DetectBox>;
         let lb_segs: Vec<Segmentation>;
         let (detect, segmentation) = if let Some(lb) = overlay.content_region {
             lb_boxes = detect.iter().map(|&d| unletter_bbox(d, lb)).collect();
-            // Keep segmentation bboxes in sync with the transformed detect boxes
-            // when we have a 1:1 correspondence (instance segmentation).
+            // With one segmentation per box, each segmentation takes its box's transformed bounds.
             if segmentation.len() == lb_boxes.len() {
-                // Only the four bounds change; the mask bytes are copied
-                // wholesale because `TensorDyn` is not `Clone`. The memcpy is
-                // what `Array3<u8>::clone()` already paid; `copy_segmentation`
-                // pins the allocation to Mem so the ALLOCATOR cost matches too
-                // (see there). Rendering from borrowed masks plus a separate
-                // bounds list would avoid the copy entirely.
+                // Copies the mask bytes and replaces the four bounds.
                 lb_segs = segmentation
                     .iter()
                     .zip(lb_boxes.iter())
@@ -3495,9 +3216,7 @@ impl ImageProcessorTrait for ImageProcessor {
                     .collect::<Result<Vec<_>>>()?;
                 (lb_boxes.as_slice(), lb_segs.as_slice())
             } else {
-                // No 1:1 correspondence, so the segmentation bounds are left
-                // as they are -- borrow rather than the copy `to_vec()` used
-                // to make.
+                // Otherwise the segmentation bounds are left as they are.
                 (lb_boxes.as_slice(), segmentation)
             }
         } else {
@@ -3516,8 +3235,7 @@ impl ImageProcessorTrait for ImageProcessor {
                     Err(Error::ForcedBackendUnavailable("cpu".into()))
                 }
                 ForcedBackend::G2d => {
-                    // G2D can only produce empty frames (clear / bg blit).
-                    // For populated frames it has no rasterizer — fail loudly.
+                    // G2D draws empty frames only (clear or background blit).
                     #[cfg(target_os = "linux")]
                     if let Some(g2d) = self.g2d.as_mut() {
                         return g2d.draw_decoded_masks(dst, detect, segmentation, overlay);
@@ -3525,8 +3243,6 @@ impl ImageProcessorTrait for ImageProcessor {
                     Err(Error::ForcedBackendUnavailable("g2d".into()))
                 }
                 ForcedBackend::OpenGl => {
-                    // GL handles background natively via GPU blit, and now
-                    // actively clears when there is no background.
                     #[cfg(any(
                         target_os = "linux",
                         target_os = "macos",
@@ -3544,10 +3260,7 @@ impl ImageProcessorTrait for ImageProcessor {
         }
 
         // ── Auto dispatch ──────────────────────────────────────────
-        // Empty frames prefer G2D when available — a single g2d_clear or
-        // g2d_blit is the cheapest HW path to produce the correct output
-        // and avoids spinning up the GL pipeline every zero-detection
-        // frame in a triple-buffered display loop.
+        // Empty frames go to G2D when available.
         #[cfg(target_os = "linux")]
         if is_empty_frame {
             if let Some(g2d) = self.g2d.as_mut() {
@@ -3564,9 +3277,7 @@ impl ImageProcessorTrait for ImageProcessor {
             }
         }
 
-        // Populated frames (or G2D unavailable): GL first, CPU fallback.
-        // Both backends now own their own base-layer handling (bg blit
-        // or clear), so we hand the overlay through untouched.
+        // Populated frames, or G2D unavailable: GL first, then CPU.
         #[cfg(any(
             target_os = "linux",
             target_os = "macos",
@@ -3627,11 +3338,9 @@ impl ImageProcessorTrait for ImageProcessor {
             }
         }
 
-        // Un-letterbox detect boxes for rendering when a letterbox was applied
-        // to prepare the model input.  The original `detect` coords are still
-        // passed to `materialize_segmentations` (which needs model-space coords
-        // to correctly crop the proto tensor) alongside `overlay.content_region` so
-        // it can emit `Segmentation` structs in output-image space.
+        // Un-letterboxes detect boxes for rendering when the overlay has a
+        // content region. `materialize_segmentations` takes the original `detect`
+        // and `overlay.content_region`.
         let lb_boxes: Vec<DetectBox>;
         let render_detect = if let Some(lb) = overlay.content_region {
             lb_boxes = detect.iter().map(|&d| unletter_bbox(d, lb)).collect();
@@ -3676,7 +3385,7 @@ impl ImageProcessorTrait for ImageProcessor {
         }
 
         // ── Auto dispatch ──────────────────────────────────────────
-        // Empty frames: prefer G2D — cheapest HW path (clear or bg blit).
+        // Empty frames go to G2D when available.
         #[cfg(target_os = "linux")]
         if is_empty_frame {
             if let Some(g2d) = self.g2d.as_mut() {
@@ -3693,14 +3402,7 @@ impl ImageProcessorTrait for ImageProcessor {
             }
         }
 
-        // Hybrid path: CPU materialize + GL overlay (benchmarked faster than
-        // full-GPU draw_proto_masks on all tested platforms: 27× on imx8mp,
-        // 4× on imx95, 2.5× on rpi5, 1.6× on x86).
-        // GL owns its own bg-blit / glClear — we pass the overlay through.
-        //
-        // CPU materialize needs `&mut` for its MaskScratch buffers; GL also
-        // needs `&mut`. The CPU borrow is scoped to its block so the
-        // subsequent GL borrow is free to take over `self`.
+        // Hybrid path: CPU materialize, then GL overlay.
         #[cfg(any(
             target_os = "linux",
             target_os = "macos",
@@ -3779,14 +3481,7 @@ impl ImageProcessorTrait for ImageProcessor {
             };
         }
 
-        // skip G2D as it doesn't support rendering to image
-
-        // Every available backend, not the first that accepts. A palette is
-        // state a later draw reads, and which backend that draw lands on is
-        // not known here: GL declines a `view()` destination, an unsupported
-        // format or an import failure, and the CPU backend takes over. A
-        // backend that never received the colours would render
-        // `DEFAULT_COLORS_U8` with nothing to show the caller why.
+        // Sets the colours on every available backend.
         let mut backends = 0usize;
         let mut first_err = None;
         #[cfg(any(
@@ -3817,9 +3512,7 @@ impl ImageProcessorTrait for ImageProcessor {
                 }
             }
         }
-        // The first error, so a GL failure is not hidden by the CPU backend
-        // accepting afterwards; the colours the other backends took are kept
-        // either way, since a partial palette beats a stale one.
+        // Returns the first error.
         match first_err {
             Some(e) => Err(e),
             None if backends > 0 => Ok(()),
@@ -3858,7 +3551,7 @@ impl ImageProcessorTrait for ImageProcessor {
             };
         }
 
-        // Every drawing backend, for the reason `set_class_colors` gives.
+        // Sets the width on every drawing backend.
         let mut backends = 0usize;
         let mut first_err = None;
         #[cfg(any(
@@ -3895,11 +3588,9 @@ impl ImageProcessorTrait for ImageProcessor {
 // Image loading / saving helpers
 // ---------------------------------------------------------------------------
 
-/// Test-only convenience helper that peeks the image header, allocates a
-/// tensor sized to the image (honoring DMA pitch padding on Linux when
-/// requested), and decodes via [`edgefirst_codec`]. Mirrors the semantics of
-/// the removed public `load_image` API for test sites; production callers
-/// should use the explicit peek → allocate → decode pattern directly.
+/// Test helper: peeks the image header, allocates a tensor sized to the
+/// image (with DMA pitch padding on Linux when requested), and decodes via
+/// [`edgefirst_codec`].
 #[cfg(all(test, feature = "codec"))]
 pub(crate) fn load_image_test_helper(
     image: &[u8],
@@ -3908,9 +3599,7 @@ pub(crate) fn load_image_test_helper(
 ) -> Result<TensorDyn> {
     use edgefirst_codec::{peek_info, ImageDecoder, ImageLoad};
 
-    // Peek the source header to get its NATIVE format and dimensions. The
-    // codec now emits the source's native format (JPEG → Nv12/Grey, PNG →
-    // Rgb/Rgba/Grey) and configures the destination tensor itself.
+    // Peeks the source header for its native format and dimensions.
     let info = peek_info(image)?;
     let native_fmt = info.format;
     let w = info.width;
@@ -3918,8 +3607,7 @@ pub(crate) fn load_image_test_helper(
 
     let mut decoder = ImageDecoder::new();
 
-    // Decode into a native-format tensor. The decoder sets the tensor's
-    // dims+format, so we allocate it sized to the native layout.
+    // Decodes into a tensor allocated for the native layout.
     #[cfg(target_os = "linux")]
     let native_src = {
         if let Some(aligned_pitch) = padded_dma_pitch_for(native_fmt, w, &memory) {
@@ -3958,9 +3646,8 @@ pub(crate) fn load_image_test_helper(
         TensorDyn::from(img)
     };
 
-    // If the caller requested a different format, convert into it (same
-    // dims) using a headless CPU-backed processor so the helper works
-    // without GPU/G2D hardware.
+    // Converts to the requested format with a CPU-backed processor when it
+    // differs from the native one.
     match format {
         Some(f) if f != native_fmt => {
             let mut dst = TensorDyn::image(
@@ -3971,12 +3658,6 @@ pub(crate) fn load_image_test_helper(
                 memory,
                 edgefirst_tensor::CpuAccess::ReadWrite,
             )?;
-            // `ImageProcessorConfig` has platform-specific fields: on Linux it
-            // carries extra GL/G2D options so `..Default::default()` is needed,
-            // but on macOS `backend` is the only field, making the update
-            // redundant (clippy::needless_update). Allow it for cross-platform
-            // parity — the alternative (field reassign) trips
-            // clippy::field_reassign_with_default on Linux instead.
             #[allow(clippy::needless_update)]
             let mut proc = ImageProcessor::with_config(ImageProcessorConfig {
                 backend: ComputeBackend::Cpu,
@@ -4103,12 +3784,11 @@ mod alignment_tests {
 
     #[test]
     fn align_width_rgba8_common_widths() {
-        // RGBA8 (bpp=4, lcm(64,4)=64, so width must round to multiple of 16 px).
-        assert_eq!(align_width_for_gpu_pitch(640, 4), 640); // 2560 byte pitch — already aligned
+        // RGBA8: bpp=4, lcm(64,4)=64, widths round to a multiple of 16 px.
+        assert_eq!(align_width_for_gpu_pitch(640, 4), 640); // 2560 byte pitch
         assert_eq!(align_width_for_gpu_pitch(1280, 4), 1280); // 5120
         assert_eq!(align_width_for_gpu_pitch(1920, 4), 1920); // 7680
         assert_eq!(align_width_for_gpu_pitch(3840, 4), 3840); // 15360
-                                                              // crowd.png case from the imx95 investigation:
         assert_eq!(align_width_for_gpu_pitch(3004, 4), 3008); // 12016 → 12032
         assert_eq!(align_width_for_gpu_pitch(3000, 4), 3008); // 12000 → 12032
         assert_eq!(align_width_for_gpu_pitch(17, 4), 32); // 68 → 128
@@ -4117,12 +3797,11 @@ mod alignment_tests {
 
     #[test]
     fn align_width_rgb888_packed() {
-        // RGB888 (bpp=3, lcm(64,3)=192, so width must round to multiple of 64 px).
+        // RGB888: bpp=3, lcm(64,3)=192, widths round to a multiple of 64 px.
         assert_eq!(align_width_for_gpu_pitch(64, 3), 64); // 192 byte pitch
         assert_eq!(align_width_for_gpu_pitch(640, 3), 640); // 1920
         assert_eq!(align_width_for_gpu_pitch(1, 3), 64); // 3 → 192
         assert_eq!(align_width_for_gpu_pitch(65, 3), 128); // 195 → 384
-                                                           // Verify the rounded width × bpp is a clean multiple of the LCM.
         for w in [3004usize, 1281, 100, 17] {
             let padded = align_width_for_gpu_pitch(w, 3);
             assert!(padded >= w);
@@ -4133,7 +3812,7 @@ mod alignment_tests {
 
     #[test]
     fn align_width_grey_u8() {
-        // Grey (bpp=1, lcm(64,1)=64, so width must round to multiple of 64 px).
+        // Grey: bpp=1, lcm(64,1)=64, widths round to a multiple of 64 px.
         assert_eq!(align_width_for_gpu_pitch(64, 1), 64);
         assert_eq!(align_width_for_gpu_pitch(640, 1), 640);
         assert_eq!(align_width_for_gpu_pitch(1, 1), 64);
@@ -4148,9 +3827,7 @@ mod alignment_tests {
 
     #[test]
     fn align_width_never_returns_smaller_than_input() {
-        // Spot-check the "returned width >= input width" contract across a
-        // range of values that would previously have hit `width * bpp`
-        // overflow paths.
+        // Checks returned width >= input width, including where `width * bpp` overflows.
         for &bpp in &[1usize, 2, 3, 4, 8] {
             for &w in &[
                 1usize,
@@ -4181,17 +3858,13 @@ mod alignment_tests {
 
     #[test]
     fn align_width_overflow_returns_unaligned_not_smaller() {
-        // For width values close to usize::MAX, padding up would wrap. The
-        // function must return the original width rather than wrapping or
-        // panicking. A pre-aligned width round-trips unchanged even at the
-        // extreme.
+        // A pre-aligned width near usize::MAX is returned unchanged.
         let aligned_extreme = usize::MAX - 15; // 16-pixel boundary for RGBA8
         assert_eq!(
             align_width_for_gpu_pitch(aligned_extreme, 4),
             aligned_extreme
         );
-        // A misaligned extreme value cannot be rounded up — the function
-        // returns the original.
+        // A misaligned width near usize::MAX is returned as given.
         let misaligned_extreme = usize::MAX - 1;
         let result = align_width_for_gpu_pitch(misaligned_extreme, 4);
         assert!(
@@ -4207,7 +3880,7 @@ mod alignment_tests {
         assert_eq!(checked_num_integer_lcm(64, 1), Some(64));
         assert_eq!(checked_num_integer_lcm(0, 4), Some(0));
         assert_eq!(checked_num_integer_lcm(64, 0), Some(0));
-        // Coprime values whose product exceeds usize::MAX must return None.
+        // Coprime values whose product exceeds usize::MAX return None.
         assert_eq!(
             checked_num_integer_lcm(usize::MAX, usize::MAX - 1),
             None,
@@ -4238,11 +3911,8 @@ mod image_tests {
     use edgefirst_tensor::{TensorMapTrait, TensorMemory, TensorTrait};
     use image::buffer::ConvertBuffer;
 
-    /// Test helper: call `ImageProcessorTrait::convert()` on two `TensorDyn`s
-    /// by going through the `TensorDyn` API.
-    ///
-    /// Returns the `(src_image, dst_image)` reconstructed from the TensorDyn
-    /// round-trip so the caller can feed them to `compare_images` etc.
+    /// Calls `ImageProcessorTrait::convert()` on two `TensorDyn`s and returns
+    /// the result, the source and the destination.
     fn convert_img(
         proc: &mut dyn ImageProcessorTrait,
         src: TensorDyn,
@@ -4299,18 +3969,7 @@ mod image_tests {
         }};
     }
 
-    /// Master oracle for the view/batch **destination** batch engine: render `N`
-    /// tiles into row-bands of ONE tall destination and assert each band equals
-    /// the same source converted standalone — proving correct band placement and
-    /// that a later tile's letterbox clear / draw never wipes a sibling band. On
-    /// the Linux GL backend the `N` `convert_deferred` calls share ONE parent
-    /// EGLImage import (each tile is a `glViewport`/`glScissor` ROI) and sync
-    /// once at `flush()`; other backends fall back to an eager per-band convert
-    /// (CPU writes via offset + parent stride). Either way the oracle must hold.
-    ///
-    /// Identical source/tile size makes the convert an exact copy, so the
-    /// assertion is backend-agnostic (no GL-vs-CPU resampling drift). Distinct
-    /// solid colors per tile make any sibling wipe a hard failure.
+    /// Tiles deferred into row-bands of one tall destination each equal the same source converted standalone.
     #[test]
     fn batch_view_dst_tiles_match_standalone() {
         let mut proc = match ImageProcessor::new() {
@@ -4330,8 +3989,7 @@ mod image_tests {
             let bytes: Vec<u8> = c.iter().copied().cycle().take(w * h * 4).collect();
             load_bytes_to_tensor(w, h, PixelFormat::Rgba, Some(TensorMemory::Mem), &bytes).unwrap()
         };
-        // Tall destination: N stacked row-bands. DMA so the Linux GL band path
-        // runs (one parent import + per-tile glViewport); skip if unavailable.
+        // Tall destination: N stacked row-bands.
         let Some(parent) = crate::test_support::dma_allocated(
             TensorDyn::image(
                 w,
@@ -4346,7 +4004,6 @@ mod image_tests {
             return;
         };
 
-        // Deferred batch: one parent import, glViewport/scissor per band, one sync.
         for (i, &c) in colors.iter().enumerate().take(n) {
             let mut tile = parent.view(Region::new(0, i * h, w, h)).unwrap();
             proc.convert_deferred(&make_src(c), &mut tile, None)
@@ -4355,7 +4012,7 @@ mod image_tests {
         proc.flush().unwrap();
 
         for (i, &c) in colors.iter().enumerate().take(n) {
-            // Standalone full-buffer convert of the same source = the oracle.
+            // The oracle: a standalone full-buffer convert of the same source.
             let mut solo = TensorDyn::image(
                 w,
                 h,
@@ -4393,9 +4050,7 @@ mod image_tests {
         }
     }
 
-    /// Build a `w`×`h` RGBA frame whose pixels encode their position, so a crop
-    /// at any origin has distinct content (catches crop-origin / band-placement
-    /// bugs a solid color cannot).
+    /// Builds a `w`×`h` RGBA frame whose pixels encode their position.
     #[cfg(test)]
     fn gradient_frame(w: usize, h: usize) -> TensorDyn {
         let mut bytes = vec![0u8; w * h * 4];
@@ -4411,9 +4066,7 @@ mod image_tests {
         load_bytes_to_tensor(w, h, PixelFormat::Rgba, Some(TensorMemory::Mem), &bytes).unwrap()
     }
 
-    /// `set_box_line_width` validates before reaching any backend and the
-    /// width reaches whichever backend draws: the default chain (GL where
-    /// available, else CPU) and a forced CPU backend.
+    /// `set_box_line_width` validates its argument and reaches the default chain and a forced CPU backend.
     #[test]
     fn set_box_line_width_reaches_the_drawing_backend() {
         use crate::test_support::{box_drawn_columns, box_expected_span, BOX_DIM};
@@ -4442,9 +4095,7 @@ mod image_tests {
         }
     }
 
-    /// `tile_into` band == standalone crop-convert of the same source region,
-    /// on the CPU backend (runs on CI without a GPU). Distinct gradient content
-    /// makes a wrong crop origin or a sibling-band wipe a hard failure.
+    /// A `tile_into` band equals a standalone crop-convert of the same source region on the CPU backend.
     #[test]
     fn tile_into_cpu_distinct_content_parity() {
         let mut proc = ImageProcessor::with_config(ImageProcessorConfig {
@@ -4522,8 +4173,7 @@ mod image_tests {
         }
     }
 
-    /// Streaming `tile_one` into a single slot == the corresponding batched
-    /// `tile_into` band (proves the two paths agree).
+    /// `tile_one` into a single slot matches the corresponding `tile_into` band.
     #[test]
     fn tile_one_matches_tile_into_band() {
         let mut proc = ImageProcessor::with_config(ImageProcessorConfig {
@@ -4584,12 +4234,7 @@ mod image_tests {
         }
     }
 
-    /// `plan_tiles` returns correct per-tile metadata for a 4K frame (pure, no
-    /// GPU render).
-    /// `tile_into` through the auto backend with a DMA parent — exercises the
-    /// GL single-import band path on a GPU machine (skips when DMA/GL is
-    /// unavailable). The source is sampled via `Crop::with_source`, never
-    /// `src.view()`, so all tiles share one source import.
+    /// `tile_into` through the auto backend with a DMA parent matches standalone crop-converts.
     #[test]
     fn tile_into_auto_dma_parity() {
         let mut proc = match ImageProcessor::new() {
@@ -4651,11 +4296,6 @@ mod image_tests {
             )
             .unwrap();
             let band = parent.view(Region::new(0, p.index * 32, 32, 32)).unwrap();
-            // Structural-similarity tolerance (the house GPU-parity bar) rather
-            // than exact bytes: rendering a tile into a viewport band at a
-            // non-zero offset vs. a standalone origin render diverges by sampling
-            // rounding on virtualized GPUs (paravirtual Metal/ANGLE on macOS CI),
-            // the same tolerance class as the other cross-backend parity tests.
             compare_images(
                 &band,
                 &solo,
@@ -4676,7 +4316,6 @@ mod image_tests {
         let (fw, fh) = (96usize, 64usize);
         let src = gradient_frame(fw, fh);
         let cfg = TilingConfig::new(32, 32).with_overlap(0.0); // 6 tiles
-                                                               // Allocate a parent for only 2 bands, far short of 6.
         let mut small = TensorDyn::image(
             32,
             2 * 32,
@@ -4764,7 +4403,7 @@ mod image_tests {
         let crop = Crop::new().with_source(Some(Region::new(0, 0, 10, 10)));
         assert!(crop.check_crop_dyn(&src, &dst).is_ok());
 
-        // Letterbox is always valid — placement is computed within the dst.
+        // A letterbox is valid.
         assert!(Crop::letterbox([0, 0, 0, 255])
             .check_crop_dyn(&src, &dst)
             .is_ok());
@@ -4798,8 +4437,6 @@ mod image_tests {
     #[test]
     fn test_invalid_jpeg_format() -> Result<(), Error> {
         let result = crate::load_image_test_helper(&[123; 5000], Some(PixelFormat::Yuyv), None);
-        // YUYV is not a valid decode target; peek_info fails before the magic-
-        // bytes check, so the precise variant depends on which error fires first.
         assert!(
             matches!(result, Err(Error::Codec(_))),
             "Yuyv target with garbage bytes should surface as Error::Codec, got {result:?}"
@@ -4839,8 +4476,7 @@ mod image_tests {
         crate::save_jpeg(&dst, "zidane_resized.jpg", 80).unwrap();
 
         let file = std::fs::read("zidane_resized.jpg").unwrap();
-        // With `format: None` the helper returns the source's native format.
-        // The codec now decodes colour JPEGs to NV12 (was RGB previously).
+        // With `format: None` the helper returns the source's native format, NV12 for a colour JPEG.
         let img = crate::load_image_test_helper(&file, None, None).unwrap();
         assert_eq!(img.width(), Some(640));
         assert_eq!(img.height(), Some(360));
@@ -4874,8 +4510,6 @@ mod image_tests {
 
     #[test]
     fn test_from_tensor_invalid_format() {
-        // PixelFormat::from_fourcc_str returns None for unknown FourCC codes.
-        // Since there's no "TEST" pixel format, this validates graceful handling.
         assert!(PixelFormat::from_fourcc(u32::from_le_bytes(*b"TEST")).is_none());
     }
 
@@ -4937,12 +4571,8 @@ mod image_tests {
 
     #[test]
     fn test_disable_env_var() -> Result<(), Error> {
-        // Acquire the env-var mutex for the entire test body so we never race
-        // with test_force_backend_* or test_draw_proto_masks_no_cpu_returns_error.
         let _lock = acquire_env_lock();
 
-        // Snapshot ALL env vars we might touch so the RAII guard restores them
-        // on exit (even on panic), preventing env-var poisoning of other tests.
         let _guard = EnvGuard::snapshot(&[
             "EDGEFIRST_FORCE_BACKEND",
             "EDGEFIRST_DISABLE_GL",
@@ -4950,8 +4580,6 @@ mod image_tests {
             "EDGEFIRST_DISABLE_CPU",
         ]);
 
-        // EDGEFIRST_FORCE_BACKEND takes precedence over EDGEFIRST_DISABLE_*,
-        // so clear it for the duration of this test.
         unsafe { std::env::remove_var("EDGEFIRST_FORCE_BACKEND") };
 
         #[cfg(target_os = "linux")]
@@ -4976,7 +4604,7 @@ mod image_tests {
         assert!(converter.cpu.is_none());
         unsafe { std::env::remove_var("EDGEFIRST_DISABLE_CPU") };
 
-        // Disable everything — convert must return NoConverter.
+        // With every backend disabled, convert returns `NoConverter`.
         unsafe { std::env::set_var("EDGEFIRST_DISABLE_CPU", "1") };
         unsafe { std::env::set_var("EDGEFIRST_DISABLE_GL", "1") };
         unsafe { std::env::set_var("EDGEFIRST_DISABLE_G2D", "1") };
@@ -5007,7 +4635,6 @@ mod image_tests {
             Crop::no_crop(),
         );
         assert!(matches!(result, Err(Error::NoConverter)));
-        // _guard restores all env vars on drop.
         Ok(())
     }
 
@@ -5049,9 +4676,7 @@ mod image_tests {
 
     #[test]
     fn test_load_grey() {
-        // A single-component (greyscale) JPEG decodes to its native GREY
-        // format, which has no even-dimension constraint, so the 1024×681
-        // `grey.jpg` loads and converts to RGBA successfully.
+        // A single-component JPEG decodes to GREY and converts to RGBA.
         let grey_img = crate::load_image_test_helper(
             &edgefirst_bench::testdata::read("grey.jpg"),
             Some(PixelFormat::Rgba),
@@ -5061,11 +4686,8 @@ mod image_tests {
         assert_eq!(grey_img.width(), Some(1024));
         assert_eq!(grey_img.height(), Some(681));
 
-        // `grey-rgb.jpg` holds the same grey content but is encoded as a
-        // 3-component (colour) JPEG, so the codec decodes it to native NV12.
-        // Its 1024×681 dimensions have an odd height; NV12 now represents odd
-        // dimensions via the `H + ceil(H/2)` combined-plane height, so the
-        // decode succeeds and converts to RGBA at the true dimensions.
+        // `grey-rgb.jpg` is a 3-component JPEG with an odd height: it decodes to
+        // NV12 and converts to RGBA at its true dimensions.
         let grey_but_rgb = crate::load_image_test_helper(
             &edgefirst_bench::testdata::read("grey-rgb.jpg"),
             Some(PixelFormat::Rgba),
@@ -5090,7 +4712,6 @@ mod image_tests {
         assert_eq!(nv12.height(), Some(720));
         assert_eq!(nv12.width(), Some(1280));
         assert_eq!(nv12.format().unwrap(), PixelFormat::Nv12);
-        // PixelFormat::Nv12.channels() returns 1 (luma plane channel count)
         assert_eq!(nv12.format().unwrap().channels(), 1);
         assert!(nv12.format().is_some_and(
             |f| f.layout() == PixelLayout::Planar || f.layout() == PixelLayout::SemiPlanar
@@ -5154,7 +4775,6 @@ mod image_tests {
     fn test_create_image_dtype_i8() {
         let mut converter = ImageProcessor::new().unwrap();
 
-        // I8 image should allocate successfully via create_image
         let dst = converter
             .create_image(
                 320,
@@ -5170,7 +4790,6 @@ mod image_tests {
         assert!(dst.height() == Some(240));
         assert_eq!(dst.format(), Some(PixelFormat::Rgb));
 
-        // U8 for comparison
         let dst_u8 = converter
             .create_image(
                 320,
@@ -5183,7 +4802,6 @@ mod image_tests {
             .unwrap();
         assert_eq!(dst_u8.dtype(), DType::U8);
 
-        // Convert into I8 dst should succeed
         let file = edgefirst_bench::testdata::read("zidane.jpg").to_vec();
         let src = crate::load_image_test_helper(&file, Some(PixelFormat::Rgba), None).unwrap();
         let mut dst_i8 = converter
@@ -5202,14 +4820,9 @@ mod image_tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn test_create_image_nv12_dma_non_aligned_width() {
-        // create_image is fully stride-aware: a non-64-aligned NV12 DMA tensor
-        // may legitimately carry a GPU-pitch-padded row stride — that is the
-        // intended behaviour, not a bug. Verify the logical geometry is preserved
-        // for any width and that a reported stride is a valid (>= logical)
-        // padding, rather than asserting the absence of a stride.
+        // Checks the logical geometry and that a reported stride is at least the logical row.
         let converter = ImageProcessor::new().unwrap();
 
-        // 100 is intentionally not a multiple of 64 (the GPU pitch alignment).
         let Some(img) = crate::test_support::dma_allocated(
             converter.create_image(
                 100,
@@ -5235,9 +4848,7 @@ mod image_tests {
     }
 
     #[test]
-    #[ignore] // Hangs on desktop platforms where DMA-buf is unavailable and PBO
-              // fallback triggers a GPU driver hang during SHM→texture upload (e.g.,
-              // NVIDIA without /dev/dma_heap permissions). Works on embedded targets.
+    #[ignore]
     fn test_crop_skip() {
         let file = edgefirst_bench::testdata::read("zidane.jpg").to_vec();
         let src = crate::load_image_test_helper(&file, Some(PixelFormat::Rgba), None).unwrap();
@@ -5289,12 +4900,10 @@ mod image_tests {
 
     #[test]
     fn test_invalid_pixel_format() {
-        // PixelFormat::from_fourcc returns None for unknown formats,
-        // so TensorDyn::image cannot be called with an invalid format.
         assert!(PixelFormat::from_fourcc(u32::from_le_bytes(*b"TEST")).is_none());
     }
 
-    // Helper function to check if G2D library is available (Linux/i.MX8 only)
+    // Whether the G2D library is available.
     #[cfg(target_os = "linux")]
     static G2D_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
@@ -5305,11 +4914,6 @@ mod image_tests {
         )
     }
 
-    // Every GL platform: Linux EGL, ANGLE/Metal (macOS, iOS), Android EGL,
-    // ANGLE/D3D11 (Windows). `GLProcessorThreaded::new` fails cleanly where
-    // the driver or ANGLE is missing, so the `test_opengl_*` callers below
-    // self-skip there (and `HAL_TEST_REQUIRE_GL=1` lanes catch that via
-    // `gl_backend_available_canary`).
     #[cfg(any(
         target_os = "linux",
         target_os = "macos",
@@ -5328,22 +4932,12 @@ mod image_tests {
         target_os = "windows"
     ))]
     #[cfg(feature = "opengl")]
-    // Helper function to check if OpenGL is available
+    // Whether OpenGL is available.
     fn is_opengl_available() -> bool {
         *GL_AVAILABLE.get_or_init(|| GLProcessorThreaded::new(None).is_ok())
     }
 
-    /// CI canary: fails the lane when the GL backend cannot initialize.
-    ///
-    /// Every GL test in this suite self-skips when the backend is
-    /// unavailable — correct for developer machines, but it means a broken
-    /// CI GL stack (e.g. the macOS ANGLE re-sign step regressing, the exact
-    /// failure mode documented in the workflow) ships an untested GL
-    /// backend behind a green lane. Gated on `HAL_TEST_REQUIRE_GL=1`, set
-    /// only by CI jobs that install a working GL stack; local runs without
-    /// one pass trivially. On macOS it additionally requires
-    /// `HAL_TEST_ALLOW_DLOPEN_ANGLE`, so coverage pass 1 (unsigned
-    /// binaries, dlopen gate closed) skips it and pass 2 (signed) enforces.
+    /// Fails when `HAL_TEST_REQUIRE_GL=1` and the GL backend cannot initialise.
     #[test]
     #[cfg(feature = "opengl")]
     fn gl_backend_available_canary() {
@@ -5358,7 +4952,7 @@ mod image_tests {
         #[cfg(target_os = "macos")]
         if std::env::var_os("HAL_TEST_ALLOW_DLOPEN_ANGLE").is_none() {
             crate::test_support::report_skip(&format!(
-                "{} — ANGLE dlopen gate closed (coverage pass 1)",
+                "{} — ANGLE dlopen gate closed",
                 function!()
             ));
             return;
@@ -5374,22 +4968,17 @@ mod image_tests {
     fn test_load_jpeg_with_exif() {
         use edgefirst_codec::peek_info;
 
-        // The migrated codec NEVER applies EXIF orientation: it decodes to the
-        // source's native (un-rotated) dimensions and reports the rotation via
-        // ImageInfo. `zidane_rotated_exif.jpg` carries EXIF orientation 6
-        // (90° clockwise) over a 1280×720 frame.
+        // `zidane_rotated_exif.jpg` carries EXIF orientation 6 (90° clockwise) over a 1280×720 frame.
         let file = edgefirst_bench::testdata::read("zidane_rotated_exif.jpg").to_vec();
         let info = peek_info(&file).unwrap();
         assert_eq!(info.rotation_degrees, 90);
         assert!(!info.flip_horizontal);
 
         let loaded = crate::load_image_test_helper(&file, Some(PixelFormat::Rgba), None).unwrap();
-        // Native (un-rotated) dimensions — the decode does not rotate.
+        // Native, un-rotated dimensions.
         assert_eq!(loaded.width(), Some(1280));
         assert_eq!(loaded.height(), Some(720));
 
-        // Applying the reported rotation downstream reproduces the upright
-        // image: it matches `zidane.jpg` rotated by the same 90° clockwise.
         let file = edgefirst_bench::testdata::read("zidane.jpg").to_vec();
         let cpu_src = crate::load_image_test_helper(&file, Some(PixelFormat::Rgba), None).unwrap();
 
@@ -5407,8 +4996,7 @@ mod image_tests {
         .unwrap();
         let mut cpu_converter = CPUProcessor::new();
 
-        // Rotate the native-orientation `loaded` frame and the native `zidane`
-        // frame by the same reported rotation; the results must agree.
+        // Rotates `loaded` and `zidane` by the reported rotation.
         let loaded_rotated = TensorDyn::image(
             dst_width,
             dst_height,
@@ -5445,7 +5033,6 @@ mod image_tests {
     fn test_load_png_with_exif() {
         use edgefirst_codec::peek_info;
 
-        // PNGs also report EXIF orientation without applying it.
         // `zidane_rotated_exif_180.png` carries EXIF orientation 3 (180°).
         let file = edgefirst_bench::testdata::read("zidane_rotated_exif_180.png").to_vec();
         let info = peek_info(&file).unwrap();
@@ -5453,14 +5040,10 @@ mod image_tests {
         assert!(!info.flip_horizontal);
 
         let loaded = crate::load_image_test_helper(&file, Some(PixelFormat::Rgba), None).unwrap();
-        // Native (un-rotated) dimensions — PNG decodes upright as authored.
+        // Native, un-rotated dimensions.
         assert_eq!(loaded.height(), Some(720));
         assert_eq!(loaded.width(), Some(1280));
 
-        // The PNG fixture stores upright `zidane` pixels tagged with a 180°
-        // EXIF orientation. Because the codec no longer applies the rotation,
-        // the decoded pixels match `zidane.jpg` directly (no convert needed).
-        // Re-applying the reported rotation to both must still agree.
         let file = edgefirst_bench::testdata::read("zidane.jpg").to_vec();
         let cpu_src = crate::load_image_test_helper(&file, Some(PixelFormat::Rgba), None).unwrap();
 
@@ -5486,8 +5069,7 @@ mod image_tests {
         );
         result.unwrap();
 
-        // Rotate the decoded PNG by the same reported angle so both frames are
-        // in the same (180°-rotated) orientation before comparing.
+        // Rotates the decoded PNG by the reported angle.
         let loaded_rotated = TensorDyn::image(
             1280,
             720,
@@ -5507,18 +5089,10 @@ mod image_tests {
         );
         r0.unwrap();
 
-        // Threshold 0.95 (was 0.98): `loaded` comes from a lossless PNG decode
-        // while `cpu_src` (zidane.jpg) now decodes through native NV12 (chroma
-        // subsampling) before the RGBA conversion, so the two paths differ by a
-        // couple of percent versus the old direct-RGB JPEG decode.
         compare_images(&loaded_rotated, &cpu_dst, 0.95, function!());
     }
 
-    /// Synthesise an RGB JPEG with a deterministic pattern at `(width, height)`
-    /// using the workspace's `jpeg-encoder` crate (the `image` crate is
-    /// compiled without its JPEG feature). Used to exercise the decoder /
-    /// pitch-padding paths for arbitrary dimensions without having to bundle
-    /// a fixture file per test size.
+    /// Builds an RGB JPEG of `(width, height)` with a deterministic pattern using `jpeg-encoder`.
     #[cfg(target_os = "linux")]
     fn make_rgb_jpeg(width: u32, height: u32) -> Vec<u8> {
         let mut bytes = Vec::with_capacity((width * height * 3) as usize);
@@ -5542,14 +5116,7 @@ mod image_tests {
         out
     }
 
-    /// End-to-end: a 375×333 RGBA JPEG (width NOT divisible by 4) loaded
-    /// via the pitch-padded DMA path and letterboxed through the GL
-    /// backend must produce correct output. Before the Rgba/Bgra
-    /// width%4 relaxation in `DmaImportAttrs::from_tensor`, this case
-    /// failed the pre-check and forced a CPU texture upload fallback;
-    /// with the relaxation, EGL import succeeds at the driver level and
-    /// the GL fast path runs. Output correctness is checked against a
-    /// CPU reference (convert ran with `EDGEFIRST_FORCE_BACKEND=cpu`).
+    /// A 375×333 RGBA JPEG loaded through the pitch-padded DMA path letterboxes on the GL backend matching the CPU.
     #[test]
     #[cfg(target_os = "linux")]
     #[cfg(feature = "opengl")]
@@ -5561,17 +5128,13 @@ mod image_tests {
             );
             return;
         }
-        // 375 is the canonical failure width from dataset loaders —
-        // 375 * 4 = 1500 bytes/row, pitch-padded to 1536. Width%4 = 3,
-        // so the old pre-check rejected it; new code accepts it.
+        // 375 * 4 = 1500 bytes per row, pitch-padded to 1536; width % 4 = 3.
         let jpeg = make_rgb_jpeg(375, 333);
         let src_gl = crate::load_image_test_helper(&jpeg, Some(PixelFormat::Rgba), None).unwrap();
         assert_eq!(src_gl.width(), Some(375));
-        // Row stride must still be pitch-padded (separate concern from width).
         let stride = src_gl.row_stride().unwrap();
         assert_eq!(stride, 1536, "expected padded pitch 1536, got {stride}");
 
-        // GL-backed convert into a pitch-aligned 640×640 Rgba dest.
         let mut gl_proc = ImageProcessor::new().unwrap();
         let gl_dst = gl_proc
             .create_image(
@@ -5593,10 +5156,7 @@ mod image_tests {
         );
         r_gl.expect("GL-backed convert must succeed for 375x333 Rgba src");
 
-        // CPU reference via a fresh load so the two paths start from
-        // byte-identical inputs. `with_config(backend=Cpu)` forces the
-        // CPU-only processor regardless of which backends the host has
-        // available.
+        // CPU reference from a fresh load.
         let src_cpu =
             crate::load_image_test_helper(&jpeg, Some(PixelFormat::Rgba), Some(TensorMemory::Mem))
                 .unwrap();
@@ -5624,18 +5184,10 @@ mod image_tests {
         );
         r_cpu.unwrap();
 
-        // Structural similarity: the GL path may have gone through EGL
-        // import OR fallen back to CPU texture upload — either way, the
-        // output must match the CPU reference closely.
         compare_images(&gl_dst, &cpu_dst, 0.95, function!());
     }
 
-    /// Regression lock: loading a JPEG at a non-64-aligned RGBA pitch (e.g.
-    /// 500×333 → natural pitch 2000, needs to be padded to 2048) must go
-    /// through `image_with_stride` and set `row_stride()` / `effective_row_stride()`
-    /// to the padded value. The earlier pitch-padding commit fixed this in
-    /// `load_jpeg`; a regression would surface as `row_stride == None` or
-    /// `effective_row_stride == 2000`.
+    /// A JPEG loaded at a non-64-aligned RGBA pitch reports the padded pitch from `row_stride()` and `effective_row_stride()`.
     #[test]
     #[cfg(target_os = "linux")]
     fn test_load_jpeg_rgba_non_aligned_pitch_padded_dma() {
@@ -5646,9 +5198,7 @@ mod image_tests {
             );
             return;
         }
-        // Widths that force a non-64-aligned natural RGBA pitch. All three
-        // are divisible by 4 so the EGL width-alignment pre-check passes.
-        // The pitch-padding fix is what makes these importable at all.
+        // Widths with a non-64-aligned natural RGBA pitch, all divisible by 4.
         for &w in &[500u32, 612, 428] {
             let jpeg = make_rgb_jpeg(w, 333);
             let loaded =
@@ -5677,9 +5227,7 @@ mod image_tests {
         }
     }
 
-    /// Only a loader that found no file for the G2D library says the host has
-    /// no G2D. A library that is installed and does not load, or that lacks
-    /// a dependency, is a G2D failure and worth a warning.
+    /// The host has no G2D only when the loader found no file for the library; a library that fails to load is a G2D failure.
     #[test]
     #[cfg(target_os = "linux")]
     fn only_a_g2d_library_that_was_not_found_counts_as_absent() {
@@ -5710,8 +5258,7 @@ mod image_tests {
         )));
     }
 
-    /// The host's loader names the file it could not find, and reports a
-    /// file it found and could not load differently.
+    /// The host's loader names a file it could not find and reports a file it could not load differently.
     #[test]
     #[cfg(target_os = "linux")]
     fn the_loader_tells_a_missing_library_from_a_broken_one() {
@@ -5740,25 +5287,17 @@ mod image_tests {
         );
     }
 
-    /// `padded_dma_pitch_for` must respect the caller's memory choice and
-    /// must NOT route into the pitch-padded DMA path when the caller left
-    /// the choice to the allocator (`None`) but DMA is unavailable on the
-    /// host. The padded path requires `image_with_stride`, which always
-    /// allocates DMA — taking it on a system without `/dev/dma_heap`
-    /// would convert a normally-working image load into a hard failure
-    /// (since `Tensor::image(..., None)` would have fallen back to
-    /// SHM/Mem).
+    /// `padded_dma_pitch_for` pads for an explicit DMA request, never for `Mem` or `Shm`, and for `None` only when DMA is available.
     #[test]
     #[cfg(target_os = "linux")]
     fn test_padded_dma_pitch_for_respects_memory_choice() {
         use crate::test_support::is_dma_available;
         use edgefirst_tensor::TensorMemory;
 
-        // 500×4 = 2000 → padded to 2048 by GPU alignment. Use it for
-        // every case so any "no padding" answer is unambiguous.
+        // 500×4 = 2000 bytes pads to 2048.
         let unaligned_w = 500;
 
-        // Caller asks for Mem / Shm: never pad, regardless of DMA.
+        // `Mem` and `Shm`: no padding.
         assert_eq!(
             crate::padded_dma_pitch_for(PixelFormat::Rgba, unaligned_w, &Some(TensorMemory::Mem),),
             None,
@@ -5770,10 +5309,7 @@ mod image_tests {
             "Shm must never trigger DMA padding"
         );
 
-        // Caller explicitly asks for DMA: always pad if width needs it.
-        // Even if the runtime can't actually allocate DMA, the caller
-        // owns that decision and the resulting allocation error is
-        // their problem, not ours.
+        // An explicit DMA request pads.
         assert_eq!(
             crate::padded_dma_pitch_for(
                 PixelFormat::Rgba,
@@ -5784,9 +5320,7 @@ mod image_tests {
             "explicit Dma must pad regardless of runtime DMA availability"
         );
 
-        // Caller leaves it to the allocator: behaviour depends on
-        // host-runtime DMA availability. This is the case the fix
-        // guards against.
+        // `None` pads only when DMA is available.
         let none_result = crate::padded_dma_pitch_for(PixelFormat::Rgba, unaligned_w, &None);
         if is_dma_available() {
             assert_eq!(
@@ -5804,9 +5338,7 @@ mod image_tests {
         }
     }
 
-    // Synthesise a small greyscale PNG in memory at `(width, height)` with a
-    // deterministic ramp pattern so multiple tests can cross-check output
-    // without bundling an extra fixture file.
+    // Builds a greyscale PNG of `(width, height)` with a deterministic ramp.
     fn make_grey_png(width: u32, height: u32) -> Vec<u8> {
         let mut bytes = Vec::with_capacity((width * height) as usize);
         for y in 0..height {
@@ -5821,10 +5353,7 @@ mod image_tests {
         buf
     }
 
-    /// Greyscale PNG with a width that forces a pitch-misaligned natural
-    /// row stride (612 bytes is not a multiple of the 64-byte GPU pitch
-    /// alignment) must still load via the pitch-padded DMA path. Gated on
-    /// DMA availability because `image_with_stride` is DMA-only.
+    /// A greyscale PNG whose 612-byte row is not pitch-aligned loads through the pitch-padded DMA path.
     #[test]
     #[cfg(target_os = "linux")]
     fn test_load_png_grey_misaligned_width_dma() {
@@ -5841,8 +5370,7 @@ mod image_tests {
         assert_eq!(loaded.height(), Some(388));
         assert_eq!(loaded.format(), Some(PixelFormat::Grey));
 
-        // Round-trip pixels — natural-pitch DMA-BUFs pad the stride so we
-        // must indirect through row_stride() rather than assume width.
+        // Reads rows at `row_stride()`.
         let map = loaded.as_typed::<u8>().unwrap().map().unwrap();
         let stride = loaded.row_stride().unwrap_or(612);
         assert!(stride >= 612);
@@ -5859,9 +5387,7 @@ mod image_tests {
         }
     }
 
-    /// Greyscale PNG loaded with explicit Mem backing — runs on any
-    /// platform (no DMA permission requirement) and covers the
-    /// decoder-native Luma → Grey no-conversion path.
+    /// A greyscale PNG loads into `Mem` as `Grey` at its natural pitch.
     #[test]
     fn test_load_png_grey_mem() {
         use edgefirst_tensor::TensorMemory;
@@ -5874,7 +5400,6 @@ mod image_tests {
         assert_eq!(loaded.format(), Some(PixelFormat::Grey));
         let map = loaded.as_typed::<u8>().unwrap().map().unwrap();
         let bytes: &[u8] = &map;
-        // Mem allocation uses the natural pitch — 612 bytes per row, exact.
         assert_eq!(bytes.len(), 612 * 100);
         for y in 0..100 {
             for x in 0..612 {
@@ -5883,9 +5408,7 @@ mod image_tests {
         }
     }
 
-    /// Greyscale PNG decoded into RGB — exercises the decoder-colorspace
-    /// mismatch path (Luma → Rgb via CPU converter). Uses Mem memory to
-    /// stay portable to host-side test environments.
+    /// A greyscale PNG loads as `Rgb` with the luma in each channel.
     #[test]
     fn test_load_png_grey_to_rgb_mem() {
         use edgefirst_tensor::TensorMemory;
@@ -5897,7 +5420,6 @@ mod image_tests {
         assert_eq!(loaded.height(), Some(240));
         assert_eq!(loaded.format(), Some(PixelFormat::Rgb));
 
-        // Greyscale promoted to RGB replicates luma into each channel.
         let map = loaded.as_typed::<u8>().unwrap().map().unwrap();
         let bytes: &[u8] = &map;
         for (x, y) in [(0usize, 0usize), (100, 50), (619, 239)] {
@@ -5971,11 +5493,6 @@ mod image_tests {
         );
         result.unwrap();
 
-        // Post-WS1 both CPU and G2D resolve untagged sources to limited-
-        // range BT.601/709 (G2D is limited-range matrix-only hardware), so
-        // the YUV-matrix delta that forced 0.95 has closed; tightened to
-        // 0.98. G2D declines full-range and BT.2020 (handled by GL/CPU) — a
-        // structural gap not exercised by these limited-range fixtures.
         compare_images(&g2d_dst, &cpu_dst, 0.98, function!());
     }
 
@@ -6144,12 +5661,7 @@ mod image_tests {
         compare_images(&gl_dst, &cpu_dst, 0.98, function!());
     }
 
-    /// A `Grey` source in zero-copy GPU memory converts to `Rgba`, `Rgb` and
-    /// `PlanarRgb` with its luma in every colour channel, matching the CPU.
-    /// The Linux import is R8, which samples as (l, 0, 0, 1) until the
-    /// sampler replicates it, so this runs on every GL platform and fails
-    /// rather than skips wherever a zero-copy `Grey` source exists. 62 is a
-    /// width that is not a multiple of 4 but whose pitch is aligned.
+    /// A zero-copy `Grey` source converts to `Rgba`, `Rgb` and `PlanarRgb` with its luma in every colour channel, matching the CPU.
     #[test]
     #[cfg(any(
         target_os = "linux",
@@ -6233,10 +5745,7 @@ mod image_tests {
                     "{}: {w}x{h} Grey -> {fmt:?} imports={imports} uploads={uploads}",
                     function!()
                 );
-                // Linux imports a zero-copy Grey source as an R8 EGLImage,
-                // the route whose sampler has to replicate the luma. A forced
-                // upload transfer (`EDGEFIRST_FORCE_TRANSFER=pbo` or `sync`)
-                // uploads it on purpose.
+                // A zero-copy transfer imports the Grey source once.
                 #[cfg(target_os = "linux")]
                 if gl.transfer_backend().is_zero_copy() {
                     assert_eq!(
@@ -6249,9 +5758,7 @@ mod image_tests {
         }
     }
 
-    /// Compare every image row of a GL and a CPU `Rgba`/`Rgb`/`PlanarRgb`
-    /// destination within ±4: V3D samples a step of 249 between neighbouring
-    /// texels up to 2 off, while a missing channel is off by up to 255.
+    /// Compares every image row of a GL and a CPU `Rgba`/`Rgb`/`PlanarRgb` destination within ±4.
     #[cfg(feature = "opengl")]
     fn assert_grey_rgb_rows_match(
         gl_dst: &TensorDyn,
@@ -6340,11 +5847,6 @@ mod image_tests {
         );
         result.unwrap();
 
-        // Post-WS1 both CPU and G2D resolve untagged sources to limited-
-        // range BT.601/709 (G2D is limited-range matrix-only hardware), so
-        // the YUV-matrix delta that forced 0.95 has closed; tightened to
-        // 0.98. G2D declines full-range and BT.2020 (handled by GL/CPU) — a
-        // structural gap not exercised by these limited-range fixtures.
         compare_images(&g2d_dst, &cpu_dst, 0.98, function!());
     }
 
@@ -6406,11 +5908,6 @@ mod image_tests {
         );
         result.unwrap();
 
-        // Post-WS1 both CPU and G2D resolve untagged sources to limited-
-        // range BT.601/709 (G2D is limited-range matrix-only hardware), so
-        // the YUV-matrix delta that forced 0.95 has closed; tightened to
-        // 0.98. G2D declines full-range and BT.2020 (handled by GL/CPU) — a
-        // structural gap not exercised by these limited-range fixtures.
         compare_images(&g2d_dst, &cpu_dst, 0.98, function!());
     }
 
@@ -6642,8 +6139,7 @@ mod image_tests {
         compare_images(&gl_dst, &cpu_dst, 0.98, function!());
     }
     /// A deterministic RGBA8 `Mem` source: `R = x`, `G = y`, `B = x + y`,
-    /// `A = 255`, each `& 255`. Written at the tensor's own row stride so a
-    /// padded allocation still gets the pattern at the right columns.
+    /// `A = 255`, each `& 255`, written at the tensor's own row stride.
     #[cfg(all(target_os = "windows", feature = "opengl"))]
     fn synthetic_rgba(w: usize, h: usize) -> TensorDyn {
         let t = TensorDyn::image(
@@ -6659,10 +6155,8 @@ mod image_tests {
         t
     }
 
-    /// Every pixel of `actual` equals `expected`, compared through the
-    /// tensors' own row compaction so a padded texture and a tight `Mem`
-    /// image compare as images. `compare_images` scores similarity and
-    /// accepts anything at a 0.0 threshold; this is the exact check.
+    /// Asserts every pixel of `actual` equals `expected`, compared through the
+    /// tensors' own row compaction.
     #[cfg(all(target_os = "windows", feature = "opengl"))]
     fn assert_pixels_identical(actual: &TensorDyn, expected: &TensorDyn, name: &str) {
         assert_eq!(actual.shape(), expected.shape(), "{name}: shapes differ");
@@ -6684,7 +6178,7 @@ mod image_tests {
         );
     }
 
-    /// Write the `synthetic_rgba` pattern into any writable RGBA8 tensor,
+    /// Writes the `synthetic_rgba` pattern into any writable RGBA8 tensor,
     /// a texture included, at its own row stride.
     #[cfg(all(target_os = "windows", feature = "opengl"))]
     fn fill_synthetic_rgba(t: &TensorDyn) {
@@ -6706,12 +6200,7 @@ mod image_tests {
     }
 
     /// Element-wise comparison of two float images of the same format and
-    /// dtype.
-    ///
-    /// Both sides are read through `copy_to_flat`, the tensor's own row
-    /// compaction, for the reason `compare_images` does: a Windows texture
-    /// destination pads its rows, so reading the head of the mapping as a
-    /// tight image would read padding as values. F16 values are widened with
+    /// dtype, read through `copy_to_flat`. F16 values are widened with
     /// `half::f16::to_f64` before the comparison.
     #[cfg(all(target_os = "windows", feature = "opengl"))]
     fn compare_float_images(a: &TensorDyn, b: &TensorDyn, tol: f64, what: &str) {
@@ -6761,28 +6250,7 @@ mod image_tests {
         }
     }
 
-    /// The float PBO readback has to land each destination row at the
-    /// destination's own pitch, exactly as the u8 PBO readback does.
-    ///
-    /// The packed render target's rows ARE the destination's rows -- `(W/4,
-    /// 3H)` RGBA16F texels, one plane row per surface row, for
-    /// `PlanarRgb`/F16; `(W*3, H)` R32F texels, one image row per surface
-    /// row, for `Rgb`/F32 -- and the read was tight whatever pitch the
-    /// destination declared. A pool tensor narrowed with `configure_image`
-    /// that keeps the pool's pitch is exactly that destination, so every row
-    /// after the first landed short.
-    ///
-    /// Both routes the pitch can take are covered. `POOL_W`'s pitch is a
-    /// whole number of texels for both formats, which `GL_PACK_ROW_LENGTH`
-    /// expresses; the F16 case adds a 4-byte pad, which an 8-byte texel does
-    /// not divide, so those rows are read tight and spread afterwards. The
-    /// tight stride is the control: it must still take the read it always
-    /// did.
-    ///
-    /// The oracle is the same convert into a tight PBO of the same geometry.
-    /// `compare_float_images` reads both sides through `copy_to_flat`, the
-    /// tensor's own row compaction, so it compares logical elements and not
-    /// mapping offsets.
+    /// The float PBO readback lands each destination row at the destination's own pitch.
     #[test]
     #[cfg(all(target_os = "windows", feature = "opengl"))]
     fn windows_padded_float_pbo_rows_land_at_the_declared_stride() {
@@ -6804,8 +6272,7 @@ mod image_tests {
                 PixelFormat::PlanarRgb,
                 DType::F16,
                 support.f16,
-                // Tight plane row, the pool's pitch (a whole texel count),
-                // and a 4-byte pad that no 8-byte texel divides.
+                // Tight plane row, the pool's pitch, and a 4-byte pad.
                 &[W * 2, POOL_W * 2, W * 2 + 4],
             ),
             (
@@ -6828,7 +6295,7 @@ mod image_tests {
                 crate::test_support::report_skip(&format!("{} - no GL processor", function!()));
                 return;
             };
-            // The oracle: a tight PBO of the target geometry, same route.
+            // The oracle: a tight PBO of the target geometry.
             let mut reference = gl
                 .create_pbo_image_dtype(W, H, fmt, dtype)
                 .unwrap_or_else(|e| panic!("{fmt:?}/{dtype:?}: tight reference PBO: {e:?}"));
@@ -6842,8 +6309,7 @@ mod image_tests {
 
             for &stride in strides {
                 let label = format!("{fmt:?}/{dtype:?} at a {stride} B pitch");
-                // Allocate at the pool width, then narrow the geometry and
-                // declare the pitch, as the u8 stride tests do.
+                // Allocates at the pool width, then narrows the geometry and declares the pitch.
                 let mut padded = gpu
                     .opengl
                     .as_ref()
@@ -6861,8 +6327,6 @@ mod image_tests {
                 let before = gpu.convert_fallback_count();
                 gpu.convert(&src, &mut padded, None)
                     .unwrap_or_else(|e| panic!("{label}: padded convert failed: {e}"));
-                // A CPU fallback writes the destination with the stride-aware
-                // CPU writers and would pass without the GL readback running.
                 assert_eq!(
                     gpu.convert_fallback_count(),
                     before,
@@ -6879,15 +6343,7 @@ mod image_tests {
         }
     }
 
-    /// Every float destination layout the GL backend reports it can render
-    /// must render zero-copy into the texture and match the CPU converter
-    /// element for element: F16 and F32 planar (three and four planes),
-    /// interleaved float RGB, and float RGBA.
-    ///
-    /// The destination memory is requested explicitly so each layout is
-    /// exercised as a texture whatever `create_image`'s own allocation
-    /// policy would pick for it; the policy itself is covered by
-    /// `windows_create_image_prefers_textures_and_convert_with_fence_returns_a_set_event`.
+    /// Every float destination layout the GL backend reports renders zero-copy into a texture and matches the CPU converter.
     #[test]
     #[cfg(all(target_os = "windows", feature = "opengl"))]
     fn windows_float_destinations_match_the_cpu_converter_for_every_layout() {
@@ -6969,11 +6425,7 @@ mod image_tests {
         }
     }
 
-    /// An even NV12 texture source on Windows is a native two-plane texture:
-    /// the GL backend imports its luma and chroma planes and draws it with the
-    /// hardware-filtered program. At 1:1 the result matches the CPU
-    /// converter to rounding; through a crop and a bilinear resize it stays
-    /// within a filtering tolerance. None of it may fall back to the CPU.
+    /// A native two-plane NV12 texture source converts on the GL backend with no CPU fallback and matches the CPU converter.
     #[test]
     #[cfg(all(target_os = "windows", feature = "opengl"))]
     fn windows_native_nv12_sources_convert_through_their_planes() {
@@ -7019,12 +6471,8 @@ mod image_tests {
             fill_nv12_gradient(&src, w, h);
             fill_nv12_gradient(&host, w, h);
             let crop = Region::new((w / 8) & !1, (h / 8) & !1, w / 2, h / 2);
-            // At 1:1 and through a crop the draw samples each texel once and
-            // matches the CPU converter to rounding. A bilinear resize is
-            // checked against the same convert of a host copy, which GL
-            // draws from an upload of the combined plane: the GPU's bilinear
-            // kernel is not the CPU's, but the two plane imports must sample
-            // exactly what the combined plane does.
+            // The 1:1 and crop draws are compared with the CPU converter, the
+            // bilinear resize with the same convert of a host copy.
             for (label, (dw, dh), region, cpu_reference) in [
                 ("1:1", (w, h), None, true),
                 ("crop", (w / 2, h / 2), Some(crop), true),
@@ -7070,9 +6518,7 @@ mod image_tests {
         }
     }
 
-    /// A native NV12 pool texture reconfigured for a smaller frame samples
-    /// inside its logical image: the planes are wider and taller than the
-    /// picture, whose chroma sits at the top of the texture's chroma plane.
+    /// A native NV12 pool texture reconfigured for a smaller frame samples inside its logical image.
     #[test]
     #[cfg(all(target_os = "windows", feature = "opengl"))]
     fn windows_native_nv12_pool_reconfigured_for_a_smaller_frame_converts() {
@@ -7193,22 +6639,14 @@ mod image_tests {
         true
     }
 
-    // The tests below wait on a Windows completion fence directly, so they
-    // need the raw wait call — no crate in this workspace wraps it.
+    // The Win32 wait call the fence tests use.
     #[cfg(target_os = "windows")]
     #[link(name = "kernel32")]
     extern "system" {
         fn WaitForSingleObject(handle: *mut std::ffi::c_void, milliseconds: u32) -> u32;
     }
 
-    /// A batch of deferred converts records one distinct fence value per
-    /// tile and submits once, at `flush`.
-    ///
-    /// The values are what a GPU consumer waits on, so they have to stay
-    /// per-destination and strictly increasing; the submission is what
-    /// batching exists to spare, so there must be exactly one of it. The
-    /// destinations are compared against the same convert done standalone,
-    /// which is what proves the deferred submission did not lose a tile.
+    /// A batch of deferred converts records one distinct fence value per tile and submits once, at `flush`.
     #[cfg(all(target_os = "windows", feature = "opengl"))]
     #[test]
     fn windows_deferred_batch_records_one_value_per_tile_and_submits_once() {
@@ -7265,8 +6703,6 @@ mod image_tests {
             );
         }
         p.flush().unwrap();
-        // The one submission the batch owed has happened, so every recorded
-        // value is reachable.
         let dev = edgefirst_tensor::d3d11::device().unwrap();
         let last = *values.last().unwrap();
         let ev = dev.event_for(last).unwrap();
@@ -7287,9 +6723,7 @@ mod image_tests {
             .create_image(w, h, PixelFormat::Rgba, DType::U8, None, CpuAccess::Read)
             .unwrap();
         p.convert(&src, &mut solo, None).unwrap();
-        // Read through the tensor's own compaction: a Windows texture's
-        // staging rows are pitch-padded, so a flat read of the mapping would
-        // compare padding as pixels.
+        // Reads through the tensor's own compaction.
         let flat = |img: &TensorDyn| -> Vec<u8> {
             let t = img.as_typed::<u8>().expect("u8 image");
             let mut out = vec![0u8; t.shape().iter().product::<usize>()];
@@ -7306,14 +6740,7 @@ mod image_tests {
         }
     }
 
-    /// A processor dropped with a batch still open submits what that batch
-    /// recorded.
-    ///
-    /// The values are already published on destinations that outlive the
-    /// processor, so a consumer may be waiting on one; a deferred signal that
-    /// is never submitted is a wait nothing can satisfy. `flush` is what
-    /// normally pays it, and the whole point here is that the caller never
-    /// calls it.
+    /// A processor dropped with a batch still open submits what that batch recorded.
     #[cfg(all(target_os = "windows", feature = "opengl"))]
     #[test]
     fn windows_dropping_a_processor_submits_an_open_batch() {
@@ -7356,7 +6783,6 @@ mod image_tests {
                 return;
             }
             p.convert_deferred(&src, &mut dst, None).unwrap();
-            // No `flush`: the drop below is what has to settle the batch.
             dst.gpu_completion()
                 .unwrap()
                 .expect("the deferred convert recorded a completion")
@@ -7375,10 +6801,7 @@ mod image_tests {
         }
     }
 
-    /// After Task B5, `create_image(.., None, ..)` reaches the Windows
-    /// Dma-first arm (a D3D11 texture, not a PBO or `Mem` tensor), and
-    /// `convert_with_fence` is available on every platform: on Windows it
-    /// returns a manual-reset event set when the GPU work completes.
+    /// `create_image(.., None, ..)` returns a D3D11 texture and `convert_with_fence` returns an event set when the GPU work completes.
     #[cfg(all(target_os = "windows", feature = "opengl"))]
     #[test]
     fn windows_create_image_prefers_textures_and_convert_with_fence_returns_a_set_event() {
@@ -7404,9 +6827,6 @@ mod image_tests {
                 CpuAccess::Read,
             )
             .unwrap();
-        // Without a GL backend (CI's no-ANGLE coverage pass) `create_image`
-        // answers host memory and there is no fence to wait on; the lanes
-        // that set HAL_TEST_REQUIRE_GL=1 still hold the texture-first claim.
         if dst.memory() != TensorMemory::DmaBuf
             && !std::env::var("HAL_TEST_REQUIRE_GL").is_ok_and(|v| v == "1")
         {
@@ -7422,8 +6842,6 @@ mod image_tests {
             TensorMemory::DmaBuf,
             "create_image(None) must prefer a texture on Windows"
         );
-        // Read before the wait: the recorded value must be the one the fence
-        // names, not an older point the destination happened to carry.
         let before = dst.gpu_completion().unwrap().map(|c| c.value);
         let fence = p
             .convert_with_fence(&src, &mut dst, None)
@@ -7438,27 +6856,18 @@ mod image_tests {
             before.is_none_or(|b| recorded > b),
             "the fenced convert recorded a newer value than {before:?}"
         );
-        // One flush and one signal for the whole call: the value the
-        // destination carries is the newest the device has allocated, so
-        // nothing was signalled after `record_completion`. Two signals (the
-        // shape this replaced) would leave `last_signalled` one past it.
+        // One signal for the whole call.
         assert_eq!(
             edgefirst_tensor::d3d11::device().unwrap().last_signalled(),
             recorded,
             "a fenced convert must signal exactly once"
         );
-        // SAFETY: `fence` owns a live Win32 event handle returned by
-        // `convert_with_fence`; WaitForSingleObject only reads the handle,
-        // which stays valid for the duration of this call because `fence`
-        // is not dropped until after it.
+        // SAFETY: `fence` owns a live Win32 event handle that outlives this call.
         assert_eq!(
             unsafe { WaitForSingleObject(fence.as_raw_handle() as _, 5000) },
             0,
             "fence was not set within 5 seconds"
         );
-        // The event and the destination's own completion name the same
-        // value, so a consumer may wait on either: the event fired, and the
-        // device's completed value has reached the value `dst` reports.
         assert!(
             edgefirst_tensor::d3d11::device().unwrap().completed_value() >= recorded,
             "the event fired, so the recorded value {recorded} is complete"
@@ -7486,10 +6895,8 @@ mod image_tests {
         compare_images(&dst, &expected, 0.0, "fenced convert");
     }
 
-    /// A Windows GL test's destination must be a texture; without a GL backend
-    /// (CI's no-ANGLE coverage pass) `create_image` answers host memory and the
-    /// test skips, unless the lane set HAL_TEST_REQUIRE_GL=1, which keeps the
-    /// texture-first claim a hard assertion.
+    /// Whether `t` is a texture. Otherwise reports a skip, or panics when
+    /// `HAL_TEST_REQUIRE_GL=1`.
     #[cfg(all(target_os = "windows", feature = "opengl"))]
     fn texture_or_skip(t: &TensorDyn, test: &str) -> bool {
         if t.memory() == TensorMemory::DmaBuf {
@@ -7508,11 +6915,7 @@ mod image_tests {
         false
     }
 
-    /// A draw into a texture destination records a completion on it the way
-    /// a convert does, so a device consumer can wait on the drawn frame. The
-    /// destination is `CpuAccess::Read`: only the GL backend can write it,
-    /// so a CPU fallback fails the draw outright instead of leaving the
-    /// completion empty.
+    /// A draw into a texture destination records a completion on it.
     #[cfg(all(target_os = "windows", feature = "opengl"))]
     #[test]
     fn windows_draw_decoded_masks_into_a_texture_records_a_completion() {
@@ -7562,9 +6965,6 @@ mod image_tests {
             .expect("the draw recorded no completion on dst");
         assert!(completion.value > 0, "completion value must be non-zero");
 
-        // The drawn frame is read back through the texture's staging copy;
-        // `copy_to_flat` compacts its padded rows into tight RGBA pixels and
-        // needs only a read mapping, which the read-only texture allows.
         // The corner is cleared and the box centre carries the mask colour.
         let mut flat = vec![0u8; 64 * 64 * 4];
         dst.as_typed::<u8>()
@@ -7579,8 +6979,7 @@ mod image_tests {
         assert_ne!(px(32, 32), [0, 0, 0, 0], "centre (32,32) was not coloured");
     }
 
-    /// The full-GPU proto draw (forced GL, no CPU materialize) records a
-    /// completion on a texture destination too.
+    /// The full-GPU proto draw records a completion on a texture destination.
     #[cfg(all(target_os = "windows", feature = "opengl"))]
     #[test]
     fn windows_draw_proto_masks_into_a_texture_records_a_completion() {
@@ -7593,9 +6992,6 @@ mod image_tests {
             ));
             return;
         }
-        // Forcing OpenGL fails outright without a GL backend (CI's no-ANGLE
-        // coverage pass); that is the same skip the texture guard below gives,
-        // unless the lane set HAL_TEST_REQUIRE_GL=1.
         let mut p = match with_force_backend(Some("opengl"), ImageProcessor::new) {
             Ok(p) => p,
             Err(e) if !std::env::var("HAL_TEST_REQUIRE_GL").is_ok_and(|v| v == "1") => {
@@ -7640,10 +7036,7 @@ mod image_tests {
         assert!(completion.value > 0, "completion value must be non-zero");
     }
 
-    /// An empty draw with a host-memory background onto a texture
-    /// destination leaves the background in the texture, rows in order.
-    /// The gradient pattern makes a missing or vertically flipped base
-    /// layer differ from the expected image.
+    /// An empty draw with a host-memory background onto a texture destination leaves the background in it, rows in order.
     #[cfg(all(target_os = "windows", feature = "opengl"))]
     #[test]
     fn windows_draw_decoded_masks_composites_a_host_background_onto_a_texture() {
@@ -7670,8 +7063,7 @@ mod image_tests {
         assert!(dst.gpu_completion().unwrap().is_some());
     }
 
-    /// The same draw with the background in a texture of its own: the
-    /// base layer is sampled from the background texture directly.
+    /// An empty draw with a texture background onto a texture destination leaves the background in it.
     #[cfg(all(target_os = "windows", feature = "opengl"))]
     #[test]
     fn windows_draw_decoded_masks_composites_a_texture_background_onto_a_texture() {
@@ -7710,11 +7102,7 @@ mod image_tests {
         assert!(dst.gpu_completion().unwrap().is_some());
     }
 
-    /// A draw into a `view()` of a texture fills that band and leaves its
-    /// sibling alone. The GL draw declines a sub-region destination
-    /// (`check_draw_dst_placement`) and the CPU backend, which offsets into
-    /// the parent, takes it; the zero-copy arm would otherwise have cleared
-    /// the parent's first rows instead of the view's.
+    /// A draw into a `view()` of a texture fills that band and leaves its sibling alone.
     #[cfg(all(target_os = "windows", feature = "opengl"))]
     #[test]
     fn windows_draw_decoded_masks_into_a_texture_view_fills_only_its_band() {
@@ -7744,9 +7132,7 @@ mod image_tests {
         }
         fill_synthetic_rgba(&parent);
 
-        // The lower band only. An empty draw with no background clears its
-        // destination, so a write at the parent's origin would show up as
-        // cleared pixels in the upper band.
+        // The lower band only.
         let mut band = parent
             .view(edgefirst_tensor::Region::new(0, h / 2, w, h / 2))
             .unwrap();
@@ -7773,8 +7159,7 @@ mod image_tests {
             }
         }
 
-        // The GL decline is what sent the draw above to the CPU: with GL
-        // forced there is no CPU arm to fall through to, so it surfaces.
+        // With GL forced, the draw into the view is refused.
         let mut forced = with_force_backend(Some("opengl"), ImageProcessor::new).unwrap();
         let mut band = parent
             .view(edgefirst_tensor::Region::new(0, h / 2, w, h / 2))
@@ -7788,10 +7173,7 @@ mod image_tests {
         );
     }
 
-    /// `set_class_colors` reaches the CPU backend even when GL accepts it, so
-    /// a draw GL declines still renders the caller's palette. The view
-    /// destination is the reachable decline: `check_draw_dst_placement`
-    /// refuses it and the CPU backend draws the mask.
+    /// A draw GL declines renders the palette given to `set_class_colors`.
     #[cfg(all(target_os = "windows", feature = "opengl"))]
     #[test]
     fn windows_class_colors_reach_the_cpu_backend_behind_a_declined_gl_draw() {
@@ -7825,10 +7207,6 @@ mod image_tests {
                 CpuAccess::ReadWrite,
             )
             .unwrap();
-        // Without a GL backend (CI's no-ANGLE coverage pass) `create_image`
-        // answers host memory and nothing declines the draw; the test needs
-        // the texture-backed parent so the view is the reachable decline. The
-        // lanes that set HAL_TEST_REQUIRE_GL=1 still require the texture.
         if parent.memory() != TensorMemory::DmaBuf
             && !std::env::var("HAL_TEST_REQUIRE_GL").is_ok_and(|v| v == "1")
         {
@@ -7869,8 +7247,7 @@ mod image_tests {
             .unwrap()
             .copy_to_flat(&mut flat)
             .expect("read the parent texture");
-        // The band's centre, inside the box. The mask blend writes RGB only;
-        // alpha is whatever the base layer left, which is the clear.
+        // The band's centre, inside the box.
         let o = ((h / 2 + h / 4) * w + w / 2) * 4;
         assert_eq!(
             &flat[o..o + 3],
@@ -7880,10 +7257,7 @@ mod image_tests {
         );
     }
 
-    /// Two independently-created `ImageProcessor`s, each converting into its
-    /// own texture destination in lockstep, must not bleed GL state into
-    /// each other across 200 iterations (the destination created by
-    /// `create_image(None)` is the texture arm this task adds).
+    /// Two `ImageProcessor`s converting into their own texture destinations in lockstep stay independent over 200 iterations.
     #[cfg(all(target_os = "windows", feature = "opengl"))]
     #[test]
     fn two_processors_alternate_on_texture_destinations_without_state_bleed() {
@@ -7976,9 +7350,7 @@ mod image_tests {
 
         let mut gl_converter = GLProcessorThreaded::new(None).unwrap();
 
-        // Every backing this host can allocate: Shm is Unix-only, and the
-        // zero-copy slot is DMA-BUF on Linux / IOSurface on macOS (nothing on
-        // Windows yet).
+        // Every backing this host can allocate.
         let mut mem = vec![None, Some(TensorMemory::Mem)];
         if edgefirst_tensor::is_shm_available() {
             mem.push(Some(TensorMemory::Shm));
@@ -8093,9 +7465,7 @@ mod image_tests {
 
     #[cfg(target_os = "linux")]
     fn test_cpu_rotate_(rot: Rotation) {
-        // This test rotates the image 4 times and checks that the image was returned to
-        // be the same Currently doesn't check if rotations actually rotated in
-        // right direction
+        // Rotates the image four times and compares it with the original.
         let file = edgefirst_bench::testdata::read("zidane.jpg").to_vec();
 
         let unchanged_src =
@@ -8119,8 +7489,6 @@ mod image_tests {
         )
         .unwrap();
         let mut cpu_converter = CPUProcessor::new();
-
-        // After rotating 4 times, the image should be the same as the original
 
         let (result, src, cpu_dst) = convert_img(
             &mut cpu_converter,
@@ -8181,7 +7549,7 @@ mod image_tests {
         }
 
         let size = (1280, 720);
-        // Same backing list as `test_opengl_all_rgba`.
+        // Every backing this host can allocate.
         let mut mem = vec![None, Some(TensorMemory::Mem)];
         if edgefirst_tensor::is_shm_available() {
             mem.push(Some(TensorMemory::Shm));
@@ -8353,11 +7721,6 @@ mod image_tests {
         );
         result.unwrap();
 
-        // Post-WS1 both CPU and G2D resolve untagged sources to limited-
-        // range BT.601/709 (G2D is limited-range matrix-only hardware), so
-        // the YUV-matrix delta that forced 0.95 has closed; tightened to
-        // 0.98. G2D declines full-range and BT.2020 (handled by GL/CPU) — a
-        // structural gap not exercised by these limited-range fixtures.
         compare_images(&g2d_dst, &cpu_dst, 0.98, function!());
     }
 
@@ -8663,8 +8026,6 @@ mod image_tests {
             .as_mut_slice()
             .copy_from_slice(&edgefirst_bench::testdata::read("camera720p.rgba"));
 
-        // CPU path resolves the untagged 720p source to BT.709 limited (height
-        // heuristic), matching the BT.709 camera fixture; measured 0.9995.
         compare_images(&dst, &target_image, 0.98, function!());
     }
 
@@ -8733,8 +8094,6 @@ mod image_tests {
             )
             .for_each(|(dst, src)| *dst = [src[0], src[1], src[2]]);
 
-        // CPU path resolves the untagged 720p source to BT.709 limited (height
-        // heuristic), matching the BT.709 camera fixture; measured 0.9995.
         compare_images(&dst, &target_image, 0.98, function!());
     }
 
@@ -8797,9 +8156,6 @@ mod image_tests {
             .as_mut_slice()
             .copy_from_slice(&edgefirst_bench::testdata::read("camera720p.rgba"));
 
-        // Post-WS1 the GPU path applies the resolved per-tensor colorimetry,
-        // so the matrix delta vs the reference that forced 0.95 has closed;
-        // tightened to 0.98 (confirmed on the GPU/G2D lanes).
         compare_images(&dst, &target_image, 0.98, function!());
     }
 
@@ -8817,8 +8173,6 @@ mod image_tests {
             crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
             return;
         }
-        // Zero-copy YUYV source: DMA-BUF on Linux, IOSurface on macOS, a
-        // D3D11 texture on Windows; skips where no such backing exists.
         if !crate::test_support::is_gpu_buffer_available() {
             crate::test_support::report_skip(&format!(
                 "{} - zero-copy GPU buffer (DMA-BUF / IOSurface) not available on this host",
@@ -8855,8 +8209,6 @@ mod image_tests {
             Flip::None,
             Crop::no_crop(),
         );
-        // Desktop NVIDIA cannot sample YUYV as a GL texture; i.MX/Vivante can.
-        // Production ImageProcessor falls back to CPU; this oracle skips.
         if let Err(crate::Error::NotSupported(msg)) = &result {
             crate::test_support::report_skip(&format!("{} — {msg}", function!()));
             return;
@@ -8880,21 +8232,10 @@ mod image_tests {
             .as_mut_slice()
             .copy_from_slice(&edgefirst_bench::testdata::read("camera720p.rgba"));
 
-        // Post-WS1 the GPU path applies the resolved per-tensor colorimetry,
-        // so the matrix delta vs the reference that forced 0.95 has closed;
-        // tightened to 0.98 (confirmed on the GPU/G2D lanes).
         compare_images(&dst, &target_image, 0.98, function!());
     }
 
-    /// macOS analog of `test_yuyv_to_rgba_opengl` — drives the ANGLE +
-    /// IOSurface backend end-to-end and compares against the same
-    /// reference image. Skips silently if ANGLE isn't installed so the
-    /// test suite still passes on CI hosts without the Homebrew tap.
-    /// Step-1 probe: proves ANGLE's Metal IOSurface-client-buffer path accepts
-    /// an `L008`→`GL_RED` (R8) binding — the foundation for sampling the
-    /// contiguous semi-planar YUV buffer as a single R8 texture. Renders a
-    /// GREY (R8 IOSurface) source through the GL backend to RGBA and checks the
-    /// luma round-trips to R=G=B (identity GREY→RGB).
+    /// The GL backend renders a GREY R8 IOSurface source to RGBA with R=G=B equal to the luma.
     #[test]
     #[cfg(target_os = "macos")]
     #[cfg(feature = "opengl")]
@@ -8920,7 +8261,7 @@ mod image_tests {
             edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .expect("GREY IOSurface (R8/L008) should allocate — proves the FourCC mapping");
-        // Known luma ramp: value = (x * 13 + y * 7) & 0xff.
+        // Luma ramp: value = (x * 13 + y * 7) & 0xff.
         {
             let su8 = src.as_typed::<u8>().unwrap();
             let stride = src
@@ -8985,11 +8326,7 @@ mod image_tests {
         }
     }
 
-    /// Two-pass GPU chain: NV12 (R8 IOSurface) → PlanarRgb F16, the profiler's
-    /// preprocess. Verifies the chained `convert_nv_to_planar_float`
-    /// (NV12→RGBA8 then the verified RGBA8→PlanarRgb F16) executes on ANGLE and
-    /// produces a sane F16 planar result: a neutral-grey NV12 input (Y=U=V=128,
-    /// BT.601 full ⇒ RGB≈0.5) must yield all three planes ≈0.5 (half-float).
+    /// A neutral-grey NV12 IOSurface converts on the GPU to `PlanarRgb` F16 planes near 0.5.
     #[test]
     #[cfg(target_os = "macos")]
     #[cfg(feature = "opengl")]
@@ -9036,11 +8373,7 @@ mod image_tests {
             return;
         };
         let mut dst = dst;
-        // Call convert directly (the convert_img helper restores u8 only).
         if let Err(e) = ImageProcessorTrait::convert(&mut gpu, &src, &mut dst, None) {
-            // GL_EXT_color_buffer_half_float may be absent on some configs; the
-            // RGBA8 pass-1 + F16 pass-2 path then can't render. Skip rather than
-            // fail on a capability gap (the same policy as the F16 path tests).
             crate::test_support::report_skip(&format!(
                 "{} — NV12→PlanarRgb F16 not available ({e:?})",
                 function!()
@@ -9050,8 +8383,6 @@ mod image_tests {
         let dt = dst.as_typed::<half::f16>().expect("dst is F16 PlanarRgb");
         let map = dt.map().unwrap();
         let vals = map.as_slice();
-        // Neutral grey → ~0.5 in every plane. Allow generous tolerance for the
-        // mediump YUV math + half-float rounding.
         let mut checked = 0usize;
         for &v in vals.iter() {
             let f = f32::from(v);
@@ -9067,13 +8398,7 @@ mod image_tests {
         );
     }
 
-    /// Profiler-shaped two-pass: a reused **R8/Grey pool** (allocated larger
-    /// than the frame, the NV24 worst case `3·H`) is reconfigured to an NV12
-    /// frame, filled at the preserved physical stride, and converted with a
-    /// letterbox `src_rect` crop into a model-sized PlanarRgb F16 destination —
-    /// exactly the orchestrator's preprocess. Guards against the pooled
-    /// two-pass NV→PlanarRgb F16 path hanging/erroring (the exact-size
-    /// `test_nv12_to_planar_f16_two_pass` never exercised the larger pool).
+    /// An NV12 frame in a larger reused R8 pool converts with a letterbox crop into a `PlanarRgb` F16 destination.
     #[test]
     #[cfg(target_os = "macos")]
     #[cfg(feature = "opengl")]
@@ -9085,7 +8410,7 @@ mod image_tests {
                 return;
             }
         };
-        // Frame 96×64 in a 256×768 R8 pool (3·256 height; bpr padded past 96).
+        // Frame 96×64 in a 256×768 R8 pool.
         let (fw, fh) = (96usize, 64usize);
         let (pool_w, pool_h) = (256usize, 768usize);
         let (model_w, model_h) = (128usize, 128usize);
@@ -9131,7 +8456,6 @@ mod image_tests {
             return;
         };
 
-        // Letterbox crop like the profiler: the backend computes the band.
         let _ = model_w;
         let crop = Crop::new()
             .with_source(Some(Region::new(0, 0, fw, fh)))
@@ -9151,8 +8475,6 @@ mod image_tests {
             return;
         }
         let _ = stride;
-        // Neutral grey → ~0.5 inside the letterbox band; just assert the convert
-        // completed and produced finite values (no hang, no NaN garbage).
         let dt = dst.as_typed::<half::f16>().expect("dst F16");
         let map = dt.map().unwrap();
         let any_half = map.as_slice().iter().any(|&v| {
@@ -9162,18 +8484,12 @@ mod image_tests {
         assert!(any_half, "expected ~0.5 grey samples in the letterbox band");
     }
 
-    /// Mirrors the orchestrator: the GL processor is created on one thread
-    /// and `convert()` is called from a *different* thread (the profiler's
-    /// Pre-processing worker). Reproduces (or rules out) the GL-context /
-    /// `glFinish` cross-thread hang seen in the live pipeline. A 20 s watchdog
-    /// fails loudly rather than hanging the whole test binary.
+    /// A processor created on one thread converts on another within a 20 s watchdog.
     #[test]
     #[cfg(target_os = "macos")]
     #[cfg(feature = "opengl")]
     fn test_nv12_to_planar_f16_cross_thread_opengl_macos() {
         use std::sync::mpsc;
-        // Public ImageProcessor (Send) created HERE (the main test thread),
-        // exactly like the orchestrator builds `config.processor` during setup.
         let mut proc = match ImageProcessor::new() {
             Ok(p) => p,
             Err(e) => {
@@ -9217,8 +8533,6 @@ mod image_tests {
         };
         let crop = Crop::new().with_source(Some(Region::new(0, 0, fw, fh)));
 
-        // ...then MOVED to a worker thread where convert() runs — exactly the
-        // orchestrator's create-on-setup / convert-on-Pre-processing split.
         let (tx, rx) = mpsc::channel::<bool>();
         let worker = std::thread::spawn(move || {
             let _ = ImageProcessorTrait::convert(
@@ -9237,12 +8551,7 @@ mod image_tests {
         }
     }
 
-    /// Reproduces the profiler's progressive-slowdown/hang: one processor
-    /// converting many **varying-size** NV frames (like a COCO dataset) from a
-    /// reused R8 pool into a fixed PlanarRgb F16 model input. The two-pass path
-    /// reallocated its RGBA intermediate per frame-size, churning/leaking
-    /// pbuffers until the GPU stalled. Asserts per-convert latency stays bounded
-    /// (no runaway) over many iterations.
+    /// One processor converting many varying-size NV frames from a reused pool keeps per-convert latency bounded.
     #[test]
     #[cfg(target_os = "macos")]
     #[cfg(feature = "opengl")]
@@ -9254,8 +8563,7 @@ mod image_tests {
                 return;
             }
         };
-        // Mirror the orchestrator's ring buffers at depth 4: a pool of source R8
-        // tensors AND a pool of PlanarRgb F16 dst slots, both cycled per frame.
+        // A pool of source R8 tensors and a pool of `PlanarRgb` F16 destinations, both of depth 4.
         let (max_w, max_h) = (640usize, 640usize);
         let depth = 4usize;
         let mut srcs = Vec::new();
@@ -9290,7 +8598,7 @@ mod image_tests {
             };
             dsts.push(dst);
         }
-        // COCO-like assorted frame sizes (all ≤ max), cycled.
+        // Assorted frame sizes, all ≤ max, cycled.
         let sizes = [
             (640, 480),
             (500, 375),
@@ -9339,12 +8647,7 @@ mod image_tests {
         );
     }
 
-    /// Step-2 verification: NV12/NV16/NV24 (R8 IOSurface) → RGBA on the GPU
-    /// must match the CPU `yuv` kernels within shader rounding. Fills an
-    /// IOSurface source and a Mem source from the same logical YUV pattern
-    /// (each at its own row stride), converts the IOSurface on the GPU and the
-    /// Mem one on the CPU, and compares. Exercises the in-shader semi-planar
-    /// addressing for all three subsamplings (incl. NV24's 2×-wide UV rows).
+    /// NV12, NV16 and NV24 IOSurface sources convert to RGBA on the GPU matching the CPU within shader rounding.
     #[test]
     #[cfg(target_os = "macos")]
     #[cfg(feature = "opengl")]
@@ -9361,17 +8664,10 @@ mod image_tests {
         };
         let mut cpu = CPUProcessor::new();
 
-        // Fill Y plus the interleaved UV plane in the canonical semi-planar
-        // layout — exactly what the codec writes and the CPU `yuv`-crate reader
-        // expects: the Y plane is `h` rows at the buffer's row stride; the UV
-        // plane starts at `h * stride`; each chroma row advances
-        // `uv_grid_rows * stride` bytes (NV24 carries a full-resolution `2*W`
-        // byte line == two grid rows, NV12/NV16 one row of `W/2` pairs); each
-        // (Cb,Cr) pair is two consecutive bytes at column `cx * 2`. This is
-        // stride-correct for both the tight Mem buffer and the padded IOSurface.
-        //
-        // Takes explicit w/h so the closure can be reused across multiple frame
-        // sizes (even and odd) without capturing a fixed outer variable.
+        // Fills Y and the interleaved UV plane in the semi-planar layout: the Y
+        // plane is `h` rows at `stride`; the UV plane starts at `h * stride`; each
+        // chroma row advances `uv_grid_rows * stride` bytes; each (Cb, Cr) pair is
+        // two consecutive bytes at column `cx * 2`.
         let fill = |buf: &mut [u8], stride: usize, fmt: PixelFormat, w: usize, h: usize| {
             for y in 0..h {
                 for x in 0..w {
@@ -9395,7 +8691,7 @@ mod image_tests {
 
         for fmt in [PixelFormat::Nv12, PixelFormat::Nv16, PixelFormat::Nv24] {
             for (w, h) in [
-                (16usize, 16usize), // original even-dim case
+                (16usize, 16usize), // even dimensions
                 (15, 16),           // odd-W
                 (16, 15),           // odd-H
             ] {
@@ -9511,13 +8807,7 @@ mod image_tests {
         }
     }
 
-    /// Phase-0 gate: the reused-pool / larger-surface case. A single R8 pool
-    /// IOSurface (allocated bigger than the frame, so its `bytesPerRow` exceeds
-    /// the frame's even width) is reconfigured to each NV frame, filled at the
-    /// preserved physical stride, and converted on the GPU. This proves ANGLE
-    /// binds the *whole* physical surface as a pbuffer and that `texelFetch`
-    /// resolves the frame's Y/UV texels through the surface's real `bytesPerRow`
-    /// (the physical-grid / logical-ROI decoupling). GPU must match CPU ≤3 LSB.
+    /// NV frames in a larger reused R8 pool IOSurface convert on the GPU matching the CPU within 3 LSB.
     #[test]
     #[cfg(target_os = "macos")]
     #[cfg(feature = "opengl")]
@@ -9533,13 +8823,10 @@ mod image_tests {
             }
         };
         let mut cpu = CPUProcessor::new();
-        // The pool is generously oversized (256-wide → bpr 256, well beyond any
-        // frame's even width) and tall enough for NV24's 3·H at the test frames.
         let (pool_w, pool_h) = (256usize, 256usize);
 
-        // Canonical semi-planar fill: Y plane at the row stride, then the UV
-        // plane at `h * stride` with each chroma row advancing `uv_grid_rows *
-        // stride` bytes. Stride-correct for both tight Mem and padded IOSurface.
+        // Semi-planar fill: the Y plane at the row stride, then the UV plane at
+        // `h * stride`, each chroma row advancing `uv_grid_rows * stride` bytes.
         let fill = |buf: &mut [u8], stride: usize, fmt: PixelFormat, w: usize, h: usize| {
             for y in 0..h {
                 for x in 0..w {
@@ -9563,12 +8850,11 @@ mod image_tests {
 
         for fmt in [PixelFormat::Nv12, PixelFormat::Nv16, PixelFormat::Nv24] {
             for (w, h) in [
-                (40usize, 24usize), // original even-dim case
+                (40usize, 24usize), // even dimensions
                 (15, 16),           // odd-W
                 (16, 15),           // odd-H
             ] {
-                // `ew` is the minimum even extent; the pool stride must exceed it
-                // to actually exercise the physical-stride shader decoupling.
+                // `ew` is the minimum even extent.
                 let ew = w.next_multiple_of(2);
 
                 // CPU reference from a tightly-packed Mem tensor at the frame size.
@@ -9612,9 +8898,7 @@ mod image_tests {
                 );
                 r.unwrap_or_else(|e| panic!("CPU {fmt:?}->{w}x{h}->RGBA: {e}"));
 
-                // GPU source: a LARGER R8 pool surface, reconfigured down to the
-                // frame. Phase 1 preserves the pool's padded `bytesPerRow` as the
-                // tensor's row stride; the fill writes the frame at that stride.
+                // GPU source: a larger R8 pool surface reconfigured to the frame, filled at the pool's row stride.
                 let Some(mut ios) = crate::test_support::gpu_buffer_allocated(
                     TensorDyn::image(
                         pool_w,
@@ -9765,31 +9049,10 @@ mod image_tests {
             .as_mut_slice()
             .copy_from_slice(&edgefirst_bench::testdata::read("camera720p.rgba"));
 
-        // macOS YUYV shader now threads per-tensor colorimetry: the untagged
-        // camera720p source resolves to BT.709 limited (matching the BT.709
-        // reference), measured 0.9973 on ANGLE — up from 0.9733 under the old
-        // BT.601-full stop-gap. 0.98 leaves headroom for cross-GPU variance.
         compare_images(&dst, &target_image, 0.98, function!());
     }
 
-    /// Multi-resolution smoke test: convert YUYV→RGBA via the GL
-    /// backend at a small (64×32) frame and a 4K (3840×2160) frame,
-    /// both filled with a synthetic mid-grey pattern. Validates the
-    /// shader math at the chroma-pairing boundary on small textures
-    /// and exercises the IOSurface bytes-per-row alignment path at 4K
-    /// (3840 pixels × 2 bytes/pixel = 7680 bytes, naturally 64-aligned).
-    ///
-    /// Resolutions below 32 pixels wide aren't tested because the
-    /// IOSurface allocator pads bpr to 64 bytes — for a 4-px-wide
-    /// YUYV surface that's 8 bytes data + 56 bytes padding per row,
-    /// which exercises a sampling pattern that's ANGLE-version
-    /// dependent rather than HAL-correctness dependent.
-    ///
-    /// This complements `test_yuyv_to_rgba_opengl_macos` (which checks
-    /// pixel-exact correctness against a reference image at 720p) by
-    /// ensuring the pipeline does not crash or produce gross errors at
-    /// resolution extremes. Pixel-exact validation at 4K would require
-    /// a 30 MB reference file we don't want to bundle.
+    /// The GL backend converts mid-grey YUYV to RGBA at 64×32 and at 3840×2160.
     #[test]
     #[cfg(target_os = "macos")]
     #[cfg(feature = "opengl")]
@@ -9806,8 +9069,7 @@ mod image_tests {
         };
 
         for (w, h) in [(64usize, 32usize), (3840, 2160)] {
-            // Synthetic YUYV: Y=128 (mid-grey luma), U=V=128 (neutral
-            // chroma) → RGB grey at the output.
+            // Synthetic YUYV: Y=128, U=V=128.
             let bytes_per_row = w * 2;
             let mut yuyv = vec![0u8; bytes_per_row * h];
             for chunk in yuyv.as_chunks_mut::<4>().0 {
@@ -9841,10 +9103,6 @@ mod image_tests {
             );
             result.expect("GL convert should succeed at this resolution");
 
-            // The neutral-chroma input must produce a near-grey output;
-            // BT.709 limited-range maps Y=128/UV=128 → roughly
-            // (130, 130, 130). Allow ±4 LSB for `mediump float` shader
-            // rounding.
             let dst_u8 = dst.as_typed::<u8>().unwrap();
             let dst_map = dst_u8.map().unwrap();
             let dst_bytes = dst_map.as_slice();
@@ -9862,15 +9120,7 @@ mod image_tests {
         }
     }
 
-    /// Verify that two consecutive convert() calls on the same source
-    /// tensor reuse the cached EGL pbuffer. Tests the cache hit path
-    /// added with the macOS GL backend hardening — without it, each
-    /// frame would pay `eglCreatePbufferFromClientBuffer` + destroy.
-    ///
-    /// This is a behaviour test rather than a perf test (the timing
-    /// difference is 100-200µs which is too noisy to assert on); we
-    /// check that the second call succeeds and produces a result
-    /// identical to the first.
+    /// Two consecutive converts of one source tensor succeed and produce identical output.
     #[test]
     #[cfg(target_os = "macos")]
     #[cfg(feature = "opengl")]
@@ -9886,7 +9136,6 @@ mod image_tests {
             }
         };
 
-        // Allocate one source + one destination, run convert twice.
         let mut yuyv = vec![0u8; 64 * 32 * 2];
         for chunk in yuyv.as_chunks_mut::<4>().0 {
             chunk[0] = 200;
@@ -9944,13 +9193,7 @@ mod image_tests {
         assert_eq!(first, second, "cache-hit conversion must be deterministic");
     }
 
-    /// Steady-state import gate (macOS half of the Linux
-    /// `dma_pool_steady_state_zero_imports` test): an N-frame convert loop
-    /// over a fixed pool of IOSurface tensors must create ZERO new EGL
-    /// pbuffers after the pool has been seen once — pbuffer-cache misses
-    /// stay flat while hits grow. Counter-based hardening of
-    /// `test_macos_gl_pbuffer_cache_reuses_surfaces` above: a refactor that
-    /// re-imports per frame passes the pixel-equality test but fails this.
+    /// A convert loop over a fixed pool of IOSurface tensors creates no EGL pbuffers after the pool has been seen once.
     #[test]
     #[cfg(target_os = "macos")]
     #[cfg(feature = "opengl")]
@@ -9987,7 +9230,7 @@ mod image_tests {
         )
         .unwrap();
 
-        // Warmup: two passes over the pool import every surface once.
+        // Warm-up: two passes over the pool.
         for src in pool.iter().cycle().take(POOL * 2) {
             proc.convert(src, &mut dst, None).unwrap();
         }
@@ -10011,17 +9254,7 @@ mod image_tests {
         );
     }
 
-    /// Backend assertion for the F16 zero-copy path: when the GL backend
-    /// initialized (ANGLE on macOS) and reports F16 color-buffer support,
-    /// the NV12→PlanarRgb-F16 IOSurface convert MUST be handled by the GL
-    /// engine — proven by the engine's import-cache counters moving, not
-    /// just by output correctness. This is the guard against the
-    /// silent-CPU-fallback failure mode: a misclassified IOSurface F16
-    /// destination keeps every output-correctness test green while
-    /// quietly running ~10× slower on CPU; only a backend observable
-    /// catches it. Skips ONLY when GL itself is unavailable or the
-    /// configuration lacks F16 — a convert error or a CPU-routed convert
-    /// with the capability present is a FAILURE.
+    /// The NV12 to `PlanarRgb` F16 IOSurface convert runs on the GL engine, shown by its import-cache counters.
     #[test]
     #[cfg(target_os = "macos")]
     #[cfg(feature = "opengl")]
@@ -10078,10 +9311,6 @@ mod image_tests {
             .expect("GL backend present")
             .egl_cache_stats()
             .expect("cache stats");
-        // ≥ 2 misses: the fused convert imports the zero-copy NV source
-        // (pass 1) AND the F16 destination (pass 2). Requiring both means a
-        // convert that imported its source, failed mid-engine, and fell back
-        // to CPU (1 miss) cannot satisfy this gate.
         assert!(
             stats_after.total_misses() >= stats_before.total_misses() + 2,
             "convert succeeded but the GL engine did not import both the \
@@ -10092,11 +9321,7 @@ mod image_tests {
         );
     }
 
-    /// Portable oracle for the fused NV12→PlanarRgb-F16 engine convert
-    /// (two GL passes: NV→RGBA intermediate, then the packed RGBA16F
-    /// render). New on every platform with F16 render support — macOS
-    /// IOSurface and Linux DMA-BUF alike. Compares against the CPU
-    /// backend's reference within the float-path tolerance.
+    /// The fused NV12 to `PlanarRgb` F16 GL convert matches the CPU backend within the float-path tolerance.
     #[test]
     #[cfg(feature = "opengl")]
     fn test_nv12_to_planar_f16_fused_engine_vs_cpu() {
@@ -10139,11 +9364,7 @@ mod image_tests {
         )
         .unwrap();
         {
-            // Smooth gradients, NOT noise: the GL and CPU paths upsample
-            // chroma with different kernels (nearest vs bilinear), which
-            // legitimately diverges on per-texel chroma noise. Gradients
-            // keep that kernel difference sub-LSB while still exercising
-            // the full matrix math and the letterbox geometry.
+            // Fills the source with smooth gradients.
             let t = src.as_typed::<u8>().unwrap();
             let mut m = t.map().unwrap();
             let buf = m.as_mut_slice();
@@ -10171,12 +9392,7 @@ mod image_tests {
             edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
-        // Drive the GL backend DIRECTLY: a convert through `ImageProcessor`
-        // silently falls back to CPU on a GL error, turning this oracle into
-        // a CPU-vs-CPU tautology. A direct call surfaces the engine error.
-        // GPUs that allocate DMA-BUF but cannot complete an RGBA16F FBO
-        // (desktop NVIDIA: GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT 0x8cd6)
-        // take the production CPU fallback; this oracle cannot run there.
+        // Converts on the GL backend directly.
         match gl.opengl.as_mut().expect("GL backend present").convert(
             &src,
             &mut gl_dst,
@@ -10235,7 +9451,7 @@ mod image_tests {
                 max_at = i;
             }
         }
-        // Localize: plane (R/G/B), row, col of the worst element.
+        // Plane, row and column of the worst element.
         let (plane, rem) = (max_at / (640 * 640), max_at % (640 * 640));
         let (row, col) = (rem / 640, rem % 640);
         eprintln!(
@@ -10244,23 +9460,13 @@ mod image_tests {
             g[max_at].to_f32(),
             c[max_at].to_f32()
         );
-        // Two GPU passes (8-bit intermediate + linear filtering) vs the
-        // CPU's direct path: allow a few 8-bit steps of divergence.
         assert!(
             max_diff <= 4.0 / 255.0 + 1e-3,
             "fused NV12→PlanarF16 diverges from CPU reference: max_diff={max_diff}"
         );
     }
 
-    /// Zero-copy source → heap destination through the GL engine,
-    /// driven on the GL backend DIRECTLY so a GL error cannot hide
-    /// behind the `ImageProcessor` CPU fallback (the shape that exposed
-    /// the macOS `glReadnPixels` failure: imported source, rendered,
-    /// then errored at the heap readback). RGBA→BGRA so the convert is
-    /// a pure byte shuffle: no chroma kernel or colorimetry ambiguity
-    /// (Vivante's NV fast path legitimately diverges from the CPU
-    /// reference), and the readback stays GL_RGBA (V3D rejects RGB
-    /// readbacks).
+    /// The GL backend, called directly, converts a zero-copy RGBA source to a heap BGRA destination.
     #[test]
     #[cfg(feature = "opengl")]
     fn test_zero_copy_src_to_mem_dst_gl_direct() {
@@ -10348,8 +9554,6 @@ mod image_tests {
             .map(|(a, b)| a.abs_diff(*b))
             .max()
             .unwrap();
-        // Same-size byte shuffle: GL samples texel centers 1:1, so allow
-        // only rounding slack.
         assert!(
             max_diff <= 2,
             "zero-copy src → heap dst diverges from CPU reference: max_diff={max_diff}"
@@ -10419,11 +9623,6 @@ mod image_tests {
         );
         result.unwrap();
 
-        // Post-WS1 both CPU and G2D resolve untagged sources to limited-
-        // range BT.601/709 (G2D is limited-range matrix-only hardware), so
-        // the YUV-matrix delta that forced 0.95 has closed; tightened to
-        // 0.98. G2D declines full-range and BT.2020 (handled by GL/CPU) — a
-        // structural gap not exercised by these limited-range fixtures.
         compare_images(&g2d_dst, &cpu_dst, 0.98, function!());
     }
 
@@ -10490,11 +9689,6 @@ mod image_tests {
         );
         result.unwrap();
 
-        // G2D has poor colorimetry support: its hardware YUYV resize/sampling
-        // diverges from the CPU reference by enough that the similarity score
-        // sits around 0.85 on every measured G2D core (i.MX 8M Plus, i.MX 95).
-        // The threshold is held at 0.85 so the test guards against gross
-        // regressions while tolerating the driver's inherent colorimetry error.
         // TODO: compare YUYV↔YUYV directly without a YUYV→RGB convert.
         eprintln!(
             "WARNING: G2D has poor colorimetry support — YUYV resize diverges from the \
@@ -10564,8 +9758,6 @@ mod image_tests {
         );
         result.unwrap();
 
-        // CPU path resolves the untagged 720p source to BT.709 limited (height
-        // heuristic), matching the BT.709 camera fixture; measured 0.9995.
         compare_images(&dst, &dst_target, 0.98, function!());
     }
 
@@ -10634,11 +9826,6 @@ mod image_tests {
             crop,
         );
         result.unwrap();
-        // Post-WS1 both CPU and G2D resolve untagged sources to limited-
-        // range BT.601/709 (G2D is limited-range matrix-only hardware), so
-        // the YUV-matrix delta that forced 0.95 has closed; tightened to
-        // 0.98. G2D declines full-range and BT.2020 (handled by GL/CPU) — a
-        // structural gap not exercised by these limited-range fixtures.
         compare_images(&dst_g2d, &dst_cpu, 0.98, function!());
     }
 
@@ -10696,7 +9883,6 @@ mod image_tests {
             Flip::Horizontal,
             crop,
         );
-        // Desktop NVIDIA cannot sample YUYV as a GL texture; i.MX/Vivante can.
         if let Err(crate::Error::NotSupported(msg)) = &result {
             crate::test_support::report_skip(&format!("{} — {msg}", function!()));
             return;
@@ -10723,10 +9909,6 @@ mod image_tests {
             crop,
         );
         result.unwrap();
-        // Post-WS1 the GL path applies the resolved colorimetry via the EGL
-        // YUV color-space/sample-range hints, so the matrix delta that forced
-        // 0.95 has closed; tightened to 0.98 (driver-matrix rounding confirmed
-        // on the GPU lanes).
         compare_images(&dst_gl, &dst_cpu, 0.98, function!());
     }
 
@@ -10787,8 +9969,6 @@ mod image_tests {
             .as_mut_slice()
             .copy_from_slice(&edgefirst_bench::testdata::read("camera720p.rgba"));
 
-        // CPU path resolves the untagged 720p source to BT.709 limited (height
-        // heuristic), matching the BT.709 camera fixture; measured 0.9995.
         compare_images(&dst, &target_image, 0.98, function!());
     }
 
@@ -10857,8 +10037,6 @@ mod image_tests {
             )
             .for_each(|(dst, src)| *dst = [src[0], src[1], src[2]]);
 
-        // CPU path resolves the untagged 720p source to BT.709 limited (height
-        // heuristic), matching the BT.709 camera fixture; measured 0.9995.
         compare_images(&dst, &target_image, 0.98, function!());
     }
 
@@ -10930,9 +10108,6 @@ mod image_tests {
             .as_mut_slice()
             .copy_from_slice(&edgefirst_bench::testdata::read("camera720p.rgba"));
 
-        // Post-WS1 the GPU path applies the resolved per-tensor colorimetry,
-        // so the matrix delta vs the reference that forced 0.95 has closed;
-        // tightened to 0.98 (confirmed on the GPU/G2D lanes).
         compare_images(&dst, &target_image, 0.98, function!());
     }
 
@@ -11008,11 +10183,6 @@ mod image_tests {
         );
         result.unwrap();
 
-        // Post-WS1 both CPU and G2D resolve untagged sources to limited-
-        // range BT.601/709 (G2D is limited-range matrix-only hardware), so
-        // the YUV-matrix delta that forced 0.95 has closed; tightened to
-        // 0.98. G2D declines full-range and BT.2020 (handled by GL/CPU) — a
-        // structural gap not exercised by these limited-range fixtures.
         compare_images(&g2d_dst, &cpu_dst, 0.98, function!());
     }
 
@@ -11038,7 +10208,6 @@ mod image_tests {
             return;
         }
 
-        // VYUY has a DMA-BUF FourCC on Linux but no IOSurface mapping on macOS/iOS.
         let expect = if cfg!(target_os = "linux") {
             crate::test_support::Expect::Succeeds
         } else {
@@ -11105,9 +10274,6 @@ mod image_tests {
             .as_mut_slice()
             .copy_from_slice(&edgefirst_bench::testdata::read("camera720p.rgba"));
 
-        // Post-WS1 the GPU path applies the resolved per-tensor colorimetry,
-        // so the matrix delta vs the reference that forced 0.95 has closed;
-        // tightened to 0.98 (confirmed on the GPU/G2D lanes).
         compare_images(&dst, &target_image, 0.98, function!());
     }
 
@@ -11154,25 +10320,12 @@ mod image_tests {
         )
         .unwrap();
 
-        // Threshold 0.95 (was 0.98): the reference now decodes the colour JPEG
-        // to native NV12 and then converts to RGBA (was a direct JPEG → RGBA
-        // decode), so it differs slightly from the RGBA derived from the
-        // separate `zidane.nv12` fixture.
         compare_images(&dst, &target_image, 0.95, function!());
     }
 
     #[test]
     fn test_nv12_odd_height_to_rgb_cpu() {
-        // Odd height (even width) — the logical-odd case, e.g. 640×483. The
-        // contiguous NV12 buffer is `[5 + ceil(5/2), 8]` = `[8, 8]` (5 luma rows
-        // + 3 chroma rows). A neutral-grey fill (Y=U=V=128, BT.601 full-range)
-        // must convert to a uniform grey RGB, exercising the odd-height
-        // chroma-row count and the logical-height derivation in convert.
-        // (Odd *width* is rounded to an even buffer at allocation, so it is
-        // covered by the decode integration tests rather than here.)
-        // CPU-only test: pin to tight host memory (None auto-selects pitch-padded
-        // DMA on i.MX, which would leave the dst's row padding unconverted and
-        // break the flat byte scan below).
+        // NV12 with odd height 5: the buffer is `[5 + ceil(5/2), 8]` = `[8, 8]`, filled with neutral grey.
         let mut src = TensorDyn::image(
             8,
             5,
@@ -11190,9 +10343,6 @@ mod image_tests {
             .unwrap()
             .as_mut_slice()
             .fill(128);
-        // Tag BT.601 full-range so Y=128 decodes to grey 128 (the neutral-grey
-        // identity this test asserts). Without a tag, the colorimetry heuristic
-        // resolves an SD tensor to BT.601 *limited*, expanding Y=128 → ~131.
         src.set_colorimetry(Some(
             edgefirst_tensor::Colorimetry::default()
                 .with_encoding(edgefirst_tensor::ColorEncoding::Bt601)
@@ -11231,11 +10381,7 @@ mod image_tests {
 
     #[test]
     fn test_nv24_to_rgb_cpu() {
-        // NV24 (4:4:4) at 8×4: contiguous buffer is [4*3, 8] = [12, 8] — Y plane
-        // (4 rows) + full-res interleaved UV plane (8 rows = 2H, 2W bytes per
-        // chroma row). Neutral-grey fill (Y=U=V=128) must convert to uniform
-        // grey RGB, exercising the 2× UV stride and shape[0]/3 height recovery.
-        // CPU-only test: pin to tight host memory (see test_nv12_odd_height_to_rgb_cpu).
+        // NV24 at 8×4: the buffer is `[12, 8]`, a 4-row Y plane and an 8-row interleaved UV plane, filled with neutral grey.
         let mut src = TensorDyn::image(
             8,
             4,
@@ -11253,8 +10399,6 @@ mod image_tests {
             .unwrap()
             .as_mut_slice()
             .fill(128);
-        // Tag BT.601 full-range (see test_nv12_odd_height_to_rgb_cpu): without it
-        // the heuristic picks limited range and Y=128 expands to ~131.
         src.set_colorimetry(Some(
             edgefirst_tensor::Colorimetry::default()
                 .with_encoding(edgefirst_tensor::ColorEncoding::Bt601)
@@ -11293,13 +10437,7 @@ mod image_tests {
 
     #[test]
     fn cpu_nv12_to_rgb_respects_tagged_bt2020() {
-        // A uniform but *saturated* chroma sample (U/V far from neutral) so the
-        // YUV→RGB matrix — not just the range — drives the result. Decoding the
-        // same NV12 bytes under BT.601 / BT.709 / BT.2020 must yield three
-        // distinct RGB triples, proving the CPU path honours the source's tagged
-        // ColorEncoding instead of a hardcoded matrix. (G2D declines BT.2020 and
-        // falls through to this CPU path; QA F9.)
-        // CPU-only test: pin to tight host memory (see test_nv12_odd_height_to_rgb_cpu).
+        // Converts a uniform saturated NV12 frame tagged with `enc` on the CPU and returns its first RGB pixel.
         fn decode_tagged(enc: edgefirst_tensor::ColorEncoding) -> [u8; 3] {
             let mut src = TensorDyn::image(
                 8,
@@ -11321,8 +10459,6 @@ mod image_tests {
                     px[1] = 64; // V / Cr
                 }
             }
-            // Range held constant (Limited) across all three so only the encoding
-            // matrix varies between runs.
             src.set_colorimetry(Some(
                 edgefirst_tensor::Colorimetry::default()
                     .with_encoding(enc)
@@ -11413,10 +10549,6 @@ mod image_tests {
         )
         .unwrap();
 
-        // Threshold 0.95 (was 0.98): the reference now decodes the colour JPEG
-        // to native NV12 and then converts to RGB (was a direct JPEG → RGB
-        // decode), so it differs slightly from the RGB derived from the
-        // separate `zidane.nv12` fixture.
         compare_images(&dst, &target_image, 0.95, function!());
     }
 
@@ -11463,10 +10595,6 @@ mod image_tests {
         )
         .unwrap();
 
-        // Threshold 0.95 (was 0.98): the reference grey frame now comes from
-        // the colour JPEG decoded to native NV12 and then converted to GREY
-        // (was a direct JPEG → GREY decode), so it differs slightly from the
-        // grey derived from the `zidane.nv12` fixture.
         compare_images(&dst, &target_image, 0.95, function!());
     }
 
@@ -11513,10 +10641,6 @@ mod image_tests {
         )
         .unwrap();
 
-        // Threshold 0.95 (was 0.98): the reference now decodes the colour JPEG
-        // to native NV12 and then converts to RGB (was a direct JPEG → RGB
-        // decode), so it differs slightly from the YUYV-sourced frame derived
-        // from the separate `zidane.nv12` fixture.
         compare_images_convert_to_rgb(&dst, &target_image, 0.95, function!());
     }
 
@@ -11591,13 +10715,6 @@ mod image_tests {
         Ok(src)
     }
 
-    // DEDUP: this function is also defined verbatim in
-    // `crates/image/src/gl/tests.rs` (inside `mod gl_tests`). Both copies
-    // must be kept in sync. Cross-module sharing would require either a
-    // `pub(crate)` test-helper module (which pollutes the non-test API) or a
-    // separate test-utils crate — both are disproportionate for a single
-    // helper. If the implementation ever diverges, extract to a shared
-    // `test_helpers` module in this crate.
     fn compare_images(img1: &TensorDyn, img2: &TensorDyn, threshold: f64, name: &str) {
         assert_eq!(img1.height(), img2.height(), "Heights differ");
         assert_eq!(img1.width(), img2.width(), "Widths differ");
@@ -11618,12 +10735,7 @@ mod image_tests {
             "format must be Rgb or Rgba for comparison"
         );
 
-        // A pitch-padded destination -- the D3D11 staging texture behind a
-        // Windows `TensorMemory::DmaBuf` tensor pads an RGBA row to 128 bytes
-        // -- spaces its rows at `effective_row_stride()`, so reading the head
-        // of the mapping as a tight image would read padding as pixels.
-        // `copy_to_flat` is the tensor's own compaction and degenerates to one
-        // memcpy when the tensor is tight.
+        // Returns the image's bytes without row padding.
         fn flat(img: &TensorDyn) -> Vec<u8> {
             let t = img.as_typed::<u8>().expect("u8 image");
             let mut out = vec![0u8; t.shape().iter().product::<usize>()];
@@ -11700,8 +10812,6 @@ mod image_tests {
         )
         .expect("Image Comparison failed");
         if similarity.score < threshold {
-            // image1.save(format!("{name}_1.png"));
-            // image2.save(format!("{name}_2.png"));
             similarity
                 .image
                 .to_color_map()
@@ -11745,7 +10855,7 @@ mod image_tests {
         let r1 = __cv.convert(img1, &mut img_rgb1, None);
         let r2 = __cv.convert(img2, &mut img_rgb2, None);
         if r1.is_err() || r2.is_err() {
-            // Fallback: compare raw bytes as greyscale strip
+            // Compares the raw bytes as a greyscale strip.
             let w = img1.width().unwrap() as u32;
             let data1 = img1.as_typed::<u8>().unwrap().map().unwrap().to_vec();
             let data2 = img2.as_typed::<u8>().unwrap().map().unwrap().to_vec();
@@ -11789,8 +10899,6 @@ mod image_tests {
         )
         .expect("Image Comparison failed");
         if similarity.score < threshold {
-            // image1.save(format!("{name}_1.png"));
-            // image2.save(format!("{name}_2.png"));
             similarity
                 .image
                 .to_color_map()
@@ -11842,7 +10950,6 @@ mod image_tests {
             edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
-        // PixelFormat::Nv12.channels() returns 1 (luma plane)
         assert_eq!(img.format().unwrap().channels(), 1);
     }
 
@@ -11902,7 +11009,6 @@ mod image_tests {
 
     #[test]
     fn test_rgb_int8_format() {
-        // Int8 variant: same PixelFormat::Rgb but with DType::I8
         let img = TensorDyn::image(
             1280,
             720,
@@ -11957,7 +11063,6 @@ mod image_tests {
 
     #[test]
     fn test_dtype_determines_int8() {
-        // DType::I8 indicates int8 data
         let u8_img = TensorDyn::image(
             64,
             64,
@@ -11982,23 +11087,13 @@ mod image_tests {
 
     #[test]
     fn test_pixel_layout_packed_vs_planar() {
-        // Packed vs planar layout classification
         assert_eq!(PixelFormat::Rgb.layout(), PixelLayout::Packed);
         assert_eq!(PixelFormat::Rgba.layout(), PixelLayout::Packed);
         assert_eq!(PixelFormat::PlanarRgb.layout(), PixelLayout::Planar);
         assert_eq!(PixelFormat::Nv12.layout(), PixelLayout::SemiPlanar);
     }
 
-    /// Integration test that exercises the PBO-to-PBO convert path.
-    /// A PBO cannot hand out a host address that outlives its map guard, and
-    /// the error has to say why rather than reading as unfinished work.
-    ///
-    /// `glMapBufferRange`'s pointer is valid only until `glUnmapBuffer`, and
-    /// this backend maps with `MAP_READ_BIT | MAP_WRITE_BIT` — there is no
-    /// `GL_MAP_PERSISTENT_BIT` and no `glBufferStorage` in the tree. Pinning
-    /// would mean holding the buffer mapped across GL work, which is the
-    /// opposite of what a PBO is for. `EXT_buffer_storage` would change the
-    /// answer, but that is a buffer-allocation feature, not wiring.
+    /// A PBO tensor refuses `pin_host` and `sync_for_cpu` with `NotImplemented` and still maps.
     #[cfg(target_os = "linux")]
     #[cfg(feature = "opengl")]
     #[test]
@@ -12040,27 +11135,22 @@ mod image_tests {
             }
             other => panic!("expected an explained NotImplemented, got {other:?}"),
         }
-        // Sync is unavailable for the same reason, and must not silently succeed.
         assert!(matches!(
             t.sync_for_cpu(edgefirst_tensor::CpuAccess::Read),
             Err(Error::NotImplemented(_))
         ));
 
-        // The supported path still works, which is what makes the refusal safe.
         let g = t.map().expect("map must work where pin cannot");
         assert!(!g.as_slice().is_empty());
     }
 
-    /// Uses ImageProcessor::create_image() to allocate PBO-backed tensors,
-    /// then converts between them. Skipped when GL is unavailable or the
-    /// backend is not PBO (e.g. DMA-buf systems).
+    /// Converts between PBO-backed tensors from `create_image` and compares with the CPU result.
     #[cfg(target_os = "linux")]
     #[cfg(feature = "opengl")]
     #[test]
     fn test_convert_pbo_to_pbo() {
         let mut converter = ImageProcessor::new().unwrap();
 
-        // Skip if GL is not available or backend is not PBO
         let is_pbo = converter
             .opengl
             .as_ref()
@@ -12077,7 +11167,6 @@ mod image_tests {
         let dst_w = 320;
         let dst_h = 240;
 
-        // Create PBO-backed source image
         let pbo_src = converter
             .create_image(
                 src_w,
@@ -12094,11 +11183,9 @@ mod image_tests {
             "create_image should produce a PBO tensor"
         );
 
-        // Fill source PBO with test pattern: load JPEG then convert Mem→PBO
         let file = edgefirst_bench::testdata::read("zidane.jpg").to_vec();
         let jpeg_src = crate::load_image_test_helper(&file, Some(PixelFormat::Rgba), None).unwrap();
 
-        // Resize JPEG into a Mem temp of the right size, then copy into PBO
         let mem_src = TensorDyn::image(
             src_w,
             src_h,
@@ -12118,14 +11205,12 @@ mod image_tests {
         );
         result.unwrap();
 
-        // Copy pixel data into the PBO source by mapping it
         {
             let src_data = mem_src.as_typed::<u8>().unwrap().map().unwrap();
             let mut pbo_map = pbo_src.as_typed::<u8>().unwrap().map().unwrap();
             pbo_map.copy_from_slice(&src_data);
         }
 
-        // Create PBO-backed destination image
         let pbo_dst = converter
             .create_image(
                 dst_w,
@@ -12141,12 +11226,10 @@ mod image_tests {
             TensorMemory::Pbo
         );
 
-        // Convert PBO→PBO (this exercises convert_pbo_to_pbo)
         let mut pbo_dst = pbo_dst;
         let result = converter.convert(&pbo_src, &mut pbo_dst, None);
         result.unwrap();
 
-        // Verify: compare with CPU-only conversion of the same input
         let cpu_dst = TensorDyn::image(
             dst_w,
             dst_h,
@@ -12233,7 +11316,6 @@ mod image_tests {
 
     #[test]
     fn test_draw_proto_masks_no_cpu_returns_error() {
-        // Serialize against all other env-var-mutating tests.
         let _lock = acquire_env_lock();
         let _guard = EnvGuard::snapshot(&[
             "EDGEFIRST_FORCE_BACKEND",
@@ -12242,7 +11324,6 @@ mod image_tests {
             "EDGEFIRST_DISABLE_CPU",
         ]);
 
-        // Disable all backends so cpu.is_none() after construction.
         unsafe { std::env::set_var("EDGEFIRST_DISABLE_CPU", "1") };
         unsafe { std::env::set_var("EDGEFIRST_DISABLE_GL", "1") };
         unsafe { std::env::set_var("EDGEFIRST_DISABLE_G2D", "1") };
@@ -12291,8 +11372,6 @@ mod image_tests {
 
     #[test]
     fn test_draw_proto_masks_cpu_fallback_works() {
-        // Force CPU-only backend to ensure the CPU fallback path executes.
-        // Serialized under ENV_MUTEX so we don't race with disable-var tests.
         let _lock = acquire_env_lock();
         let _guard = EnvGuard::snapshot(&["EDGEFIRST_FORCE_BACKEND"]);
         unsafe { std::env::set_var("EDGEFIRST_FORCE_BACKEND", "cpu") };
@@ -12336,9 +11415,7 @@ mod image_tests {
     }
 
     // ============================================================
-    // draw_decoded_masks / draw_proto_masks — 4-scenario pixel-
-    // verified tests. Exercises each backend against the full
-    // output-contract matrix:
+    // draw_decoded_masks / draw_proto_masks output contract, per backend:
     //
     //   | detections | background | expected dst             |
     //   |------------|------------|--------------------------|
@@ -12349,23 +11426,14 @@ mod image_tests {
     //   | set        | set        | bg outside box + mask    |
     //   |            |            | blended inside           |
     //
-    // Every test pre-fills dst with a non-zero "dirty" pattern so
-    // that any silent `return Ok(())` leaks the pattern into the
-    // asserted output and fails loudly.
+    // Every test pre-fills dst with a non-zero pattern.
     // ============================================================
 
     // =========================================================================
     // Env-var serialisation helpers
-    //
-    // ALL tests that mutate any EDGEFIRST_* backend env var must hold
-    // ENV_MUTEX for their full duration.  This single mutex serialises
-    // test_disable_env_var, test_draw_proto_masks_no_cpu_returns_error,
-    // test_force_backend_*, with_force_backend, and with_env — preventing
-    // any two of them from racing in a parallel `cargo test` run.
     // =========================================================================
 
-    /// Acquire the process-wide env-var mutex.  Returns a guard that must be
-    /// kept alive for the entire duration of the test body.
+    /// Acquires the process-wide env-var mutex.
     fn acquire_env_lock() -> std::sync::MutexGuard<'static, ()> {
         use std::sync::{Mutex, OnceLock};
         static ENV_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
@@ -12375,16 +11443,13 @@ mod image_tests {
             .unwrap_or_else(|e| e.into_inner())
     }
 
-    /// RAII guard that snapshots a set of env vars on construction and
-    /// restores them on `Drop`, even if the test panics.
+    /// Snapshots a set of env vars on construction and restores them on drop.
     struct EnvGuard {
         vars: Vec<(&'static str, Option<String>)>,
     }
 
     impl EnvGuard {
-        /// Snapshot the current values of `names`.  Call this while holding
-        /// the env lock (the lock is not taken here — that is the caller's
-        /// responsibility so the lock scope can be wider than the guard).
+        /// Snapshots the current values of `names`. The caller holds the env lock.
         fn snapshot(names: &[&'static str]) -> Self {
             Self {
                 vars: names.iter().map(|&k| (k, std::env::var(k).ok())).collect(),
@@ -12403,8 +11468,7 @@ mod image_tests {
         }
     }
 
-    /// `EDGEFIRST_INTERPOLATION` accepts `nearest` and `bilinear` in any
-    /// case and ignores anything else.
+    /// `EDGEFIRST_INTERPOLATION` accepts `nearest` and `bilinear` in any case and ignores anything else.
     #[test]
     fn test_interpolation_env_parse() {
         let _lock = acquire_env_lock();
@@ -12428,8 +11492,7 @@ mod image_tests {
         }
     }
 
-    /// `ImageProcessorConfig::interpolation` reaches the CPU backend, and
-    /// `EDGEFIRST_INTERPOLATION` overrides it.
+    /// `ImageProcessorConfig::interpolation` reaches the CPU backend and `EDGEFIRST_INTERPOLATION` overrides it.
     #[test]
     fn test_interpolation_config_and_env_reach_cpu() {
         let _lock = acquire_env_lock();
@@ -12499,9 +11562,7 @@ mod image_tests {
         );
     }
 
-    /// A per-convert interpolation overrides the processor's for that
-    /// convert only, so two option sets on one processor do not interfere;
-    /// `EDGEFIRST_INTERPOLATION` pins both.
+    /// A per-convert interpolation overrides the processor's for that convert only; `EDGEFIRST_INTERPOLATION` pins both.
     #[test]
     fn test_per_convert_interpolation_overrides_processor() {
         let _lock = acquire_env_lock();
@@ -12592,8 +11653,7 @@ mod image_tests {
         assert_eq!(resize(&mut p, Some(model_a)), bilinear, "the env pin wins");
     }
 
-    /// The threaded GL worker honours a per-convert interpolation and keeps
-    /// the processor's for converts without one.
+    /// The threaded GL worker honours a per-convert interpolation and keeps the processor's otherwise.
     #[test]
     #[cfg(feature = "opengl")]
     fn test_per_convert_interpolation_reaches_gl_worker() {
@@ -12677,9 +11737,7 @@ mod image_tests {
         assert!(!warn_first_fallback(Interpolation::Area));
     }
 
-    /// Run `body` with `EDGEFIRST_FORCE_BACKEND` temporarily set (or
-    /// removed), restoring the prior value afterward. Tests are env-
-    /// serialized via the process-wide `ENV_MUTEX`.
+    /// Runs `body` with `EDGEFIRST_FORCE_BACKEND` set or removed under the env lock, then restores it.
     fn with_force_backend<R>(value: Option<&str>, body: impl FnOnce() -> R) -> R {
         let _lock = acquire_env_lock();
         let _guard = EnvGuard::snapshot(&["EDGEFIRST_FORCE_BACKEND"]);
@@ -12690,10 +11748,7 @@ mod image_tests {
         body()
     }
 
-    /// Allocate an RGBA image tensor and pre-fill every byte with a
-    /// distinctive non-zero pattern. Any test that relies on the old
-    /// "dst is already cleared" assumption will see this pattern leak
-    /// through to the output and fail.
+    /// Allocates an RGBA image tensor filled with a non-zero pattern.
     fn make_dirty_dst(w: usize, h: usize, mem: Option<TensorMemory>) -> TensorDyn {
         let dst = TensorDyn::image(
             w,
@@ -12715,7 +11770,7 @@ mod image_tests {
         dst
     }
 
-    /// Allocate an RGBA background filled with a constant colour.
+    /// Allocates an RGBA background filled with a constant colour.
     fn make_bg(w: usize, h: usize, mem: Option<TensorMemory>, rgba: [u8; 4]) -> TensorDyn {
         let bg = TensorDyn::image(
             w,
@@ -12759,8 +11814,7 @@ mod image_tests {
         }
     }
 
-    /// Scenario 1: empty detections, empty segmentation, no background
-    /// → dst must be fully cleared to 0x00000000.
+    /// Empty detections and no background: dst is cleared to zero.
     fn scenario_empty_no_bg(processor: &mut ImageProcessor, case: &str) {
         let mut dst = make_dirty_dst(64, 64, None);
         processor
@@ -12771,7 +11825,7 @@ mod image_tests {
         let mut dst = make_dirty_dst(64, 64, None);
         let proto = {
             use edgefirst_tensor::{Tensor, TensorDyn};
-            // Placeholder (no detections); shape [1, 4] to keep the tensor well-formed.
+            // Placeholder coefficients of shape [1, 4].
             let coeff_t = Tensor::<f32>::from_slice(&[0.0_f32; 4], &[1, 4]).unwrap();
             let protos_t =
                 Tensor::<f32>::from_slice(&vec![0.0_f32; 8 * 8 * 4], &[8, 8, 4]).unwrap();
@@ -12787,8 +11841,7 @@ mod image_tests {
         assert_every_pixel_eq(&dst, [0, 0, 0, 0], &format!("{case}/proto"));
     }
 
-    /// Scenario 2: empty detections, empty segmentation, background set
-    /// → dst must be fully equal to bg.
+    /// Empty detections with a background: dst equals the background.
     fn scenario_empty_with_bg(processor: &mut ImageProcessor, case: &str) {
         let bg_color = [42, 99, 200, 255];
         let bg = make_bg(64, 64, None, bg_color);
@@ -12803,7 +11856,7 @@ mod image_tests {
         let mut dst = make_dirty_dst(64, 64, None);
         let proto = {
             use edgefirst_tensor::{Tensor, TensorDyn};
-            // Placeholder (no detections); shape [1, 4] to keep the tensor well-formed.
+            // Placeholder coefficients of shape [1, 4].
             let coeff_t = Tensor::<f32>::from_slice(&[0.0_f32; 4], &[1, 4]).unwrap();
             let protos_t =
                 Tensor::<f32>::from_slice(&vec![0.0_f32; 8 * 8 * 4], &[8, 8, 4]).unwrap();
@@ -12819,9 +11872,7 @@ mod image_tests {
         assert_every_pixel_eq(&dst, bg_color, &format!("{case}/proto bg blit"));
     }
 
-    /// Scenario 3: one detection with a fully-opaque segmentation fill,
-    /// no background → outside the box dst must be 0x00, inside it must
-    /// be a non-zero mask colour (the render_segmentation output).
+    /// One detection without a background: dst is zero outside the box and mask-coloured inside.
     fn scenario_detect_no_bg(processor: &mut ImageProcessor, case: &str) {
         use edgefirst_tensor::Segmentation;
         use ndarray::Array3;
@@ -12850,16 +11901,12 @@ mod image_tests {
             .draw_decoded_masks(&mut dst, &[detect], &[seg], MaskOverlay::default())
             .unwrap_or_else(|e| panic!("{case}/decoded_masks detect+no-bg failed: {e:?}"));
 
-        // Outside the bbox (corner): must be cleared black.
         let corner = pixel_at(&dst, 2, 2);
         assert_eq!(
             corner,
             [0, 0, 0, 0],
             "{case}/decoded: corner (2,2) leaked dirty pattern: {corner:?}"
         );
-        // Inside the bbox (center): the mask colour must be visible.
-        // Any non-zero pixel is acceptable — exact rendering varies
-        // between backends (GL smoothstep, CPU nearest).
         let center = pixel_at(&dst, 32, 32);
         assert!(
             center != [0, 0, 0, 0],
@@ -12867,8 +11914,7 @@ mod image_tests {
         );
     }
 
-    /// Scenario 4: detection + background. Outside the box must match
-    /// bg; inside the box must NOT match bg (mask blended on top).
+    /// One detection with a background: dst equals the background outside the box and differs inside.
     fn scenario_detect_with_bg(processor: &mut ImageProcessor, case: &str) {
         use edgefirst_tensor::Segmentation;
         use ndarray::Array3;
@@ -12900,14 +11946,11 @@ mod image_tests {
             .draw_decoded_masks(&mut dst, &[detect], &[seg], overlay)
             .unwrap_or_else(|e| panic!("{case}/decoded_masks detect+bg failed: {e:?}"));
 
-        // Outside the bbox (corner): bg colour.
         let corner = pixel_at(&dst, 2, 2);
         assert_eq!(
             corner, bg_color,
             "{case}/decoded: corner (2,2) should show bg {bg_color:?} got {corner:?}"
         );
-        // Inside the bbox (center): mask blended on bg, must differ from
-        // pure bg (alpha-blend with mask colour produces a distinct shade).
         let center = pixel_at(&dst, 32, 32);
         assert!(
             center != bg_color,
@@ -12915,8 +11958,7 @@ mod image_tests {
         );
     }
 
-    /// Run all 4 scenarios against the processor. Skip gracefully if
-    /// construction fails (backend unavailable on this host).
+    /// Runs all four scenarios, skipping when the processor cannot be constructed.
     fn run_all_scenarios(
         force_backend: Option<&'static str>,
         case: &'static str,
@@ -12963,10 +12005,7 @@ mod image_tests {
         run_all_scenarios(Some("opengl"), "opengl", false);
     }
 
-    /// G2D forced backend: exercises the zero-detection empty-frame
-    /// paths via `g2d_clear` and `g2d_blit`. Scenarios 3 and 4 (with
-    /// detections) expect `NotImplemented` since G2D has no rasterizer
-    /// for boxes / masks.
+    /// Forced G2D clears or blits an empty frame and returns `NotImplemented` for detections.
     #[cfg(target_os = "linux")]
     #[test]
     fn test_draw_masks_zero_detection_g2d_forced() {
@@ -12983,7 +12022,7 @@ mod image_tests {
             }
         };
 
-        // Case 1: empty + no bg. G2D requires DMA-backed dst.
+        // Empty detections, no background.
         let mut dst = TensorDyn::image(
             64,
             64,
@@ -13004,7 +12043,7 @@ mod image_tests {
             .expect("g2d empty+no-bg");
         assert_every_pixel_eq(&dst, [0, 0, 0, 0], "g2d/case1 cleared");
 
-        // Case 2: empty + bg. Both surfaces DMA-backed for g2d_blit.
+        // Empty detections with a background.
         let bg_color = [7, 11, 13, 255];
         let bg = {
             let t = TensorDyn::image(
@@ -13046,7 +12085,7 @@ mod image_tests {
             .expect("g2d empty+bg");
         assert_every_pixel_eq(&dst, bg_color, "g2d/case2 bg blit");
 
-        // Case 3 and 4: detect present — must return NotImplemented.
+        // A detection returns `NotImplemented`.
         let detect = DetectBox {
             bbox: [0.25, 0.25, 0.75, 0.75].into(),
             score: 0.9,
@@ -13072,40 +12111,28 @@ mod image_tests {
 
     #[test]
     fn test_set_format_then_cpu_convert() {
-        // Force CPU backend; serialized under ENV_MUTEX to avoid racing with
-        // test_force_backend_* and test_disable_env_var.
         let _lock = acquire_env_lock();
         let _guard = EnvGuard::snapshot(&["EDGEFIRST_FORCE_BACKEND"]);
         unsafe { std::env::set_var("EDGEFIRST_FORCE_BACKEND", "cpu") };
         let mut processor = ImageProcessor::new().unwrap();
 
-        // Load a source image
         let image = edgefirst_bench::testdata::read("zidane.jpg");
         let src = load_image_test_helper(&image, Some(PixelFormat::Rgba), None).unwrap();
 
-        // Create a raw tensor, then attach format — simulating the from_fd workflow
         let mut dst =
             TensorDyn::new(&[640, 640, 3], DType::U8, Some(TensorMemory::Mem), None).unwrap();
         dst.set_format(PixelFormat::Rgb).unwrap();
 
-        // Convert should work with the set_format-annotated tensor
         processor.convert(&src, &mut dst, None).unwrap();
 
-        // Verify format survived conversion
         assert_eq!(dst.format(), Some(PixelFormat::Rgb));
         assert_eq!(dst.width(), Some(640));
         assert_eq!(dst.height(), Some(640));
     }
 
-    /// Verify that creating multiple ImageProcessors on the same thread and
-    /// performing a resize on each does not deadlock or error.
-    ///
-    /// Uses automatic memory allocation (DMA → PBO → Mem fallback) so that
-    /// hardware backends (OpenGL, G2D) are exercised on capable targets.
+    /// Several `ImageProcessor`s on one thread each resize without deadlock or error.
     #[test]
     fn test_multiple_image_processors_same_thread() {
-        // Hold the env mutex so env-var-mutating tests can't corrupt the state
-        // seen by ImageProcessor::new() calls during this test.
         let _lock = acquire_env_lock();
         let mut processors: Vec<ImageProcessor> = (0..4)
             .map(|_| ImageProcessor::new().expect("ImageProcessor::new() failed"))
@@ -13138,27 +12165,12 @@ mod image_tests {
         }
     }
 
-    /// Verify that creating ImageProcessors on separate threads and performing
-    /// a resize on each does not deadlock or error.
-    ///
-    /// Uses automatic memory allocation (DMA → PBO → Mem fallback) so that
-    /// hardware backends (OpenGL, G2D) are exercised on capable targets.
-    /// A 60-second timeout prevents CI from hanging on deadlock regressions.
+    /// `ImageProcessor`s created on separate threads each resize without deadlock or error.
     #[test]
     fn test_multiple_image_processors_separate_threads() {
         use std::sync::mpsc;
         use std::time::Duration;
 
-        // The Vivante GC7000UL driver (i.MX 8M Plus) double-frees on concurrent
-        // EGL context teardown — four processors spun up on four threads here
-        // trips it and aborts the whole test binary (SIGABRT, not a catchable
-        // panic). The bug is the driver's, not the HAL's; this test is kept so
-        // it still exercises the multi-context path on every other GPU. The
-        // board lane and scripts/on-target-test.sh set
-        // EDGEFIRST_SKIP_VIVANTE_KNOWN_BUGS on any board with /dev/galcore
-        // to skip just this case there, while the run stays red anywhere else
-        // a regression appears. (Skip, not #[ignore]: the platform is decided
-        // at runtime, not compile time.)
         if std::env::var_os("EDGEFIRST_SKIP_VIVANTE_KNOWN_BUGS").is_some() {
             crate::test_support::report_skip(
                 "test_multiple_image_processors_separate_threads — known Vivante \
@@ -13170,8 +12182,6 @@ mod image_tests {
 
         const TIMEOUT: Duration = Duration::from_secs(60);
 
-        // Hold the env mutex so env-var-mutating tests can't corrupt ImageProcessor::new()
-        // calls made inside the spawned threads during this test.
         let _lock = acquire_env_lock();
 
         let (tx, rx) = mpsc::channel::<()>();
@@ -13224,12 +12234,7 @@ mod image_tests {
         });
     }
 
-    /// Verify that 4 fully-initialized ImageProcessors on separate threads can
-    /// all operate concurrently without deadlocking each other.
-    ///
-    /// All processors are created first, then a barrier synchronizes them so
-    /// they all start converting at the same instant — maximizing contention.
-    /// A 60-second timeout prevents CI from hanging on deadlock regressions.
+    /// Four `ImageProcessor`s on separate threads convert concurrently without deadlock.
     #[test]
     fn test_image_processors_concurrent_operations() {
         use std::sync::{mpsc, Arc, Barrier};
@@ -13239,8 +12244,6 @@ mod image_tests {
         const ROUNDS: usize = 10;
         const TIMEOUT: Duration = Duration::from_secs(60);
 
-        // Hold the env mutex so env-var-mutating tests can't corrupt ImageProcessor::new()
-        // calls made inside the spawned threads during this test.
         let _lock = acquire_env_lock();
 
         let (tx, rx) = mpsc::channel::<()>();
@@ -13256,10 +12259,8 @@ mod image_tests {
                             panic!("ImageProcessor::new() failed on thread {i}: {e}")
                         });
 
-                        // All threads wait here until every processor is initialized.
                         barrier.wait();
 
-                        // Now all 4 hammer the GPU concurrently.
                         for round in 0..ROUNDS {
                             let src = proc
                                 .create_image(
@@ -13308,23 +12309,7 @@ mod image_tests {
         });
     }
 
-    /// THE parallel-processors demonstration test: 4 ImageProcessors on 4
-    /// threads, each with its own GL context and worker, converting
-    /// per-thread-DISTINCT synthetic inputs concurrently (barrier-released);
-    /// every output must byte-match the thread's own pre-barrier sequential
-    /// oracle from the same processor. On LifecycleOnly platforms (Mali,
-    /// V3D, Tegra, llvmpipe, macOS) the converts genuinely overlap on the
-    /// GPU; on Vivante they serialize via the Full policy and the test still
-    /// must pass. Distinct inputs make any cross-processor state leakage
-    /// (wrong texture, wrong context, clobbered upload) visible as a byte
-    /// diff rather than a coincidental match — proven by a scratch
-    /// cross-wire run (neighbor's input post-oracle) failing on every
-    /// thread with ~53% of bytes diverged.
-    ///
-    /// Skipped under EDGEFIRST_SKIP_VIVANTE_KNOWN_BUGS like
-    /// `test_multiple_image_processors_separate_threads`: the galcore driver
-    /// can abort intermittently on concurrent multi-processor lifecycles
-    /// regardless of locking (P0 spike: reproduces fully serialized).
+    /// Four processors on four threads convert distinct inputs concurrently; each output matches its sequential oracle.
     #[test]
     fn test_parallel_processors_unique_outputs() {
         use std::sync::{mpsc, Arc, Barrier};
@@ -13344,7 +12329,6 @@ mod image_tests {
         }
 
         let _lock = acquire_env_lock();
-        // Probed here, where the policy can name the test; worker threads are unnamed.
         let use_dma = crate::test_support::is_dma_available();
         if !use_dma {
             crate::test_support::report_skip(&format!(
@@ -13363,7 +12347,6 @@ mod image_tests {
                         let mut proc = ImageProcessor::new().unwrap_or_else(|e| {
                             panic!("ImageProcessor::new() failed on thread {i}: {e}")
                         });
-                        // CI-weight geometry (llvmpipe renders on the CPU).
                         let (w, h) = (640usize, 480usize);
                         let mem = if use_dma {
                             Some(TensorMemory::DmaBuf)
@@ -13443,14 +12426,7 @@ mod image_tests {
         });
     }
 
-    /// Heavy on-demand stressor for the GL serialization policy: 4
-    /// processors × 4 threads × barrier × 200 NV12 720p → RGB 640 letterbox
-    /// converts (DMA where available); every output must byte-match the
-    /// thread's own pre-barrier sequential oracle from the same processor.
-    /// Ignored by default (heavy; board tool — the CI-weight version is
-    /// `test_parallel_processors_unique_outputs`). Run explicitly, optionally
-    /// pinning the policy via EDGEFIRST_GL_SERIALIZE=full|lifecycle:
-    ///   <test binary> stress_parallel_processors_oracle --ignored
+    /// Four processors on four threads each run 200 NV12 720p to RGB letterbox converts that match their oracle.
     #[test]
     #[ignore = "heavy on-demand GL-parallelism stressor; run explicitly on boards"]
     fn stress_parallel_processors_oracle() {
@@ -13462,7 +12438,6 @@ mod image_tests {
         const TIMEOUT: Duration = Duration::from_secs(600);
 
         let _lock = acquire_env_lock();
-        // Probed here, where the policy can name the test; worker threads are unnamed.
         let use_dma = crate::test_support::is_dma_available();
         if !use_dma {
             crate::test_support::report_skip(&format!(
@@ -13488,8 +12463,7 @@ mod image_tests {
                             Some(TensorMemory::Mem)
                         };
 
-                        // Per-thread-distinct synthetic NV12 so cross-wired
-                        // GL state between processors shows up as a byte diff.
+                        // Per-thread-distinct synthetic NV12.
                         let src = proc
                             .create_image(
                                 w,
@@ -13567,21 +12541,13 @@ mod image_tests {
     // F16 / F32 auto-chain fallback integration tests
     // =========================================================================
 
-    /// Proves the auto-chain (OpenGL → G2D → CPU) NEVER errors for a float
-    /// combo the GL path does NOT cover.
-    ///
-    /// `Yuyv → Rgb F32` is not handled by the GL float render path (which
-    /// only covers `Rgba → PlanarRgb F16` and `Rgba → Rgb F32`), so the
-    /// chain falls through to the CPU float path. Before commit 868a7649
-    /// added CPU U8→F32/F16 support this would have returned `Err`; now it
-    /// must return `Ok` with output in `[0, 1]` and all values finite.
+    /// The auto chain converts `Yuyv` to `Rgb` F32 through the CPU with finite output in `[0, 1]`.
     #[test]
     fn convert_f32_auto_never_errors_non_gl_combo() {
         const W: usize = 64;
         const H: usize = 64;
 
-        // Build a small synthetic YUYV source (Y=128, U=128, V=128 → near-grey).
-        // YUYV packs two pixels into 4 bytes: [Y0, U, Y1, V] per macropixel.
+        // YUYV source, `[Y0, U, Y1, V]` per macropixel.
         let src = TensorDyn::image(
             W,
             H,
@@ -13597,7 +12563,7 @@ mod image_tests {
             for chunk in data.as_chunks_mut::<4>().0 {
                 chunk[0] = 128; // Y0
                 chunk[1] = 128; // U
-                chunk[2] = 160; // Y1 — distinct so a layout bug is visible
+                chunk[2] = 160; // Y1
                 chunk[3] = 128; // V
             }
         }
@@ -13620,7 +12586,6 @@ mod image_tests {
             result.err()
         );
 
-        // Verify all output values are finite and in [0, 1].
         let map = dst.as_typed::<f32>().unwrap().map().unwrap();
         let floats = map.as_slice();
         assert_eq!(floats.len(), W * H * 3, "unexpected output element count");
@@ -13631,16 +12596,11 @@ mod image_tests {
             );
         }
 
-        // WEAK-1: Anti-all-zero spot-check.  A Y=128 YUYV source normalises to
-        // ≈0.502 on the luma channel.  If the buffer is all-zero (e.g. the CPU
-        // path never wrote to it) this assertion catches the regression.
         let first_non_zero = floats.iter().find(|&&v| v > 0.01);
         assert!(
             first_non_zero.is_some(),
             "all-zero output detected — CPU path likely did not write to the destination buffer"
         );
-        // Y=128 → luma ≈ 0.502.  Spot-check the first pixel's R channel
-        // (which carries luma for a near-grey YUV source).
         let r0 = floats[0];
         assert!(
             (r0 - 0.502_f32).abs() < 0.05,
@@ -13648,17 +12608,8 @@ mod image_tests {
         );
     }
 
-    /// Proves CPU-forced `Rgba → PlanarRgb F16` correctness.
-    ///
-    /// Uses a source with clearly distinct per-channel values so a
-    /// plane-swap or layout bug surfaces immediately. Tolerance is 2^-9
-    /// (one F16 ULP at 0.5, i.e. roughly 1/512).
+    /// A forced-CPU `Rgba` to `PlanarRgb` F16 convert matches the source within 2^-9.
     #[test]
-    // `ImageProcessorConfig` carries a Linux-only `egl_display` field, so
-    // `{ backend, ..Default::default() }` is a genuine update on Linux but
-    // covers no remaining fields on macOS, where `clippy::needless_update`
-    // then fires. `allow` (not `expect`) because the lint is platform-
-    // conditional — it does not fire on Linux.
     #[allow(clippy::needless_update)]
     fn convert_f16_forced_cpu_correct() {
         const W: usize = 16;
@@ -13739,7 +12690,6 @@ mod image_tests {
                     "B plane ({x},{y}): got {b_got}, expected {b_exp}"
                 );
 
-                // Catch plane-swap: R and G must differ (they have different formulas).
                 if src_bytes[i * 4] != src_bytes[i * 4 + 1] {
                     assert_ne!(r_got, g_got, "R and G planes must differ at ({x},{y})");
                 }
@@ -13747,19 +12697,12 @@ mod image_tests {
         }
     }
 
-    /// Proves the auto-chain falls through to CPU for `Rgba → Rgb F32` with
-    /// rotation set.
-    ///
-    /// The GL float render path rejects any call where rotation ≠ None,
-    /// returning an error that causes the chain to continue. Before the CPU
-    /// float fallback this would have produced an error at the end of the
-    /// chain; now it must reach CPU and return `Ok` with finite `[0, 1]` output.
+    /// The auto chain converts `Rgba` to `Rgb` F32 with a rotation through the CPU.
     #[test]
     fn convert_f32_with_rotation_falls_back() {
         const W: usize = 16;
         const H: usize = 16;
 
-        // RGBA8 source with a known gradient (distinct per-channel values).
         let src = TensorDyn::image(
             W,
             H,
@@ -13783,10 +12726,10 @@ mod image_tests {
             }
         }
 
-        // Rotation swaps W and H, so dst is [W, H] (H×W output).
+        // The rotated destination is H wide and W high.
         let mut dst = TensorDyn::image(
-            H, // dst W = src H after 90° rotation
-            W, // dst H = src W after 90° rotation
+            H, // dst W = src H
+            W, // dst H = src W
             PixelFormat::Rgb,
             DType::F32,
             Some(TensorMemory::Mem),
@@ -13817,31 +12760,7 @@ mod image_tests {
         }
     }
 
-    /// GL-vs-CPU identity parity for `Rgba → PlanarRgb F16`.
-    ///
-    /// Converts the same RGBA8 source via the `OpenGl` backend and the
-    /// forced `Cpu` backend, then verifies the two F16 output tensors agree
-    /// element-wise within 2^-8 (two F16 ULPs at 0.5). Skipped when OpenGL
-    /// or F16 render is unavailable, and when the host cannot hold the
-    /// zero-copy F16 destination the GL float route needs.
-    ///
-    /// **The GL route is asserted, not assumed** (issue #179).
-    /// `ComputeBackend::OpenGl` is not a forced backend: it leaves
-    /// `forced_backend` at `None`, so a GL decline logs at debug and the CPU
-    /// serves the same convert. Both sides of the comparison would then be
-    /// the CPU's answer and the parity claim would be a tautology — which is
-    /// exactly how a host whose RGBA16F FBO is incomplete (desktop NVIDIA:
-    /// `GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT`) passed while proving nothing,
-    /// `supported_render_dtypes().f16` above notwithstanding: that flag is
-    /// an extension query, not a completed render. `convert_fallback_count()`
-    /// staying flat across the GL convert is the proof, and a decline is
-    /// reported as a skip rather than a failure because it is a property of
-    /// the host's driver, not of this code — except under
-    /// `HAL_TEST_REQUIRE_GL=1`, which turns it into a named failure, the
-    /// same opt-in `crates/image/tests/dst_view_stride.rs` and
-    /// `reconstructed_view_draw.rs` carry for a GL backend that fails to
-    /// come up. A lane that has asserted it has GL should not be quietly
-    /// losing this test's coverage.
+    /// The OpenGL and CPU backends agree within 2^-8 on an `Rgba` to `PlanarRgb` F16 convert.
     #[test]
     #[cfg(all(
         any(
@@ -13854,17 +12773,13 @@ mod image_tests {
         feature = "opengl"
     ))]
     fn convert_f16_gl_cpu_parity_identity() {
-        // The macOS coverage lane sets `HAL_TEST_REQUIRE_GL=1` for both
-        // passes but deliberately hobbles pass 1 (unsigned binaries, the
-        // ANGLE dlopen gate closed). Excluded there the same way
-        // `gl_backend_available_canary` excludes it, so the gate below
-        // enforces in pass 2 only.
+        // Skips on the first pass of the macOS coverage lane.
         #[cfg(target_os = "macos")]
         if std::env::var("HAL_TEST_REQUIRE_GL").is_ok_and(|v| v == "1")
             && std::env::var_os("HAL_TEST_ALLOW_DLOPEN_ANGLE").is_none()
         {
             crate::test_support::report_skip(
-                "convert_f16_gl_cpu_parity_identity - ANGLE dlopen gate closed (coverage pass 1)",
+                "convert_f16_gl_cpu_parity_identity - ANGLE dlopen gate closed",
             );
             return;
         }
@@ -13875,7 +12790,6 @@ mod image_tests {
             return;
         }
 
-        // 32 F16 pixels make a 64-byte row, the pitch IOSurface requires for a planar destination.
         const W: usize = 32;
         const H: usize = 16;
         const TOL: f32 = 1.0 / 256.0; // 2^-8
@@ -13904,7 +12818,6 @@ mod image_tests {
             }
         }
 
-        // GL path.
         let gl_result = {
             let mut gl_proc = match ImageProcessor::with_config(ImageProcessorConfig {
                 backend: ComputeBackend::OpenGl,
@@ -13926,26 +12839,6 @@ mod image_tests {
                 return;
             }
 
-            // A destination the GL float route actually serves. A
-            // `TensorMemory::Mem` float destination has no arm in
-            // `float_dispatch::classify_float_render` at all: it classifies as
-            // `FloatRenderPath::None`, the u8 route rejects the dtype, and the
-            // CPU serves every convert. With a host destination the GL half
-            // below was therefore unreachable and this test could only ever
-            // skip. `(Rgba, PlanarRgb, F16, DmaBuf)` -- `ZeroCopyF16Nchw` --
-            // is the zero-copy float tuple EVERY platform's capability set
-            // serves: it is unconditional in `classify_float_render`, so it
-            // holds for the `PlanarF16` set Linux, Android and ANGLE/macOS
-            // declare as well as the `All` set Windows declares.
-            //
-            // One spelling covers all of them. `TensorMemory::DmaBuf` is the
-            // portable name for the platform-native zero-copy GPU buffer --
-            // a DMA-BUF on Linux, an IOSurface on macOS/iOS, an
-            // AHardwareBuffer on Android, an `ID3D11Texture2D` on Windows --
-            // and the classifier matches on that one variant for all of them,
-            // so this needs no `cfg`. Where the platform cannot hold one the
-            // allocation fails or falls back, and both are reported below.
-            // Checked before the HAL_TEST_REQUIRE_GL gate below, which covers a declined destination.
             let Some(mut dst) = crate::test_support::gpu_buffer_allocated(
                 TensorDyn::image(
                     W,
@@ -13997,7 +12890,6 @@ mod image_tests {
             }
         };
 
-        // CPU path.
         let cpu_result = {
             let mut cpu_proc = ImageProcessor::with_config(ImageProcessorConfig {
                 backend: ComputeBackend::Cpu,
@@ -14019,10 +12911,6 @@ mod image_tests {
             dst
         };
 
-        // Compare element-wise. Both sides are read through `copy_to_flat`:
-        // the GL destination is a packed zero-copy surface whose rows can be
-        // spaced at a driver pitch, so its mapping is not a flat run of the
-        // logical elements.
         let flat_f16 = |t: &TensorDyn| -> Vec<half::f16> {
             let typed = t.as_typed::<half::f16>().expect("F16 image");
             let mut bytes = vec![0u8; typed.shape().iter().product::<usize>() * 2];
@@ -14061,12 +12949,10 @@ mod image_tests {
     }
 
     // =========================================================================
-    // GAP-1: supported_render_dtypes() Linux smoke test
+    // supported_render_dtypes() smoke test
     // =========================================================================
 
-    /// Exercises the real Linux/Windows GL path that reads
-    /// `gl.supported_render_dtypes()`. Skipped when no GL backend is
-    /// available (CI/host without a GPU).
+    /// `supported_render_dtypes()` returns on a GL backend.
     #[test]
     #[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "opengl"))]
     fn supported_render_dtypes_linux_smoke() {
@@ -14085,29 +12971,23 @@ mod image_tests {
             );
             return;
         }
-        // The call must complete without panicking or deadlocking.
         let support = proc.supported_render_dtypes();
         eprintln!(
             "supported_render_dtypes_linux_smoke: f16={} f32={}",
             support.f16, support.f32
         );
-        // No assertion on the specific values — they are hardware-dependent.
     }
 
     // =========================================================================
-    // GAP-2: F16 PlanarRgb with width NOT divisible by 4 falls back to CPU
+    // F16 PlanarRgb with a width not divisible by 4 falls back to CPU
     // =========================================================================
 
-    /// The GL float render path rejects PlanarRgb F16 destinations whose width
-    /// is not a multiple of 4 (the packed RGBA16F swizzle trick requires W%4==0).
-    /// The auto-chain must transparently fall through to the CPU path, which has
-    /// no such restriction.  W=18, H=16 is chosen so W%4 == 2.
+    /// The auto chain converts to a `PlanarRgb` F16 destination whose width is not a multiple of 4.
     #[test]
     fn convert_f16_pbo_non_4_aligned_width_falls_back() {
-        const W: usize = 18; // 18 % 4 == 2 — NOT divisible by 4
+        const W: usize = 18; // 18 % 4 == 2
         const H: usize = 16;
 
-        // RGBA8 source filled with a flat mid-grey.
         let src = TensorDyn::image(
             W,
             H,
@@ -14128,8 +13008,6 @@ mod image_tests {
             }
         }
 
-        // F16 PlanarRgb destination in Mem (GL would use PBO, but we want
-        // to exercise the fallback chain without hardware dependency).
         let mut dst = TensorDyn::image(
             W,
             H,
@@ -14140,8 +13018,6 @@ mod image_tests {
         )
         .unwrap();
 
-        // Use the default auto-chain so the GL path can attempt and reject,
-        // then the CPU path succeeds.
         let mut proc = ImageProcessor::new().unwrap();
         let result = proc.convert(&src, &mut dst, None);
         assert!(
@@ -14150,7 +13026,6 @@ mod image_tests {
             result.err()
         );
 
-        // All output values must be finite and in [0, 1].
         let map = dst.as_typed::<half::f16>().unwrap().map().unwrap();
         let halfs = map.as_slice();
         assert_eq!(halfs.len(), W * H * 3, "unexpected element count");
@@ -14164,23 +13039,17 @@ mod image_tests {
     }
 
     // =========================================================================
-    // GAP-4: NV12 → Rgb F32 and NV12 → PlanarRgb F16, forced CPU
+    // NV12 → Rgb F32 and NV12 → PlanarRgb F16, forced CPU
     // =========================================================================
 
-    /// CPU widen-composition: NV12 (non-RGBA source) → Rgb F32.
-    ///
-    /// NV12 requires a two-stage CPU conversion (NV12→Rgba then Rgba→F32)
-    /// which was untested. A wrong intermediate format selection silently
-    /// produces garbage. Y=128, U=V=128 → near-neutral grey → R≈G≈B≈0.5.
+    /// The forced CPU backend converts NV12 to `Rgb` F32 with finite output in `[0, 1]`.
     #[test]
-    // Linux-only `egl_display` field makes `..Default::default()` needless
-    // on macOS only; see `convert_f16_forced_cpu_correct`.
     #[allow(clippy::needless_update)]
     fn convert_nv12_to_rgb_f32_cpu() {
         const W: usize = 16;
-        const H: usize = 16; // must be even for NV12
+        const H: usize = 16;
 
-        // Build a valid NV12 tensor: shape [H*3/2, W], luma=128, chroma=128.
+        // NV12 tensor of shape [H*3/2, W], luma 128, chroma 128.
         let src = TensorDyn::image(
             W,
             H,
@@ -14227,17 +13096,12 @@ mod image_tests {
                 "output[{i}]={v} is not finite or not in [0,1]"
             );
         }
-        // Anti-all-zero: Y=128 → luma channel ≈ 0.5 after YUV→RGB.
         let non_zero = floats.iter().any(|&v| v > 0.01);
         assert!(non_zero, "all-zero output from NV12→Rgb F32 CPU path");
     }
 
-    /// CPU widen-composition: NV12 (non-RGBA source) → PlanarRgb F16.
-    ///
-    /// Same rationale as `convert_nv12_to_rgb_f32_cpu` but for F16 output.
+    /// The forced CPU backend converts NV12 to `PlanarRgb` F16.
     #[test]
-    // Linux-only `egl_display` field makes `..Default::default()` needless
-    // on macOS only; see `convert_f16_forced_cpu_correct`.
     #[allow(clippy::needless_update)]
     fn convert_nv12_to_planar_rgb_f16_cpu() {
         const W: usize = 16;
@@ -14295,7 +13159,7 @@ mod image_tests {
     }
 
     // =========================================================================
-    // GAP-5: create_image F32 + DMA must return NotSupported
+    // create_image access and memory
     // =========================================================================
 
     fn access_test_src(w: usize, h: usize) -> TensorDyn {
@@ -14323,9 +13187,7 @@ mod image_tests {
         t
     }
 
-    /// With only the CPU backend, `create_image` declares `ReadWrite` for the
-    /// destinations whose CPU convert reads back what it wrote (the `I8`
-    /// bias, the BGRA swizzle), and the convert into them succeeds.
+    /// With only the CPU backend, `create_image` declares `ReadWrite` for destinations the CPU convert reads back.
     #[test]
     fn create_image_adds_readwrite_for_read_modify_write_passes() {
         use edgefirst_tensor::CpuAccess;
@@ -14365,9 +13227,7 @@ mod image_tests {
         }
     }
 
-    /// The CPU convert refuses up front, asking for `ReadWrite`, a
-    /// `Write`-only destination it would read back (the `I8` bias, the BGRA
-    /// swizzle); a BGRA-to-BGRA copy has no swizzle and needs only `Write`.
+    /// The CPU convert refuses a `Write`-only destination it would read back.
     #[test]
     fn cpu_convert_refuses_a_write_only_destination_it_reads_back() {
         use edgefirst_tensor::{CpuAccess, Error as TensorError};
@@ -14415,16 +13275,14 @@ mod image_tests {
         cpu.convert(&bgra_src, &mut dst, None).unwrap();
     }
 
-    /// The prediction `create_image` widens with, per backend mix: the CPU
-    /// and G2D post-passes when either may run, nothing when the GPU renders
-    /// the destination, `Write` for a host-memory readback.
+    /// The access `create_image` predicts is the union over the backends that may run.
     #[test]
     fn predicted_cpu_access_unions_the_backends_that_may_run() {
         use edgefirst_tensor::CpuAccess::{self, None as No, Read, ReadWrite, Write};
         let p = predicted_cpu_access;
         let takes = |a: CpuAccess| Some(Some(a));
         let declines = Some(None);
-        // A forced backend is the only one that runs.
+        // A forced backend.
         assert_eq!(
             p(
                 Some(ForcedBackend::G2d),
@@ -14455,16 +13313,14 @@ mod image_tests {
         assert_eq!(p(None, takes(No), takes(ReadWrite), takes(ReadWrite)), No);
         // A host-memory readback leaves the fallbacks predicted.
         assert_eq!(p(None, takes(Write), None, takes(ReadWrite)), ReadWrite);
-        // G2D may decline at run time, so the CPU stays predicted after it.
+        // A G2D decline leaves the CPU predicted.
         assert_eq!(p(None, declines, takes(No), takes(Write)), Write);
         assert_eq!(p(None, declines, takes(ReadWrite), None), ReadWrite);
         assert_eq!(p(None, None, None, takes(Read)), Read);
         assert_eq!(p(None, None, None, None), No);
     }
 
-    /// The GL prediction follows the float classifier: a float destination
-    /// GL cannot render (host memory, an unsupported format) is predicted
-    /// for the CPU fallback.
+    /// A float destination GL cannot render is predicted for the CPU fallback.
     #[cfg(all(target_os = "linux", feature = "opengl"))]
     #[test]
     fn float_destinations_gl_declines_are_predicted_for_the_cpu() {
@@ -14498,8 +13354,7 @@ mod image_tests {
         assert!(image.cpu_access().writes());
     }
 
-    /// When a GPU backend declined and the CPU fallback is refused for
-    /// access, the error carries the decline; otherwise it is the CPU's.
+    /// A refused CPU fallback reports the GPU backend's decline when there was one.
     #[test]
     fn a_refused_cpu_fallback_reports_the_gpu_decline() {
         use edgefirst_tensor::{CpuAccess, Error as TensorError};
@@ -14540,9 +13395,7 @@ mod image_tests {
         ));
     }
 
-    /// With only the CPU backend, `create_image` widens a `Read` request to
-    /// `ReadWrite` and a `None` request to `Write`, so the processor's own
-    /// convert can fill the image.
+    /// With only the CPU backend, `create_image` widens `Read` to `ReadWrite` and `None` to `Write`.
     #[test]
     fn create_image_adds_write_when_the_cpu_backend_fills_it() {
         use edgefirst_tensor::CpuAccess;
@@ -14576,8 +13429,7 @@ mod image_tests {
         }
     }
 
-    /// A CPU convert refuses up front a caller destination declared without
-    /// writes, and a source declared without reads, naming both accesses.
+    /// A CPU convert refuses a destination declared without writes and a source declared without reads.
     #[test]
     fn cpu_convert_refuses_tensors_outside_their_declaration() {
         use edgefirst_tensor::{CpuAccess, Error as TensorError};
@@ -14635,8 +13487,7 @@ mod image_tests {
             .contains("declare CpuAccess::ReadWrite (the default)"));
     }
 
-    /// The CPU mask draw blends into its destination, so a `Write`-only
-    /// destination is refused before anything is drawn.
+    /// The CPU mask draw refuses a `Write`-only destination.
     #[test]
     fn cpu_draw_requires_readwrite_on_the_destination() {
         use edgefirst_tensor::{CpuAccess, Error as TensorError};
@@ -14665,10 +13516,7 @@ mod image_tests {
         );
     }
 
-    /// `create_image_desc` without a compression request is exactly
-    /// `create_image` (the processor's memory negotiation applies); with
-    /// `Compression::Any` off-Android it resolves linear and counts the
-    /// fallback in the processor-visible mirror.
+    /// `create_image_desc` matches `create_image` without a compression request and counts a `Compression::Any` fallback.
     #[test]
     fn create_image_desc_negotiates_and_counts_fallbacks() {
         use edgefirst_tensor::{CpuAccess, ImageDesc};
@@ -14706,8 +13554,7 @@ mod image_tests {
         }
     }
 
-    /// A contiguous request through `create_image_desc` is a CMA DMA-BUF,
-    /// or an error where there is no CMA heap; never a PBO or host memory.
+    /// A contiguous request through `create_image_desc` yields a CMA DMA-BUF or an error.
     #[test]
     #[cfg(target_os = "linux")]
     fn create_image_desc_contiguous_is_cma_dma_or_an_error() {
@@ -14729,8 +13576,7 @@ mod image_tests {
         }
     }
 
-    /// There is no DRM FourCC for F32 images, so `create_image` with
-    /// `TensorMemory::DmaBuf` and `DType::F32` must return `Err(NotSupported)`.
+    /// `create_image` with `TensorMemory::DmaBuf` and `DType::F32` returns `NotSupported`.
     #[test]
     #[cfg(target_os = "linux")]
     fn create_image_f32_dma_rejected() {
@@ -14749,14 +13595,7 @@ mod image_tests {
         );
     }
 
-    /// Verify that `import_image` stores the supplied `Option<Colorimetry>` on
-    /// the returned `TensorDyn`.
-    ///
-    /// `import_image` requires a DMA-backed fd on Linux.  When DMA is
-    /// unavailable we skip the DMA call but still verify the storage contract
-    /// by inspecting `set_colorimetry` / `colorimetry` on a plain `TensorDyn`
-    /// constructed the same way the function body does it — and we confirm via
-    /// code-read that the new parameter is unconditionally stored.
+    /// `import_image` stores the supplied `Option<Colorimetry>` on the returned `TensorDyn`.
     #[test]
     #[cfg(target_os = "linux")]
     fn import_image_carries_colorimetry() {
@@ -14767,8 +13606,7 @@ mod image_tests {
             .with_range(ColorRange::Limited);
 
         if !is_dma_available() {
-            // DMA unavailable on this host: exercise the storage path via
-            // TensorDyn directly (mirrors what import_image does internally).
+            // Without DMA, checks the colorimetry accessors on a plain `TensorDyn`.
             let mut t = TensorDyn::image(
                 8,
                 8,
@@ -14789,8 +13627,6 @@ mod image_tests {
             return;
         }
 
-        // DMA is available: allocate a real DMA tensor, extract its fd, and
-        // call import_image with an explicit Colorimetry.
         use edgefirst_tensor::{PlaneDescriptor, Tensor};
 
         let rgba_bytes = 64 * 64 * 4; // 64×64 RGBA8

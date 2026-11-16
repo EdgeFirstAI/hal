@@ -146,12 +146,10 @@ where
 /// Draw boxes and decoded masks onto `dst`.
 ///
 /// On Windows the destination's `ef_tensor_gpu_completion` reflects this draw
-/// afterwards, as it does after a convert, so another device can wait on the
-/// drawn frame instead of the CPU.
+/// afterwards, as it does after a convert.
 ///
 /// A `BGRA` background onto a zero-copy destination (a D3D11 texture, an
-/// IOSurface, a dma-buf) returns `ENOTSUP`: the GL base-layer draw has no
-/// `BGRA` arm and the CPU backend renders only `RGBA`/`RGB`.
+/// IOSurface, a dma-buf) returns `ENOTSUP`.
 ///
 /// `content_region` is `NULL` or four floats: where the image sits in the
 /// model input as normalized `[xmin, ymin, xmax, ymax]`
@@ -159,8 +157,8 @@ where
 /// to the image.
 ///
 /// `color_mode` is an `EF_COLOR_MODE_*` code; any other value is `EINVAL`.
-/// A CPU draw blends into `dst`, so one not declared `EF_CPU_ACCESS_READ_WRITE`
-/// (or a `background` not declared readable) is `EACCES`.
+/// A CPU draw into a `dst` not declared `EF_CPU_ACCESS_READ_WRITE`, or with a
+/// `background` not declared readable, is `EACCES`.
 ///
 /// @return 0 on success, `EINVAL` for an invalid argument or aliased
 /// buffers, `ENOTSUP` for a format no backend draws, `EACCES` as above,
@@ -397,8 +395,7 @@ mod tests {
 
     #[test]
     fn an_unknown_color_mode_is_einval() {
-        // Both handles are non-null but never dereferenced: the colour
-        // mode is validated before either is used.
+        // Non-null handles that are never dereferenced.
         let p = std::ptr::NonNull::<EfImageProcessor>::dangling().as_ptr();
         let dst = std::ptr::NonNull::<EfTensor>::dangling().as_ptr();
         let rc = unsafe {

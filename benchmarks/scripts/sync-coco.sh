@@ -54,9 +54,8 @@ for target in "${TARGETS[@]}"; do
     echo "(using fallback host ${host})"
   fi
 
-  # Prefer /data/coco/val2017; fall back to ~/coco/val2017.
-  # Require the rsync user can create a probe file (mkdir -p alone is insufficient
-  # when a root-owned /data/coco exists).
+  # Prefer /data/coco/val2017; fall back to ~/coco/val2017. The directory must
+  # accept a probe file from the rsync user.
   remote_dir="$(ssh "${host}" "bash -s" <<EOS
 set -euo pipefail
 pref='${REMOTE_PREFERRED}'

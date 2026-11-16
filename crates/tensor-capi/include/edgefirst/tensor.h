@@ -8,26 +8,20 @@
  * SPDX-License-Identifier: Apache-2.0
  * Copyright (c) 2026 Au-Zone Technologies. All Rights Reserved.
  *
- * The one tensor header. Every EdgeFirst application includes this — they all
- * need at least ef_tensor_free() — and every sibling library's header includes
- * it rather than restating the tensor surface.
+ * The tensor header. Every sibling library's header includes it.
  *
- * The handle is fully opaque. Every accessor is an exported function of
- * libedgefirst_tensor, the single implementation home of the tensor type: a
- * tensor from ef_image_processor_create_image() and one from ef_tensor_new()
- * are the same kind of object and behave identically, ef_tensor_free()
- * included.
+ * The handle is opaque. Every accessor is an exported function of
+ * libedgefirst_tensor. A tensor from ef_image_processor_create_image() and
+ * one from ef_tensor_new() are the same kind of object.
  *
- * Three surfaces, and a layout appears in exactly one of them:
+ * Three surfaces:
  *   - Opaque handle + exported accessors, for in-process access.
  *   - A builder, for construction, with sticky errors.
- *   - A (blob, fds) pair, for IPC. Fds travel out of band; a struct with an
- *     fd field is meaningless across a process boundary.
+ *   - A (blob, fds) pair, for IPC. Fds travel out of band.
  *
  * Platform-specific entry points. Every function is declared on every
- * platform and refuses at run time off its platform, so linking never
- * depends on the host. The tie is stated per function with a
- * "Platforms:" line:
+ * platform and refuses at run time off its platform. Each function states
+ * its platforms on a "Platforms:" line:
  *   - Linux:   dma-buf fds (the DMA_BUF export kind); ef_tensor_clone_fd
  *              duplicates the fd of any Unix backing that has one
  *   - macOS, iOS: IOSurface (ef_tensor_iosurface_ref, ef_tensor_from_iosurface_id)
@@ -55,10 +49,6 @@ typedef struct ef_tensor ef_tensor;
 
 /**
  * @brief Opaque builder handle.
- *
- * Forward-declared so callers can write `ef_tensor_builder *` without the
- * `struct` keyword. The definition is private to the library: construction
- * state is not part of the ABI.
  */
 typedef struct ef_tensor_builder ef_tensor_builder;
 
@@ -125,10 +115,8 @@ typedef uint32_t ef_dtype;
 /**
  * Backing store for a tensor.
  *
- * Every kind is declared on every platform. Whether one can be *materialised*
- * here is a runtime question — an IOSurface is a meaningful thing to name on
- * Linux even though nothing will allocate one — and platform-gating the
- * vocabulary would make the same integer mean different things per target.
+ * Every kind is declared on every platform; whether one can be allocated is a
+ * runtime question.
  */
 enum ef_storage_kind
 #if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
@@ -177,12 +165,6 @@ typedef uint32_t ef_storage_kind;
  *   targets, CPU-drawn overlays). On Linux a DMA-BUF comes from the uncached
  *   CMA heap where available, and CPU writes are write-combined.
  * - `EF_CPU_ACCESS_READ_WRITE`: both; cached memory. The default.
- *
- * A device that maps a cached buffer cleans and invalidates the CPU cache
- * over all of it on every access (a compositor blitting the buffer every
- * frame, for example); an uncached buffer needs no cache maintenance. CPU
- * reads of uncached memory are slow, so only declarations without CPU reads
- * select it.
  */
 enum ef_cpu_access
 #if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
@@ -203,19 +185,14 @@ typedef uint32_t ef_cpu_access;
 #endif // __cplusplus
 
 /**
- * Vendor tile-compression scheme actually in force for a tensor's
- * allocation.
+ * Vendor tile-compression scheme in force for a tensor's allocation.
  *
- * A *result*, not a request: [`EfImageDescView::compression`] carries what
- * an allocation asked for ("any scheme" / "a specific one"), whereas this
- * names the scheme the allocator actually resolved to. `None` is a real
- * enumerator rather than a presence flag because "linear" is the answer for
- * almost every allocation on almost every platform -- there is no absent
- * case to distinguish from it, unlike `EfViewOrigin`/`EfQuantizationInfo`
- * where every field value is legitimate.
+ * A result, not a request: [`EfImageDescView::compression`] carries what an
+ * allocation asked for, and this names the scheme the allocator resolved to.
+ * `None` means a linear layout.
  *
- * Mirrors `edgefirst_tensor::CompressionScheme`'s variants, plus the
- * `None` the Rust side spells as `Option::None`.
+ * Mirrors `edgefirst_tensor::CompressionScheme`'s variants, plus the `None`
+ * the Rust side spells as `Option::None`.
  */
 enum ef_compression
 #if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
@@ -223,7 +200,7 @@ enum ef_compression
 #endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
  {
   /**
-   * Linear layout -- no vendor tile compression.
+   * Linear layout: no vendor tile compression.
    */
   EF_COMPRESSION_NONE = 0,
   /**
@@ -252,12 +229,12 @@ typedef uint32_t ef_compression;
 #endif // __cplusplus
 
 /**
- * Compression *request*, as `ef_tensor_image_desc_set_compression` takes it
- * and [`EfImageDescView::compression`] reports it.
+ * Compression request, as `ef_tensor_image_desc_set_compression` takes it and
+ * [`EfImageDescView::compression`] reports it.
  *
  * Distinct from [`EfCompression`], which names the scheme an allocation
- * resolved to. No C setter can request `Scheme`; the view reports it so a
- * request made through the Rust API is not folded into `Any` or dropped.
+ * resolved to. No C setter can request `Scheme`; the view reports it for a
+ * request made through the Rust API.
  */
 enum ef_compression_request
 #if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
@@ -318,25 +295,12 @@ typedef uint32_t ef_contiguity;
 #endif // __cplusplus
 
 /**
- * Which *kind* of failure the calling thread's last failing
- * `ef_tensor_*` call was.
+ * Which kind of failure the calling thread's last failing `ef_tensor_*` call
+ * was. The companion to `ef_tensor_last_error_message`.
  *
- * The companion to `ef_tensor_last_error_message`, and the reason it
- * exists: an entry point that reports failure by returning `NULL` has no
- * errno to carry a class, so a Rust consumer rebuilding a typed
- * `edgefirst_tensor::Error` from it had nothing to go on but the advisory
- * message -- which the message's own contract says must never be parsed.
- * `ef_tensor_batch` really did match on a fragment of a `Display` string
- * for exactly this reason.
- *
- * A **class**, not a one-to-one mirror of `edgefirst_tensor::Error`. Its
- * variants are the distinctions a caller acts on differently; several Rust
- * variants deliberately collapse into one here, and adding a Rust variant
- * does not oblige adding one here. `Unspecified` is the honest answer when
- * a failure path recorded only a message, and is what every such path
- * resets this to -- a stale class from an earlier failure would be read as
- * this call's, which is the confident-falsehood shape this whole mechanism
- * exists to remove.
+ * A class, not a one-to-one mirror of `edgefirst_tensor::Error`: several Rust
+ * variants collapse into one here. `Unspecified` is reported when a failure
+ * path recorded only a message, and every such path resets the class to it.
  */
 enum ef_error_class
 #if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
@@ -374,7 +338,7 @@ enum ef_error_class
    */
   EF_ERROR_CLASS_NOT_SUPPORTED = 6,
   /**
-   * The operation is legal but not permitted right now -- a live map, a
+   * The operation is legal but not permitted right now: a live map, a
    * shared handle, a lock another holder owns.
    */
   EF_ERROR_CLASS_INVALID_OPERATION = 7,
@@ -401,41 +365,28 @@ typedef uint32_t ef_error_class;
 typedef struct ef_tensor_image_desc ef_tensor_image_desc;
 
 /**
- * Client-owned state a library entry point calls back into — **frozen by
- * value, forever**, and reused verbatim by every domain that needs one
- * (PBO today; CUDA-GL next).
+ * Client-owned state a library entry point calls back into. Passed by value;
+ * its size and field offsets are fixed.
  *
- * # What `retain`/`release` govern — and what they do not
+ * # What `retain`/`release` govern
  *
- * They extend the life of the **callback channel only**. They never
- * transfer ownership of the GL buffer, the CUDA resource, or anything else
- * the context happens to address. Getting this backwards double-frees a GL
- * buffer:
+ * They extend the life of the callback channel only. They never transfer
+ * ownership of the GL buffer, the CUDA resource, or anything else the context
+ * addresses:
  *
  * * The producing side's own destructor stays the sole caller of the real
  *   `delete_buffer`.
  * * A library that reconstructed operations from this struct treats
- *   `delete_buffer` as a no-op — it borrows the resource, it does not own
- *   it.
+ *   `delete_buffer` as a no-op: it borrows the resource.
  *
  * # Ownership at an entry point
  *
- * An entry point that stores this struct calls `retain(ctx)` itself and
- * calls `release(ctx)` exactly once when the object holding it is
- * destroyed. The caller keeps its own count and may drop it at any time
- * after the call returns.
+ * An entry point that stores this struct calls `retain(ctx)` itself and calls
+ * `release(ctx)` exactly once when the object holding it is destroyed. The
+ * caller keeps its own count and may drop it at any time after the call
+ * returns.
  *
- * # Freezing
- *
- * This vocabulary declines the `struct_size` handshake (see the root
- * `ARCHITECTURE.md`, "Why there is no `struct_size` handshake"), so a
- * by-value struct grows only by a major bump or a suffixed successor.
- * Freezing **one** tiny universal struct — rather than one per domain, or
- * one that grows per domain — is what keeps that cost paid once. Its size
- * and offsets are pinned by `tests/c/test_layout_goldens.c` in
- * `edgefirst-tensor-capi` and by `client_state_layout_is_pinned` below.
- *
- * `ctx` is opaque to the library: only the producing copy of the code ever
+ * `ctx` is opaque to the library: only the producing copy of the code
  * dereferences it.
  */
 typedef struct ef_client_state {
@@ -458,8 +409,8 @@ typedef struct ef_client_state {
 /**
  * Map a CUDA graphics resource to a device pointer. `0` on success.
  *
- * May be NULL where an entry point takes one; such an entry point refuses
- * a NULL rather than calling through it.
+ * May be NULL where an entry point takes one; such an entry point refuses a
+ * NULL.
  */
 typedef int (*EfCudaMapFnNullable)(const void *ctx,
                                    void *resource,
@@ -469,53 +420,44 @@ typedef int (*EfCudaMapFnNullable)(const void *ctx,
 /**
  * Unmap a resource previously mapped by an `ef_cuda_map_fn`.
  *
- * May be NULL where an entry point takes one; such an entry point refuses
- * a NULL rather than calling through it.
+ * May be NULL where an entry point takes one; such an entry point refuses a
+ * NULL.
  */
 typedef void (*EfCudaUnmapFnNullable)(const void *ctx, void *resource);
 
 /**
  * Unregister a CUDA graphics resource.
  *
- * May be NULL where an entry point takes one; such an entry point refuses
- * a NULL rather than calling through it.
+ * May be NULL where an entry point takes one; such an entry point refuses a
+ * NULL.
  */
 typedef void (*EfCudaUnregisterFnNullable)(const void *ctx, void *resource);
 
 /**
  * The D3D11 texture behind a Windows texture tensor.
  *
- * The scalar block `ef_tensor_d3d11_layout` fills, the same shape as
- * `ef_tensor_plane` and `ef_tensor_view_origin` -- one library reading a
- * tensor it did not mint. Mirrors `edgefirst_tensor::d3d11_layout::
- * D3d11ImageLayout`.
+ * The scalar block `ef_tensor_d3d11_layout` fills. Mirrors
+ * `edgefirst_tensor::d3d11_layout::D3d11ImageLayout`.
  *
  * The dimensions are the texture's, in texels and rows, not the image's in
  * pixels: a combined-plane semi-planar image is one texture whose row count
- * covers both planes, and a YUYV image is one texel per two pixels, so
- * `texture_width`/`texture_height` do not match `ef_tensor_shape` for
- * either. Read the image's own dimensions from the shape.
+ * covers both planes, and a YUYV image is one texel per two pixels. Read the
+ * image's own dimensions from `ef_tensor_shape`.
  *
  * An NV12 image of even width and height is a native two-plane texture,
- * `dxgi_format` 103 (`DXGI_FORMAT_NV12`): `texture_width` x
- * `texture_height` is the luma grid, the image's own size, and the chroma
- * plane is a second plane of the same texture at half each dimension, which
- * GL and video APIs address by plane index. A CPU map of it is still laid
- * out as luma rows then chroma rows at `ef_tensor_row_stride`.
+ * `dxgi_format` 103 (`DXGI_FORMAT_NV12`): `texture_width` x `texture_height`
+ * is the luma grid, the image's own size, and the chroma plane is a second
+ * plane of the same texture at half each dimension, which GL and video APIs
+ * address by plane index. A CPU map of it is laid out as luma rows then
+ * chroma rows at `ef_tensor_row_stride`.
  *
  * Every other semi-planar image (`nv16`, `nv24`, and `nv12` at an odd size)
  * is the combined-plane `R8` texture, whose `texture_width` is the driver's
- * row pitch -- at least `even(width)`, and on a discrete adapter commonly
- * more (128 bytes on NVIDIA, so a 64-wide NV16 image is a 128-wide texture).
- * It is the pitch the combined plane's rows are spaced by and the width a
- * sampler must address the texture at. Never derive it from the image
- * width: read this field, or `ef_tensor_row_stride`, which carries the same
- * number.
+ * row pitch: at least `even(width)`, and possibly more. It is the pitch the
+ * combined plane's rows are spaced by and the width a sampler addresses the
+ * texture at. `ef_tensor_row_stride` carries the same number.
  *
- * By-value and frozen forever: a consumer bakes this size and these offsets
- * into its call sites, so the struct evolves by a suffixed successor, never
- * by an in-place edit. `d3d11_layout_is_pinned` and the C golden in
- * `tensor-capi/tests/c/test_layout_goldens.c` hold both sides to it.
+ * Passed by value; its size and field offsets are fixed.
  */
 typedef struct ef_d3d11_layout {
   /**
@@ -544,20 +486,12 @@ typedef struct ef_d3d11_layout {
 /**
  * Flattened, `#[repr(C)]` view of an image-request descriptor's fields.
  *
- * `ef_tensor_image_desc` is opaque (handles are opaque both ways: a
- * receiving library never dereferences, sizes, or copies one). This is the
- * scalar block `ef_tensor_image_desc_get` fills instead -- the same shape as
- * `ef_tensor_plane`, which lets one library read a tensor it did not mint
- * without touching the other's private layout.
+ * `ef_tensor_image_desc` is opaque; this is the scalar block
+ * `ef_tensor_image_desc_get` fills.
  *
- * `memory` and `compression` are each a value plus an explicit presence
- * flag rather than a sentinel: every code in `ef_storage_kind` (0..=6) is a
- * real value, so there is no unused number to repurpose as "no request"
- * without colliding with `ef_storage_kind`'s `MEM == 0`. `compression` is an
- * [`EfCompressionRequest`]: `Any`, or `Scheme` for "a specific vendor
- * scheme", the latter not further decodable through this view -- no
- * `ef_tensor_image_desc_set_*` entry point can request one, so this view has
- * never needed to carry more detail than "present, and it's a specific one."
+ * `memory` and `compression` are each a value plus an explicit presence flag.
+ * `compression` is an [`EfCompressionRequest`]: `Any`, or `Scheme` for a
+ * specific vendor scheme, which this view does not decode further.
  */
 typedef struct ef_image_desc_view {
   /**
@@ -601,11 +535,6 @@ typedef struct ef_image_desc_view {
 
 /**
  * One plane's location, mirroring `TensorPlane` on the wire.
- *
- * The route by which one library consumes a tensor another minted: the Rust
- * types are not shared across `.so` boundaries, so the planes are the
- * interface. Emitted into `edgefirst/tensor.h` as `ef_tensor_plane` by
- * cbindgen.
  */
 typedef struct ef_tensor_plane {
   /**
@@ -637,12 +566,9 @@ typedef struct ef_tensor_plane {
 /**
  * Parent-region snapshot for a tensor that is a `view`/`batch` sub-region.
  *
- * The scalar block `ef_tensor_view_origin` fills, the same shape as
- * `ef_tensor_plane` and `ef_tensor_image_desc_view` -- one library reading a
- * tensor it did not mint. `has_origin` is a presence flag rather than a
- * sentinel value because every field is a legitimate 0 for a view pinned at
- * the parent's top-left corner; the other fields are meaningful only when
- * it is non-zero. Mirrors `edgefirst_tensor::ViewOrigin`.
+ * The scalar block `ef_tensor_view_origin` fills. The other fields are
+ * meaningful only when `has_origin` is non-zero. Mirrors
+ * `edgefirst_tensor::ViewOrigin`.
  */
 typedef struct EfViewOrigin {
   /**
@@ -683,11 +609,9 @@ typedef void (*EfLogCallback)(ef_log_level level,
 /**
  * A mapped CPU window over a tensor's bytes.
  *
- * By-value with no version field and no reserved tail, so its size
- * is baked into consumer call sites, so it evolves by a suffixed successor
- * (`ef_tensor_view2` + new entry points), never in place. The pointer is
- * valid from `ef_tensor_map` until the matching `ef_tensor_unmap`; writing
- * through it is allowed only when the map was taken with a writable access.
+ * Passed by value; its size is fixed. The pointer is valid from
+ * `ef_tensor_map` until the matching `ef_tensor_unmap`; writing through it is
+ * allowed only when the map was taken with a writable access.
  */
 typedef struct ef_tensor_view {
   uint8_t *ptr;
@@ -698,8 +622,8 @@ typedef struct ef_tensor_view {
  * Map a PBO for CPU access. `0` on success; `-1` when the GL context is
  * gone; any other non-zero value a generic failure.
  *
- * May be NULL where an entry point takes one; such an entry point refuses
- * a NULL rather than calling through it.
+ * May be NULL where an entry point takes one; such an entry point refuses a
+ * NULL.
  */
 typedef int (*ef_pbo_map_fn)(const void *ctx,
                              uint32_t buffer_id,
@@ -710,26 +634,18 @@ typedef int (*ef_pbo_map_fn)(const void *ctx,
 /**
  * Unmap a PBO previously mapped by an `ef_pbo_map_fn`. Same return codes.
  *
- * May be NULL where an entry point takes one; such an entry point refuses
- * a NULL rather than calling through it.
+ * May be NULL where an entry point takes one; such an entry point refuses a
+ * NULL.
  */
 typedef int (*ef_pbo_unmap_fn)(const void *ctx, uint32_t buffer_id);
 
 /**
- * Presence/shape summary of a tensor's quantization metadata.
+ * Presence and shape summary of a tensor's quantization metadata.
  *
  * The first half of the two-call idiom `ef_tensor_quantization_info` /
- * `ef_tensor_quantization_get` use: this scalar block tells the caller
- * *whether* quantization is attached and *how big* a buffer the second call
- * needs, without allocating on either side of the boundary --
- * `Quantization` itself is variable-length (an axis plus per-axis `scales`
- * and `zero_points`), so unlike `ef_tensor_plane`/`ef_tensor_view_origin`
- * this view cannot carry the payload itself.
- *
- * `has_quantization` is a presence flag, not a sentinel, for the same
- * reason `EfViewOrigin::has_origin` is: axis `0` and a scale of `0.0` are
- * both legitimate values, so there is no unused bit pattern to repurpose as
- * "absent" without colliding with a real one.
+ * `ef_tensor_quantization_get` use: this scalar block reports whether
+ * quantization is attached and how many entries the second call's buffers
+ * need.
  */
 typedef struct ef_quantization_info {
   /**
@@ -757,15 +673,8 @@ extern "C" {
 /**
  * ABI version of this library's C surface.
  *
- * Bumped only when the C ABI breaks. Adding a new exported accessor does
- * *not* bump this: an existing consumer's header simply never names the new
- * symbol, so linking against an older `libedgefirst_tensor.so` still
- * resolves everything it actually calls.
- *
- * 2: a map, copy or sync outside a tensor's declared `ef_cpu_access` fails
- * with `EACCES` (reads included), `ef_tensor_image_desc_new` defaults to
- * `EF_CPU_ACCESS_READ_WRITE`, and `ef_unplanned_cpu_access_count` is
- * removed.
+ * Incremented when the C ABI breaks; adding an exported function does not
+ * change it.
  */
 uint32_t ef_tensor_abi_version(void);
 
@@ -775,7 +684,7 @@ uint32_t ef_tensor_abi_version(void);
 ef_tensor_builder *ef_tensor_builder_new(void);
 
 /**
- * Free a builder. Freeing `NULL` is a no-op, matching `free(3)`.
+ * Free a builder. Freeing `NULL` is a no-op.
  *
  * # Safety
  * `b` must have come from [`ef_tensor_builder_new`].
@@ -791,12 +700,8 @@ void ef_tensor_builder_free(ef_tensor_builder *b);
 int ef_tensor_builder_error(const ef_tensor_builder *b);
 
 /**
- * Set the element type.
- *
- * Takes the integer rather than `ef_dtype` deliberately: a C caller can pass
- * any value, and transmuting an out-of-range one into a Rust enum is undefined
- * behaviour, while validating an integer is not. Pass an `EF_DTYPE_*`
- * enumerator; an unknown code is `EINVAL`.
+ * Set the element type. `dtype` is an `EF_DTYPE_*` code; an unknown code
+ * is `EINVAL`.
  *
  * # Safety
  * `b` must be `NULL` or a live builder.
@@ -812,10 +717,7 @@ int ef_tensor_builder_dtype(ef_tensor_builder *b, uint32_t dtype);
 int ef_tensor_builder_shape(ef_tensor_builder *b, const uint64_t *dims, uint32_t ndim);
 
 /**
- * Set strides, **in bytes**.
- *
- * Must have the same rank as the shape: a partial stride array has no
- * meaning, matching the blob format's all-or-nothing rule.
+ * Set strides, in bytes. Must have the same rank as the shape.
  *
  * # Safety
  * `str_` must point to `ndim` readable `int64_t`.
@@ -823,10 +725,8 @@ int ef_tensor_builder_shape(ef_tensor_builder *b, const uint64_t *dims, uint32_t
 int ef_tensor_builder_strides(ef_tensor_builder *b, const int64_t *str, uint32_t ndim);
 
 /**
- * Set the backing store.
- *
- * Takes the integer rather than `ef_storage_kind`, for the same reason as
- * [`ef_tensor_builder_dtype`]. Pass an `EF_STORAGE_KIND_*` enumerator.
+ * Set the backing store. `kind` is an `EF_STORAGE_KIND_*` code; an unknown
+ * code is `EINVAL`.
  *
  * # Safety
  * `b` must be `NULL` or a live builder.
@@ -836,42 +736,21 @@ int ef_tensor_builder_storage(ef_tensor_builder *b, uint32_t kind);
 /**
  * Add a plane. Required by `wrap`, rejected by `alloc`.
  *
- * Every field is recorded here, but [`ef_tensor_builder_wrap`] cannot honour
- * all of them equally -- the underlying `Tensor` can only represent a
- * subset of what a real V4L2/DRM plane carries:
+ * [`ef_tensor_builder_wrap`] treats the fields as follows:
  *
  * * `handle` -- adopted as the tensor's fd.
- * * `stride` -- carried onto the tensor as its row stride, applied after any
- *   format the builder also carries (`ef_tensor_builder_format`) is
- *   attached -- `set_row_stride` itself requires a format already be set,
- *   so applying it any earlier would reject every `wrap` call that supplied
- *   both a format and a nonzero stride, unconditionally, regardless of
- *   whether the stride was actually valid.
- * * `offset` -- carried onto the tensor as its plane offset, for the same
- *   reason applied after any format (this is the one field `wrap` used to
- *   silently drop).
- * * `size` -- validated against the extent `shape` and `stride` imply, never
- *   stored: the tensor derives its own extent from shape and stride, and a
- *   caller-supplied `size` is only ever a sanity bound. `0` means
- *   "unspecified" and is not checked (matching `stride`'s own convention). A
- *   nonzero `size` **smaller** than required is rejected; **larger** is
- *   accepted -- a padded or over-allocated buffer is a normal thing to hand
- *   a wrapper.
- * * `used` -- rejected unless equal to `size`. The tensor has no
- *   partial-fill/`bytes_used` concept, so any other value is unrepresentable.
- *   `used > size` is rejected right here, by this function, with `EINVAL`;
- *   `used < size` is rejected by `wrap` itself, with `EBADMSG` -- same
- *   underlying fact caught at two different points in the two functions'
- *   own validation order, not an accidental split.
- * * `modifier` -- rejected unless `0` (linear). The `Tensor` type has no
- *   representation for a DRM format modifier: adopting a tiled or
- *   compressed buffer under a nonzero modifier would read it back as
- *   linear, which is silently wrong data in every pixel, so `wrap` refuses
- *   it instead.
- * * a second and later plane -- rejected: `wrap` adopts exactly one handle
- *   per tensor. Combined multi-plane geometry (e.g. NV12's Y and UV planes
- *   at different offsets within one dma-buf) is not something this builder
- *   composes; wrap each plane as its own single-plane tensor instead.
+ * * `stride` -- carried onto the tensor as its row stride, applied after
+ *   any format the builder carries. `0` means unspecified.
+ * * `offset` -- carried onto the tensor as its plane offset, applied after
+ *   any format.
+ * * `size` -- validated against the extent `shape` and `stride` imply, and
+ *   not stored. `0` means unspecified and is not checked. A nonzero `size`
+ *   smaller than required is rejected; a larger one is accepted.
+ * * `used` -- rejected unless equal to `size`: `used > size` by this
+ *   function with `EINVAL`, `used < size` by `wrap` with `EBADMSG`.
+ * * `modifier` -- rejected unless `0` (linear).
+ * * a second and later plane -- rejected: `wrap` adopts one handle per
+ *   tensor.
  *
  * # Safety
  * `b` must be `NULL` or a live builder.
@@ -927,11 +806,7 @@ int ef_tensor_builder_fence(ef_tensor_builder *b, int fd);
 /**
  * Allocate storage and produce a tensor. Returns `NULL` on failure.
  *
- * Requires **no** planes: `alloc` derives storage from the format, shape and
- * alignment. Supplying planes means the caller wanted [`ef_tensor_builder_wrap`],
- * so it is rejected rather than silently ignored.
- *
- * The builder survives and may be called again.
+ * Fails when planes were added. The builder survives and may be used again.
  *
  * # Safety
  * `b` must be `NULL` or a live builder.
@@ -939,44 +814,31 @@ int ef_tensor_builder_fence(ef_tensor_builder *b, int fd);
 ef_tensor *ef_tensor_builder_alloc(ef_tensor_builder *b);
 
 /**
- * Adopt externally-owned handles and produce a tensor. Returns `NULL` on failure.
+ * Adopt an externally-owned handle and produce a tensor. Returns `NULL` on
+ * failure.
  *
- * Requires **at least one** plane carrying a real handle — that is the
- * difference from [`ef_tensor_builder_alloc`], and the reason misuse is a
- * per-field error rather than a convention.
+ * Requires exactly one plane carrying a handle.
  *
  * Adopts the handle only on success: the resulting tensor owns it and the
  * caller must not close it. On failure the handle is left open and remains
  * the caller's to close.
  *
- * **Behaviour change**: earlier versions of this function silently ignored
- * `offset`, `size`, `used`, `modifier`, and every plane past the first --
- * a caller who supplied any of them got a tensor that looked valid but read
- * from the wrong place, or under the wrong layout. They are now carried,
- * validated, or rejected; see [`ef_tensor_builder_add_plane`]'s doc for the
- * field-by-field disposition. A third-party caller that was previously
- * getting a silently-wrong tensor now gets one of the errors below instead
- * -- the correct trade, but a real behaviour change for anyone linking this
- * library. Also fixed in the same pass: a `wrap` call that supplied both a
- * format (`ef_tensor_builder_format`) and a nonzero plane `stride` used to
- * fail unconditionally with `EINVAL` regardless of whether the stride was
- * valid, because the stride was applied before the format was; that
- * combination now succeeds when the stride is actually valid for the format.
+ * See [`ef_tensor_builder_add_plane`] for how each plane field is treated.
+ * A nonzero plane `stride` supplied together with a format
+ * (`ef_tensor_builder_format`) is validated against that format.
  *
  * @retval non-`NULL` success.
  * @retval `NULL` on failure; [`ef_tensor_builder_error`] distinguishes why:
  *   - `EINVAL` no plane was added, `handle` is negative or does not fit an
  *     `int`, no dtype/shape was set, `stride` is nonzero and smaller than
- *     the format's minimum row size (only checked once a format is
- *     attached; same check as [`crate::mutate::ef_tensor_set_row_stride`]),
- *     `from_fd` itself failed (e.g. an unrecognized fd type), or the
- *     platform is non-Unix.
+ *     the format's minimum row size (checked only when a format is
+ *     attached), or the fd could not be imported.
  *   - `ERANGE` `size` is nonzero and smaller than the extent `shape` and
  *     `stride` require.
  *   - `EBADMSG` `used` does not equal `size`.
- *   - `EDOM` `modifier` is nonzero -- only linear (`0`) is representable.
- *   - `ENOTSUP` more than one plane was added -- `wrap` adopts a single
- *     handle per tensor.
+ *   - `EDOM` `modifier` is nonzero.
+ *   - `ENOTSUP` more than one plane was added.
+ *   - `ENOSYS` the platform is non-Unix.
  *
  * # Safety
  * `b` must be `NULL` or a live builder, and any plane handle must be a valid
@@ -995,13 +857,13 @@ ef_tensor *ef_tensor_builder_wrap(ef_tensor_builder *b);
  *
  * On Windows the mapping of a D3D11 texture tensor is tight rows of
  * `width * bytes_per_texel`, and the size [`ef_tensor_cuda_device_ptr`]
- * reports is their sum, whatever `ef_tensor_row_stride` says -- that is the
- * D3D11 staging pitch a CPU map sees, a larger number on a padded backing.
- * A consumer must not stride the device pointer by `ef_tensor_row_stride`.
+ * reports is their sum. `ef_tensor_row_stride` is the D3D11 staging pitch a
+ * CPU map sees, which is larger on a padded backing: a consumer must not
+ * stride the device pointer by it.
  *
- * A semi-planar texture (NV12, NV16, NV24) is as wide as its own pitch, so
- * there the mapping is `ef_tensor_row_stride` times the combined height and
- * striding by it is correct.
+ * For a semi-planar texture (NV12, NV16, NV24) the mapping is
+ * `ef_tensor_row_stride` times the combined height, and striding by
+ * `ef_tensor_row_stride` is correct.
  *
  * # Safety
  * `t` must be `NULL` or a live handle.
@@ -1016,17 +878,16 @@ void *ef_tensor_cuda_map(const ef_tensor *t);
  *
  * On Windows the mapping of a D3D11 texture tensor is tight rows of
  * `width * bytes_per_texel`, and the size [`ef_tensor_cuda_device_ptr`]
- * reports is their sum, whatever `ef_tensor_row_stride` says -- that is the
- * D3D11 staging pitch a CPU map sees, a larger number on a padded backing.
- * A consumer must not stride the device pointer by `ef_tensor_row_stride`;
- * writing at that pitch scrambles the image rather than failing.
+ * reports is their sum. `ef_tensor_row_stride` is the D3D11 staging pitch a
+ * CPU map sees, which is larger on a padded backing: a consumer must not
+ * stride the device pointer by it.
  *
- * A semi-planar texture (NV12, NV16, NV24) is as wide as its own pitch, so
- * there the mapping is `ef_tensor_row_stride` times the combined height and
- * striding by it is correct.
+ * For a semi-planar texture (NV12, NV16, NV24) the mapping is
+ * `ef_tensor_row_stride` times the combined height, and striding by
+ * `ef_tensor_row_stride` is correct.
  *
- * Retains `t` and returns NULL when CUDA is unavailable, exactly as
- * [`ef_tensor_cuda_map`].
+ * Retains `t` and returns NULL when CUDA is unavailable, as
+ * [`ef_tensor_cuda_map`] does.
  *
  * # Safety
  * `t` must be `NULL` or a live handle.
@@ -1041,13 +902,10 @@ void *ef_tensor_cuda_map_mut(const ef_tensor *t);
  *
  * `*out_size` is the mapping's length in bytes. On Windows that is the
  * D3D11 texture's tight rows of `width * bytes_per_texel` summed over the
- * rows, not `ef_tensor_row_stride` times the row count -- the stride is the
- * staging pitch a CPU map sees, and striding this pointer by it walks off
- * the end of the mapping.
+ * rows, not `ef_tensor_row_stride` times the row count.
  *
- * A semi-planar texture (NV12, NV16, NV24) is as wide as its own pitch, so
- * there the mapping is `ef_tensor_row_stride` times the combined height and
- * striding by it is correct.
+ * For a semi-planar texture (NV12, NV16, NV24) the mapping is
+ * `ef_tensor_row_stride` times the combined height.
  *
  * # Safety
  * `map` must be `NULL` or a live map. `out_size` may be NULL.
@@ -1060,9 +918,9 @@ void *ef_tensor_cuda_device_ptr(const void *map, uintptr_t *out_size);
  * Release a map from [`ef_tensor_cuda_map`] or [`ef_tensor_cuda_map_mut`].
  * NULL is a no-op.
  *
- * Drops the CUDA mapping first, then releases the retain taken at map. A
- * writable map's drop is where the write-back happens: the device buffer is
- * copied into the tensor and the copy is synchronized before this returns.
+ * Drops the CUDA mapping first, then releases the retain taken at map. For
+ * a writable map, the device buffer is copied into the tensor and the copy
+ * is synchronized before this returns.
  *
  * # Safety
  * `map` must be `NULL` or have come from [`ef_tensor_cuda_map`] or
@@ -1075,17 +933,15 @@ void ef_tensor_cuda_unmap(void *map);
  *
  * `state` is the callback channel this library keeps for the registration's
  * life: it calls `state.retain` before returning and `state.release` when
- * the tensor (and therefore the `CudaHandle`) is freed. Reuses frozen
- * `ef_client_state` (24 bytes); this adds no new `repr(C)` struct.
+ * the tensor (and therefore the `CudaHandle`) is freed.
  *
- * **`resource` is the client-owned GL buffer handle.** This entry point
- * never deletes it; the caller's own GL teardown stays the sole caller of
- * `glDeleteBuffers`. On **success**, the CUDA *graphics registration* for
- * that buffer is consumed by the library tensor and torn down through
- * `unregister_fn` when the tensor is freed — do not call
- * `cudaGraphicsUnregisterResource` on that registration after success. On
- * **failure** (`EINVAL`), nothing is stored and the registration remains
- * entirely caller-owned.
+ * `resource` is the client-owned GL buffer handle. This entry point never
+ * deletes it; the caller remains the sole caller of `glDeleteBuffers`. On
+ * success, the CUDA graphics registration for that buffer is consumed by
+ * the library tensor and torn down through `unregister_fn` when the tensor
+ * is freed: do not call `cudaGraphicsUnregisterResource` on that
+ * registration after success. On failure (`EINVAL`), nothing is stored and
+ * the registration remains caller-owned.
  *
  * `map_fn` / `unmap_fn` / `unregister_fn` must be non-NULL. They run on
  * the caller's thread (typically the GL worker).
@@ -1123,14 +979,12 @@ int ef_tensor_cuda_attached(const ef_tensor *t);
 /**
  * Platforms: Windows.
  *
- * The process `ID3D11Device*`, created on first call. **Borrowed**: no
- * reference is transferred, so a caller that keeps the pointer past this
- * tensor library's lifetime must `AddRef` it, and must never `Release` the
- * one handed back here.
+ * The process `ID3D11Device*`, created on first call. Borrowed: no
+ * reference is transferred. A caller that keeps the pointer past this
+ * library's lifetime must `AddRef` it, and must not `Release` the pointer
+ * returned here.
  *
- * Every texture tensor this library allocates lives on this device, so a
- * consumer that wants to render into one creates its own resources on the
- * same device rather than opening a shared handle.
+ * Every texture tensor this library allocates lives on this device.
  *
  * @retval `NULL` with `errno` set: `EIO` when no device could be created
  *         (no adapter, or `D3D11CreateDevice` failed --
@@ -1142,13 +996,12 @@ void *ef_d3d11_device(void);
 /**
  * Platforms: Windows.
  *
- * Adopt a host-owned `ID3D11Device*` as the process device, so tensors this
- * library allocates share the caller's device instead of creating a second
- * one. The reference stays the caller's; this library takes its own when it
- * first uses the device.
+ * Adopt a host-owned `ID3D11Device*` as the process device. The reference
+ * stays the caller's; this library takes its own when it first uses the
+ * device.
  *
- * Must be called before anything that creates the device as a side effect
- * -- `ef_d3d11_device`, `ef_is_gpu_buffer_available`, or any texture
+ * Must be called before anything that creates the device --
+ * `ef_d3d11_device`, `ef_is_gpu_buffer_available`, or any texture
  * allocation. Once the device exists it cannot be replaced.
  *
  * @return 0 on success, `EINVAL` for `NULL` or a pointer that is not a live
@@ -1163,10 +1016,9 @@ int ef_d3d11_use_external_device(void *device);
 /**
  * Platforms: Windows.
  *
- * The `ID3D11Texture2D*` backing this tensor. **Borrowed**: valid while the
- * tensor lives, and never `Release`d by the caller. Bind it, copy from it,
- * or `QueryInterface` it; to hand it to another device or process use
- * [`ef_tensor_d3d11_shared_handle`] instead.
+ * The `ID3D11Texture2D*` backing this tensor. Borrowed: valid while the
+ * tensor lives, and never `Release`d by the caller. To hand the texture to
+ * another device or process use [`ef_tensor_d3d11_shared_handle`].
  *
  * @retval `NULL` with `errno` set: `EINVAL` for a `NULL` tensor, `ENOTSUP`
  *         for a tensor that is not a D3D11 texture and off Windows.
@@ -1181,8 +1033,8 @@ void *ef_tensor_d3d11_texture(const ef_tensor *t);
  *
  * The texture geometry the HAL chose for this image: DXGI format, texel
  * dimensions, bytes per texel, and the matching GL internal format. The
- * dimensions are the *texture's*, not the image's -- see `ef_d3d11_layout`
- * for why the two differ for semi-planar and packed-YUV formats.
+ * dimensions are the texture's, which differ from the image's for
+ * semi-planar and packed-YUV formats (see `ef_d3d11_layout`).
  *
  * `out` is written only on success.
  *
@@ -1198,15 +1050,14 @@ int ef_tensor_d3d11_layout(const ef_tensor *t, struct ef_d3d11_layout *out);
 /**
  * Platforms: Windows.
  *
- * An **owned** duplicate of the texture's NT shared handle; close it with
- * `CloseHandle`. Open it on a D3D12 device, another D3D11 device, in CUDA,
- * or duplicate it into another process. Closing it does not affect the
- * tensor, and the tensor's own handle outlives this duplicate.
+ * An owned duplicate of the texture's NT shared handle; close it with
+ * `CloseHandle`. It can be opened on a D3D12 device, on another D3D11
+ * device, in CUDA, or duplicated into another process. Closing it does not
+ * affect the tensor.
  *
  * @retval `NULL` with `errno` set: `EINVAL` for a `NULL` tensor, `ENOTSUP`
  *         for a tensor that is not a D3D11 texture and off Windows, or
- *         another errno translated from the backend's error -- a
- *         duplication that failed for its own reason keeps that reason.
+ *         another errno translated from the backend's error.
  *
  * # Safety
  * `t` must be `NULL` or a live handle.
@@ -1219,13 +1070,12 @@ void *ef_tensor_d3d11_shared_handle(const ef_tensor *t);
  * The fence a GPU consumer waits on before reading this texture, and the
  * timeline value to wait for.
  *
- * `*fence` and `*value` are cleared to `NULL`/0 before anything else, so
- * whatever the caller had in those variables can never be mistaken for an
- * answer: "no write has been recorded" is return 0 with `*fence == NULL`,
- * and every failure path leaves them cleared too.
+ * `*fence` and `*value` are set to `NULL`/0 first and stay that way on
+ * every failure path. When no write has been recorded the call returns 0
+ * with `*fence == NULL`.
  *
- * When a write *is* recorded, `*fence` is an **owned** duplicate of the
- * shared fence's NT handle; close it with `CloseHandle`. Open it with
+ * When a write is recorded, `*fence` is an owned duplicate of the shared
+ * fence's NT handle; close it with `CloseHandle`. Open it with
  * `ID3D12Device::OpenSharedHandle`, `ID3D11Device5::OpenSharedFence`, or
  * `cudaImportExternalSemaphore`, and wait for `*value`.
  *
@@ -1244,15 +1094,12 @@ int ef_tensor_gpu_completion(const ef_tensor *t, void **fence, uint64_t *value);
  *
  * The fence value of the newest GPU write recorded on this tensor, or 0 when
  * there is none: the `*value` [`ef_tensor_gpu_completion`] reports, without
- * the duplicated fence handle. For a consumer that already holds the process
- * fence -- one an earlier `ef_tensor_gpu_completion` handed it -- and needs
- * only the value to wait for, so a query costs no `DuplicateHandle` and no
- * `CloseHandle`.
+ * the duplicated fence handle.
  *
  * @return the recorded value, or 0 with `errno` set: `EINVAL` for a `NULL`
  *         tensor, `ENOTSUP` for a tensor that is not a D3D11 texture and
- *         off Windows. A texture with no recorded write answers 0 and
- *         leaves `errno` alone.
+ *         off Windows. A texture with no recorded write returns 0 and
+ *         leaves `errno` unchanged.
  *
  * # Safety
  * `t` must be `NULL` or a live handle.
@@ -1264,15 +1111,11 @@ uint64_t ef_tensor_gpu_write_value(const ef_tensor *t);
  *
  * Record that the GPU work writing this texture completes at `value` of the
  * process device's shared fence -- the value a later
- * [`ef_tensor_gpu_completion`] hands a consumer. Monotonic: an older value
- * never displaces a newer one.
+ * [`ef_tensor_gpu_completion`] reports. Monotonic: an older value never
+ * displaces a newer one.
  *
- * The value is a monotonic maximum, recorded into an atomic: it is safe to
- * call while consumers hold the same handle and are reading the tensor,
- * which is the situation it exists for -- a producer that has just queued
- * work publishes the fence value on a tensor it has already shared. Unlike
- * the geometry setters, this needs no exclusive access. `ef_tensor *` rather
- * than `const ef_tensor *` only because it changes what the tensor reports.
+ * May be called while other threads hold the same handle and read the
+ * tensor; it needs no exclusive access.
  *
  * @return 0 on success, `EINVAL` for a `NULL` tensor, `ENOTSUP` for a
  *         tensor that is not a D3D11 texture and off Windows, or another
@@ -1294,27 +1137,20 @@ int ef_tensor_set_gpu_write(ef_tensor *t, uint64_t value);
  *
  * `dims`/`ndim` describe the tensor's grid: the allocation shape --
  * `[height, width, channels]` packed, `[channels, height, width]` planar,
- * `[combined_height, width]` semi-planar -- or the (smaller) addressing
- * shape, which names the same texture. The width and height are read off
- * the texture description, never derived from `dims`; `dims` is then
- * checked against them and anything else is `EINVAL`, so a shape cannot
- * silently reinterpret the texture. The tensor that comes back always
- * carries the allocation shape, so `ef_tensor_shape` echoes `dims` back
- * only for that spelling.
+ * `[combined_height, width]` semi-planar -- or the addressing shape. The
+ * width and height are read from the texture description; a `dims` that
+ * matches neither shape is `EINVAL`. The returned tensor carries the
+ * allocation shape.
  *
- * `format` is the wire descriptor (`"NV12"`, `"rgba8"`), the same
- * vocabulary every other entry point takes; `dtype` is an `EF_DTYPE_*`
- * code; `access` is an `EF_CPU_ACCESS_*` code, and decides whether a CPU
- * staging texture is created alongside -- `EF_CPU_ACCESS_NONE` included,
- * which is what a caller that will only touch the texture from the GPU
- * asks for and costs no staging texture at all. `name` may be `NULL`.
+ * `format` is the wire descriptor (`"NV12"`, `"rgba8"`); `dtype` is an
+ * `EF_DTYPE_*` code; `access` is an `EF_CPU_ACCESS_*` code and decides
+ * whether a CPU staging texture is created alongside: `EF_CPU_ACCESS_NONE`
+ * creates none. `name` may be `NULL`.
  *
  * A semi-planar texture (`"NV12"`, `"NV16"`, `"NV24"`) carries the image's
- * row stride as its width, so it is accepted only when that width is even
+ * row stride as its width, and is accepted only when that width is even
  * and equal to the staging row pitch the driver gives a texture of that
- * width; anything else is `EINVAL` with both numbers in the message. The
- * HAL allocates its own that way. A D3D12 or CUDA producer that needs one
- * should allocate through the HAL, or match the pitch.
+ * width; anything else is `EINVAL` with both numbers in the message.
  *
  * @retval a new tensor the caller must free with `ef_tensor_free`.
  * @retval `NULL` with `errno` set: `EINVAL` for a `NULL`/unshaped argument,
@@ -1339,19 +1175,17 @@ ef_tensor *ef_tensor_from_d3d11_texture(void *texture,
 /**
  * Platforms: Windows.
  *
- * Open a shared D3D11 texture by its NT handle on the process device --
- * the consumer half of [`ef_tensor_d3d11_shared_handle`], and the route by
- * which a texture crosses a process boundary.
+ * Open a shared D3D11 texture by its NT handle on the process device.
  *
  * `handle` stays owned by the caller: this opens its own texture from it,
- * so the caller still closes the handle with `CloseHandle`. `fence` is the
- * same: when non-`NULL` it names a shared fence whose value `fence_value`
- * is waited for on the process device's immediate context, so a same-device
- * reader needs no further ordering; the handle is duplicated, never
- * consumed. Pass `NULL`/0 when there is nothing to wait for.
+ * and the caller closes the handle with `CloseHandle`. When `fence` is
+ * non-`NULL` it names a shared fence whose value `fence_value` is waited
+ * for on the process device's immediate context; the fence handle is
+ * duplicated and stays owned by the caller. Pass `NULL`/0 when there is
+ * nothing to wait for.
  *
  * `dims`, `format`, `dtype`, `access` and `name` follow
- * [`ef_tensor_from_d3d11_texture`] exactly, geometry check included.
+ * [`ef_tensor_from_d3d11_texture`], geometry check included.
  *
  * @retval a new tensor the caller must free with `ef_tensor_free`.
  * @retval `NULL` with `errno` set, as [`ef_tensor_from_d3d11_texture`].
@@ -1375,9 +1209,8 @@ ef_tensor *ef_tensor_from_d3d11_shared_handle(void *handle,
 /**
  * Create a request for a `width`×`height` image.
  *
- * `format` is the wire descriptor (`"NV12"`, `"rgb8"`), matching every other
- * entry point rather than introducing a second vocabulary. `dtype` is the
- * shared code. CPU access defaults to `EF_CPU_ACCESS_READ_WRITE`.
+ * `format` is the wire descriptor (`"NV12"`, `"rgb8"`). `dtype` is an
+ * `ef_dtype` code. CPU access defaults to `EF_CPU_ACCESS_READ_WRITE`.
  *
  * @return `NULL` for an unknown format or dtype, or zero dimensions.
  *
@@ -1416,14 +1249,10 @@ int ef_tensor_image_desc_set_access(struct ef_tensor_image_desc *d, uint32_t acc
 /**
  * Request compression, by `ef_compression_request` code:
  * `EF_COMPRESSION_REQUEST_NONE` or `EF_COMPRESSION_REQUEST_ANY` (any scheme
- * the platform offers).
+ * the platform offers). Any other code is `EINVAL`.
  *
  * `Any` allocates linear when the format is not eligible and counts the
- * fallback, which is the right default for a pipeline that wants the
- * bandwidth win without a portability failure. Requesting a *specific*
- * scheme is deliberately not exposed here — it fails outright on a device
- * whose scheme differs, and that belongs behind a named entry point rather
- * than an integer a caller might pass by accident.
+ * fallback.
  *
  * # Safety
  * `d` must be `NULL` or a live request.
@@ -1433,9 +1262,9 @@ int ef_tensor_image_desc_set_compression(struct ef_tensor_image_desc *d, uint32_
 /**
  * Require physically contiguous memory: 0 = no, 1 = yes.
  *
- * A contiguous request is allocated from the Linux CMA DMA heap only, and
- * `ef_tensor_image_desc_alloc` fails, naming the heap, instead of falling
- * back to the system heap or another kind of memory.
+ * A contiguous request is allocated from the Linux CMA DMA heap only:
+ * `ef_tensor_image_desc_alloc` fails, naming the heap, when that heap
+ * cannot serve it.
  *
  * # Safety
  * `d` must be `NULL` or a live request.
@@ -1446,18 +1275,13 @@ int ef_tensor_image_desc_set_contiguous(struct ef_tensor_image_desc *d, int cont
  * Whether the request requires physically contiguous memory: 1 if it does,
  * 0 if not or `d` is `NULL`.
  *
- * A separate getter rather than a field of `EfImageDescView`, whose size
- * is fixed between independently versioned libraries.
- *
  * # Safety
  * `d` must be `NULL` or a live request.
  */
 int ef_tensor_image_desc_contiguous(const struct ef_tensor_image_desc *d);
 
 /**
- * Read a request's fields into `out`, mirroring `ef_tensor_plane_at`'s
- * shape: a scalar block a foreign library copies rather than a pointer it
- * would have to dereference into this library's private layout.
+ * Read a request's fields into `out`.
  *
  * @return 0 on success, `EINVAL` for a `NULL` argument.
  *
@@ -1468,18 +1292,13 @@ int ef_tensor_image_desc_contiguous(const struct ef_tensor_image_desc *d);
 int ef_tensor_image_desc_get(const struct ef_tensor_image_desc *d, struct ef_image_desc_view *out);
 
 /**
- * Allocate an image tensor from a finished request -- the primitive that
- * makes the `ef_tensor_image_desc` family a real constructor rather than a
- * request-only echo. Triggers [`edgefirst_tensor::TensorDyn::image_desc`]
- * (dispatching on `desc.dtype()`) inside `libedgefirst_tensor.so`, the same
- * geometry-computing code any Rust caller of `TensorDyn::image_desc`
- * reaches -- this does not reimplement or approximate it.
+ * Allocate an image tensor from a finished request. See
+ * [`edgefirst_tensor::TensorDyn::image_desc`].
  *
  * @retval a new tensor the caller must free with `ef_tensor_free`, on
  *         success.
  * @retval `NULL` for a `NULL` request, or if the underlying allocation
- *         fails (see `TensorDyn::image_desc`'s error conditions --
- *         incompatible `CpuAccess`/compression combination, an
+ *         fails (an incompatible `CpuAccess`/compression combination, an
  *         unsupported compression request, or an invalid `width`x`height`
  *         for the format) -- `ef_tensor_last_error_message` carries the
  *         reason.
@@ -1508,7 +1327,7 @@ uint32_t ef_tensor_ndim(const ef_tensor *t);
 const uint64_t *ef_tensor_shape(const ef_tensor *t);
 
 /**
- * Borrowed pointer to `ndim` strides in BYTES, valid while `t` lives.
+ * Borrowed pointer to `ndim` strides in bytes, valid while `t` lives.
  *
  * Returns NULL for an invalid or NULL handle.
  *
@@ -1561,9 +1380,7 @@ const char *ef_tensor_format(const ef_tensor *t);
  * Packed colorimetry (`space | transfer<<8 | encoding<<16 | range<<24`),
  * or 0 when undefined. See `edgefirst_tensor::Colorimetry::pack`.
  *
- * Returns 0 for an invalid or NULL handle -- indistinguishable from a
- * genuinely undefined colorimetry, which is the same ambiguity every other
- * "0 means absent" wire value in this ABI already accepts.
+ * Returns 0 for an invalid or NULL handle.
  *
  * # Safety
  * `t` must be `NULL` or a live handle from an EdgeFirst library.
@@ -1580,18 +1397,7 @@ int ef_tensor_plane_at(const ef_tensor *t, uint32_t index, struct ef_tensor_plan
 
 /**
  * Bytes of the underlying allocation, which is `>=` the tensor's logical
- * size -- a pool tensor holding a smaller decoded image, or a
- * pitch-aligned image whose padding the shape alone cannot express.
- *
- * The producer side of [`edgefirst_tensor::TensorDesc::capacity`]: a
- * consumer re-importing this tensor's memory needs the real allocation
- * size, not the size the shape implies. Not derivable from
- * `ef_tensor_plane_at`: for a *formatted* tensor that reports per-plane
- * geometry over a computed plane table, whose sum is the logical image
- * size and not the allocation's.
- *
- * `-1` is a genuine sentinel, matching `ef_tensor_plane_offset`'s: a byte
- * count can never be negative.
+ * size.
  *
  * @retval `>= 0` the allocation's byte count.
  * @retval `-1` `t` is `NULL` or invalid.
@@ -1602,19 +1408,11 @@ int ef_tensor_plane_at(const ef_tensor *t, uint32_t index, struct ef_tensor_plan
 int64_t ef_tensor_capacity_bytes(const ef_tensor *t);
 
 /**
- * The *recorded* row stride in bytes, or `-1` when none is recorded
+ * The recorded row stride in bytes, or `-1` when none is recorded
  * (tightly packed).
  *
- * Deliberately distinct from `ef_tensor_plane_at`'s `stride`, which is the
- * *effective* pitch -- the recorded one when there is one, else a pitch
- * computed from the format and width. The difference is load-bearing for
- * [`edgefirst_tensor::TensorDyn::descriptor`]: the cross-package protocol
- * carries `None` for a tight tensor and lets the consumer recompute, and
- * baking a computed pitch in instead would turn "no stride recorded" into
- * "this exact stride is required" across a package boundary.
- *
- * `-1` is a genuine sentinel, matching `ef_tensor_plane_offset`'s: a byte
- * pitch can never be negative.
+ * `ef_tensor_plane_at`'s `stride` is the effective pitch: the recorded one
+ * when there is one, else a pitch computed from the format and width.
  *
  * @retval `>= 0` the recorded row stride in bytes.
  * @retval `-1` `t` is `NULL`/invalid, or no row stride is recorded.
@@ -1625,18 +1423,12 @@ int64_t ef_tensor_capacity_bytes(const ef_tensor *t);
 int64_t ef_tensor_row_stride(const ef_tensor *t);
 
 /**
- * The vendor tile-compression scheme this tensor's allocation actually
- * resolved to; `EF_COMPRESSION_NONE` (0) for a linear layout, which is the
- * answer everywhere except an Android AHardwareBuffer allocation that both
- * requested compression and got it.
+ * The vendor tile-compression scheme this tensor's allocation resolved to,
+ * as an `ef_compression` code; `EF_COMPRESSION_NONE` (0) for a linear
+ * layout. Non-zero only for an Android AHardwareBuffer allocation that
+ * requested compression and received it.
  *
- * Returns 0 rather than an error code for a `NULL`/invalid handle: the
- * return type is the vocabulary itself, with no spare bit pattern to carry
- * a failure, and "linear" is the conservative answer -- a consumer that
- * treats an unreadable handle as linear reads plausible bytes, whereas one
- * that treated it as tiled would decode garbage. Callers who need to
- * distinguish an invalid handle have `ef_tensor_dtype`/`ef_tensor_ndim`
- * for that.
+ * Returns `EF_COMPRESSION_NONE` (0) for a `NULL`/invalid handle.
  *
  * # Safety
  * `t` must be `NULL` or a live handle.
@@ -1649,8 +1441,7 @@ uint32_t ef_tensor_compression(const ef_tensor *t);
  * map, copy or sync bracket whose direction it does not cover fails with
  * `EACCES`.
  *
- * Returns `EF_CPU_ACCESS_NONE` (0) for a `NULL`/invalid handle, which no
- * CPU access can be made through either.
+ * Returns `EF_CPU_ACCESS_NONE` (0) for a `NULL`/invalid handle.
  *
  * # Safety
  * `t` must be `NULL` or a live handle.
@@ -1661,8 +1452,7 @@ uint32_t ef_tensor_cpu_access(const ef_tensor *t);
  * Narrow this tensor's declared CPU access to the directions both it and
  * `access` (an `ef_cpu_access` code) cover, on the chroma plane too.
  * Never widens: a code wider than the declaration leaves it unchanged and
- * is not an error. The descriptor import calls this with the producer's
- * `CPU_ACCESS_*` flag bits, so an alias refuses what its producer refuses.
+ * is not an error.
  *
  * @return 0, or `EINVAL` for a `NULL`/invalid handle or an unknown code.
  *
@@ -1678,8 +1468,7 @@ int ef_tensor_restrict_cpu_access(ef_tensor *t, uint32_t access);
  * non-contiguous for the system heap, unknown for an imported fd and every
  * other kind of memory.
  *
- * Returns unknown (0) for a `NULL`/invalid handle, which a caller checking
- * for known non-contiguous memory treats as "cannot tell".
+ * Returns unknown (0) for a `NULL`/invalid handle.
  *
  * # Safety
  * `t` must be `NULL` or a live handle.
@@ -1713,8 +1502,7 @@ int ef_tensor_is_view(const ef_tensor *t);
 
 /**
  * Record that this tensor addresses part of a larger buffer, which
- * `ef_tensor_is_view` then reports. Never cleared. The descriptor import
- * calls this for a producer whose descriptor carries the `VIEW` flag.
+ * `ef_tensor_is_view` then reports. Never cleared.
  *
  * @return 0, or `EINVAL` for a `NULL`/invalid handle.
  *
@@ -1727,8 +1515,7 @@ int ef_tensor_mark_view(ef_tensor *t);
 /**
  * Allocate a host-memory tensor.
  *
- * The simplest constructor: `edgefirst-tensor` handles `mem` allocation
- * itself, with no `ImageProcessor` involved. Returns `NULL` on failure.
+ * Returns `NULL` on failure.
  *
  * # Safety
  * `dims` must point to `ndim` readable `uint64_t`.
@@ -1744,22 +1531,14 @@ ef_tensor *ef_tensor_new(uint32_t dtype, const uint64_t *dims, uint32_t ndim);
 char *ef_tensor_name(const ef_tensor *t);
 
 /**
- * Wrap a caller-owned host allocation as a tensor, aliasing it rather than
- * copying or owning it -- the consumer half of the cross-package capsule
- * protocol's host-memory kinds (`MEM`, `SHM`).
+ * Wrap a caller-owned host allocation as a tensor that aliases it, without
+ * copying or owning it.
  *
- * `capacity` is the producer's real allocation size, which is `>=` the
- * tight footprint `dims` implies: a pool tensor, or one padded to a
- * decoder's pitch alignment, is larger than the shape it currently
- * reports, and without carrying it the alias would be clamped to today's
- * shape and unable to grow back into memory the producer actually has.
- * Pass 0 to mean "exactly the tight footprint".
+ * `capacity` is the allocation's size in bytes, which is `>=` the tight
+ * footprint `dims` implies. Pass 0 for the tight footprint.
  *
- * **The returned tensor does not keep `ptr` alive.** It is valid only
- * while the producer keeps that memory alive, which for the capsule
- * protocol is the capsule keepalive's job; nothing here takes a reference
- * to extend it. See
- * [`edgefirst_tensor::TensorDyn::import_descriptor`].
+ * The returned tensor does not keep `ptr` alive: it is valid only while
+ * the caller keeps that memory alive.
  *
  * @retval a new tensor the caller must free with `ef_tensor_free`.
  * @retval `NULL` for a `NULL` `ptr`/`dims`, `ndim == 0`, or an
@@ -1783,16 +1562,10 @@ ef_tensor *ef_tensor_wrap_host(uint8_t *ptr,
  * Platforms: macOS, iOS.
  *
  * Wrap a live IOSurface, named by its cross-process `IOSurfaceID`, as a
- * tensor -- the consumer half of the capsule protocol's `IOSURFACE` kind.
+ * tensor.
  *
- * Declared on every platform and refused at runtime off Apple, rather than
- * existing only in an Apple build: this library's ABI surface is the same
- * set of symbols everywhere, the same rule `ef_storage_kind` follows for
- * naming `IO_SURFACE` on Linux. A platform-conditional symbol would make
- * "does this build have it" a link-time question for every consumer.
- *
- * IDs are reused after a surface is freed, so a stale one fails rather
- * than resolving to an unrelated buffer.
+ * The symbol is exported on every platform and returns `NULL` off Apple
+ * platforms.
  *
  * @retval a new tensor the caller must free with `ef_tensor_free`. It
  *         holds its own retain on the surface.
@@ -1812,16 +1585,11 @@ ef_tensor *ef_tensor_from_iosurface_id(uint32_t id,
  * Release one reference to a tensor handle. Freeing `NULL` is a no-op.
  *
  * `ef_tensor` is refcounted: `ef_tensor_retain` adds a reference and this
- * function is the release. The tensor is destroyed only when the *last*
- * reference is released -- whoever still holds a reference keeps the tensor
- * alive, the `GstBuffer`/`CVPixelBuffer` convention. A handle you hold a
- * reference to remains valid after another reference's `ef_tensor_free`
- * call returns; it is a use-after-free only once *your own* last reference
- * has been released.
+ * function releases one. The tensor is destroyed when the last reference
+ * is released. A handle the caller holds a reference to remains valid
+ * after another reference's `ef_tensor_free` call returns.
  *
- * Works on a handle from **any** EdgeFirst library: every library links
- * this one's shared implementation, so every handle is the exact same
- * layout, allocated by the exact same allocator.
+ * Accepts a handle from any EdgeFirst library.
  *
  * # Safety
  * `t` must be `NULL` or a live handle from an EdgeFirst library. `t` must
@@ -1839,18 +1607,11 @@ void ef_tensor_free(ef_tensor *t);
 int ef_tensor_retain(ef_tensor *t);
 
 /**
- * Attach/clear colorimetry metadata on a live handle. `packed` is
- * `Colorimetry::pack`'s wire form; 0 clears it (matching `pack`'s own
- * all-`None`-maps-to-0 convention, so a caller can round-trip
- * [`ef_tensor_colorimetry`] straight back through this without special-
- * casing "no colorimetry").
+ * Set or clear colorimetry metadata on a live handle. `packed` is
+ * `Colorimetry::pack`'s wire form; 0 clears it.
  *
- * **Concurrency.** `ef_tensor` is refcounted and its handles are designed
- * to cross threads (`ef_tensor_retain` is exactly how two threads come to
- * legitimately hold the same handle). This function and
- * [`ef_tensor_colorimetry`] are safe to call concurrently -- from any
- * number of threads, holding valid references to the same handle, in any
- * interleaving -- with no external locking required around either call.
+ * This function and [`ef_tensor_colorimetry`] may be called concurrently
+ * on the same handle from any number of threads, with no external locking.
  *
  * # Safety
  * `t` must be `NULL` or a live handle from an EdgeFirst library.
@@ -1955,8 +1716,7 @@ ef_tensor *ef_tensor_image_with_stride_alloc(uintptr_t width,
 /**
  * Borrow a rectangular `(x, y, width, height)` pixel sub-region of `t` as a
  * new, independent handle that shares `t`'s underlying allocation and
- * identity (zero-copy) -- never a new allocation. See
- * [`edgefirst_tensor::TensorDyn::view`].
+ * identity (zero-copy). See [`edgefirst_tensor::TensorDyn::view`].
  *
  * @retval a new tensor the caller must free with `ef_tensor_free`
  *         (independently of `t`; both stay valid, sharing the same
@@ -1977,14 +1737,10 @@ ef_tensor *ef_tensor_view_region(const ef_tensor *t,
 /**
  * Borrow batch element `n` of a batched tensor (leading `N` dimension) as a
  * new, independent handle that shares `t`'s underlying allocation and
- * identity (zero-copy) -- never a new allocation. See
- * [`edgefirst_tensor::TensorDyn::batch`].
+ * identity (zero-copy). See [`edgefirst_tensor::TensorDyn::batch`].
  *
- * Distinct from `ef_tensor_view_region`, which crops a *spatial*
- * rectangle within one image: this indexes the leading dimension, and the
- * result has `t`'s shape with that dimension dropped. A tensor whose
- * leading dimension is not a batch axis has no meaningful element `n`, and
- * the underlying call refuses.
+ * The result has `t`'s shape with the leading dimension dropped. A tensor
+ * whose leading dimension is not a batch axis is refused.
  *
  * @retval a new tensor the caller must free with `ef_tensor_free`
  *         (independently of `t`; both stay valid, sharing the same
@@ -2001,32 +1757,20 @@ ef_tensor *ef_tensor_batch(const ef_tensor *t, uint64_t n);
  * Combine separate luma and chroma plane tensors into one semi-planar
  * (NV12/NV16) tensor. See [`edgefirst_tensor::Tensor::from_planes`].
  *
- * **Ownership: consumes both `luma` and `chroma`, but only past this
- * function's precondition checks.** A real Rust caller of
- * `Tensor::<T>::from_planes` always passes both by value, with no "give
- * them back on error" path -- but every precondition that call requires
- * (matching element types chief among them, since the C boundary is
- * type-erased and the compiler cannot enforce it the way it does for a
- * real Rust caller) is checked here *first*, before either handle is
- * reclaimed. Consuming happens once, right before the underlying
- * `Tensor::from_planes` call; from that point on both outcomes (success or
- * a validation failure *inside* `Tensor::from_planes`, e.g. an
- * incompatible format/shape) leave `luma`/`chroma` invalidated, matching
- * Rust's own by-value semantics. See the `@retval` list below for exactly
- * which failures consume and which do not.
+ * Consumes both `luma` and `chroma` once the precondition checks pass:
+ * from that point both handles are invalid whether the call succeeds or
+ * fails. A failed precondition check leaves both handles valid.
  *
  * @retval a new tensor the caller must free with `ef_tensor_free`, on
  *         success (`luma`/`chroma` consumed).
- * @retval `NULL`, **`luma`/`chroma` left valid and unconsumed** -- a
+ * @retval `NULL`, `luma`/`chroma` left valid and unconsumed -- a
  *         `NULL`/invalid `luma` or `chroma`, an unrecognized `format`, a
- *         `luma`/`chroma` element-type mismatch, or an
- *         outstanding `ef_tensor_retain`/`ef_tensor_map` on either handle
- *         (consuming a handle another reference still points at, or that
- *         has a live map guard, would dangle it).
- * @retval `NULL`, **`luma`/`chroma` consumed regardless** -- every
- *         precondition above passed but `Tensor::from_planes` itself
- *         refused (see its constraints: only NV12/NV16, matching
- *         luma/chroma widths, and the format-specific height ratio).
+ *         `luma`/`chroma` element-type mismatch, or an outstanding
+ *         `ef_tensor_retain`/`ef_tensor_map` on either handle.
+ * @retval `NULL`, `luma`/`chroma` consumed -- every precondition above
+ *         passed but `Tensor::from_planes` refused (it accepts only
+ *         NV12/NV16, matching luma/chroma widths, and the format-specific
+ *         height ratio).
  *
  * Every `NULL` case sets `ef_tensor_last_error_message` with the reason.
  *
@@ -2053,8 +1797,8 @@ int ef_tensor_is_multiplane(const ef_tensor *t);
  * The result is an independent handle the caller must free with
  * `ef_tensor_free`. Geometry mutations (`ef_tensor_set_row_stride_unchecked`,
  * `ef_tensor_set_plane_offset`) apply to this handle. Stride/offset that
- * must live on the combined tensor should be set on the chroma input
- * *before* `ef_tensor_from_planes`.
+ * must live on the combined tensor are set on the chroma input before
+ * `ef_tensor_from_planes`.
  *
  * @retval a new tensor on success.
  * @retval `NULL` if `t` is `NULL`, not multiplane, or the chroma plane
@@ -2071,8 +1815,8 @@ ef_tensor *ef_tensor_chroma(const ef_tensor *t);
  *
  * The returned pointer is valid only until this thread's next failing
  * `tensor-capi` call (or the thread's exit); a caller that wants to keep
- * the text must copy it out before calling in again. Never parse this
- * string -- program against the errno return, this is a log line.
+ * the text must copy it out before calling in again. The string is a log
+ * line and is not meant to be parsed.
  *
  * # Safety
  * The returned pointer must not be read after this thread makes another
@@ -2081,25 +1825,20 @@ ef_tensor *ef_tensor_chroma(const ef_tensor *t);
 const char *ef_tensor_last_error_message(void);
 
 /**
- * Which *kind* of failure the calling thread's last failing
- * `ef_tensor_*` call was; `EF_ERROR_CLASS_UNSPECIFIED` (0) if none has
- * failed yet, or if that failure recorded no class.
+ * Which kind of failure the calling thread's last failing `ef_tensor_*`
+ * call was; `EF_ERROR_CLASS_UNSPECIFIED` (0) if none has failed yet, or if
+ * that failure recorded no class.
  *
- * The companion to [`ef_tensor_last_error_message`], and unlike that
- * string this **is** meant to be programmed against. It exists for the
- * entry points that report failure by returning `NULL`: those have no
- * errno to carry a class, so before this a caller rebuilding a typed error
- * from one had only the advisory message -- and `ef_tensor_batch`'s Rust
- * wrapper really did match on a fragment of it, because there was nowhere
- * else for the distinction to live.
+ * The companion to [`ef_tensor_last_error_message`]. Unlike that string,
+ * this value may be programmed against. It serves the entry points that
+ * report failure by returning `NULL`.
  *
- * Same lifetime rules as the message: thread-local, set by every failing
- * call, unchanged by a successful one. Read it immediately after the call
- * that returned `NULL`, before making another.
+ * Thread-local, set by every failing call, unchanged by a successful one.
+ * Read it immediately after the call that returned `NULL`, before making
+ * another.
  *
  * # Safety
- * Safe to call at any time; declared `unsafe` only for symmetry with the
- * rest of this ABI.
+ * Safe to call at any time.
  */
 uint32_t ef_tensor_last_error_class(void);
 
@@ -2127,34 +1866,22 @@ int ef_log_init_callback(EfLogCallback cb, void *userdata, uint32_t max_level);
  * the mapping direction: `EF_CPU_ACCESS_READ`, `_WRITE`, or `_READ_WRITE`.
  * `EF_CPU_ACCESS_NONE` is not a mappable direction.
  *
- * A read-only map (`EF_CPU_ACCESS_READ`) still populates `out->ptr` --
- * `ef_tensor_view` is one shared shape for both directions -- but writing
- * through it is a contract violation this C signature cannot itself
- * enforce; the Rust-side guard does enforce it (a debug assertion fires if
- * the guard is ever asked for a mutable slice while read-only), so misuse
- * is a caught bug on the Rust side even though nothing stops the raw
- * pointer write from C directly.
+ * A read-only map (`EF_CPU_ACCESS_READ`) populates `out->ptr`; the caller
+ * must not write through it.
  *
- * Exclusive write, CPU-side only: a writable map (`_WRITE`/`_READ_WRITE`)
- * is refused with `EBUSY` unless the tensor's CPU-side handle count
- * (`ef_tensor_retain`/`ef_tensor_free`) is exactly one -- a second EBUSY
- * trigger distinct from the double-map one above, with its own
- * `ef_tensor_last_error_message` text so the two are distinguishable. This
- * is the C surface's honesty limit on exclusivity: the gate sees only the
- * CPU-side handle count, because a refcount cannot see a device -- the
- * GPU/NPU hold no reference of their own, so a dma-buf a device is
- * concurrently writing is not exclusive no matter what this count says.
- * Device-side ordering is not this gate's job; it stays with the fence
- * field.
+ * A writable map (`_WRITE`/`_READ_WRITE`) is refused with `EBUSY` unless
+ * the tensor's CPU-side handle count (`ef_tensor_retain`/`ef_tensor_free`)
+ * is exactly one. `ef_tensor_last_error_message` distinguishes this from
+ * the double-map `EBUSY`. The count covers CPU-side handles only; it does
+ * not order access against a device writing the same buffer.
  *
  * @return 0 on success, `EINVAL` (null tensor/out, or bad access code),
  *         `EBUSY` (a map is already outstanding on this tensor, or a
  *         writable map was requested while the CPU-side handle count is
- *         greater than one -- see above), `EACCES` (the requested direction
- *         is not covered by the tensor's declared CPU access -- reads and
- *         writes alike; see `ef_tensor_cpu_access`. Backend-level mapping
- *         refusals, e.g. AHardwareBuffer lock exclusivity, also surface as
- *         `EACCES`), or another errno translated from the backend's error.
+ *         greater than one), `EACCES` (the requested direction is not
+ *         covered by the tensor's declared CPU access, see
+ *         `ef_tensor_cpu_access`, or the backend refused the mapping), or
+ *         another errno translated from the backend's error.
  *
  * # Safety
  * `t` must be `NULL` or a live handle; `out` must be writable for one
@@ -2163,21 +1890,14 @@ int ef_log_init_callback(EfLogCallback cb, void *userdata, uint32_t max_level);
 int ef_tensor_map(ef_tensor *t, uint32_t access, struct ef_tensor_view *out);
 
 /**
- * Non-blocking [`ef_tensor_map`]: identical in every way except that a
- * backing whose map has to wait for a GPU copy answers `EAGAIN` instead of
- * stalling until that copy lands.
+ * Non-blocking [`ef_tensor_map`]: identical except that a backing whose
+ * map has to wait for a GPU copy returns `EAGAIN` instead of waiting.
  *
- * Only the Windows D3D11 texture has such a copy today (its staging
- * refresh). Every other backing -- host memory, shared memory, dma-buf,
- * IOSurface, AHardwareBuffer, PBO -- reaches exactly the code
- * `ef_tensor_map` reaches and can never answer `EAGAIN`, so a caller can
- * use this unconditionally and only ever actually retry where the wait is
- * real.
+ * Only the Windows D3D11 texture has such a copy. Every other backing
+ * behaves as `ef_tensor_map` and never returns `EAGAIN`.
  *
- * `EAGAIN` takes nothing: no map is left outstanding, `out` is untouched,
- * and a later call (this one or `ef_tensor_map`) makes progress. Yield or
- * sleep between attempts: on the WARP software adapter the CPU threads are
- * the GPU, so a tight retry loop starves the copy it is waiting for.
+ * On `EAGAIN` no map is left outstanding and `out` is untouched. Yield or
+ * sleep between attempts.
  *
  * @return the codes [`ef_tensor_map`] returns, plus `EAGAIN` when the map
  *         would have had to wait for a GPU copy.
@@ -2191,10 +1911,9 @@ int ef_tensor_try_map(ef_tensor *t, uint32_t access, struct ef_tensor_view *out)
 /**
  * Release the outstanding map taken by `ef_tensor_map`.
  *
- * Dropping the guard runs the platform sync bracket (mmap stays resident,
- * but e.g. IOSurface/dma-buf run their unlock/sync-for-device here). The
- * pointer handed out by the matching `ef_tensor_map` is invalid the instant
- * this returns 0.
+ * Runs the platform sync bracket (for example the IOSurface unlock or the
+ * dma-buf sync-for-device). The pointer returned by the matching
+ * `ef_tensor_map` is invalid once this returns 0.
  *
  * @return 0 on success, `EINVAL` (null tensor, or no map is outstanding).
  *
@@ -2204,24 +1923,18 @@ int ef_tensor_try_map(ef_tensor *t, uint32_t access, struct ef_tensor_view *out)
 int ef_tensor_unmap(ef_tensor *t);
 
 /**
- * Acquire the buffer for CPU access -- the standalone cache-maintenance
- * bracket, without a mapping.
+ * Acquire the buffer for CPU access: the cache-maintenance bracket,
+ * without a mapping.
  *
  * `DMA_BUF_IOCTL_SYNC` with `DMA_BUF_SYNC_START` on Linux; the IOSurface
  * lock on Apple platforms; a no-op for coherent host memory. Pairs with
- * [`ef_tensor_sync_for_device`], which **must** be called with the same
- * `access`: the direction tells the kernel which half of the maintenance
- * this access needs, and a mismatched pair skips one of them (a read-only
- * bracket lets the kernel skip the writeback, a write-only one skips the
- * invalidate).
+ * [`ef_tensor_sync_for_device`], which must be called with the same
+ * `access`.
  *
- * Distinct from `ef_tensor_map`, which establishes an address *and* the
- * coherency window together. This is for a caller that already holds the
- * address -- one that mapped once at init and now brackets each frame's
- * CPU access -- so it takes no map state and leaves none behind.
+ * Unlike `ef_tensor_map`, this takes no map state and returns no address.
  *
  * `EF_CPU_ACCESS_NONE` is not a sync direction and is refused with
- * `EINVAL`, exactly as it is for `ef_tensor_map`.
+ * `EINVAL`.
  *
  * @return 0 on success, `EINVAL` (null tensor, or a bad/`NONE` access
  *         code), `EACCES` (the direction is not covered by the tensor's
@@ -2236,11 +1949,10 @@ int ef_tensor_unmap(ef_tensor *t);
 int ef_tensor_sync_for_cpu(const ef_tensor *t, uint32_t access);
 
 /**
- * Release the buffer back to the device -- the CPU is done accessing it.
+ * Release the buffer back to the device after CPU access.
  *
- * `DMA_BUF_SYNC_END`. See [`ef_tensor_sync_for_cpu`] for the pairing rule
- * and the direction's meaning; `access` must match the one that opened the
- * bracket.
+ * `DMA_BUF_SYNC_END` on Linux. `access` must match the one passed to the
+ * [`ef_tensor_sync_for_cpu`] that opened the bracket.
  *
  * @return the same codes as [`ef_tensor_sync_for_cpu`].
  *
@@ -2253,14 +1965,7 @@ int ef_tensor_sync_for_device(const ef_tensor *t, uint32_t access);
  * Copy a tensor's whole extent into a caller-provided buffer.
  *
  * Needs no outstanding `ef_tensor_map`: it takes its own short-lived read
- * guard, copies, and drops the guard before returning. On `edgefirst-tensor`
- * backends today (`Mem`, at minimum -- see the test below) a plain read
- * guard coexists freely with an outstanding stored map, because the
- * underlying platform mapping carries no single-writer lock of its own;
- * this call does not special-case that, so if a future backend's map ever
- * does refuse a second concurrent guard, the refusal surfaces here as
- * whatever errno `errno_for` gives that backend's error (in practice
- * `EACCES` or `EBUSY` depending on the backend), not a hardcoded one.
+ * guard, copies, and drops the guard before returning.
  *
  * @return bytes written (`>= 0`) on success, or a negative errno: `-EINVAL`
  *         (null tensor/out), `-EACCES` (the tensor's declared CPU access
@@ -2277,12 +1982,9 @@ int64_t ef_tensor_copy_to(ef_tensor *t, uint8_t *out, uintptr_t cap);
 /**
  * Runs `f(ctx)` while no tensor CPU mapping can be created in this process.
  *
- * For a consumer about to make a GPU-driver call that may unmap an address
- * range twice (Adreno `eglDestroyImage`): a mapping created between the two
- * `munmap`s would be destroyed by the second. Every tensor mapping this
- * library creates waits until `f` returns, so `f` must not map a tensor
- * itself. `f` is called exactly once, on the calling thread; a NULL `f` is
- * a no-op.
+ * Every tensor mapping this library creates waits until `f` returns; `f`
+ * must not map a tensor itself. `f` is called exactly once, on the calling
+ * thread; a NULL `f` is a no-op.
  *
  * # Safety
  *
@@ -2296,14 +1998,14 @@ void ef_tensor_with_cpu_mappings_excluded(void (*f)(void *ctx), void *ctx);
  * [`edgefirst_tensor::TensorDyn::set_format`].
  *
  * @retval 0 success; the format is attached and `ef_tensor_format` /
- *         `ef_tensor_plane_count` / `ef_tensor_plane_at` now reflect it.
+ *         `ef_tensor_plane_count` / `ef_tensor_plane_at` reflect it.
  * @retval EINVAL `t` is `NULL`, `format` is `NULL`/non-UTF8/unrecognized, or
  *         the tensor's current shape does not match the format's layout
  *         (packed expects `[H, W, C]`, planar `[C, H, W]`, semi-planar
  *         `[H*k, W]`).
  *
  * @warning Not safe to call concurrently with any other `tensor-capi` call
- * on the same handle from another thread -- see this file's module docs.
+ * on the same handle from another thread.
  *
  * # Safety
  * `t` must be `NULL` or a live handle; `format` must be `NULL` or a
@@ -2323,7 +2025,7 @@ int ef_tensor_set_format(ef_tensor *t, const char *format);
  *         tensor's current width.
  *
  * @warning Not safe to call concurrently with any other `tensor-capi` call
- * on the same handle from another thread -- see this file's module docs.
+ * on the same handle from another thread.
  *
  * # Safety
  * `t` must be `NULL` or a live handle.
@@ -2334,27 +2036,18 @@ int ef_tensor_set_row_stride(ef_tensor *t, uintptr_t stride);
  * Set the row stride in bytes without format validation. See
  * [`edgefirst_tensor::TensorDyn::set_row_stride_unchecked`].
  *
- * Unlike [`ef_tensor_set_row_stride`], this never requires a pixel format
- * and never validates `stride` against one -- for a raw sub-tensor that by
- * contract carries no format (the multiplane chroma plane
- * [`crate::image::ef_tensor_from_planes`] combines, or the standalone plane
- * tensors `ef_tensor_builder_wrap` produces before a format is attached),
- * there is no minimum to check the caller's stride against. Same escape
- * hatch as `static`'s `Tensor::set_row_stride_unchecked` (`lib.rs`): the
- * caller is responsible for the stride being valid for whatever it goes on
- * to describe.
+ * Unlike [`ef_tensor_set_row_stride`], this requires no pixel format and
+ * does not validate `stride` against one. The caller is responsible for
+ * the stride being valid.
  *
- * Updates `ef_tensor_plane_at`'s cached geometry the same way
- * [`ef_tensor_set_row_stride`] does (`refresh_caches`) -- unlike that
- * setter, a formatless tensor's plane-0 geometry falls back to reporting
- * this stride directly (see `ef_tensor_plane_at`'s own doc comment for why
- * that fallback exists).
+ * For a tensor with no format, `ef_tensor_plane_at` reports this stride as
+ * plane 0's stride.
  *
  * @retval 0 success.
  * @retval EINVAL `t` is `NULL`.
  *
  * @warning Not safe to call concurrently with any other `tensor-capi` call
- * on the same handle from another thread -- see this file's module docs.
+ * on the same handle from another thread.
  *
  * # Safety
  * `t` must be `NULL` or a live handle.
@@ -2366,16 +2059,11 @@ int ef_tensor_set_row_stride_unchecked(ef_tensor *t, uintptr_t stride);
  * Format-independent, unlike [`ef_tensor_set_row_stride`]. See
  * [`edgefirst_tensor::TensorDyn::set_plane_offset`].
  *
- * Does not touch `ef_tensor_shape`/`ef_tensor_strides`/`ef_tensor_format`'s
- * cached values -- `plane_offset` is read live from `inner` by
- * `ef_tensor_plane_at`, not cached, so no refresh is needed here (contrast
- * [`ef_tensor_set_format`]/[`ef_tensor_set_row_stride`]).
- *
  * @retval 0 success.
  * @retval EINVAL `t` is `NULL`.
  *
  * @warning Not safe to call concurrently with any other `tensor-capi` call
- * on the same handle from another thread -- see this file's module docs.
+ * on the same handle from another thread.
  *
  * # Safety
  * `t` must be `NULL` or a live handle.
@@ -2387,12 +2075,6 @@ int ef_tensor_set_plane_offset(ef_tensor *t, uintptr_t offset);
  * starts, as set by [`ef_tensor_set_plane_offset`] (or a producer's
  * `ef_tensor_builder_add_plane` at construction). See
  * [`edgefirst_tensor::TensorDyn::plane_offset`].
- *
- * `-1` is a genuine sentinel here, not a presence-flag substitute: a byte
- * offset can never be negative, so it is unambiguous, matching
- * `ef_tensor_plane`'s own `handle: -1` convention for "none" -- unlike
- * axis or scale (where every value including 0 is legitimate), there is no
- * real offset this collides with.
  *
  * @retval `>= 0` the current plane offset in bytes.
  * @retval `-1` `t` is `NULL`, or no offset has been set (the default).
@@ -2406,18 +2088,17 @@ int64_t ef_tensor_plane_offset(const ef_tensor *t);
  * Change a tensor's logical shape, keeping the same element count.
  *
  * The product of `dims` must equal the current element count. See
- * [`ef_tensor_set_logical_shape`] for the capacity-based sibling a pool
- * tensor needs.
+ * [`ef_tensor_set_logical_shape`] for the capacity-based variant.
  *
- * @retval 0 success; `ef_tensor_shape`/`ef_tensor_strides` now reflect the
- *         new geometry.
+ * @retval 0 success; `ef_tensor_shape`/`ef_tensor_strides` reflect the new
+ *         geometry.
  * @retval EINVAL `t` or `dims` is `NULL`, `ndim` is 0, or a dimension is
  *         out of range for this host.
  * @retval ERANGE the new shape's element count differs from the current
  *         one -- the tensor is left untouched.
  *
  * @warning Not safe to call concurrently with any other `tensor-capi` call
- * on the same handle from another thread -- see this file's module docs.
+ * on the same handle from another thread.
  *
  * # Safety
  * `t` must be `NULL` or a live handle; `dims` must point to `ndim`
@@ -2426,24 +2107,10 @@ int64_t ef_tensor_plane_offset(const ef_tensor *t);
 int ef_tensor_reshape(ef_tensor *t, const uint64_t *dims, uint32_t ndim);
 
 /**
- * Change a tensor's logical shape to anything its **allocation** can hold.
+ * Change a tensor's logical shape to anything its allocation can hold.
  *
- * The capacity-based counterpart to [`ef_tensor_reshape`]
- * (`TensorTrait::set_logical_shape`): an oversized reusable pool tensor
- * reconfigured to a smaller image without reallocating, which
- * `ef_tensor_reshape`'s equal-count rule refuses.
- *
- * Two entry points rather than one with a flag, because they are two
- * contracts a caller picks between deliberately -- the same reason
- * `ef_tensor_sync_for_cpu` and `_sync_for_device` are two entries.
- *
- * Task P2b wrote this, found nothing called it, and **deleted it before
- * committing** -- unreferenced ABI surface drifts unwatched. Task P2e gave
- * it a caller: `Tensor<T>` never overrode
- * `TensorTrait::set_logical_shape`, so both backends silently applied
- * `reshape`'s strict rule under a name promising the opposite, and fixing
- * that on the `dynamic` side needs exactly this primitive. Added back on
- * the strength of the caller, not of the idea.
+ * The capacity-based counterpart to [`ef_tensor_reshape`]: the new shape's
+ * element count may differ from the current one.
  *
  * @retval 0 success.
  * @retval EINVAL `t` or `dims` is `NULL`, `ndim` is 0, or a dimension is
@@ -2452,7 +2119,7 @@ int ef_tensor_reshape(ef_tensor *t, const uint64_t *dims, uint32_t ndim);
  *         the tensor is left untouched.
  *
  * @warning Not safe to call concurrently with any other `tensor-capi` call
- * on the same handle from another thread -- see this file's module docs.
+ * on the same handle from another thread.
  *
  * # Safety
  * `t` must be `NULL` or a live handle; `dims` must point to `ndim`
@@ -2466,13 +2133,6 @@ int ef_tensor_set_logical_shape(ef_tensor *t, const uint64_t *dims, uint32_t ndi
  * Duplicate the file descriptor backing this tensor, for any storage kind
  * that has one: a dma-buf fd on Linux, a shared-memory fd wherever `Shm`
  * allocates.
- *
- * Deliberately **not** derivable from `ef_tensor_plane_at`: that reports a
- * plane's *native handle*, which is a dma-buf fd on Linux and an IOSurface
- * id on Apple and `-1` for everything else -- so a consumer deriving
- * "clone this tensor's fd" from it refuses SHM-backed tensors, which do
- * have a real fd. The library owns the storage and knows which kinds have
- * one; asking it is the whole point of the split.
  *
  * @retval `>= 0` a new file descriptor the caller owns and must `close()`.
  * @retval a negative errno: `-EINVAL` for a `NULL`/invalid handle,
@@ -2489,23 +2149,15 @@ int ef_tensor_clone_fd(const ef_tensor *t);
  *
  * The recorded dtype is metadata over the same allocation: `EF_DTYPE_U8`
  * and `EF_DTYPE_I8` address identical bytes and differ only in how a
- * consumer reads them. `edgefirst-image` allocates a PBO or DMA buffer as
- * `u8` and hands it back as `i8`, with the int8 shader applying an XOR 0x80
- * bias over the same buffer -- this is the primitive that makes the handle
- * agree with that.
+ * consumer reads them. A dtype of a different width is refused.
  *
- * A dtype of a different width is refused. That is not a retag but a
- * reinterpretation: `ef_tensor_shape` times the element width is what a
- * consumer multiplies out, so widening or narrowing here would silently
- * change the element count over an allocation whose size did not change.
- *
- * @retval 0 success; `ef_tensor_dtype` now reports `dtype`.
+ * @retval 0 success; `ef_tensor_dtype` reports `dtype`.
  * @retval EINVAL `t` is `NULL`, or `dtype` is not a recognized code.
  * @retval ERANGE `dtype` has a different element width than the current one
  *         -- the tensor is left untouched.
  *
  * @warning Not safe to call concurrently with any other `tensor-capi` call
- * on the same handle from another thread -- see this file's module docs.
+ * on the same handle from another thread.
  *
  * # Safety
  * `t` must be `NULL` or a live handle.
@@ -2514,19 +2166,18 @@ int ef_tensor_set_dtype(ef_tensor *t, uint32_t dtype);
 
 /**
  * Reconfigure a live handle's logical dimensions and pixel format, reusing
- * its existing allocation -- the pool-reuse primitive a JPEG
- * decode-into-pool destination tensor needs before each decode. See
+ * its existing allocation. See
  * [`edgefirst_tensor::TensorDyn::configure_image`].
  *
  * @retval 0 success; `ef_tensor_shape`/`ef_tensor_strides`/`ef_tensor_format`
- *         /`ef_tensor_plane_at` now reflect the new geometry.
+ *         /`ef_tensor_plane_at` reflect the new geometry.
  * @retval EINVAL `t` is `NULL`, `format` is `NULL`/non-UTF8/unrecognized, or
  *         `width`x`height` is not a valid size for `format`.
  * @retval ERANGE the existing allocation cannot hold `width`x`height` in
- *         `format` (a pool tensor sized too small for this request).
+ *         `format`.
  *
  * @warning Not safe to call concurrently with any other `tensor-capi` call
- * on the same handle from another thread -- see this file's module docs.
+ * on the same handle from another thread.
  *
  * # Safety
  * `t` must be `NULL` or a live handle; `format` must be `NULL` or a
@@ -2542,27 +2193,20 @@ int ef_tensor_configure_image(ef_tensor *t, uintptr_t width, uintptr_t height, c
  * when the last reference to the returned tensor is freed. The caller
  * keeps its own reference and may drop it as soon as this returns.
  *
- * **`retain`/`release` govern the channel only.** They never transfer
+ * `retain`/`release` govern the channel only. They do not transfer
  * ownership of the GL buffer: this library never deletes it, and the
- * caller's own destructor stays the sole caller of `glDeleteBuffers`.
- * Getting this backwards double-frees the buffer.
+ * caller remains the sole caller of `glDeleteBuffers`.
  *
  * `size` is the GL allocation's full byte count, which may exceed the
- * product of `dims` — a PBO allocated at a 64-byte-aligned row stride is
- * larger than its shape implies, and clamping to the shape would lose the
- * padding a strided map needs.
+ * product of `dims`.
  *
  * `map_fn` and `unmap_fn` are called on the caller's own thread, never on
  * a thread this library creates. They must be safe to call concurrently
  * and must not unwind.
  *
- * **The whole channel is checked, not assumed.** `state.ctx`,
- * `state.retain`, `state.release`, `map_fn` and `unmap_fn` are five
- * non-NULL requirements, and all five are rejected rather than
- * dereferenced: a NULL function pointer this library called would be
- * undefined behaviour, not a diagnosable failure, so the check happens
- * before anything is constructed. The two op parameters are nullable
- * function pointers in C for exactly that reason.
+ * `state.ctx`, `state.retain`, `state.release`, `map_fn` and `unmap_fn`
+ * must all be non-NULL; a NULL one is rejected before anything is
+ * constructed.
  *
  * @retval a new tensor the caller must free with `ef_tensor_free`.
  * @retval `NULL` for a NULL `state.ctx`/`state.retain`/`state.release`/
@@ -2570,8 +2214,7 @@ int ef_tensor_configure_image(ef_tensor *t, uintptr_t width, uintptr_t height, c
  *         unrecognized `dtype`, or a `size` smaller than the shape needs
  *         — `ef_tensor_last_error_message` carries the reason and
  *         `ef_tensor_last_error_class` its class. `errno` is set to
- *         `EINVAL` for the argument-validation refusals, alongside the
- *         `NULL` return that is this entry point's contract.
+ *         `EINVAL` for these argument-validation refusals.
  *
  * # Safety
  * `dims` must point to `ndim` readable `uint64_t`. `state.ctx` must remain
@@ -2592,8 +2235,8 @@ ef_tensor *ef_tensor_wrap_pbo(struct ef_client_state state,
  *
  * @retval 0 success; `*out_id` holds the buffer name.
  * @retval EINVAL `t` is NULL/unresolvable, `out_id` is NULL, or `t` is not
- *         PBO-backed. `ef_tensor_storage_kind` is the unambiguous
- *         predicate; do not infer the backing from this call's failure.
+ *         PBO-backed. Use `ef_tensor_storage_kind` to test whether a tensor
+ *         is PBO-backed.
  *
  * # Safety
  * `t` must be NULL or a live handle; `out_id` must be NULL or a writable
@@ -2602,20 +2245,14 @@ ef_tensor *ef_tensor_wrap_pbo(struct ef_client_state state,
 int ef_tensor_pbo_id(const ef_tensor *t, uint32_t *out_id);
 
 /**
- * Whether a PBO-backed tensor currently holds (or is establishing) a CPU
- * mapping — "is this buffer free for GL operations?", not "does a CPU
- * pointer exist right now".
+ * Whether a PBO-backed tensor holds, or is establishing, a CPU mapping.
  *
  * @retval 1 mapped, or a map/unmap is in flight.
  * @retval 0 fully unmapped.
  * @retval -1 `t` is NULL/unresolvable or not PBO-backed.
  *
- * @warning Three-valued behind an `int`. Test `< 0` **before**
- * truthiness: `if (ef_tensor_pbo_is_mapped(t))` is true for the error
- * value, so a caller that writes it that way treats "not a PBO" as
- * "mapped". The shape is
- * `int r = ef_tensor_pbo_is_mapped(t); if (r < 0) { ...error... } else if
- * (r) { ...mapped... }`.
+ * @warning Three-valued: the error value `-1` is truthy. Test `< 0` before
+ * testing for non-zero.
  *
  * # Safety
  * `t` must be NULL or a live handle.
@@ -2623,12 +2260,12 @@ int ef_tensor_pbo_id(const ef_tensor *t, uint32_t *out_id);
 int ef_tensor_pbo_is_mapped(const ef_tensor *t);
 
 /**
- * The address of this PBO's callback vtable, for the cross-package
- * descriptor protocol's `ptr` field under its `PBO` kind.
+ * The address of this PBO's callback vtable, as carried in the
+ * cross-package descriptor's `ptr` field for the `PBO` kind.
  *
- * Borrowed, never owned: valid for as long as `t` is, and a consumer that
- * reconstructs operations from it takes its own reference through the
- * `ef_client_state` embedded in it.
+ * Borrowed: valid for as long as `t` is. A consumer that reconstructs
+ * operations from it takes its own reference through the `ef_client_state`
+ * embedded in it.
  *
  * @retval the vtable address.
  * @retval `NULL` when `t` is NULL/unresolvable or not PBO-backed.
@@ -2684,7 +2321,8 @@ int ef_is_shm_available(void);
 int ef_platform_compression_support(const char *format, uint32_t dtype);
 
 /**
- * `HAL_COMPRESSION_ANY` requests that fell back to a linear layout.
+ * Number of `EF_COMPRESSION_REQUEST_ANY` requests that fell back to a
+ * linear layout.
  */
 uint64_t ef_compression_fallback_count(void);
 
@@ -2692,7 +2330,7 @@ uint64_t ef_compression_fallback_count(void);
  * Report whether a live handle carries quantization metadata, and how many
  * `scale`/`zero_point` entries it has.
  *
- * The first half of the two-call idiom; see this module's docs.
+ * Call this before [`ef_tensor_quantization_get`] to size its buffers.
  *
  * @retval 0 success (`out` is always fully written, whether or not
  *         quantization is present).
@@ -2706,8 +2344,8 @@ int ef_tensor_quantization_info(const ef_tensor *t, struct ef_quantization_info 
 
 /**
  * Fill caller-provided buffers with a live handle's quantization scales and
- * zero-points. The second half of the two-call idiom; `n` must equal the
- * `count` [`ef_tensor_quantization_info`] reported.
+ * zero-points. `n` must equal the `count` [`ef_tensor_quantization_info`]
+ * reported.
  *
  * @retval 0 success; `scales[0..n]` is filled, and `zps[0..n]` too when
  *         `zps` is non-`NULL` (zero-filled for a symmetric quantization).
@@ -2725,9 +2363,7 @@ int ef_tensor_quantization_get(const ef_tensor *t, float *scales, int32_t *zps, 
  * per-tensor (`n` must be 1) or `>= 0` for per-channel; `zps` may be `NULL`
  * for symmetric quantization (zero-point implicitly 0).
  *
- * Only meaningful for an integer-dtype tensor; a float tensor is refused,
- * matching [`edgefirst_tensor::TensorDyn::set_quantization`]'s own
- * `QuantizationInvalid { field: "dtype_is_integer", .. }` refusal.
+ * A float tensor is refused.
  *
  * @retval 0 success.
  * @retval EINVAL `t` or `scales` is `NULL`, `n == 0`, `axis` is `< -1`,
@@ -2736,7 +2372,7 @@ int ef_tensor_quantization_get(const ef_tensor *t, float *scales, int32_t *zps, 
  *         with the tensor's shape).
  *
  * @warning Not safe to call concurrently with any other `tensor-capi` call
- * on the same handle from another thread -- see this module's docs.
+ * on the same handle from another thread.
  *
  * # Safety
  * `t` must be `NULL` or a live handle; `scales` must point to `n` readable
@@ -2756,7 +2392,7 @@ int ef_tensor_quantization_set(ef_tensor *t,
  * @retval EINVAL `t` is `NULL`.
  *
  * @warning Not safe to call concurrently with any other `tensor-capi` call
- * on the same handle from another thread -- see this module's docs.
+ * on the same handle from another thread.
  *
  * # Safety
  * `t` must be `NULL` or a live handle.
@@ -2766,30 +2402,26 @@ int ef_tensor_quantization_clear(ef_tensor *t);
 /**
  * Serialize a tensor into a caller-provided blob buffer and handle table.
  *
- * Follows the standard two-call C pattern: pass `blob_cap`/`fds_cap` of 0 (or
- * `NULL` buffers) to learn the sizes required, then call again with buffers
- * that large. `blob_len` and `fds_len` are always written when non-`NULL`, so
- * a caller learns the requirement even from a failed call.
+ * Two-call pattern: pass `blob_cap`/`fds_cap` of 0 (or `NULL` buffers) to
+ * learn the sizes required, then call again with buffers that large.
+ * `*blob_len` and `*fds_len` are written even when the call fails with
+ * `ENOSPC`.
  *
- * A `NULL` `fds_out` is a zero-capacity handle table, not an error: it is
- * refused only when the export actually produced handles. An export that
- * produces none — every inline export, and every export on a platform that
- * shares by handle value inside the blob rather than out of band, which is
- * all of them on Windows — therefore succeeds with `fds_out, fds_cap` of
- * `NULL, 0` and reports `*fds_len == 0`.
+ * A `NULL` `fds_out` is a zero-capacity handle table: it is refused only
+ * when the export produced handles. An inline export, and every export on
+ * a platform that shares by handle value inside the blob (Windows),
+ * produces none: it succeeds with `fds_out, fds_cap` of `NULL, 0` and
+ * reports `*fds_len == 0`.
  *
  * The transport mode is chosen from the tensor's storage: a backing with a
- * shareable handle is exported by reference, and one without — `mem`, `pbo` —
- * is inlined, because there is nothing to refer to. A caller that needs bytes
- * from a shareable tensor (sending over a network, where a handle is
- * meaningless off-host) should copy into a `mem` tensor first; a mode-selecting
- * variant can be appended later without breaking this signature.
+ * shareable handle is exported by reference, and one without (`mem`, `pbo`)
+ * is inlined.
  *
- * @return 0 on success, `ENOSPC` when a buffer is too small (with the
- *         required lengths written) -- a `NULL` `fds_out` on an export that
- *         produced handles is that case, not a pointer refusal -- `EINVAL`
- *         on a null tensor, a null `blob_len` or a null `fds_len`, `EIO` if
- *         the tensor cannot be serialized.
+ * @return 0 on success; `ENOSPC` when a buffer is too small (with the
+ *         required lengths written), including a `NULL` `fds_out` on an
+ *         export that produced handles; `EINVAL` on a null tensor, a null
+ *         `blob_len` or a null `fds_len`; `EIO` if the tensor cannot be
+ *         serialized.
  *
  * # Safety
  * `blob` must be writable for `blob_cap` bytes and `fds` for `fds_cap` ints.
@@ -2805,13 +2437,11 @@ int ef_tensor_export(const ef_tensor *t,
 /**
  * Reconstruct a tensor from a blob and its handle table.
  *
- * **Import dups** every handle it retains, so the result is independent and
- * the sender may close its own copies as soon as this returns. There is no
- * keepalive protocol.
+ * Import dups every handle it retains: the result is independent and the
+ * sender may close its own copies as soon as this returns.
  *
- * `blob` is untrusted — it may have arrived from another library, another
- * process, or a network — so every length and index inside it is validated
- * against the buffer and against `fds_len` before use.
+ * Every length and index inside `blob` is validated against the buffer and
+ * against `fds_len` before use.
  *
  * @return a new tensor the caller must free with `ef_tensor_free`, or `NULL`.
  *

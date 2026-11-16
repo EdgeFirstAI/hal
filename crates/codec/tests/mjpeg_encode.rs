@@ -4,8 +4,7 @@
 //! MJPEG encoding with [`VideoEncoder`], and still JPEG on a hardware
 //! [`ImageEncoder`] engine. Each picture is decoded on the CPU and compared
 //! with its source. Tests skip (print `SKIPPED` and pass) where the platform
-//! has no hardware JPEG encoder (only V4L2 devices such as the i.MX 95's have
-//! one today).
+//! has no hardware JPEG encoder.
 
 use edgefirst_codec::video::{EncoderConfig, FrameOptions, VideoEncoder};
 use edgefirst_codec::{Codec, CodecError, Engine, ImageDecoder, ImageEncoder};

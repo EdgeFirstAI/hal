@@ -19,8 +19,7 @@ use crate::last_error::{
 
 /// Heap object behind the opaque `void *` returned by [`ef_tensor_cuda_map`].
 ///
-/// `map` is transmuted to `'static` for FFI storage. That is only sound
-/// while the tensor allocation stays alive, so this wrapper retains `t`
+/// `map` is transmuted to `'static` for FFI storage; the wrapper retains `t`
 /// for the map's lifetime and releases it in [`ef_tensor_cuda_unmap`].
 struct CudaMapHandle {
     map: edgefirst_tensor::CudaMap<'static>,
@@ -29,9 +28,7 @@ struct CudaMapHandle {
 
 /// The body both map entry points share: take the mapping `mk` returns for
 /// `t`, retain `t` for as long as that mapping lives, and box the pair as
-/// the opaque handle the caller receives. One body so the retain that makes
-/// the transmute sound cannot be added to one entry point and forgotten in
-/// the other.
+/// the opaque handle the caller receives.
 ///
 /// # Safety
 /// `t` must be `NULL` or a live handle.
@@ -39,8 +36,7 @@ unsafe fn boxed_map(
     t: *const EfTensor,
     mk: fn(&TensorDyn) -> Option<edgefirst_tensor::CudaMap<'_>>,
 ) -> *mut c_void {
-    // SAFETY: `t` is NULL or a live handle by this function's contract, which
-    // is what `tensor_of` and `ef_tensor_retain` below require of it.
+    // SAFETY: `t` is NULL or a live handle by this function's contract.
     ensure_hook_installed();
     unsafe {
         catch_unwind(AssertUnwindSafe(|| {
@@ -66,7 +62,6 @@ unsafe fn boxed_map(
             }
         }))
         .unwrap_or_else(|_| {
-            // An unwind must not leave a stale errno behind the NULL it returns.
             set_errno(libc::EINVAL);
             std::ptr::null_mut()
         })
@@ -83,13 +78,13 @@ unsafe fn boxed_map(
 ///
 /// On Windows the mapping of a D3D11 texture tensor is tight rows of
 /// `width * bytes_per_texel`, and the size [`ef_tensor_cuda_device_ptr`]
-/// reports is their sum, whatever `ef_tensor_row_stride` says -- that is the
-/// D3D11 staging pitch a CPU map sees, a larger number on a padded backing.
-/// A consumer must not stride the device pointer by `ef_tensor_row_stride`.
+/// reports is their sum. `ef_tensor_row_stride` is the D3D11 staging pitch a
+/// CPU map sees, which is larger on a padded backing: a consumer must not
+/// stride the device pointer by it.
 ///
-/// A semi-planar texture (NV12, NV16, NV24) is as wide as its own pitch, so
-/// there the mapping is `ef_tensor_row_stride` times the combined height and
-/// striding by it is correct.
+/// For a semi-planar texture (NV12, NV16, NV24) the mapping is
+/// `ef_tensor_row_stride` times the combined height, and striding by
+/// `ef_tensor_row_stride` is correct.
 ///
 /// # Safety
 /// `t` must be `NULL` or a live handle.
@@ -106,17 +101,16 @@ pub unsafe extern "C" fn ef_tensor_cuda_map(t: *const EfTensor) -> *mut c_void {
 ///
 /// On Windows the mapping of a D3D11 texture tensor is tight rows of
 /// `width * bytes_per_texel`, and the size [`ef_tensor_cuda_device_ptr`]
-/// reports is their sum, whatever `ef_tensor_row_stride` says -- that is the
-/// D3D11 staging pitch a CPU map sees, a larger number on a padded backing.
-/// A consumer must not stride the device pointer by `ef_tensor_row_stride`;
-/// writing at that pitch scrambles the image rather than failing.
+/// reports is their sum. `ef_tensor_row_stride` is the D3D11 staging pitch a
+/// CPU map sees, which is larger on a padded backing: a consumer must not
+/// stride the device pointer by it.
 ///
-/// A semi-planar texture (NV12, NV16, NV24) is as wide as its own pitch, so
-/// there the mapping is `ef_tensor_row_stride` times the combined height and
-/// striding by it is correct.
+/// For a semi-planar texture (NV12, NV16, NV24) the mapping is
+/// `ef_tensor_row_stride` times the combined height, and striding by
+/// `ef_tensor_row_stride` is correct.
 ///
-/// Retains `t` and returns NULL when CUDA is unavailable, exactly as
-/// [`ef_tensor_cuda_map`].
+/// Retains `t` and returns NULL when CUDA is unavailable, as
+/// [`ef_tensor_cuda_map`] does.
 ///
 /// # Safety
 /// `t` must be `NULL` or a live handle.
@@ -133,13 +127,10 @@ pub unsafe extern "C" fn ef_tensor_cuda_map_mut(t: *const EfTensor) -> *mut c_vo
 ///
 /// `*out_size` is the mapping's length in bytes. On Windows that is the
 /// D3D11 texture's tight rows of `width * bytes_per_texel` summed over the
-/// rows, not `ef_tensor_row_stride` times the row count -- the stride is the
-/// staging pitch a CPU map sees, and striding this pointer by it walks off
-/// the end of the mapping.
+/// rows, not `ef_tensor_row_stride` times the row count.
 ///
-/// A semi-planar texture (NV12, NV16, NV24) is as wide as its own pitch, so
-/// there the mapping is `ef_tensor_row_stride` times the combined height and
-/// striding by it is correct.
+/// For a semi-planar texture (NV12, NV16, NV24) the mapping is
+/// `ef_tensor_row_stride` times the combined height.
 ///
 /// # Safety
 /// `map` must be `NULL` or a live map. `out_size` may be NULL.
@@ -164,7 +155,6 @@ pub unsafe extern "C" fn ef_tensor_cuda_device_ptr(
             h.map.device_ptr()
         }))
         .unwrap_or_else(|_| {
-            // An unwind must not leave a stale errno behind the NULL it returns.
             set_errno(libc::EINVAL);
             std::ptr::null_mut()
         })
@@ -176,9 +166,9 @@ pub unsafe extern "C" fn ef_tensor_cuda_device_ptr(
 /// Release a map from [`ef_tensor_cuda_map`] or [`ef_tensor_cuda_map_mut`].
 /// NULL is a no-op.
 ///
-/// Drops the CUDA mapping first, then releases the retain taken at map. A
-/// writable map's drop is where the write-back happens: the device buffer is
-/// copied into the tensor and the copy is synchronized before this returns.
+/// Drops the CUDA mapping first, then releases the retain taken at map. For
+/// a writable map, the device buffer is copied into the tensor and the copy
+/// is synchronized before this returns.
 ///
 /// # Safety
 /// `map` must be `NULL` or have come from [`ef_tensor_cuda_map`] or
@@ -201,17 +191,15 @@ pub unsafe extern "C" fn ef_tensor_cuda_unmap(map: *mut c_void) {
 ///
 /// `state` is the callback channel this library keeps for the registration's
 /// life: it calls `state.retain` before returning and `state.release` when
-/// the tensor (and therefore the `CudaHandle`) is freed. Reuses frozen
-/// `ef_client_state` (24 bytes); this adds no new `repr(C)` struct.
+/// the tensor (and therefore the `CudaHandle`) is freed.
 ///
-/// **`resource` is the client-owned GL buffer handle.** This entry point
-/// never deletes it; the caller's own GL teardown stays the sole caller of
-/// `glDeleteBuffers`. On **success**, the CUDA *graphics registration* for
-/// that buffer is consumed by the library tensor and torn down through
-/// `unregister_fn` when the tensor is freed — do not call
-/// `cudaGraphicsUnregisterResource` on that registration after success. On
-/// **failure** (`EINVAL`), nothing is stored and the registration remains
-/// entirely caller-owned.
+/// `resource` is the client-owned GL buffer handle. This entry point never
+/// deletes it; the caller remains the sole caller of `glDeleteBuffers`. On
+/// success, the CUDA graphics registration for that buffer is consumed by
+/// the library tensor and torn down through `unregister_fn` when the tensor
+/// is freed: do not call `cudaGraphicsUnregisterResource` on that
+/// registration after success. On failure (`EINVAL`), nothing is stored and
+/// the registration remains caller-owned.
 ///
 /// `map_fn` / `unmap_fn` / `unregister_fn` must be non-NULL. They run on
 /// the caller's thread (typically the GL worker).
@@ -303,14 +291,10 @@ mod tests {
 
     #[test]
     fn cuda_map_keeps_the_tensor_alive_after_the_caller_frees() {
-        // Copilot review of this file: transmute-to-'static is only sound if
-        // the map retains `t`. `ef_tensor_cuda_map` already does that; this
-        // test is the contract, including the common NULL-map (no CUDA) path
-        // which must *not* take a retain.
         let dims = [4u64];
         let t = unsafe { ef_tensor_new(0, dims.as_ptr(), 1) };
         assert!(!t.is_null());
-        // Extra owner so we can observe liveness after dropping the mint.
+        // A second reference, to observe liveness after the first is freed.
         assert_eq!(unsafe { ef_tensor_retain(t) }, 0);
 
         let map = unsafe { ef_tensor_cuda_map(t) };
@@ -339,9 +323,6 @@ mod tests {
 
     #[test]
     fn cuda_map_mut_takes_the_same_retain_as_cuda_map() {
-        // The writable export shares `boxed_map` with the read-only one, so
-        // this pins the shared body's retain from the second entry point:
-        // a NULL map consumes no retain, a live one keeps the handle alive.
         let dims = [4u64];
         let t = unsafe { ef_tensor_new(0, dims.as_ptr(), 1) };
         assert!(!t.is_null());

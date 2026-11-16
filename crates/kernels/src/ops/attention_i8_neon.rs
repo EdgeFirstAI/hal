@@ -7,9 +7,8 @@
 //! `sdot v.4s, block.16b, rows.4b[r]` adds, to each of four lanes, the dot product of four
 //! bytes of the block (one token's four dims, or one value dim's four tokens) with row `r`'s
 //! four bytes. Four blocks are interleaved per 64-byte step, so a 4×4 tile of accumulators
-//! (16 tokens or value dims by four query rows) reads one stream. The step loop is
-//! hand-scheduled for in-order cores such as the Cortex-A55. The accumulators start at the
-//! zero-point terms, so they end as the exact `Σ (a − za)(b − zb)`; only the int8 softmax rows
+//! (16 tokens or value dims by four query rows) reads one stream. The accumulators start at the
+//! zero-point terms and end as the exact `Σ (a − za)(b − zb)`; only the int8 softmax rows
 //! differ from the portable kernel (±1 LSB, as [`super::softmax_i8::SoftmaxI8Plan`] on NEON).
 
 #![cfg(target_arch = "aarch64")]
@@ -110,11 +109,9 @@ macro_rules! dot_step {
 /// `acc[t][r] += Σ_s block(t, s) · rows(s)[lane r]` over `steps` steps, block `(t, s)` at
 /// `blocks + 64·s + 16·t` and the row vector of step `s` at `rows + 16·s`.
 ///
-/// Each 128-bit operand is loaded as a 64-bit `ldr d` and a general-register
-/// `ldr x` merged with `ins`, which issue alongside the `sdot`s, each just before its first
-/// use; the next step's row vector and first block load after their last use in this one. Steps
-/// go in pairs with the row vector alternating between two registers. That runs at about
-/// 1.0 cycle per `sdot` on a Cortex-A55, against about 1.7 with `ldr q`.
+/// Each 128-bit operand is loaded as a 64-bit `ldr d` and a general-register `ldr x` merged
+/// with `ins`; the next step's row vector and first block load after their last use in this
+/// one. Steps go in pairs with the row vector alternating between two registers.
 ///
 /// # Safety
 /// FEAT_DotProd; every block and row of steps `0..steps` readable, and one more step past the
@@ -245,8 +242,7 @@ pub(super) unsafe fn block(
         bufs.p_sums[r] = sum;
     }
     // Token block jc of row r is the 32-bit word jc of row r; transposing 4×4 words gives
-    // four interleaved blocks. Rows past `count` and tokens past `m` hold leftovers, which
-    // meet zero values or go unstored.
+    // four interleaved blocks.
     for g4 in 0..b.m4g {
         // SAFETY: `16 · (g4 + 1) <= ROW` bytes in each row and `64 · (g4 + 1)` within `p`.
         unsafe {
@@ -387,8 +383,8 @@ pub(super) struct PackJob<'a> {
     pub(super) value_partials: *mut i32,
 }
 
-// SAFETY: tasks write disjoint parts of the buffers (each kernel's task function documents its
-// part), which outlive them; the views and table are only read.
+// SAFETY: tasks write disjoint parts of the buffers, which outlive them; the views and table are
+// only read.
 unsafe impl Sync for PackJob<'_> {}
 
 impl<'a> PackJob<'a> {

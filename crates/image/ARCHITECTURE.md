@@ -31,7 +31,7 @@ shutdown quirks of each driver stack.
 | [`gl/render.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/src/gl/render.rs) | local | **Portable** pure decision tables and geometry — `lower_dst`, `plan_convert`, `region_to_viewport_top_down`, plus `region_to_viewport`, `source_uv`, and `plan_batch` reserved for the bottom-up-surface and `GL_MAX_*` chunking follow-ups. Host-tested with no GL dependency. |
 | [`gl/shaders_common.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/src/gl/shaders_common.rs) | local | **Portable** GLSL shared by both backends (compiled on every OS): the shared fullscreen `VERTEX_SHADER`, the PlanarRgb F16 packer, and the NV→RGBA shader (`NV_RGBA_FRAGMENT`, one divide-free body shared by both backends). Its bytes are byte-frozen by golden-file tests that run on every platform. |
 | [`gl/core.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/src/gl/core.rs) | local | **Portable** renderer helpers shared by both backends (no gbm/IOSurface types): `float_crop_uniforms` and its unit tests. |
-| [`gl/fourcc.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/src/gl/fourcc.rs) | local | `PixelFormat`→`DrmFourcc` mapping via the portable `drm_fourcc` crate (NOT `gbm`), so shader/format code carries no `gbm` coupling. |
+| [`gl/fourcc.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/src/gl/fourcc.rs) | local | `PixelFormat`→`DrmFourcc` mapping via the portable `drm_fourcc` crate (not `gbm`), so shader/format code carries no `gbm` coupling. |
 | [`gl/cuda_policy.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/src/gl/cuda_policy.rs) | local | Test-only CUDA skip-or-fail policy: turns a skipped precondition in the CUDA device-pointer tests into a failure under `HAL_TEST_REQUIRE_CUDA=1`. |
 | [`gl/platform/mod.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/src/gl/platform/mod.rs) | local | `GlPlatform` — the compile-time platform contract (display bring-up, buffer import, texture attach) + `PlatformCaps`; one impl per OS selected by the `Platform` alias (static dispatch). |
 | [`gl/platform/linux.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/src/gl/platform/linux.rs) | local | Linux `GlPlatform`: delegates to `context.rs`/`dma_import.rs`; owns `EglImage` and the single `eglCreateImageKHR` funnel. |
@@ -246,7 +246,7 @@ processor doesn't need a runtime predicate to tell them apart.
 
 ### GL platform seam (`gl/platform/`)
 
-ONE GL engine (`GLProcessorST` behind the `GLProcessorThreaded` worker
+One GL engine (`GLProcessorST` behind the `GLProcessorThreaded` worker
 wrapper) runs on every OS. Platform differences are confined to the
 [`GlPlatform`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/src/gl/platform/mod.rs)
 trait — the compile-time porting contract, selected per build by the
@@ -264,47 +264,22 @@ path, no type parameters leaking into the engine):
 | Transfer backend | `DmaBuf` → `Pbo` on the NVIDIA verify-failure downgrade | `IOSurface` | `AHardwareBuffer` | `D3d11Texture` |
 
 `PlatformCaps` (transfer backend, float render support, `serialize_gl`,
-`external_oes`, `native_fence_sync`) is captured ONCE per processor at worker startup and
+`external_oes`, `native_fence_sync`) is captured once per processor at worker startup and
 feeds the pure decision tables — platform differences never appear as
 new `cfg` branches inside the engine.
 
-`serialize_gl` selects between running several processors' GL work in
-parallel and serializing every message process-wide, and it is decided by
-`requires_full_serialization` from the GL_RENDERER string. Parallelism is
-validated on **Mali G310, V3D and Tegra/Orin only**; Vivante (driver races),
-ANGLE (per-draw state lost under concurrent contexts) and Adreno on the
-proprietary Linux KGSL driver (foreign DMA-BUF mappings unmapped under
-concurrent contexts) are serialized.
-Adding a driver to the parallel set means running it through
-`tests/gl_concurrent_stress.rs` first — ANGLE shipped wrong pixels for a
-release because it was assumed to behave like the drivers that had been
-measured.
+`serialize_gl` selects between running several processors' GL work in parallel and serializing every message process-wide, and it is decided by `requires_full_serialization` from the GL_RENDERER string. Parallelism is validated on **Mali G310, V3D and Tegra/Orin only**; Vivante (driver races), ANGLE (per-draw state lost under concurrent contexts) and Adreno on the proprietary Linux KGSL driver (foreign DMA-BUF mappings unmapped under concurrent contexts) are serialized. Adding a driver to the parallel set means running it through `tests/gl_concurrent_stress.rs` first.
 
-ANGLE over Direct3D 11 (Windows) needs one step more than the Full
-policy. That backend keeps a single `StateManager11` per display and only
-re-syncs a context's GL state onto the shared D3D device from
-`eglMakeCurrent`; with every processor's context permanently current on
-its own thread, alternating processors — even fully serialized — rendered
-with the previous context's viewport/bindings. The trait therefore has a
-`begin_gpu_pass` hook the dispatch wrapper calls before every message: the
-Windows leaf releases and re-makes its context current whenever a
-different context issued the last commands (a process-global
-`LAST_ACTIVE_CONTEXT`); Linux, Metal and Android implement it as a no-op.
-Windows also takes the non-Linux message mutex around processor bring-up
-and teardown, because the D3D11 immediate context is not safe to drive
-from two threads at once (concurrent bring-up crashed with an access
-violation). Every context creation and destruction clears the marker as
-well: a new context on a recycled address would otherwise be mistaken for
-the one that issued the last commands, and skip the re-sync it needs.
+ANGLE over Direct3D 11 (Windows) needs one step more than the Full policy. That backend keeps a single `StateManager11` per display and only re-syncs a context's GL state onto the shared D3D device from `eglMakeCurrent`; with every processor's context permanently current on its own thread, alternating processors — even fully serialized — would render with the previous context's viewport/bindings. The trait therefore has a `begin_gpu_pass` hook the dispatch wrapper calls before every message: the Windows leaf releases and re-makes its context current whenever a different context issued the last commands (a process-global `LAST_ACTIVE_CONTEXT`); Linux, Metal and Android implement it as a no-op. Windows also takes the non-Linux message mutex around processor bring-up and teardown, because the D3D11 immediate context is not safe to drive from two threads at once (concurrent bring-up crashes with an access violation). Every context creation and destruction clears the marker as well: a new context on a recycled address would otherwise be mistaken for the one that issued the last commands, and skip the re-sync it needs.
 
 `RendererTraits::mali` is a second GL_RENDERER-derived policy bit,
 independent of `is_vivante`: on i.MX 95 the EGL DMA-BUF import silently
 samples zeros from a source whose `EGL_DMA_BUF_PLANE0_OFFSET_EXT` is not
 64-byte aligned — no EGL error at all (measured at offsets 32 and 2080 of a
-256-byte pitch, against 64/256/2048 which sample correctly; #165). V3D was
-measured on the same offsets and imports every one correctly; Tegra/Orin is
+256-byte pitch, against 64/256/2048 which sample correctly). V3D
+imports every one of the same offsets correctly; Tegra/Orin is
 unmeasured, having no DMA heap to build a DMA-BUF source on.
-A source no longer meets that offset. `DmaImportAttrs::from_tensor` imports a
+A packed source is not imported at that offset. `DmaImportAttrs::from_tensor` imports a
 packed source from the largest 64-byte-aligned base a whole number of pixels
 below its plane offset — the step is `lcm(64, bpp)`, so RGB walks back by 192
 and not 64, because a 64-byte floor lands mid-pixel for a 3-byte texel — and
@@ -316,11 +291,11 @@ into the sampling rectangle beside the extent it already folded
 `scale_uv_rect_to_import` / `sample_clamp_rect` the Windows pool-narrowing case
 uses). The rebase runs on every driver rather than only Mali, so the path is
 exercised wherever an unaligned source runs; an aligned offset yields a zero
-shift and is bit-identical to before. Two declines remain: an offset that is
+shift. Two declines remain: an offset that is
 not a whole number of pixels (a 64-byte-padded pitch need not be a multiple of
 3) and a widened row that would run past the pitch (`rebase_fits_pitch`).
 
-`rejects_unaligned_import_offset` therefore now guards only the imports the rebase
+`rejects_unaligned_import_offset` therefore guards only the imports the rebase
 could not move, and it is asked about the offset the import will actually
 present rather than the one the tensor carries. `resolve_source_plane0` is the
 single answer both sides read: `from_tensor` builds the import from it, and the
@@ -347,8 +322,8 @@ NV is the format that matters among the ones the rebase never covers: the
 combined-plane R8 import's pitch **is** its width (`tex_width`), so widening it
 would overlap every row with the next, and the alternative of a uniform shift
 makes the shader address luma at `y * tex_width + x + shift` — a per-texel
-integer divide and modulo, exactly what `nv_rgba_body_divfree` was written to
-avoid (3.3x on Vivante GC7000UL), and one that leaves the final chroma row's
+integer divide and modulo, exactly what `nv_rgba_body_divfree`
+avoids (3.3x on Vivante GC7000UL), and one that leaves the final chroma row's
 last bytes outside the import. NV sources at an unaligned offset keep the
 decline and upload the combined plane through the R8 shader. YUYV/VYUY are
 excluded for a different reason: their two-byte texels carry a two-pixel
@@ -360,37 +335,11 @@ leave unaligned while plane 0 is fine, and chroma alone sampling zeros is a
 colour shift rather than a black frame. The R8 entry point needs plane 0 only,
 binding the combined plane as one R8 texture.
 
-Because the Linux import can now be wider than the logical image, the two
-`GL_TEXTURE_EXTERNAL_OES` camera programs
-(`draw_camera_texture_to_rgb_planar`, `draw_camera_texture_eglimage`) carry the
-`src_extent` clamp the `sampler2D` programs already had — the condition
-`GlPlatform::import_extent`'s contract puts on any leaf that reports a
-narrowed extent and has external-OES programs. Routing a coordinate through
-`clamp()` is also what makes its precision qualifier load-bearing: `tc`
-defaulted to `mediump`, and on Mali's fp16 ALU that quantized the sampled
-coordinate to about 0.625 texel at 1280 wide, which `LINEAR` smeared across the
-whole frame. Every shader that computes on `tc` declares it `highp`, pinned by
-`mod tc_precision` in `gl/shaders.rs`; the rule tracks the name `tc` only, so a
-sample coordinate under another name needs its own recorded decision.
+Because the Linux import can be wider than the logical image, the two `GL_TEXTURE_EXTERNAL_OES` camera programs (`draw_camera_texture_to_rgb_planar`, `draw_camera_texture_eglimage`) carry the same `src_extent` clamp as the `sampler2D` programs — the condition `GlPlatform::import_extent`'s contract puts on any leaf that reports a narrowed extent and has external-OES programs. A coordinate routed through `clamp()` depends on its precision qualifier: at the default `mediump`, Mali's fp16 ALU quantizes the sampled coordinate to about 0.625 texel at 1280 wide, which `LINEAR` smears across the whole frame. Every shader that computes on `tc` declares it `highp`, pinned by `mod tc_precision` in `gl/shaders.rs`; the rule tracks the name `tc` only, so a sample coordinate under another name needs its own check.
 
-A `Grey` source is an R8 import, which an external sampler returns as (l, 0, 0, 1). The two camera programs therefore swizzle it on the texture: `draw_camera_texture_eglimage` points G and B at R for the draw and restores identity afterwards, and `draw_camera_texture_to_rgb_planar` draws every colour plane from R. GLES leaves `GL_TEXTURE_SWIZZLE_*` undefined on external textures, but every Linux driver the HAL runs on (Mali-G310, Vivante GC7000UL, V3D, Adreno 663) honours it, which the planar draw already depended on for every source format; `test_opengl_grey_zero_copy_source_to_rgb` pins it on every GL platform. The import gate checks the pitch a `Grey` import uses rather than its width, so a pool tensor's 64-byte pitch keeps an odd-width image (638 wide at pitch 640) on the zero-copy path; a tight `Grey` pitch still needs a width divisible by 4.
+A `Grey` source is an R8 import, which an external sampler returns as (l, 0, 0, 1). The two camera programs therefore swizzle it on the texture: `draw_camera_texture_eglimage` points G and B at R for the draw and restores identity afterwards, and `draw_camera_texture_to_rgb_planar` draws every colour plane from R. GLES leaves `GL_TEXTURE_SWIZZLE_*` undefined on external textures, but every Linux driver the HAL runs on (Mali-G310, Vivante GC7000UL, V3D, Adreno 663) honours it, which the planar draw depends on for every source format; `test_opengl_grey_zero_copy_source_to_rgb` pins it on every GL platform. The import gate checks the pitch a `Grey` import uses rather than its width, so a pool tensor's 64-byte pitch keeps an odd-width image (638 wide at pitch 640) on the zero-copy path; a tight `Grey` pitch still needs a width divisible by 4.
 
-Mali **destinations** keep the zero-copy import, and that is measured, not
-assumed: rendering into an unaligned base at the same offsets is correct on
-i.MX 95, so the defect is in sampling and not in the render target. The
-driver that does fail on the destination side is Vivante, and it fails
-loudly — `eglCreateImage` returns `EGL_BAD_ACCESS` for a destination at
-offset 2080 while offset 2048 renders. **A loud failure needs no
-prediction.** The destination arms fall back the way the source arms always
-have: `bind_dst` lowers to the mapped-texture path — render to a texture,
-read back through `map()` at the destination's offset and pitch — when the
-zero-copy setup fails, whatever the driver and whatever its reason, warning
-once per buffer and counting the decline in
-`ConvertStats::dst_import_fallbacks`. The guard covers the whole setup, not
-just `eglCreateImage`: attaching the image to the texture and the FBO can
-fail after the import succeeded, and nothing has been written to the
-destination yet either way. So there is no per-driver destination predicate,
-and a future driver quirk of the same kind needs no new trait (#175).
+Mali **destinations** keep the zero-copy import: rendering into an unaligned base at the same offsets is correct on i.MX 95, so the defect is in sampling and not in the render target. The driver that does fail on the destination side is Vivante, and it fails with an error — `eglCreateImage` returns `EGL_BAD_ACCESS` for a destination at offset 2080 while offset 2048 renders. **A reported failure needs no prediction.** The destination arms fall back the way the source arms do: `bind_dst` lowers to the mapped-texture path — render to a texture, read back through `map()` at the destination's offset and pitch — when the zero-copy setup fails, whatever the driver and whatever its reason, warning once per buffer and counting the decline in `ConvertStats::dst_import_fallbacks`. The guard covers the whole setup, not just `eglCreateImage`: attaching the image to the texture and the FBO can fail after the import succeeded, and nothing has been written to the destination yet either way. So there is no per-driver destination predicate, and a future driver quirk of the same kind needs no new trait.
 
 The one destination question that must still be asked **before** the import
 is `Platform::dst_import_places`, because the import it guards *succeeds* and
@@ -424,23 +373,18 @@ is a hit. The float paths have no mapped-texture readback to lower to —
 `read_pixels_into` packs `UNSIGNED_BYTE` — so a refused float destination
 propagates and `ImageProcessor` runs the CPU converter.
 
-The mapped-texture path had to be made correct for a `view()` destination
-before any of this was safe to adopt (#177): it renders into an offscreen
-texture that IS the tile, at origin (0, 0), so it must not carry the band
+For a `view()` destination the mapped-texture path renders into an offscreen
+texture that is the tile, at origin (0, 0), so it does not carry the band
 `glScissor` that places a tile inside a shared parent import, and its readback
-must place each row at the destination's pitch and write nothing between the
+places each row at the destination's pitch and writes nothing between the
 rows — for a view those bytes are the parent's columns to the right of the
 tile.
 
-Folding the pixel remainder into the sampling rectangle to keep the aligned
-case zero-copy — the source-side counterpart of the viewport band a
-destination view already resolves to — is filed as #170. A source whose R8
-import is refused this way, or by the ANGLE leaves' own offset refusal, now
-uploads the combined plane through the R8 shader rather than falling to
-`draw_src_texture`, which has no NV arm and previously dropped the convert
-onto the CPU.
+An NV source whose R8 import is refused for its unaligned offset, or by the
+ANGLE leaves' own offset refusal, uploads the combined plane through the R8
+shader rather than falling to `draw_src_texture`, which has no NV arm.
 
-**Porting checklist (how Windows/ANGLE-D3D11 landed as a leaf, not a
+**Porting checklist (Windows/ANGLE-D3D11 is a leaf, not a
 fork):** implement the trait (`init_display` over a shared ANGLE display
 + per-processor context, the three import methods, the attach calls,
 `load_gl_once`), add the `Platform` alias arm — `rustc` rejects a partial
@@ -529,7 +473,7 @@ DMA-BUF import paths, selected by format (`processor/mod.rs::convert_to`):
   Vivante GC7000UL, which is texture-fetch-bound for this kernel). This is the
   path **NV16 and NV24** use on all GPUs.
 
-Both paths feed the existing, dtype-appropriate output render unchanged: u8/i8
+Both paths feed the dtype-appropriate output render: u8/i8
 RGB(A) into a zero-copy DMA target for the quantized NPU targets (imx8mp vx,
 imx95 Neutron), or the RGBA8→PlanarRgb-F16 packer for the F16 targets
 (Tegra/orin, macOS). `last_nv_convert_path` records which path ran
@@ -576,7 +520,7 @@ The letterbox colour of a `Grey` destination becomes its luma (`CPUProcessor::rg
 
 ### macOS GL backend (unified engine over ANGLE)
 
-macOS runs the SAME `GLProcessorThreaded` engine as Linux: each
+macOS runs the same `GLProcessorThreaded` engine as Linux: each
 `ImageProcessor` owns a dedicated worker thread holding a private ANGLE
 context on the process-global Metal display (made current once, held
 for the thread's life). The engine handles the macOS-specific
@@ -592,15 +536,11 @@ conversion shapes through the shared seam:
   heap destinations read back via `glReadPixels` exactly as on Linux.
 - **NV* → PlanarRgb F16** (the model-input convert) is the engine's
   portable fused two-pass (`convert_nv_to_planar_float_two_pass`) — it
-  also runs on Linux DMA-BUF f16 targets now. The intermediate is the
+  also runs on Linux DMA-BUF f16 targets. The intermediate is the
   shared GPU texture (`packed_rgb_intermediate_tex`): zero-copy source
   → GPU → texture → GPU → zero-copy destination, no host transit.
 
-macOS thereby inherits the engine's full conversion matrix
-(resize/letterbox everywhere, rotation/flip, int8, masks, view/batch
-tiling) where the legacy backend supported same-size YUYV/NV→RGBA only.
-Unsupported pairs still return `NotSupported` and fall back to CPU.
-Each new IOSurface-renderable format needs:
+macOS thereby has the engine's full conversion matrix (resize/letterbox everywhere, rotation/flip, int8, masks, view/batch tiling). Unsupported pairs return `NotSupported` and fall back to CPU. Each new IOSurface-renderable format needs:
 - A FourCC entry for the destination layout in
   `tensor::iosurface::image_fourcc_and_bpe`. (For RGBA the FourCC is
   `'RGBA'` — not `'BGRA'` — so the CPU readback sees the bytes in the
@@ -628,7 +568,7 @@ YUV→RGB on every backend is driven by the source tensor's per-tensor
   Hint-ignoring drivers (Vivante) apply a fixed BT.601-limited matrix
   regardless. How `auto` weighs that against Vivante's ~12× Path-B cost is
   the **`ColorimetryMode`** knob (`ImageProcessorConfig::colorimetry`, env
-  `EDGEFIRST_COLORIMETRY`; issue #106 policy): the default **`Fast`** keeps
+  `EDGEFIRST_COLORIMETRY`): the default **`Fast`** keeps
   single-plane 4-aligned NV12 on Path A for every colorimetry (approximate
   matrix for non-BT.601-limited sources), while the **`Exact`** opt-in
   forces non-matching colorimetries to Path B so the exact matrix always
@@ -648,13 +588,13 @@ See the [Colorimetry](#colorimetry-1) section for the full design.
 `options::OutputMap::resolve` folds the convert's `Normalization` (`(x - mean) / std` on 0–255 values, RGB order) and, for a u8 or i8 destination, the destination's `Quantization` into one per-channel affine on 8-bit samples, in the destination's channel order:
 
 - float: `y = x * scale + offset`;
-- integer: `clamp(floor(x * scale + offset + 0.5) + zero_point, lo, hi)`, stored as the low byte. Rounding is half up, before the integer zero point is added, which is what the GL shaders always did and keeps the CPU and GL paths in agreement on ties.
+- integer: `clamp(floor(x * scale + offset + 0.5) + zero_point, lo, hi)`, stored as the low byte. Rounding is half up, before the integer zero point is added, which matches the GL shaders, so the CPU and GL paths agree on ties.
 
-Alpha maps to `x / 255` for float destinations and stays the raw byte for integer ones. An integer destination without quantization uses scale 1/255 and zero point 0 (u8) or -128 (i8), which is the plain copy and the `x ^ 0x80` bias; a non-default normalization on one is `InvalidOptions`. When the resolved map equals that plain mapping and no output-domain pad is set, `output_map_for` returns `None` and every backend runs its existing path unchanged.
+Alpha maps to `x / 255` for float destinations and stays the raw byte for integer ones. An integer destination without quantization uses scale 1/255 and zero point 0 (u8) or -128 (i8), which is the plain copy and the `x ^ 0x80` bias; a non-default normalization on one is `InvalidOptions`. When the resolved map equals that plain mapping and no output-domain pad is set, `output_map_for` returns `None` and every backend runs its unmapped path.
 
 - **CPU** (`cpu/normalize.rs`) converts into the u8 scratch, then maps it row by row: NEON on aarch64 (48-byte blocks against a 12-lane coefficient pattern, which covers 1-, 3- and 4-channel packed rows and a planar plane), scalar elsewhere, with the same unfused arithmetic. An output-domain pad is written over the letterbox band afterwards.
 - **GL float** shaders apply `sample * norm_scale + norm_offset` (`FloatNorm`, set per convert; identity is exact) and write the precomputed pad.
-- **GL integer**: every int8 program is linked in two builds from one source. The default build compiles `quantize()` as the plain `(q + 128) mod 256` bias in literals, so a convert without a mapping runs the same shader as before mapping existed. The mapped build (`#define QUANT_MAPPED`, linked on the first mapped convert) reads the coefficients as uniforms: per-program state that `load_int_quant` uploads only when a convert's mapping differs from the loaded one, with the rounding offset and zero point folded in (clamp bounds shifted by the zero point, the wrap to a negative stored byte as one `step`). `use_int8_set` swaps the builds, with the uniform locations each draw caches, between the processor's int8 fields and `int8_alt`. Literals matter on Vivante, where the int8 draws are ALU-bound: the uniform build costs 10-13% on planar output there. A mapped u8 destination renders through the int8 programs. The planar draws swizzle each plane's channel into `.r`, so `set_plane_quant` points a mapped program at that plane's colour coefficients for each plane draw. The letterbox `glClear` writes the mapped pad bytes.
+- **GL integer**: every int8 program is linked in two builds from one source. The default build compiles `quantize()` as the plain `(q + 128) mod 256` bias in literals, so a convert without a mapping runs a shader with no mapping uniforms. The mapped build (`#define QUANT_MAPPED`, linked on the first mapped convert) reads the coefficients as uniforms: per-program state that `load_int_quant` uploads only when a convert's mapping differs from the loaded one, with the rounding offset and zero point folded in (clamp bounds shifted by the zero point, the wrap to a negative stored byte as one `step`). `use_int8_set` swaps the builds, with the uniform locations each draw caches, between the processor's int8 fields and `int8_alt`. Literals matter on Vivante, where the int8 draws are ALU-bound: the uniform build costs 10-13% on planar output there. A mapped u8 destination renders through the int8 programs. The planar draws swizzle each plane's channel into `.r`, so `set_plane_quant` points a mapped program at that plane's colour coefficients for each plane draw. The letterbox `glClear` writes the mapped pad bytes.
 - An **output-domain pad** on an integer destination is first replaced by the pixel pad that maps to it exactly (`OutputMap::sample_for`), when every channel has one, so every route renders it, two-pass ones included; otherwise a two-pass route (pass 1 pads with a pixel colour, pass 2 maps it) declines and the CPU writes it. The NV→float two-pass route samples its pass-2 letterbox rectangle 1:1 from the intermediate and writes the pad outside it, so it takes either pad. GL also declines a mapped `Bgra` integer destination.
 - **G2D** declines any non-default mapping.
 
@@ -695,9 +635,7 @@ constants (lifted from `ANGLE/include/EGL/eglext_angle.h`):
 | `EGL_TEXTURE_INTERNAL_FORMAT_ANGLE` | `0x345D` | GL internal format the IOSurface bytes are interpreted as (`GL_RG`, `GL_RGBA`, `GL_BGRA_EXT`). |
 | `EGL_BIND_TO_TEXTURE_TARGET_ANGLE` | `0x348D` | Required EGL config attribute: must equal `EGL_TEXTURE_2D` for the pbuffer to be `eglBindTexImage`-able. |
 
-The 0x345B vs 0x345C swap is the kind of bug that survives review and
-only manifests at runtime as a vague `EGL_BAD_ATTRIBUTE` — worth
-calling out.
+Swapping 0x345B and 0x345C compiles and fails only at runtime, as an `EGL_BAD_ATTRIBUTE`.
 
 ### GL thread architecture
 
@@ -743,8 +681,7 @@ caller of `glDeleteBuffers`.
 
 What comes back is deliberately narrow. Every PBO call site in this crate
 reads exactly two facts off a tensor, `pbo_id()` and `pbo_is_mapped()`, and
-those two are the whole surface. `as_pbo()`, which used to lend a
-`PboTensor<T>`, is gone — not as a style preference but because the `dynamic`
+those two are the whole surface. No call lends a `PboTensor<T>`: the `dynamic`
 backend has no `PboTensor<T>` to lend once the buffer lives in the library,
 and a borrow that exists on only one backend cannot be the signature this
 crate compiles against on both.
@@ -790,12 +727,10 @@ DMA-only. A texture-lowered planar destination therefore has no single-pass
 route for *any* source format, and semi-planar NV has none even zero-copy
 (no multi-plane EGLImage/IOSurface binding for the planar shader). Only
 non-NV → planar on a zero-copy destination keeps the proven single-pass
-EXTERNAL_OES route. The Vivante GC7000UL single-pass GPU hang (EDGEAI-1180)
+EXTERNAL_OES route. The Vivante GC7000UL single-pass GPU hang
 is subsumed by the same plan rather than gated separately.
 
-Single-pass converts share the same `bind_dst → render → readback` body for
-every src/dst memory combination. The two-pass functions survive as render
-strategies, not duplicated dispatch.
+Single-pass converts share the same `bind_dst → render → readback` body for every src/dst memory combination. The two-pass functions are render strategies, not duplicated dispatch.
 
 **Source feeds.** Every draw feeds its source one of three ways, counted in
 `ConvertStats` and named by `src_feed`: `import` (a DMA-BUF attached as the
@@ -811,7 +746,7 @@ formats on the GPU. Where the platform has zero-copy import,
 `check_src_format_supported` declines YUYV from host memory or a PBO, and NV
 from a PBO, to the CPU: such a source is one the DMA-BUF heap could not
 place, and uploading it is slower than the CPU converter (Mesa V3D's PBO
-upload measured 1.3-50x behind it). The DMA-BUF allocator takes the system
+upload is 1.3-50x behind it). The DMA-BUF allocator takes the system
 heap when CMA is full, so that case is rare.
 
 A PBO is fed through the unpack binding only when this processor allocated
@@ -832,21 +767,11 @@ tables.
 **Planar render-target geometry.** A planar destination's render target is
 full `dst_w × (dst_h · channels)` single-channel R8 — the planar shader draws
 each plane as one full-width quad, so there is no `/4` texel packing to
-compensate for. Sizing the target at `dst_w/4` (as the non-DMA setup once
-did) has no shader that packs four plane bytes per texel and silently
+compensate for. Sizing the target at `dst_w/4`
+has no shader that packs four plane bytes per texel and silently
 truncates. The `W*3/4` reinterpretation belongs to `TwoPassPackedRgb` alone.
 
-**Why the PBO lowering never maps:** mapping a PBO image on the GL thread once
-deadlocked outright — the `PboMap` message went back to the queue that thread
-itself drains. That re-entrancy is serviced inline now (see the GL thread
-architecture section), but the lowering still does not map. `bind_dst` seeds
-the render
-texture by binding the PBO as `GL_PIXEL_UNPACK_BUFFER` and calling
-`glTexImage2D` with the view's byte offset into that buffer (GL reads
-directly from the PBO; the argument is an offset, not a pointer, and passing
-a literal null there is what made every view of one PBO upload the parent's
-origin), and the readback targets the PACK binding. Mem tensors map directly — no channel round-trip
-— so the `TextureMem` lowering may map freely.
+**The PBO lowering never maps:** a `PboMap` message sent from the GL thread goes back to the queue that thread itself drains, and is serviced inline (see the GL thread architecture section); the lowering does not map. `bind_dst` seeds the render texture by binding the PBO as `GL_PIXEL_UNPACK_BUFFER` and calling `glTexImage2D` with the view's byte offset into that buffer (GL reads directly from the PBO; the argument is an offset, not a pointer, and a null there would make every view of one PBO upload the parent's origin), and the readback targets the PACK binding. Mem tensors map directly — no channel round-trip — so the `TextureMem` lowering may map freely.
 
 **Int8 letterbox bias is lowering-independent:** the int8 fragment shader
 maps rendered pixels (`quantize()`) and no readback un-maps them, so the
@@ -1034,8 +959,7 @@ OpenGL destination-tile obligations:
   `view`/`batch` destination on a zero-copy lowering whose format is packed
   `Rgb` or any planar layout reinterprets the render-target geometry
   (`W*3/4 × H`, `H*3` bands), which the band path does not yet compute, so the
-  GL backend declines it and the tile falls through to CPU. Band tiling for
-  those geometries is a follow-up.
+  GL backend declines it and the tile falls through to CPU.
 
 **Source import churn.** Each distinct source re-imports (~100–300 µs); across a
 run that is O(images) unless bounded. Reuse a fixed-capacity ring of source
@@ -1068,7 +992,7 @@ one `TilePlacement` type (re-exported here) so the lift back to full-frame
 coordinates cannot drift from the crop that produced it.
 
 **Grid.** `tile_grid` lays a uniform row-major grid using **EvenDist**
-spacing, ported from the adis-uav-model `sahi()` reference. `overlap_ratio`
+spacing. `overlap_ratio`
 is a *minimum*: the step is `floor(tile · (1 − overlap))` and the origins are
 then redistributed evenly, so the first tile starts at 0, the last lands
 exactly on `frame − tile`, and every tile is full-size. Realized overlap is
@@ -1118,7 +1042,7 @@ mechanisms keep the cost proportional to the crop.
 **Fused NV → planar strip path.** `convert_nv_to_planar_fused` decodes YUV
 into packed RGB one cache-resident 32-row strip at a time and NEON-
 deinterleaves each strip straight into the destination planes, so the
-full-size packed intermediate never round-trips through DRAM. It now takes an
+full-size packed intermediate never round-trips through DRAM. It takes an
 optional source `region`. Exactly two shapes reach it: the whole-frame case
 (no crop, destination the same size as the source) and a **scale-identity**
 crop — crop extent equal to the destination extent, no rotation or flip, full
@@ -1143,15 +1067,7 @@ pair an odd-width crop still needs.
 
 The halo is computed, not assumed. The HAL's `Bilinear` uses `Interpolation(Bilinear)`, which holds a fixed `support` regardless of scale; `Convolution`, whose adaptive radius is `support · max(scale, 1)`, is modelled for completeness, and shows why a fixed radius would be wrong. `filter_halo` reads the support from the configured `ResizeAlg` (`Box` 0.5, `Bilinear`/`Hamming` 1, `CatmullRom`/`Mitchell` 2, `Gaussian`/`Lanczos3` 3, `Custom` from the filter itself) and derives the reach as `ceil(radius − scale/2)`. An algorithm it cannot model (`SuperSampling`, or anything a future upstream release adds) returns `None` and the caller keeps the full-frame intermediate and its unchanged output.
 
-`HALO_SLACK = 1` is added to every modelled reach and is load-bearing, not
-padding. Growing the extracted rect beyond the filter's true reach cannot
-change an output pixel — the extra columns are never sampled — but a *zero*
-halo can: an already-chroma-aligned crop would grow by nothing, the rebased
-source rect would become the whole intermediate, `needs_resize` would flip to
-false, and control would pass to `flip_rotate_ndarray_pf`, which assumes
-tightly-packed destination rows and so bypasses the padded-destination
-destride. Only `Nearest` has a genuinely zero reach, which is why it was the
-one algorithm that could hit that case before the floor applied uniformly.
+`HALO_SLACK = 1` is added to every modelled reach, and the path depends on it. Growing the extracted rect beyond the filter's true reach cannot change an output pixel — the extra columns are never sampled — but a *zero* halo can: an already-chroma-aligned crop would grow by nothing, the rebased source rect would become the whole intermediate, `needs_resize` would flip to false, and control would pass to `flip_rotate_ndarray_pf`, which assumes tightly-packed destination rows and so bypasses the padded-destination destride. Only `Nearest` has a zero reach of its own, and the slack keeps it off that path.
 
 Byte-exactness across this whole path is frozen by the per-architecture
 golden fixtures in `tests/crop_golden.rs` — see
@@ -1220,8 +1136,8 @@ fd recycling, inode-keyed cache, GStreamer adaptor integration).
 ### NV12/NV16/NV24 → PlanarRgb two-pass render
 
 A single-pass semi-planar-YUV → PlanarRgb shader causes a GPU hang on the
-Vivante GC7000UL (NXP i.MX 8M Plus), which is where this split originated.
-It is now the plan for every NV\* → planar convert on every GPU, for the
+Vivante GC7000UL (NXP i.MX 8M Plus).
+The two-pass split is the plan for every NV\* → planar convert on every GPU, for the
 capability reasons in [Destination lowering](#destination-lowering-bind_dst):
 
 ```text
@@ -1231,13 +1147,7 @@ Pass 2:  RGBA → PlanarRgb (at destination resolution)
          Deinterleaves RGBA to three planes via sampler2D variants
 ```
 
-Pass 1 reuses the existing `packed_rgb_intermediate_tex` texture — no new
-GPU resources allocated. Pass 2 uses the same shader infrastructure as
-direct RGBA → PlanarRgb, and classifies its target through the same
-`bind_dst` seam `SinglePass` uses, so a heap or PBO destination reads back
-identically. The function is `convert_nv_to_planar_two_pass`; selection is
-`render::plan_convert`'s, not an `is_vivante` branch. No API changes
-required from callers.
+Pass 1 renders into the `packed_rgb_intermediate_tex` texture, which the packed-RGB plan also uses. Pass 2 uses the same shader infrastructure as direct RGBA → PlanarRgb, and classifies its target through the same `bind_dst` seam `SinglePass` uses, so a heap or PBO destination reads back identically. The function is `convert_nv_to_planar_two_pass`; selection is `render::plan_convert`'s, not an `is_vivante` branch.
 
 **Multi-pass invariant.** Every multi-pass GL flow keeps its intermediate
 GPU-resident — a pass renders into an engine-internal texture that the
@@ -1544,8 +1454,8 @@ when the worker starts:
 
 | Driver | Policy | Effect |
 |---|---|---|
-| Vivante `galcore` (i.MX 8M Plus) | `Full` | Every message acquires the global `GL_MUTEX` — all instances serialize (the pre-2026-06 behaviour on every platform). |
-| Adreno on Linux (proprietary KGSL driver, e.g. IQ-9075 / Adreno 663) | `Full` | Its `eglCreateImage` maps every imported DMA-BUF into the process (through `msm_gbm`), and one `eglDestroyImage` unmaps that range **twice**; any mapping created between the two `munmap`s is destroyed. `Full` keeps other GL threads out of that window (9/30 crashes of four concurrent processors under `LifecycleOnly`, 0/30 under `Full`); `edgefirst_tensor::pin::with_cpu_mappings_excluded`, run around every `eglDestroyImage` against a shared lock held across every tensor `mmap`, keeps CPU threads' tensor mappings out of it. In a `dynamic` build it reaches the lock inside `libedgefirst_tensor` through `ef_tensor_with_cpu_mappings_excluded`, the one copy that makes the mappings (10-thread convert test: 10/20 crashes under `Full` alone, 0/80 with the guard). |
+| Vivante `galcore` (i.MX 8M Plus) | `Full` | Every message acquires the global `GL_MUTEX` — all instances serialize. |
+| Adreno on Linux (proprietary KGSL driver, e.g. IQ-9075 / Adreno 663) | `Full` | Its `eglCreateImage` maps every imported DMA-BUF into the process (through `msm_gbm`), and one `eglDestroyImage` unmaps that range **twice**; any mapping created between the two `munmap`s is destroyed. `Full` keeps other GL threads out of that window; `edgefirst_tensor::pin::with_cpu_mappings_excluded`, run around every `eglDestroyImage` against a shared lock held across every tensor `mmap`, keeps CPU threads' tensor mappings out of it. In a `dynamic` build it reaches the lock inside `libedgefirst_tensor` through `ef_tensor_with_cpu_mappings_excluded`, the one copy that makes the mappings. |
 | Virtualized GPUs (`Paravirtual`/`virtio` in `GL_RENDERER`) | `Full` | Concurrent GL across contexts mis-renders on paravirtual Metal (observed on GitHub macOS runners: ~60–86% of output bytes diverge under parallel converts). Messages serialize on a process-global mutex (macOS has no lifecycle lock — ANGLE serializes display entry points internally). |
 | Mali/Panfrost, V3D, Tegra, llvmpipe, macOS (real Apple GPU) | `LifecycleOnly` | Messages run unlocked; instances execute GL concurrently on the same GPU. |
 | Android (Adreno/Mali system drivers) | `LifecycleOnly` | Messages run unlocked. Android's system EGL is specification-conformant thread-safe, so there is also no Linux-style lifecycle lock around context bring-up (same reasoning as ANGLE's internal serialization); this claim is device-validated by the Device Farm harness. |
@@ -1563,8 +1473,8 @@ interfere; Vivante `galcore` violates this — concurrent `eglInitialize`,
 threads corrupt driver-internal state (SIGSEGV at offset `0x18` in
 `galcore` ioctl, futex deadlocks). Separately, concurrent multi-processor
 *lifecycles* can abort intermittently (`double free or corruption`) even
-when fully serialized — the 2026-06 lock-scoping spike reproduced it
-under `Full` policy, implicating driver thread-exit TLS destructors that
+when fully serialized under `Full` policy, which points at driver
+thread-exit TLS destructors that
 no userspace lock can order. That known bug keeps the
 `EDGEFIRST_SKIP_VIVANTE_KNOWN_BUGS` test skip.
 
@@ -1574,7 +1484,7 @@ no userspace lock can order. That known bug keeps the
    context setup, shader compilation, DMA-BUF roundtrip verification).
    Also makes the once-per-process GL function-pointer load race-free.
 2. **Teardown** — `GLProcessorST::drop()` → `GlContext::drop()`
-   (`eglDestroyContext` serialization; V3D historically broke display
+   (`eglDestroyContext` serialization; V3D breaks display
    ref-counting on concurrent `eglTerminate`, which the HAL additionally
    avoids by never terminating the shared display).
 3. **EGLImage create/destroy** — a dedicated short `EGL_IMAGE_MUTEX`
@@ -1653,7 +1563,7 @@ image.convert                                           [user-facing fn, orchest
 │   │         dst_feed (zero_copy | mapped_texture | pbo)
 │   │         src_feed and dst_feed are recorded on this span for both the u8 and float routes
 │   ├── image.convert.gl.engine                         ← plan + destination lowering for the convert ({plan, lowering, src_pbo})
-│   ├── image.convert.gl.egl_import                     ← one actual eglCreateImageKHR (cache MISS only; zero in steady state)
+│   ├── image.convert.gl.egl_import                     ← one actual eglCreateImageKHR (cache miss only; zero in steady state)
 │   ├── image.convert.gl.pack_rgb.pass1_rgba            ← NV* → intermediate RGBA (resize + crop + flip)
 │   ├── image.convert.gl.pack_rgb.pass2_pack            ← intermediate RGBA → packed RGB (3:4 width ratio)
 │   ├── image.convert.gl.nv_to_planar.pass1_rgba        ← 2-pass: NV12/NV16/NV24 → intermediate RGBA
@@ -1665,7 +1575,7 @@ image.convert                                           [user-facing fn, orchest
 ├── image.convert.g2d                                   [NXP i.MX G2D backend, picked second]
 │   fields: src_fmt, dst_fmt
 │
-└── (image.convert.cpu)                                 [universal fallback — GROUPING ONLY, no span of this name is emitted]
+└── (image.convert.cpu)                                 [universal fallback — grouping only, no span of this name is emitted]
     ├── image.convert.cpu.format_convert                ← per-pixel format conversion
     │   │ fields: from, to, pass = "pre_resize" | "direct" | "post_resize"
     │   └── image.convert.cpu.extract_region             ← NV12/NV16/NV24 sub-rect copy feeding a "pre_resize" convert
@@ -1720,12 +1630,12 @@ image.tile_one                                          [user-facing fn — rend
 |--------------------------------------------------------|--------------------------|------------------|
 | `image.gl_init`                                        | One-time shared-display bring-up: ANGLE dylib discovery + Metal display on macOS/iOS, system EGL default display on Android. An `info_span`, not a trace span. | Fires once per process, not per processor. A second occurrence means the `OnceLock` was re-entered — worth investigating. Linux brings its display up through `context.rs` and emits no span here. |
 | `image.convert`                                        | Orchestration: probe backends, pick OpenGL → G2D → CPU, dispatch. | The `src_memory` and `dst_memory` fields reveal whether you're on a zero-copy DMA-buf path, the PBO path, or the heap fallback. Cache-miss EGLImage imports show up as outliers here when callers reuse fds without reusing tensors. |
-| `image.convert.gl`                                     | The chosen GL backend's full shader pipeline: bind/import source, set up FBO/renderbuffer, run conversion shader, `glFinish`. | First call at a new (src_fmt, dst_fmt, dims) tuple includes shader compile/link cost. Steady-state cost is dominated by the GPU draw and the `glFinish` at the end. Both feed fields land on `image.convert.gl` itself for **u8 and float converts**, and both are recorded on every one — including the single-pass planar route, whose source import is unconditional and which used to be the one convert with no `src_feed` at all: `src_feed` (`import` / `pbo` / `upload`) says how the source was fed, `dst_feed` (`zero_copy` / `mapped_texture` / `pbo`) how the output reached the destination. The float route enters this span before dispatch (`convert_float_to_*`, `convert_nv_to_float_two_pass`) with `is_int8 = false`. `dst_feed` is recorded where the route is COMMITTED, not where the destination is bound, so a bind the engine then re-plans away from does not put a stale value on the span. On the float route that commit is the zero-copy FBO draw (`zero_copy`) or the PBO pack readback (`pbo`). `dst_feed` is deliberately NOT an import-refusal marker — it is recorded in `bind_dst`, the one place a `DstTarget` is decided, plus the packed-RGB plan's pre-flight, which is the only destination import that does not go through it. A field that appeared only on the refused route would read as "zero-copy" whenever it was absent, which is how an ordinary texture-lowered convert, or a DMA destination that `dst_import_places` pre-lowered without attempting an import, could pass for a zero-copy one in a trace. `ConvertStats::dst_import_fallbacks` is the refusal count. Anything but `import` on a DMA source means the frame paid a copy. The recording sites take the span's handle rather than `Span::current()`, which inside the engine names `image.convert.gl.engine` (and on the two-pass plans a pass span); `tracing` drops a record against a field the span does not declare, so a record through `Span::current()` there is silently lost. Use `ConvertStats` (`src_imports` / `src_pbo_uploads` / `src_uploads` / `zero_copy_declines` / `dst_import_fallbacks`) for counts on any route. |
+| `image.convert.gl`                                     | The chosen GL backend's full shader pipeline: bind/import source, set up FBO/renderbuffer, run conversion shader, `glFinish`. | First call at a new (src_fmt, dst_fmt, dims) tuple includes shader compile/link cost. Steady-state cost is dominated by the GPU draw and the `glFinish` at the end. Both feed fields land on `image.convert.gl` itself for **u8 and float converts**, and both are recorded on every one — including the single-pass planar route, whose source import is unconditional: `src_feed` (`import` / `pbo` / `upload`) says how the source was fed, `dst_feed` (`zero_copy` / `mapped_texture` / `pbo`) how the output reached the destination. The float route enters this span before dispatch (`convert_float_to_*`, `convert_nv_to_float_two_pass`) with `is_int8 = false`. `dst_feed` is recorded where the route is committed, not where the destination is bound, so a bind the engine then re-plans away from does not put a stale value on the span. On the float route that commit is the zero-copy FBO draw (`zero_copy`) or the PBO pack readback (`pbo`). `dst_feed` is deliberately not an import-refusal marker — it is recorded in `bind_dst`, the one place a `DstTarget` is decided, plus the packed-RGB plan's pre-flight, which is the only destination import that does not go through it. A field that appeared only on the refused route would read as "zero-copy" whenever it was absent, which is how an ordinary texture-lowered convert, or a DMA destination that `dst_import_places` pre-lowered without attempting an import, could pass for a zero-copy one in a trace. `ConvertStats::dst_import_fallbacks` is the refusal count. Anything but `import` on a DMA source means the frame paid a copy. The recording sites take the span's handle rather than `Span::current()`, which inside the engine names `image.convert.gl.engine` (and on the two-pass plans a pass span); `tracing` drops a record against a field the span does not declare, so a record through `Span::current()` there is silently lost. Use `ConvertStats` (`src_imports` / `src_pbo_uploads` / `src_uploads` / `zero_copy_declines` / `dst_import_fallbacks`) for counts on any route. |
 | `image.convert.gl.engine`                              | The convert engine's decision record: which `ConvertPlan` (`SinglePass` / `TwoPassPackedRgb` / `TwoPassNvPlanar` / `TwoPassGrey`) and which destination lowering (`ZeroCopy` / `TextureMem` / `TexturePbo`) this convert took, plus whether the source is PBO-backed. | The plan/lowering pair maps 1:1 onto the GL work performed — filter traces by these fields to isolate one lowering's latency. Both decisions are pure host-tested tables in `render.rs` (`plan_convert`, `lower_dst`). |
-| `image.convert.gl.egl_import`                          | One actual `eglCreateImageKHR` — every EGLImage creation (DMA-BUF, NV R8, RGB renderbuffer paths) funnels through this single choke point. | The cache-behaviour observable: a steady-state frame loop over a fixed buffer pool must emit ZERO of these after warmup. Any per-frame occurrence means the EGLImage cache stopped hitting (key drift, geometry churn, or pool misuse). The `GLProcessorThreaded::egl_cache_stats()` counters (`src`/`dst`/`nv_r8` hits/misses) are the assertable form, pinned by the `dma_pool_steady_state_zero_imports` test. |
+| `image.convert.gl.egl_import`                          | One actual `eglCreateImageKHR` — every EGLImage creation (DMA-BUF, NV R8, RGB renderbuffer paths) funnels through this single choke point. | The cache-behaviour observable: a steady-state frame loop over a fixed buffer pool must emit zero of these after warmup. Any per-frame occurrence means the EGLImage cache stopped hitting (key drift, geometry churn, or pool misuse). The `GLProcessorThreaded::egl_cache_stats()` counters (`src`/`dst`/`nv_r8` hits/misses) are the assertable form, pinned by the `dma_pool_steady_state_zero_imports` test. |
 | `image.convert.gl.pack_rgb.pass1_rgba`                 | NV12 → intermediate RGBA texture (full geometry: resize, crop, rotation, flip, letterbox). | Reused for the "packed RGB" output path (DMA destination with 3-byte-per-pixel width × 3 / 4 render geometry). |
 | `image.convert.gl.pack_rgb.pass2_pack`                 | Intermediate RGBA → RGB DMA destination via the packed shader. | Only the second pass touches the DMA buffer; the first pass renders into the cached intermediate texture. |
-| `image.convert.gl.nv_to_planar.pass1_rgba`             | NV12/NV16/NV24 → intermediate RGBA — pass 1 of the `TwoPassNvPlanar` plan. | Selected by `render::plan_convert` for every NV\* → planar convert on every GPU, and for any source → planar on a texture lowering. Originally the Vivante GC7000UL single-pass GPU-hang workaround, now the general route. |
+| `image.convert.gl.nv_to_planar.pass1_rgba`             | NV12/NV16/NV24 → intermediate RGBA — pass 1 of the `TwoPassNvPlanar` plan. | Selected by `render::plan_convert` for every NV\* → planar convert on every GPU, and for any source → planar on a texture lowering. |
 | `image.convert.gl.nv_to_planar.pass2_deinterleave`     | RGBA → PlanarRgb / PlanarRgba via `sampler2D` deinterleave shader. | Includes the optional `XOR 0x80` int8-bias step when the destination is `DType::I8`. |
 | `image.convert.gl.grey.pass1_rgba`                     | Rgb/Rgba → intermediate RGBA — pass 1 of the `TwoPassGrey` plan (full geometry, through whatever route the source takes). | Selected by `render::plan_convert` for every RGB-family source into a `Grey` destination; see *Grey destinations*. |
 | `image.convert.gl.grey.pass2_luma`                     | Intermediate RGBA → Grey destination, BT.601 luma 1:1. | Applies the int8 mapping with channel 0's parameters. |
@@ -1767,10 +1677,9 @@ independent properties, and a mismatch on any of them corrupts the result:
 So the HAL's conversion correctness reduces to picking the right **(matrix,
 range)** pair for each source buffer.
 
-### Per-source findings (what each producer actually emits)
+### What each producer emits
 
-Research across the four target boards (kernel driver source, NXP/NVIDIA/RPi
-docs, libcamera, V4L2 colorspace spec — sources below):
+Per source, on the four target boards (from kernel driver source, NXP/NVIDIA/RPi docs, libcamera and the V4L2 colorspace spec — sources below):
 
 | Source | Matrix | Range | Signalling / notes |
 |--------|--------|-------|--------------------|
@@ -1781,7 +1690,7 @@ docs, libcamera, V4L2 colorspace spec — sources below):
 | **Orin Nano** (NVDEC / NVJPG) | baked into format enum | baked into enum | NVIDIA encodes (matrix,range) into `NvBufSurfaceColorFormat`: suffix `_709`=BT.709, `_2020`=BT.2020, `_ER`=full range, none=601-limited. NVJPG (HW JPEG) → 601 full (`_ER`). NVDEC decode-only (no NVENC). |
 
 Cross-cutting truths:
-- **JPEG is unambiguous (601 full)** — the safe, immediate win.
+- **JPEG is unambiguous (601 full).**
 - **Video is VUI-driven** — colorimetry must be read from the bitstream and
   carried, not inferred.
 - **Camera is BT.601 matrix** (709 only on the Pi5 HD-YUV path); **range varies**
@@ -1826,8 +1735,7 @@ Helper constructors:
 | PNG decode (`Grey`) | full range only |
 | `ImageProcessor::import_image(..., colorimetry)` | caller-supplied; client adaptors fill it from the producer's signalling (V4L2 `ycbcr_enc`/`quantization`, libcamera `ColorSpace`, bitstream VUI, NvBufSurface format suffix) |
 
-Native Mac/Windows capture does not yet exist in the HAL; all camera/stream
-sources go through `import_image` on client adaptors until those paths land.
+The HAL has no native Mac/Windows capture; all camera/stream sources go through `import_image` on client adaptors.
 
 #### `convert()` and the `effective_colorimetry` resolver
 

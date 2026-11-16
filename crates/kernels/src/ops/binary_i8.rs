@@ -172,15 +172,14 @@ impl Arith {
                 (a.out_mult, a.out_shift) = if real_out < 1.0 {
                     quantize_multiplier_smaller_than_one(real_out).ok_or_else(unsupported)?
                 } else if p.op == BinaryOp::Sub && real_out.is_finite() {
-                    // sub.cc's `QuantizeMultiplierGreaterThanOne`; add.cc has no such path.
+                    // sub.cc's `QuantizeMultiplierGreaterThanOne`.
                     quantize_multiplier(real_out)
                 } else {
                     return Err(unsupported());
                 };
             }
         }
-        // TFLite's left shift by `out_shift` overflows past 30 and its NEON and scalar kernels
-        // then disagree, so such multipliers are refused.
+        // Multipliers that need a left shift past 30 are refused.
         if a.out_shift > 30 {
             return Err(KernelError::Unsupported(Cow::Borrowed(
                 "binary_i8 output multiplier needs a left shift beyond 30",
@@ -303,8 +302,7 @@ impl Arith {
 ///   `vqrdmulh`, and keep the low 16 bits before adding `zo`; `SUB` always runs the scalar code.
 /// - The fused activation clamps as `CalculateActivationRangeQuantized`.
 /// - An output multiplier that needs a left shift beyond 30 (`sx·sy/so` of 2³⁰ or more) is
-///   refused (`Unsupported`): TFLite's shift overflows there and its NEON and scalar code
-///   disagree.
+///   refused (`Unsupported`).
 ///
 /// Under `TfliteKernels::NeonRuy` and `NeonGemmlowp`, flat elements in whole 16-element blocks take TFLite's NEON
 /// arithmetic and the last `n % 16` its scalar code, as TFLite's loops do for an elementwise
@@ -458,8 +456,7 @@ mod tests {
         }
     }
 
-    /// A table, when there is one, gives what the plan gives for every element of a call of
-    /// that length; `None` only when the NEON-block and scalar results disagree.
+    /// A table, when there is one, gives what the plan gives for every element of a call of that length.
     #[test]
     fn rhs_tables_follow_the_call_length() {
         for op in [BinaryOp::Add, BinaryOp::Sub, BinaryOp::Mul] {
@@ -500,8 +497,7 @@ mod tests {
         }
     }
 
-    /// Row gaps, a broadcast axis, rows that do not divide the chunk size and a NEON-build
-    /// tail: every tier gives what it gives on dense copies.
+    /// Strided, broadcast and tail layouts give what dense copies give, on every tier.
     #[test]
     fn strided_views_match_contiguous() {
         let shape = [4usize, 7, 41];

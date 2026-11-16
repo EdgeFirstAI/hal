@@ -79,14 +79,12 @@ for target in "${TARGETS[@]}"; do
     echo "SKIP: ${target} unreachable"
     continue
   fi
-  # Public board label is always the requested target (e.g. orin-nano), even
-  # when SSH resolved to an internal alias for the same hardware.
+  # The board label is the requested target, not the resolved SSH host.
   board_label="${target}"
   out_dir="${RESULTS}/${board_label}"
   mkdir -p "${out_dir}"
 
-  # `set -e` would take the whole run down on the first board without a
-  # dataset, so take the exit status rather than letting it escape.
+  # A board without a dataset yields an empty path.
   coco="$(remote_coco_path "${host}")" || coco=""
   if [[ -z "${coco}" ]]; then
     echo "WARN: no COCO on ${host}; run sync-coco.sh first. Skipping runs."

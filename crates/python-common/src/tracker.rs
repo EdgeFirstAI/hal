@@ -13,7 +13,7 @@ use numpy::{PyArrayLike1, PyArrayLike2};
 use pyo3::{exceptions::PyValueError, pyclass, pymethods, PyResult, Python};
 use uuid::Uuid;
 
-/// Local box type so this module does not depend on `edgefirst-tensor`.
+/// Box type local to this module.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct TrackBox {
     bbox: [f32; 4],
@@ -217,11 +217,10 @@ impl PyByteTrack {
         }
     }
 
-    /// Decode-tracked fast path: Kalman update plus the live/coasting rewrite
-    /// in one `py.detach`. Returns tracked boxes/scores/classes, `TrackInfo`
-    /// objects, and the detection indices whose masks to keep. `Decoder.
-    /// decode_tracked` calls this via `getattr` so a duck-typed tracker
-    /// without it still works through `update` / `get_active_tracks`.
+    /// Kalman update plus the live/coasting rewrite in one `py.detach`.
+    /// Returns tracked boxes/scores/classes, `TrackInfo` objects, and the
+    /// detection indices whose masks to keep. `Decoder.decode_tracked` calls
+    /// this via `getattr`.
     pub fn _associate_detections(
         &mut self,
         py: Python<'_>,

@@ -1,16 +1,12 @@
 #!/usr/bin/env bash
 # Load the kernel's virtual V4L2 capture driver, vivid, on a GitHub-hosted
 # Ubuntu runner and arm the HAL_TEST_REQUIRE_VIVID gate only when its nodes
-# appear. crates/tensor/tests/vivid_capture_import.rs imports real padded
-# V4L2 capture buffers from it.
+# appear. crates/tensor/tests/vivid_capture_import.rs imports V4L2 capture
+# buffers from it.
 #
-# vivid ships in linux-modules-extra for the runner's kernel, which is not
-# preinstalled. When the archive has no such package (it has not caught up
-# with the runner image) the tests skip, and this says why.
-#
-# Only ephemeral GitHub-hosted VMs are touched: loading a kernel module and
-# opening its nodes to every user would outlive the job on a persistent
-# machine. Skipped under SKIP_PACKAGES. Never fails the job.
+# Installs linux-modules-extra for the runner's kernel, which carries vivid.
+# Runs on GitHub-hosted runners only. Skipped under SKIP_PACKAGES. Never fails
+# the job.
 #
 # Exports, via $GITHUB_ENV when it is set and to this shell otherwise:
 #   HAL_TEST_REQUIRE_VIVID=1          only when the vivid nodes appeared
@@ -49,7 +45,7 @@ if ! apt-cache show "${pkg}" > /dev/null 2>&1; then
     report unavailable "vivid: unavailable — vivid tests skipped (${pkg} is not in the archive)"
     exit 0
 fi
-# A stalled mirror trickles data past apt's own timeouts; bound the download only so dpkg is never interrupted.
+# The download is bounded by a timeout; the install is not.
 if ! sudo timeout --kill-after=10 180 apt-get install -y -q --download-only "${pkg}"; then
     report unavailable "vivid: unavailable — vivid tests skipped (downloading ${pkg} failed or timed out)"
     exit 0
@@ -59,8 +55,7 @@ if ! sudo apt-get install -y -q "${pkg}" \
     report unavailable "vivid: unavailable — vivid tests skipped (installing or loading vivid failed)"
     exit 0
 fi
-# udev creates and permissions the nodes after modprobe returns; wait for it,
-# or it resets the modes changed below.
+# Waits for udev to create the nodes.
 sudo udevadm settle
 nodes=()
 for d in /sys/class/video4linux/video*; do

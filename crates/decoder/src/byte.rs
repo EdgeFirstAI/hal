@@ -4,11 +4,8 @@
 //! Quantized-domain NMS, the int8 / uint8 mirror of [`crate::float`].
 //!
 //! These kernels suppress and post-process candidates while the scores are
-//! still in their raw integer units, which is the point: dequantizing every
-//! anchor costs more than dequantizing the handful that survive. The threshold
-//! crosses the other way instead — [`quantize_score_threshold`] maps a float
-//! score threshold into the tensor's quantized domain so the comparison stays
-//! an integer one.
+//! in their raw integer units. [`quantize_score_threshold`] maps a float
+//! score threshold into the tensor's quantized domain.
 //!
 //! [`postprocess_boxes_quant`] and [`postprocess_boxes_index_quant`] handle
 //! candidate selection; [`nms_int`], [`nms_class_aware_int`], and their
@@ -62,9 +59,8 @@ pub fn postprocess_boxes_quant<
 /// This function is very similar to `postprocess_boxes_quant` but will also
 /// return the index of the box. The boxes will be in ascending index order.
 ///
-/// When scores originate from a transposed DMA-BUF view (stride-1 along axis 0),
-/// an optimized column-major scan is used to avoid catastrophic strided reads on
-/// uncacheable memory.
+/// When scores are a transposed view (stride-1 along axis 0), a column-major
+/// scan is used.
 ///
 /// An unavailable or unknown tier forced by `EDGEFIRST_DECODER_FORCE_KERNEL` runs the scalar
 /// code, which gives the same result.
@@ -126,9 +122,8 @@ pub(crate) fn argmax_candidates_quant_with<
     quant_boxes: Quantization,
     emit: impl Fn(DetectBoxQuantized<Scores>, usize) -> O + Sync + Send,
 ) -> Vec<O> {
-    // Detect transposed C-contiguous layout (e.g., from reversed_axes() on DMA-BUF).
-    // In this layout columns are contiguous (stride-1 along axis 0) but rows are not.
-    // The column-major path reads memory sequentially, avoiding cache-hostile strides.
+    // Transposed C-contiguous layout (columns contiguous, rows not): take the
+    // column-major path.
     if scores.strides()[0] == 1 && scores.as_slice().is_none() {
         return argmax_candidates_quant_column_major::<B, _, _, _>(
             isa,
@@ -209,8 +204,6 @@ pub(crate) fn decode_candidates_quant<
 
 /// Multi-label variant of [`postprocess_boxes_index_quant`]: one entry per
 /// class at or above `threshold`, sharing the anchor's bbox and index.
-///
-/// Intended for validation decode; deployment uses the argmax variant.
 ///
 /// An unavailable or unknown tier forced by `EDGEFIRST_DECODER_FORCE_KERNEL` runs the scalar
 /// code, which gives the same result.
@@ -395,12 +388,11 @@ pub(crate) fn check_candidate_shapes(
 
 /// Column-major path for [`argmax_candidates_quant`].
 ///
-/// When scores come from a transposed DMA-BUF view ([N_candidates, N_classes]
-/// with strides [1, N_candidates]), row iteration causes N_classes reads each
-/// N_candidates bytes apart — catastrophic on uncacheable memory. Instead, this
-/// iterates over classes (columns, which are contiguous): on NEON tiers in
-/// register tiles that keep each anchor's running argmax across every class,
-/// otherwise with a running argmax per candidate in heap buffers.
+/// For scores viewed as `[N_candidates, N_classes]` with strides
+/// `[1, N_candidates]`, iterates over classes (columns, which are
+/// contiguous): on NEON tiers in register tiles that keep each anchor's
+/// running argmax across every class, otherwise with a running argmax per
+/// candidate in heap buffers.
 fn argmax_candidates_quant_column_major<
     B: BBoxTypeTrait,
     Boxes: PrimInt + AsPrimitive<f32> + Send + Sync,
@@ -462,9 +454,8 @@ fn argmax_candidates_quant_column_major<
             .collect();
     }
 
-    // Step 2: Copy boxes column-by-column into contiguous heap buffer.
-    // Boxes view is also transposed [N_candidates, 4] with strides [1, N_candidates],
-    // so column reads are sequential while row reads are strided.
+    // Step 2: copy boxes column-by-column into contiguous heap buffers when
+    // the boxes view is transposed too.
     let copy = !kept.is_empty() && boxes.strides()[0] == 1 && boxes.as_slice().is_none();
     let boxes_buf: [Vec<Boxes>; 4] = if copy {
         let mut cols: [Vec<Boxes>; 4] = [
@@ -540,13 +531,12 @@ pub(crate) fn nms_int_on<SCORE: PrimInt + AsPrimitive<f32> + Send + Sync>(
     max_det: Option<usize>,
     mut boxes: Vec<DetectBoxQuantized<SCORE>>,
 ) -> Vec<DetectBoxQuantized<SCORE>> {
-    // Boxes get sorted by score in descending order so we know based on the
-    // index the scoring of the boxes and can skip parts of the loop.
+    // Sort boxes by score in descending order.
 
     boxes.par_sort_by(|a, b| b.score.cmp(&a.score));
 
-    // When the iou is 1.0 or larger, no boxes will be filtered so we just return
-    // immediately
+    // An iou of 1.0 or larger suppresses nothing: return the boxes, capped
+    // at `max_det`.
     if iou >= 1.0 {
         return match max_det {
             Some(n) => {
@@ -576,14 +566,14 @@ pub(crate) fn nms_int_on<SCORE: PrimInt + AsPrimitive<f32> + Send + Sync>(
     // Outer loop over all boxes.
     for i in 0..boxes.len() {
         if boxes[i].score <= min_val {
-            // this box was merged with a different box earlier
+            // this box is suppressed
             continue;
         }
         for j in (i + 1)..boxes.len() {
             // Inner loop over boxes with lower score (later in the list).
 
             if boxes[j].score <= min_val {
-                // this box was suppressed by different box earlier
+                // this box is suppressed
                 continue;
             }
 
@@ -597,8 +587,7 @@ pub(crate) fn nms_int_on<SCORE: PrimInt + AsPrimitive<f32> + Send + Sync>(
             break;
         }
     }
-    // Filter out boxes that were suppressed; cap because boxes after the
-    // break may still hold positive scores but are all lower than survivors.
+    // Filter out suppressed boxes and cap at `max_det`.
     boxes
         .into_iter()
         .filter(|b| b.score > min_val)
@@ -632,12 +621,11 @@ pub(crate) fn nms_extra_int_on<SCORE: PrimInt + AsPrimitive<f32> + Send + Sync, 
     max_det: Option<usize>,
     mut boxes: Vec<(DetectBoxQuantized<SCORE>, E)>,
 ) -> Vec<(DetectBoxQuantized<SCORE>, E)> {
-    // Boxes get sorted by score in descending order so we know based on the
-    // index the scoring of the boxes and can skip parts of the loop.
+    // Sort boxes by score in descending order.
     boxes.par_sort_by(|a, b| b.0.score.cmp(&a.0.score));
 
-    // When the iou is 1.0 or larger, no boxes will be filtered so we just return
-    // immediately
+    // An iou of 1.0 or larger suppresses nothing: return the boxes, capped
+    // at `max_det`.
     if iou >= 1.0 {
         return match max_det {
             Some(n) => {
@@ -667,14 +655,14 @@ pub(crate) fn nms_extra_int_on<SCORE: PrimInt + AsPrimitive<f32> + Send + Sync, 
     // Outer loop over all boxes.
     for i in 0..boxes.len() {
         if boxes[i].0.score <= min_val {
-            // this box was merged with a different box earlier
+            // this box is suppressed
             continue;
         }
         for j in (i + 1)..boxes.len() {
             // Inner loop over boxes with lower score (later in the list).
 
             if boxes[j].0.score <= min_val {
-                // this box was suppressed by different box earlier
+                // this box is suppressed
                 continue;
             }
             if jaccard(&boxes[j].0.bbox, &boxes[i].0.bbox, iou) {
@@ -700,8 +688,8 @@ pub(crate) fn nms_extra_int_on<SCORE: PrimInt + AsPrimitive<f32> + Send + Sync, 
 /// label.
 ///
 /// Sorts boxes by score, then greedily selects a subset of boxes in descending
-/// order of score. Unlike class-agnostic NMS, boxes are only suppressed if they
-/// have the same class label AND overlap above the IoU threshold.
+/// order of score. Boxes are only suppressed if they have the same class label
+/// and overlap above the IoU threshold.
 ///
 /// An unavailable or unknown tier forced by `EDGEFIRST_DECODER_FORCE_KERNEL` runs the scalar
 /// code, which gives the same result.
@@ -725,8 +713,8 @@ pub(crate) fn nms_class_aware_int_on<SCORE: PrimInt + AsPrimitive<f32> + Send + 
 ) -> Vec<DetectBoxQuantized<SCORE>> {
     boxes.par_sort_by(|a, b| b.score.cmp(&a.score));
 
-    // When the iou is 1.0 or larger, no boxes will be filtered so we just return
-    // immediately
+    // An iou of 1.0 or larger suppresses nothing: return the boxes, capped
+    // at `max_det`.
     if iou >= 1.0 {
         return match max_det {
             Some(n) => {
@@ -761,7 +749,6 @@ pub(crate) fn nms_class_aware_int_on<SCORE: PrimInt + AsPrimitive<f32> + Send + 
             if boxes[j].score <= min_val {
                 continue;
             }
-            // Only suppress if same class AND overlapping
             if boxes[j].label == boxes[i].label && jaccard(&boxes[j].bbox, &boxes[i].bbox, iou) {
                 boxes[j].score = min_val;
             }
@@ -812,8 +799,8 @@ pub(crate) fn nms_extra_class_aware_int_on<
 ) -> Vec<(DetectBoxQuantized<SCORE>, E)> {
     boxes.par_sort_by(|a, b| b.0.score.cmp(&a.0.score));
 
-    // When the iou is 1.0 or larger, no boxes will be filtered so we just return
-    // immediately
+    // An iou of 1.0 or larger suppresses nothing: return the boxes, capped
+    // at `max_det`.
     if iou >= 1.0 {
         return match max_det {
             Some(n) => {
@@ -848,7 +835,6 @@ pub(crate) fn nms_extra_class_aware_int_on<
             if boxes[j].0.score <= min_val {
                 continue;
             }
-            // Only suppress if same class AND overlapping
             if boxes[j].0.label == boxes[i].0.label
                 && jaccard(&boxes[j].0.bbox, &boxes[i].0.bbox, iou)
             {
@@ -1004,10 +990,8 @@ mod tests {
         assert_eq!(stripped, without);
     }
 
-    /// Verify that the column-major path produces identical results to the
-    /// row-major path for a transposed (non-contiguous) score array.
-    /// Multi-label on a transposed (DMA-BUF style) score view must match the
-    /// contiguous row-major result exactly, including order.
+    /// Multi-label on a transposed score view matches the contiguous
+    /// row-major result, including order.
     fn multilabel_layouts_agree<S>(n_classes: usize, n_candidates: usize, threshold: S)
     where
         S: PrimInt + AsPrimitive<f32> + Send + Sync + std::fmt::Debug,
@@ -1117,7 +1101,6 @@ mod tests {
         let col_result =
             postprocess_boxes_index_quant::<XYWH, _, _>(threshold, boxes_view, scores_view, quant);
 
-        // Both paths should produce the same results
         assert_eq!(
             row_result.len(),
             col_result.len(),
@@ -1137,7 +1120,7 @@ mod tests {
         }
     }
 
-    /// Test column-major path with i8 scores (signed, matches NEON argmax path).
+    /// Column-major path with i8 scores.
     #[test]
     fn column_major_matches_row_major_i8() {
         let n_classes = 80usize;
@@ -1201,8 +1184,7 @@ mod tests {
             .collect()
     }
 
-    /// Four candidates' worth of boxes, one row each, values distinct enough
-    /// that a mis-indexed read is visible.
+    /// One row of distinct box values per candidate.
     fn probe_boxes(n: usize) -> Array2<i16> {
         let mut boxes = Array2::<i16>::zeros((n, 4));
         for i in 0..n {
@@ -1221,9 +1203,7 @@ mod tests {
         }
     }
 
-    /// The threshold is a floor: a score equal to it is a detection. Both
-    /// entry points share the rule and neither had a test that sat exactly on
-    /// it.
+    /// A score equal to the threshold is a detection.
     #[test]
     fn postprocess_boxes_quant_keeps_a_score_equal_to_the_threshold() {
         let boxes = probe_boxes(2);
@@ -1248,9 +1228,8 @@ mod tests {
         assert_eq!(kept[0].1, 0);
     }
 
-    /// Class indices in the scalar column-major scan are `u8`, so beyond 255
-    /// classes it has to hand over to the row-major scan. Running the column
-    /// scan anyway wraps the label: class 260 comes back as 4.
+    /// Beyond 255 classes the column-major scan hands over to the row-major
+    /// scan.
     #[test]
     fn column_major_falls_back_beyond_255_classes() {
         let n_classes = 300usize;
@@ -1275,15 +1254,13 @@ mod tests {
         }
     }
 
-    /// Driving the column-major scan with an ordinary row-major array: its
-    /// columns are not contiguous, so the running argmax takes its strided
-    /// branch, and the boxes are read in place rather than from the
-    /// column-copy buffers.
+    /// The column-major scan on an ordinary row-major array: the running
+    /// argmax takes its strided branch and the boxes are read in place.
     #[test]
     fn column_major_scan_handles_row_major_input() {
         let boxes = probe_boxes(3);
         // Row-major (3 candidates, 4 classes); the winner differs per row and
-        // is never class 0, so a comparison that keeps the minimum is visible.
+        // is never class 0.
         let scores = ndarray::array![[10_u8, 90, 30, 40], [5, 6, 7, 200], [1, 2, 3, 4]];
 
         for (_, isa) in crate::neon_dispatch::tiers() {
@@ -1298,15 +1275,14 @@ mod tests {
             assert_eq!(kept.len(), 2, "{isa:?} {kept:?}");
             assert_eq!((kept[0].0.label, kept[0].0.score), (1, 90));
             assert_eq!((kept[1].0.label, kept[1].0.score), (3, 200));
-            // Boxes were read in place, so row 1's values must line up with it.
+            // Boxes are read in place: row 1's values line up with it.
             assert_eq!(kept[1].0.bbox.xmin, 10.0);
             assert_eq!((kept[0].1, kept[1].1), (0, 1));
         }
     }
 
     /// Two overlapping same-class boxes. `SCORE::min_value()` is the
-    /// suppression marker, so for `u8` a score of 0 already means suppressed
-    /// and the lower box here is given a real score.
+    /// suppression marker, so the lower box has a non-zero score.
     fn overlapping_pair_int() -> Vec<DetectBoxQuantized<u8>> {
         vec![
             DetectBoxQuantized {
@@ -1370,9 +1346,8 @@ mod tests {
         assert_eq!(result[1].score, 160);
     }
 
-    /// A suppressed box is marked with `min_value()`, and the final filter
-    /// drops it. Keeping `>= min_value` instead would hand every suppressed
-    /// box back to the caller.
+    /// A suppressed box is marked with `min_value()` and the final filter
+    /// drops it.
     #[test]
     fn nms_class_aware_int_drops_boxes_already_at_the_minimum_score() {
         let mut boxes = overlapping_pair_int();
@@ -1391,11 +1366,7 @@ mod tests {
         assert_eq!(result[0].score, 200);
     }
 
-    /// A box that overlaps nothing, then a pair that overlaps each other. The
-    /// first box confirms a survivor without suppressing anything, so a loop
-    /// that stops at the first survivor leaves the pair un-deduplicated while
-    /// the chain above, where the first box does the suppressing, looks
-    /// identical either way.
+    /// A box that overlaps nothing, then a pair that overlaps each other.
     fn isolated_then_overlapping_pair_int() -> Vec<DetectBoxQuantized<u8>> {
         let mk = |xmin: f32, xmax: f32, score: u8| DetectBoxQuantized {
             bbox: BoundingBox {
@@ -1479,9 +1450,7 @@ mod tests {
         assert_eq!(result[0].0.score, 200);
     }
 
-    /// A single box is never compared with itself: the inner loop starts one
-    /// past the outer index. Starting at `i` instead makes every box suppress
-    /// itself, since a box's IoU with itself is 1.
+    /// A single box is not compared with itself and survives.
     #[test]
     fn nms_extra_class_aware_int_keeps_a_lone_box() {
         let boxes = with_index_int(vec![overlapping_pair_int().remove(0)]);
@@ -1512,7 +1481,7 @@ mod tests {
         let boxes = make_nms_boxes_int(10);
         let result = nms_int(1.0, Some(3), boxes);
         assert_eq!(result.len(), 3);
-        // Scores should be in descending order (sorted).
+        // Scores are in descending order.
         assert!(result[0].score >= result[1].score);
         assert!(result[1].score >= result[2].score);
     }

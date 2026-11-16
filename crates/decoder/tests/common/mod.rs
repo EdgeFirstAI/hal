@@ -1,12 +1,7 @@
 //! Shared helpers for decoder integration tests.
-#![allow(dead_code)] // Helpers may not be used by every test binary.
+#![allow(dead_code)]
 
 /// Emit a skip notice that survives libtest's output capture.
-///
-/// libtest captures `println!`/`eprintln!` and replays it only for **failing**
-/// tests, so a test that skips and returns prints `... ok` with its reason
-/// discarded — indistinguishable from one that did the work. Writing to
-/// `std::io::stderr()` directly bypasses that. See TESTING.md.
 macro_rules! skip_note {
     ($($arg:tt)*) => {{
         use std::io::Write;
@@ -19,9 +14,8 @@ pub mod per_scale_fixture;
 
 use std::path::{Path, PathBuf};
 
-/// Root of the `testdata/` tree. `EDGEFIRST_TESTDATA_DIR` wins when set; the
-/// manifest-relative fallback is baked in at compile time and so is useless
-/// for a cross-compiled on-target run.
+/// Root of the `testdata/` tree: `EDGEFIRST_TESTDATA_DIR` when set, else the
+/// manifest-relative path baked in at compile time.
 pub fn testdata_root() -> PathBuf {
     std::env::var("EDGEFIRST_TESTDATA_DIR")
         .map(PathBuf::from)

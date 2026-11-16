@@ -4,15 +4,11 @@
 //! `ef_tensor_image_desc` — the full-featured image request.
 //!
 //! `ef_image_processor_create_image` (in `edgefirst-image`) covers the common
-//! case in one call. This exists for the rest, and is the **only** route to
-//! compression: asking for a vendor tile layout needs more inputs than a
-//! positional call can carry without becoming unreadable.
+//! case in one call. This request is the only route to compression.
 //!
-//! The builder lives here, in `edgefirst-tensor-capi`, because it constructs
-//! an [`edgefirst_tensor::ImageDesc`] — the type this library owns. Allocating
-//! from a finished request is `edgefirst-image`'s job (only a processor can
-//! mint a PBO), so `ef_image_processor_create_image_desc` stays there and
-//! takes a `struct ef_tensor_image_desc *` it did not mint.
+//! The builder constructs an [`edgefirst_tensor::ImageDesc`].
+//! `ef_image_processor_create_image_desc` in `edgefirst-image` allocates from
+//! a `struct ef_tensor_image_desc *` built here.
 
 use std::ffi::{c_char, c_int, CStr};
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -27,9 +23,8 @@ pub struct EfTensorImageDesc {
 
 /// Create a request for a `width`×`height` image.
 ///
-/// `format` is the wire descriptor (`"NV12"`, `"rgb8"`), matching every other
-/// entry point rather than introducing a second vocabulary. `dtype` is the
-/// shared code. CPU access defaults to `EF_CPU_ACCESS_READ_WRITE`.
+/// `format` is the wire descriptor (`"NV12"`, `"rgb8"`). `dtype` is an
+/// `ef_dtype` code. CPU access defaults to `EF_CPU_ACCESS_READ_WRITE`.
 ///
 /// @return `NULL` for an unknown format or dtype, or zero dimensions.
 ///
@@ -76,11 +71,10 @@ pub unsafe extern "C" fn ef_tensor_image_desc_free(d: *mut EfTensorImageDesc) {
     }
 }
 
-/// Apply a builder step in place.
-///
-/// `ImageDesc`'s setters consume and return `self`, so each step swaps the
-/// value out and back. `take` is safe here because nothing can observe the
-/// intermediate state: the closure cannot unwind past `catch_unwind`.
+/// Apply a builder step in place: swap the value out for a 1x1 grey
+/// placeholder, run `body`, and store its result. Returns `EINVAL` for a
+/// `NULL` request, or when `body` returns `None`, which leaves the
+/// placeholder in place.
 unsafe fn with_desc<F>(d: *mut EfTensorImageDesc, body: F) -> c_int
 where
     F: FnOnce(ImageDesc) -> Option<ImageDesc>,
@@ -138,14 +132,10 @@ pub unsafe extern "C" fn ef_tensor_image_desc_set_access(
 
 /// Request compression, by `ef_compression_request` code:
 /// `EF_COMPRESSION_REQUEST_NONE` or `EF_COMPRESSION_REQUEST_ANY` (any scheme
-/// the platform offers).
+/// the platform offers). Any other code is `EINVAL`.
 ///
 /// `Any` allocates linear when the format is not eligible and counts the
-/// fallback, which is the right default for a pipeline that wants the
-/// bandwidth win without a portability failure. Requesting a *specific*
-/// scheme is deliberately not exposed here — it fails outright on a device
-/// whose scheme differs, and that belongs behind a named entry point rather
-/// than an integer a caller might pass by accident.
+/// fallback.
 ///
 /// # Safety
 /// `d` must be `NULL` or a live request.
@@ -169,9 +159,9 @@ pub unsafe extern "C" fn ef_tensor_image_desc_set_compression(
 
 /// Require physically contiguous memory: 0 = no, 1 = yes.
 ///
-/// A contiguous request is allocated from the Linux CMA DMA heap only, and
-/// `ef_tensor_image_desc_alloc` fails, naming the heap, instead of falling
-/// back to the system heap or another kind of memory.
+/// A contiguous request is allocated from the Linux CMA DMA heap only:
+/// `ef_tensor_image_desc_alloc` fails, naming the heap, when that heap
+/// cannot serve it.
 ///
 /// # Safety
 /// `d` must be `NULL` or a live request.
@@ -192,9 +182,6 @@ pub unsafe extern "C" fn ef_tensor_image_desc_set_contiguous(
 /// Whether the request requires physically contiguous memory: 1 if it does,
 /// 0 if not or `d` is `NULL`.
 ///
-/// A separate getter rather than a field of `EfImageDescView`, whose size
-/// is fixed between independently versioned libraries.
-///
 /// # Safety
 /// `d` must be `NULL` or a live request.
 #[no_mangle]
@@ -207,30 +194,18 @@ pub unsafe extern "C" fn ef_tensor_image_desc_contiguous(d: *const EfTensorImage
     }
 }
 
-/// The single place an `ImageDesc` becomes the flattened, `#[repr(C)]` view a
-/// foreign library reads instead of dereferencing this crate's opaque
-/// handle -- see `EfImageDescView`'s doc for why a handle is never crossed by
-/// pointer for this. `ef_tensor_image_desc_get` is the only caller; the
-/// round-trip test below is the proof a decoder of this view recovers
-/// exactly what went in.
+/// Flatten an `ImageDesc` into the `#[repr(C)]` view a foreign library
+/// reads.
 fn view_of(d: &ImageDesc) -> EfImageDescView {
     let (memory, has_memory) = match d.memory() {
         Some(m) => (m.code(), 1),
         None => (0, 0),
     };
-    // `Compression` has no shared `code()` in the vocabulary macro (it
-    // carries a payload on `Scheme`, unlike the plain vocabularies), so the
-    // request is encoded as an `EfCompressionRequest`. `Scheme` is a real
-    // state the type can hold even though no C setter can create one, so it
-    // gets a code rather than being folded into "any" or silently dropped.
+    // The compression request is encoded as an `EfCompressionRequest` code.
     let (compression, has_compression) = match d.compression() {
         None => (EfCompressionRequest::None as u32, 0),
         Some(Compression::Any) => (EfCompressionRequest::Any as u32, 1),
-        // `Compression` is `#[non_exhaustive]`: `Scheme(_)` is the only other
-        // variant today, but a wildcard is required here regardless, and any
-        // future variant falls into the same "present, and it's a specific
-        // one" code rather than failing to compile at the call site that
-        // adds it.
+        // Every other variant is reported as `Scheme`.
         Some(_) => (EfCompressionRequest::Scheme as u32, 1),
     };
     let access = d.access().code();
@@ -247,9 +222,7 @@ fn view_of(d: &ImageDesc) -> EfImageDescView {
     }
 }
 
-/// Read a request's fields into `out`, mirroring `ef_tensor_plane_at`'s
-/// shape: a scalar block a foreign library copies rather than a pointer it
-/// would have to dereference into this library's private layout.
+/// Read a request's fields into `out`.
 ///
 /// @return 0 on success, `EINVAL` for a `NULL` argument.
 ///
@@ -273,18 +246,13 @@ pub unsafe extern "C" fn ef_tensor_image_desc_get(
     }
 }
 
-/// Allocate an image tensor from a finished request -- the primitive that
-/// makes the `ef_tensor_image_desc` family a real constructor rather than a
-/// request-only echo. Triggers [`edgefirst_tensor::TensorDyn::image_desc`]
-/// (dispatching on `desc.dtype()`) inside `libedgefirst_tensor.so`, the same
-/// geometry-computing code any Rust caller of `TensorDyn::image_desc`
-/// reaches -- this does not reimplement or approximate it.
+/// Allocate an image tensor from a finished request. See
+/// [`edgefirst_tensor::TensorDyn::image_desc`].
 ///
 /// @retval a new tensor the caller must free with `ef_tensor_free`, on
 ///         success.
 /// @retval `NULL` for a `NULL` request, or if the underlying allocation
-///         fails (see `TensorDyn::image_desc`'s error conditions --
-///         incompatible `CpuAccess`/compression combination, an
+///         fails (an incompatible `CpuAccess`/compression combination, an
 ///         unsupported compression request, or an invalid `width`x`height`
 ///         for the format) -- `ef_tensor_last_error_message` carries the
 ///         reason.
@@ -296,10 +264,6 @@ pub unsafe extern "C" fn ef_tensor_image_desc_alloc(
     d: *const EfTensorImageDesc,
 ) -> *mut crate::handle::EfTensor {
     unsafe {
-        // The quiet hook, before the catch: a caught panic must WRITE the
-        // thread-local, or a consumer reading `ef_tensor_last_error_class`
-        // after this returns NULL gets a class left behind by an earlier
-        // failure and reports it as this call's. See `ensure_hook_installed`.
         crate::last_error::ensure_hook_installed();
         catch_unwind(AssertUnwindSafe(|| {
             if d.is_null() {
@@ -403,14 +367,8 @@ mod tests {
 
     #[test]
     fn a_rejected_setter_leaves_the_request_usable() {
-        // `with_desc` swaps the value out for the 1x1 grey placeholder
-        // *before* calling `body`, and only swaps a replacement back in on
-        // success -- there is no "restore the original" path. So a rejected
-        // setter leaves the placeholder in place, not the caller's original
-        // request. "Usable" means exactly that: still a valid `ImageDesc`,
-        // never a half-swapped or poisoned one. The corresponding
-        // cross-library check -- that a tensor can still be minted from it
-        // afterwards -- lives in image-capi, which owns that entry point.
+        // A rejected setter leaves the 1x1 grey placeholder `with_desc`
+        // swapped in.
         unsafe {
             let d = desc();
             assert_eq!(ef_tensor_image_desc_set_memory(d, 9999), libc::EINVAL);
@@ -437,12 +395,6 @@ mod tests {
 
     #[test]
     fn the_view_round_trips_every_field() {
-        // Builds a request with every field away from its default, reads it
-        // back through `ef_tensor_image_desc_get`, and decodes every view
-        // field back to the value that went in. This is the proof that
-        // `view_of` and a decoder of `EfImageDescView` (image-capi's
-        // reconstruction, mirrored here) agree -- the whole point of having
-        // exactly one conversion site.
         unsafe {
             let d = desc(); // 64x48 rgb8 u8, no memory/compression request
             assert_eq!(
@@ -480,9 +432,7 @@ mod tests {
 
     #[test]
     fn the_view_reports_absence_by_flag_not_by_a_zero_that_collides() {
-        // A fresh request has no memory or compression preference. `memory`
-        // reads 0 (== EfStorageKind::Mem's own code) precisely because
-        // `has_memory` is the thing that says "unset", not the value.
+        // A fresh request has no memory or compression preference.
         unsafe {
             let d = desc();
             let mut view = EfImageDescView::default();

@@ -6,9 +6,9 @@
 #
 # Release profile, no perf/trace instrumentation. Arms alternate inside one
 # session (HAL / turbo islow / turbo ifast × YUV / RGB), pinned to one core.
-# The claim number is the MEDIAN p50 across rounds, reported with every
-# round's p50 and the min–max spread (best-of-N favours the low tail).
-# Build/run provenance for each host is captured to provenance.txt.
+# Reports the median p50 across rounds, with every round's p50 and the
+# min–max spread. Build/run provenance for each host is captured to
+# provenance.txt.
 #
 # Usage:
 #   EDGEFIRST_BENCH_ORIN_FALLBACK=<ssh-host> \
@@ -68,7 +68,7 @@ EOS
 }
 
 parse_p50() {
-  # First "p50=N.NNN ms" in a log (HAL prints decode_p50 afterwards).
+  # First "p50=N.NNN ms" in a log.
   grep -oE 'p50=[0-9.]+ ms' "$1" | head -1 | sed -E 's/p50=([0-9.]+) ms/\1/'
 }
 
@@ -85,7 +85,7 @@ median_spread() {
 }
 
 # Toolchain on the build side; kernel / CPU / governor / clocks / libturbojpeg
-# resolution on the run side. What a reader needs to reproduce the numbers.
+# resolution on the run side.
 capture_provenance() { # host out_dir
   local host="$1" out="$2"
   {

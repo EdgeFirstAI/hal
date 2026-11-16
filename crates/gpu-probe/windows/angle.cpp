@@ -115,9 +115,7 @@ bool GlSession::bring_up(DisplayMode m, ID3D11Device* existing) {
         fprintf(stderr, "no adapter matches '%s'\n", g_opt.adapter.c_str());
         return false;
       }
-      // Video support is what Media Foundation needs; when an adapter
-      // refuses it (WARP does), fall back so the display still comes up
-      // and the report shows which flags took.
+      // Try with video support first, then without.
       UINT debug = g_opt.debug_layer ? D3D11_CREATE_DEVICE_DEBUG : 0;
       UINT attempts[] = {D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT | debug,
                          D3D11_CREATE_DEVICE_BGRA_SUPPORT | debug, debug};
@@ -279,9 +277,8 @@ void GlSession::shutdown() {
 }
 
 // ---------------------------------------------------------------------------
-// Shaders. The vertex, NV and YUYV sources are the HAL's
-// (crates/image/src/gl/shaders_common.rs) copied verbatim so the probe
-// exercises the same GLSL the engine would compile.
+// Shaders. The vertex, NV and YUYV sources are copied from
+// crates/image/src/gl/shaders_common.rs.
 // ---------------------------------------------------------------------------
 
 const char* kVertexShader =
@@ -406,7 +403,6 @@ const char* kYuyvRgbaFragment =
 
 // Two-sampler NV12 decode for the native DXGI_FORMAT_NV12 plane import,
 // where Y arrives as an R8 texture and UV as an RG8 texture at half size.
-// The colour math is the HAL's, so the CPU reference in s2 applies.
 const char* kNv12TwoPlaneFragment =
     "#version 300 es\n"
     "precision highp float;\n"

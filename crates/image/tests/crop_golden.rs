@@ -1,25 +1,15 @@
 // SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! Golden fixtures for the CPU backend's cropped-convert output, frozen
-//! **before** any crop-contract implementation work starts.
+//! Golden fixtures for the CPU backend's cropped-convert output.
 //!
 //! `generate_golden` (marked `#[ignore]`) regenerates
-//! `tests/data/crop_golden.<arch>.json` from whatever the CPU backend
-//! currently produces. `cropped_convert_matches_golden` replays the same
-//! matrix against the fixture and is the guard later crop-contract tasks must
-//! keep green — any behavioural change to cropped-convert byte output shows
-//! up here first.
+//! `tests/data/crop_golden.<arch>.json` from what the CPU backend produces.
+//! `cropped_convert_matches_golden` replays the same matrix against the
+//! fixture.
 //!
-//! The fixtures are **per architecture**, and the `yuv` crate's exact
-//! (`Professional`) kernels are selected at runtime: one NEON kernel on
-//! aarch64, AVX2 or SSE4.1 on x86_64. The two checked-in files hold the same
-//! checksums, verified on an AVX2 host and on i.MX 95 (Cortex-A55) and
-//! i.MX 8M Plus (Cortex-A53) hardware. An x86_64 CPU without AVX2 skips the
-//! matrix test, since only the AVX2 kernel has been compared. The frozen
-//! bytes are the byte-exactness arbiter; regenerate both files only for a
-//! deliberate change to the CPU conversion or resampling, and only from the
-//! same tree.
+//! The fixtures are per architecture. An x86_64 CPU without AVX2 skips the
+//! matrix test.
 
 use edgefirst_image::{CPUProcessor, Crop, Fit, ImageProcessorTrait, Region};
 use edgefirst_tensor::{
@@ -65,8 +55,7 @@ fn src_formats() -> [PixelFormat; 5] {
     ]
 }
 
-/// Destination pixel formats: packed (fast direct path) and planar (the
-/// path Task 2-4's crop-contract work will change).
+/// Destination pixel formats: packed and planar.
 fn dst_formats() -> [PixelFormat; 2] {
     [PixelFormat::Rgb, PixelFormat::PlanarRgb]
 }
@@ -74,8 +63,7 @@ fn dst_formats() -> [PixelFormat; 2] {
 /// Source-crop rectangles `(left, top, width, height)` inside the 640x480
 /// source: interior, top-left corner, bottom-right (flush against the source
 /// edge), and an even-origin variant. The interior crop's origin (101, 53) is
-/// already odd on both axes, so a separate "odd-origin" case would be
-/// identical — deduped to these four per the plan's ambiguity resolution.
+/// odd on both axes, so it also covers the odd-origin case.
 fn crops() -> [(usize, usize, usize, usize); 4] {
     [
         (101, 53, 320, 240),                  // interior / odd-origin
@@ -85,8 +73,7 @@ fn crops() -> [(usize, usize, usize, usize); 4] {
     ]
 }
 
-/// Destination sizes: scale-identity (matches the crop size) and a 2x
-/// downscale, so the matrix covers both the direct and resize paths.
+/// Destination sizes: scale-identity (matches the crop size) and a 2x downscale.
 fn dst_sizes() -> [(usize, usize); 2] {
     [(320, 240), (160, 120)]
 }
@@ -115,7 +102,7 @@ fn make_src(fmt: PixelFormat) -> TensorDyn {
 
 /// Run one cropped-convert case on the CPU backend and return the CRC32 of
 /// the destination bytes, or `None` if this (src_fmt, dst_fmt, crop) triple
-/// is rejected by the current implementation.
+/// is rejected.
 fn run_case(
     proc_: &mut CPUProcessor,
     src: &TensorDyn,
@@ -153,7 +140,7 @@ fn run_case(
 }
 
 /// Enumerate the full matrix (5 src formats x 2 dst formats x 4 crops x 2 dst
-/// sizes = 80 cells), skipping any cell the current implementation rejects.
+/// sizes = 80 cells), skipping any cell the implementation rejects.
 fn generate_cases() -> Vec<Case> {
     let mut proc_ = CPUProcessor::default();
     let mut cases = Vec::new();
@@ -188,18 +175,13 @@ fn generate_cases() -> Vec<Case> {
     cases
 }
 
-/// The architecture-specific fixture, as a compiled-in string. Architectures
-/// without a frozen fixture fail to compile here deliberately: freeze one
-/// from the pre-change implementation before enabling the guard on a new
-/// architecture, never from a tree with crop-contract work already applied.
+/// The architecture-specific fixture, as a compiled-in string.
 #[cfg(target_arch = "aarch64")]
 const GOLDEN_JSON: &str = include_str!("data/crop_golden.aarch64.json");
 #[cfg(target_arch = "x86_64")]
 const GOLDEN_JSON: &str = include_str!("data/crop_golden.x86_64.json");
 
-/// Whether this CPU selects the same `yuv`-crate kernel path the fixture was
-/// generated under (see the module doc). When it doesn't, the frozen bytes
-/// are unmatchable by construction and the matrix test skips.
+/// Whether this CPU selects the `yuv`-crate kernel path the fixture was generated under.
 fn cpu_matches_fixture_kernel_path() -> bool {
     #[cfg(target_arch = "aarch64")]
     {
@@ -246,8 +228,6 @@ fn cropped_convert_matches_golden() {
     let fixtures: Vec<Case> = serde_json::from_str(GOLDEN_JSON).unwrap();
     assert!(!fixtures.is_empty(), "golden fixture file is empty");
 
-    // Sanity: fixtures must have distinct checksums (cases actually differ),
-    // otherwise the matrix isn't exercising anything meaningful.
     let mut distinct: Vec<u32> = fixtures.iter().map(|c| c.crc32).collect();
     distinct.sort_unstable();
     distinct.dedup();

@@ -1,31 +1,19 @@
 // SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! Tier 2-a mask pool proof-of-concept benchmark.
+//! Mask pool benchmark.
 //!
 //! Compares two paths for rendering N segmentation masks into an RGBA8 FBO:
 //!
-//! 1. **`baseline_per_instance`** — one `glTexImage2D` per detection, one
-//!    `glDrawElements` per detection, optional `glFinish` per detection
-//!    (matches the Tier 1 implementation in
-//!    `crates/image/src/gl/processor.rs:render_yolo_segmentation`).
-//! 2. **`instanced_array`** — one `glTexImage3D` upload of all N masks into
+//! 1. **`baseline_per_instance`**: one `glTexImage2D` per detection, one
+//!    `glDrawElements` per detection, optional `glFinish` per detection.
+//! 2. **`instanced_array`**: one `glTexImage3D` upload of all N masks into
 //!    a `GL_TEXTURE_2D_ARRAY`, followed by a single `glDrawElementsInstanced`
 //!    that expands a unit quad to N detections via per-instance vertex
 //!    attributes (`bbox_ndc`, `mask_extent`, `layer`, `class_index`).
 //!
-//! Both paths render into the same RGBA8 FBO and pixel-validate against
-//! each other on the first frame, then sweep `N ∈ {2, 5, 10, 20, 40, 80}`.
-//!
-//! The point of the bench is to answer:
-//!
-//! - Does instancing actually win on Vivante GC7000UL and Mali-G310?
-//! - How does the gap scale with N?
-//! - What is the practical floor for the per-frame draw cost?
-//!
-//! This isolates the GL behaviour from the rest of the HAL — no
-//! `Tensor` / `Decoder` / `materialize_masks` involvement. If instancing
-//! wins here, it will win in the HAL too.
+//! Both paths render into the same RGBA8 FBO and are pixel-validated against
+//! each other, then swept over `N ∈ {2, 5, 10, 20, 40, 80}`.
 
 use crate::bench::{run_bench, BenchResult};
 use crate::bench_render::compile_program;
@@ -37,29 +25,26 @@ use std::ptr::null;
 // Test parameters
 // ---------------------------------------------------------------------------
 
-/// Output framebuffer dimensions — matches HAL's typical letterbox output.
+/// Output framebuffer dimensions.
 const FBO_W: i32 = 640;
 const FBO_H: i32 = 640;
 
-/// Mask cell dimensions in texels. Matches YOLOv8-seg proto resolution
-/// upper bound; using a fixed cell size for the bench means both paths
-/// upload the same byte volume.
+/// Mask cell dimensions in texels.
 const CELL_W: i32 = 40;
 const CELL_H: i32 = 40;
 
-/// Detection counts to sweep. Picked to bracket realistic scenes:
-/// 2 ≈ zidane, 40 ≈ crowd, 80 = stress.
+/// Detection counts to sweep.
 const N_DETECT_SWEEP: &[u32] = &[2, 5, 10, 20, 40, 80];
 
 const WARMUP: usize = 10;
 const ITERATIONS: usize = 100;
 
 // ---------------------------------------------------------------------------
-// Shaders — match the HAL's instanced_segmentation_shader behaviour
+// Shaders
 // ---------------------------------------------------------------------------
 
-/// Baseline vertex shader: trivial passthrough with attribute-supplied
-/// position + texcoord (matches HAL's `generate_vertex_shader`).
+/// Baseline vertex shader: passthrough with attribute-supplied position and
+/// texcoord.
 const BASELINE_VS: &str = "\
 #version 300 es
 precision mediump float;
@@ -69,8 +54,7 @@ out vec2 tc;
 void main() { tc = texCoord; gl_Position = vec4(pos, 1.0); }
 ";
 
-/// Baseline fragment shader: 1 texel fetch + smoothstep + discard.
-/// Identical to HAL's `generate_instanced_segmentation_shader`.
+/// Baseline fragment shader: one texel fetch, smoothstep and discard.
 const BASELINE_FS: &str = "\
 #version 300 es
 precision mediump float;
@@ -138,7 +122,7 @@ void main() {
 ";
 
 // ---------------------------------------------------------------------------
-// Default 20-colour palette (matches HAL's DEFAULT_COLORS)
+// Default 20-colour palette
 // ---------------------------------------------------------------------------
 
 const DEFAULT_COLORS: [[f32; 4]; 20] = [
@@ -165,13 +149,11 @@ const DEFAULT_COLORS: [[f32; 4]; 20] = [
 ];
 
 // ---------------------------------------------------------------------------
-// Synthetic mask data — sigmoid-shaped blob with noise, deterministic
+// Synthetic mask data
 // ---------------------------------------------------------------------------
 
-/// Build a `cell_w × cell_h` R8 mask with a soft circular blob roughly
-/// mimicking a YOLOv8-seg sigmoid output: high in the centre, falling off
-/// to edges. Per-mask seed varies the centre slightly so consecutive
-/// uploads differ.
+/// Build a `cell_w × cell_h` R8 mask with a soft circular blob: high in the
+/// centre, falling off to the edges. The seed shifts the centre.
 fn synthesize_mask(seed: u32) -> Vec<u8> {
     let mut data = vec![0u8; (CELL_W * CELL_H) as usize];
     let cx = (CELL_W as f32) * (0.4 + 0.2 * ((seed % 7) as f32 / 7.0));
@@ -191,8 +173,7 @@ fn synthesize_mask(seed: u32) -> Vec<u8> {
     data
 }
 
-/// Build a synthetic detection layout: N quads scattered across the FBO,
-/// each ~80×80 pixels, deterministic positions.
+/// One synthetic detection quad.
 struct Detection {
     bbox_ndc: [f32; 4], // xmin ymin xmax ymax in NDC
     class_index: u32,
@@ -270,7 +251,7 @@ fn destroy_dst_fbo(fbo: u32, rbo: u32) {
 }
 
 // ---------------------------------------------------------------------------
-// Vivante detection — match HAL behaviour: per-instance glFinish only on Vivante
+// Vivante detection
 // ---------------------------------------------------------------------------
 
 fn detect_vivante() -> bool {
@@ -287,7 +268,7 @@ fn detect_vivante() -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Path A: baseline per-instance (matches HAL Tier 1)
+// Path A: baseline per-instance
 // ---------------------------------------------------------------------------
 
 struct BaselinePath {
@@ -344,9 +325,7 @@ impl BaselinePath {
                 edgefirst_gl::gl::CLAMP_TO_EDGE as i32,
             );
 
-            // VAO captures the attribute-pointer state so we only pay the
-            // setup cost once. Per-call we just `BindVertexArray` and
-            // `BufferSubData` the new vertex / texcoord values.
+            // VAO holding the attribute-pointer state.
             let mut vao = 0u32;
             edgefirst_gl::gl::GenVertexArrays(1, &mut vao);
             edgefirst_gl::gl::BindVertexArray(vao);
@@ -415,17 +394,15 @@ impl BaselinePath {
         }
     }
 
-    /// Render `N` masks the way HAL's Tier 1 `render_yolo_segmentation` does.
+    /// Render `N` masks with one upload and one draw per detection.
     fn render(&self, detections: &[Detection], masks: &[Vec<u8>]) {
         unsafe {
-            // Hoisted-out-of-loop state (matches Tier 1).
             edgefirst_gl::gl::UseProgram(self.program);
             edgefirst_gl::gl::ActiveTexture(edgefirst_gl::gl::TEXTURE0);
             edgefirst_gl::gl::BindTexture(edgefirst_gl::gl::TEXTURE_2D, self.tex);
             edgefirst_gl::gl::BindVertexArray(self.vao);
 
-            // Texel-centre UVs (matches Tier 1) — constant across the
-            // batch since cell size is fixed.
+            // Texel-centre UVs, constant across the batch.
             let u_lo = 0.5 / CELL_W as f32;
             let v_lo = 0.5 / CELL_H as f32;
             let u_hi = (CELL_W as f32 - 0.5) / CELL_W as f32;
@@ -440,7 +417,7 @@ impl BaselinePath {
             );
 
             for (det, mask) in detections.iter().zip(masks.iter()) {
-                // Per-instance allocating upload (implicit orphan).
+                // Per-instance allocating upload.
                 edgefirst_gl::gl::TexImage2D(
                     edgefirst_gl::gl::TEXTURE_2D,
                     0,
@@ -506,7 +483,7 @@ impl Drop for BaselinePath {
 }
 
 // ---------------------------------------------------------------------------
-// Path B: instanced texture array (POC for Tier 2-a)
+// Path B: instanced texture array
 // ---------------------------------------------------------------------------
 
 #[repr(C)]
@@ -526,10 +503,8 @@ struct InstancedPath {
     unit_quad_vbo: u32,
     instance_vbo: u32,
     ebo: u32,
-    /// Pre-allocated host-side buffer for the per-instance attribute table.
-    /// Reused across `render()` calls so the timing loop doesn't pay for a
-    /// `Vec` allocation on every iteration. Capacity is fixed at construction
-    /// to `InstancedPath::capacity`.
+    /// Host-side buffer for the per-instance attribute table, pre-allocated
+    /// to `InstancedPath::capacity` and reused across `render()` calls.
     instance_attrs: Vec<MaskInstanceAttr>,
 }
 
@@ -586,9 +561,7 @@ impl InstancedPath {
                 edgefirst_gl::gl::CLAMP_TO_EDGE as i32,
             );
 
-            // VAO captures all 5 vertex attribute pointer bindings + EBO
-            // binding. Per render() call we just BindVertexArray + 1
-            // BufferSubData for the instance attrs.
+            // VAO holding the five vertex attribute bindings and the EBO binding.
             let mut vao = 0u32;
             edgefirst_gl::gl::GenVertexArrays(1, &mut vao);
             edgefirst_gl::gl::BindVertexArray(vao);
@@ -699,28 +672,20 @@ impl InstancedPath {
 
     /// Render `N` masks via a single instanced draw.
     ///
-    /// `flat_masks` must be a contiguous `(N, CELL_H, CELL_W)` buffer —
-    /// the same layout the real `MaskPool` will use, so this matches the
-    /// production cost.
-    ///
-    /// The per-instance attribute table is reused from `self.instance_attrs`
-    /// (pre-allocated to `capacity`) so the timing loop never pays for a
-    /// `Vec` allocation. `&mut self` is required for the in-place rebuild;
-    /// the GL draw is otherwise unchanged.
+    /// `flat_masks` must be a contiguous `(N, CELL_H, CELL_W)` buffer.
     fn render(&mut self, detections: &[Detection], flat_masks: &[u8]) {
         assert!(detections.len() <= self.capacity as usize);
         let n = detections.len() as i32;
         let expected_bytes = (CELL_W * CELL_H * n) as usize;
         assert_eq!(flat_masks.len(), expected_bytes);
 
-        // Rebuild the instance attribute table in place. The pre-allocated
-        // capacity guarantees `extend` here never reallocates.
+        // Rebuild the instance attribute table in place.
         self.instance_attrs.clear();
         self.instance_attrs
             .extend(detections.iter().enumerate().map(|(i, d)| {
                 MaskInstanceAttr {
                     bbox_ndc: d.bbox_ndc,
-                    mask_extent: [1.0, 1.0], // POC: every mask fills its cell
+                    mask_extent: [1.0, 1.0], // every mask fills its cell
                     layer: i as f32,
                     class_index: d.class_index as f32,
                 }
@@ -735,9 +700,7 @@ impl InstancedPath {
             edgefirst_gl::gl::ActiveTexture(edgefirst_gl::gl::TEXTURE0);
             edgefirst_gl::gl::BindTexture(edgefirst_gl::gl::TEXTURE_2D_ARRAY, self.tex_array);
 
-            // Single contiguous upload for all N layers — matches the
-            // production code path where the mask pool is a flat
-            // DMA-BUF or PBO and every detection writes directly into it.
+            // Single contiguous upload for all N layers.
             edgefirst_gl::gl::TexSubImage3D(
                 edgefirst_gl::gl::TEXTURE_2D_ARRAY,
                 0,
@@ -760,7 +723,6 @@ impl InstancedPath {
                 self.instance_attrs.as_ptr() as *const c_void,
             );
 
-            // VAO holds the attribute pointer state (set once at init).
             edgefirst_gl::gl::BindVertexArray(self.vao);
             edgefirst_gl::gl::DrawElementsInstanced(
                 edgefirst_gl::gl::TRIANGLE_FAN,
@@ -787,7 +749,7 @@ impl Drop for InstancedPath {
 }
 
 // ---------------------------------------------------------------------------
-// Pixel-level cross-validation: do both paths produce the same image?
+// Pixel-level cross-validation of the two paths
 // ---------------------------------------------------------------------------
 
 fn read_back_fbo() -> Vec<u8> {
@@ -834,8 +796,7 @@ fn compare_paths(
         edgefirst_gl::gl::Finish();
         let img_b = read_back_fbo();
 
-        // Optional dump for diagnosis: set MASK_POOL_DUMP=/tmp/mp to write
-        // both images as raw RGBA8 the bench harness can post-mortem.
+        // `MASK_POOL_DUMP=<prefix>` writes both images as raw RGBA8.
         if let Ok(prefix) = std::env::var("MASK_POOL_DUMP") {
             let _ = std::fs::write(format!("{prefix}_baseline.rgba"), &img_a);
             let _ = std::fs::write(format!("{prefix}_instanced.rgba"), &img_b);
@@ -845,10 +806,8 @@ fn compare_paths(
             );
         }
 
-        // Count differing pixels and max channel-sum diff across ALL
-        // four channels — mask shaders encode coverage primarily in
-        // alpha, so an RGB-only diff would miss a real divergence in
-        // transparency. Max theoretical per-pixel sum is 4 × 255 = 1020.
+        // Count differing pixels and the max channel-sum diff across all
+        // four channels (at most 4 × 255 = 1020 per pixel).
         let mut diff_pixels = 0u32;
         let mut max_diff = 0u32;
         for (a, b) in img_a
@@ -877,7 +836,7 @@ fn compare_paths(
 // ---------------------------------------------------------------------------
 
 pub fn run(_ctx: &GpuContext) -> Vec<BenchResult> {
-    println!("== Benchmark: Mask Pool POC (Tier 2-a) ==");
+    println!("== Benchmark: Mask Pool ==");
     let is_vivante = detect_vivante();
     println!(
         "  GPU: {}  cell={}x{}  fbo={}x{}",
@@ -924,8 +883,7 @@ pub fn run(_ctx: &GpuContext) -> Vec<BenchResult> {
         );
     }
 
-    // Cross-validate at N=10 first so any divergence is caught before
-    // we trust the timing numbers.
+    // Cross-validate at N=10.
     {
         let dets = synthesize_detections(10);
         let masks: Vec<Vec<u8>> = (0..10).map(synthesize_mask).collect();
@@ -940,9 +898,6 @@ pub fn run(_ctx: &GpuContext) -> Vec<BenchResult> {
             100.0 * diff_px as f32 / total_px as f32,
             max_diff
         );
-        // 5% threshold accommodates sub-texel filtering precision differences
-        // between `sampler2D` and `sampler2DArray` on some drivers (NVIDIA).
-        // A real correctness failure would diverge across the whole quad.
         if diff_px * 20 > total_px {
             println!("  WARNING: >5% pixel divergence — bench results may not be apples-to-apples");
         }
@@ -981,14 +936,7 @@ pub fn run(_ctx: &GpuContext) -> Vec<BenchResult> {
     }
 
     // -----------------------------------------------------------------
-    // Diagnostic: how much does framebuffer readback cost on this GPU?
-    //
-    // Hypothesis: a large fraction of HAL `draw_decoded_masks` time on
-    // Mali is the `glReadnPixels` of the 640×640 RGBA8 framebuffer at
-    // the end of the call, not the per-mask draw work. If this bench
-    // shows readback ≈ HAL Draw - mask_render_cost, then Tier 2-a's
-    // win is in the mask draw cost is small and the bigger win is to
-    // make the destination DMA-BUF.
+    // Diagnostic: framebuffer readback cost.
     {
         println!("== Diagnostic: framebuffer readback cost ==");
         let mut buf = vec![0u8; (FBO_W * FBO_H * 4) as usize];

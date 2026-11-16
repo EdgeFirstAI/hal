@@ -1,13 +1,6 @@
 #!/usr/bin/env bash
-# Fetch the org license-policy scripts so local `make sbom` enforces exactly the
-# policy CI enforces.
-#
-# hal used to keep its own copies of generate_sbom.sh and check_license_policy.py.
-# They drifted from the org copies, so the Quick tier and `make sbom` disagreed
-# about the same dependency tree. The policy has one home now: EdgeFirstAI/.github.
-#
-# The commit is read from the uses: pin in ci.yml, so there is no second SHA to
-# maintain. Prints the directory holding the scripts.
+# Fetch the org license-policy scripts from EdgeFirstAI/.github, at the commit
+# pinned in ci.yml's uses: line, into target/ci-scripts. Prints that directory.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"

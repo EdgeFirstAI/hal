@@ -3,13 +3,10 @@
 
 //! Schema v2 metadata types for EdgeFirst model configuration.
 //!
-//! Schema v2 introduces a two-layer output model that separates the logical
-//! contract (what the model produces semantically) from the physical
-//! realization (what tensors the converter emitted). Each entry in the
-//! top-level [`SchemaV2::outputs`] array is a [`LogicalOutput`]. A logical
-//! output either IS a physical tensor (when the converter did not split it
-//! further) or contains a `outputs` array of [`PhysicalOutput`] children
-//! that realize it.
+//! Each entry in the top-level [`SchemaV2::outputs`] array is a
+//! [`LogicalOutput`]: the semantic output of the model. A logical output is
+//! either a physical tensor itself or holds an `outputs` array of
+//! [`PhysicalOutput`] children, the tensors the converter emitted for it.
 //!
 //! # Example — YOLOv8 detection, flat (TFLite)
 //!
@@ -52,18 +49,14 @@ pub use edgefirst_tensor::{
 };
 
 /// Highest `schema_version` this parser accepts. Files with a higher
-/// version are rejected rather than silently parsed against the wrong
-/// grammar.
+/// version are rejected.
 pub const MAX_SUPPORTED_SCHEMA_VERSION: u32 = 2;
 
 /// Root of the edgefirst.json schema v2 metadata.
 ///
-/// All fields except [`SchemaV2::schema_version`] are optional, so
-/// third-party integrations can include only the sections relevant to
-/// their use case.
+/// All fields except [`SchemaV2::schema_version`] are optional.
 ///
-/// The struct is `#[non_exhaustive]` so new optional sections can be added
-/// without a breaking change. Outside this crate, start from
+/// The struct is `#[non_exhaustive]`. Outside this crate, start from
 /// [`SchemaV2::new`] (or [`Default`], or a parser) and assign fields:
 ///
 /// ```rust
@@ -179,8 +172,7 @@ pub struct InputSpec {
     pub dshape: Vec<(DimName, usize)>,
 
     /// Camera adaptor input format (`rgb`, `rgba`, `bgr`, `bgra`, `grey`,
-    /// `yuyv`). Free-form string rather than an enum because new adaptor
-    /// formats can appear without breaking parsing.
+    /// `yuyv`), as a free-form string.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cameraadaptor: Option<String>,
 
@@ -232,8 +224,7 @@ impl InputSpec {
 
 /// Input pre-processing declared by the model producer.
 ///
-/// Every field is optional; an absent field means "not declared" rather
-/// than a specific default, so consumers can apply their own fallback.
+/// Every field is optional; an absent field means it was not declared.
 ///
 /// ```
 /// use edgefirst_decoder::schema::{InputSpec, NormalizationPreset, NormalizationConfig};
@@ -261,7 +252,7 @@ pub struct Preprocessing {
     pub resize: Option<FitMode>,
 
     /// Resampling filter of the reference pipeline. Informational: a
-    /// runtime may use a different filter and should report the deviation.
+    /// runtime may use a different filter.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interpolation: Option<Interpolation>,
 
@@ -370,23 +361,21 @@ pub struct Letterbox {
 
 /// Logical output: the semantic contract the model exposes.
 ///
-/// When `outputs` is empty, the logical output IS the physical tensor
+/// When `outputs` is empty, the logical output is the physical tensor
 /// (`dtype` and `quantization` carry the tensor-level fields directly).
 /// When `outputs` contains one or more [`PhysicalOutput`] entries, those
-/// children are the real physical tensors and the logical `shape` is
-/// the reconstructed shape produced by the fallback merge path.
+/// children are the physical tensors and the logical `shape` is the
+/// reconstructed shape produced by the fallback merge path.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LogicalOutput {
     /// Logical output name (optional at the logical level).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
 
-    /// Semantic type. `None` marks the output as "additional" — carried in
-    /// the schema for completeness (e.g. diagnostic or auxiliary tensors)
-    /// but not participating in decoder dispatch. See
-    /// [`SchemaV2::to_legacy_config_outputs`] for how typeless outputs are
-    /// filtered out of the legacy config, and the module docs for when to
-    /// use this vs. a recognised [`LogicalType`] variant.
+    /// Semantic type. `None` marks an additional output (e.g. a diagnostic
+    /// or auxiliary tensor) that takes no part in decoder dispatch;
+    /// [`SchemaV2::to_legacy_config_outputs`] leaves it out of the legacy
+    /// config.
     #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
     pub type_: Option<LogicalType>,
 
@@ -433,8 +422,8 @@ pub struct LogicalOutput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stride: Option<Stride>,
 
-    /// Tensor dtype. Present when `outputs` is empty (this logical IS the
-    /// physical tensor).
+    /// Tensor dtype. Present when `outputs` is empty (this logical output
+    /// is the physical tensor).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dtype: Option<DType>,
 
@@ -444,29 +433,26 @@ pub struct LogicalOutput {
     pub quantization: Option<Quantization>,
 
     /// Physical children that realize this logical output. Empty when the
-    /// logical IS the physical tensor. At most one level of nesting is
-    /// permitted.
+    /// logical output is the physical tensor. At most one level of nesting
+    /// is permitted.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub outputs: Vec<PhysicalOutput>,
 
-    /// Activation already applied by the model graph or runtime. The
-    /// HAL must NOT re-apply an activation declared here.
+    /// Activation already applied by the model graph or runtime; the HAL
+    /// does not apply it again.
     ///
-    /// On per-scale models the converter writes this on the logical
-    /// parent (e.g. `scores.activation_applied = sigmoid`) when the
-    /// model graph already includes the activation; the per-physical
-    /// children inherit it.
+    /// On per-scale models it is declared on the logical parent (e.g.
+    /// `scores.activation_applied = sigmoid`) and the physical children
+    /// inherit it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activation_applied: Option<Activation>,
 
-    /// Activation NOT yet applied. The HAL MUST apply the declared
-    /// activation before consuming the tensor.
+    /// Activation not yet applied; the HAL applies it before consuming the
+    /// tensor.
     ///
-    /// On per-scale models the converter writes this on the logical
-    /// parent (e.g. `scores.activation_required = sigmoid`) when the
-    /// score-activation step was stripped from the model graph and
-    /// must be re-applied by the runtime; per-physical children
-    /// inherit the parent's declaration.
+    /// On per-scale models it is declared on the logical parent (e.g.
+    /// `scores.activation_required = sigmoid`) and the physical children
+    /// inherit it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activation_required: Option<Activation>,
 
@@ -581,18 +567,16 @@ pub struct PhysicalOutput {
 
     /// Semantic type. Matches the parent's type or declares a sub-split
     /// such as `boxes_xy` or `boxes_wh`. `None` marks the child as
-    /// type-opaque: it still binds to a physical tensor by `name`/`shape`
-    /// during merging, but is not used to disambiguate against typed
-    /// siblings. Useful when a converter emits extra per-scale tensors
-    /// the HAL has no semantic for but the user manages downstream.
+    /// type-opaque: it binds to a physical tensor by `name`/`shape`
+    /// during merging and is not compared against typed siblings.
     #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
     pub type_: Option<PhysicalType>,
 
     /// Physical tensor shape.
     pub shape: Vec<usize>,
 
-    /// Named dimensions ordered to match `shape`. Disambiguates NHWC vs
-    /// NCHW per-child rather than assuming a model-wide layout.
+    /// Named dimensions ordered to match `shape`; they give the NHWC or
+    /// NCHW layout of this child.
     #[serde(
         default,
         deserialize_with = "deserialize_dshape",
@@ -613,19 +597,17 @@ pub struct PhysicalOutput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stride: Option<Stride>,
 
-    /// Zero-based index into the parent's strides array. Used for
-    /// parallel iteration with precomputed per-scale state.
+    /// Zero-based index into the parent's strides array.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scale_index: Option<usize>,
 
-    /// Activation already applied by the NPU. The HAL must NOT re-apply
-    /// an activation declared here (e.g. Hailo applies sigmoid to score
-    /// tensors on-chip).
+    /// Activation already applied by the NPU (e.g. Hailo applies sigmoid
+    /// to score tensors on-chip); the HAL does not apply it again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activation_applied: Option<Activation>,
 
-    /// Activation NOT yet applied. The HAL MUST apply the declared
-    /// activation before consuming the tensor.
+    /// Activation not yet applied; the HAL applies it before consuming the
+    /// tensor.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activation_required: Option<Activation>,
 }
@@ -703,15 +685,12 @@ impl Quantization {
     }
 }
 
-/// Convert a schema-level `Quantization` (which also carries the quantized
-/// `dtype`) into the tensor-crate `edgefirst_tensor::Quantization` attached
-/// to a `Tensor<T>` at runtime. The `dtype` field is dropped — the tensor's
-/// `T` supplies the storage element type directly.
+/// Convert a schema-level `Quantization` into the tensor-crate
+/// `edgefirst_tensor::Quantization` attached to a `Tensor<T>` at runtime.
+/// The `dtype` field is dropped.
 ///
-/// Returns `Err` on any length-mismatch / axis-out-of-range condition; the
-/// schema's `Quantization::validate_shape` has looser rules (accepts absent
-/// axis on per-channel) that the tensor crate does not. Callers should prefer
-/// the v2 parse path which normalizes.
+/// Returns `Err` on a length mismatch, an axis out of range, or a
+/// per-channel scale without an axis.
 impl TryFrom<&Quantization> for edgefirst_tensor::Quantization {
     type Error = edgefirst_tensor::Error;
 
@@ -839,10 +818,10 @@ pub enum LogicalType {
     /// ModelPack anchor-grid raw output requiring anchor decode.
     Detection,
     /// Mask-classification per-query class logits `[1, Q, K+1]`.
-    /// Reserved: described by the schema, not yet decoded by the HAL.
+    /// Reserved: described by the schema, not decoded by the HAL.
     ClassLogits,
     /// Mask-classification per-query mask logits `[1, Q, H, W]`.
-    /// Reserved: described by the schema, not yet decoded by the HAL.
+    /// Reserved: described by the schema, not decoded by the HAL.
     MaskLogits,
 }
 
@@ -983,8 +962,8 @@ pub enum NmsMode {
 /// A subset of [`edgefirst_tensor::DType`], numbered and named by it: the
 /// discriminant is that enum's code and the serialized string is its
 /// [`as_str`](edgefirst_tensor::DType::as_str) (`"i8"`, `"u8"`, ...,
-/// `"f32"`). The older spellings (`"int8"`, `"uint8"`, ..., `"float32"`)
-/// are still accepted on input; see [`DType::from_str_code`].
+/// `"f32"`). The spellings `"int8"`, `"uint8"`, ..., `"float32"` are also
+/// accepted on input; see [`DType::from_str_code`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u32)]
 pub enum DType {
@@ -1000,7 +979,7 @@ pub enum DType {
     Int64 = edgefirst_tensor::protocol::dtype::I64,
 }
 
-/// The pre-`edgefirst_tensor::DType` spellings, accepted on input only.
+/// Alternative spellings, accepted on input only.
 const DTYPE_LEGACY_NAMES: [(&str, DType); 9] = [
     ("int8", DType::Int8),
     ("uint8", DType::Uint8),
@@ -1014,7 +993,7 @@ const DTYPE_LEGACY_NAMES: [(&str, DType); 9] = [
 ];
 
 impl DType {
-    /// Every variant, for exhaustive cross-surface tests.
+    /// Every variant.
     pub fn all() -> &'static [DType] {
         &[
             DType::Int8,
@@ -1069,7 +1048,7 @@ impl DType {
         self.to_tensor_dtype().as_str()
     }
 
-    /// Parse the string form, also accepting the older `"int8"`, `"uint8"`,
+    /// Parse the string form, also accepting the `"int8"`, `"uint8"`,
     /// ..., `"float32"` spellings.
     pub fn from_str_code(s: &str) -> Option<Self> {
         edgefirst_tensor::DType::from_str_code(s)
@@ -1082,7 +1061,7 @@ impl DType {
             })
     }
 
-    /// Every accepted input spelling, current and legacy.
+    /// Every accepted input spelling.
     pub fn accepted_names() -> impl Iterator<Item = &'static str> {
         Self::all()
             .iter()
@@ -1186,8 +1165,7 @@ impl SchemaV2 {
         }
     }
 
-    /// Parse from an already-deserialized `serde_json::Value`. Useful for
-    /// callers that have already done the initial deserialization step.
+    /// Parse from an already-deserialized `serde_json::Value`.
     pub fn from_json_value(value: serde_json::Value) -> DecoderResult<Self> {
         let version = value
             .get("schema_version")
@@ -1223,9 +1201,7 @@ impl SchemaV2 {
     ///
     /// Fields v1 does not carry (tensor `dtype`, per-channel quant, box
     /// encoding, score format, activation metadata, stride on physical
-    /// children) are left as `None`. The v2 decoder is expected to infer
-    /// these from the runtime tensor type and the legacy decoder
-    /// dispatch rules.
+    /// children) are left as `None`.
     pub fn from_v1(v1: &ConfigOutputs) -> DecoderResult<Self> {
         let outputs = v1
             .outputs
@@ -1251,43 +1227,27 @@ impl SchemaV2 {
     /// Each [`LogicalOutput`] maps to one [`ConfigOutput`] variant
     /// selected by [`LogicalType`]; per-tensor scalar quantization
     /// becomes a `QuantTuple(scale, zp)`; and `decoder`, `anchors`,
-    /// `normalized` are copied verbatim.
+    /// `normalized` are copied verbatim. Logical outputs without a type
+    /// are left out.
     ///
-    /// This conversion does **not** reject logical outputs that also
-    /// declare physical children (per-scale FPN splits, or channel
-    /// sub-splits such as ARA-2 `boxes_xy` / `boxes_wh`). The returned
-    /// legacy config captures the logical-level metadata, while the
-    /// physical-to-logical merge is handled separately by the
-    /// `DecodeProgram` that
-    /// [`DecoderBuilder::build`](crate::DecoderBuilder::build)
-    /// compiles alongside this legacy config.
+    /// Logical outputs that declare physical children (per-scale FPN
+    /// splits, or channel sub-splits such as ARA-2 `boxes_xy` /
+    /// `boxes_wh`) are accepted: the returned config carries the
+    /// logical-level metadata, and the `DecodeProgram` that
+    /// [`DecoderBuilder::build`](crate::DecoderBuilder::build) compiles
+    /// merges the physical tensors.
     ///
-    /// Returns [`DecoderError::NotSupported`] when the schema uses
-    /// features the v1 decoder cannot express at the logical level:
+    /// Returns [`DecoderError::NotSupported`] for:
     /// - Per-channel quantization arrays on a logical output.
-    /// - `encoding: dfl` on a **flat** logical output (no physical
-    ///   children). DFL combined with per-scale children is handled by
-    ///   the merge path (see `DecodeProgram`)
-    ///   which decodes the distribution before producing the merged
-    ///   post-decode `(1, 4, total_anchors)` tensor the legacy decoder
-    ///   consumes.
+    /// - `encoding: dfl` on a flat logical output (no physical
+    ///   children).
     pub fn to_legacy_config_outputs(&self) -> DecoderResult<ConfigOutputs> {
         let mut outputs = Vec::with_capacity(self.outputs.len());
         for logical in &self.outputs {
-            // Typeless logical outputs are carried for round-tripping
-            // but are not required for decoding. Skip them — the decoder
-            // builder will surface its own "missing required output"
-            // error if a decode-critical role (e.g. `boxes`) is absent,
-            // which is more actionable than a serde "missing type" error.
             if logical.type_.is_none() {
                 continue;
             }
-            // Flat DFL (no children) remains unsupported — the HAL has
-            // no path that applies softmax + dist2bbox to a single
-            // `(1, 4·reg_max, anchors)` tensor yet. DFL with per-scale
-            // children is decoded by the merge path, so we let it
-            // through here and rely on the merged logical shape (post-
-            // decode 4 channels) being valid for the legacy dispatch.
+            // DFL boxes without physical children are not supported.
             if logical.type_ == Some(LogicalType::Boxes)
                 && logical.encoding == Some(BoxEncoding::Dfl)
                 && logical.outputs.is_empty()
@@ -1328,19 +1288,16 @@ impl SchemaV2 {
     ///
     /// Rules checked:
     /// - `schema_version` in `[1, MAX_SUPPORTED_SCHEMA_VERSION]`.
-    /// - Physical children, when present, carry non-empty `name` fields
-    ///   so tensor binding by name is unambiguous.
-    /// - All physical children of a given logical output have pairwise
-    ///   distinct shapes (shape-based binding safety, per HailoRT spec).
+    /// - Preprocessing vectors (normalization `mean`/`std`, letterbox
+    ///   `pad`) have one element or one per input channel.
+    /// - Physical children, when present, carry non-empty `name` fields.
+    /// - Physical children of a logical output that share a type have
+    ///   pairwise distinct shapes.
+    /// - Either every physical child of a logical output carries
+    ///   `stride` (per-scale split) or none does (channel sub-split).
     /// - For a `boxes` logical output with `encoding: dfl`, every
     ///   physical child shape has a `num_features` (or last) dimension
     ///   divisible by 4 (the box-coordinate count).
-    /// - Per-scale splits carry `stride` on every child.
-    /// - Mixed per-scale + channel-sub-split decompositions are
-    ///   rejected (the spec permits only one merge strategy per logical).
-    /// - `end2end` models (decoder_version=yolo26 with `detections`
-    ///   output) do not also declare per-scale split children on that
-    ///   output.
     pub fn validate(&self) -> DecoderResult<()> {
         if self.schema_version == 0 || self.schema_version > MAX_SUPPORTED_SCHEMA_VERSION {
             return Err(DecoderError::InvalidConfig(format!(
@@ -1416,7 +1373,7 @@ fn validate_logical(logical: &LogicalOutput) -> DecoderResult<()> {
         return Ok(());
     }
 
-    // All children must carry a name for unambiguous tensor binding.
+    // Every child carries a name.
     for child in &logical.outputs {
         if child.name.is_empty() {
             return Err(DecoderError::InvalidConfig(format!(
@@ -1427,14 +1384,8 @@ fn validate_logical(logical: &LogicalOutput) -> DecoderResult<()> {
         }
     }
 
-    // Uniqueness of physical child shapes *within the same type* — two
-    // children with distinct types (e.g. ARA-2 `boxes_xy` + `boxes_wh`)
-    // may legitimately share shape, since type disambiguates the binding.
-    //
-    // Typeless children are excluded from this check: shape uniqueness
-    // only matters when we need to bind a tensor by type+shape, and
-    // typeless children are treated as opaque passthrough — name-based
-    // binding still disambiguates them from each other.
+    // Children of the same type have pairwise distinct shapes; children
+    // without a type are not compared.
     for (i, a) in logical.outputs.iter().enumerate() {
         for b in &logical.outputs[i + 1..] {
             let (Some(ta), Some(tb)) = (a.type_, b.type_) else {
@@ -1450,9 +1401,8 @@ fn validate_logical(logical: &LogicalOutput) -> DecoderResult<()> {
         }
     }
 
-    // Merge strategy must be uniform: either all children carry `stride`
-    // (per-scale split) or none (channel sub-split). Mixed decompositions
-    // are ill-defined.
+    // Either every child carries `stride` (per-scale split) or none does
+    // (channel sub-split).
     let strided: Vec<_> = logical.outputs.iter().map(|c| c.stride.is_some()).collect();
     let all_strided = strided.iter().all(|&b| b);
     let none_strided = strided.iter().all(|&b| !b);
@@ -1465,8 +1415,7 @@ fn validate_logical(logical: &LogicalOutput) -> DecoderResult<()> {
         )));
     }
 
-    // DFL boxes: every child's feature axis must be divisible by 4
-    // (otherwise `reg_max` is not an integer).
+    // DFL boxes: every child's feature axis is divisible by 4.
     if logical.type_ == Some(LogicalType::Boxes) && logical.encoding == Some(BoxEncoding::Dfl) {
         for child in &logical.outputs {
             if let Some(feat) = last_feature_axis(child) {
@@ -1516,16 +1465,14 @@ fn quantization_from_v1(q: Option<QuantTuple>) -> Option<Quantization> {
 fn logical_from_v1(v1: &ConfigOutput) -> DecoderResult<LogicalOutput> {
     match v1 {
         ConfigOutput::Detection(d) => {
-            // v1 Detection covers two semantic cases that v2 separates:
-            //   - ModelPack anchor-grid (decoder=modelpack, anchors present)
-            //   - YOLO legacy combined (decoder=ultralytics, no anchors)
-            // Both map to v2 LogicalType::Detection; the decoder dispatch
-            // still differentiates via the `decoder` + `anchors` fields.
+            // v1 Detection is either ModelPack anchor-grid
+            // (decoder=modelpack, anchors present) or YOLO combined
+            // (decoder=ultralytics, no anchors); both map to
+            // LogicalType::Detection.
             let encoding = match (d.decoder, d.anchors.is_some()) {
                 (configs::DecoderType::ModelPack, true) => Some(BoxEncoding::Anchor),
                 (configs::DecoderType::Ultralytics, _) => Some(BoxEncoding::Direct),
-                // ModelPack without anchors — keep encoding unset; the
-                // decoder may not need it.
+                // ModelPack without anchors: encoding unset.
                 (configs::DecoderType::ModelPack, false) => None,
                 (configs::DecoderType::Semantic, _) => None,
             };
@@ -1554,9 +1501,7 @@ fn logical_from_v1(v1: &ConfigOutput) -> DecoderResult<LogicalOutput> {
             shape: b.shape.clone(),
             dshape: b.dshape.clone(),
             decoder: Some(DecoderKind::from_v1(b.decoder)),
-            // v1 boxes are always pre-decoded 4-channel (the legacy
-            // convention). Explicitly declare Direct so the v2 dispatch
-            // doesn't try DFL decoding on them.
+            // v1 boxes are decoded 4-channel coordinates.
             encoding: Some(BoxEncoding::Direct),
             score_format: None,
             normalized: b.normalized,
@@ -1576,9 +1521,7 @@ fn logical_from_v1(v1: &ConfigOutput) -> DecoderResult<LogicalOutput> {
             dshape: s.dshape.clone(),
             decoder: Some(DecoderKind::from_v1(s.decoder)),
             encoding: None,
-            // v1 does not declare score format explicitly; assume per_class
-            // (YOLOv8-style). YOLOv5 users must migrate to v2 to get
-            // obj_x_class behaviour.
+            // v1 carries no score format; per_class is assumed.
             score_format: Some(ScoreFormat::PerClass),
             normalized: None,
             anchors: None,
@@ -1595,7 +1538,7 @@ fn logical_from_v1(v1: &ConfigOutput) -> DecoderResult<LogicalOutput> {
             type_: Some(LogicalType::Protos),
             shape: p.shape.clone(),
             dshape: p.dshape.clone(),
-            // protos are consumed directly; decoder field is informational.
+            // The decoder field of protos is informational.
             decoder: Some(DecoderKind::from_v1(p.decoder)),
             encoding: None,
             score_format: None,
@@ -1763,18 +1706,13 @@ fn quantization_to_legacy(q: &Quantization) -> DecoderResult<QuantTuple> {
     Ok(QuantTuple(scale, zp))
 }
 
-/// Drop axes named `padding` (always size 1 per spec) from the given
-/// shape/dshape pair. ARA-2 emits logical shapes like
-/// `[1, 4, 8400, 1]` with a trailing `padding=1` dim to satisfy the
-/// converter's rank requirements — the decoder only cares about the
-/// semantic axes, so squeezing is safe.
+/// Drop axes named `padding` (size 1) from the given shape/dshape pair,
+/// e.g. the trailing axis of an ARA-2 `[1, 4, 8400, 1]` logical shape.
 pub(crate) fn squeeze_padding_dims(
     shape: Vec<usize>,
     dshape: Vec<(DimName, usize)>,
 ) -> (Vec<usize>, Vec<(DimName, usize)>) {
-    // dshape is `#[serde(default)]`; a logical output without named dims
-    // arrives here with an empty dshape. `zip` would stop at the shorter
-    // iterator and silently truncate shape to `[]`, so short-circuit.
+    // An empty dshape leaves the shape unchanged.
     if dshape.is_empty() {
         return (shape, dshape);
     }
@@ -1795,10 +1733,8 @@ pub(crate) fn squeeze_padding_dims(
     (shape, dshape)
 }
 
-/// Return the list of axis indices in `dshape` that carry the
-/// `padding` dim name. Indices are returned in descending order so
-/// that `remove_axis` calls can be applied directly without tracking
-/// index shifts.
+/// Return the axis indices in `dshape` that carry the `padding` dim
+/// name, in descending order.
 pub(crate) fn padding_axes(dshape: &[(DimName, usize)]) -> Vec<usize> {
     let mut v: Vec<usize> = dshape
         .iter()
@@ -1826,20 +1762,13 @@ fn logical_to_legacy_config_output(logical: &LogicalOutput) -> DecoderResult<Con
         .as_ref()
         .map(quantization_to_legacy)
         .transpose()?;
-    // Squeeze explicit `padding` dims before handing to the legacy
-    // dispatch: the v1 decoder's `verify_yolo_*` helpers require rank-3
-    // shapes, but v2 metadata often carries an explicit `padding: 1`
-    // axis (ARA-2). ModelPack boxes are validated as 4D, so keep
-    // padding dims for ModelPack outputs.
+    // Squeeze `padding` dims, except on ModelPack outputs.
     let (shape, dshape) = match logical.decoder {
         Some(DecoderKind::ModelPack) => (logical.shape.clone(), logical.dshape.clone()),
         _ => squeeze_padding_dims(logical.shape.clone(), logical.dshape.clone()),
     };
 
     let ty = logical.type_.ok_or_else(|| {
-        // Defense-in-depth: `to_legacy_config_outputs` already filters
-        // typeless outputs, so reaching here means a new caller added a
-        // bypass. Surface it as an internal error rather than panicking.
         DecoderError::InvalidConfig(format!(
             "logical output `{}` has no type; typeless outputs should be \
              filtered before legacy conversion",
@@ -1865,8 +1794,7 @@ fn logical_to_legacy_config_output(logical: &LogicalOutput) -> DecoderResult<Con
         LogicalType::Masks => Ok(masks_to_legacy(&ctx)),
         LogicalType::Classes => Ok(classes_to_legacy(&ctx)),
         LogicalType::Detection | LogicalType::Detections => Ok(detection_to_legacy(&ctx)),
-        // Objectness / Landmarks have no direct v1 equivalent; the v1
-        // YOLOv5 path embedded objectness in the combined Detection.
+        // Types with no v1 equivalent.
         LogicalType::Objectness
         | LogicalType::Landmarks
         | LogicalType::ClassLogits
@@ -1953,9 +1881,8 @@ fn classes_to_legacy(ctx: &LegacyConvertCtx) -> ConfigOutput {
 }
 
 fn detection_to_legacy(ctx: &LegacyConvertCtx) -> ConfigOutput {
-    // Detection covers ModelPack anchor-grid and legacy YOLO combined.
-    // Detections (plural) is end-to-end; maps to Detection with the
-    // appropriate dimension layout.
+    // Detection (ModelPack anchor-grid, YOLO combined) and Detections
+    // (end-to-end) both map to the v1 Detection.
     ConfigOutput::Detection(configs::Detection {
         anchors: ctx.anchors.clone(),
         decoder: ctx.decoder,
@@ -2030,7 +1957,6 @@ mod tests {
         let direct: BoxEncoding = serde_json::from_str("\"direct\"").unwrap();
         assert_eq!(direct, BoxEncoding::Direct);
 
-        // yolo26 metadata uses "ltrb" — must deserialise to Direct.
         let ltrb: BoxEncoding = serde_json::from_str("\"ltrb\"").unwrap();
         assert_eq!(ltrb, BoxEncoding::Direct);
     }
@@ -2057,7 +1983,6 @@ mod tests {
                 format!("\"{}\"", t.as_str())
             );
         }
-        // `u64` and `f64` are not model I/O dtypes.
         for t in [edgefirst_tensor::DType::U64, edgefirst_tensor::DType::F64] {
             assert_eq!(DType::from_tensor_dtype(t), None);
             assert_eq!(DType::from_code(t.code()), None);
@@ -2236,18 +2161,13 @@ mod tests {
             dtype: None,
         };
         let err = edgefirst_tensor::Quantization::try_from(&q).unwrap_err();
-        // The field matters: the per-channel-without-axis arm is what should
-        // reject this. Matching only on the variant also accepts the catch-all
-        // "scale" arm, which would mean the arm above never ran.
         assert!(matches!(
             err,
             edgefirst_tensor::Error::QuantizationInvalid { field: "axis", .. }
         ));
     }
 
-    /// Both redundant-axis arms map to per-tensor. Losing either one drops the
-    /// conversion through to the catch-all and turns a valid configuration
-    /// into an error.
+    /// A redundant axis on a per-tensor quantization is ignored.
     #[test]
     fn quantization_to_tensor_per_tensor_ignores_a_redundant_axis() {
         let q = Quantization {
@@ -2276,9 +2196,8 @@ mod tests {
         assert_eq!(t.scale(), &[0.5][..]);
     }
 
-    /// An empty scale is neither per-tensor nor per-channel, so it must reach
-    /// the catch-all and name `scale`. Each of these reaches it down a
-    /// different path: no axis, an axis, and an axis with zero points.
+    /// An empty scale is rejected with an error naming `scale`, with or
+    /// without an axis or zero points.
     #[test]
     fn quantization_to_tensor_empty_scale_errors_on_scale() {
         for (zero_point, axis) in [
@@ -2304,9 +2223,8 @@ mod tests {
         }
     }
 
-    /// One scale with two zero points is not per-tensor (the zero point is not
-    /// a single element) and not per-channel (there is one scale), so it is
-    /// the catch-all's job with or without an axis.
+    /// One scale with two zero points is rejected with an error naming
+    /// `scale`, with or without an axis.
     #[test]
     fn quantization_to_tensor_single_scale_with_many_zero_points_errors_on_scale() {
         for axis in [None, Some(0)] {
@@ -2349,8 +2267,7 @@ mod tests {
     }
 
     /// A single zero point applies to every channel; a per-channel list is
-    /// indexed. Treating the list as if it had one element would return
-    /// channel 0's zero point for every channel.
+    /// indexed.
     #[test]
     fn zero_point_at_indexes_per_channel_zero_points() {
         let per_channel = Quantization {
@@ -2362,7 +2279,7 @@ mod tests {
         assert_eq!(per_channel.zero_point_at(0), 10);
         assert_eq!(per_channel.zero_point_at(1), 20);
         assert_eq!(per_channel.zero_point_at(2), 30);
-        // Out of range falls back to 0 rather than panicking.
+        // Out of range returns 0.
         assert_eq!(per_channel.zero_point_at(3), 0);
 
         let shared = Quantization {
@@ -2385,7 +2302,7 @@ mod tests {
 
     #[test]
     fn logical_output_flat_tflite_boxes() {
-        // Example 3 from the spec: TFLite YOLOv8 detection, flat boxes
+        // TFLite YOLOv8 detection, flat boxes
         let j = r#"{
           "name": "boxes", "type": "boxes",
           "shape": [1, 64, 8400],
@@ -2406,7 +2323,7 @@ mod tests {
 
     #[test]
     fn logical_output_hailo_per_scale_split() {
-        // Example 5 from the spec: Hailo YOLOv8 boxes, per-scale split
+        // Hailo YOLOv8 boxes, per-scale split
         let j = r#"{
           "name": "boxes", "type": "boxes",
           "shape": [1, 64, 8400],
@@ -2435,7 +2352,7 @@ mod tests {
 
     #[test]
     fn logical_output_ara2_xy_wh_channel_split() {
-        // Example 4 from the spec: ARA-2 boxes split into xy/wh
+        // ARA-2 boxes split into xy/wh
         let j = r#"{
           "name": "boxes", "type": "boxes",
           "shape": [1, 4, 8400, 1],
@@ -2560,7 +2477,7 @@ mod tests {
 
     #[test]
     fn direct_protos_no_decoder() {
-        // protos are consumed directly — no `decoder` field
+        // protos without a `decoder` field
         let j = r#"{
           "name": "protos", "type": "protos",
           "shape": [1, 32, 160, 160],
@@ -2577,7 +2494,7 @@ mod tests {
 
     #[test]
     fn full_yolov8_tflite_flat_detection() {
-        // Example 3: complete two-output YOLOv8 detection schema
+        // Two-output YOLOv8 detection schema
         let j = r#"{
           "schema_version": 2,
           "decoder_version": "yolov8",
@@ -2615,8 +2532,7 @@ mod tests {
 
     #[test]
     fn schema_unknown_version_parses_without_validation() {
-        // Parser accepts any u32; the decoder is responsible for rejecting
-        // unsupported versions with a useful error.
+        // The serde parser accepts any u32 version.
         let j = r#"{"schema_version": 99, "outputs": []}"#;
         let s: SchemaV2 = serde_json::from_str(j).unwrap();
         assert_eq!(s.schema_version, 99);
@@ -2727,7 +2643,7 @@ mod tests {
 
     #[test]
     fn parse_absent_schema_version_treats_as_v1() {
-        // No schema_version field — classic v1 yolov8 split
+        // No schema_version field: v1 yolov8 split
         let j = r#"{
           "outputs": [
             {
@@ -2775,12 +2691,8 @@ mod tests {
         assert_eq!(q.dtype, None); // v1 did not carry dtype
     }
 
-    /// Outputs declared without a `type` field must parse successfully
-    /// and round-trip to JSON without introducing a synthetic type.
-    /// The metadata v2 spec lists `type` as required on both logical
-    /// and physical levels, but the HAL tolerates typeless logical
-    /// outputs as "additional" (auxiliary / diagnostic) tensors that
-    /// do not participate in decoder dispatch.
+    /// Outputs declared without a `type` field parse and round-trip to
+    /// JSON without a `type` field.
     #[test]
     fn typeless_logical_output_parses_and_roundtrips() {
         let j = r#"{
@@ -2803,7 +2715,7 @@ mod tests {
         assert_eq!(schema.outputs[0].name.as_deref(), Some("extra_telemetry"));
         assert_eq!(schema.outputs[1].type_, Some(LogicalType::Boxes));
 
-        // Typeless output must not serialize a `type` field.
+        // The typeless output serializes without a `type` field.
         let round = serde_json::to_string(&schema).unwrap();
         let first_obj = round
             .split("\"outputs\":[")
@@ -2816,11 +2728,7 @@ mod tests {
         );
     }
 
-    /// Typeless logical outputs are filtered out of the legacy
-    /// ConfigOutputs — they carry no decoder role and the legacy
-    /// builder can't represent them. A schema with typeless extras
-    /// plus a recognised `boxes` role must lower to a legacy config
-    /// containing only the `boxes` entry.
+    /// Typeless logical outputs are left out of the legacy config.
     #[test]
     fn typeless_outputs_filtered_from_legacy_config() {
         let schema = SchemaV2 {
@@ -2881,10 +2789,8 @@ mod tests {
         );
     }
 
-    /// A schema that contains no typed outputs (all typeless) lowers
-    /// to an empty legacy config. The decoder builder then surfaces
-    /// its own "No outputs found in config" error — meaningful,
-    /// decoder-centric, not a serde-level "missing field type".
+    /// A schema with only typeless outputs lowers to an empty legacy
+    /// config.
     #[test]
     fn all_typeless_schema_produces_empty_legacy_config() {
         let schema = SchemaV2 {
@@ -2917,11 +2823,8 @@ mod tests {
         assert!(legacy.outputs.is_empty());
     }
 
-    /// Physical children may also omit `type`. The schema parses, the
-    /// output round-trips without a synthetic `type` field, and the
-    /// uniqueness check doesn't flag a typeless child sharing shape
-    /// with a typed sibling (the type disambiguator is absent, but we
-    /// don't bind typeless children by type anyway).
+    /// A physical child without a `type` parses, round-trips without a
+    /// `type` field and is not compared for shape uniqueness.
     #[test]
     fn typeless_physical_child_parses_and_skips_uniqueness() {
         let j = r#"{
@@ -2947,9 +2850,7 @@ mod tests {
         assert_eq!(lo.outputs[0].type_, Some(PhysicalType::BoxesXy));
         assert_eq!(lo.outputs[1].type_, None);
 
-        // Wrap in a minimal schema so we can call validate().
-        // BoxesXy and the typeless child share shape `[1, 8400, 2]`;
-        // the uniqueness check must not treat this as a conflict.
+        // BoxesXy and the typeless child share shape `[1, 8400, 2]`.
         let schema = SchemaV2 {
             schema_version: 2,
             input: None,
@@ -3057,7 +2958,7 @@ mod tests {
 
     #[test]
     fn validate_rejects_mixed_decomposition() {
-        // one child carries stride, the other does not — ill-defined merge
+        // one child carries stride, the other does not
         let j = r#"{
           "schema_version": 2,
           "outputs": [{
@@ -3205,7 +3106,6 @@ mod tests {
         assert_eq!(protos.type_, Some(LogicalType::Protos));
         assert_eq!(protos.shape, vec![1, 32, 160, 160]);
 
-        // Schema-level validation passes.
         schema.validate().expect("ARA-2 int8 validate");
     }
 
@@ -3221,7 +3121,7 @@ mod tests {
         assert_eq!(q_xy.dtype, Some(DType::Int16));
         assert!((q_xy.scale[0] - 3.211_570_6e-5).abs() < 1e-10);
         assert_eq!(q_xy.zero_point_at(0), 0);
-        // Mask coefs and protos too are INT16 in this build.
+        // Mask coefs and protos are INT16.
         let mc_q = schema.outputs[2].quantization.as_ref().unwrap();
         assert_eq!(mc_q.dtype, Some(DType::Int16));
         schema.validate().expect("ARA-2 int16 validate");
@@ -3247,14 +3147,11 @@ outputs:
         assert_eq!(schema.outputs[0].score_format, Some(ScoreFormat::PerClass));
     }
 
-    // ─── squeeze_padding_dims / to_legacy_config_outputs regressions ────
+    // ─── squeeze_padding_dims / to_legacy_config_outputs ────
 
     #[test]
     fn squeeze_padding_dims_preserves_shape_when_dshape_absent() {
-        // Empty dshape must pass shape through untouched. The previous
-        // `zip` implementation silently truncated to `[]`, which made
-        // every v2 logical output without named dims arrive at the legacy
-        // verifier with `shape: []` and fail rank checks.
+        // An empty dshape passes shape through untouched.
         let (shape, dshape) = squeeze_padding_dims(vec![1, 4, 8400], vec![]);
         assert_eq!(shape, vec![1, 4, 8400]);
         assert!(dshape.is_empty());
@@ -3331,10 +3228,8 @@ outputs:
 
     #[test]
     fn to_legacy_modelpack_boxes_preserves_padding_dim() {
-        // Regression: ModelPack boxes with shape [1, N, 1, 4] (padding dim
-        // present in dshape) were incorrectly squeezed to [1, N, 4] by
-        // `logical_to_legacy_config_output`, triggering "Invalid ModelPack
-        // Boxes shape [1, 1935, 4]". The ModelPack path must skip squeezing.
+        // ModelPack boxes with shape [1, N, 1, 4] (padding dim present in
+        // dshape) keep the padding dim: the ModelPack path skips squeezing.
         let j = r#"{
           "schema_version": 2,
           "outputs": [
@@ -3350,8 +3245,6 @@ outputs:
             crate::ConfigOutput::Boxes(b) => b,
             other => panic!("expected Boxes, got {other:?}"),
         };
-        // Must preserve the rank-4 shape — the padding dim must NOT be
-        // squeezed for ModelPack outputs.
         assert_eq!(boxes.shape, vec![1, 1935, 1, 4]);
         assert_eq!(
             boxes.dshape,
@@ -3366,9 +3259,8 @@ outputs:
 
     #[test]
     fn to_legacy_preserves_shape_for_v2_split_boxes_without_dshape() {
-        // Regression: `Decoder({...v2 split boxes, shape:[1,4,8400], no dshape...})`
-        // used to fail with `Invalid Yolo Split Boxes shape []` because
-        // `squeeze_padding_dims` truncated shape when dshape was empty.
+        // v2 split boxes with shape `[1,4,8400]` and no dshape keep their
+        // shape when lowered to the legacy config.
         let j = r#"{
           "schema_version": 2,
           "outputs": [

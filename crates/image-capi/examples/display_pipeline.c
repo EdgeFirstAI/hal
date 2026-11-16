@@ -4,16 +4,11 @@
  *
  * Display-pipeline building blocks from C, checked on the device.
  *
- * The pattern: the GPU renders the camera frame and the detection boxes into
- * a hardware-only (EF_CPU_ACCESS_NONE) DMA-BUF canvas whose fd goes to the
+ * The GPU renders the camera frame and the detection boxes into a
+ * hardware-only (EF_CPU_ACCESS_NONE) DMA-BUF canvas whose fd goes to the
  * compositor, a CPU-written overlay lives in an EF_CPU_ACCESS_WRITE image, and
- * the decoder turns model outputs into boxes. On Linux both images come from
- * the uncached CMA heap where available, so the compositor's per-frame mapping
- * costs no CPU cache maintenance; the library refuses any CPU read of them.
- *
- * Converts and draws use separate processors: on the i.MX 95's Mali GPU a
- * draw leaves state behind that corrupts the next convert on the same
- * processor.
+ * the decoder turns model outputs into boxes. Converts and draws use separate
+ * processors.
  *
  * Usage: display_pipeline <capture_dir> [iters]
  *

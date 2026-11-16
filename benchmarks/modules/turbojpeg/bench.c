@@ -1,24 +1,15 @@
 /* SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
  * SPDX-License-Identifier: Apache-2.0
  *
- * libjpeg-turbo decode-only benchmark — the TurboJPEG arm of the EdgeFirst
+ * libjpeg-turbo decode-only benchmark: the TurboJPEG arm of the EdgeFirst
  * decoder A/B.
  *
  *   --format yuv   tjDecompressToYUV2   (vs hal_cpu --decode-fmt native)
  *   --format rgb   tjDecompress2 TJPF_RGB (vs hal_cpu --decode-fmt rgb)
  *
- * Native C on purpose. The comparison is between two native decoding
- * libraries, so the harness around libturbojpeg has to be as thin as the Rust
- * one around EdgeFirst: a Python driver puts interpreter dispatch and an FFI
- * marshalling layer inside the timed region on one side of the A/B only.
- *
- * Mirrors `benchmarks/common` (the hal_cpu harness) exactly where it affects
- * the numbers: same evenly-spaced image selection, same preload-before-timing,
- * same CLOCK_MONOTONIC around decode alone, same percentile index, same MP/s
- * definition, same peak-RSS source, same CSV schema.
- *
- * libturbojpeg is resolved with dlopen rather than linked, so this
- * cross-compiles for the boards without needing their headers or libraries.
+ * Uses the same image selection, preload, CLOCK_MONOTONIC timing of decode
+ * alone, percentile index, MP/s definition, peak-RSS source and CSV schema
+ * as `benchmarks/common`. libturbojpeg is resolved with dlopen.
  *
  * Build: make -C benchmarks/modules/turbojpeg
  */
@@ -43,9 +34,7 @@
 #include <pthread/qos.h>
 #endif
 
-/* macOS has no taskset-equivalent core pinning; see cbench.h's identical
- * helper for the reasoning (this binary doesn't include cbench.h, so it
- * gets its own copy). Advisory only, no-op on non-Apple platforms. */
+/* Advisory QoS hint on macOS; no-op on non-Apple platforms. */
 static void bench_pin_qos(void) {
 #ifdef __APPLE__
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
@@ -96,13 +85,8 @@ static void die(const char *fmt, ...) {
 
 static const char *tj_err(void) { return tj.error ? tj.error() : "(no tjGetErrorStr)"; }
 
-/* Same candidate list as the retired Python driver: distributions disagree on
- * whether libturbojpeg ships a bare .so, and Jetson/Ubuntu images often have
- * only the versioned one.
- *
- * EDGEFIRST_TURBOJPEG_LIB, if set, overrides the search entirely and dlopens
- * that exact path — for A/B'ing a source-built libjpeg-turbo against the
- * distro-packaged one on the same host without uninstalling either. */
+/* Candidate library names. EDGEFIRST_TURBOJPEG_LIB, if set, overrides the
+ * search and dlopens that exact path. */
 static void tj_load(void) {
     const char *override = getenv("EDGEFIRST_TURBOJPEG_LIB");
     if (override && *override) {
@@ -148,14 +132,12 @@ static void tj_load(void) {
     if (!tj.init || !tj.destroy || !tj.header || !tj.to_yuv || !tj.decompress || !tj.bufsize_yuv)
         die("libturbojpeg at %s is missing required symbols", tj.path);
 
-    /* The candidate string may be relative ("libturbojpeg.so.0"); record the
-     * loader's resolved absolute path so the run's provenance names the exact
-     * library file measured. */
+    /* Record the loader's resolved absolute path of the library. */
     Dl_info info;
     if (dladdr((void *)tj.init, &info) && info.dli_fname) tj.path = info.dli_fname;
 }
 
-/* --- timing / stats: identical definitions to benchmarks/common ---------- */
+/* --- timing / stats ------------------------------------------------------ */
 
 static double now_ms(void) {
     struct timespec ts;
@@ -168,7 +150,7 @@ static int cmp_double(const void *a, const void *b) {
     return (x > y) - (x < y);
 }
 
-/* `idx = round(p * (n - 1))`, as TimingStats::from_samples does. */
+/* `idx = round(p * (n - 1))`. */
 static double percentile(const double *sorted, size_t n, double p) {
     if (n == 0) return 0.0;
     double pos = p * ((double)n - 1.0);
@@ -177,9 +159,8 @@ static double percentile(const double *sorted, size_t n, double p) {
     return sorted[idx];
 }
 
-/* 0-based sorted-sample indices bounding the ~95% CI for the median, identical
- * to benchmarks/common median_ci_indices(): 1-based ranks
- * floor(n/2 - 1.96*sqrt(n)/2) and ceil(n/2 + 1 + 1.96*sqrt(n)/2), clamped. */
+/* 0-based sorted-sample indices bounding the ~95% CI for the median: 1-based
+ * ranks floor(n/2 - 1.96*sqrt(n)/2) and ceil(n/2 + 1 + 1.96*sqrt(n)/2), clamped. */
 static void median_ci_indices(size_t n, size_t *lo, size_t *hi) {
     if (n == 0) {
         *lo = *hi = 0;
@@ -195,7 +176,7 @@ static void median_ci_indices(size_t n, size_t *lo, size_t *hi) {
     *hi = (size_t)hi_rank - 1;
 }
 
-/* Peak RSS, matching peak_rss_mb(). Linux VmHWM is kB; Darwin ru_maxrss is bytes. */
+/* Peak RSS in MB. Linux VmHWM is kB; Darwin ru_maxrss is bytes. */
 static double peak_rss_mb(void) {
 #ifdef __APPLE__
     struct rusage ru;
@@ -218,19 +199,14 @@ static double peak_rss_mb(void) {
 #endif
 }
 
-/* Process CPU time over the run; the decode loop is single-threaded, so this
- * doubles as the busiest-core figure the Rust harness samples per-core.
- *
- * From the CPU clock rather than /proc/self/stat: the latter is quantised to
- * clock ticks, which at a small --limit is a large fraction of the measured
- * window and reports impossible percentages. */
+/* Process CPU time over the run, from the process CPU clock. */
 static double process_cpu_seconds(void) {
     struct timespec ts;
     if (clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &ts) != 0) return 0.0;
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
 }
 
-/* --- image list: sorted, then evenly spaced, as list_jpegs() does -------- */
+/* --- image list: sorted, then evenly spaced ------------------------------ */
 
 typedef struct {
     char *name;
@@ -275,8 +251,7 @@ static Image *preload(char **paths, size_t total, size_t limit, size_t *out_n) {
     size_t n = (limit > 0 && limit < total) ? limit : total;
     Image *images = calloc(n, sizeof(*images));
     for (size_t i = 0; i < n; i++) {
-        /* paths[i * total / n] — the Rust harness's spacing, so both arms see
-         * the same subset of val2017 for a given --limit. */
+        /* Evenly spaced subset: paths[i * total / n]. */
         const char *path = (limit > 0 && limit < total) ? paths[i * total / n] : paths[i];
         FILE *f = fopen(path, "rb");
         if (!f) die("open %s", path);
@@ -301,10 +276,7 @@ typedef struct {
     void *handle;
     int pixel_format; /* -1 = YUV, else TJPF_* */
     /* TJFLAG_ACCURATEDCT/TJFLAG_FASTDCT, OR'd with TJFLAG_FASTUPSAMPLE when
-     * --upsample fast is selected. Chroma upsampling only happens on the
-     * tjDecompress2 (RGB) path — tjDecompressToYUV2 decodes to native
-     * subsampled YUV with no resampling — so the flag is a harmless no-op
-     * there, but it's set unconditionally to keep one flags field. */
+     * --upsample fast is selected. */
     int flags;
     unsigned char *buf;
     size_t buf_cap;
@@ -323,8 +295,7 @@ static void decode_one(Decoder *d, const Image *img) {
         need = (size_t)w * (size_t)h * 3;
     }
     if (need > d->buf_cap) {
-        /* Grows to the high-water mark and is reused, as the HAL arm's tensor
-         * is: neither side pays an allocation per frame in steady state. */
+        /* Grows to the high-water mark and is reused. */
         d->buf = realloc(d->buf, need);
         if (!d->buf) die("out of memory for %zu byte output", need);
         d->buf_cap = need;
@@ -377,8 +348,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--upsample")) upsample = NEXT("--upsample");
         else if (!strcmp(a, "--csv")) csv_path = NEXT("--csv");
         else if (!strcmp(a, "--verbose")) verbose = 1;
-        /* Accepted and ignored: this binary only does decode-only, which is
-         * what the flag selects on the HAL side. */
+        /* Accepted and ignored. */
         else if (!strcmp(a, "--decode-only")) continue;
         else usage(argv[0]);
 #undef NEXT
@@ -391,21 +361,16 @@ int main(int argc, char **argv) {
     else if (!strcmp(format, "bgr")) pixel_format = TJPF_BGR;
     else die("--format must be yuv, rgb or bgr (got %s)", format);
 
-    /* HAL's IDCT is the accurate one (`islow`: CONST_BITS 13, PASS1_BITS 2), so
-     * that is the default here. TJFLAG_FASTDCT selects libjpeg-turbo's `ifast`
-     * kernel, which is a different accuracy class — faster, and not what HAL is
-     * doing. Kept selectable so the gap between the two can be reported. */
+    /* TJFLAG_ACCURATEDCT selects the `islow` kernel (the default),
+     * TJFLAG_FASTDCT the `ifast` kernel. */
     int dct_flag;
     if (!strcmp(dct, "accurate")) dct_flag = TJFLAG_ACCURATEDCT;
     else if (!strcmp(dct, "fast")) dct_flag = TJFLAG_FASTDCT;
     else die("--dct must be accurate or fast (got %s)", dct);
 
-    /* Accuracy-class match for chroma upsampling, same discipline as --dct:
-     * turbo's default (this binary's default too) is "fancy"/triangle
-     * upsampling (do_fancy_upsampling=TRUE); TJFLAG_FASTUPSAMPLE selects its
-     * box/nearest-neighbour fast path — the same accuracy class EdgeFirst's
-     * fused 4:2:0->RGB write uses. Only meaningful on the RGB (tjDecompress2)
-     * path; harmless no-op on tjDecompressToYUV2, which never upsamples. */
+    /* The default is turbo's "fancy"/triangle chroma upsampling;
+     * TJFLAG_FASTUPSAMPLE selects box/nearest-neighbour. Applies to the RGB
+     * (tjDecompress2) path only. */
     int upsample_flag;
     if (!strcmp(upsample, "accurate")) upsample_flag = 0;
     else if (!strcmp(upsample, "fast")) upsample_flag = TJFLAG_FASTUPSAMPLE;
@@ -432,8 +397,7 @@ int main(int argc, char **argv) {
     d.pixel_format = pixel_format;
     d.flags = dct_flag | upsample_flag;
 
-    /* Warm up over the whole measured pipeline so decoder setup and first-touch
-     * page faults land here rather than in the samples. */
+    /* Warm up over the whole measured pipeline. */
     for (size_t i = 0; i < warmup; i++) decode_one(&d, &images[0]);
 
     double *samples = malloc(n * sizeof(*samples));

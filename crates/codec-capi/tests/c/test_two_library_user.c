@@ -1,7 +1,5 @@
-/* G3: the minimal two-library user — edgefirst-codec + edgefirst-tensor only.
-   Decode a JPEG into a HOST-MEMORY tensor and read the pixels back.
-   Host memory is the default allocation and the only kind available without
-   dma-heap privileges, so this is the common case, not an edge case. */
+/* The minimal two-library user: edgefirst-codec and edgefirst-tensor only.
+   Decodes a JPEG into a host-memory tensor and reads the pixels back. */
 #include <edgefirst/codec.h>
 #include <errno.h>
 #include <stdio.h>
@@ -32,7 +30,7 @@ int main(void) {
     if (v.len == 0 || v.ptr == NULL) {
         fprintf(stderr, "FAIL: empty map view\n"); return 4;
     }
-    /* A decoded photograph is not uniformly zero. */
+    /* The decoded pixels are not all zero. */
     size_t nonzero = 0;
     for (size_t i = 0; i < v.len; i++) if (v.ptr[i]) nonzero++;
     if (nonzero * 100 < v.len) {

@@ -52,9 +52,8 @@ pub(super) fn compile_shader_from_str(
     }
 }
 
-/// While one is alive, GL errors on this thread are logged at debug level:
-/// the caller is asking what the driver supports, and a refusal is the
-/// answer, not a fault. The error is still returned.
+/// While one is alive, GL errors on this thread are logged at debug level.
+/// The error is returned either way.
 pub(super) struct ProbeScope {
     outer: bool,
 }
@@ -98,46 +97,12 @@ pub(super) fn check_gl_error(name: &str, line: u32) -> Result<(), Error> {
 }
 
 pub(super) fn generate_vertex_shader() -> &'static str {
-    // Shared with the macOS backend; see `shaders_common::VERTEX_SHADER`.
     super::shaders_common::VERTEX_SHADER
 }
 
 /// `sampler2D` source blit. `src_extent` is the rectangle a sample may reach
 /// (`render::sample_clamp_rect`): the logical image's share of the texture,
-/// inset by half a texel, so a `LINEAR` kernel at the edge of an import that
-/// covers more than the logical image does not blend the texel beyond it.
-///
-/// `src_extent` is `highp` although this shader's default is `mediump`: a
-/// `mediump` bound rounds to a multiple of 2^-11 near 1.0, which on a texture
-/// wider than 1024 lands inside the true half-texel inset and would pull the
-/// last column's sample in by up to half a texel. At `highp` the bound is
-/// exact, so clamping to it reproduces `CLAMP_TO_EDGE` wherever the texture
-/// is the logical image.
-///
-/// `tc` is `highp` for a second, sharper reason: the SAMPLED COORDINATE must
-/// not go through a `mediump` ALU. Passing a varying straight to `texture()`
-/// lets a driver hand the interpolator's own coordinate to the texture unit,
-/// but `clamp()` is arithmetic, and at `mediump` it rounds the result to fp16
-/// — a step of 2^-11 near 1.0, which is 0.625 texel on a 1280-wide source.
-/// `LINEAR` then blends the neighbour in by that fraction. Measured on
-/// Mali-G310 (i.MX 95) with a 1280x720 RGBA identity blit: 96% of the frame
-/// differed from the CPU reference, worst 50/255 mid-frame at an implied
-/// blend fraction of 0.40 texel, and the error was flat across the width
-/// rather than confined to the edges — so it was the coordinate, not the
-/// bound. Clamping to the full texture `[0,0,1,1]` reproduced the corruption
-/// byte for byte; declaring `tc` `highp` removed it. Vivante GC7000UL and
-/// V3D did not show it (issue #170).
-///
-/// Only the CONSUMER's qualifier matters here. The vertex stage still writes
-/// `out vec2 tc;` under a `mediump` default (`shaders_common::VERTEX_SHADER`,
-/// byte-pinned by `golden/vertex.glsl`) and is deliberately left alone:
-/// GLSL ES 3.00 does not match precision across stages, so the fragment
-/// shader's own qualifier governs the interpolation and the ALU it feeds.
-/// Two independent facts confirm it. Removing only the `clamp()` while
-/// leaving that same vertex shader in place made the Mali case pass, so the
-/// vertex write was never the limiting step; and the `highp` shaders that
-/// have always sampled correctly on Mali — `YUYV_RGBA_2D_FRAGMENT` and
-/// `NV_RGBA_FRAGMENT` — are fed by this very vertex shader.
+/// inset by half a texel. `src_extent` and `tc` are `highp`.
 pub(super) fn generate_texture_fragment_shader() -> &'static str {
     "\
 #version 300 es
@@ -156,14 +121,9 @@ void main(){
 "
 }
 
-/// `src_extent` is the rectangle a sample may reach
-/// (`render::sample_clamp_rect`), the same uniform and the same reason as
-/// [`generate_texture_fragment_shader`]: an EGLImage import can cover more
-/// texture than the logical image — a narrowed pool buffer, or a source
-/// rebased onto an aligned DMA-BUF offset (issue #170) — and a `LINEAR`
-/// kernel at the edge must not blend the texels outside it. `highp` although
-/// this shader's default is `mediump`, because a `mediump` bound rounds near
-/// 1.0 and would pull the last column's sample in.
+/// `samplerExternalOES` source blit for EGLImage sources. `src_extent` is the
+/// rectangle a sample may reach (`render::sample_clamp_rect`), as in
+/// [`generate_texture_fragment_shader`].
 pub(super) fn generate_texture_fragment_shader_yuv() -> &'static str {
     "\
 #version 300 es
@@ -182,12 +142,8 @@ void main(){
 "
 }
 
-/// Planar RGB shader using `samplerExternalOES` for EGLImage sources.
-///
-/// Currently byte-identical to [`generate_texture_fragment_shader_yuv`] but
-/// kept as a separate function so the planar draw path can diverge
-/// independently (e.g., for custom per-channel operations). The `_2d`
-/// variant ([`generate_planar_rgb_shader_2d`]) uses `sampler2D` instead.
+/// Planar RGB shader using `samplerExternalOES` for EGLImage sources. The
+/// `_2d` variant ([`generate_planar_rgb_shader_2d`]) uses `sampler2D`.
 pub(super) fn generate_planar_rgb_shader() -> &'static str {
     "\
 #version 300 es
@@ -208,9 +164,8 @@ void main(){
 
 /// Int8 variant of [`generate_texture_fragment_shader`]. Quantizes each RGB
 /// channel to uint8, applies XOR 0x80 bias via `(q + 128) mod 256`, then
-/// normalizes back. Intended for non-external 2D texture sources
-/// (e.g., RGBA/BGRA/Grey textures bound as `sampler2D`). DMA/EGLImage and
-/// other external-OES paths use [`generate_texture_int8_shader_yuv`].
+/// normalizes back. For 2D texture sources bound as `sampler2D`;
+/// external-OES sources use [`generate_texture_int8_shader_yuv`].
 pub(super) fn generate_texture_int8_shader() -> &'static str {
     "\
 #version 300 es
@@ -251,7 +206,7 @@ void main(){
 /// Int8 variant of [`generate_texture_fragment_shader_yuv`]. Applies XOR 0x80 bias
 /// to each RGB channel (uint8 → int8 conversion).
 /// Used for single-pass int8 output with external OES sources (YUV EGLImage).
-/// Carries the same `src_extent` clamp, for the same reason.
+/// Carries the same `src_extent` clamp.
 pub(super) fn generate_texture_int8_shader_yuv() -> &'static str {
     "\
 #version 300 es
@@ -293,7 +248,7 @@ void main(){
 /// Int8 variant of [`generate_planar_rgb_shader`]. Applies XOR 0x80 bias
 /// to each RGB channel (uint8 → int8 conversion) using the bit-exact
 /// quantize+mod approach: `floor(v * 255 + 0.5) + 128 mod 256 / 255`.
-/// Carries the same `src_extent` clamp, for the same reason.
+/// Carries the same `src_extent` clamp.
 pub(super) fn generate_planar_rgb_int8_shader() -> &'static str {
     "\
 #version 300 es
@@ -333,8 +288,7 @@ void main(){
 }
 
 /// 2D-sampler variant of [`generate_planar_rgb_shader`]. Uses `sampler2D`
-/// instead of `samplerExternalOES` for sourcing from intermediate RGBA
-/// textures (e.g., two-pass NV12→RGBA→PlanarRgb on Vivante).
+/// to source from intermediate RGBA textures.
 pub(super) fn generate_planar_rgb_shader_2d() -> &'static str {
     "\
 #version 300 es
@@ -505,8 +459,7 @@ void main() {
 
 /// Int8 proto shader — nearest-neighbor only.
 ///
-/// Uses `texelFetch()` at the nearest texel. No interpolation. Simplest and
-/// fastest GPU execution but may show staircase artifacts at mask edges.
+/// Uses `texelFetch()` at the nearest texel, with no interpolation.
 ///
 /// Layout: `GL_R8I` texture with 1 proto per layer (32 layers).
 /// Mask coefficients packed as `vec4[8]`, indexed `mask_coeff[k/4][k%4]`.
@@ -548,7 +501,7 @@ void main() {
 "
 }
 
-/// Int8 proto shader — shader-based bilinear interpolation (recommended).
+/// Int8 proto shader — shader-based bilinear interpolation.
 ///
 /// Uses `texelFetch()` to fetch 4 neighboring texels per fragment, dequantizes
 /// each, and computes bilinear weights from `fract(tc * textureSize)`.
@@ -607,11 +560,11 @@ void main() {
 "
 }
 
-/// Int8 dequantization pass shader (two-pass Option C, pass 1).
+/// Int8 dequantization pass shader (pass 1 of the two-pass path).
 ///
 /// Reads `GL_R8I` texel, dequantizes, and writes float to `GL_RGBA16F` render
 /// target. This shader processes 4 protos at a time (packing into RGBA).
-/// After this pass, the existing f16 shader reads the dequantized texture with
+/// After this pass, the f16 shader reads the dequantized texture with
 /// `GL_LINEAR`.
 pub(super) fn generate_proto_dequant_shader_int8() -> &'static str {
     "\
@@ -690,7 +643,7 @@ void main() {
 "
 }
 
-/// Tightly-packed NHWC F32 fragment shader for HailoRT consumption.
+/// Tightly-packed NHWC F32 fragment shader.
 ///
 /// Render target is a single-channel `R32F` texture sized `(W*3, H)`:
 /// each output texel holds exactly one float for one `(pixel, channel)` pair.
@@ -699,16 +652,11 @@ void main() {
 /// `[H, W, 3]` F32 buffer (NHWC order, one image in the batch).
 ///
 /// The RGBA8 source texture is fetched via a `sampler2D`, which normalizes
-/// values to `[0, 1]` automatically — no explicit `/255` division needed.
-/// Letterboxing is applied using `dst_rect_px` (the active image region in
-/// pixel coords); pixels outside that rectangle are filled with `pad_color`.
+/// values to `[0, 1]`. Letterboxing is applied using `dst_rect_px` (the
+/// active image region in pixel coords); pixels outside that rectangle are
+/// filled with `pad_color`.
 ///
-/// Source sampling uses an output-pixel-center offset (`+0.5`) so the mapped
-/// source UV lands on the correct location for bilinear resize. With LINEAR
-/// source filtering this yields a proper bilinear resample; for an identity
-/// crop (`src_w == dst_w`) the UV lands exactly on the texel center, giving an
-/// exact passthrough.
-// Consumed by `GLProcessorST` for the F32 NHWC PBO render path.
+/// Source sampling uses an output-pixel-center offset (`+0.5`).
 pub(super) fn generate_packed_f32_nhwc_shader() -> &'static str {
     "\
 #version 300 es
@@ -757,14 +705,11 @@ void main() {
 /// a tightly-packed `[C, H, W]` buffer (CHW order, one plane per row-band).
 /// Width `W` must be a multiple of 4.
 ///
-/// Normalization from RGBA8 → `[0, 1]` is performed for free by the hardware
-/// texture fetch (`sampler2D` normalized fetch).  Letterboxing is applied via
-/// `dst_rect_px`; pixels outside that rectangle are filled with `pad_color`.
+/// The `sampler2D` fetch normalizes RGBA8 to `[0, 1]`. Letterboxing is
+/// applied via `dst_rect_px`; pixels outside that rectangle are filled with
+/// `pad_color`.
 ///
-/// Single source of truth lives in [`super::shaders_common::PLANAR_RGB_F16_PACKED_FRAGMENT`],
-/// shared with the macOS IOSurface and Windows D3D11 texture paths.
-// Consumed by `GLProcessorST` for the F16 NCHW PBO path and the F16/F32 NCHW
-// zero-copy render paths.
+/// Returns [`super::shaders_common::PLANAR_RGB_F16_PACKED_FRAGMENT`].
 pub(super) fn generate_planar_rgb_f16_packed_shader() -> &'static str {
     super::shaders_common::PLANAR_RGB_F16_PACKED_FRAGMENT
 }
@@ -772,9 +717,7 @@ pub(super) fn generate_planar_rgb_f16_packed_shader() -> &'static str {
 /// RGBA8 → packed interleaved-float fragment shader (`Rgb`, F16 or F32) for
 /// the `(W*3/4, H)` zero-copy render surface.
 ///
-/// Single source of truth lives in
-/// [`super::shaders_common::FLOAT_NHWC_PACKED_FRAGMENT`].
-// Consumed by `GLProcessorST` for the interleaved float zero-copy render path.
+/// Returns [`super::shaders_common::FLOAT_NHWC_PACKED_FRAGMENT`].
 pub(super) fn generate_float_nhwc_packed_shader() -> &'static str {
     super::shaders_common::FLOAT_NHWC_PACKED_FRAGMENT
 }
@@ -782,9 +725,7 @@ pub(super) fn generate_float_nhwc_packed_shader() -> &'static str {
 /// RGBA8 → float `Rgba` fragment shader for the `(W, H)` zero-copy render
 /// surface (one texel per pixel, no packing).
 ///
-/// Single source of truth lives in
-/// [`super::shaders_common::FLOAT_RGBA_FRAGMENT`].
-// Consumed by `GLProcessorST` for the float RGBA zero-copy render path.
+/// Returns [`super::shaders_common::FLOAT_RGBA_FRAGMENT`].
 pub(super) fn generate_float_rgba_shader() -> &'static str {
     super::shaders_common::FLOAT_RGBA_FRAGMENT
 }
@@ -810,9 +751,8 @@ void main() {
 ///
 /// Reads from an intermediate RGBA texture and packs 3 RGB channels into
 /// RGBA8 output pixels. Each output pixel stores 4 consecutive bytes of the
-/// destination RGB buffer. Uses only 2 texture fetches per fragment (down
-/// from 4) by exploiting the fact that 4 consecutive bytes span at most 2
-/// source pixels.
+/// destination RGB buffer, read with 2 texture fetches per fragment: 4
+/// consecutive bytes span at most 2 source pixels.
 pub(super) fn generate_packed_rgba8_shader_2d() -> &'static str {
     "\
 #version 300 es
@@ -821,8 +761,8 @@ precision highp int;
 uniform sampler2D tex;
 out vec4 color;
 void main() {
-    // gl_FragCoord is at pixel center (n+0.5). Use floor() for robust
-    // integer pixel index on all GPUs (Vivante, Mali, Adreno).
+    // gl_FragCoord is at pixel center (n+0.5); floor() gives the integer
+    // pixel index.
     int out_x = int(floor(gl_FragCoord.x));
     int out_y = int(floor(gl_FragCoord.y));
     int base = out_x * 4;
@@ -846,9 +786,9 @@ void main() {
 
 /// Packed RGB -> RGBA8 packing shader with int8 XOR 0x80 bias (2D source, pass 2).
 ///
-/// Same packing logic as [`generate_packed_rgba8_shader_2d`] but applies
-/// bit-exact XOR 0x80 bias via quantize+mod: `floor(v * 255 + 0.5) + 128
-/// mod 256 / 255`. This matches the CPU `byte ^ 0x80` operation exactly.
+/// Same packing logic as [`generate_packed_rgba8_shader_2d`], with the XOR
+/// 0x80 bias applied via quantize+mod: `floor(v * 255 + 0.5) + 128 mod 256 /
+/// 255`.
 pub(super) fn generate_packed_rgba8_int8_shader_2d() -> &'static str {
     "\
 #version 300 es
@@ -877,8 +817,8 @@ vec4 int8_bias(vec4 v) {
 #endif
 
 void main() {
-    // gl_FragCoord is at pixel center (n+0.5). Use floor() for robust
-    // integer pixel index on all GPUs (Vivante, Mali, Adreno).
+    // gl_FragCoord is at pixel center (n+0.5); floor() gives the integer
+    // pixel index.
     int out_x = int(floor(gl_FragCoord.x));
     int out_y = int(floor(gl_FragCoord.y));
     int base = out_x * 4;
@@ -913,7 +853,7 @@ void main() {
 "
 }
 
-/// Semi-planar YUV (NV12/NV16/NV24) → RGBA, Path B (R8 sampler2D, ES 3.0 core).
+/// Semi-planar YUV (NV12/NV16/NV24) → RGBA from an R8 `sampler2D` (ES 3.0 core).
 ///
 /// The combined semi-planar buffer is imported as a single-plane R8 EGLImage
 /// (width = `effective_row_stride`, height = luma_h + chroma_h) and bound as
@@ -926,31 +866,17 @@ void main() {
 ///   * `chroma_shift` — (cx, cy) right-shifts: NV12=(1,1), NV16=(1,0), NV24=(0,0).
 ///   * `chroma_lines`  — R8 buffer rows per image-chroma-row: NV12/NV16=1,
 ///     NV24=2 (NV24's 2W-byte CbCr row wraps at `tex_width`, spanning 2 rows;
-///     the shader's `carry` term handles the wrap). Direct 2D addressing — no
-///     per-pixel integer divide/modulo (pathologically slow on Vivante).
+///     the shader's `carry` term handles the wrap).
 ///
 /// Vertex varying is `tc` (vec2, matching `generate_vertex_shader`).
-/// BT.601 full-range matches the CPU kernels and the EGL YUV color hints.
-/// No extension required: `texelFetch` + R8 is core ES 3.0.
 ///
-/// CHROMA-LAYOUT CONTRACT: this shader and the macOS `NV_TO_RGBA_FRAGMENT`
-/// (`macos_processor.rs`) decode the SAME `model-2` combined-plane byte layout
-/// (`PixelFormat::chroma_layout` + `combined_plane_height`), but parameterise it
-/// differently: this one uses `chroma_lines` + a branchless `carry` for direct
-/// 2D `texelFetch`, while macOS uses `uv_row_bytes` + a linear `fetch_r(b)` with
-/// `b % tex_width`. They are kept SEPARATE on purpose — the divide-free form
-/// here is required for Vivante/V3D, while Apple-silicon ANGLE tolerates the
-/// linear form. They are provably equivalent at every NV24 texel (the codec's
-/// `decode_padded_grid_matches_tight` fixture and the `*_opengl_macos` GPU-vs-CPU
-/// tests are the cross-checks); keep both in sync if the layout ever changes.
+/// Returns `shaders_common::NV_RGBA_FRAGMENT`.
 pub(super) fn generate_nv_to_rgba_shader_2d() -> &'static str {
-    // Single source of truth shared with the macOS backend; see
-    // `shaders_common::NV_RGBA_FRAGMENT` and its byte-identity golden test.
     super::shaders_common::NV_RGBA_FRAGMENT
 }
 
 /// Int8 variant of [`generate_nv_to_rgba_shader_2d`], used when the
-/// destination dtype is i8 so no CPU post-processing is needed.
+/// destination dtype is i8.
 pub(super) fn generate_nv_to_rgba_int8_shader_2d() -> &'static str {
     super::shaders_common::NV_RGBA_INT8_FRAGMENT
 }
@@ -1068,7 +994,7 @@ void main() {
 }
 
 /// An int8 shader built with the uniform output mapping of its `quantize()`:
-/// `QUANT_MAPPED` defined after the `#version` line, which must stay first.
+/// `QUANT_MAPPED` defined after the `#version` line.
 pub(super) fn quant_mapped(src: &str) -> String {
     match src.split_once('\n') {
         Some((version, rest)) => format!("{version}\n#define QUANT_MAPPED\n{rest}"),
@@ -1078,8 +1004,7 @@ pub(super) fn quant_mapped(src: &str) -> String {
 
 #[cfg(test)]
 mod quant_build_tests {
-    /// Every int8 shader carries both `quantize()` builds, and the mapped
-    /// build keeps `#version` first.
+    /// Every int8 shader carries both `quantize()` builds; the mapped build keeps `#version` first.
     #[test]
     fn int8_shaders_build_both_ways() {
         let int8 = [
@@ -1109,14 +1034,7 @@ mod quant_build_tests {
 mod tc_precision {
     /// Every shader this module can link, paired with its source: each
     /// generator here, plus the `shaders_common` fragment constants that
-    /// carry a `tc` and are linked directly rather than through a generator
-    /// (`YUYV_RGBA_2D_FRAGMENT` is, at `processor/mod.rs`'s
-    /// `yuyv_program_2d`).
-    ///
-    /// The list is written out by hand rather than discovered, so a new
-    /// shader has to be added here deliberately —
-    /// [`the_list_names_every_shader`] fails until it is. Add new shaders to
-    /// this list.
+    /// carry a `tc` and are linked directly.
     fn all_shaders() -> Vec<(&'static str, &'static str)> {
         vec![
             ("generate_vertex_shader", super::generate_vertex_shader()),
@@ -1365,9 +1283,7 @@ mod tc_precision {
         ]
     }
 
-    /// `//` and `/* */` stripped, so a commented-out sample cannot be counted
-    /// as a real one. Without this a commented `texture(tex, tc)` would raise
-    /// the verbatim-fetch tally and mask a genuine arithmetic use beside it.
+    /// `src` with `//` and `/* */` comments stripped.
     fn strip_comments(src: &str) -> String {
         let b = src.as_bytes();
         let mut out = String::with_capacity(src.len());
@@ -1411,9 +1327,8 @@ mod tc_precision {
         out
     }
 
-    /// How many of those occurrences are `tc` handed VERBATIM to a texture
-    /// fetch — the exact shape `texture(<sampler>, tc)`, the one use that
-    /// needs no arithmetic and so needs no precision promise.
+    /// How many of those occurrences are `tc` handed verbatim to a texture
+    /// fetch: the exact shape `texture(<sampler>, tc)`.
     fn verbatim_fetch_count(src: &str) -> usize {
         let mut n = 0;
         let mut i = 0;
@@ -1466,22 +1381,7 @@ mod tc_precision {
         Some((effective, total > verbatim_fetch_count(src)))
     }
 
-    /// A shader that does ARITHMETIC on `tc` must declare it `highp`.
-    ///
-    /// Handing a varying straight to `texture()` lets a driver give the
-    /// interpolator's own coordinate to the texture unit, but any operation
-    /// on it — `clamp()`, a `vec3(tc, i)` constructor, a multiply — runs on
-    /// the ALU, and a `mediump` ALU is fp16 on Mali: a 2^-11 step, which is
-    /// 0.625 texel on a 1280-wide source, and `LINEAR` blends the neighbour
-    /// in by that fraction (the measurement is in the comment above
-    /// [`super::generate_texture_fragment_shader`]). No other lane can catch
-    /// it — Vivante, V3D and every desktop GL evaluate `mediump` at fp32, and
-    /// the desktop cannot import a DMA-BUF at all — so this test is the only
-    /// guard, and it is textual on purpose.
-    ///
-    /// The rule: count the `tc` identifiers outside the declaration line; a
-    /// shader is doing arithmetic if any of them is not the second argument
-    /// of a verbatim `texture(<sampler>, tc)`.
+    /// A shader that does arithmetic on `tc` declares it `highp`.
     #[test]
     fn shaders_that_compute_on_tc_declare_it_highp() {
         let mut offenders = Vec::new();
@@ -1495,8 +1395,7 @@ mod tc_precision {
                 offenders.push(format!("{name} (tc is {precision})"));
             }
         }
-        // Cross-check the line parser against a dumb substring test: if the
-        // parser silently stops matching a declaration, the two disagree.
+        // Cross-check the line parser against a substring test.
         let expected = all_shaders()
             .iter()
             .filter(|(_, src)| {
@@ -1526,15 +1425,14 @@ mod tc_precision {
     }
 
     /// Every shader name the sources declare: each function in this file
-    /// whose name starts with `generate_`, at ANY visibility, plus each
+    /// whose name starts with `generate_`, at any visibility, plus each
     /// `shaders_common` constant ending `_FRAGMENT` whose body carries a
-    /// `tc`. Textual on purpose — it must not share the parser it checks.
+    /// `tc`.
     fn shader_names_in_source() -> Vec<String> {
         let mut names = Vec::new();
         let this = include_str!("shaders.rs");
         let mut i = 0;
-        // A definition, not a call: the marker is the `fn ` keyword, which
-        // `super::generate_x()` in the list above does not have.
+        // Match definitions (the `fn` keyword), not calls.
         while let Some(k) = this[i..].find("fn generate_") {
             let at = i + k + "fn ".len();
             let rest = &this[at..];
@@ -1585,11 +1483,7 @@ mod tc_precision {
         names
     }
 
-    /// [`all_shaders`] is hand-written, so it can fall behind the sources.
-    /// This pins it by NAME rather than by count, so an omission, a
-    /// duplicate and a shader declared at a different visibility all fail,
-    /// each naming what is wrong. A count alone would let an omission and an
-    /// accidental duplicate cancel out.
+    /// [`all_shaders`] names every shader the sources declare, with no omission or duplicate.
     #[test]
     fn the_list_names_every_shader() {
         let listed: Vec<String> = all_shaders().iter().map(|(n, _)| n.to_string()).collect();
@@ -1623,8 +1517,7 @@ mod tc_precision {
         );
     }
 
-    /// The `tc` identifier scan must not match a longer identifier, or the
-    /// rule would fire on unrelated names.
+    /// The `tc` identifier scan does not match a longer identifier.
     #[test]
     fn tc_scan_matches_the_identifier_only() {
         assert_eq!(tc_identifier_offsets("tc").len(), 1);
@@ -1636,9 +1529,7 @@ mod tc_precision {
         assert_eq!(verbatim_fetch_count("texture(tex, vec3(tc, i))"), 0);
     }
 
-    /// A commented-out verbatim sample must not be counted, or it would
-    /// cancel a real arithmetic use sitting beside it and let an offender
-    /// through.
+    /// A commented-out verbatim sample is not counted.
     #[test]
     fn a_commented_out_sample_does_not_mask_an_arithmetic_use() {
         let src = "\
@@ -1659,7 +1550,7 @@ void main(){
             "the commented sample must not hide the clamp"
         );
 
-        // The block-comment form, and a comment that is the ONLY use.
+        // The block-comment form, and a comment that is the only use.
         let only_comment = "\
 #version 300 es
 precision mediump float;
@@ -1674,8 +1565,7 @@ void main(){ /* texture(tex, tc) */ color = vec4(0.0); }
 mod probe_scope_tests {
     use super::{gl_error_level, ProbeScope};
 
-    /// A probe quiets GL errors for as long as it lasts, nested or not, and
-    /// the level comes back when it ends.
+    /// A probe logs GL errors at debug level while it lasts, nested or not, then restores the level.
     #[test]
     fn gl_errors_are_logged_at_debug_inside_a_probe() {
         assert_eq!(gl_error_level(), log::Level::Error);

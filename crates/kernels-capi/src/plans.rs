@@ -40,7 +40,7 @@ unsafe fn levels(ptr: *const EfKernelLevel, n: usize) -> Result<Vec<k::Level>, C
     Ok(v)
 }
 
-/// Sets `*out` to NULL when `out` is non-NULL, so every failure leaves it NULL.
+/// Sets `*out` to NULL when `out` is non-NULL.
 ///
 /// # Safety
 /// `out` must be NULL or writable.
@@ -133,7 +133,7 @@ pub(crate) unsafe fn run_plan_n<P, const N: usize>(
     // SAFETY: the C contract makes the views valid for the call, and the output overlaps no
     // input.
     let output = unsafe { tensor_mut(output)? };
-    // SAFETY: as above; inputs are only read, so they may share memory.
+    // SAFETY: as above; the inputs are only read.
     let inputs = inputs.map(|i| unsafe { tensor_ref(i) });
     f(
         plan,
@@ -155,7 +155,7 @@ unsafe fn free_plan<P>(plan: *mut P) {
     if plan.is_null() {
         return;
     }
-    // A panic must not unwind into C; a plan's drop frees memory only, so one is not expected.
+    // Catches a panic from the plan's drop.
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         // SAFETY: the caller owns `plan`, which came from `Box::into_raw`.
         drop(unsafe { Box::from_raw(plan) });

@@ -3,11 +3,8 @@
 
 """Tests for the hardware-test / hardware-bench fleet roll-up.
 
-The roll-up turns one artifact per board into the run's summary and decides
-whether the run is red. These tests pin what the workflows depend on: every
-requested board gets a row naming the runner that ran it, a board that failed
-or uploaded nothing fails the run, a board reported unavailable does not, and
-a run that scheduled nothing fails rather than passing having tested nothing.
+Covers the per-board rows and the conditions that fail the run: a board that failed or
+uploaded nothing, and a run that scheduled nothing.
 """
 
 import csv
@@ -248,7 +245,7 @@ def test_bench_headline_and_all_cases_across_boards(tmp_path, capsys):
     )
     assert status == 0
     assert "| GL letterbox 1080p YUYV→RGBA | 3.03 ms | 1.20 ms |" in out
-    # A repeated harness name stays two rows rather than one overwriting the other.
+    # A repeated harness name stays two rows.
     assert "`letterbox/1920x1080/YUYV->640x640/RGB #2`" in out
     assert "Cortex-A78C (8)" in out
     assert "Adreno663v1" in out

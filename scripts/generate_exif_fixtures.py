@@ -4,13 +4,8 @@
 """Generate EXIF orientation fixtures for codec tests/benchmarks.
 
 For each EXIF orientation value (1..=8), produce a JPEG and a PNG whose
-**pixel bytes are identical to `zidane.jpg`** and whose **only difference
-is the EXIF orientation tag**. This lets tests assert:
-
-  - apply_exif=false on all 8 variants yields the same decoded bytes
-    (since the JPEG/PNG IDAT/SOS content is unchanged).
-  - apply_exif=true on each variant yields the orientation-specific
-    transform applied to the orientation=1 reference.
+pixel bytes are identical to `zidane.jpg` and whose only difference is the
+EXIF orientation tag.
 
 EXIF orientation reference (per EXIF/TIFF spec):
    1: Identity                  (no transform)
@@ -27,9 +22,7 @@ Run once when fixtures are missing or zidane.jpg changes:
     source venv/bin/activate
     python scripts/generate_exif_fixtures.py
 
-The generated files (`testdata/zidane_exif_<N>.jpg|.png` for N in 1..=8)
-are committed to the repository so cross-target benchmark deployments
-don't need to regenerate them.
+The generated files are `testdata/zidane_exif_<N>.jpg|.png` for N in 1..=8.
 """
 
 from __future__ import annotations
@@ -50,7 +43,7 @@ def jpeg_with_orientation(zidane_jpg_bytes: bytes, orientation: int) -> bytes:
     """Return a JPEG identical to `zidane_jpg_bytes` except for the EXIF
     orientation tag. Uses piexif to rewrite the APP1 segment; the entropy-
     coded scan data is untouched."""
-    # piexif works on a fresh EXIF dict so we can set just orientation
+    # An EXIF dict holding only the orientation tag.
     exif_dict = {"0th": {piexif.ImageIFD.Orientation: orientation}, "Exif": {}, "GPS": {}, "1st": {}, "thumbnail": None}
     exif_bytes = piexif.dump(exif_dict)
     out = io.BytesIO()
@@ -72,17 +65,11 @@ def png_with_orientation(zidane_jpg_bytes: bytes, orientation: int) -> bytes:
     """Encode zidane's pixels as PNG with an `eXIf` chunk carrying the
     given orientation.
 
-    PIL's `PngInfo.add()` does not actually write custom chunks like
-    `eXIf` (silently dropped on save), so we post-process: render the
-    PNG without EXIF, then splice an `eXIf` chunk in between IHDR and
-    the first IDAT. PNG IDAT content is reproducible (Pillow's
-    deterministic deflate), so all 8 PNG variants differ only in the
-    inserted `eXIf` chunk."""
+    Renders the PNG without EXIF, then splices an `eXIf` chunk in between
+    IHDR and the first IDAT."""
     src = Image.open(io.BytesIO(zidane_jpg_bytes)).convert("RGB")
 
-    # Build a TIFF-formatted EXIF block (no JPEG APP1 "Exif\0\0" prefix —
-    # PNG eXIf chunks carry only the TIFF data per the PNG eXIf chunk
-    # spec).
+    # Build a TIFF-formatted EXIF block (no JPEG APP1 "Exif\0\0" prefix).
     exif_dict = {"0th": {piexif.ImageIFD.Orientation: orientation}, "Exif": {}, "GPS": {}, "1st": {}, "thumbnail": None}
     raw = piexif.dump(exif_dict)
     if raw.startswith(b"Exif\x00\x00"):
@@ -122,7 +109,7 @@ def main() -> int:
         jpg_path.write_bytes(jpg_bytes)
         png_path.write_bytes(png_bytes)
 
-        # Sanity: round-trip the EXIF tag we just wrote.
+        # Round-trip the EXIF tag.
         rt = piexif.load(jpg_bytes)
         got = rt["0th"].get(piexif.ImageIFD.Orientation)
         ok = "OK" if got == orientation else f"BAD (got {got})"

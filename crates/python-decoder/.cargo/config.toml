@@ -1,4 +1,3 @@
-# Selects edgefirst-tensor's dynamic backend; each shared-library leaf carries this file as its .cargo/config.toml.
-# Never use RUSTFLAGS instead: it replaces every config rustflags. See ARCHITECTURE.md § Tensor Backend Selection.
+# Selects edgefirst-tensor's dynamic backend.
 [target.'cfg(all())']
 rustflags = ["--cfg", "edgefirst_tensor_dynamic"]

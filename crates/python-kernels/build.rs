@@ -3,6 +3,6 @@
 
 fn main() {
     pyo3_build_config::use_pyo3_cfgs();
-    // Kernels does not link libedgefirst_tensor: the plans operate on borrowed numpy buffers.
+    // Kernels does not link libedgefirst_tensor.
     edgefirst_build_support::python_extension();
 }

@@ -1,43 +1,12 @@
 // SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! The convert span must actually CARRY `src_feed` and `dst_feed`, and
-//! `dst_feed` must be recorded for EVERY destination, not only a refused
-//! import.
+//! The `image.convert.gl` span carries `src_feed` and `dst_feed`, and
+//! `dst_feed` is recorded for every destination.
 //!
-//! Both fields are declared on `image.convert.gl`, and every recording site
-//! reaches that span through the handle the engine captures rather than through
-//! `Span::current()` — which inside the engine names `image.convert.gl.engine`,
-//! and on the two-pass plans a pass span. `tracing` drops a record against a
-//! field the span does not declare, silently, so the wrong span means the
-//! catalog promises an observable nothing emits. Both fields were in exactly
-//! that state (#175).
-//!
-//! **This is its own test binary, and it holds exactly one test, deliberately.**
-//! `tracing` caches callsite interest process-wide: the first evaluation of a
-//! callsite decides its `Interest`, and a thread with no subscriber caches
-//! `never`, which no later scoped subscriber undoes. As a lib test among ~470
-//! others running in parallel it therefore failed about four runs in nine —
-//! seeing `image.convert.gl.engine` (a callsite first evaluated inside the
-//! scoped subscriber, during the processor's own DMA-BUF probe) but never
-//! `image.convert.gl` (one another thread had already reached). A dedicated
-//! process with a GLOBAL subscriber installed before the first span removes the
-//! race rather than narrowing it, and lets the public `GLProcessorThreaded` be
-//! the thing under test: a global subscriber is visible from its GL worker
-//! thread, where a thread-local one is not.
-//!
-//! No test hook either. The `dst_feed` half is driven by a driver that really
-//! refuses a destination — Vivante returns `EGL_BAD_ACCESS` for an import at an
-//! offset that is not 64-byte aligned — so the trigger under test is the
-//! production one. Where the driver accepts that destination (Mali, V3D) there
-//! is nothing refused and that half self-skips; `src_feed` is asserted on every
-//! host, including a desktop whose EGL cannot import a DMA-BUF at all.
-//!
-//! The float route (planar F16 zero-copy on Linux, F32 on Windows) enters the
-//! same `image.convert.gl` span and records both feed fields. A host that
-//! cannot hold or render that destination skips with a reason; the
-//! `HAL_TEST_REQUIRE_GL=1` gate on processor creation stays after the GL
-//! bring-up skip, not after an unroutable float destination.
+//! This test binary holds one test and installs a global `tracing` subscriber
+//! before the first span. The refused-destination and float halves skip on a
+//! host that cannot reach them.
 
 #![cfg(all(feature = "opengl", any(target_os = "linux", target_os = "windows")))]
 
@@ -51,11 +20,10 @@ use tracing_subscriber::layer::SubscriberExt;
 const W: usize = 320;
 const H: usize = 240;
 const BPP: usize = 4;
-/// Pseudo-field marking a span creation rather than a field record.
+/// Pseudo-field marking a span creation.
 const NEW_SPAN: &str = "<new_span>";
 
-/// `(span name, field, value)` for every `record` call, plus one entry per span
-/// creation so an absent field can be told from a dead capture.
+/// `(span name, field, value)` for every `record` call, plus one entry per span creation.
 type Records = Arc<Mutex<Vec<(String, String, String)>>>;
 
 struct Capture(Records);
@@ -145,9 +113,7 @@ fn values_for(seen: &[(String, String, String)], field: &str) -> Vec<String> {
 #[test]
 fn the_convert_span_records_the_feed_fields() {
     let records: Records = Arc::new(Mutex::new(Vec::new()));
-    // GLOBAL, not scoped: the convert runs on `GLProcessorThreaded`'s worker
-    // thread, and it must be installed before the first span so this process
-    // cannot have cached `Interest::never()` for any callsite under test.
+    // A global subscriber, installed before the first span.
     tracing::subscriber::set_global_default(
         tracing_subscriber::registry().with(Capture(records.clone())),
     )
@@ -166,8 +132,6 @@ fn the_convert_span_records_the_feed_fields() {
     };
 
     // ── src_feed: asserted on every host ────────────────────────────────
-    // A host-memory source and destination need no zero-copy anything, so
-    // this half runs on a desktop whose EGL cannot import a DMA-BUF.
     let src = host_image(W, H);
     {
         let mut m = src.map_bytes(CpuAccess::Write).expect("map source");
@@ -196,7 +160,7 @@ fn the_convert_span_records_the_feed_fields() {
         "src_feed must be one of import|pbo|upload, saw {feeds:?}"
     );
 
-    // A zero-copy source, so the `import` arm is covered where a host has one.
+    // A zero-copy source, where the host has one.
     if let Some(dma_src) = zero_copy_rgba(W, H) {
         {
             let mut m = dma_src.map_bytes(CpuAccess::Write).expect("map dma source");
@@ -208,10 +172,6 @@ fn the_convert_span_records_the_feed_fields() {
     eprintln!("CAPTURE src_feed on image.convert.gl: {src_feeds:?}");
 
     // ── dst_feed: stated for every destination ──────────────────────────
-    // The host-memory convert above is a `mapped_texture` destination, and the
-    // field must SAY so. An absent field used to be the only signal for an
-    // ordinary texture-lowered convert, which reads exactly like a zero-copy
-    // one that never recorded anything.
     let dst_feeds = values_for(&records.lock().unwrap().clone(), "dst_feed");
     assert!(
         dst_feeds.iter().any(|v| v == "mapped_texture"),
@@ -224,16 +184,7 @@ fn the_convert_span_records_the_feed_fields() {
         "dst_feed must be one of zero_copy|mapped_texture|pbo, saw {dst_feeds:?}"
     );
 
-    // A zero-copy destination the driver ACCEPTS must say `zero_copy` -- the
-    // half an import-refusal marker could never state, and the one that makes
-    // the field readable without inference.
-    //
-    // Reachable only where the display can render into a DMA-BUF at all: on a
-    // host whose transfer backend fell back to PBO, a DMA-BUF destination is
-    // lowered to the mapped route with no import attempted, and
-    // `mapped_texture` is then the correct answer. The value is checked
-    // against the vocabulary on every host either way, which is what catches a
-    // missing or misspelled record.
+    // A zero-copy destination, where the host has one.
     if let Some(mut zc) = zero_copy_rgba(W, H) {
         let _ = gl.convert(&src, &mut zc, None);
     }
@@ -252,8 +203,7 @@ fn the_convert_span_records_the_feed_fields() {
     eprintln!("CAPTURE dst_feed values: {feeds:?}");
 
     // ── Float route: same span, both feed fields ────────────────────────
-    // Mem float destinations never classify as a GL float path. The
-    // destination must be the platform's zero-copy GPU buffer.
+    // The float destination is the platform's zero-copy GPU buffer.
     #[cfg(target_os = "linux")]
     let (dst_fmt, dst_dtype) = (PixelFormat::PlanarRgb, DType::F16);
     #[cfg(target_os = "windows")]
@@ -266,7 +216,6 @@ fn the_convert_span_records_the_feed_fields() {
                 .expect("map float src");
             m.as_mut_slice().fill(0x40);
         }
-        // Isolated from the u8 converts above, whose feed records would otherwise satisfy these assertions.
         records.lock().unwrap().clear();
         match gl.convert(&float_src, &mut float_dst, None) {
             Ok(()) => {
@@ -297,10 +246,9 @@ fn the_convert_span_records_the_feed_fields() {
         }
     }
 
-    // ── dst_feed on the REFUSED route, where a driver really refuses ─────
-    // The rebuilt-view shape `offset_source_view_alignment.rs` pins: it
-    // carries the byte offset and no `view_origin`, so the import bases at
-    // that offset, and Vivante refuses it when it is not 64-byte aligned.
+    // ── dst_feed on the refused route ───────────────────────────────────
+    // A destination rebuilt from a view's descriptor at a byte offset that is
+    // not 64-byte aligned.
     let Some(canvas) = zero_copy_rgba(64, 64) else {
         return;
     };

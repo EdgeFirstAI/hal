@@ -4,20 +4,12 @@
 //! GL float (F16/F32) preprocessing paths (Linux DMA-BUF + macOS IOSurface
 //! zero-copy targets, Tegra PBO targets).
 //!
-//! This is a child module of [`super`] (`gl::processor`) so the
-//! `impl GLProcessorST` block here can access the parent's PRIVATE fields
-//! (`convert_fbo`, `float_render_texture`, the float programs, EGLImage caches,
-//! capability flags, …) via the same-module-tree visibility rules. None of
-//! those fields are promoted to `pub(super)` for this move.
-//!
 //! Items grouped here:
-//! * [`float_render_support`] — reportable float-render capability.
-//! * [`packed_planar_layout`] — packed zero-copy surface geometry for a
+//! * [`float_render_support`]: reportable float-render capability.
+//! * [`packed_planar_layout`]: packed zero-copy surface geometry for a
 //!   planar float destination.
 //! * The [`GLProcessorST`] float render methods: `convert_float_to_pbo`,
-//!   `convert_float_to_zero_copy`, `render_float_to_zero_copy_tail` (the
-//!   dst-import/draw half, shared with the fused NV→PlanarF16 two-pass —
-//!   its source is the GPU-resident intermediate texture),
+//!   `convert_float_to_zero_copy`, `render_float_to_zero_copy_tail`,
 //!   `feed_float_src`, `draw_float_quad`.
 
 use std::ffi::{c_void, CStr};
@@ -32,28 +24,22 @@ use super::{
 use crate::{Error, Flip, ResolvedCrop, Rotation};
 use edgefirst_tensor::{DType, PixelFormat, Tensor, TensorDyn, TensorMemory, TensorTrait};
 
-// The float render-path decision (`FloatRenderPath` + `classify_float_render`)
-// is defined once in the cfg-agnostic `gl::float_dispatch` module so the Linux
-// and macOS backends share a single source of truth. Re-imported here so this
-// module's call sites and the `gl::tests` unit tests keep using the
-// `processor::{FloatRenderPath, classify_float_render}` paths unchanged.
+// Re-imports the float render-path decision from `gl::float_dispatch`.
 pub(in super::super) use super::super::float_dispatch::{classify_float_render, FloatRenderPath};
 
-/// How the float source reached the GPU this frame — the zero-copy
-/// telemetry primitive (see `ConvertStats`).
+/// How the float source reached the GPU this frame (see `ConvertStats`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in super::super) enum FloatSrcFeed {
     /// Zero-copy: the source's Dma buffer is the texture's storage.
     Import,
-    /// GL-internal copy from the source PBO (no CPU visit).
+    /// GL-internal copy from the source PBO.
     Pbo,
-    /// CPU map + TexImage upload — the copy fallback.
+    /// CPU map + TexImage upload.
     Upload,
 }
 
-/// `EDGEFIRST_GL_NO_FLOAT_SRC_IMPORT=1` disables the float-path zero-copy
-/// source import (field escape hatch — a driver that mis-renders TEXTURE_2D
-/// dma-buf attaches can fall back to the upload path without a rebuild).
+/// Whether `EDGEFIRST_GL_NO_FLOAT_SRC_IMPORT=1` disables the float-path
+/// zero-copy source import.
 fn float_src_import_disabled() -> bool {
     static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *DISABLED.get_or_init(|| {
@@ -63,16 +49,11 @@ fn float_src_import_disabled() -> bool {
     })
 }
 
-/// Decide reportable float render support. Vivante GC7000UL float readback is
-/// 170-320 ms (probe-measured) so GL float is refused there; `ImageProcessor`
-/// falls back to CPU float output (normalized to `[0, 1]`), not u8.
+/// Reportable float render support: none on Vivante or when
+/// `float_import_refused`, otherwise what the two extensions provide.
 ///
 /// `float_import_refused` is a driver whose EGL imports no float DMA-BUF
-/// format (Adreno on Linux: `eglQueryDmaBufFormatsEXT` lists no
-/// `AB4H`/`AB8H`, and the import fails `EGL_BAD_MATCH`) running on a
-/// zero-copy transfer backend. Every float destination GL serves there is a
-/// zero-copy import, so none is servable and float output goes to the CPU up
-/// front rather than failing an import per frame.
+/// format, running on a zero-copy transfer backend.
 pub(in super::super) fn float_render_support(
     is_vivante: bool,
     float_import_refused: bool,
@@ -99,13 +80,7 @@ pub(in super::super) fn float_render_support(
 /// texel holds four contiguous planar elements, giving a GL-visible surface of
 /// `(W/4, C*H)` texels.
 ///
-/// Returns `None` when `W` is not divisible by 4 (the packing requires whole
-/// texels per row), signalling the caller to fall back to CPU.
-///
-/// The same geometry the allocators derive — `edgefirst_tensor`'s
-/// `packed_rgba16f_layout` (F16 IOSurface/AHardwareBuffer) and
-/// `d3d11_layout::image_d3d11_layout` (both dtypes) — so a destination
-/// allocated there imports at exactly these dimensions.
+/// Returns `None` when `W` is not divisible by 4.
 pub(in super::super) fn packed_planar_layout(w: u32, h: u32, channels: u32) -> Option<(u32, u32)> {
     if !w.is_multiple_of(4) {
         return None;
@@ -117,9 +92,7 @@ pub(in super::super) fn packed_planar_layout(w: u32, h: u32, channels: u32) -> O
 /// destination: four contiguous interleaved elements per texel give a surface
 /// of `(W*3/4, H)`.
 ///
-/// Returns `None` unless `W*3` divides into whole texels, which for a
-/// three-channel row means `W % 4 == 0` — the same rule
-/// `d3d11_layout::image_d3d11_layout` applies to an `Rgb` float texture.
+/// Returns `None` unless `W*3` is divisible by 4.
 fn packed_interleaved_layout(w: u32, h: u32) -> Option<(u32, u32)> {
     let row = w.checked_mul(3)?;
     if !row.is_multiple_of(4) {
@@ -128,11 +101,8 @@ fn packed_interleaved_layout(w: u32, h: u32) -> Option<(u32, u32)> {
     Some((row / 4, h))
 }
 
-/// Fetch the PBO buffer id of a float PBO destination tensor.
-///
-/// Shared by the `TensorDyn::F32`/`F16` arms of `convert_float_to_pbo`:
-/// resolves the tensor's buffer id (`NotSupported`-equivalent `OpenGl` error
-/// when the tensor is not PBO-backed) and rejects a currently-mapped PBO.
+/// Fetch the PBO buffer id of a float PBO destination tensor. Returns an
+/// `OpenGl` error when the tensor is not PBO-backed or the PBO is mapped.
 fn float_pbo_buffer_id<T>(t: &edgefirst_tensor::Tensor<T>) -> crate::Result<u32>
 where
     T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync + edgefirst_tensor::Element,
@@ -149,30 +119,19 @@ where
 }
 
 /// Block until all previously-issued GL commands have completed, using a fence
-/// sync instead of a full-queue `glFinish` drain.
-///
-/// This preserves the same blocking-completion contract the float paths relied
-/// on (`glFinish`): when this returns, the readback into the mapped PBO / the
-/// render into the dma-buf is guaranteed complete, so the result is safe to
-/// read. The difference is scope: `glFenceSync` + `glClientWaitSync` waits only
-/// for the commands issued before the fence rather than draining the entire GPU
-/// queue, so the producer thread can enqueue the next frame's work sooner.
-///
-/// `GL_SYNC_FLUSH_COMMANDS_BIT` is passed so the wait flushes the command
-/// buffer and cannot deadlock waiting on un-submitted work. On any failure
-/// (fence creation failed, timeout, or `GL_WAIT_FAILED`) it falls back to a
-/// blocking `glFinish` so the completion guarantee is never silently dropped.
+/// sync (`glFenceSync` + `glClientWaitSync` with
+/// `GL_SYNC_FLUSH_COMMANDS_BIT`). Falls back to a blocking `glFinish` when
+/// the fence cannot be created, the wait times out or it fails.
 ///
 /// # Safety
 /// Must be called on the thread owning the current GL context.
 pub(super) unsafe fn finish_via_fence() {
     unsafe {
-        // 1 second, in nanoseconds — generous; a healthy convert completes in well
-        // under a millisecond and never reaches the timeout.
+        // 1 second, in nanoseconds.
         const TIMEOUT_NS: u64 = 1_000_000_000;
         let sync = edgefirst_gl::gl::FenceSync(edgefirst_gl::gl::SYNC_GPU_COMMANDS_COMPLETE, 0);
         if sync.is_null() {
-            // Fence could not be created; preserve the completion guarantee.
+            // The fence could not be created.
             edgefirst_gl::gl::Finish();
             return;
         }
@@ -185,8 +144,7 @@ pub(super) unsafe fn finish_via_fence() {
         match status {
             s if s == edgefirst_gl::gl::ALREADY_SIGNALED
                 || s == edgefirst_gl::gl::CONDITION_SATISFIED => {}
-            // Timeout expired or the wait failed: fall back to a blocking drain so
-            // the caller never proceeds on an incomplete readback/render.
+            // Timeout expired or the wait failed.
             _ => edgefirst_gl::gl::Finish(),
         }
     }
@@ -195,23 +153,14 @@ pub(super) unsafe fn finish_via_fence() {
 /// `glReadPixels` the packed float render target into the destination PBO,
 /// placing each destination row at its own pitch.
 ///
-/// The float counterpart of the u8 `read_pixels_into_pbo`, and the same three
-/// routes: a tight destination takes exactly the read it always did, a pitch
-/// that is a whole number of texels is handed to GL as `GL_PACK_ROW_LENGTH`
-/// so the transfer stays CPU-free, and a pitch no texel size divides is read
-/// tight and spread inside the PBO's own mapping. There is no
-/// `direct_read_supported` question here and no BGRA swap: the pack format is
-/// the render target's own, and the float shaders write the destination's
-/// channel order already.
-///
-/// The spread route is reachable: an F16 NCHW destination reads 8 bytes to a
-/// texel, so a plane-row pitch padded by 4 bytes is not expressible in texels.
+/// A pitch that is a whole number of texels is handed to GL as
+/// `GL_PACK_ROW_LENGTH`; a pitch no texel size divides is read tight and
+/// spread inside the PBO's own mapping.
 ///
 /// # Safety
 /// Must run on the GL thread with the float render target bound as a complete
-/// read framebuffer. `layout` must describe this destination -- its `needed`
-/// is the bound every write here stays inside, and nothing below can check it
-/// (the read and the mapping both go through raw pointers).
+/// read framebuffer. `layout` must describe this destination: every write
+/// stays inside its `needed` bytes.
 unsafe fn read_float_pixels_into_pbo(
     layout: &PboReadbackLayout,
     buffer_id: u32,
@@ -234,9 +183,6 @@ unsafe fn read_float_pixels_into_pbo(
         if let Some(pixels) = row_length {
             edgefirst_gl::gl::PixelStorei(edgefirst_gl::gl::PACK_ROW_LENGTH, pixels);
         }
-        // Plain ReadPixels — glReadnPixels is ES 3.2-only and rejected by
-        // ANGLE/Metal's ES 3.0 contexts (see `readback_rendered`). The PBO
-        // PACK binding bounds the write.
         edgefirst_gl::gl::ReadPixels(
             0,
             0,
@@ -250,9 +196,7 @@ unsafe fn read_float_pixels_into_pbo(
             edgefirst_gl::gl::PixelStorei(edgefirst_gl::gl::PACK_ROW_LENGTH, 0);
         }
         edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::PIXEL_PACK_BUFFER, 0);
-        // Wait for the readback into the destination PBO to complete before
-        // returning (same contract as glFinish, scoped to a fence). The spread
-        // below reads what it wrote, so this wait has to precede it.
+        // Waits for the readback into the destination PBO to complete.
         finish_via_fence();
     }
     check_gl_error(function!(), line!())?;
@@ -275,41 +219,20 @@ unsafe fn read_float_pixels_into_pbo(
 
 impl GLProcessorST {
     /// Feed the RGBA8 source into `camera_normal_texture` for the float
-    /// render paths (PBO and zero-copy F16), preferring zero-copy.
+    /// render paths, preferring zero-copy.
     ///
     /// Feed order:
-    /// 1. **Import** — a `TensorMemory::DmaBuf` source on a zero-copy backend
-    ///    is attached as the texture's storage (EGLImage on Linux/Android,
-    ///    IOSurface pbuffer bind on macOS) through the same
-    ///    `get_or_create_egl_image(CacheKind::Src)` cache the u8 engine
-    ///    uses. No map, no upload, no per-frame cache-maintenance on the
-    ///    source buffer. NOTE the gate deliberately does NOT carry the u8
-    ///    path's `!is_dma()` exclusion (`draw_src_texture`,
-    ///    `zero_copy_attach`): on Linux `is_dma()` is true and the u8
-    ///    engine samples imports via `GL_TEXTURE_EXTERNAL_OES`, but the
-    ///    float shaders sample plain `sampler2D`, so the float path wants
-    ///    the `TEXTURE_2D` attach on Linux too. Do not "fix" the gates to
-    ///    match.
-    /// 2. **PBO** — uploaded via `GL_PIXEL_UNPACK_BUFFER` (a GPU-side copy;
-    ///    the buffer is never mapped).
-    /// 3. **Upload** — CPU map + `TexImage2D`/`TexSubImage2D` (the
-    ///    fallback copy path; logged at debug when it follows a failed
-    ///    import).
+    /// 1. **Import**: a `TensorMemory::DmaBuf` source on a zero-copy backend
+    ///    is attached as the texture's storage through the
+    ///    `get_or_create_egl_image(CacheKind::Src)` cache.
+    /// 2. **PBO**: uploaded via `GL_PIXEL_UNPACK_BUFFER`.
+    /// 3. **Upload**: CPU map + `TexImage2D`/`TexSubImage2D`.
     ///
-    /// `EDGEFIRST_GL_NO_FLOAT_SRC_IMPORT=1` disables arm 1 (field escape
-    /// hatch, mirroring `EDGEFIRST_GL_NO_FLOAT_LINEAR`).
+    /// `EDGEFIRST_GL_NO_FLOAT_SRC_IMPORT=1` disables arm 1.
     ///
-    /// Resets the texture swizzle to identity first (a prior Grey/planar
-    /// conversion may have left it non-identity).
-    ///
-    /// Storage-state contract (the "poison", mirroring the u8 attach at
-    /// `draw_src_texture`): after an Import, `camera_normal_texture.target`
-    /// is set to 0 so a later upload frame must re-`TexImage2D` fresh
-    /// storage — `TexSubImage2D` into an EGLImage-sibling texture would
-    /// write through into the client's live buffer. In the reverse
-    /// direction, `Texture::upload` clears `bound_egl_key` whenever it
-    /// reallocates, so a later import frame can never be skipped by the
-    /// binding-skip cache.
+    /// Resets the texture swizzle to identity first. After an import the
+    /// texture's upload-tracking storage is forgotten, so a later upload
+    /// allocates fresh storage.
     pub(super) fn feed_float_src(
         &mut self,
         src_u8: &Tensor<u8>,
@@ -342,8 +265,7 @@ impl GLProcessorST {
                 edgefirst_gl::gl::TEXTURE_WRAP_T,
                 edgefirst_gl::gl::CLAMP_TO_EDGE as i32,
             );
-            // Identity swizzle (a prior Grey/planar conversion may have left
-            // TEXTURE_SWIZZLE_* in a non-identity state on this texture).
+            // Identity swizzle.
             for (swizzle, comp) in [
                 (edgefirst_gl::gl::TEXTURE_SWIZZLE_R, edgefirst_gl::gl::RED),
                 (edgefirst_gl::gl::TEXTURE_SWIZZLE_G, edgefirst_gl::gl::GREEN),
@@ -363,22 +285,17 @@ impl GLProcessorST {
             let key = BufferImportKey::from_tensor(src_u8, PixelFormat::Rgba, false);
             match self.get_or_create_egl_image(CacheKind::Src, src_u8, PixelFormat::Rgba) {
                 Ok(handle) => {
-                    // SAFETY: camera_normal_texture is bound on the active
-                    // unit (prologue above); the handle's import is owned by
-                    // the src cache.
+                    // SAFETY: camera_normal_texture is bound on the active unit; the
+                    // handle's import is owned by the src cache.
                     let attach = unsafe {
                         self.camera_normal_texture
                             .bind_egl_image(&self.gl_context, key, handle)
                     };
-                    // Explicit glGetError: the Linux `attach_tex_image_2d`
-                    // does not check it, and some drivers (Vivante) accept
-                    // dma-buf EGLImages only on EXTERNAL_OES targets —
-                    // GL_INVALID_OPERATION here must fall back to upload,
-                    // not render garbage.
+                    // Checks glGetError after the attach; a failure falls back to the
+                    // upload.
                     match attach.and_then(|_| check_gl_error(function!(), line!())) {
                         Ok(()) => {
-                            // Upload-poison (see doc comment): a later
-                            // upload frame must TexImage2D fresh storage.
+                            // Forgets the upload-tracking storage.
                             self.camera_normal_texture.forget_storage();
                             self.convert_stats.src_imports += 1;
                             convert_span.record("src_feed", "import");
@@ -400,22 +317,9 @@ impl GLProcessorST {
             }
         }
 
-        // ── Arms 2 and 3: a PBO source (GL-internal copy, no CPU visit), or
-        // a CPU map + upload (the copy fallback). The map happens ONLY here —
-        // a Dma source that imported above never pays the per-frame
-        // lock/sync cache maintenance. Both share `camera_normal_texture`'s
-        // size/format cache with the u8 engine, so a steady-state video path
-        // (fixed input size) reuses storage with `TexSubImage2D`.
-        //
-        // This feed is RGBA-only, hence the fixed 4 bytes per pixel. The row
-        // length comes from `unpack_row_length` rather than `stride / 4`:
-        // that division truncates, and this state counts PIXELS, so a pitch
-        // 4 does not divide would advance GL by up to three bytes less than
-        // the source's real row and shear every row after the first --
-        // silently. A PBO can carry any pitch at or above the format minimum
-        // (`set_row_stride`, `ef_tensor_wrap_pbo`), so the refusal is not
-        // theoretical. Both `?`s propagate before any pixel-store state is
-        // touched.
+        // ── Arms 2 and 3: a PBO source (GL-internal copy), or a CPU map +
+        // upload. This feed is RGBA-only: 4 bytes per pixel. The row length
+        // comes from `unpack_row_length`.
         const SRC_BPP: usize = 4;
         let row_len_px =
             super::unpack_row_length(src_u8.effective_row_stride(), src_w, SRC_BPP, "RGBA")?;
@@ -441,8 +345,7 @@ impl GLProcessorST {
                 required,
                 pixels.source(),
             );
-            // `UNPACK_ROW_LENGTH` is context state every other upload relies
-            // on being unset; reset it on both outcomes.
+            // Resets `UNPACK_ROW_LENGTH` on both outcomes.
             edgefirst_gl::gl::PixelStorei(edgefirst_gl::gl::UNPACK_ROW_LENGTH, 0);
             uploaded
         };
@@ -453,17 +356,15 @@ impl GLProcessorST {
         })
     }
 
-    /// Run the shared float full-screen-quad draw used by both the PBO and DMA
-    /// F16 render paths.
+    /// Run the float full-screen-quad draw used by both the PBO and zero-copy
+    /// render paths.
     ///
-    /// The caller must have already (a) uploaded the source via
-    /// [`Self::upload_float_src`] and (b) bound the render target (float
-    /// texture for PBO, EGLImage renderbuffer for DMA) to the active FBO and
-    /// confirmed it complete. This sets the viewport to `(packed_w, packed_h)`,
-    /// binds the program, sets the crop uniforms, the sample clamp
-    /// `src_extent` (`render::sample_clamp_rect`) and `dst_image_size` when
-    /// it is `Some` (required by the F16 NCHW shader), binds the source to
-    /// TEXTURE0, and draws the quad. No readback is performed.
+    /// The caller must have already put the source pixels in `src_tex_id` and
+    /// bound the render target to the active FBO, complete. This sets the
+    /// viewport to `(packed_w, packed_h)`, binds the program, sets the crop
+    /// uniforms, the sample clamp `src_extent` (`render::sample_clamp_rect`)
+    /// and `dst_image_size` when it is `Some`, binds the source to TEXTURE0,
+    /// and draws the quad. No readback is performed.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn draw_float_quad(
         &mut self,
@@ -478,9 +379,7 @@ impl GLProcessorST {
         pad_color: [f32; 4],
         dst_image_size: Option<(f32, f32)>,
     ) -> crate::Result<()> {
-        // Locations resolve once per program (the string lookups previously
-        // ran on every float draw); render programs live for the
-        // processor's life, so ids are never recycled under the cache.
+        // Resolves the uniform locations once per program.
         let locs = *self
             .float_quad_locs
             .entry(program_id)
@@ -536,7 +435,6 @@ impl GLProcessorST {
                 pad_color[2],
                 pad_color[3],
             );
-            // Always set: an unset uniform reads as zero.
             edgefirst_gl::gl::Uniform4fv(locs.norm_scale, 1, norm.scale.as_ptr());
             edgefirst_gl::gl::Uniform4fv(locs.norm_offset, 1, norm.offset.as_ptr());
             if let Some((w, h)) = dst_image_size {
@@ -544,16 +442,10 @@ impl GLProcessorST {
             }
             check_gl_error(function!(), line!())?;
 
-            // Full-screen quad: NDC -1..1 mapped to the whole viewport with
-            // 0..1 texcoords. The float shaders ignore the interpolated
-            // texcoords (they derive sampling from gl_FragCoord + uniforms),
-            // but a valid quad is still needed to rasterize every fragment.
-            // The geometry is constant, so it lives in the two STATIC_DRAW
-            // VBOs uploaded once by `ensure_float_quad_vbos` — the attrib
-            // pointers are re-pointed at them for the draw and RESTORED to
-            // the engine's dynamic buffers after (Buffer::new's init-time
-            // contract: attrib N permanently reads vertex_buffer /
-            // texture_buffer, which every other draw path relies on).
+            // Full-screen quad: NDC -1..1 mapped to the whole viewport with 0..1
+            // texcoords, from the two STATIC_DRAW VBOs. The attrib pointers are
+            // pointed at them for the draw and restored to the engine's dynamic
+            // buffers after.
             edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::ARRAY_BUFFER, pos_vbo);
             edgefirst_gl::gl::VertexAttribPointer(
                 self.vertex_buffer.buffer_index,
@@ -581,8 +473,7 @@ impl GLProcessorST {
                 edgefirst_gl::gl::UNSIGNED_INT,
                 quad_index.as_ptr() as *const c_void,
             );
-            // Restore the init-time attrib→buffer contract before any other
-            // draw path runs.
+            // Restores the attrib pointers to the engine's dynamic buffers.
             edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::ARRAY_BUFFER, self.vertex_buffer.id);
             edgefirst_gl::gl::VertexAttribPointer(
                 self.vertex_buffer.buffer_index,
@@ -606,8 +497,8 @@ impl GLProcessorST {
         Ok(())
     }
 
-    /// Lazily create + upload the constant full-screen quad VBOs used by
-    /// [`Self::draw_float_quad`] (see the field docs on `GLProcessorST`).
+    /// Create and upload the constant full-screen quad VBOs used by
+    /// [`Self::draw_float_quad`] on first use.
     fn ensure_float_quad_vbos(&mut self) -> (u32, u32) {
         if self.float_quad_pos_vbo == 0 {
             const QUAD_POS: [f32; 12] = [
@@ -643,23 +534,20 @@ impl GLProcessorST {
 
     /// Render an RGBA8 source into a float PBO destination.
     ///
-    /// Two packed layouts are produced, selected by `path`:
+    /// `path` selects the packed layout:
     ///
-    /// * [`FloatRenderPath::PboF32Nhwc`] — F32 `Rgb`, logical `[H,W,3]`.
-    ///   Render target is a single-channel `R32F` texture sized `(W*3, H)`;
-    ///   the shader emits one channel per fragment and `glReadPixels` reads
-    ///   `(RED, FLOAT)` straight into the PBO.
-    /// * [`FloatRenderPath::PboF16Nchw`] — F16 `PlanarRgb`, logical `[3,H,W]`.
-    ///   Render target is an `RGBA16F` texture sized `(W/4, 3*H)` packing four
-    ///   contiguous planar f16 elements per texel; readback is
-    ///   `(RGBA, HALF_FLOAT)`.
+    /// * [`FloatRenderPath::PboF32Nhwc`]: F32 `Rgb`, logical `[H,W,3]`. The
+    ///   render target is a single-channel `R32F` texture sized `(W*3, H)`,
+    ///   read back as `(RED, FLOAT)`.
+    /// * [`FloatRenderPath::PboF16Nchw`] / [`FloatRenderPath::PboF32Nchw`]:
+    ///   `PlanarRgb`, logical `[3,H,W]`. The render target is an `RGBA16F` /
+    ///   `RGBA32F` texture sized `(W/4, 3*H)` packing four contiguous planar
+    ///   elements per texel.
+    /// * [`FloatRenderPath::PboF16Nhwc`]: F16 `Rgb`, packed into an `RGBA16F`
+    ///   texture sized `(W*3/4, H)`.
     ///
-    /// [`FloatRenderPath::ZeroCopyF16Nchw`] and [`FloatRenderPath::None`] are not
-    /// handled here — they return `NotSupported` so `convert()` falls back to
-    /// CPU. Likewise,
-    /// non-`Rgba` sources and any rotation/flip fall back: the
-    /// float shaders are uniform-driven and normalize `[0,1]` via the texture
-    /// fetch, but do not implement rotation/flip.
+    /// Returns `NotSupported` for a path that is not a PBO path, a
+    /// non-`Rgba` source, or any rotation/flip.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn convert_float_to_pbo(
         &mut self,
@@ -671,11 +559,7 @@ impl GLProcessorST {
         crop: ResolvedCrop,
         convert_span: &tracing::Span,
     ) -> crate::Result<()> {
-        // Only the two PBO float paths are implemented here. `pixel_bytes` is
-        // what one texel of the pack format occupies -- one f32 for the NHWC
-        // path, four f16 for the NCHW one -- which is what turns the packed
-        // surface's width into a tight row of bytes and what
-        // `GL_PACK_ROW_LENGTH` counts.
+        // `pixel_bytes` is what one texel of the pack format occupies.
         let (internal, client_fmt, gl_type, pixel_bytes) = match path {
             FloatRenderPath::PboF32Nhwc => (
                 edgefirst_gl::gl::R32F,
@@ -695,9 +579,6 @@ impl GLProcessorST {
                 edgefirst_gl::gl::FLOAT,
                 16,
             ),
-            // The zero-copy variants and `None` are not PBO paths;
-            // `convert()` never routes them here (see the match in
-            // `processor::convert`), but the match must stay exhaustive.
             FloatRenderPath::ZeroCopyF16Nchw
             | FloatRenderPath::ZeroCopyF32Nchw
             | FloatRenderPath::ZeroCopyFloatNhwc
@@ -709,7 +590,6 @@ impl GLProcessorST {
             }
         };
 
-        // Rotation/flip are not implemented by the float shaders.
         if rotation != Rotation::None || flip != Flip::None {
             return Err(crate::Error::NotSupported(
                 "GL float render-to-PBO: rotation/flip not supported on the float path; \
@@ -718,7 +598,6 @@ impl GLProcessorST {
             ));
         }
 
-        // Source must be RGBA8.
         let (src_u8, src_fmt) = dyn_to_u8_src(src)?;
         if src_fmt != PixelFormat::Rgba {
             return Err(crate::Error::NotSupported(format!(
@@ -779,18 +658,10 @@ impl GLProcessorST {
             _ => unreachable!(),
         };
 
-        // ── Destination pitch, before anything is drawn ──
-        // The packed surface's rows ARE the destination's rows: `PboF32Nhwc`
-        // renders `(W*3, H)` R32F texels, one texel per element and one
-        // surface row per image row; `PboF16Nchw` renders `(W/4, C*H)`
-        // RGBA16F texels, one texel per four planar elements and one surface
-        // row per plane row. So surface row `y` is destination row `y`, the
-        // read is tight at `packed_w * pixel_bytes`, and the destination
-        // spaces its rows at `effective_row_stride()` -- `W * 2` for an F16
-        // plane row, `W * 3 * 4` for an F32 image row, more for a pool tensor
-        // narrowed with `configure_image` that kept the pool's pitch. Planned
-        // here rather than after the draw so a destination this readback
-        // cannot fill declines to the CPU backend without rendering first.
+        // ── Destination pitch ──
+        // Surface row `y` is destination row `y`: the read is tight at
+        // `packed_w * pixel_bytes` and the destination spaces its rows at
+        // `effective_row_stride()`.
         let layout = plan_pbo_readback(
             dst.effective_row_stride().unwrap_or(packed_w * pixel_bytes),
             dst.view_origin().is_some(),
@@ -801,9 +672,9 @@ impl GLProcessorST {
             pixel_bytes,
         )?;
 
-        // Uniforms from crop — identical contract to the macOS IOSurface path.
-        // `src_rect_uv` is normalized to source dims; `dst_rect_px` is in
-        // single-plane pixel coords; `pad_color` is normalized [0,1].
+        // Uniforms from crop: `src_rect_uv` is normalized to source dims,
+        // `dst_rect_px` is in single-plane pixel coords, `pad_color` is
+        // normalized [0,1].
         let (src_rect_uv, dst_rect_px, pad_color) =
             float_crop_uniforms(&crop, src_w, src_h, dst_w, dst_h)?;
 
@@ -824,21 +695,14 @@ impl GLProcessorST {
         let render_tex_id = self.float_render_texture.id;
         let src_tex_id = self.camera_normal_texture.id;
 
-        // Source sampling filter, from `Interpolation`. Both float shaders
-        // sample at output-pixel centers (they add +0.5 to the integer output
-        // index before mapping to the source UV), so LINEAR gives a correct
-        // bilinear resize and NEAREST a correct nearest one on both paths. LINEAR on the RGBA8 source is unconditionally supported —
-        // GL_OES_texture_float_linear is irrelevant here because we filter the
-        // u8 source texture, not the float render target.
+        // Source sampling filter, from `Interpolation`.
         let src_filter = self.source_filter() as i32;
 
-        // ── Source RGBA8 feed (shared with the DMA F16 path): zero-copy
-        // import when the source is Dma-backed, PBO upload, or CPU upload —
+        // ── Source RGBA8 feed: zero-copy import, PBO upload, or CPU upload;
         // see `feed_float_src`.
         let feed = self.feed_float_src(src_u8, src_w, src_h, src_filter, convert_span)?;
-        // A zero-copy feed may have imported more of the texture than the
-        // logical image; map the source rectangle onto it and clamp samples
-        // to it.
+        // Maps the source rectangle onto the texture the feed covers and clamps
+        // samples to it.
         let (src_rect_uv, src_extent) =
             self.float_src_mapping_for_feed(feed, src_rect_uv, src_u8, src_w, src_h);
 
@@ -849,11 +713,8 @@ impl GLProcessorST {
                 edgefirst_gl::gl::TEXTURE_2D,
                 edgefirst_gl::gl::NEAREST,
             );
-            // Only (re)spec the render-target storage when the packed dims or
-            // internal format change (mirrors `proto_tex_dims` / Texture's
-            // size cache). On the steady-state fixed-input video path this is
-            // unchanged every frame, so we reuse the existing storage and skip
-            // the per-frame `TexImage2D` reallocation entirely.
+            // Specifies the render-target storage only when the packed dims or
+            // internal format change.
             let render_dims = (packed_w, packed_h, internal);
             if self.float_render_tex_dims != render_dims {
                 edgefirst_gl::gl::TexImage2D(
@@ -868,9 +729,7 @@ impl GLProcessorST {
                     std::ptr::null(),
                 );
                 self.float_render_tex_dims = render_dims;
-                // The float render texture storage was just (re)allocated; mark
-                // the cached struct fields so a later EGLImage path won't assume
-                // a stale binding/size on this texture object.
+                // Drops the cached EGLImage binding of the reallocated texture.
                 self.float_render_texture.invalidate_egl_binding();
             }
 
@@ -891,7 +750,7 @@ impl GLProcessorST {
             }
         }
 
-        // ── Render the full-screen quad with the float program (shared) ──
+        // ── Render the full-screen quad with the float program ──
         let dst_image_size = match path {
             FloatRenderPath::PboF16Nchw | FloatRenderPath::PboF32Nchw => {
                 Some((dst_w as f32, dst_h as f32))
@@ -929,30 +788,23 @@ impl GLProcessorST {
     }
 
     /// Render an RGBA8 source into a zero-copy float destination, writing the
-    /// packed surface straight into the platform's GPU buffer through an
-    /// imported renderbuffer or texture (zero-copy — no `glReadPixels`).
+    /// packed surface into the platform's GPU buffer through an imported
+    /// renderbuffer or texture.
     ///
     /// `path` selects the destination layout, which
     /// [`Self::render_float_to_zero_copy_tail`] turns into a surface geometry,
     /// an import format and a program:
     ///
-    /// * [`FloatRenderPath::ZeroCopyF16Nchw`] / [`FloatRenderPath::ZeroCopyF32Nchw`]
-    ///   — `PlanarRgb` / `PlanarRgba`, three or four planes packed into a
+    /// * [`FloatRenderPath::ZeroCopyF16Nchw`] / [`FloatRenderPath::ZeroCopyF32Nchw`]:
+    ///   `PlanarRgb` / `PlanarRgba`, three or four planes packed into a
     ///   `(W/4, C*H)` RGBA16F / RGBA32F surface.
-    /// * [`FloatRenderPath::ZeroCopyFloatNhwc`] — `Rgb`, interleaved into a
+    /// * [`FloatRenderPath::ZeroCopyFloatNhwc`]: `Rgb`, interleaved into a
     ///   `(W*3/4, H)` surface.
-    /// * [`FloatRenderPath::ZeroCopyFloatRgba`] — `Rgba`, one texel per pixel
+    /// * [`FloatRenderPath::ZeroCopyFloatRgba`]: `Rgba`, one texel per pixel
     ///   into a `(W, H)` surface.
     ///
-    /// Everything before the tail — source feed, crop uniforms, quad — is the
-    /// F16 PBO path's ([`Self::convert_float_to_pbo`] /
-    /// `FloatRenderPath::PboF16Nchw`); only the render target differs.
-    ///
-    /// This is the V3D / Mali / IOSurface / D3D11-texture zero-copy float
-    /// path. On any driver that rejects the float import (e.g. Vivante,
-    /// desktop NVIDIA dma-buf) or returns an incomplete FBO, returns
-    /// `Err(NotSupported)` so `convert()` degrades gracefully to the CPU.
-    /// Never panics.
+    /// Returns `Err(NotSupported)` when the driver rejects the float import or
+    /// the FBO is incomplete.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn convert_float_to_zero_copy(
         &mut self,
@@ -964,7 +816,6 @@ impl GLProcessorST {
         crop: ResolvedCrop,
         convert_span: &tracing::Span,
     ) -> crate::Result<()> {
-        // Rotation/flip are not implemented by the float shaders.
         if rotation != Rotation::None || flip != Flip::None {
             return Err(crate::Error::NotSupported(
                 "GL float render-to-DMA: rotation/flip not supported on the float path; \
@@ -973,7 +824,6 @@ impl GLProcessorST {
             ));
         }
 
-        // Source must be RGBA8.
         let (src_u8, src_fmt) = dyn_to_u8_src(src)?;
         if src_fmt != PixelFormat::Rgba {
             return Err(crate::Error::NotSupported(format!(
@@ -984,23 +834,19 @@ impl GLProcessorST {
         let src_w = src_u8.width().ok_or(Error::NotAnImage)?;
         let src_h = src_u8.height().ok_or(Error::NotAnImage)?;
 
-        // Destination geometry for the crop uniforms; the full destination
-        // validation (format, dtype, zero-copy) happens in the shared tail.
+        // Destination geometry for the crop uniforms.
         let dst_w = dst.width().ok_or(Error::NotAnImage)?;
         let dst_h = dst.height().ok_or(Error::NotAnImage)?;
 
-        // Crop uniforms — identical contract to the F16 PBO path.
         let (src_rect_uv, dst_rect_px, pad_color) =
             float_crop_uniforms(&crop, src_w, src_h, dst_w, dst_h)?;
 
         let src_tex_id = self.camera_normal_texture.id;
         let src_filter = self.source_filter() as i32;
 
-        // ── Source RGBA8 feed (shared with the PBO F16 path): zero-copy
-        // import when the source is Dma-backed, else PBO/CPU upload — see
-        // `feed_float_src`.
+        // ── Source RGBA8 feed; see `feed_float_src`.
         let feed = self.feed_float_src(src_u8, src_w, src_h, src_filter, convert_span)?;
-        // As above: the imported texture can be larger than the logical image.
+        // Maps the source rectangle onto the texture the feed covers.
         let (src_rect_uv, src_extent) =
             self.float_src_mapping_for_feed(feed, src_rect_uv, src_u8, src_w, src_h);
 
@@ -1021,10 +867,6 @@ impl GLProcessorST {
     /// draw `src_tex_id` (an RGBA8 texture already holding the source pixels)
     /// through the program that packs it.
     ///
-    /// Shared by [`Self::convert_float_to_zero_copy`] (which feeds its tensor
-    /// source first) and the fused NV→float two-pass (whose pass 1 rendered
-    /// into an engine-internal texture — the pixels never visit the host).
-    ///
     /// `path` decides the destination this accepts, the surface it packs it
     /// into, the import format and the program:
     ///
@@ -1035,8 +877,7 @@ impl GLProcessorST {
     /// | `ZeroCopyFloatNhwc` | `Rgb` F16/F32 | `(W*3/4, H)` | per dtype | `float_nhwc_pack_program` |
     /// | `ZeroCopyFloatRgba` | `Rgba` F16/F32 | `(W, H)` | per dtype | `float_rgba_program` |
     ///
-    /// Any other `(path, format, dtype)` combination is `NotSupported` so
-    /// `convert()` falls back to the CPU.
+    /// Any other `(path, format, dtype)` combination is `NotSupported`.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn render_float_to_zero_copy_tail(
         &mut self,
@@ -1061,8 +902,8 @@ impl GLProcessorST {
             ));
         }
 
-        // Surface geometry, program and the plane size the packed shaders need
-        // (`dst_image_size`, which only the planar packer reads).
+        // Surface geometry, program and the plane size (`dst_image_size`, read
+        // by the planar packer).
         let (surface, program_id, dst_image_size) = match (path, dst_fmt, dst_dtype) {
             (
                 FloatRenderPath::ZeroCopyF16Nchw,
@@ -1102,8 +943,7 @@ impl GLProcessorST {
             ))
         })?;
 
-        // The float import format follows the destination's element width;
-        // both are RGBA surfaces of four elements per texel.
+        // The float import format follows the destination's element width.
         let packed = match dst_dtype {
             DType::F16 => super::super::platform::PackedImportFormat::Rgba16161616F,
             DType::F32 => super::super::platform::PackedImportFormat::Rgba32323232F,
@@ -1116,8 +956,6 @@ impl GLProcessorST {
         };
 
         // The typed destination the import and renderbuffer cache key need.
-        // Both arms run the same body — `render_float_dst` is generic over the
-        // element type.
         match dst_dtype {
             DType::F16 => {
                 let dst_t = dst.as_typed_mut::<half::f16>().expect("dtype checked");
@@ -1160,12 +998,7 @@ impl GLProcessorST {
 
     /// Import `dst` as a `(surface_w, surface_h)` packed float render surface,
     /// attach it to the convert FBO and draw `src_tex_id` through
-    /// `program_id`.
-    ///
-    /// Generic over the destination element type so the F16 and F32 arms of
-    /// [`Self::render_float_to_zero_copy_tail`] share one body; the surface,
-    /// import format and program are all the four zero-copy float paths
-    /// differ in.
+    /// `program_id`. Generic over the destination element type.
     #[allow(clippy::too_many_arguments)]
     fn render_float_dst<T>(
         &mut self,
@@ -1187,9 +1020,6 @@ impl GLProcessorST {
         T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync + edgefirst_tensor::Element,
     {
         // ── Import the destination as a renderable float surface ──
-        // The tensor's natural row stride equals the packed pitch for every
-        // layout in the table (four elements per texel), so the import derives
-        // the correct pitch from the surface dimensions.
         self.convert_fbo.bind();
         let dest_egl = self.get_or_create_egl_image_rgb(
             dst,
@@ -1200,13 +1030,11 @@ impl GLProcessorST {
         )?;
 
         // Attach the import (renderbuffer when supported, else texture) to the
-        // FBO, mirroring the u8 packed-RGB DMA destination path.
+        // FBO.
         //
         // SAFETY: convert_fbo is bound above on the thread's current GL
-        // context; rbo comes from this call's own cache (either just
-        // inserted by get_or_create_egl_image_rgb or a prior hit for the
-        // same buffer identity) and dest_egl/self.render_texture stay valid
-        // for the FBO calls below.
+        // context; rbo comes from this call's own cache and
+        // dest_egl/self.render_texture stay valid for the FBO calls below.
         unsafe {
             match self.cached_dst_renderbuffer(dst, dst_fmt) {
                 Some(rbo) => {
@@ -1228,10 +1056,7 @@ impl GLProcessorST {
                         edgefirst_gl::gl::TEXTURE_2D,
                         edgefirst_gl::gl::NEAREST,
                     );
-                    // Platform attach (EGLImage target on Linux and ANGLE,
-                    // eglBindTexImage on macOS — a raw OES call there
-                    // silently no-ops on a pbuffer handle and leaves the
-                    // FBO incomplete).
+                    // Platform attach of the import to the texture.
                     super::super::platform::Platform::attach_tex_image_2d(
                         &self.gl_context,
                         dest_egl,
@@ -1243,9 +1068,7 @@ impl GLProcessorST {
                         self.render_texture.id,
                         0,
                     );
-                    // The texture-path binding above mutated render_texture's GL state
-                    // without going through bind_egl_image's cache; drop any stale
-                    // cached binding so future convert calls re-bind correctly.
+                    // Drops render_texture's cached EGLImage binding.
                     self.render_texture.invalidate_egl_binding();
                 }
             }
@@ -1260,8 +1083,8 @@ impl GLProcessorST {
             check_gl_error(function!(), line!())?;
         }
 
-        // ── Shared float draw: viewport = the packed surface, program,
-        // uniforms, quad ──
+        // ── Float draw: viewport = the packed surface, program, uniforms,
+        // quad ──
         self.draw_float_quad(
             program_id,
             c"src",
@@ -1275,11 +1098,7 @@ impl GLProcessorST {
             dst_image_size,
         )?;
 
-        // Zero-copy: the GPU wrote straight into the destination buffer. No
-        // readback, but we must still wait for the render to complete before
-        // returning so the buffer is safe for the consumer to read (same
-        // contract as glFinish, scoped to a fence rather than a full-queue
-        // drain).
+        // Waits for the render into the destination buffer to complete.
         //
         // SAFETY: called on the thread that owns the current GL context, per
         // finish_via_fence's contract.
@@ -1292,27 +1111,17 @@ impl GLProcessorST {
     }
 }
 
-// `float_pbo_buffer_id` is pure (no GL state), so it is unit-testable without a
-// GPU. The GL draw/upload/readback methods above need a real V3D/Mali device and
-// are covered on-target, not in CI. (`float_crop_uniforms` moved to `gl::core`
-// and is tested there.)
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::{float_pbo_buffer_id, packed_interleaved_layout, packed_planar_layout};
     use crate::Error;
 
-    /// The interleaved rule is the less obvious of the two: three channels
-    /// per pixel means a row is `W*3` elements, and a texel holds four, so a
-    /// whole-texel row needs `W*3 % 4 == 0` -- which for three channels is
-    /// exactly `W % 4 == 0`.
+    /// Checks that `packed_interleaved_layout` accepts only widths divisible by 4.
     #[test]
     fn packed_interleaved_layout_takes_whole_texels_only() {
         assert_eq!(packed_interleaved_layout(640, 480), Some((480, 480)));
         assert_eq!(packed_interleaved_layout(4, 1), Some((3, 1)));
-        // W*3 for these six widths is 3, 6, 9, 15, 18 and 21 -- not one of
-        // them a whole number of four-element texels, which is the same set
-        // `W % 4 == 0` rejects.
         for w in [1u32, 2, 3, 5, 6, 7] {
             assert_eq!(
                 packed_interleaved_layout(w, 16),
@@ -1320,16 +1129,14 @@ mod tests {
                 "{w}x3 is not a whole number of four-element texels"
             );
         }
-        // The planar rule beside it, for contrast: four elements of one
-        // channel per texel, so it is the width itself that must divide.
+        // The planar layout.
         assert_eq!(packed_planar_layout(640, 480, 3), Some((160, 1440)));
         assert_eq!(packed_planar_layout(6, 16, 3), None);
     }
 
     #[test]
     fn pbo_buffer_id_rejects_non_pbo_tensor() {
-        // A plain Mem-backed tensor is not PBO-backed → OpenGl error rather
-        // than a panic / bogus buffer id.
+        // A Mem-backed tensor is not PBO-backed.
         let t = edgefirst_tensor::Tensor::<f32>::image(
             4,
             4,

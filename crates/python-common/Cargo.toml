@@ -7,36 +7,27 @@ authors.workspace = true
 license.workspace = true
 publish = false
 
-# An rlib, deliberately: every extension module statically links its own copy,
-# so each gets its own PyO3 type objects. Cross-module handoff therefore goes
-# through the capsule protocol (edgefirst_tensor::EfTensorDesc), never through
-# a shared Python type. That is the A3 contract.
+# An rlib: every extension module statically links its own copy.
 [lints]
 workspace = true
 
 [lib]
 name = "edgefirst_python_common"
-# The doc comments in this crate are PyO3 docstrings: they become Python
-# `__doc__` and are written in reStructuredText for Sphinx, with `::`-indented
-# PYTHON examples. rustdoc treats an indented block as Rust and tries to
-# compile it, so `cargo test --doc` fails on seven of them with parse errors
-# on ordinary Python. They are not Rust documentation and should not be
-# compiled as Rust.
+# The doc comments in this crate are PyO3 docstrings in reStructuredText and
+# are not compiled as doctests.
 doctest = false
 
 [features]
-# Each extension enables only its own domain so the linker can discard the
-# rest.
+# Each extension enables only its own domain.
 default = []
 tensor = ["dep:edgefirst-tensor"]
 codec = ["tensor", "dep:edgefirst-codec"]
 # Image processing only: tensor + image. No decoder, no tracker, no codec.
 image = ["tensor", "dep:edgefirst-image"]
 decoder = ["tensor", "dep:edgefirst-decoder", "dep:edgefirst-decoder-abi"]
-# Tracker consumes plain boxes; it does not enable tensor, so _tracker.so
-# has no DT_NEEDED on libedgefirst_tensor.
+# Tracker consumes plain boxes and does not enable tensor.
 tracker = ["dep:edgefirst-tracker"]
-# Kernels operate on borrowed numpy buffers; like tracker, no tensor.
+# Kernels operate on borrowed numpy buffers and do not enable tensor.
 kernels = ["dep:edgefirst-kernels"]
 abi3-py38 = ["pyo3/abi3-py38"]
 abi3-py311 = ["pyo3/abi3-py311"]
@@ -45,7 +36,7 @@ abi3-py311 = ["pyo3/abi3-py311"]
 edgefirst-tensor = { workspace = true, default-features = false, optional = true }
 # Each extension states exactly the library features it ships.
 edgefirst-codec = { workspace = true, optional = true, default-features = false, features = ["v4l2", "nvjpeg", "png", "media-foundation"] }
-# `opengl` is explicit because the workspace entry disables image's defaults; without it the GPU path silently falls back to CPU.
+# `opengl` enables the GPU path; the workspace entry disables image's defaults.
 edgefirst-image = { workspace = true, optional = true, default-features = false, features = [
     "opengl",
 ] }

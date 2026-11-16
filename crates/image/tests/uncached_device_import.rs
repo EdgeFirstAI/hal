@@ -3,16 +3,14 @@
 
 //! Devices render into and read from uncached DMA-BUF images.
 //!
-//! A `CpuAccess::None` or `CpuAccess::Write` DMA-BUF image comes from the
-//! uncached CMA heap when it can serve the allocation. Each test drives a
-//! device through such an image and checks the pixels through a second device
-//! pass into a CPU-readable image, against the same work done in cached
-//! memory.
+//! Each test drives a device through a `CpuAccess::None` or
+//! `CpuAccess::Write` DMA-BUF image and checks the pixels through a second
+//! device pass into a CPU-readable image, against the same work done in
+//! cached memory.
 //!
-//! The tests run only where an allocation is actually served uncached, which a
-//! probe allocation's exporter name establishes; elsewhere they skip loudly,
-//! and the cached fallback is the tensor crate's to test. Missing backends
-//! skip as well, except under `HAL_TEST_REQUIRE_DMA=1`, `HAL_TEST_REQUIRE_GL=1`
+//! The tests run where a probe allocation's exporter name shows the
+//! allocation is served uncached; elsewhere they skip. Missing backends skip
+//! as well, except under `HAL_TEST_REQUIRE_DMA=1`, `HAL_TEST_REQUIRE_GL=1`
 //! and `HAL_TEST_REQUIRE_G2D=1`, which turn the matching skip into a failure.
 
 #![cfg(target_os = "linux")]
@@ -67,8 +65,7 @@ fn dma_image(access: CpuAccess) -> TensorDyn {
 }
 
 /// Whether the test named `what` runs: a usable DMA heap (under
-/// `HAL_TEST_REQUIRE_DMA`) whose uncached CMA heap actually serves a
-/// write-only image.
+/// `HAL_TEST_REQUIRE_DMA`) whose uncached CMA heap serves a write-only image.
 fn uncached_or_skip(what: &str) -> bool {
     if !dma_require::available_or_skip(edgefirst_tensor::is_dma_available(), what) {
         return false;
@@ -107,8 +104,7 @@ fn read(t: &TensorDyn) -> Vec<u8> {
     t.as_u8().unwrap().map_read().unwrap().as_slice().to_vec()
 }
 
-/// GL renders into a hardware-only image, as a compositor-bound canvas, and
-/// samples it and a CPU-written image back into readable memory unchanged.
+/// GL renders into a hardware-only image and samples it and a CPU-written image back unchanged.
 #[test]
 fn gl_renders_into_and_samples_uncached_images() {
     const NAME: &str = "gl_renders_into_and_samples_uncached_images";
@@ -128,8 +124,7 @@ fn gl_renders_into_and_samples_uncached_images() {
     })
     .expect("GL processor");
     let mut canvas = gl_image(&gl, CpuAccess::None);
-    // A GL backend that cannot render a hardware-only image widens the
-    // declaration so its CPU fallback can; that is a capability, not a bug.
+    // Skips when the GL backend widened the canvas's declared access.
     if canvas.cpu_access() != CpuAccess::None {
         return skip(&format!(
             "{NAME} - this GL backend cannot render a hardware-only image"
@@ -169,8 +164,7 @@ fn gl_renders_into_and_samples_uncached_images() {
     );
 }
 
-/// G2D blits from a CPU-written uncached image into a hardware-only one and
-/// back out unchanged.
+/// G2D blits from a CPU-written uncached image into a hardware-only one and back out unchanged.
 #[test]
 fn g2d_blits_between_uncached_images() {
     const NAME: &str = "g2d_blits_between_uncached_images";

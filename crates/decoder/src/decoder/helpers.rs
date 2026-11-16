@@ -64,27 +64,14 @@ impl Decoder {
     }
 
     /// Returns the canonical logical-axis index for a given `(output role,
-    /// decoder, dim name)` tuple.
-    ///
-    /// The returned index is the position the axis must occupy in the
-    /// decoder's internal tensor view — e.g. `(Boxes, Ultralytics,
-    /// BoxCoords)` must be at index 1 because the ultralytics box kernels
-    /// iterate `[batch, coords, anchors]`.
+    /// decoder, dim name)` tuple: the position the axis occupies in the
+    /// decoder's internal tensor view, e.g. index 1 for `(Boxes,
+    /// Ultralytics, BoxCoords)` in `[batch, coords, anchors]`.
     ///
     /// Each `(role, decoder)` pair maps the dim names that have a
     /// canonical position to a distinct index in `[0, ndim)`. Dim names
-    /// without a canonical position for the role — for example `Height`
-    /// / `Width` on a flat-anchor detection output, or `NumAnchorsXFeatures`
-    /// on a ModelPack per-scale FPN tensor — return `None`. The caller
-    /// ([`Self::swap_axes_if_needed`]) maps `None` to a `usize::MAX`
-    /// sentinel so those axes sort to the tail of the stride permutation;
-    /// they keep their relative order among themselves but end up after
-    /// all canonically-placed axes. This preserves the legacy behaviour
-    /// that ModelPack per-scale FPN configs rely on.
-    ///
-    /// This table is the single source of truth for role → canonical order;
-    /// it replaces the per-role `_order()` helpers that previously scattered
-    /// the same information across eleven separate functions.
+    /// without a canonical position for the role (for example `Height`
+    /// / `Width` on a flat-anchor detection output) return `None`.
     pub(super) fn canonical_axis_index(
         config: ConfigOutputRef<'_>,
         name: DimName,
@@ -102,12 +89,8 @@ impl Decoder {
                 _ => None,
             },
             // ModelPack per-scale FPN detection: dshape is
-            // [batch, height, width, num_anchors_x_features] and none of
-            // the non-batch axes have a canonical logical slot — they
-            // drive the FPN decode in declared order, with the batch
-            // axis bubbled to index 0 by swap_axes_if_needed and the
-            // remainder falling to the TAIL sentinel so their relative
-            // order is preserved.
+            // [batch, height, width, num_anchors_x_features]; only the batch
+            // axis has a canonical index.
             (Detection(_), ModelPack) => match name {
                 Batch => Some(0),
                 _ => None,
@@ -176,36 +159,15 @@ impl Decoder {
         }
     }
 
-    // `protos_to_hwc` was removed after the physical-order contract
-    // landed. Under the contract, the 3D view entering a decode kernel
-    // is always canonical HWC: either `swap_axes_if_needed` reordered
-    // the 4D tensor to `[batch, height, width, num_protos]` using the
-    // caller's dshape, or the caller omitted dshape and asserted the
-    // declared shape was already canonical. The pre-2026-04 size
-    // heuristic (permute when `d0 < d1 && d0 < d2`) was the workaround
-    // that couldn't distinguish physically-NCHW bytes from
-    // physically-NHWC bytes mislabelled as NCHW — the root cause of
-    // the vertical-stripe mask bug on i.MX 8M Plus TFLite.
-
     /// Permutes the tensor view into the decoder's canonical logical-axis
     /// order (as defined by [`Self::canonical_axis_index`]).
     ///
-    /// **Precondition**: the input view's strides must already match the
-    /// producer's physical memory layout. That is guaranteed by the HAL
-    /// contract — callers declare `shape` and `dshape` in physical memory
-    /// order (outermost first), so the C-contiguous strides derived at
-    /// wrap time are correct by construction.
-    ///
-    /// This function only reshuffles the stride tuple; it never moves
-    /// bytes. If the precondition is violated (declared shape does not
-    /// match physical layout), this function silently produces a view
-    /// with strides that point into the wrong places — the bug we explicitly
-    /// avoid by enforcing the contract at [`Decoder::validate_output_layout`].
+    /// The input view's strides must match the producer's physical memory
+    /// layout. Only the stride tuple is permuted; no bytes move.
     ///
     /// Dim names without a canonical position for the current role (e.g.
     /// `Height` / `Width` on a flat-anchor detection output) sort to the
-    /// tail. This preserves the legacy "unreachable-axis stays at the
-    /// back" behaviour that the per-scale modelpack FPN path relies on.
+    /// tail and keep their relative order.
     pub(super) fn swap_axes_if_needed<'a, T, D: Dimension>(
         array: &ArrayView<'a, T, D>,
         config: ConfigOutputRef,
@@ -214,9 +176,8 @@ impl Decoder {
         if config.dshape().is_empty() {
             return array;
         }
-        // Sentinel for axes with no canonical index for this role —
-        // guarantees they sort to the end without affecting relative
-        // order of canonical axes.
+        // Sentinel for axes with no canonical index for this role: they sort
+        // to the end.
         const TAIL: usize = usize::MAX;
         let mut current_order: Vec<usize> = config
             .dshape()
@@ -225,8 +186,7 @@ impl Decoder {
             .collect();
 
         assert_eq!(array.shape().len(), current_order.len());
-        // Simple bubble sort: swap_axes is cheap (stride-tuple permutation
-        // only, no byte movement) and ndim is small (≤ 4 in practice).
+        // Bubble sort with `swap_axes`, which permutes the stride tuple.
         for i in 0..current_order.len() {
             let mut swapped = false;
             for j in 0..current_order.len() - 1 - i {
@@ -261,34 +221,22 @@ impl Decoder {
     }
 
     /// Validate that an output's `shape` and `dshape` satisfy the HAL
-    /// physical-order contract.
-    ///
-    /// The contract is: if `dshape` is present, `shape[i]` and
+    /// physical-order contract: when `dshape` is present, `shape[i]` and
     /// `dshape[i]` describe the same axis, and both are listed in
-    /// physical memory order (outermost first, innermost last).
-    /// C-contiguous strides derived from `shape` are therefore correct
-    /// by construction. Callers who already declare `shape` in the
-    /// decoder's canonical order may omit `dshape` entirely.
+    /// physical memory order (outermost first, innermost last). An output
+    /// whose `shape` is in the decoder's canonical order may omit `dshape`.
     ///
-    /// This validator runs once per output at
-    /// [`DecoderBuilder::build`](super::DecoderBuilder::build) and enforces
-    /// structural, role-agnostic rules:
+    /// Runs once per output at
+    /// [`DecoderBuilder::build`](super::DecoderBuilder::build) and checks:
     ///
     /// 1. `dshape.len() == shape.len()` (when dshape is present).
-    /// 2. Each `dshape[i].1` size matches `shape[i]` — catches the common
-    ///    mistake of declaring dshape in a different order than shape
-    ///    (the exact failure mode that caused the TFLite stripe bug).
-    /// 3. `Padding` axes must have size 1.
-    /// 4. `BoxCoords` axes must have size 4 (xyxy/xywh convention).
-    /// 5. Dshape roles are unique within the output (no axis name appears
-    ///    twice), so every axis maps to a distinct canonical slot.
+    /// 2. Each `dshape[i].1` size matches `shape[i]`.
+    /// 3. `Padding` axes have size 1.
+    /// 4. `BoxCoords` axes have size 4 (xyxy/xywh convention).
+    /// 5. No axis name appears twice in the dshape.
     ///
-    /// Per-role *required-dim-name* checks (e.g. Ultralytics boxes must
-    /// carry `Batch`, `BoxCoords`, and `NumBoxes`) are enforced
-    /// separately by `verify_dshapes` at the role-specific verification
-    /// step in `DecoderBuilder`. The two layers are intentional: this
-    /// validator rejects malformed dshapes at build entry; role
-    /// verification then checks role-specific semantic constraints.
+    /// The per-role required-dim-name checks are done by `verify_dshapes`
+    /// in `DecoderBuilder`.
     pub(super) fn validate_output_layout(config: ConfigOutputRef<'_>) -> Result<(), DecoderError> {
         use ConfigOutputRef::*;
         let role_name = match config {

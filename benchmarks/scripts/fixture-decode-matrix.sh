@@ -3,7 +3,6 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Diagnostic decode matrix on fixed fixtures (zidane NV12 + optional 444).
-# COCO remains the primary Article-1 workload (deploy-and-run.sh).
 #
 # Usage:
 #   ./benchmarks/scripts/fixture-decode-matrix.sh [host...]

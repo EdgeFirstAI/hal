@@ -25,14 +25,8 @@ windows_only = pytest.mark.skipif(
 def _warp_adapter_requested() -> bool:
     """True when this process was pointed at the WARP software adapter.
 
-    WARP has no CUDA device behind it, so a texture allocated on it carries
-    no CUDA handle and maps to ``None``.
-
-    Follows the HAL's own precedence (``d3d11/adapter.rs``): the primary
-    name wins, and the alias is read only when the primary is unset or
-    blank. Reading either would skip a genuine regression on the hardware
-    adapter whenever a stale ``EDGEFIRST_ANGLE_ADAPTER=warp`` is left in the
-    shell -- the exact configuration TESTING.md warns about.
+    Reads ``EDGEFIRST_D3D11_ADAPTER``, and ``EDGEFIRST_ANGLE_ADAPTER`` only when that is
+    unset or blank.
     """
     primary = os.environ.get("EDGEFIRST_D3D11_ADAPTER", "").strip()
     chosen = primary or os.environ.get("EDGEFIRST_ANGLE_ADAPTER", "").strip()
@@ -40,11 +34,7 @@ def _warp_adapter_requested() -> bool:
 
 
 def _close(handle: int) -> None:
-    """Close a Windows handle a completion or handle call handed back.
-
-    A plain call, never an assertion: these run in `finally` blocks, where a
-    failing assert would replace the real failure with this one.
-    """
+    """Close a Windows handle a completion or handle call handed back."""
     ctypes.windll.kernel32.CloseHandle(ctypes.c_void_p(handle))
 
 
@@ -98,7 +88,7 @@ def test_texture_import_and_module_device():
 
     device = d3d11_device()
     assert device
-    # The process device exists by now, so adopting one is refused.
+    # Adopting a device once the process device exists is refused.
     with pytest.raises(RuntimeError):
         d3d11_use_external_device(device)
 
@@ -108,8 +98,8 @@ def test_texture_import_and_module_device():
         t.d3d11_texture(), [32, 64, 4], "uint8", PixelFormat.Rgba, "read"
     )
     assert _read_first_pixel(again) == [9, 8, 7, 6]
-    # The shape must describe the texture the constructor measured; [8, 8, 4]
-    # is a well-formed Rgba shape belonging to a different image.
+    # A shape that does not describe the texture is refused; [8, 8, 4] is a
+    # well-formed Rgba shape of a different image.
     for wrong in ([32, 64], [8, 8, 4]):
         with pytest.raises(ValueError):
             Tensor.from_d3d11_texture(
@@ -133,13 +123,7 @@ DXGI_FORMAT_NV12 = 103
     ],
 )
 def test_semi_planar_accepts_either_shape_spelling(width, dxgi_format, texture_height):
-    """NV12 at 480 rows has 720 combined rows but addresses a 480-row grid.
-
-    Nothing in a rank-2 shape distinguishes the two, so the constructors read
-    the dimensions off the texture and accept either spelling of them, for a
-    native NV12 texture and a combined R8 one alike. A third rank-2 shape
-    that is neither is an argument error.
-    """
+    """The constructors accept either rank-2 shape spelling of a semi-planar texture."""
     if not is_gpu_buffer_available():
         pytest.skip("no D3D11 device")
     t = Tensor.image(width, 480, PixelFormat.Nv12, TensorMemory.DMABUF, "readwrite")
@@ -155,8 +139,7 @@ def test_semi_planar_accepts_either_shape_spelling(width, dxgi_format, texture_h
             again = Tensor.from_d3d11_shared_handle(
                 h, shape, "uint8", PixelFormat.Nv12, "read"
             )
-            # Both spellings recover the image the texture holds, not the
-            # 320-row one a shape-derived reading of [480, w] would infer.
+            # Both spellings recover the image the texture holds.
             assert (again.width, again.height) == (width, 480), f"shape {shape}"
             with again.map("read") as m:
                 first = list(np.asarray(memoryview(m))[0, :4])
@@ -206,8 +189,7 @@ def test_shared_handle_hands_out_a_fresh_duplicate_each_call():
     finally:
         _close(a)
         _close(b)
-    # The tensor keeps its own handle, so closing both duplicates leaves it
-    # shareable.
+    # The tensor stays shareable after both duplicate handles are closed.
     c = t.d3d11_shared_handle()
     _close(c)
 
@@ -248,12 +230,7 @@ def test_gpu_write_value_is_the_completion_value_without_a_handle():
 @windows_only
 @pytest.mark.gpu
 def test_module_device_is_the_device_the_library_allocates_on():
-    """The module functions are backend-routed.
-
-    On the shipped wheel the tensors are allocated inside
-    ``libedgefirst_tensor``, so ``d3d11_device()`` must report *its* device
-    rather than a second one in the wheel's own linked copy of the crate.
-    """
+    """``d3d11_device()`` reports the device the library allocates tensors on."""
     if not is_gpu_buffer_available():
         pytest.skip("no D3D11 device")
     from edgefirst.tensor import d3d11_device, d3d11_use_external_device
@@ -267,7 +244,7 @@ def test_module_device_is_the_device_the_library_allocates_on():
     entry.argtypes = []
     assert d3d11_device() == entry()
 
-    # And a pointer that is not a device is refused rather than adopted.
+    # A pointer that is not a device is refused.
     with pytest.raises(RuntimeError):
         d3d11_use_external_device(1)
 
@@ -290,19 +267,7 @@ def test_try_map_is_generic():
 @windows_only
 @pytest.mark.gpu
 def test_try_map_on_a_texture_sees_the_written_bytes():
-    """The binding's non-blocking map on the one backing that can block.
-
-    ``try_map`` translates the backend's ``WouldBlock`` into
-    ``BlockingIOError``, and the retry must yield: on WARP the threads that
-    finish the staging copy are the CPU. Both are exercised here -- the loop
-    is what makes the map succeed, and the bytes prove the copy it waited
-    for is the one the CPU write produced.
-
-    A deterministic ``BlockingIOError`` is not asserted: forcing one needs a
-    write map held from another thread on the same tensor, and the Python
-    map guard is not shareable across threads, so this covers the success
-    path and the yield rule only.
-    """
+    """``try_map`` on a texture succeeds after yielding and sees the written bytes."""
     if not is_gpu_buffer_available():
         pytest.skip("no D3D11 device")
     t = Tensor.image(64, 64, PixelFormat.Rgba, TensorMemory.DMABUF, "readwrite")
@@ -318,21 +283,13 @@ def test_try_map_on_a_texture_sees_the_written_bytes():
         except BlockingIOError:
             blocked += 1
             assert time.monotonic() < deadline, "try_map never made progress"
-            # The documented rule: a retry loop must yield, or on WARP it
-            # starves the copy it is waiting for.
+            # Yield before retrying.
             time.sleep(0)
     print(f"try_map blocked {blocked} time(s) before succeeding")
 
 
 def test_cuda_map_mut_on_host_memory_is_none():
-    """``cuda_map_mut`` is callable on every platform and every backing, and
-    answers ``None`` where the backing carries no CUDA registration.
-
-    Host memory never carries one -- there is nothing for CUDA to import --
-    so ``None`` here is the documented answer, not a skip. The mapping case
-    is covered by ``test_cuda_map_mut_when_cuda_is_present``, which uses a
-    D3D11 texture.
-    """
+    """``cuda_map_mut`` on host memory returns ``None``."""
     t = Tensor.image(16, 16, PixelFormat.Rgb, None, "readwrite")
     assert t.cuda_map_mut() is None
 
@@ -351,7 +308,7 @@ def test_cuda_map_mut_when_cuda_is_present():
     assert cm is not None
     with cm as m:
         assert m.device_ptr != 0
-        # Tight rows, not the staging pitch row_stride reports.
+        # The map holds tight rows.
         assert m.size == 64 * 32 * 4
         assert len(m) == m.size
 

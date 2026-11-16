@@ -14,7 +14,7 @@ use crate::tflite::{activation_range_i8, multiply_by_quantized_multiplier, quant
 use crate::view::{TensorMut, TensorRef, View, ViewMut, MAX_RANK};
 
 /// Longest reduction axis: operands not contiguous along it are packed into stack buffers of
-/// this many elements per row, and `255 · 255 · MAX_K` stays inside an `i32`.
+/// this many elements per row.
 pub(crate) const MATMUL_MAX_K: usize = 4096;
 
 /// Rows (and columns) of an output tile.
@@ -303,8 +303,7 @@ impl MatMulI8Plan {
         })
     }
 
-    /// `Ok` when the kernels take a reduction axis of `k` elements; `Unsupported` past 4096
-    /// (operands not contiguous along it are packed into fixed stack buffers).
+    /// `Ok` when the kernels take a reduction axis of `k` elements; `Unsupported` past 4096.
     pub fn check_depth(k: usize) -> Result<()> {
         if k > MATMUL_MAX_K {
             return Err(KernelError::Unsupported(Cow::Borrowed(
@@ -425,8 +424,7 @@ impl MatMulI8Plan {
         let dst = OutPtr(out.data_mut().as_mut_ptr());
         let row_blocks = s.m.div_ceil(TILE);
         let tasks = s.batches() * row_blocks;
-        // An empty reduction reads nothing: its outputs are the requantized biases, which the
-        // portable rows write without touching either operand.
+        // An empty reduction runs the portable rows, which write the requantized biases.
         let kernel = if s.k == 0 {
             Kernel::Portable
         } else {
@@ -780,8 +778,7 @@ mod tests {
         }
     }
 
-    /// `K = 0`: every output is its column's requantized bias, on every tier and whatever
-    /// the operands' strides.
+    /// `K = 0`: every output is its column's requantized bias, on every tier and stride.
     #[test]
     fn empty_reductions_write_the_requantized_bias() {
         for n in [1usize, 3, 40] {

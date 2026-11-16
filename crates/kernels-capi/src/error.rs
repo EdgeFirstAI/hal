@@ -50,7 +50,7 @@ impl CError {
 
 fn set_last(msg: &str) {
     let c = CString::new(msg.replace('\0', "?")).unwrap_or_default();
-    // A destroyed thread-local at thread exit just means there is nobody left to read it.
+    // The message is dropped when the thread-local is already destroyed.
     let _ = LAST.try_with(|l| *l.borrow_mut() = Some(c));
 }
 

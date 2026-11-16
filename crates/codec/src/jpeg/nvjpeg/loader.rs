@@ -3,37 +3,24 @@
 
 //! `dlopen` loader for the CUDA nvJPEG library.
 //!
-//! Mirrors the discipline of `edgefirst_tensor`'s `cuda.rs`: the library is
-//! opened at runtime and every entry point resolved into a function-pointer
-//! table cached in a [`OnceLock`]. Absent or incomplete ⇒ the whole table is
-//! `None` and the codec degrades to the V4L2/CPU decoders.
+//! The library is opened at runtime and every entry point resolved into a
+//! function-pointer table cached in a [`OnceLock`]. When the library is
+//! absent or incomplete the table is `None` and the codec uses the V4L2/CPU
+//! decoders.
 //!
-//! Two target-specific facts shape the candidate list:
-//! - The real `libnvjpeg.so.12` is NOT on the default loader path on JetPack 6;
-//!   it lives under `/usr/local/cuda/targets/<arch>/lib/`.
-//! - The `libnvjpeg.so` on the default path (`/usr/lib/.../nvidia/`) is a
-//!   libjpeg-turbo *decoy* that exports `jpeg_*`, not `nvjpeg*`.
-//!
-//! So the explicit CUDA paths are tried first, and `nvjpegCreateEx` is required
-//! to resolve before a library is accepted — the decoy is rejected because it
-//! lacks that symbol.
+//! The explicit CUDA paths are tried first, and `nvjpegCreateEx` must
+//! resolve before a library is accepted.
 
 use super::ffi::*;
 use libloading::Library;
 use std::sync::OnceLock;
 
-/// Opt-in environment variable enabling the nvJPEG backend. **Default off**:
-/// nvJPEG decodes on the same GPU as CUDA inference (e.g. TensorRT), so it is
-/// not enabled automatically — sharing the GPU can slow a concurrent inference
-/// engine more than the decode speedup is worth. Set `EDGEFIRST_ENABLE_NVJPEG`
-/// to `1`/`true`/`yes` on workloads that benefit (decode-bound, or no
-/// concurrent GPU compute). Contrast `EDGEFIRST_DISABLE_V4L2`, which is opt-out:
-/// V4L2 is a separate hardware block and does not contend with CUDA.
+/// Environment variable enabling the nvJPEG backend, which is off by
+/// default. `1`/`true`/`yes` enable it.
 const ENV_ENABLE: &str = "EDGEFIRST_ENABLE_NVJPEG";
 
-/// Candidate library names/paths, in priority order. Explicit CUDA install
-/// locations come first (the soname is not on the default loader path); the
-/// bare soname is last so a correctly-set `LD_LIBRARY_PATH` still works.
+/// Candidate library names/paths, in priority order: explicit CUDA install
+/// locations, then the bare soname.
 const CANDIDATES: &[&str] = &[
     "/usr/local/cuda/targets/aarch64-linux/lib/libnvjpeg.so.12",
     "/usr/local/cuda/targets/aarch64-linux/lib/libnvjpeg.so",
@@ -44,7 +31,7 @@ const CANDIDATES: &[&str] = &[
 ];
 
 /// Resolved nvJPEG entry points. The leaked `Library` keeps the symbols valid
-/// for the process lifetime (matching `cuda.rs`).
+/// for the process lifetime.
 pub(crate) struct NvjpegLib {
     _lib: &'static Library,
     pub create_ex: FnCreateEx,
@@ -63,13 +50,12 @@ fn load() -> Option<NvjpegLib> {
         return None;
     }
     for name in CANDIDATES {
-        // SAFETY: dlopen of a system library; failures are expected and skipped.
+        // SAFETY: dlopen of a system library.
         let Ok(lib) = (unsafe { Library::new(*name) }) else {
             continue;
         };
-        // Require the real nvjpeg symbol set; this rejects the libjpeg-turbo
-        // decoy (which has no `nvjpegCreateEx`). A library that opens but is
-        // missing any symbol is skipped in favour of the next candidate.
+        // A library missing any required symbol is skipped in favour of the
+        // next candidate.
         match resolve(&lib) {
             Some((
                 create_ex,
@@ -131,9 +117,8 @@ pub(crate) fn lib() -> Option<&'static NvjpegLib> {
     LIB.get_or_init(load).as_ref()
 }
 
-/// True iff nvJPEG is opted in (`EDGEFIRST_ENABLE_NVJPEG`) **and** both
-/// libnvjpeg and libcudart loaded with all required symbols. Cheap (cached) —
-/// intended as a fast pre-check for benches/consumers.
+/// True iff nvJPEG is opted in (`EDGEFIRST_ENABLE_NVJPEG`) and both
+/// libnvjpeg and libcudart loaded with all required symbols. Cached.
 pub fn is_nvjpeg_available() -> bool {
     lib().is_some() && edgefirst_tensor::is_cuda_available()
 }

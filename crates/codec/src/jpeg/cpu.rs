@@ -5,23 +5,16 @@
 //!
 //! ## AArch64 — [`NeonTier`]
 //!
-//! A single aarch64 binary must run well on Cortex-A53 (in-order, no DOTPROD),
-//! Cortex-A55 (in-order, DOTPROD), and big out-of-order cores: Cortex-A7x
-//! (Jetson Orin A78AE, Raspberry Pi 5 A76) and Apple Silicon (M2+/A16+).
-//!
 //! | Tier | Probe | Typical cores | Huffman bits |
 //! |------|-------|---------------|--------------|
 //! | `Baseline` | NEON only | A53, A57, A72 | 10 |
 //! | `Plus` | +`dotprod`, LITTLE core | A55, A510 | 10 |
-//! | `High` | +`i8mm` **or** big-core MIDR | A76/A78(AE), X1+, Apple M2+ | 11 |
+//! | `High` | +`i8mm` or big-core MIDR | A76/A78(AE), X1+, Apple M2+ | 11 |
 //!
-//! `HWCAP` alone cannot split A55 from A76/A78 (both are `dotprod`, no
-//! `i8mm`), so on Linux the probe also reads MIDR part numbers from sysfs and
-//! promotes known big OoO cores to `High` (measured ~3% faster entropy decode
-//! on Cortex-A76 from the wider Huffman lookahead). On Apple platforms `i8mm`
-//! is present from M2/A15 onward and the HWCAP-style probe suffices.
+//! On Linux the probe also reads MIDR part numbers from sysfs and promotes
+//! known big out-of-order cores to `High`.
 //!
-//! Override with `EDGEFIRST_CODEC_FORCE_NEON=scalar|baseline|plus|high` for A/B.
+//! `EDGEFIRST_CODEC_FORCE_NEON=scalar|baseline|plus|high` overrides the tier.
 //!
 //! ## x86_64 — [`IntelTier`]
 //!
@@ -32,7 +25,7 @@
 //! | `Sse41` | `sse4.1` | SSE4.1 IDCT + SSSE3/SSE4.1 color |
 //! | `Avx2` | `avx2` | AVX2 IDCT + wider color/downsample |
 //!
-//! Override with `EDGEFIRST_CODEC_FORCE_INTEL=scalar|sse2|sse41|avx2` for A/B.
+//! `EDGEFIRST_CODEC_FORCE_INTEL=scalar|sse2|sse41|avx2` overrides the tier.
 
 use std::sync::OnceLock;
 
@@ -51,31 +44,18 @@ pub enum NeonTier {
 
 impl NeonTier {
     /// Huffman fast-lookup width.
-    ///
-    /// Trade-off vs libjpeg-turbo's 8-bit `HUFF_LOOKAHEAD`: wider tables raise
-    /// the fast-path hit rate (JPEG AC codes often need 9–11 bits) but cost L1
-    /// (2^N × 2 bytes × ~4 tables). Measured on Cortex-A55 (32 KiB L1D): 10–11
-    /// bits beat 8/9 despite the larger footprint; 12 bits starts to thrash
-    /// when all four tables are hot. A53 originally stayed at 8, but with the
-    /// combined code+magnitude fast-AC LUT a hit now covers the whole
-    /// coefficient, and re-measurement on imx8mp put 10 bits ~0.3 ms/frame
-    /// ahead of 8 on COCO (9 in between).
     #[inline]
     #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
     pub fn huffman_fast_bits(self) -> u8 {
         match self {
-            Self::Scalar | Self::Baseline => 10, // A53: re-measured with fast-AC LUT
-            Self::Plus => 10,                    // A55: measured sweet spot
-            Self::High => 11,                    // A7x/X: 64 KiB L1, wider peek
+            Self::Scalar | Self::Baseline => 10,
+            Self::Plus => 10,
+            Self::High => 11,
         }
     }
 
-    /// Whether the block decoder should use the paired-coefficient probe
-    /// (`HuffmanTable::pair_ac`). Out-of-order cores win from halving the
-    /// serial probe chain (~2.7% on A76); in-order A53/A55 lose ~1-3% — the
-    /// phantom-single path retires more instructions per coefficient and a
-    /// 2-wide in-order pipe pays for all of them (measured on imx8mp/imx95,
-    /// COCO decode-only, 2026-08).
+    /// Whether the block decoder uses the paired-coefficient probe
+    /// (`HuffmanTable::pair_ac`).
     #[inline]
     #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
     pub fn entropy_pair_decode(self) -> bool {
@@ -83,7 +63,6 @@ impl NeonTier {
     }
 
     /// Prefetch distance (bytes ahead in the entropy stream).
-    /// A53 dual-issues `prfm` for free; keep distances modest to avoid pollution.
     #[inline]
     #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
     pub fn entropy_prefetch(self) -> usize {
@@ -111,7 +90,7 @@ pub enum IntelTier {
 
 #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 impl IntelTier {
-    /// Huffman fast-lookup width (same L1 trade-offs as [`NeonTier`]).
+    /// Huffman fast-lookup width.
     #[inline]
     pub fn huffman_fast_bits(self) -> u8 {
         match self {
@@ -181,7 +160,7 @@ pub fn entropy_huffman_fast_bits() -> u8 {
 }
 
 /// Whether the active arch tier uses the paired-coefficient entropy probe.
-/// x86 is unmeasured and stays on the single-coefficient path for now.
+/// x86 uses the single-coefficient path.
 #[inline]
 pub fn entropy_pair_decode() -> bool {
     #[cfg(target_arch = "aarch64")]
@@ -224,8 +203,6 @@ fn probe_neon_tier() -> NeonTier {
 
     #[cfg(target_arch = "aarch64")]
     {
-        // NEON is mandatory for aarch64 userland we care about, but honour the
-        // feature bit for completeness / exotic toolchains.
         if !std::arch::is_aarch64_feature_detected!("neon") {
             return NeonTier::Scalar;
         }
@@ -277,12 +254,7 @@ fn probe_intel_tier() -> IntelTier {
 }
 
 /// Detect a big out-of-order Arm core (Cortex-A76 and newer) from MIDR part
-/// numbers exposed in sysfs. HWCAP cannot make this distinction: A55 and
-/// A76/A78AE all report `dotprod` without `i8mm`.
-///
-/// Any big core qualifying promotes the tier — on big.LITTLE the decode worker
-/// overwhelmingly runs on a big core under load, and the `High` policy is only
-/// mildly worse on a LITTLE core (1 KiB more LUT).
+/// numbers exposed in sysfs. Any big core qualifies.
 #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
 fn has_big_ooo_core() -> bool {
     // Arm Ltd (implementer 0x41) part IDs for big OoO cores.
@@ -319,7 +291,7 @@ fn has_big_ooo_core() -> bool {
 
 #[cfg(all(target_arch = "aarch64", not(target_os = "linux")))]
 fn has_big_ooo_core() -> bool {
-    false // Apple Silicon reaches `High` via i8mm; no sysfs elsewhere.
+    false
 }
 
 #[cfg(test)]

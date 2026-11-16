@@ -5,10 +5,6 @@ use std::env;
 use std::path::PathBuf;
 
 fn skip_exports_map() -> bool {
-    // rustc 1.94 injects its own `--version-script=.../list` for Linux
-    // cdylibs (`--no-undefined-version`). A second script is
-    // `ld: anonymous version tag cannot be combined with other version tags`
-    // on aarch64 bfd. Coverage builds carry the same collision.
     env::var_os("EF_SKIP_VERSION_SCRIPT").is_some()
         || edgefirst_build_support::coverage_instrumented()
         || env::var("CARGO_ENCODED_RUSTFLAGS")
@@ -33,12 +29,7 @@ fn main() {
     edgefirst_build_support::soname("edgefirst_tensor");
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     if target_os == "linux" {
-        // aarch64 GNU bfd rejects rustc's injected version script combined
-        // with exports.map. lld concatenates them, which keeps the ef_*
-        // export set G1 measures. Only force lld when we actually pass
-        // exports.map: coverage builds skip the map, and gcc 11 (Ubuntu
-        // 22.04 ARM) rejects `-fuse-ld=/absolute/rust-lld` from rustc's
-        // sysroot.
+        // On aarch64, link with lld when exports.map is passed.
         if env::var("CARGO_CFG_TARGET_ARCH").ok().as_deref() == Some("aarch64")
             && !skip_exports_map()
         {
@@ -60,10 +51,8 @@ fn main() {
     println!("cargo:rerun-if-changed=exports.map");
     println!("cargo:rerun-if-changed=exports.syms");
 
-    // The header is regenerated only when a source file or the cbindgen
-    // config changes -- NOT when the header itself is edited or deleted. Any
-    // test that reads the header must therefore depend on the source, or it
-    // is validating a stale artifact.
+    // Regenerate the header when a source file or the cbindgen config
+    // changes.
     println!("cargo:rerun-if-changed=src/");
     println!("cargo:rerun-if-changed=cbindgen.toml");
 }

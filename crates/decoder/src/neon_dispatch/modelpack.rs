@@ -130,7 +130,7 @@ impl SplitDecode {
         let (Some(nb), Some(ns)) = (rows.checked_mul(4), rows.checked_mul(classes)) else {
             return false;
         };
-        // Already in capacity when `new` was given every output.
+        // A no-op when `new` was given every output.
         self.boxes.reserve(nb);
         self.scores.reserve(ns);
         let (Some(boxes), Some(scores)) = (
@@ -198,7 +198,7 @@ fn from_planar(src: &[u8], (h, w, c): (usize, usize, usize)) -> Option<Array3<u8
     Array3::from_shape_vec((h, w, c), out).ok()
 }
 
-/// `a` in standard layout when it is planar, so the mask tensor copies it whole; otherwise `a`.
+/// `a` in standard layout when it is planar; otherwise `a`.
 #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 fn standard_layout(a: Array3<u8>) -> Array3<u8> {
     if !is_planar(&a) {

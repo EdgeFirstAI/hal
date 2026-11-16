@@ -1,21 +1,7 @@
 # SPDX-FileCopyrightText: Copyright 2025-2026 Au-Zone Technologies
 # SPDX-License-Identifier: Apache-2.0
 
-"""Producer-side access negotiation for the __edgefirst_tensor__ capsule
-protocol (task 3 of the cross-package tensor handoff).
-
-These tests exercise `Tensor.__edgefirst_tensor__(access=...)` from pure
-Python. The capsule it returns is opaque from Python -- there is no bound
-API yet to unwrap it and inspect the descriptor's `ptr` field or observe
-whether a host pin was actually taken (that is the consumer side, landing
-in a later task). So these tests can only confirm the *call contract*:
-`access=None` and the three explicit access strings all succeed, and an
-invalid access string raises `ValueError`. They cannot yet assert that
-`access=None` skips the pin while `"read"`/`"write"`/`"readwrite"` take
-one -- that requires either a consumer-side unwrap helper or a
-pin-observable backend (e.g. a PBO, which needs a live GL context) that
-is out of scope here.
-"""
+"""Tests of tensors, decoders and proto data crossing between EdgeFirst packages."""
 
 import ctypes
 import sys
@@ -28,11 +14,7 @@ from tests.gpu_policy import skip_unless_gpu_backed
 
 
 def _close(handle: int) -> None:
-    """Close a Windows handle a completion or fence call handed back.
-
-    A plain call, never an assertion: these run in `finally` blocks, where a
-    failing assert would replace the real failure with this one.
-    """
+    """Close a Windows handle a completion or fence call handed back."""
     ctypes.windll.kernel32.CloseHandle(ctypes.c_void_p(handle))
 
 
@@ -55,20 +37,11 @@ def test_capsule_rejects_bad_access():
         t.__edgefirst_tensor__(access="sideways")
 
 
-# --- Task 4+5: TensorArg, the cross-package extractor, wired into
-# ImageProcessor -----------------------------------------------------------
-#
-# The headline scenario this whole plan exists for: decode a JPEG in
-# edgefirst.codec, preprocess it in edgefirst.image. Before this change that
-# raised `TypeError: 'Tensor' object is not an instance of 'Tensor'` --
-# every edgefirst.* extension module links its own copy of the PyO3
-# bindings, so each gets its own distinct `Tensor` type object and
-# `isinstance`/downcast across packages is always false.
+# --- TensorArg, the cross-package extractor, wired into ImageProcessor ------
 
 
 def test_codec_tensor_converts_via_image(tmp_path):
-    """Decode in one package, preprocess in another -- the pipeline this
-    whole plan exists for."""
+    """Decode in one package, preprocess in another."""
     import numpy as np
     from edgefirst.codec import Tensor as CodecTensor
     from edgefirst.image import ImageProcessor
@@ -87,24 +60,12 @@ def test_codec_tensor_converts_via_image(tmp_path):
     proc.convert(src, dst, letterbox=[114, 114, 114, 255])  # <-- crosses packages
 
     with dst.map() as m:
-        # np.asarray(memoryview(m)) honours the mapping's own row_stride
-        # (a padded pitch on a D3D11 texture destination) instead of
-        # assuming a tight buffer the way frombuffer().reshape() does.
         out = np.asarray(memoryview(m))
         assert out[32, 32].tolist() != [0, 0, 0], "converted image is blank"
 
 
-def test_codec_tensor_rejected_before_the_fix_with_a_clear_message(tmp_path):
-    """Same scenario as above, but proves *why* it used to fail and that the
-    replacement message is actionable: it names what was expected, what was
-    received, and points at the protocol -- not the pre-fix
-    `'Tensor' object is not an instance of 'Tensor'`, which names neither
-    package and gives the reader nothing to act on.
-
-    This doesn't revert the fix; it exercises the same error path a truly
-    unrelated object hits, which is the only way to observe the message
-    from pure Python now that the real cross-package case succeeds.
-    """
+def test_object_without_the_protocol_is_rejected_with_a_clear_message(tmp_path):
+    """An object without the protocol is rejected with a message naming the protocol."""
     from edgefirst.image import ImageProcessor
     from edgefirst.image import PixelFormat as ImgFmt
 
@@ -122,12 +83,7 @@ def test_codec_tensor_rejected_before_the_fix_with_a_clear_message(tmp_path):
 
 
 def test_draw_decoded_masks_background_from_different_package():
-    """`background` is read-only, and now goes through `TensorArg::extract`
-    like `model_output` does -- a background image produced by a different
-    package must composite, not raise the isolation TypeError this whole
-    plan exists to eliminate. `draw_decoded_masks` itself is fixed at
-    `dst` for the destination-can't-cross-packages-either half.
-    """
+    """A background image produced by a different package composites."""
     import numpy as np
     from edgefirst.image import ImageProcessor
     from edgefirst.image import PixelFormat as ImgFmt
@@ -137,9 +93,6 @@ def test_draw_decoded_masks_background_from_different_package():
     w, h = 16, 16
     background = TTensor.image(w, h, TFmt.Rgba, None, "readwrite")  # different package
     with background.map() as m:
-        # np.asarray(memoryview(m)) honours the mapping's own row_stride
-        # instead of assuming a tight buffer the way frombuffer().reshape()
-        # does.
         np.asarray(memoryview(m))[:] = (30, 60, 90, 255)
 
     proc = ImageProcessor()
@@ -161,17 +114,7 @@ def test_draw_decoded_masks_background_from_different_package():
 
 @pytest.mark.gpu
 def test_draw_decoded_masks_publishes_its_completion_on_a_foreign_texture():
-    """A D3D11 texture allocated read-only by `edgefirst.tensor` and drawn
-    into by `edgefirst.image` reports the draw's completion afterwards.
-
-    Only the GL engine can write a read-only texture: the CPU backend maps
-    it for writing and fails (`ef_tensor_map failed: errno 13`), which is
-    what every draw on Windows did while the GL draw arms were Linux-only.
-    The GL draw records a fence value on the tensor it renders into -- the
-    one reconstructed from the descriptor, not the caller's -- and the
-    binding publishes it back the way `convert` does, so a device consumer
-    can wait on the drawn frame instead of the CPU.
-    """
+    """A read-only texture from another package reports the draw's completion."""
     if sys.platform != "win32" or not is_gpu_buffer_available():
         pytest.skip("needs Windows with a D3D11 device")
 
@@ -203,11 +146,9 @@ def test_draw_decoded_masks_publishes_its_completion_on_a_foreign_texture():
     try:
         assert value > 0
     finally:
-        # An owned duplicate under the dynamic backend the wheels link.
         _close(fence)
 
     with dst.map("read") as m:
-        # np.asarray(memoryview(m)) honours the texture's staging pitch.
         out = np.asarray(memoryview(m))
         assert out[2, 2].tolist() == [0, 0, 0, 0], "corner (2,2) was not cleared"
         assert out[32, 32].tolist() != [0, 0, 0, 0], (
@@ -217,14 +158,7 @@ def test_draw_decoded_masks_publishes_its_completion_on_a_foreign_texture():
 
 @pytest.mark.gpu
 def test_draw_proto_masks_publishes_its_completion_on_a_foreign_texture():
-    """The proto draw publishes its completion the way the decoded-mask
-    draw does: a read-only texture from `edgefirst.tensor`, prototype data
-    from `edgefirst.decoder`, rendered by `edgefirst.image`.
-
-    Same reasoning as the decoded-mask test above. The proto data crosses
-    packages through `__edgefirst_protodata__`, built the way
-    `test_materialize_masks_accepts_foreign_proto_data` builds it.
-    """
+    """The proto draw reports its completion on a foreign read-only texture."""
     if sys.platform != "win32" or not is_gpu_buffer_available():
         pytest.skip("needs Windows with a D3D11 device")
 
@@ -297,26 +231,7 @@ def test_draw_proto_masks_publishes_its_completion_on_a_foreign_texture():
 
 
 def test_access_negotiation_retries_mem_backed_destination():
-    """Carried coverage item from Task 3, updated for the extract_mut()
-    retry fix (task 5b review): a Mem-backed *destination* from a
-    different package is a legitimate CPU-fallback target -- the earlier
-    "a destination must already be GPU-importable" policy was an
-    unjustified assumption, not a spec requirement, and made every
-    heap-backed tensor from another package unusable as a `convert()` dst
-    for no real reason.
-
-    `TensorArg::extract_mut`'s first `access=None` call takes no pin; when
-    the resulting descriptor comes back host-kind with a null `ptr`, it now
-    retries once with `access="readwrite"` -- mirroring `extract()`'s
-    `access="read"` retry for read-only sources, just with the stronger
-    access a write destination (and a decode that may read-modify-write a
-    strided destination) needs.
-
-    Both `src` and `dst` are Mem-backed producers from a *different*
-    package than the `ImageProcessor` doing the convert, and the assertion
-    checks real pixel data landed in `dst` -- not merely that the call
-    didn't raise.
-    """
+    """A Mem-backed destination from a different package is a valid convert() target."""
     import numpy as np
     from edgefirst.image import ImageProcessor
     from edgefirst.tensor import PixelFormat as TFmt
@@ -330,7 +245,7 @@ def test_access_negotiation_retries_mem_backed_destination():
         buf[:] = (200, 100, 50)
     dst = TTensor.image(8, 8, TFmt.Rgb, TensorMemory.MEM, "readwrite")
 
-    proc.convert(src, dst)  # dst used to raise "host descriptor has no address"
+    proc.convert(src, dst)
 
     with dst.map() as m:
         out = np.frombuffer(m, dtype=np.uint8).reshape(8, 8, 3)
@@ -339,31 +254,7 @@ def test_access_negotiation_retries_mem_backed_destination():
 
 @pytest.mark.gpu
 def test_gpu_backed_destination_skips_the_retry():
-    """The retry added above must stay conditional on a host-kind
-    descriptor with no address -- a GPU-importable destination
-    (DMA/IOSurface/PBO) carries a usable native handle regardless of
-    `ptr`, so it must never hit that branch and must stay on the original
-    zero-pin `access=None` fast path.
-
-    There is no Python-visible hook onto the imported descriptor itself
-    (see this file's module docstring), so this checks the *producer's*
-    reported memory kind instead: `create_image()`'s tensor is never
-    Mem/Shm-backed, and `TensorDyn::descriptor_pinned` derives the
-    descriptor's `kind` directly from that field
-    (`protocol::kind_of`). That proves the retry's `desc.is_host()`
-    precondition is structurally false on this path. It does **not**
-    directly observe that zero pins were taken at runtime -- proving that
-    would need the same consumer-side introspection hook this file already
-    notes is missing.
-
-    `str()` rather than `==`/`in` against `edgefirst.tensor.TensorMemory`
-    sidesteps the same cross-package identity issue this whole plan
-    exists to solve: `dst.memory`'s reported `__module__` is
-    `edgefirst.tensor` (baked into the shared binding source for cosmetic
-    consistency) but it is `edgefirst.image`'s own distinct compiled type,
-    so equality against a value imported from `edgefirst.tensor` is always
-    `False`.
-    """
+    """A `create_image()` destination on a GPU-backed host is not Mem- or Shm-backed."""
     from edgefirst.image import ImageProcessor
     from edgefirst.image import PixelFormat as ImgFmt
 
@@ -377,10 +268,7 @@ def test_gpu_backed_destination_skips_the_retry():
 
 
 def test_access_none_never_pins_bypasses_gate_loudly_if_skipped():
-    """Loud-skip guard: if the tensor kind above ever stops being
-    Mem-backed by default on some platform (making the negotiation gate
-    above vacuous), fail loudly on stderr instead of silently passing.
-    """
+    """Skip, reporting on stderr, when a MEM request is not Mem-backed."""
     from edgefirst.tensor import PixelFormat as TFmt
     from edgefirst.tensor import Tensor as TTensor
     from edgefirst.tensor import TensorMemory
@@ -400,15 +288,7 @@ def test_access_none_never_pins_bypasses_gate_loudly_if_skipped():
 
 @pytest.mark.gpu
 def test_decode_into_gpu_backed_tensor_from_another_package():
-    """The documented zero-copy pipeline: allocate GPU-backed, decode into
-    it, convert. `decode_file_into` is `edgefirst.codec`'s free-function
-    counterpart of `Tensor.decode_image_file` -- it accepts any object
-    implementing `__edgefirst_tensor__`, so an `edgefirst.image.Tensor`
-    allocated by `ImageProcessor.create_image()` (a DMA/PBO-backed
-    destination this package's own `Tensor` type never was) can be decoded
-    into directly, closing the gap `decode_image_file` (a method that can
-    only ever take `self`) cannot.
-    """
+    """`decode_file_into` decodes into a GPU-backed tensor from another package."""
     import numpy as np
     from edgefirst.codec import Tensor as CodecTensor
     from edgefirst.codec import decode_file_into
@@ -426,37 +306,13 @@ def test_decode_into_gpu_backed_tensor_from_another_package():
     dst = proc.create_image(640, 640, ImgFmt.Rgb, "uint8", "readwrite")
     proc.convert(src, dst, letterbox=[114, 114, 114, 255])
     with dst.map() as m:
-        # np.asarray(memoryview(m)) honours the mapping's own row_stride. A
-        # `create_image()` destination is a D3D11 texture on Windows, whose
-        # staging pitch need not equal the tight 1920-byte row
-        # frombuffer().reshape() assumes.
         out = np.asarray(memoryview(m))
         assert out[320, 320].tolist() != [0, 0, 0], "converted image is blank"
 
 
 @pytest.mark.gpu
 def test_d3d11_texture_crosses_packages_through_the_capsule():
-    """A D3D11 texture allocated by `edgefirst.tensor` and rendered into by
-    `edgefirst.image`, through the capsule and nothing else.
-
-    Every `edgefirst.*` wheel links its own copy of the tensor crate, so
-    before the device rendezvous each copy created its own `ID3D11Device`
-    and a texture from one was unreachable from the other -- the convert
-    either failed to import the destination or rendered into a texture the
-    consumer's device could not open. It also needs the `D3D11_TEXTURE`
-    descriptor kind: without it the destination arrives as a host-memory
-    descriptor with no address and the convert falls back to (or fails on)
-    host memory, which is not the zero-copy path this exists for.
-
-    The completion crosses back two ways, and both are checked here. A
-    convert renders into a `TensorDyn` the binding reconstructs from the
-    descriptor -- that is what lets it release the GIL -- so the fence value
-    `edgefirst.image`'s GL engine records lands on that short-lived tensor;
-    the binding publishes it onto the caller's object through
-    `set_gpu_write` before returning, which is what `dst.gpu_completion()`
-    reads back. `convert_with_fence` carries the same completion the other
-    way, as an event the caller waits on and owns.
-    """
+    """A D3D11 texture from `edgefirst.tensor` is rendered into by `edgefirst.image`."""
     if sys.platform != "win32" or not is_gpu_buffer_available():
         pytest.skip("needs Windows with a D3D11 device")
 
@@ -471,9 +327,6 @@ def test_d3d11_texture_crosses_packages_through_the_capsule():
 
     # Allocated by edgefirst.tensor, written by edgefirst.image's GL engine.
     dst = Tensor.image(64, 48, PixelFormat.Rgb, TensorMemory.DMABUF, "read")
-    # The same GPU policy the other tests here follow: Windows runs this only
-    # with HAL_TEST_REQUIRE_GL=1 and ANGLE configured, because a CPU-backend
-    # convert has no device fence to hand back.
     skip_unless_gpu_backed(dst)
     assert dst.memory == TensorMemory.DMABUF, (
         f"destination is {dst.memory!r}, not a texture -- this test is "
@@ -485,8 +338,6 @@ def test_d3d11_texture_crosses_packages_through_the_capsule():
     p.convert(src, dst, Rotation.Rotate0, Flip.NoFlip)  # <-- crosses packages
 
     with dst.map("read") as m:
-        # np.asarray(memoryview(m)) honours the texture's staging pitch,
-        # which is not the tight 192-byte row of a 64-pixel rgb8 image.
         assert np.asarray(memoryview(m))[0, 0].tolist() == [200, 100, 50]
 
     completion = dst.gpu_completion()
@@ -495,34 +346,23 @@ def test_d3d11_texture_crosses_packages_through_the_capsule():
     try:
         assert value > 0
     finally:
-        # An owned duplicate under the dynamic backend the wheels link.
         _close(fence)
 
-    # The same completion the other way round: the event a fenced convert
-    # hands back, which a caller waits on instead of the fence value.
+    # A fenced convert hands back an event to wait on.
     event = p.convert_with_fence(src, dst, Rotation.Rotate0, Flip.NoFlip)
     assert event is not None, (
         "a D3D11 display signals its device fence, so a fenced convert into "
         "a texture from another package must hand back an event"
     )
     try:
-        # WAIT_OBJECT_0. A fence the consumer's device could not signal
-        # would time out here (WAIT_TIMEOUT, 0x102).
         waited = ctypes.windll.kernel32.WaitForSingleObject(
             ctypes.c_void_p(event), 5000
         )
     finally:
-        # The caller owns the event, as it owns the handle `gpu_completion`
-        # returns: both are duplicates under the dynamic backend the wheels
-        # link.
         _close(event)
     assert waited == 0
 
-    # The second convert published a value of its own. Strictly greater, not
-    # merely not-smaller: each recorded completion signals the shared device
-    # fence at a new, higher value, so an equal reading would mean the fenced
-    # convert published nothing and this is still the first convert's value
-    # sitting in a monotonic slot.
+    # The second convert published a greater value.
     later = dst.gpu_completion()
     assert later is not None
     later_fence, later_value = later
@@ -531,11 +371,7 @@ def test_d3d11_texture_crosses_packages_through_the_capsule():
     finally:
         _close(later_fence)
 
-    # `convert_deferred` publishes too, and its value covers the queued
-    # render. Read before the `flush`, deliberately: that is the whole point
-    # of the deferred path -- a device consumer waits on this fence instead
-    # of paying the flush. The flush then completes the render this test
-    # queued rather than leaving it outstanding.
+    # `convert_deferred` publishes a value before the flush.
     p.convert_deferred(src, dst, Rotation.Rotate0, Flip.NoFlip)
     deferred = dst.gpu_completion()
     p.flush()
@@ -548,15 +384,7 @@ def test_d3d11_texture_crosses_packages_through_the_capsule():
 
 
 def test_decode_into_mem_backed_destination_from_another_package():
-    """The extract_mut() retry fix (task 5b review) applies to decode_into()
-    too, not just convert(): a Mem-backed destination allocated by a
-    different package is a legitimate decode target. The first
-    `access=None` `__edgefirst_tensor__` call takes no pin; when it comes
-    back host-kind with a null `ptr`, `decode_into`/`decode_file_into`
-    retry once with `access="readwrite"` via the same `TensorArg::
-    extract_mut` path `convert()`'s destination uses, rather than raising
-    "host descriptor has no address" as it did before this fix.
-    """
+    """A Mem-backed destination from another package is a valid decode target."""
     import numpy as np
     from edgefirst.codec import decode_file_into
     from edgefirst.tensor import PixelFormat as TFmt
@@ -574,12 +402,7 @@ def test_decode_into_mem_backed_destination_from_another_package():
 
 
 def test_decoder_accepts_foreign_tensor():
-    """`Decoder.decode`'s `model_output` now goes through
-    `TensorArg::extract` like `ImageProcessor.draw_masks`'s does -- a model
-    output tensor allocated by a different package (`edgefirst.tensor`, not
-    `edgefirst.decoder`) must decode, not raise the isolation TypeError this
-    whole plan exists to eliminate.
-    """
+    """`Decoder.decode` accepts a model output tensor allocated by another package."""
     import numpy as np
     from edgefirst.decoder import Decoder, Output
     from edgefirst.tensor import Tensor as CoreTensor
@@ -593,7 +416,7 @@ def test_decoder_accepts_foreign_tensor():
     raw[0, 0:4, 0] = [0.5, 0.5, 0.2, 0.2]
     raw[0, 4, 0] = 0.9
 
-    t = CoreTensor(raw.shape, "float32")  # from edgefirst.tensor, NOT .decoder
+    t = CoreTensor(raw.shape, "float32")  # from edgefirst.tensor
     t.from_numpy(raw)
 
     boxes, scores, _classes, _masks = dec.decode([t])
@@ -602,11 +425,7 @@ def test_decoder_accepts_foreign_tensor():
 
 
 def test_decoder_decode_proto_accepts_foreign_tensor():
-    """`Decoder.decode_proto`'s `model_output` now goes through
-    `TensorArg::extract` too -- this is the segmentation entry point that
-    `materialize_masks` builds on, so it must accept foreign tensors just
-    like `decode` does.
-    """
+    """`Decoder.decode_proto` accepts a model output tensor from another package."""
     import numpy as np
     from edgefirst.decoder import Decoder
     from edgefirst.tensor import Tensor as CoreTensor
@@ -656,27 +475,11 @@ def test_decoder_decode_proto_accepts_foreign_tensor():
     assert float(np.asarray(scores)[0]) == pytest.approx(0.9)
 
 
-# --- Task 7: Decoder and ProtoData across packages ------------------------
-#
-# `ImageProcessor.draw_masks(decoder, ...)` and `.materialize_masks(...,
-# proto_data, ...)` are the fused paths `edgefirst-image` declares its
-# `edgefirst-decoder` dependency for -- but a `Decoder`/`ProtoData` built by
-# `edgefirst.decoder` used to be rejected by `edgefirst.image` for the same
-# per-module-type-object reason every other cross-package case in this file
-# is. Per ruling R15, the two protocols are NOT the same mechanism:
-#
-# - `Decoder.__edgefirst_decoder__` carries a raw, version-guarded pointer --
-#   a `Decoder` is a live Rust object with internal state that cannot be
-#   decomposed the way a tensor can.
-# - `ProtoData.__edgefirst_protodata__` carries no pointer at all: it
-#   composes the already-proven `__edgefirst_tensor__` protocol for its two
-#   `TensorDyn` fields plus a layout string, so it needs no version guard.
+# --- Decoder and ProtoData across packages ----------------------------------
 
 
 def test_draw_onto_accepts_image_processor():
-    """Decoder.draw_onto drives image drawing without ImageProcessor linking
-    a Decoder type. Score/class must come from the actual Decoder.
-    """
+    """Decoder.draw_onto draws its scores and classes through an ImageProcessor."""
     import numpy as np
     from edgefirst.decoder import Decoder, Output
     from edgefirst.image import ImageProcessor
@@ -711,19 +514,7 @@ def test_image_processor_has_no_fused_draw_masks():
 
 
 def test_materialize_masks_accepts_foreign_proto_data():
-    """`ImageProcessor.materialize_masks`'s `proto_data` argument now goes
-    through `interop::ProtoDataArg::extract` -- composing the existing
-    `__edgefirst_tensor__` protocol for `mask_coefficients` and `protos`
-    (ruling R15), not a raw pointer. A `ProtoData` produced by
-    `edgefirst.decoder.decode_proto` must materialize real masks in
-    `edgefirst.image`, not raise the isolation TypeError this whole plan
-    exists to eliminate.
-
-    Asserts the materialized mask's dtype and values match the documented
-    contract (binary ``uint8 {0, 255}``, foreground where the dot product is
-    positive) for a hand-computed coefficient/proto pair, not merely that
-    the call didn't raise.
-    """
+    """`materialize_masks` accepts a `ProtoData` produced by `edgefirst.decoder`."""
     import numpy as np
     from edgefirst.decoder import Decoder
     from edgefirst.decoder import Tensor as DTensor
@@ -781,8 +572,7 @@ def test_materialize_masks_accepts_foreign_proto_data():
     m = masks[0]
     assert m.dtype == np.uint8
     assert m.shape == (proto_h, proto_w, 1)
-    # coef=4.0 dotted with protos=1.0 everywhere -> logit=4.0 > 0 everywhere,
-    # so the documented ">0 is foreground" contract says fully 255.
+    # coef 4.0 dotted with protos 1.0 -> logit +4.0 everywhere, foreground.
     assert np.array_equal(m, np.full_like(m, 255)), (
         "expected the whole proto-resolution tile to be foreground per the "
         "documented positive-dot-product convention"
@@ -790,26 +580,7 @@ def test_materialize_masks_accepts_foreign_proto_data():
 
 
 def test_materialize_masks_carries_quantization_across_packages():
-    """An int8 `ProtoData` must keep its quantization when it crosses from
-    `edgefirst.decoder` into `edgefirst.image`.
-
-    Regression for the `_v1` capsule, which carried only a `TensorDesc`.
-    `TensorDesc` has no quantization field, so `import_tensor_capsule`
-    rebuilt the prototype tensors without it and `materialize_masks`' int8
-    fast path -- which reads `.quantization()` off the tensors themselves --
-    refused them with "I8 mask_coefficients require quantization metadata".
-    Every real NPU segmentation model is int8, so this was the whole feature
-    on quantized hardware, not an edge case. `_v2` adds a `QuantDesc` to the
-    payload; see INTEROP.md's Quantization section.
-
-    The values are chosen so the answer is checkable by hand rather than
-    merely non-raising: with `scale=0.5` the coefficient dequantizes to
-    `4 x 0.5 = 2.0` and each proto element to `2 x 0.5 = 1.0`, so every
-    logit is `+2.0` -- positive, i.e. foreground everywhere. Dropping the
-    quantization (the bug) would not produce a *wrong* mask here, it would
-    raise; asserting the mask's contents as well pins the arithmetic that
-    the carried scales feed.
-    """
+    """An int8 `ProtoData` keeps its quantization crossing into `edgefirst.image`."""
     import numpy as np
     from edgefirst.decoder import Decoder
     from edgefirst.decoder import Tensor as DTensor
@@ -844,9 +615,7 @@ def test_materialize_masks_carries_quantization_across_packages():
     }
     dec = Decoder(metadata, score_threshold=0.25, iou_threshold=0.45)
 
-    # Quantized ints: the dequantized values match the float32 sibling test
-    # above (full-frame box, score 0.9 is not representable at scale 0.5 so
-    # the score here is 1.0, coefficient 2.0, protos 1.0).
+    # Quantized ints: score 1.0, coefficient 2.0 and protos 1.0 once dequantized.
     combined = np.zeros((1, 4 + nc + nm, n_anchors), dtype=np.int8)
     combined[0, 0:4, 0] = [1, 1, 2, 2]  # xc, yc, w, h -> 0.5, 0.5, 1.0, 1.0
     combined[0, 4, 0] = 2  # class score -> 1.0
@@ -881,26 +650,9 @@ def test_materialize_masks_carries_quantization_across_packages():
 
 
 def test_tensor_capsule_is_v2_for_a_per_channel_producer():
-    """Pin the capsule name, on a per-channel-quantized producer.
-
-    The name is the protocol's gate (INTEROP.md's Versioning section): it is
-    checked before a single byte of the payload is read, so a payload change
-    that forgets to move the name is exactly the mistake that produces a
-    misread rather than a clean rejection. Asserting it here fails with that
-    sentence rather than as a segfault somewhere downstream.
-
-    Per-channel because `QuantDesc` *borrows* variable-length arrays rather
-    than inlining them, so building the capsule at all is the producer half
-    of that encoding (`QuantDesc::borrowing`). This test cannot reach the
-    consumer half: no Python binding hands back the quantization of an
-    *imported* tensor, so there is nothing here to compare against. The
-    borrow-then-copy round trip is covered in Rust instead, by
-    `protocol::quant_desc_tests` in `crates/tensor/src/protocol.rs` -- which
-    is where `QuantDesc` lives precisely so those tests run under
-    `make test`.
-    """
+    """A per-channel-quantized producer's capsule is named `edgefirst_tensor_v2`."""
     import numpy as np
-    from edgefirst.decoder import Decoder  # noqa: F401  (forces a sibling .so in)
+    from edgefirst.decoder import Decoder  # noqa: F401
     from edgefirst.image import ImageProcessor  # noqa: F401
     from edgefirst.tensor import Tensor as CoreTensor
 
@@ -913,8 +665,6 @@ def test_tensor_capsule_is_v2_for_a_per_channel_producer():
         f"capsule name must move with any payload layout change, got {cap!r}"
     )
 
-    # The producer's own metadata, i.e. what `QuantDesc::borrowing` was
-    # handed. Not a round-trip assertion -- see the docstring.
     q = src.quantization
     assert q is not None
     assert q.scale == pytest.approx([0.5, 0.25, 0.125])
@@ -924,18 +674,7 @@ def test_tensor_capsule_is_v2_for_a_per_channel_producer():
 
 
 def _view_source_or_skip(cls, mem, shape, fmt):
-    """Allocate a whole image in `mem`, skipping only if DMA-BUF is absent.
-
-    A skip rather than a fallback: silently converting a DMA request into a
-    MEM allocation would run the parametrised case below twice against the
-    same backing store and report the DMA half as passing without ever
-    having imported through an fd.
-
-    The skip is scoped to `DMABUF` on purpose. `MEM` is the always-available
-    host constructor and is the half CI actually runs, so a failure there is
-    a real regression; swallowing it into a skip would quietly delete the
-    only coverage this test has on a machine with no DMA heap.
-    """
+    """Allocate a whole image in `mem`, skipping only if DMA-BUF is absent."""
     from edgefirst.tensor import TensorMemory
 
     if mem == TensorMemory.DMABUF:
@@ -944,7 +683,7 @@ def _view_source_or_skip(cls, mem, shape, fmt):
         except (
             RuntimeError,
             OSError,
-        ) as e:  # pragma: no cover - depends on the host's heaps
+        ) as e:  # pragma: no cover
             skip_dma(f"DMA-BUF allocation unavailable here: {e}")
         if t.memory != TensorMemory.DMABUF:
             skip_dma(f"DMA-BUF request fell back to {t.memory!r}")
@@ -957,38 +696,14 @@ def _view_source_or_skip(cls, mem, shape, fmt):
 @pytest.mark.parametrize("mem_name", ["DMABUF", "MEM"])
 @pytest.mark.parametrize("source", ["foreign", "native"])
 def test_view_converts_its_own_sub_region_not_the_parents_origin(source, mem_name):
-    """A ``view()`` handed to ``convert()`` must read its OWN sub-region.
-
-    ``TensorDesc`` has no field for the plane offset, so rebuilding a tensor
-    from a descriptor dropped it and the view came back addressing the
-    parent buffer's origin -- wrong pixels, silently, with no error to
-    follow. The same root cause as the quantization loss above, but this one
-    corrupts data instead of refusing to run. ``_v2`` carries
-    ``plane_offset`` in the capsule payload, and ``interop::reconstruct``
-    clones it across for the same-module path, which had the identical bug.
-
-    Both parameters are load-bearing, because the two halves fail in
-    *opposite* directions and only running both pins the guard in
-    ``interop::apply_plane_offset``:
-
-    * ``DMABUF`` re-derives its base from the fd, which names the whole
-      parent buffer, so the offset must be put back.
-    * ``MEM`` rebuilds from the producer's pinned ``ptr``, which already
-      points at the sub-region's first byte, so putting it back again would
-      advance past it a second time -- an equal and opposite corruption.
-
-    ``source`` covers the two independent code paths that reconstruct: the
-    capsule (``TensorArg::Foreign``) and ``interop::reconstruct``
-    (``TensorArg::NativeRef``).
-    """
+    """A ``view()`` handed to ``convert()`` reads its own sub-region."""
     import numpy as np
     from edgefirst.image import ImageProcessor
     from edgefirst.image import Tensor as ImageTensor
     from edgefirst.tensor import PixelFormat, Region, TensorMemory
     from edgefirst.tensor import Tensor as CoreTensor
 
-    # Distinct per-row and per-column values, so a mask that is off by the
-    # view's origin cannot coincidentally match the expected tile.
+    # Distinct per-row and per-column values.
     w = h = 64
     x0 = y0 = 8
     side = 16
@@ -1022,25 +737,9 @@ def test_view_converts_its_own_sub_region_not_the_parents_origin(source, mem_nam
 
 
 def _pbo_processor_and_source(monkeypatch, make_proc, w, h, fmt):
-    """A PBO-backed image and the processor that owns it.
+    """A PBO-backed image and the processor that owns it, or a skip.
 
-    ``create_image`` is the only route to a PBO from Python, and left to
-    itself whether it returns one is a property of the host: the engine
-    allocates a PBO only when it has GL but no working zero-copy DMA-BUF
-    import. That would make these tests silently vanish on every DMA-capable
-    machine, which is all four embedded boards and most of CI -- coverage
-    that exists on one desktop is not coverage.
-
-    ``EDGEFIRST_FORCE_TRANSFER=pbo`` removes the host dependency:
-    ``apply_forced_transfer`` pins the GL transfer backend at converter
-    construction, and ``ImageProcessor::create_image`` skips its DMA attempt
-    whenever GL has selected PBO. It must be set BEFORE the processor is
-    built, which is why this takes the constructor rather than an instance.
-    ``monkeypatch`` unsets it again at teardown, so no other test in the
-    session inherits it.
-
-    The remaining skip is only the no-GL backstop: with no GL there is no
-    PBO allocator at all, and nothing here can force one into existence.
+    Sets ``EDGEFIRST_FORCE_TRANSFER=pbo`` before building the processor.
     """
     from edgefirst.tensor import TensorMemory
 
@@ -1048,9 +747,9 @@ def _pbo_processor_and_source(monkeypatch, make_proc, w, h, fmt):
     try:
         proc = make_proc()
         src = proc.create_image(w, h, fmt)
-    except (RuntimeError, OSError) as e:  # pragma: no cover - host-dependent
+    except (RuntimeError, OSError) as e:  # pragma: no cover
         pytest.skip(f"no GL image allocator here: {e}")
-    if src.memory != TensorMemory.PBO:  # pragma: no cover - host-dependent
+    if src.memory != TensorMemory.PBO:  # pragma: no cover
         pytest.skip(
             f"create_image returned {src.memory!r} even under "
             "EDGEFIRST_FORCE_TRANSFER=pbo"
@@ -1059,36 +758,7 @@ def _pbo_processor_and_source(monkeypatch, make_proc, w, h, fmt):
 
 
 def test_pbo_view_converts_its_own_sub_region_not_the_parents_origin(monkeypatch):
-    """A ``view()`` of a PBO-backed image must stay PBO-backed and read its
-    OWN sub-region -- issue #162.
-
-    The PBO sibling of the DMABUF/MEM case above, and it failed for three
-    independent reasons, each of which alone produces wrong pixels with no
-    error:
-
-    1. Under the ``dynamic`` backend -- which every wheel uses -- a PBO
-       tensor was a host placeholder with the real ``PboTensor`` stashed
-       beside it in a Rust field. ``view()`` went through
-       ``ef_tensor_view_region``, which never saw that field, so the view
-       came back reporting ``TensorMemory.MEM``: a window onto the
-       placeholder, which reads as all zeros. Not the wrong region -- no
-       region at all.
-    2. The GL engine's PBO source upload bound the buffer and read from byte
-       0, ignoring the view's plane offset, so every view of one buffer
-       converted the parent's top-left tile.
-    3. Rebuilding the view from its capsule dropped the recorded row stride
-       -- which for a sub-view is the PARENT's pitch -- so rows were read at
-       the window's own tight row and each one after the first landed on the
-       wrong columns.
-
-    The origin is non-zero and the pattern is positional in both axes, so a
-    view that reads the right number of bytes from the wrong place fails
-    rather than coincidentally matching. The window is also NARROWER than
-    its parent, which is what keeps reason 3 in play: a full-width band's
-    tight pitch and its parent's pitch are the same number, so it would pass
-    either way. QVGA-scale rather than a toy size, because tiny textures
-    have their own failure modes on Mali that would confound this one.
-    """
+    """A ``view()`` of a PBO-backed image stays PBO-backed and reads its own region."""
     import numpy as np
     from edgefirst.image import ImageProcessor
     from edgefirst.tensor import PixelFormat, Region, TensorMemory
@@ -1097,9 +767,7 @@ def test_pbo_view_converts_its_own_sub_region_not_the_parents_origin(monkeypatch
     w, h = 320, 240
     x0, y0 = 40, 32
     side = 96
-    # Plain index values, not multiples: every row of a 240-row image and
-    # every column the window touches (40..135) then has its own value, so
-    # no two positions this test compares can collide.
+    # Each row and each column carries its own index value.
     img = np.zeros((h, w, 3), np.uint8)
     img[..., 0] = np.arange(h)[:, None] % 256
     img[..., 1] = np.arange(w)[None, :] % 256
@@ -1113,7 +781,7 @@ def test_pbo_view_converts_its_own_sub_region_not_the_parents_origin(monkeypatch
     view = src.view(Region(x0, y0, side, side))
     assert view.memory == TensorMemory.PBO, (
         f"a view of a PBO must stay PBO-backed, got {view.memory!r}; "
-        "it demoted to a host placeholder (issue #162)"
+        "it demoted to a host placeholder"
     )
 
     dst = CoreTensor([side, side, 3], "uint8", TensorMemory.MEM)
@@ -1125,7 +793,7 @@ def test_pbo_view_converts_its_own_sub_region_not_the_parents_origin(monkeypatch
     if np.array_equal(out, np.zeros_like(out)):
         pytest.fail(
             "convert() read all zeros: the view was a window onto the host "
-            "placeholder, not the GL buffer (issue #162)"
+            "placeholder, not the GL buffer"
         )
     expected = img[y0 : y0 + side, x0 : x0 + side]
     origin = img[0:side, 0:side]
@@ -1142,20 +810,7 @@ def test_pbo_view_converts_its_own_sub_region_not_the_parents_origin(monkeypatch
 def test_pbo_capsule_refuses_an_explicit_access_and_allows_the_unpinned_form(
     monkeypatch,
 ):
-    """A PBO-backed tensor hands out a descriptor, but never a host address.
-
-    ``__edgefirst_tensor__(access=...)`` pins; ``glMapBufferRange``'s
-    address is valid only until ``glUnmapBuffer``, so there is no address to
-    pin and both backends refuse. The ``access=None`` form -- the one
-    ``ImageProcessor.convert`` actually uses -- must still succeed, because
-    that descriptor carries the PBO vtable pointer rather than an address,
-    and refusing it would take the whole zero-copy path down with it.
-
-    The pair is the point. A build that refused both would pass a
-    single-sided "PBO capsules raise" assertion while breaking every
-    converter, and a build that allowed both would hand the consumer a stale
-    address to read after the unmap.
-    """
+    """A PBO-backed tensor's capsule succeeds unpinned and refuses explicit access."""
     from edgefirst.image import ImageProcessor
     from edgefirst.tensor import PixelFormat
 
@@ -1175,10 +830,7 @@ def test_pbo_capsule_refuses_an_explicit_access_and_allows_the_unpinned_form(
 
 
 def test_materialize_masks_rejects_an_object_without_the_protocol():
-    """Mirrors `test_codec_tensor_rejected_before_the_fix_with_a_clear_message`
-    for `ProtoData`: an unrelated object is rejected with a message naming
-    the protocol, what was expected, and what was received.
-    """
+    """An object without the `ProtoData` protocol is rejected, naming the protocol."""
     import numpy as np
     from edgefirst.image import ImageProcessor
 

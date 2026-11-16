@@ -1,16 +1,7 @@
 """Isolation of the libraries: Rust crates via cargo tree, Python
 wheels via the DT_NEEDED / otool of the installed extension.
-
-A coupling can be re-added by one unconditional reference and shrink to
-nothing under dead-code elimination, so it is invisible in a size baseline
-while still being wrong. `cargo tree --prefix none --format {p}` is the
-honest check for Rust. Python wheels do not cargo-depend on the sibling
-Rust crates (they are python-common + a C library from build.rs), so
-isolation for those is measured on the built ``.so`` / ``.dylib``.
 """
 
-# `set[str]` in a runtime annotation is evaluated at def time; the project
-# floor is Python 3.8, where the builtin is not subscriptable.
 from __future__ import annotations
 
 import importlib
@@ -22,23 +13,12 @@ from pathlib import Path
 
 import pytest
 
-# Hardware runners (imx8mp) install wheels and run pytest without a
-# Rust toolchain. Crate-graph isolation is the hosted-CI job.
 needs_cargo = pytest.mark.skipif(
     shutil.which("cargo") is None,
     reason="cargo is not on PATH; crate-graph checks run on hosted CI",
 )
 
-# Exact crate names only. This list will keep growing as more leaves are
-# split out (it already did once: `edgefirst-decoder-abi`, `edgefirst-tensor-
-# abi`, `edgefirst-tensor-ffi`), and every `-abi`/`-ffi` split creates a real
-# dependency whose name has an existing INTERNAL crate's full name as a
-# prefix. `links()` below compares crate-name tokens for equality precisely
-# because of that: a substring/`in` test against the raw `cargo tree` text
-# would report the shorter crate "linked" whenever only its `-abi`/`-ffi`
-# leaf is (`edgefirst-decoder-abi` in the tree made `edgefirst-decoder` look
-# linked when it wasn't -- see the dependency-isolation hygiene track).
-# Restoring `c in out` here as a "simplification" reintroduces that bug.
+# Internal crate names, matched exactly.
 INTERNAL = (
     "edgefirst-tensor",
     "edgefirst-codec",
@@ -63,10 +43,8 @@ CARGO_TREE = [
 def _crate_names(tree_output: str) -> set[str]:
     """The set of crate names `cargo tree --prefix none --format {p}` printed.
 
-    Each line is ``<name> v<version>`` (stable; no box-drawing prefix). The
-    first whitespace-delimited token is the crate name. A substring scan of
-    the whole blob would report ``edgefirst-decoder`` whenever only
-    ``edgefirst-decoder-abi`` is present.
+    Each line is ``<name> v<version>``; the first whitespace-delimited token is the
+    crate name.
     """
     names = set()
     for line in tree_output.splitlines():
@@ -90,9 +68,7 @@ def links(package: str, extra: list[str] | None = None) -> set[str]:
 
 
 # Captured `cargo tree --prefix none --format {p}` output with one
-# dependency whose name is a different INTERNAL crate's name plus a suffix
-# -- exactly the `edgefirst-decoder` / `edgefirst-decoder-abi` shape that
-# broke the substring version of `links()`.
+# dependency whose name is a different INTERNAL crate's name plus a suffix.
 _DECODER_ABI_ONLY_FIXTURE = (
     "edgefirst-python-image v0.29.0\n"
     "edgefirst-image v0.29.0\n"
@@ -104,12 +80,7 @@ _DECODER_ABI_ONLY_FIXTURE = (
 
 
 def test_links_reports_a_crate_only_when_it_is_actually_in_the_graph(monkeypatch):
-    """`links()` must not report `edgefirst-decoder` on a tree that contains
-    only `edgefirst-decoder-abi` -- a real, intentional dependency whose name
-    happens to start with another INTERNAL crate's full name. A substring
-    test against the raw `cargo tree` blob gets this wrong; per-line crate-
-    name parsing does not.
-    """
+    """`links()` matches whole crate names, not prefixes."""
 
     class _FakeCompletedProcess:
         stdout = _DECODER_ABI_ONLY_FIXTURE
@@ -141,10 +112,7 @@ def _wheel_extension(leaf: str) -> Path:
 
 
 def _pe_imports(path: Path) -> list[str]:
-    """DLL names in a PE image's import directory (the DT_NEEDED analogue).
-
-    Pure Python so the check does not need dumpbin / a VS developer shell.
-    """
+    """DLL names in a PE image's import directory (the DT_NEEDED analogue)."""
     import struct
 
     data = path.read_bytes()
@@ -200,8 +168,7 @@ def _needed_text(so: Path) -> str:
         )
         return r.stdout
     if sys.platform == "win32":
-        # `.pyd` extension modules are PE DLLs; their import directory names
-        # `edgefirst_tensor.dll` (no `lib` prefix on Windows).
+        # `.pyd` extension modules are PE DLLs.
         return "\n".join(_pe_imports(so))
     r = subprocess.run(
         ["readelf", "-d", str(so)], capture_output=True, text=True, check=True
@@ -224,7 +191,7 @@ def _embedded_sibling_c_libs(so: Path) -> list[str]:
 
 
 def _tensor_backend_is_dynamic() -> bool:
-    """The backend the installed edgefirst-tensor declares; G13 installs a static build, so it is not assumed."""
+    """Whether the installed edgefirst-tensor declares the dynamic backend."""
     import edgefirst.tensor
 
     return edgefirst.tensor.__tensor_backend__ == "dynamic"
@@ -232,11 +199,7 @@ def _tensor_backend_is_dynamic() -> bool:
 
 @pytest.mark.parametrize("leaf", ["tensor", "codec", "image", "decoder"])
 def test_python_wheel_dt_needed_libedgefirst_tensor(leaf):
-    """Under a `dynamic` tensor backend, these four wheels link
-    libedgefirst_tensor; under `static` none of them do (the implementation
-    is embedded instead). Either way they must not embed a sibling C
-    library (G12).
-    """
+    """The four wheels link libedgefirst_tensor only under the `dynamic` backend."""
     so = _wheel_extension(leaf)
     dynamic = _tensor_backend_is_dynamic()
     if dynamic:
@@ -257,9 +220,7 @@ def test_python_wheel_dt_needed_libedgefirst_tensor(leaf):
 
 @pytest.mark.parametrize("leaf", ["tracker", "kernels"])
 def test_tensor_free_wheel_does_not_link_tensor(leaf):
-    """Tracker detections cross as a plain array and kernels read borrowed
-    numpy buffers, so neither extension may DT_NEEDED libedgefirst_tensor.
-    """
+    """The tracker and kernels extensions do not link libedgefirst_tensor."""
     so = _wheel_extension(leaf)
     assert not _links_libedgefirst_tensor(so), (
         f"{so} unexpectedly links libedgefirst_tensor"
@@ -270,20 +231,20 @@ def test_tensor_free_wheel_does_not_link_tensor(leaf):
 
 @needs_cargo
 def test_kernels_crate_links_no_other_hal_crate():
-    """edgefirst-kernels sits at the bottom of the graph; a sibling edge would pull tensor into every kernels consumer."""
+    """edgefirst-kernels links no other HAL crate."""
     assert links("edgefirst-kernels") == {"edgefirst-kernels"}
 
 
 # `edgefirst-tensor`'s optional features.
 FEATURE_SETS = ["", "ndarray", "tracing", "ndarray,tracing"]
 
-# The backend is a build cfg, not a feature: static unless the dynamic config is passed.
+# The backend is a build cfg: static unless the dynamic config is passed.
 TENSOR_DYNAMIC = Path(__file__).resolve().parents[2] / ".cargo" / "tensor-dynamic.toml"
 BACKENDS = {"static": [], "dynamic": ["--config", str(TENSOR_DYNAMIC)]}
 
 
 def _cargo_env():
-    """The caller's environment minus RUSTFLAGS, which would hide the dynamic config's cfg."""
+    """The caller's environment minus RUSTFLAGS."""
     return {
         k: v
         for k, v in os.environ.items()
@@ -293,7 +254,7 @@ def _cargo_env():
 
 @needs_cargo
 def test_dynamic_config_selects_the_ffi_backend():
-    """Only the dynamic backend pulls in edgefirst-tensor-ffi, so its presence proves the cfg took effect."""
+    """Only the dynamic backend pulls in edgefirst-tensor-ffi."""
     trees = {
         backend: subprocess.run(
             ["cargo", "tree", *args, "-p", "edgefirst-tensor", "-e", "normal"],
@@ -312,12 +273,7 @@ def test_dynamic_config_selects_the_ffi_backend():
 @pytest.mark.parametrize("backend", sorted(BACKENDS))
 @pytest.mark.parametrize("features", FEATURE_SETS, ids=lambda f: f or "none")
 def test_tensor_compiles_across_feature_sets(features, backend):
-    """edgefirst-tensor must build under any combination of its features, on both backends.
-
-    A crate that only compiles with its defaults cannot be trimmed by a
-    consumer, and the breakage is invisible until someone tries. Checked here
-    rather than left to CI's default-features-only build.
-    """
+    """edgefirst-tensor builds under every feature combination on both backends."""
     cmd = [
         "cargo",
         "check",
@@ -328,8 +284,6 @@ def test_tensor_compiles_across_feature_sets(features, backend):
     ]
     if features:
         cmd += ["--features", features]
-    # check=False: a non-zero exit IS the finding here, and the assertion below
-    # reports cargo's own diagnostics. CalledProcessError would hide them.
     r = subprocess.run(
         cmd, capture_output=True, text=True, check=False, env=_cargo_env()
     )
@@ -338,12 +292,8 @@ def test_tensor_compiles_across_feature_sets(features, backend):
 
 # --- edgefirst-image must not link a model decoder to draw ------------------
 
-# Everything the `image -> decoder` edge used to drag in. A YAML parser, a
-# JSON parser, a stats crate and an RNG, because drawing a rectangle needed
-# `DetectBox`. The vocabulary now lives in edgefirst-tensor and the two
-# decoder-taking convenience wrappers sit behind the non-default `decode`
-# feature, so a default build of edgefirst-image links none of this.
-SHED_BY_DECOUPLING = (
+# Crates a default build of edgefirst-image must not link.
+NOT_LINKED_BY_DEFAULT = (
     "edgefirst-decoder",
     "serde_json",
     "serde_yaml_ng",
@@ -359,34 +309,18 @@ SHED_BY_DECOUPLING = (
 
 @needs_cargo
 def test_image_does_not_link_a_decoder_by_default():
-    """Drawing masks must not require a model-postprocessing crate.
-
-    `draw_decoded_masks` and `draw_proto_masks` take plain data, so the
-    default build has no reason to link `edgefirst-decoder`. Asserted on the
-    dependency *graph* rather than on wheel size: static linking plus DCE can
-    hide a re-added edge that costs no bytes but is still wrong.
-    """
+    """A default build of edgefirst-image does not link a decoder crate."""
     linked = links("edgefirst-image")
-    regressions = sorted(d for d in SHED_BY_DECOUPLING if d in linked)
+    regressions = sorted(d for d in NOT_LINKED_BY_DEFAULT if d in linked)
     assert not regressions, (
-        f"edgefirst-image links {regressions} again; the decoupling regressed. "
+        f"edgefirst-image links {regressions}. "
         f"If a new caller needs the decoder, put it behind --features decode."
     )
 
 
 @needs_cargo
 def test_decode_feature_restores_the_decoder():
-    """The gate must be a gate, not a deletion.
-
-    Without this, dropping the wrappers entirely would also pass the test
-    above — and the convenience API is meant to remain available on request.
-
-    Parsed with `_crate_names`, not a raw substring check on `r.stdout`:
-    `edgefirst-image` links `edgefirst-decoder-abi` unconditionally (see
-    `test_image_does_not_link_a_decoder_by_default`'s docstring), so
-    `"edgefirst-decoder" in r.stdout` would already be true with the feature
-    off and prove nothing about what `--features decode` actually changed.
-    """
+    """The `decode` feature links edgefirst-decoder into edgefirst-image."""
     r = subprocess.run(
         [
             "cargo",

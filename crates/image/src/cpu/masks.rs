@@ -21,8 +21,6 @@ impl CPUProcessor {
     ) -> Result<()> {
         let seg = &segmentation.segmentation;
         let [seg_height, seg_width, seg_classes] = *seg.shape() else {
-            // A TensorDyn can carry any rank, so unlike the former Array3 this
-            // is genuinely reachable for a malformed mask.
             return Err(crate::Error::InvalidShape(format!(
                 "segmentation must be [H, W, C], got {:?}",
                 seg.shape()
@@ -41,15 +39,9 @@ impl CPUProcessor {
         let end_x_u = (end_x as usize).min(dst_w);
         let end_y_u = (end_y as usize).min(dst_h);
 
-        // Per-pixel argmax over the class axis, by a direct scan of the
-        // contiguous `[H, W, C]` bytes rather than
-        // `map_axis(Axis(2), |r| r.argmax())`. Same result — ties resolve to
-        // the lowest class index, as `ndarray_stats`' argmax does — but it
-        // drops this crate's only `ndarray-stats` use and avoids the
-        // `Array2<usize>` that `map_axis` allocates per mask.
+        // Per-pixel argmax over the class axis by a scan of the contiguous
+        // `[H, W, C]` bytes; ties resolve to the lowest class index.
         if seg_classes > u16::MAX as usize {
-            // An error, not a panic: this function returns Result and the mask
-            // is caller-supplied through a public API.
             return Err(crate::Error::InvalidShape(format!(
                 "semantic segmentation with {seg_classes} classes exceeds the \
                  u16 argmax index"
@@ -123,19 +115,11 @@ impl CPUProcessor {
     ) -> Result<()> {
         let seg = &segmentation.segmentation;
         let [seg_height, seg_width, classes] = *seg.shape() else {
-            // A TensorDyn can carry any rank, so unlike the former Array3 this
-            // is genuinely reachable for a malformed mask.
             return Err(crate::Error::InvalidShape(format!(
                 "segmentation must be [H, W, C], got {:?}",
                 seg.shape()
             )));
         };
-        // Promoted from `debug_assert_eq!(classes, 1)`. This renderer is for
-        // instance masks; a semantic mask reaching it means the caller mixed
-        // channel counts in one list, and the dispatcher picks the path from
-        // `segmentation[0]` alone. Rendering channel 0 of a multi-class mask
-        // as if it were an instance mask is not meaningful output, and in a
-        // release build the old debug assertion caught nothing at all.
         if classes != 1 {
             return Err(crate::Error::InvalidShape(format!(
                 "instance mask must be [H, W, 1], got [{seg_height}, {seg_width}, {classes}]; \
@@ -166,17 +150,7 @@ impl CPUProcessor {
                 let seg_x = ((x as f32 - start_x) * scale_x) as usize;
                 let seg_y = ((y as f32 - start_y) * scale_y) as usize;
                 // Channel 0 of an `[H, W, C]` contiguous buffer is at
-                // `(y * W + x) * C`, NOT `y * W + x`. The former Array3 read
-                // `.get([seg_y, seg_x, 0])` was correct for any C; dropping
-                // the stride made it correct only for C == 1, and since the
-                // read stays in bounds a C > 1 mask would silently render the
-                // wrong bytes past the debug_assert. Reachable because the
-                // semantic/instance split is decided from segmentation[0]
-                // alone, so a list whose first mask is C == 1 routes any later
-                // C > 1 mask here.
-                //
-                // Out-of-range reads yielded 0 through `Array3::get`; preserve
-                // that rather than clamping, which would smear the edge pixel.
+                // `(y * W + x) * C`. Out-of-range reads yield 0.
                 let val = if seg_y < seg_height && seg_x < seg_width {
                     seg_flat[(seg_y * seg_width + seg_x) * classes]
                 } else {
@@ -264,8 +238,7 @@ impl CPUProcessor {
             };
             // The last column of the left line, the last row of the top line,
             // and the first column and row of the right and bottom lines. The
-            // lines lie outside the box, so these may fall outside the image
-            // (a left edge at 0 puts the left line at -1 and before).
+            // lines lie outside the box and may fall outside the image.
             let left = ((dst_w - 1) as f32 * bbox.xmin - 0.5).round() as i64;
             let top = ((dst_h - 1) as f32 * bbox.ymin - 0.5).round() as i64;
             let right = ((dst_w - 1) as f32 * bbox.xmax + 0.5).round() as i64;
@@ -294,14 +267,9 @@ impl CPUProcessor {
 
     /// Materialize segmentation masks from proto data into `Vec<Segmentation>`.
     ///
-    /// This is the CPU-side decode step of the hybrid mask rendering path:
-    /// call this to get pre-decoded masks, then pass them to
+    /// This is the CPU-side decode step of the hybrid mask rendering path: the
+    /// returned masks go to
     /// [`draw_decoded_masks`](crate::ImageProcessorTrait::draw_decoded_masks) for GPU overlay.
-    /// Benchmarks show this hybrid path (CPU decode + GL overlay) is faster
-    /// than the fused GPU `draw_proto_masks` on all tested platforms.
-    ///
-    /// Optimized: fused dequantization + dot product avoids a 3.1MB f32
-    /// allocation for the full proto tensor. Uses fast sigmoid approximation.
     pub fn materialize_segmentations(
         &self,
         detect: &[crate::DetectBox],
@@ -364,12 +332,10 @@ impl CPUProcessor {
             None => (0.0_f32, 1.0_f32, 0.0_f32, 1.0_f32),
         };
 
-        // Fast integer path: when both coefficients and protos are I8 with
-        // per-tensor quantization, use the all-integer kernel (same dot
-        // product infrastructure as the scaled path, but at proto resolution
-        // without bilinear upsampling). Output is binary {0, 255}.
-        // Falls through to the general f32 dequant path for per-channel
-        // quantization or other unsupported modes.
+        // Integer path: I8 coefficients and I8 protos with per-tensor
+        // quantization use the all-integer kernel at proto resolution. Output
+        // is binary {0, 255}. Other quantization modes continue to the f32
+        // dequant path.
         if proto_data.mask_coefficients.dtype() == DType::I8
             && proto_data.protos.dtype() == DType::I8
         {
@@ -405,14 +371,13 @@ impl CPUProcessor {
             ) {
                 Ok(result) => return Ok(result),
                 Err(crate::Error::NotSupported(_)) => {
-                    // Fall through to the general f32 dequant path below for
-                    // per-channel quantization and other unsupported modes.
+                    // Continues to the f32 dequant path below.
                 }
                 Err(e) => return Err(e),
             }
         }
 
-        // Fast i16×i8 integer path: i16 coefficients × i8 protos → i32 dot.
+        // i16×i8 integer path: i16 coefficients × i8 protos → i32 dot.
         if proto_data.mask_coefficients.dtype() == DType::I16
             && proto_data.protos.dtype() == DType::I8
         {
@@ -421,8 +386,8 @@ impl CPUProcessor {
                 .as_typed::<i16>()
                 .expect("I16 coefficients");
             let coeff_m = coeff_t.map_read()?;
-            // Skip the integer fast path when coefficient quantization is
-            // absent — the f32 fallback below handles raw i16 by widening.
+            // The integer path needs coefficient quantization; without it the
+            // f32 path below widens raw i16.
             if let Some(coeff_quant) = coeff_t.quantization() {
                 let proto_t = proto_data.protos.as_typed::<i8>().expect("I8 protos");
                 let proto_m = proto_t.map_read()?;
@@ -446,17 +411,15 @@ impl CPUProcessor {
                 ) {
                     Ok(result) => return Ok(result),
                     Err(crate::Error::NotSupported(_)) => {
-                        // Fall through to the general f32 dequant path.
+                        // Continues to the f32 dequant path below.
                     }
                     Err(e) => return Err(e),
                 }
             }
         }
 
-        // Coefficients may be F32 (from f32 models), F16 (from fp16 models),
-        // I8 (from quantized models — kept raw with quantization), or I16.
-        // For the mask kernel we always need an f32 view (the multiply-accumulate
-        // is done in f32 for precision). Map once and widen once outside the loop.
+        // Coefficients are F32, F16, I8 (raw, with quantization) or I16; they
+        // are mapped and widened to f32 once, outside the loop.
         if proto_data.layout == edgefirst_tensor::ProtoLayout::Nchw
             && proto_data.protos.dtype() != DType::I8
         {
@@ -544,11 +507,8 @@ impl CPUProcessor {
             }
         };
 
-        // Hoist the proto tensor map() out of the per-detection loop so the
-        // map-guard is acquired once. Then dispatch per-dtype via a helper
-        // that runs the per-detection kernels in parallel across detections
-        // via rayon. This restores the parallelism that PR #54 added and
-        // PR #51 (EDGEAI-1244 f16 refactor) inadvertently removed.
+        // Maps the proto tensor once, then dispatches per dtype to a helper that
+        // runs the per-detection kernels in parallel.
         match proto_data.protos.dtype() {
             DType::I8 => {
                 let t = proto_data
@@ -562,10 +522,7 @@ impl CPUProcessor {
                 let src_slice = m.as_slice();
                 let transposed_storage = if proto_data.layout == edgefirst_tensor::ProtoLayout::Nchw
                 {
-                    // Guard the proto geometry before the per-plane slice so
-                    // an undersized or overflowing (e.g. imported `from_fd`)
-                    // proto tensor yields `InvalidShape` instead of a wrapped
-                    // `hw` slipping past the bounds check (panic/SIGBUS).
+                    // Checks the proto geometry before the per-plane slice.
                     let hw = proto_h.checked_mul(proto_w).ok_or_else(|| {
                         crate::Error::InvalidShape(format!(
                             "proto plane size overflow (proto_h={proto_h}, proto_w={proto_w})"
@@ -756,11 +713,9 @@ impl CPUProcessor {
             )));
         }
 
-        // Fast integer path: when both coefficients and protos are I8, use
-        // the all-integer kernel (i8×i8→i32 dot product, sign-shortcut
-        // bilinear). No floating-point conversion at all.
-        // Falls through to the general f32 dequant path for per-channel
-        // quantization or other unsupported modes.
+        // Integer path: I8 coefficients and I8 protos use the all-integer kernel
+        // (i8×i8→i32 dot product, sign-shortcut bilinear). Other quantization
+        // modes continue to the f32 dequant path.
         if proto_data.mask_coefficients.dtype() == DType::I8
             && proto_data.protos.dtype() == DType::I8
         {
@@ -795,14 +750,13 @@ impl CPUProcessor {
             ) {
                 Ok(result) => return Ok(result),
                 Err(crate::Error::NotSupported(_)) => {
-                    // Fall through to the general f32 dequant path below for
-                    // per-channel quantization and other unsupported modes.
+                    // Continues to the f32 dequant path below.
                 }
                 Err(e) => return Err(e),
             }
         }
 
-        // Fast i16×i8 integer path: i16 coefficients × i8 protos.
+        // i16×i8 integer path: i16 coefficients × i8 protos.
         if proto_data.mask_coefficients.dtype() == DType::I16
             && proto_data.protos.dtype() == DType::I8
         {
@@ -811,8 +765,8 @@ impl CPUProcessor {
                 .as_typed::<i16>()
                 .expect("I16 coefficients");
             let coeff_m = coeff_t.map_read()?;
-            // Skip the integer fast path when coefficient quantization is
-            // absent — the f32 fallback below handles raw i16 by widening.
+            // The integer path needs coefficient quantization; without it the
+            // f32 path below widens raw i16.
             if let Some(coeff_quant) = coeff_t.quantization() {
                 let proto_t = proto_data.protos.as_typed::<i8>().expect("I8 protos");
                 let proto_m = proto_t.map_read()?;
@@ -840,7 +794,7 @@ impl CPUProcessor {
             }
         }
 
-        // Fallback: widen coefficients to f32 for the float-path kernels.
+        // Widens coefficients to f32 for the float-path kernels.
         if proto_data.layout == edgefirst_tensor::ProtoLayout::Nchw
             && proto_data.protos.dtype() != DType::I8
         {
@@ -956,10 +910,7 @@ impl CPUProcessor {
                 let src_slice = m.as_slice();
                 let transposed_storage = if proto_data.layout == edgefirst_tensor::ProtoLayout::Nchw
                 {
-                    // Guard the proto geometry before the per-plane slice so
-                    // an undersized or overflowing (e.g. imported `from_fd`)
-                    // proto tensor yields `InvalidShape` instead of a wrapped
-                    // `hw` slipping past the bounds check (panic/SIGBUS).
+                    // Checks the proto geometry before the per-plane slice.
                     let hw = proto_h.checked_mul(proto_w).ok_or_else(|| {
                         crate::Error::InvalidShape(format!(
                             "proto plane size overflow (proto_h={proto_h}, proto_w={proto_w})"
@@ -1017,27 +968,19 @@ impl CPUProcessor {
 // point). Per-dtype variants exist for i8 (with on-the-fly dequant using a
 // tensor-level `Quantization`), f32, and f16; f16 widens to f32 per-element
 // at the FMA site via `half::f16::to_f32()`.
-//
-// On ARMv8.2-FP16 this compiles to `fcvt`; on Cortex-A53 and non-F16C x86 it
-// becomes a soft-float helper.
 // =============================================================================
 
-/// Map a detection bbox in normalised letterboxed coords to its ROI in
-/// the proto plane (floor xmin/ymin, ceil xmax/ymax, clamp to plane bounds).
-/// Returns `(x0, y0, x1, y1, roi_w, roi_h)` where roi_w/h are guaranteed ≥ 1.
 /// Materialise an ndarray mask into the [`TensorDyn`] that
 /// [`Segmentation`] carries.
-///
-/// `materialize_masks` still computes mask values with ndarray; this converts
-/// once at the point the value becomes a `Segmentation`. Making that output
-/// natively `TensorDyn` — which would let this crate drop `ndarray` entirely
-/// — is deliberately out of scope for the decoupling work.
 fn mask_to_tensor(mask: ndarray::ArrayView3<'_, u8>) -> Result<edgefirst_tensor::TensorDyn> {
     edgefirst_tensor::Tensor::from_arrayview3(mask)
         .map(edgefirst_tensor::TensorDyn::from)
         .map_err(|e| crate::Error::InvalidShape(format!("mask -> TensorDyn: {e}")))
 }
 
+/// Map a detection bbox in normalised letterboxed coords to its ROI in
+/// the proto plane (floor xmin/ymin, ceil xmax/ymax, clamp to plane bounds).
+/// Returns `(x0, y0, x1, y1, roi_w, roi_h)` where roi_w/h are at least 1.
 fn bbox_to_proto_roi(
     det: &DetectBox,
     proto_w: usize,
@@ -1174,7 +1117,7 @@ fn shared_i8(_: i32, _: i32, _: usize, _: edgefirst_tensor::ProtoLayout) -> bool
 }
 
 /// Whether the shared exact wide kernel serves this i16 x i8 sign-only call: NHWC protos with a
-/// coefficient zero point, where the image kernel would sum every proto pixel first.
+/// coefficient zero point.
 #[cfg(target_arch = "aarch64")]
 fn shared_i16(zp_c: i32, zp_p: i32, k: usize, layout: edgefirst_tensor::ProtoLayout) -> bool {
     zp_c != 0 && layout == edgefirst_tensor::ProtoLayout::Nhwc && shared::i16_ok(zp_c, zp_p, k)
@@ -1219,11 +1162,6 @@ fn seg_from_roi(
 // =============================================================================
 // Integer-domain proto-resolution kernel: i8 coefficients × i8 protos → i32
 // → sign threshold → binary {0, 255}.
-//
-// Reuses the same dot product infrastructure as the scaled path (NEON sdot on
-// A55+, smull+sadalp on A53, scalar fallback on x86). Since proto-resolution
-// produces masks at the native proto grid (~30×30 per ROI), there is no
-// bilinear upsampling — just a direct sign threshold per pixel.
 // =============================================================================
 
 /// Proto-resolution mask materialization using integer-domain math.
@@ -1311,7 +1249,7 @@ fn proto_segmentations_i8_i8(
     #[cfg(target_arch = "aarch64")]
     let dotprod = std::arch::is_aarch64_feature_detected!("dotprod");
 
-    // `logits` is the scalar loop's buffer, one per worker; the shared kernel needs none.
+    // `logits` is the scalar loop's buffer, one per worker.
     let segment = |logits: &mut Vec<i32>, (i, det): (usize, &crate::DetectBox)| {
         let coeff = &coeff_all[i * num_protos..(i + 1) * num_protos];
         let (x0, y0, x1, y1, roi_w, roi_h) = bbox_to_proto_roi(det, proto_w, proto_h);
@@ -1362,8 +1300,7 @@ fn proto_segmentations_i8_i8(
             }
             edgefirst_tensor::ProtoLayout::Nchw => {
                 // Channel-major accumulation: for each channel, accumulate
-                // coeff[c] * proto[c, py, px] across the ROI. Each channel
-                // plane is contiguous, giving excellent sequential read access.
+                // coeff[c] * proto[c, py, px] across the ROI.
                 let mut accum = vec![0i32; roi_h * roi_w];
                 for c in 0..num_protos {
                     let plane = &protos[c * hw..];
@@ -1410,7 +1347,6 @@ fn proto_segmentations_i8_i8(
     }
 }
 
-// =============================================================================
 #[allow(clippy::too_many_arguments)]
 fn proto_segmentations_i16_i8(
     detect: &[crate::DetectBox],
@@ -1567,8 +1503,7 @@ fn proto_segmentations_i16_i8(
                 }
                 edgefirst_tensor::ProtoLayout::Nchw => {
                     // Channel-major accumulation: for each channel, accumulate
-                    // coeff[c] * proto[c, py, px] across the ROI. Each channel
-                    // plane is contiguous, giving excellent sequential read access.
+                    // coeff[c] * proto[c, py, px] across the ROI.
                     let mut accum = vec![0i32; roi_h * roi_w];
                     for c in 0..num_protos {
                         let plane = &protos[c * hw..];
@@ -1611,12 +1546,9 @@ fn proto_segmentations_i16_i8(
 }
 
 // =============================================================================
-
 // Sign-threshold proto-resolution kernels (f32/f16/i8 protos with f32 coeffs).
 //
-// These replace the sigmoid-computing kernels for the non-i8×i8 fallback paths.
-// Since downstream always thresholds at > 127, computing sigmoid is wasteful;
-// sign(dot) > 0 ⟺ sigmoid(dot) > 0.5 gives the same binary result.
+// sign(dot) > 0 ⟺ sigmoid(dot) > 0.5.
 // =============================================================================
 
 /// f32 protos × f32 coefficients → sign threshold → binary {0, 255}.
@@ -1761,7 +1693,7 @@ fn fused_dot_sign_f16_slice_scalar(
 ///
 /// Uses `_mm256_cvtph_ps` for hardware 8-lane f16→f32 widening and
 /// `_mm256_fmadd_ps` for fused multiply-add. Only the sign of the
-/// accumulated dot product is checked (no sigmoid needed).
+/// accumulated dot product is checked.
 ///
 /// # Safety
 ///
@@ -1837,8 +1769,7 @@ unsafe fn fused_dot_sign_f16_slice_f16c(
 }
 
 /// i8 protos (with quant) × f32 coefficients → sign threshold → binary {0, 255}.
-/// Fallback for per-channel quant or mixed-dtype cases where the i8×i8 fast path
-/// doesn't apply.
+/// Used for per-channel quant and mixed-dtype cases.
 #[allow(clippy::too_many_arguments)]
 fn fused_dequant_dot_sign_i8_slice(
     protos: &[i8],
@@ -1855,7 +1786,7 @@ fn fused_dequant_dot_sign_i8_slice(
     use edgefirst_tensor::QuantMode;
     let stride_y = proto_w * num_protos;
 
-    // Precompute scaled coefficients + zp_offset (same as the old sigmoid kernel).
+    // Precompute scaled coefficients + zp_offset.
     let mut stack_scratch = [0.0_f32; 64];
     let mut heap_scratch: Vec<f32>;
     let scaled_coeff: &mut [f32] = if num_protos <= stack_scratch.len() {
@@ -2026,9 +1957,7 @@ fn scaled_segmentations_i8_slice(
     height: u32,
 ) -> crate::Result<Vec<edgefirst_tensor::Segmentation>> {
     use edgefirst_tensor::QuantMode;
-    // Only per-tensor quantization supported on the scaled-path CPU kernel
-    // today. Per-channel fits naturally into a future extension (would need
-    // per-channel scaled coefficients in scaled_run's dot-product precompute).
+    // The scaled-path CPU kernel supports per-tensor quantization only.
     let (scale, zp) = match quant.mode() {
         QuantMode::PerTensor { scale, zero_point } => (scale, zero_point as f32),
         QuantMode::PerTensorSymmetric { scale } => (scale, 0.0),
@@ -2086,7 +2015,6 @@ fn row_dot_f32<P>(_: &[f32], _: &[P], _: &mut [f32]) -> bool {
 // =============================================================================
 // Integer-domain kernel: i8 coefficients × i8 protos → i32 → sign threshold.
 //
-// Eliminates all f32 conversion by working directly with raw quantized values.
 // The math:
 //   sign(dot(dequant(coeff), dequant(proto)))
 //   = sign(Σ (c_raw - zp_c) · (p_raw - zp_p))
@@ -2138,8 +2066,7 @@ fn dot_i16_i8_scalar(coeff: &[i16], proto: &[i8], n: usize) -> i32 {
     acc
 }
 
-/// NEON i16×i8→i32 dot product using widening multiply-accumulate.
-/// Processes 8 elements per iteration (vs 16 for i8×i8 dotprod).
+/// NEON i16×i8→i32 dot product using widening multiply-accumulate, 8 elements per iteration.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn dot_i16_i8_neon(coeff: *const i16, proto: *const i8, n: usize) -> i32 {
@@ -2308,13 +2235,7 @@ fn scaled_segmentations_i8_i8(
 
     let (lx0, lw, ly0, lh) = match content_region {
         Some([lx0, ly0, lx1, ly1]) => {
-            // Unit scale on a degenerate axis, matching the canonical
-            // `edgefirst_tensor::unletter_norm` and the `inv_lw` computation
-            // earlier in this file. `.max(f32::EPSILON)` instead made a
-            // zero-span axis divide by ~1.2e-7, i.e. scale by ~8.5e37, so the
-            // same degenerate letterbox produced a hard clamp here and an
-            // identity map there -- two answers from one transform, which is
-            // exactly what hoisting the math into one home was meant to end.
+            // Unit scale on a degenerate axis.
             let lw = if lx1 > lx0 { lx1 - lx0 } else { 1.0 };
             let lh = if ly1 > ly0 { ly1 - ly0 } else { 1.0 };
             (lx0, lw, ly0, lh)
@@ -2354,7 +2275,7 @@ fn scaled_segmentations_i8_i8(
         Vec::new()
     };
 
-    // Detect dotprod support once, outside the hot loop.
+    // Detects dotprod support once.
     #[cfg(target_arch = "aarch64")]
     let dotprod = std::arch::is_aarch64_feature_detected!("dotprod");
 
@@ -2508,11 +2429,10 @@ fn scaled_segmentations_i8_i8(
                     let bl = row_hi[x_lo];
                     let br = row_hi[x_hi];
 
-                    // Sign-shortcut: if all 4 corners have the same sign,
-                    // the bilinear interpolation (positive-weight combination)
-                    // preserves that sign. Skip arithmetic for ~80% of pixels.
+                    // Sign-shortcut: when all 4 corners have the same sign the
+                    // interpolation keeps that sign.
                     if (tl & tr & bl & br) < 0 {
-                        // All negative → output 0 (already zero).
+                        // All negative → output 0.
                         continue;
                     }
                     if tl > 0 && tr > 0 && bl > 0 && br > 0 {
@@ -2593,13 +2513,7 @@ fn scaled_segmentations_i16_i8(
 
     let (lx0, lw, ly0, lh) = match content_region {
         Some([lx0, ly0, lx1, ly1]) => {
-            // Unit scale on a degenerate axis, matching the canonical
-            // `edgefirst_tensor::unletter_norm` and the `inv_lw` computation
-            // earlier in this file. `.max(f32::EPSILON)` instead made a
-            // zero-span axis divide by ~1.2e-7, i.e. scale by ~8.5e37, so the
-            // same degenerate letterbox produced a hard clamp here and an
-            // identity map there -- two answers from one transform, which is
-            // exactly what hoisting the math into one home was meant to end.
+            // Unit scale on a degenerate axis.
             let lw = if lx1 > lx0 { lx1 - lx0 } else { 1.0 };
             let lh = if ly1 > ly0 { ly1 - ly0 } else { 1.0 };
             (lx0, lw, ly0, lh)
@@ -2802,11 +2716,10 @@ fn scaled_segmentations_i16_i8(
                     let bl = row_hi[x_lo];
                     let br = row_hi[x_hi];
 
-                    // Sign-shortcut: if all 4 corners have the same sign,
-                    // the bilinear interpolation (positive-weight combination)
-                    // preserves that sign. Skip arithmetic for ~80% of pixels.
+                    // Sign-shortcut: when all 4 corners have the same sign the
+                    // interpolation keeps that sign.
                     if (tl & tr & bl & br) < 0 {
-                        // All negative → output 0 (already zero).
+                        // All negative → output 0.
                         continue;
                     }
                     if tl > 0 && tr > 0 && bl > 0 && br > 0 {
@@ -2854,13 +2767,7 @@ fn scaled_run<P: Copy + Sync>(
 ) -> crate::Result<Vec<edgefirst_tensor::Segmentation>> {
     let (lx0, lw, ly0, lh) = match content_region {
         Some([lx0, ly0, lx1, ly1]) => {
-            // Unit scale on a degenerate axis, matching the canonical
-            // `edgefirst_tensor::unletter_norm` and the `inv_lw` computation
-            // earlier in this file. `.max(f32::EPSILON)` instead made a
-            // zero-span axis divide by ~1.2e-7, i.e. scale by ~8.5e37, so the
-            // same degenerate letterbox produced a hard clamp here and an
-            // identity map there -- two answers from one transform, which is
-            // exactly what hoisting the math into one home was meant to end.
+            // Unit scale on a degenerate axis.
             let lw = if lx1 > lx0 { lx1 - lx0 } else { 1.0 };
             let lh = if ly1 > ly0 { ly1 - ly0 } else { 1.0 };
             (lx0, lw, ly0, lh)
@@ -2871,27 +2778,17 @@ fn scaled_run<P: Copy + Sync>(
     let out_h = height as usize;
     let stride_y = proto_w * num_protos;
 
-    // Parallelise across detections. Each detection produces an
-    // independent ndarray::Array3<u8> tile from a read-only proto slice +
-    // its own coeff slice; no shared mutable state.
+    // Runs detections in parallel; each produces an independent tile.
     //
-    // Algorithm (restores the spirit of PR #54's batched-GEMM optimisation
-    // that PR #51's f16 dispatch refactor inadvertently removed):
+    // Algorithm:
     //
     //   1. Map the output bbox back to a proto-plane ROI (with 1-px margin
     //      so the bilinear sampling at the output edges has neighbours).
-    //   2. Precompute *f32 logits* at every proto pixel inside that ROI by
-    //      doing a single K-wide dot product per proto pixel — once, not
-    //      once per output pixel.
+    //   2. Precompute f32 logits at every proto pixel inside that ROI with
+    //      one K-wide dot product per proto pixel.
     //   3. For each output pixel, bilinear-interpolate the scalar f32 logit
-    //      from the 4 surrounding proto-roi pixels, apply sigmoid, and
-    //      threshold to {0, 255}.
-    //
-    // For typical YOLO-seg: proto_roi ~ 30×30 = 900 px × K=32 = 28.8K dot
-    // ops vs the legacy "bilinear sample then dot at every output pixel"
-    // which costs bbox_h × bbox_w × 4 × K = ~1.3M ops at 100×100 output
-    // bbox. ~45× fewer FMAs at this size; the bilinear upsample of a
-    // scalar plane (no inner K loop) is comparatively negligible.
+    //      from the 4 surrounding proto-roi pixels and threshold its sign
+    //      to {0, 255}.
     detect
         .par_iter()
         .enumerate()
@@ -2909,10 +2806,9 @@ fn scaled_run<P: Copy + Sync>(
             let bbox_w = px1.saturating_sub(px0).max(1);
             let bbox_h = py1.saturating_sub(py0).max(1);
 
-            // Step 1 — proto-plane ROI for this detection's output bbox.
-            // Map the four output bbox corners back to proto coords and
-            // expand by 1 pixel in each direction so the bilinear sampler
-            // at the bbox boundary has both neighbours.
+            // Step 1 — proto-plane ROI for this detection's output bbox: the
+            // four output bbox corners mapped back to proto coords, expanded
+            // by 1 pixel in each direction.
             let sample_x_at = |px: f32| -> f32 {
                 let model_x_norm = lx0 + (px + 0.5) / out_w as f32 * lw;
                 model_x_norm * proto_w as f32 - 0.5
@@ -2926,8 +2822,7 @@ fn scaled_run<P: Copy + Sync>(
             let s_y_min = sample_y_at(py0 as f32);
             let s_y_max = sample_y_at((py1 as f32) - 1.0);
             // Floor min, ceil max+1 to include both bilinear neighbours.
-            // Start indices are used as direct bases into `protos`, so clamp
-            // them to the last valid index, not to the exclusive upper bound.
+            // Start indices are clamped to the last valid index.
             let proto_x0 = (s_x_min.floor() as isize)
                 .max(0)
                 .min(proto_w.saturating_sub(1) as isize) as usize;
@@ -2941,18 +2836,13 @@ fn scaled_run<P: Copy + Sync>(
 
             // Step 2 — precompute f32 logits at every proto-roi pixel.
             // logits[(py - proto_y0) * roi_w + (px - proto_x0)] = dot(coeff, proto[py, px, :])
-            //
-            // Since the final threshold is `logit > 0` (O1) and bilinear
-            // interpolation is a positive-weight linear combination,
-            // `acc_scale * interp(logits) > 0 ⟺ interp(logits) > 0` when
-            // acc_scale > 0. We therefore skip the per-pixel `acc_scale *`
-            // multiply entirely, storing raw dot products.
+            // The raw dot products are stored without the `acc_scale` multiply.
             if !acc_scale.is_finite() || acc_scale <= 0.0 {
                 return Err(crate::Error::NotSupported(format!(
                     "acc_scale must be finite and positive for sign-threshold optimization (got {acc_scale})"
                 )));
             }
-            let _ = acc_scale; // Scale-invariant: only sign matters.
+            let _ = acc_scale;
             let mut logits = vec![0.0_f32; roi_h * roi_w];
             for ly_idx in 0..roi_h {
                 let py = proto_y0 + ly_idx;
@@ -2965,7 +2855,7 @@ fn scaled_run<P: Copy + Sync>(
                 for lx_idx in 0..roi_w {
                     let pix_base = row_base + lx_idx * num_protos;
                     let mut acc = 0.0_f32;
-                    // 4-wide unroll to help auto-vectorization.
+                    // 4-wide unroll.
                     let mut k = 0;
                     let chunks = num_protos / 4;
                     for _ in 0..chunks {
@@ -2983,16 +2873,9 @@ fn scaled_run<P: Copy + Sync>(
                 }
             }
 
-            // Step 3 — bilinear upsample logits → binary mask.
-            //
-            // O1: sigmoid(x) > 0.5 ⟺ x > 0 (sigmoid is strictly monotonic,
-            // and acc_scale > 0 preserves sign). The sign threshold replaces
-            // the old fast_sigmoid approximation, saving ~15 cycles/pixel.
-            //
-            // O5: Pre-compute bilinear sample coordinates. sample_x_at /
-            // sample_y_at depend only on pixel index, not on logit values.
-            // Building lookup tables avoids redundant float ops in the inner
-            // loop (floor, clamp, isize cast per pixel).
+            // Step 3 — bilinear upsample logits → binary mask by sign
+            // threshold. The sample coordinates are precomputed in lookup
+            // tables.
             let roi_last_x = roi_w.saturating_sub(1);
             let roi_last_y = roi_h.saturating_sub(1);
 
@@ -3008,8 +2891,7 @@ fn scaled_run<P: Copy + Sync>(
                 })
                 .collect();
 
-            // Write the output tile through a contiguous slice to avoid
-            // ndarray's per-element bounds checks + stride arithmetic.
+            // Writes the output tile through a contiguous slice.
             let mut tile_buf = vec![0u8; bbox_h * bbox_w];
             for yi in 0..bbox_h {
                 let sample_y = sample_y_at((py0 + yi) as f32) - proto_y0 as f32;
@@ -3144,8 +3026,7 @@ mod tests {
             0.02,
             0,
         );
-        // I16 coefficients WITHOUT quantization — fast path should be
-        // skipped, f32 fallback should widen raw i16 values.
+        // I16 coefficients without quantization.
         let coeffs = make_i16_raw(&[1, NUM_PROTOS], &gen_coeffs_i16(1, NUM_PROTOS));
         let proto_data = ProtoData {
             mask_coefficients: coeffs,
@@ -3391,7 +3272,7 @@ mod tests {
         }
     }
 
-    // ── i8×i8 existing path still works (regression) ───────────────
+    // ── i8×i8 path ─────────────────────────────────────────────────
 
     #[test]
     fn materialize_proto_i8_i8_regression() {
@@ -3441,7 +3322,7 @@ mod tests {
             for (i, &v) in protos.iter().enumerate() {
                 nchw[(i % k) * h * w + i / k] = v;
             }
-            // (200, -300) lies outside i8: the shared kernel rejects it and the scalar loop runs.
+            // (200, -300) lies outside i8: the scalar loop runs.
             for (zc, zp) in [(20, -115), (0, 0), (-128, 127), (200, -300)] {
                 for (layout, data, shape) in [
                     (ProtoLayout::Nhwc, &protos, [h, w, k]),
@@ -3590,7 +3471,7 @@ mod tests {
         }
     }
 
-    /// The sequential four-term loop the float sign paths ran before the shared kernel.
+    /// A sequential four-term dot product.
     fn sequential(coeff: &[f32], p: impl Fn(usize) -> f32) -> f32 {
         let k = coeff.len();
         let mut acc = 0.0_f32;
@@ -3787,8 +3668,7 @@ mod tests {
             .collect()
     }
 
-    /// `i16` coefficients over NHWC `i8` protos give the masks of the same data in NCHW, whose
-    /// path sums every proto pixel first, at both resolutions and with or without zero points.
+    /// `i16` coefficients over NHWC `i8` protos give the same masks as the same data in NCHW.
     #[test]
     fn i16_masks_match_between_nhwc_and_nchw() {
         let (h, w, k) = (24usize, 20usize, 32usize);

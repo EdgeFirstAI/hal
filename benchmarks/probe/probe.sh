@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 # SPDX-License-Identifier: Apache-2.0
 #
-# Capability probe for Article-1 boards. Writes results/<board>/probe.txt
+# Capability probe for the benchmark boards. Writes results/<board>/probe.txt
 #
 # Usage: ./benchmarks/probe/probe.sh [host...]
 

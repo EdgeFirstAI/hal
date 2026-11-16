@@ -29,7 +29,7 @@ pub fn softmax_inplace_f32(buf: &mut [f32]) {
 
 #[inline]
 pub fn softmax_inplace_f16(buf: &mut [f16]) {
-    // Compute in f32 for stability, write back as f16.
+    // Computed in f32, written back as f16.
     if buf.is_empty() {
         return;
     }
@@ -54,11 +54,11 @@ pub(crate) const EXP_MIN: f32 = -87.0;
 pub(crate) const EXP2_TAYLOR: [f32; 4] = [0.001_333_36, 0.009_618_13, 0.055_504_11, 0.240_226_5];
 
 /// `e^x` for `x <= 0`, within 1e-5 relative error; inputs below -87 (and NaN) clamp to `e^-87`.
-/// Branch-free so the softmax loops vectorize.
+/// Branch-free.
 #[inline(always)]
 pub fn exp_nonpositive(x: f32) -> f32 {
     let t = x.max(EXP_MIN) * std::f32::consts::LOG2_E;
-    // Truncating `t - 0.5` rounds `t <= 0` to nearest without a libm call.
+    // Truncating `t - 0.5` rounds `t <= 0` to nearest.
     let i = (t - 0.5) as i32 as f32;
     let f = t - i;
     let [c5, c4, c3, c2] = EXP2_TAYLOR;

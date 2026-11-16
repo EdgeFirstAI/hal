@@ -6,13 +6,11 @@
 //!
 //! Source tensors are imported on the OUTPUT queue as DMA-BUF planes. NV12
 //! uses the two-plane `NV12M` layout where the device offers it, so each
-//! plane carries its own offset: that is what makes crops and separately
-//! allocated chroma planes possible without a copy. The bitstream comes back
-//! in MMAP CAPTURE buffers and is copied out.
+//! plane carries its own offset. The bitstream comes back in MMAP CAPTURE
+//! buffers and is copied out.
 //!
-//! V4L2 keeps buffer timestamps at microsecond resolution, so each source is
-//! tagged with a sequence number and the caller's PTS is looked up again
-//! when its access unit comes back.
+//! Each source is tagged with a sequence number, and the caller's PTS is
+//! looked up again when its access unit comes back.
 
 use std::collections::VecDeque;
 use std::io::{Seek, SeekFrom};
@@ -44,8 +42,7 @@ const OUTPUT_GRACE: Duration = Duration::from_millis(100);
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 /// CAPTURE (bitstream) buffers, at least.
 const CAPTURE_BUFFERS: u32 = 4;
-/// OUTPUT (source) buffer slots, at least. A source is in flight only
-/// until the device has read it, so few are needed.
+/// OUTPUT (source) buffer slots, at least.
 const OUTPUT_BUFFERS: u32 = 2;
 /// `V4L2_CID_JPEG_COMPRESSION_QUALITY`: `V4L2_CID_JPEG_CLASS_BASE` + 3.
 const CID_JPEG_COMPRESSION_QUALITY: u32 = 0x009d_0903;
@@ -255,9 +252,7 @@ impl V4l2Encoder {
         let (w, h) = (self.config.width, self.config.height);
         let dev = &self.device.dev;
 
-        // The i.MX 8M Plus vsi_v4l2 encoder resets its H.264 profile to
-        // Constrained Baseline when the CAPTURE format is set, and does not
-        // take a profile set afterwards, so the controls go first.
+        // The controls are set before the CAPTURE format.
         self.controls = controls::query_all(dev).map_err(device_error)?;
         if self.is_h264() {
             self.apply_controls()?;
@@ -476,8 +471,7 @@ impl V4l2Encoder {
         for c in coding_controls(&self.config) {
             self.set_coding_control(&c)?;
         }
-        // Headers in a separate buffer are folded into the next access unit,
-        // but joining them is cheaper where the device allows it.
+        // Ask for the headers joined to the first frame, where the device allows it.
         let _ = self.set_control(
             uapi::V4L2_CID_MPEG_VIDEO_HEADER_MODE,
             uapi::V4L2_MPEG_VIDEO_HEADER_MODE_JOINED_WITH_1ST_FRAME,
@@ -586,8 +580,7 @@ impl V4l2Encoder {
             m2m, capture_maps, ..
         }) = self.stream.take()
         {
-            // Unmap before the buffers are freed: drivers without orphaned
-            // buffer support refuse to free mapped buffers.
+            // Unmap before the buffers are freed.
             drop(capture_maps);
             let _ = m2m.stream_off();
             drop(m2m);
@@ -786,7 +779,7 @@ impl V4l2Encoder {
             }
         }
 
-        // Every JPEG picture stands alone.
+        // Force a key frame, for H.264 only.
         if opts.keyframe && self.coded_fourcc == uapi::V4L2_PIX_FMT_H264 {
             let info = self
                 .controls
@@ -922,8 +915,7 @@ impl V4l2Encoder {
         if au.parameter_sets {
             self.parameter_sets = h264::parameter_sets(&data);
         } else if au.idr && self.config.repeat_headers && !self.parameter_sets.is_empty() {
-            // Some devices repeat the headers only on the IDR that opens a
-            // GOP, not on a forced one.
+            // Prepend the parameter sets to an IDR that came without them.
             let mut with_headers = self.parameter_sets.clone();
             with_headers.extend_from_slice(&data);
             data = with_headers;
@@ -1028,9 +1020,8 @@ impl EncoderBackend for V4l2Encoder {
                 }
             }
         }
-        // Drivers differ in how a drained encoder resumes (ENC_CMD_START,
-        // or restarting one queue), so the next frame sets up a new stream,
-        // which also opens it with an IDR and its parameter sets.
+        // The next frame sets up a new stream, which opens with an IDR and its
+        // parameter sets.
         self.reset();
         Ok(self.pending.drain(..).collect())
     }
@@ -1077,9 +1068,7 @@ fn dmabuf_size(fd: BorrowedFd<'_>) -> Result<usize> {
 }
 
 /// Rate control, as `(control, value)`: constant bitrate, regulated per frame
-/// and per macroblock. Left to their defaults, drivers may encode at a fixed
-/// QP (`vsi_v4l2`) so the bitrate is not held, or control frames alone and
-/// code key frames coarser than their neighbours.
+/// and per macroblock.
 const RATE_CONTROLS: [(u32, i32); 3] = [
     (
         uapi::V4L2_CID_MPEG_VIDEO_BITRATE_MODE,

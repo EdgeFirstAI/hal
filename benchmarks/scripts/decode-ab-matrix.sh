@@ -30,8 +30,7 @@ WARMUP="${WARMUP:-10}"
 REMOTE_COCO="${EDGEFIRST_BENCH_COCO_REMOTE:-/data/coco/val2017}"
 REMOTE_BIN_DIR="/tmp/edgefirst-bench-decode-ab"
 FORMATS="${FORMATS:-yuv,rgb}"
-# TurboJPEG IDCT accuracy class. `accurate` (islow) matches HAL's kernel and is
-# libjpeg-turbo's own decompression default; `fast` selects ifast.
+# TurboJPEG IDCT: `accurate` selects islow, `fast` selects ifast.
 DCT="${DCT:-accurate}"
 
 if [[ $# -gt 0 ]]; then
@@ -88,8 +87,7 @@ echo "==> Building hal_cpu for ${TARGET_TRIPLE} (profile=${PROFILE})"
 
 BIN="${BENCH_WS}/target/${TARGET_TRIPLE}/${PROFILE}/hal_cpu"
 
-# The TurboJPEG arm is native C, like the HAL arm is native Rust; it dlopens
-# libturbojpeg on the board, so cross-building it needs no sysroot.
+# Cross-build the TurboJPEG arm; it dlopens libturbojpeg on the board.
 TJ_BIN="${BENCH_WS}/modules/turbojpeg/build/turbojpeg_bench.aarch64"
 make -C "${BENCH_WS}/modules/turbojpeg" aarch64
 

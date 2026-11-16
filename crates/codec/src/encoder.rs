@@ -24,9 +24,8 @@ pub(crate) const CPU_JPEG_FORMATS: [PixelFormat; 6] = [
 
 /// Encodes image tensors into still-image files.
 ///
-/// Create one and reuse it: one encoder serves images of any size and format
-/// it takes, and keeps a hardware encoder open for the last geometry it
-/// encoded.
+/// One encoder serves images of any size and format it takes, and keeps a
+/// hardware encoder open for the last geometry it encoded.
 ///
 /// ```rust,no_run
 /// use edgefirst_codec::{Codec, ImageEncoder};
@@ -74,7 +73,7 @@ impl ImageEncoder {
     ///
     /// [`CodecError::Unsupported`] carrying
     /// [`UnsupportedFeature::Codec`](crate::UnsupportedFeature::Codec) for a
-    /// codec no engine here encodes as a still image (only JPEG today).
+    /// codec no engine here encodes as a still image (only JPEG is).
     pub fn new(codec: Codec) -> Result<Self> {
         if codec != Codec::Jpeg {
             return Err(unsupported(codec, Direction::Encode, Engine::Auto));
@@ -151,8 +150,6 @@ impl ImageEncoder {
         let _span = tracing::trace_span!("codec.encode_jpeg").entered();
         #[cfg(all(target_os = "linux", feature = "v4l2"))]
         let explicit = self.engine != Engine::Auto;
-        // In a build without a hardware JPEG encoder the first engine is the
-        // CPU or refused, so the loop body always leaves it.
         #[cfg_attr(
             not(all(target_os = "linux", feature = "v4l2")),
             allow(clippy::never_loop)

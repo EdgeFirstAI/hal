@@ -3,13 +3,12 @@
 
 //! DFL box decode of 8-bit bins through an exp lookup table.
 //!
-//! With per-tensor quantization a bin's logit is `(q - zp) * scale`, so its
+//! With per-tensor quantization a bin's logit is `(q - zp) * scale`, and its
 //! softmax weight relative to the largest bin `q_max` of its side is
 //! `exp(-(q_max - q) * scale)`. For 8-bit inputs `q_max - q` is an integer in
 //! `0..=255`: the weight is one lookup in a 256-entry table that depends
-//! only on the scale, the zero point cancels, and the side's maximum is an
-//! integer maximum over the raw bins. The largest bin weighs exactly 1, so a
-//! side's weight sum is never below 1.
+//! only on the scale, and the side's maximum is an integer maximum over the
+//! raw bins.
 //!
 //! Each side accumulates its weight sum and bin-weighted sum over even and
 //! odd bins separately, then adds the two. The NEON kernel holds the four
@@ -47,10 +46,7 @@ impl DflExpTable {
         }
     }
 
-    /// Whether a table can stand for `scale`: the weights `exp(-k * scale)`
-    /// are at most 1 only for a finite, positive scale. Any other scale
-    /// overflows the table, and the bins are decoded by the max-subtracted
-    /// softmax instead.
+    /// Whether a table can stand for `scale`: the scale must be finite and positive.
     #[inline]
     pub fn supports(scale: f32) -> bool {
         scale.is_finite() && scale > 0.0
@@ -77,7 +73,7 @@ mod sealed {
     impl Sealed for half::f16 {}
 }
 
-/// An 8-bit DFL bin type. Sealed: the NEON kernel reads the bins as bytes.
+/// An 8-bit DFL bin type. Sealed.
 ///
 /// ```compile_fail
 /// #[derive(Clone, Copy)]
@@ -381,7 +377,6 @@ mod neon {
                     bin += 2.0;
                 }
             }
-            // The true difference lies in 0..=255, so the u8 cast keeps it exactly.
             let w = |m: i32, x: T| exp[usize::from((m - x.raw()) as u8)];
             fn tail<T>(v: &[T]) -> &[T] {
                 v.get(v.len() / 8 * 8..).unwrap_or(&[])
@@ -500,7 +495,7 @@ mod neon {
         unsafe {
             let exp = table.exp.as_ptr();
             for (bins, out) in input.chunks_exact(64).zip(dst.chunks_exact_mut(4)) {
-                // `bins` holds 64 bytes and `out` 4 floats.
+                // SAFETY: `bins` holds 64 bytes and `out` 4 floats.
                 let (ws, sum) = anchor_sums::<T>(bins.as_ptr().cast::<u8>(), exp);
                 vst1q_f32(out.as_mut_ptr(), vdivq_f32(ws, sum));
             }
@@ -522,8 +517,7 @@ mod neon {
                 vld1q_u8(p.add(48)),
             ];
             let m = T::side_max(sides);
-            // The true difference lies in 0..=255 for either signedness, so
-            // the wrapping u8 subtraction yields it exactly.
+            // `max − bin` of every byte: the table indices.
             let k = [
                 vreinterpretq_u64_u8(vsubq_u8(vdupq_laneq_u8::<0>(m), sides[0])),
                 vreinterpretq_u64_u8(vsubq_u8(vdupq_laneq_u8::<1>(m), sides[1])),
@@ -555,7 +549,7 @@ mod neon {
                 }};
             }
             // Bin 0 adds nothing to the weighted sum, and bin 1 adds its
-            // weight unscaled; adding either to a zero sum is exact.
+            // weight unscaled.
             let mut sum_even = weights!(lo, 0);
             let e = weights!(lo, 1);
             let mut sum_odd = e;
@@ -624,8 +618,7 @@ mod neon {
             let src = input.as_ptr().cast::<u8>();
             let stride = vdup_n_f32(level.stride);
             let last = (dst.len() / 4).saturating_sub(1);
-            // Two anchors per step give the in-order Cortex-A55 independent
-            // work to issue while the other anchor's loads and divide retire.
+            // Two anchors per step.
             let mut pairs = dst.chunks_exact_mut(8);
             for (i, out) in pairs.by_ref().enumerate() {
                 let a = 2 * i;
@@ -782,8 +775,7 @@ mod tests {
         }
     }
 
-    /// The generic-`reg_max` NEON kernels give the portable kernels' results bit for bit, the
-    /// bound `neon_matches_portable_bit_for_bit` holds the 16-bin kernel to.
+    /// The generic-`reg_max` NEON kernels give the portable kernels' results bit for bit.
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn dfl_lut_generic_neon_matches_scalar() {

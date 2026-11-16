@@ -18,7 +18,7 @@ edgefirst-kernels          (deps: half, tracing)
   └── python-common        (feature `kernels`; built into the edgefirst.kernels wheel)
 ```
 
-The crate sits at the bottom of the graph. Because it never touches `edgefirst-tensor`, it is outside the tensor-backend `cfg` machinery, and neither `libedgefirst_kernels` nor `_kernels` has a `DT_NEEDED` on `libedgefirst_tensor` (`scripts/check-single-home.sh` G2t and `tests/packaging/test_dependency_isolation.py` assert it).
+The crate sits at the bottom of the graph. Because it never touches `edgefirst-tensor`, it is outside the tensor-backend `cfg` machinery, and neither `libedgefirst_kernels` nor `_kernels` has a `DT_NEEDED` on `libedgefirst_tensor` (`scripts/check-single-home.sh` and `tests/packaging/test_dependency_isolation.py` assert it).
 
 ## Module Map
 
@@ -47,7 +47,7 @@ Every operator is a plan type with a params struct: `SoftmaxI8Plan::new(SoftmaxI
 - **`run` never allocates, takes no lock and never touches the global rayon pool.** Scratch is fixed-size stack staging (`ops::rows::STAGE` elements per row, `ops::levels::BLOCK` anchors per decode block) or lives in the plan, read-only after `new`. The one exception is attention's packed operands, which the caller owns: `AttentionI8Plan::scratch` builds an `AttentionScratch` once for a shape, and `run` takes it `&mut`, so each concurrent `run` needs its own. A scratch serves any plan whose kernel shares its layout and is rejected by the others.
 - **Shape limits are checked, not exported.** `MatMulI8Plan::check_depth` and `AttentionI8Plan::check_shape` say whether the kernels' fixed stack buffers take a shape, so a delegate can decide before it claims a node.
 - **Plans are `Send + Sync`** and `run(&self)` may be called on one plan from several threads at once.
-- **Library code never panics.** Bad inputs are `KernelError`s; assertions moved from the decoder are unreachable from the plan API because the plans validate first.
+- **Library code never panics.** Bad inputs are `KernelError`s; assertions in the `prim` primitives are unreachable from the plan API because the plans validate first.
 - **One tracing span per `run`**, `kernels.<op>` with field `tier`, never per row or block (see [Tracing Spans](#tracing-spans)).
 
 ## Views, strides and overlap
@@ -145,10 +145,10 @@ The decode ops cover a whole concatenated multi-scale tensor in one call. Their 
 
 Inputs are `i8`, `u8`, `i16`, `u16`, `f16` or `f32`; outputs `f32`, `f16` or any of the four integer types with an output `Quant`. **`f32` outputs of integer inputs equal the decoder's**: the kernels are the decoder's own, and a one-level call gives the decoder's level result bit for bit. **Integer outputs round once**: the input is dequantized, computed in f32, and quantized once at the end (half away from zero, clamp; the NEON quantize on NEON tiers). That is within ±1 LSB of a float64 reference, for 8- and 16-bit outputs alike, and more accurate than TFLite's int8 chain (SOFTMAX → CONV_2D → MUL → SUB/ADD → MUL, requantizing at every step), which it does not reproduce bit for bit.
 
-**`f16` outputs** are the tier's `f32` result rounded once (nearest even) on the scalar and `neon` tiers. On the FP16 tier every path but `dfl` from 8-bit inputs and `dist2bbox` runs `prim::neon_fp16`; for those two the f32 path rounded once measured faster on a Cortex-A55:
+**`f16` outputs** are the tier's `f32` result rounded once (nearest even) on the scalar and `neon` tiers. On the FP16 tier every path but `dfl` from 8-bit inputs and `dist2bbox` runs `prim::neon_fp16`; for those two the f32 path rounded once is faster on a Cortex-A55:
 
 - DFL from 16-bit and float inputs: the NEON dequantize to f32, `x − max` in f32 rounded to f16, `exp` as `2^k · p(r)` in f16 (the sigmoid kernels' polynomial), eight bins per vector summed with their bin-weighted sum in two alternating f16 sets, then each side's lanes reduced and divided in f32 and rounded to f16.
-- DFL from 8-bit inputs: `DflBoxPlan` runs the exp-table kernels' f32 distances and the f16 box math below (`tier()` is `NeonFp16`); `DflPlan` has no box math, so it rounds the f32 distances once and reports `Neon`. f16 sums of an f16 exp table were measured slower than the f32 table kernels on a Cortex-A55, whose cost is the table loads.
+- DFL from 8-bit inputs: `DflBoxPlan` runs the exp-table kernels' f32 distances and the f16 box math below (`tier()` is `NeonFp16`); `DflPlan` has no box math, so it rounds the f32 distances once and reports `Neon`. f16 sums of an f16 exp table are slower than the f32 table kernels on a Cortex-A55, whose cost is the table loads.
 - dist2bbox fused in `dfl_box`: eight anchors per vector in f16, on the grid centres and stride rounded to f16, in the Ultralytics order for `Xywh`; `Xyxy` is computed directly as `[(gx − l)·s, (gy − t)·s, (gx + r)·s, (gy + b)·s]`.
 
 They are tested against the float64 result rounded to f16, in f16 ulps of the value or of the output's full scale (640 px for boxes, `reg_max − 1` grid units for distances), whichever is larger: within 1 ulp up to `reg_max` 32, and at `reg_max` 64 within 2 ulps for distances and 3 for boxes, at fixed and seeded random quantizations.

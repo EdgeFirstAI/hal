@@ -10,23 +10,18 @@
 //! return the exact `Σₖ (mₖ − zm)(pₖ − zp)`:
 //!
 //! - 8-bit NHWC maps unsigned operands to signed by flipping the top bit (`u − 128`, zero point
-//!   likewise) and computes `Σ m·p − zm·Σ p − zp·Σ m + K·zm·zp`. Every operand and zero point is
-//!   then in [−128, 127], so no partial sum exceeds `K · 2^15` and the result `K · 2^16` in
-//!   magnitude, which fits i32 for `K ≤ MAX_K`. `Σ m·p` is `sdot` on the dotprod kernels and
-//!   `smull` + `sadalp` on the others. When every `m − zm` fits i8 (and `K ≤ 256`) they take
-//!   `Σ (m − zm)·p − zp·Σ (m − zm)` instead, which needs no per-pixel `Σ p`.
-//! - 8-bit NCHW multiplies `p` by `m − zm` (at most 255 in magnitude) with `smlal` and subtracts
-//!   `zp · Σ (m − zm)`; both terms stay below `K · 2^16`.
-//! - Kernels with a 16-bit operand work in i16 lanes (`u16 − 32768`) and accumulate in i64: the
-//!   result is below `K · 2^33`, so rounding it to f32 once through f64 (exact below 2^53) is the
-//!   correctly rounded integer.
+//!   likewise) and computes `Σ m·p − zm·Σ p − zp·Σ m + K·zm·zp` in i32. `Σ m·p` is `sdot` on the
+//!   dotprod kernels and `smull` + `sadalp` on the others. When every `m − zm` fits i8 (and
+//!   `K ≤ 256`) they compute `Σ (m − zm)·p − zp·Σ (m − zm)`.
+//! - 8-bit NCHW multiplies `p` by `m − zm` with `smlal` and subtracts `zp · Σ (m − zm)`.
+//! - Kernels with a 16-bit operand work in i16 lanes (`u16 − 32768`), accumulate in i64 and
+//!   round the result to f32 once through f64.
 //!
 //! The float kernels accumulate `m · p` in f32 with FMA: NHWC in four interleaved partial sums
 //! per pixel, so a logit is within `(K/4 + 5) · 2⁻²⁴ · Σ |m·p|` of the exact dot product; NCHW
 //! one sequential sum per pixel, within `K · 2⁻²⁴ · Σ |m·p|`. Integer and `f16` protos convert to
-//! f32 exactly. Only the `*_dotprod` kernels use FEAT_DotProd (inline asm, since stable Rust has
-//! no `sdot` intrinsic); everything else is ARMv8.0 Advanced SIMD. A kernel returns `false` and
-//! writes nothing when its arguments are invalid.
+//! f32 exactly. Only the `*_dotprod` kernels use FEAT_DotProd; everything else is ARMv8.0
+//! Advanced SIMD. A kernel returns `false` and writes nothing when its arguments are invalid.
 
 #![cfg(target_arch = "aarch64")]
 
@@ -38,7 +33,7 @@ use super::neon_convert::{affine, map_steps, widen8, LoadF32};
 use super::neon_sigmoid::sigmoid4;
 use crate::Quant;
 
-/// Largest channel count the integer kernels take; the 8-bit bounds above need `K ≤ 32767`.
+/// Largest channel count the integer kernels take.
 pub const MAX_K: usize = 32767;
 
 /// Proto pixels per NHWC block.
@@ -401,7 +396,7 @@ unsafe fn nhwc8<M: MaskInt8, P: MaskInt8, const DP: bool>(
     }
     let (zm, zp) = (zm - M::OFF8, zp - P::OFF8);
     if zm != 0 && k <= FOLD_K {
-        // `m − zm` in i8 needs no `Σ p`: the result is `Σ (m − zm)·p − zp·Σ (m − zm)`.
+        // When every `m − zm` fits i8 the result is `Σ (m − zm)·p − zp·Σ (m − zm)`.
         let mut folded = [0i8; FOLD_K];
         let mut fits = true;
         for (d, &m) in folded.iter_mut().zip(coeff) {
@@ -623,7 +618,6 @@ unsafe fn nchw8_block<M: MaskInt8, P: MaskInt8>(
     unsafe {
         let mut a = [vdupq_n_s32(0); 4];
         for (c, &m) in coeff.iter().enumerate() {
-            // At most 255 in magnitude: both values lie in the 8-bit type's range.
             let w = (m.get() - zm) as i16;
             let p = planes.add(c * stride);
             let (lo, hi) = (P::load8_i16(p), P::load8_i16(p.add(8)));

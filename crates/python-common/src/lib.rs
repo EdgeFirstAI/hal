@@ -1,14 +1,13 @@
 // SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! Bindings shared by the five EdgeFirst Python extension modules.
+//! Bindings shared by the EdgeFirst Python extension modules.
 //!
-//! This is an **rlib**: every extension module statically links its own copy
-//! of the PyO3 wrapper types, so each ends up with its own type objects.
-//! Cross-module tensor handoff goes through the capsule protocol
-//! ([`edgefirst_tensor::TensorDesc`]) rather than a shared Python type.
-//! Tensor *implementation* is not duplicated: codec/image/decoder link
-//! `libedgefirst_tensor.so`. Tracker does not.
+//! This is an rlib: every extension module statically links its own copy of
+//! the PyO3 wrapper types and has its own type objects. Cross-module tensor
+//! handoff goes through the capsule protocol
+//! ([`edgefirst_tensor::TensorDesc`]). The codec, image and decoder modules
+//! link `libedgefirst_tensor.so`; the tracker module does not.
 
 #![cfg_attr(nightly, feature(f16))]
 
@@ -43,9 +42,7 @@ pub mod tracker;
 
 /// Install the coverage flush-on-abort handler for an instrumented cdylib.
 ///
-/// Each extension module must call this from its `#[pymodule_init]`: the
-/// `.init_array` constructor trick only fires for the object that carries it,
-/// and there is no longer a single cdylib to carry it for everyone.
+/// Each extension module must call this from its `#[pymodule_init]`.
 #[cfg(all(coverage, target_os = "linux"))]
 pub fn install_covguard() {
     #[cfg(feature = "tensor")]
@@ -56,19 +53,14 @@ pub fn install_covguard() {
 #[cfg(not(all(coverage, target_os = "linux")))]
 pub fn install_covguard() {}
 
-/// Initialise logging for an extension module.
-///
-/// **Must** be `try_init`, not `init`. `env_logger::Builder::init` panics when
-/// a logger is already installed, and there are now four `#[pymodule_init]`
-/// functions in one process — so `import edgefirst.tensor` followed by
-/// `import edgefirst.codec` would raise `PanicException` for every user. The
-/// first module to load wins; the rest quietly accept it.
+/// Initialise logging for an extension module. Uses `try_init`: the first
+/// module to load installs the logger and later calls leave it in place.
 pub fn init_logging() {
     let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .try_init();
 }
 
-/// Common module bootstrap: logging plus coverage, in the right order.
+/// Common module bootstrap: logging, then coverage.
 pub fn init_module() {
     init_logging();
     install_covguard();

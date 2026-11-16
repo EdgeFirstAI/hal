@@ -1,31 +1,23 @@
 // SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! Pixel-parity check against libjpeg-turbo `islow` — the single in-process
-//! accuracy reference every other decode arm is measured against (see
-//! BENCHMARKS.md § JPEG Decode). `islow` is never measured against itself;
-//! every other arm gets a cosine / mean\|Δ\| / max\|Δ\| / PSNR row, plus a
-//! phase-shift diagnostic on 4:2:0 sources.
+//! Pixel-parity check against libjpeg-turbo `islow`. Every other decode arm
+//! gets a cosine / mean\|Δ\| / max\|Δ\| / PSNR row, plus a phase-shift
+//! diagnostic on 4:2:0 sources.
 //!
-//! Two reference configurations select Table A (conformance, matched filter
-//! class) vs Table B (accuracy cost, always plain accurate `islow`):
+//! Two reference configurations:
 //!
 //! - `--reference matched` (default): 4:2:0 sources compare against
-//!   `islow + TJFLAG_FASTUPSAMPLE` (turbo's own box/nearest chroma upsample —
-//!   the like-for-like comparison for EdgeFirst's box-upsample RGB path);
-//!   4:4:4 sources are unaffected by the flag (no chroma resampling either
-//!   side).
-//! - `--reference accurate`: always plain `islow`, no upsample flag — what a
-//!   speed option (EdgeFirst `fast`, turbo `ifast`) trades away against the
-//!   accurate baseline, independent of chroma-filter choice.
+//!   `islow + TJFLAG_FASTUPSAMPLE` (turbo's box/nearest chroma upsample);
+//!   4:4:4 sources are unaffected by the flag.
+//! - `--reference accurate`: always plain `islow`, no upsample flag.
 //!
-//! Four engines: `edgefirst-accurate`/`edgefirst-fast` (this crate, via
-//! `edgefirst-codec`), `zune` (zune-jpeg direct), `image` (the `image` crate,
-//! RGB only — wraps zune, see the arm-table note on why both are kept).
+//! Engines: `edgefirst-accurate`/`edgefirst-fast` (via `edgefirst-codec`),
+//! `zune` (zune-jpeg direct), `image` (the `image` crate, RGB only) and
+//! `turbo-ifast`.
 //!
 //! `--yplane` compares EdgeFirst's native NV12/16/24 Y-plane against
-//! `tjDecompressToYUV2` instead of the RGB path (`edgefirst-*` engines only —
-//! the RGB-only comparator engines have no raw-YUV output to compare).
+//! `tjDecompressToYUV2` instead of the RGB path (`edgefirst-*` engines only).
 //!
 //! ```bash
 //! rgb_parity --dir /data/coco/val2017-yuv420 --engine edgefirst-accurate --reference matched
@@ -51,19 +43,16 @@ enum Engine {
     EdgefirstFast,
     Zune,
     Image,
-    /// Table B only: turbo `ifast` vs plain accurate `islow` — both sides
-    /// decoded in-process via the same dlopen'd library, just two
-    /// `tjDecompress2` calls with different flags. `--reference` is ignored
-    /// (always plain `islow`; `ifast` has no box-upsample filter class of
-    /// its own to be "matched" against).
+    /// Turbo `ifast` vs plain accurate `islow`, both decoded in-process
+    /// through the same dlopen'd library. `--reference` is ignored.
     TurboIfast,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum Reference {
-    /// Table A (conformance): 4:2:0 sources vs `islow + TJFLAG_FASTUPSAMPLE`.
+    /// 4:2:0 sources vs `islow + TJFLAG_FASTUPSAMPLE`.
     Matched,
-    /// Table B (accuracy cost): always plain accurate `islow`.
+    /// Always plain accurate `islow`.
     Accurate,
 }
 
@@ -87,7 +76,7 @@ struct Args {
     /// Print each image's stats, not just the aggregate.
     #[arg(long)]
     verbose: bool,
-    /// Override the libturbojpeg search (same env var turbojpeg_bench uses).
+    /// Override the libturbojpeg search.
     #[arg(long, env = "EDGEFIRST_TURBOJPEG_LIB")]
     lib: Option<String>,
 }
@@ -128,7 +117,7 @@ type TjDecompressToYuv2 = unsafe extern "C" fn(
 type TjPlaneWidth = unsafe extern "C" fn(c_int, c_int, c_int) -> c_int;
 type TjErrorStr = unsafe extern "C" fn() -> *const c_char;
 
-/// Same candidate list as `benchmarks/modules/turbojpeg/bench.c`'s `tj_load`.
+/// Candidate libturbojpeg library names.
 const CANDIDATES: &[&str] = &[
     #[cfg(target_os = "macos")]
     "/opt/homebrew/opt/jpeg-turbo/lib/libturbojpeg.dylib",
@@ -151,10 +140,7 @@ const CANDIDATES: &[&str] = &[
 ];
 
 struct TurboJpeg {
-    // Leaked for a 'static lifetime, matching the codec crate's own nvJPEG
-    // dlopen loader (jpeg/nvjpeg/loader.rs) — this is a short-lived CLI tool,
-    // so leaking once at startup is simpler than threading a lifetime through
-    // the resolved function-pointer table.
+    // Leaked for a 'static lifetime.
     _lib: &'static Library,
     handle: *mut c_void,
     destroy: TjDestroy,
@@ -185,8 +171,7 @@ impl TurboJpeg {
         };
         let lib: &'static Library = Box::leak(Box::new(lib));
 
-        // SAFETY: symbol types match the documented turbojpeg.h ABI (same
-        // signatures benchmarks/modules/turbojpeg/bench.c dlsyms).
+        // SAFETY: symbol types match the documented turbojpeg.h ABI.
         let init: TjInit = *unsafe { lib.get(b"tjInitDecompress\0") }?;
         let destroy: TjDestroy = *unsafe { lib.get(b"tjDestroy\0") }?;
         let header: TjHeader = *unsafe { lib.get(b"tjDecompressHeader3\0") }?;
@@ -225,9 +210,7 @@ impl TurboJpeg {
     }
 
     /// Decode to interleaved RGB with accurate IDCT, optionally with
-    /// `TJFLAG_FASTUPSAMPLE` (box/nearest chroma upsample — Table A's matched
-    /// config for 4:2:0 sources; omitted for Table B's accurate-vs-accurate
-    /// comparison).
+    /// `TJFLAG_FASTUPSAMPLE` (box/nearest chroma upsample).
     fn decode_rgb(&self, jpeg: &[u8], flags: c_int) -> Result<(usize, usize, Vec<u8>)> {
         let mut w = 0i32;
         let mut h = 0i32;
@@ -266,20 +249,10 @@ impl TurboJpeg {
     }
 
     /// Decode to a planar Y/U/V buffer (row alignment 1) with accurate IDCT
-    /// and return a *tight* `width * height` Y plane — the comparison
-    /// surface for EdgeFirst's semi-planar NV* arms, whose Y plane is
-    /// likewise full-resolution and independent of chroma subsampling.
+    /// and return a tight `width * height` Y plane.
     ///
-    /// `align=1` does **not** mean the Y plane's row stride equals `width`:
-    /// `tjPlaneWidth(0, width, subsamp)` rounds up to the chroma-subsampling
-    /// grid (e.g. 427 → 428 for 4:2:0, matching EdgeFirst's own
-    /// `even_width` convention) even at align 1, since the luma plane must
-    /// stay aligned with the chroma blocks it feeds. Assuming stride==width
-    /// on an odd-width source silently drifts the row-extraction offset by
-    /// one byte per row, compounding into a large apparent mismatch by the
-    /// bottom of the image — this bit a first draft of this function
-    /// (confirmed via cross-check against `decode_rgb`'s RGB→Y before
-    /// tracking down `tjPlaneWidth`; the codec itself was never wrong).
+    /// The Y plane's row stride is `tjPlaneWidth(0, width, subsamp)`, which
+    /// rounds up to the chroma-subsampling grid (e.g. 427 → 428 for 4:2:0).
     fn decode_y_plane(&self, jpeg: &[u8]) -> Result<(usize, usize, Vec<u8>)> {
         let mut w = 0i32;
         let mut h = 0i32;
@@ -327,7 +300,6 @@ impl TurboJpeg {
 
 impl Drop for TurboJpeg {
     fn drop(&mut self) {
-        // Best-effort; process exits shortly after in every use of this tool.
         unsafe { (self.destroy)(self.handle) };
     }
 }
@@ -401,11 +373,9 @@ fn shifted_diff(a: &[u8], b: &[u8], w: usize, h: usize, channels: usize, dx: i32
 }
 
 /// One image's worth of EdgeFirst decode, in RGB mode: tight-packed
-/// (`width*3` stride) so it's directly comparable to turbo's buffer. `Ok(None)`
-/// means this arm doesn't support the source (e.g. `CodecError::UnsupportedFormat`
-/// on a non-4:4:4/non-4:2:0 subsampling, or a zune/image decode error on an
-/// image that engine can't handle — same "skip, not a fault" convention the
-/// original box-upsample-only version of this tool used).
+/// (`width*3` stride). `Ok(None)` means this arm doesn't support the source
+/// (e.g. `CodecError::UnsupportedFormat` on a non-4:4:4/non-4:2:0
+/// subsampling, or a zune/image decode error).
 fn decode_engine_rgb(
     engine: Engine,
     ef_tensor: &mut Tensor<u8>,
@@ -498,8 +468,7 @@ fn engine_name(e: Engine) -> &'static str {
 }
 
 fn run_rgb(args: &Args, tj: &TurboJpeg, files: &[std::path::PathBuf]) -> Result<()> {
-    // TurboIfast always compares against plain accurate islow — Table B
-    // only, no matched-config filter class to join Table A under.
+    // TurboIfast always compares against plain accurate islow.
     let turbo_flags = if args.engine == Engine::TurboIfast {
         TJFLAG_ACCURATEDCT
     } else {
@@ -600,11 +569,11 @@ fn run_rgb(args: &Args, tj: &TurboJpeg, files: &[std::path::PathBuf]) -> Result<
     anyhow::ensure!(n_images > 0, "no images decoded on both arms");
 
     let ref_label = if args.engine == Engine::TurboIfast {
-        "islow accurate (Table B, --reference ignored)"
+        "islow accurate (--reference ignored)"
     } else {
         match args.reference {
-            Reference::Matched => "islow + TJFLAG_FASTUPSAMPLE (matched, Table A)",
-            Reference::Accurate => "islow accurate (Table B)",
+            Reference::Matched => "islow + TJFLAG_FASTUPSAMPLE (matched)",
+            Reference::Accurate => "islow accurate",
         }
     };
     println!(
@@ -640,10 +609,7 @@ fn run_yplane(args: &Args, tj: &TurboJpeg, files: &[std::path::PathBuf]) -> Resu
         CpuAccess::ReadWrite,
     )?;
     let mut decoder = ImageDecoder::new();
-    // No set_output_format: leave the decoder on its native NV12/16/24
-    // output — the Y plane is full-resolution and identically laid out
-    // (row_stride pitch, first `height * row_stride` bytes) regardless of
-    // which NV* variant the source's chroma subsampling selects.
+    // The decoder stays on its native NV12/16/24 output.
     if args.engine == Engine::EdgefirstFast {
         decoder.set_dct_method(DctMethod::Fast);
     }

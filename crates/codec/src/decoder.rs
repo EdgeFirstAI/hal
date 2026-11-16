@@ -14,16 +14,12 @@ use crate::pixel::ImagePixel;
 use edgefirst_tensor::{DType, Tensor, TensorDyn};
 use std::io::Read;
 
-/// IDCT accuracy/speed selection for the software JPEG decoder.
+/// IDCT selection for the software JPEG decoder.
 ///
-/// [`Accurate`](Self::Accurate) is the default and the kernel every published
-/// benchmark quotes: the `islow`-class Loeffler IDCT, bit-comparable to
-/// libjpeg-turbo's default. [`Fast`](Self::Fast) opts into the AAN
-/// `ifast`-class kernel — roughly an eighth of the multiplies, at a small,
-/// bounded pixel accuracy cost (and the documented `ifast` degeneration at
-/// very high quality factors). Fast is advisory: paths without a fast kernel
-/// (non-NEON tiers, hardware V4L2/nvJPEG decoders, PNG) use their normal
-/// accurate path.
+/// [`Accurate`](Self::Accurate), the default, is the `islow`-class Loeffler
+/// IDCT. [`Fast`](Self::Fast) is the AAN `ifast`-class kernel, with lower
+/// pixel accuracy. Fast is advisory: paths without a fast kernel (non-NEON
+/// tiers, hardware V4L2/nvJPEG decoders, PNG) use their accurate path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DctMethod {
     /// Accurate `islow`-class IDCT (default).
@@ -36,14 +32,8 @@ pub enum DctMethod {
 /// Chroma upsampling filter for a fused native-4:2:0 `Rgb` decode (see
 /// [`ImageDecoder::set_output_format`]).
 ///
-/// [`Box`](Self::Box) — 2×2 nearest-neighbour replication — is the only
-/// filter implemented today; the type exists so that a future
-/// fancy/triangle-filtered mode (libjpeg-turbo's default, and a materially
-/// more expensive one — see BENCHMARKS.md) can be added as a new variant
-/// without a breaking API change to
-/// [`ImageDecoder::set_chroma_upsample`]. `#[non_exhaustive]` for the same
-/// reason: adding a variant later must not be a semver break for callers who
-/// match on this type.
+/// [`Box`](Self::Box), 2×2 nearest-neighbour replication, is the only
+/// filter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum ChromaUpsample {
@@ -54,18 +44,18 @@ pub enum ChromaUpsample {
 
 /// Reusable image decoder with internal scratch buffers.
 ///
-/// Create one `ImageDecoder` at program initialisation and pass it to
-/// [`ImageLoad::load_image`](crate::ImageLoad::load_image) in the hot loop.
-/// The scratch buffers grow to the high-water mark and are reused across calls
-/// — no per-frame allocations after the first few frames.
+/// Create one `ImageDecoder` and pass it to
+/// [`ImageLoad::load_image`](crate::ImageLoad::load_image) for every image.
+/// The scratch buffers grow to the high-water mark and are reused across
+/// calls.
 ///
 /// By default the decoder produces the source's native format and configures
-/// the destination tensor's dimensions + pixel format accordingly (JPEG →
+/// the destination tensor's dimensions and pixel format accordingly (JPEG →
 /// `Nv12`/`Nv16`/`Nv24`/`Grey`, PNG → `Rgb`/`Rgba`/`Grey`).
 /// [`set_output_format`](Self::set_output_format) opts a JPEG decode into a
 /// fused `Rgb` or `Nv12` output, where the colour conversion or chroma
-/// downsample happens at the MCU write stage instead of in a second pass. The
-/// decoder never rotates or resizes; use `ImageProcessor::convert()` for that.
+/// downsample happens at the MCU write stage. The decoder never rotates or
+/// resizes.
 ///
 /// # Example
 ///
@@ -74,8 +64,7 @@ pub enum ChromaUpsample {
 /// use edgefirst_tensor::{CpuAccess, Tensor, TensorTrait, TensorMemory, PixelFormat};
 ///
 /// let mut decoder = ImageDecoder::new();
-/// // Allocate a buffer large enough for the biggest expected image. The
-/// // decoder CPU-writes the pixels, so declare `CpuAccess::Write`.
+/// // Allocate a buffer large enough for the biggest expected image.
 /// let mut tensor = Tensor::<u8>::image(1920, 1080, PixelFormat::Nv12, Some(TensorMemory::Mem),
 ///                                       CpuAccess::Write)
 ///     .expect("alloc");
@@ -107,45 +96,31 @@ impl ImageDecoder {
     /// Request a fused decode output format instead of the source's native
     /// format (JPEG only; PNG is unaffected).
     ///
-    /// This is a **pure CPU, single-pass** path inside the software JPEG
-    /// decoder — colour conversion / chroma downsample happens at the MCU
-    /// write stage. It is **not** a GPU hybrid or nvJPEG path; V4L2/nvJPEG
-    /// are bypassed whenever the resolved output differs from native.
+    /// The software JPEG decoder converts at the MCU write stage; V4L2 and
+    /// nvJPEG are bypassed whenever the resolved output differs from native.
     ///
-    /// - `Some(Rgb)`: 4:4:4 colour JPEGs decode straight to interleaved RGB
-    ///   (no chroma resampling); native 4:2:0 colour JPEGs also decode
-    ///   straight to RGB, with a 2×2 nearest-neighbour (box) chroma upsample
-    ///   fused into the write — not libjpeg's fancy/triangle upsampling, a
-    ///   deliberate speed tradeoff (see BENCHMARKS.md). Other sources (4:2:2,
-    ///   greyscale, non-standard subsamplings) cannot honour an RGB request:
-    ///   the decode returns [`CodecError::UnsupportedFormat`] rather than
-    ///   silently substituting the native semi-planar format. Check the
-    ///   source's subsampling first (e.g. via [`crate::peek_info`]) if it
-    ///   isn't known to be 4:4:4 or 4:2:0.
+    /// - `Some(Rgb)`: 4:4:4 colour JPEGs decode to interleaved RGB with no
+    ///   chroma resampling; native 4:2:0 colour JPEGs decode to RGB with a 2×2
+    ///   nearest-neighbour (box) chroma upsample. Other sources (4:2:2,
+    ///   greyscale, non-standard subsamplings) fail with
+    ///   [`CodecError::UnsupportedFormat`]; [`crate::peek_info`] reports the
+    ///   source's native format.
     /// - `Some(Nv12)`: colour JPEGs decode to NV12, downsampling chroma at
     ///   the write stage (2×2 average for 4:4:4, vertical for 4:2:2).
     /// - `None` (default): native format (`Nv12`/`Nv16`/`Nv24`/`Grey`).
-    ///
-    /// Callers still run `ImageProcessor::convert()` on the result for
-    /// model-input preprocessing (letterbox, resize, EXIF orientation). With
-    /// fused RGB that convert step is typically a pure resize.
     pub fn set_output_format(&mut self, format: Option<edgefirst_tensor::PixelFormat>) {
         self.jpeg_state.preferred_format = format;
     }
 
-    /// Select the software JPEG IDCT kernel class — see [`DctMethod`].
-    /// Off (Accurate) by default; `EDGEFIRST_CODEC_DCT=fast` in the
-    /// environment flips a **new** decoder's default for A/B runs.
+    /// Select the software JPEG IDCT kernel class; see [`DctMethod`].
+    /// Accurate by default; `EDGEFIRST_CODEC_DCT=fast` in the environment makes
+    /// Fast the default of a new decoder.
     pub fn set_dct_method(&mut self, method: DctMethod) {
         self.jpeg_state.fast_dct = method == DctMethod::Fast;
     }
 
     /// Select the chroma upsampling filter for a fused native-4:2:0 `Rgb`
-    /// decode — see [`ChromaUpsample`]. [`ChromaUpsample::Box`] (the
-    /// default) is the only filter implemented today; this setter exists so
-    /// a future filter can be selected without changing
-    /// [`set_output_format`](Self::set_output_format)'s signature. Has no
-    /// effect on 4:4:4 sources (no chroma resampling occurs there) or when
+    /// decode; see [`ChromaUpsample`]. Has no effect on 4:4:4 sources or when
     /// the output format isn't `Rgb`.
     pub fn set_chroma_upsample(&mut self, mode: ChromaUpsample) {
         self.jpeg_state.chroma_upsample = mode;
@@ -159,8 +134,8 @@ impl ImageDecoder {
     /// PNG; [`ENGINE_ENV`](crate::ENGINE_ENV) narrows that list. Any other
     /// engine decodes alone: an image it cannot take fails with
     /// [`CodecError::Unsupported`] carrying
-    /// [`UnsupportedFeature::Codec`](crate::UnsupportedFeature::Codec), and an engine this platform does not
-    /// have with [`CodecError::NoDevice`].
+    /// [`UnsupportedFeature::Codec`](crate::UnsupportedFeature::Codec), and an
+    /// engine this platform does not have with [`CodecError::NoDevice`].
     pub fn set_engine(&mut self, engine: Engine) {
         self.jpeg_state.engine = engine;
     }
@@ -255,9 +230,8 @@ impl ImageDecoder {
     }
 }
 
-/// Internal decode entry point parameterised over disjoint `&mut` borrows so
-/// callers can read from a `&[u8]` borrowed from one field of [`ImageDecoder`]
-/// while mutably borrowing the others.
+/// Decode entry point over disjoint `&mut` borrows of the [`ImageDecoder`]
+/// fields.
 pub(crate) fn decode_into_inner<T: ImagePixel>(
     jpeg_state: &mut crate::jpeg::JpegDecoderState,
     scratch: &mut Vec<u8>,
@@ -344,7 +318,7 @@ impl Default for ImageDecoder {
 /// Parse image headers and return the native dimensions, format, and EXIF
 /// orientation without decoding pixels.
 ///
-/// Recommended for one-shot flows that allocate a tensor sized to the image:
+/// The result sizes a tensor for the image:
 ///
 /// ```rust,no_run
 /// use edgefirst_codec::{peek_info, ImageDecoder, ImageLoad};

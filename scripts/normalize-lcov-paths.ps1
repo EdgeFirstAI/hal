@@ -4,20 +4,15 @@
   Rewrite an LCOV report's SF: records to repo-relative POSIX paths.
 
 .DESCRIPTION
-  cargo-llvm-cov on Windows writes absolute SF: records with backslashes
-  (D:\a\hal\hal\crates\image\src\lib.rs). SonarCloud resolves SF: against
-  the scanner's own checkout, so every lane's report must agree on
-  repo-relative forward-slash paths (crates/image/src/lib.rs) — the Unix
-  lanes get the same treatment from a sed in the sonarcloud job. Records
-  outside the root (registry sources that slipped past
-  --ignore-filename-regex) are left untouched. The file is re-emitted
-  LF-terminated so the Linux scanner never sees a stray CR.
+  Rewrites absolute SF: records under the repository root to repo-relative
+  forward-slash paths, leaves records outside the root untouched, and writes
+  the file LF-terminated.
 
 .PARAMETER Lcov
   The LCOV file to rewrite in place.
 .PARAMETER Root
   Repository root the SF: paths are made relative to (default: the parent
-  of this script's directory, i.e. the workspace root).
+  of this script's directory).
 
 .EXAMPLE
   pwsh scripts/normalize-lcov-paths.ps1 target/coverage_rust.lcov

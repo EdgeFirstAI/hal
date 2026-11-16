@@ -7,7 +7,7 @@ uniform int tex_width;
 uniform ivec2 chroma_shift;
 uniform int chroma_lines;
 // Inclusive texel bounds (x0, y0, x1, y1) of the source crop: every tap is
-// clamped to them, so a crop never reads pixels from outside itself.
+// clamped to them.
 uniform ivec4 src_rect;
 // Hardware-filtered program only: the chroma plane as (U, V) texels on unit 1,
 // the image's share of each texture (`*_scale`), and the crop's half-texel-
@@ -19,8 +19,7 @@ uniform vec4 luma_clamp;
 uniform vec2 chroma_scale;
 uniform vec4 chroma_clamp;
 // Per-tensor colorimetry (YUV→RGB matrix + range), set by draw_nv_texture_2d
-// from the source tensor's resolved colorimetry. Path B applies the matrix in
-// the shader, so it is correct regardless of driver EGL color-hint support.
+// from the source tensor's resolved colorimetry.
 uniform float y_offset;
 uniform float y_scale;
 uniform float c_vr;
@@ -31,10 +30,7 @@ in vec3 fragPos;
 in vec2 tc;
 out vec4 color;
 
-// Floor expanded luma at 0 to match the CPU `yuv` crate's saturating (Y-16)
-// term (limited footroom Y<16 → 0). The top is left uncapped — the crate lets
-// headroom exceed 1.0 and relies on the final RGB clamp, so the GL path must
-// too. No-op for full range (y_offset=0, y_scale=1).
+// Floors expanded luma at 0; the top is not capped.
 vec3 nv_yuv_to_rgb(float yv, float u, float v) {
     float yp = max((yv - y_offset) * y_scale, 0.0);
     float up = u - 128.0 / 255.0;
@@ -43,8 +39,7 @@ vec3 nv_yuv_to_rgb(float yv, float u, float v) {
 }
 
 vec3 nv_rgb(int x, int y) {
-    // Luma: direct 2D texel — no per-pixel integer divide/modulo (very slow on
-    // some embedded GPUs, e.g. Vivante GC7000UL).
+    // Luma: direct 2D texel.
     float yv = texelFetch(src, ivec2(x, y), 0).r;
 
     // Interleaved CbCr plane begins at buffer row `h`. Each image-chroma-row

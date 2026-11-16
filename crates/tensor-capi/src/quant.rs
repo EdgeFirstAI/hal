@@ -5,47 +5,29 @@
 //! `ef_tensor_quantization_get`, `ef_tensor_quantization_set`,
 //! `ef_tensor_quantization_clear`.
 //!
-//! `Quantization` (`edgefirst_tensor::Quantization`) is variable-length --
-//! an axis plus per-axis `scales` and `zero_points` -- so unlike
-//! `ef_tensor_plane`/`ef_tensor_view_origin` it does not fit a single fixed
-//! `#[repr(C)]` scalar block a getter can fill in one call. Reading it is
-//! therefore the standard two-call idiom: [`ef_tensor_quantization_info`]
-//! reports whether quantization is attached and how many entries it has,
-//! then [`ef_tensor_quantization_get`] fills caller-provided `scales`/`zps`
+//! Reading is a two-call idiom: [`ef_tensor_quantization_info`] reports
+//! whether quantization is attached and how many entries it has, then
+//! [`ef_tensor_quantization_get`] fills caller-provided `scales`/`zps`
 //! buffers sized from that count.
 //!
-//! `has_quantization` in [`EfQuantizationInfo`] is a presence flag, not a
-//! sentinel -- axis `0` and a scale of `0.0` are both legitimate values, the
-//! same reasoning as `EfViewOrigin::has_origin`
-//! (`edgefirst-tensor-abi/src/lib.rs`).
+//! `has_quantization` in [`EfQuantizationInfo`] is a presence flag: axis `0`
+//! and a scale of `0.0` are both legitimate values.
 //!
 //! `axis` on the wire is `-1` for per-tensor (no axis) and `>= 0` for
-//! per-channel, matching `ef_tensor_builder_quantization`'s own encoding
-//! (minus that function's `-2` "clear" sentinel -- here clearing is its own
-//! entry point, [`ef_tensor_quantization_clear`], not a magic axis value).
-//! `zero_point` is always readable as a full array: a symmetric
-//! quantization (`Quantization`'s `zero_point` field is `None`) is
-//! dequantized identically to an explicit all-zero array
-//! (`scale * (q - 0)`), so [`ef_tensor_quantization_get`] fills `zps` with
-//! zeros in that case rather than exposing a second "has zero point" flag
-//! nothing downstream needs.
+//! per-channel. For a symmetric quantization, which has no zero-point array,
+//! [`ef_tensor_quantization_get`] fills `zps` with zeros.
 //!
 //! # Concurrency
 //!
 //! [`ef_tensor_quantization_info`]/[`ef_tensor_quantization_get`] are
-//! read-only accessors (shared `&EfTensorImpl`, the same shape as
-//! `ef_tensor_colorimetry`/`ef_tensor_view_origin`) and safe to call from
-//! any thread holding a valid reference, concurrently with each other or
-//! with any other read-only accessor.
+//! read-only accessors and may be called from any thread holding a valid
+//! reference, concurrently with each other or with any other read-only
+//! accessor.
 //!
 //! [`ef_tensor_quantization_set`]/[`ef_tensor_quantization_clear`] mutate
-//! `inner` directly through [`crate::handle::imp_mut`] and carry the same
-//! narrower constraint `mutate.rs`'s setters do: **not safe to call
+//! `inner` through [`crate::handle::imp_mut`]: they are not safe to call
 //! concurrently with any other `tensor-capi` call on the same handle from
-//! another thread.** See `mutate.rs`'s module docs for the full reasoning
-//! and why every real caller (quantization attached once at model load,
-//! read many times per frame afterward -- `edgefirst-decoder`'s
-//! `per_scale/helper.rs`/`pipeline.rs`) fits that shape.
+//! another thread.
 
 use std::ffi::c_int;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -60,7 +42,7 @@ use crate::map::errno_for;
 /// Report whether a live handle carries quantization metadata, and how many
 /// `scale`/`zero_point` entries it has.
 ///
-/// The first half of the two-call idiom; see this module's docs.
+/// Call this before [`ef_tensor_quantization_get`] to size its buffers.
 ///
 /// @retval 0 success (`out` is always fully written, whether or not
 ///         quantization is present).
@@ -99,8 +81,8 @@ pub unsafe extern "C" fn ef_tensor_quantization_info(
 }
 
 /// Fill caller-provided buffers with a live handle's quantization scales and
-/// zero-points. The second half of the two-call idiom; `n` must equal the
-/// `count` [`ef_tensor_quantization_info`] reported.
+/// zero-points. `n` must equal the `count` [`ef_tensor_quantization_info`]
+/// reported.
 ///
 /// @retval 0 success; `scales[0..n]` is filled, and `zps[0..n]` too when
 ///         `zps` is non-`NULL` (zero-filled for a symmetric quantization).
@@ -146,8 +128,7 @@ pub unsafe extern "C" fn ef_tensor_quantization_get(
                 let out_zps = std::slice::from_raw_parts_mut(zps, n as usize);
                 match q.zero_point() {
                     Some(z) => out_zps.copy_from_slice(z),
-                    // Symmetric: dequantizes identically to an explicit all-zero
-                    // array (scale * (q - 0)) -- see this module's docs.
+                    // Symmetric quantization has no zero-point array.
                     None => out_zps.fill(0),
                 }
             }
@@ -161,9 +142,7 @@ pub unsafe extern "C" fn ef_tensor_quantization_get(
 /// per-tensor (`n` must be 1) or `>= 0` for per-channel; `zps` may be `NULL`
 /// for symmetric quantization (zero-point implicitly 0).
 ///
-/// Only meaningful for an integer-dtype tensor; a float tensor is refused,
-/// matching [`edgefirst_tensor::TensorDyn::set_quantization`]'s own
-/// `QuantizationInvalid { field: "dtype_is_integer", .. }` refusal.
+/// A float tensor is refused.
 ///
 /// @retval 0 success.
 /// @retval EINVAL `t` or `scales` is `NULL`, `n == 0`, `axis` is `< -1`,
@@ -172,7 +151,7 @@ pub unsafe extern "C" fn ef_tensor_quantization_get(
 ///         with the tensor's shape).
 ///
 /// @warning Not safe to call concurrently with any other `tensor-capi` call
-/// on the same handle from another thread -- see this module's docs.
+/// on the same handle from another thread.
 ///
 /// # Safety
 /// `t` must be `NULL` or a live handle; `scales` must point to `n` readable
@@ -248,7 +227,7 @@ pub unsafe extern "C" fn ef_tensor_quantization_set(
 /// @retval EINVAL `t` is `NULL`.
 ///
 /// @warning Not safe to call concurrently with any other `tensor-capi` call
-/// on the same handle from another thread -- see this module's docs.
+/// on the same handle from another thread.
 ///
 /// # Safety
 /// `t` must be `NULL` or a live handle.
@@ -322,7 +301,7 @@ mod tests {
     #[test]
     fn set_per_channel_symmetric_reads_back_zero_filled_zero_points() {
         let h = t();
-        // Per-channel over axis 1 (width=4), matching the tensor's own shape.
+        // Per-channel over axis 1 (width=4).
         let scales = [0.1f32, 0.2, 0.3, 0.4];
         assert_eq!(
             unsafe { ef_tensor_quantization_set(h, 1, scales.as_ptr(), std::ptr::null(), 4) },
@@ -334,7 +313,7 @@ mod tests {
         assert_eq!(info.count, 4);
 
         let mut out_scale = [0f32; 4];
-        let mut out_zp = [7i32; 4]; // sentinel to prove it gets zero-filled
+        let mut out_zp = [7i32; 4]; // non-zero sentinel
         assert_eq!(
             unsafe {
                 ef_tensor_quantization_get(h, out_scale.as_mut_ptr(), out_zp.as_mut_ptr(), 4)

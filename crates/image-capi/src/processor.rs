@@ -1,12 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! The image processor: lifecycle, and the tensors it mints.
-//!
-//! Allocating a PBO is the one operation that genuinely requires a processor,
-//! because only the owner of the GL context can create one. Everything else a
-//! caller might allocate — `mem`, `shm`, `dmabuf` — is available from
-//! `libedgefirst-tensor` alone.
+//! The image processor: its lifecycle and the tensors it allocates.
 
 use std::ffi::{c_char, c_int, c_void, CStr};
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -40,7 +35,7 @@ pub extern "C" fn ef_image_processor_new() -> *mut EfImageProcessor {
     .unwrap_or(std::ptr::null_mut())
 }
 
-/// Free a processor. Freeing `NULL` is a no-op, matching `free(3)`.
+/// Free a processor. `NULL` is a no-op.
 ///
 /// # Safety
 /// `p` must be `NULL` or have come from [`ef_image_processor_new`].
@@ -66,13 +61,13 @@ unsafe fn cstr<'a>(p: *const c_char) -> Option<&'a str> {
 
 /// Allocate an image, returning a tensor.
 ///
-/// `format` is the wire descriptor (`"NV12"`, `"rgb8"`), matching
-/// `ef_tensor_builder_format` rather than introducing a second vocabulary.
-/// `dtype` and `access` are the shared integer codes.
+/// `format` is the wire descriptor (`"NV12"`, `"rgb8"`) that
+/// `ef_tensor_builder_format` takes. `dtype` and `access` are the shared
+/// integer codes.
 ///
-/// `storage` selects the backing; pass `EF_STORAGE_KIND_PBO` for the case that
-/// actually needs a processor. The result is an ordinary `ef_tensor` — read it
-/// with `ef_tensor_shape`, release it with `ef_tensor_free`.
+/// `storage` selects the backing; `EF_STORAGE_KIND_PBO` allocates a PBO. The
+/// result is an `ef_tensor`: read it with `ef_tensor_shape`, release it with
+/// `ef_tensor_free`.
 ///
 /// The returned tensor's `ef_tensor_cpu_access` may be wider than `access`:
 /// what this processor's own convert may do to it as a destination on the
@@ -145,7 +140,7 @@ pub unsafe extern "C" fn ef_image_processor_create_image(
             let Some(acc) = cpu_access_from_code(access) else {
                 return std::ptr::null_mut();
             };
-            // `storage` is a hint the allocator may decline; `None` lets it choose.
+            // `None` lets the allocator choose the storage.
             let mem = TensorMemory::from_code(storage);
             match (*p).inner.create_image(width, height, fmt, dt, mem, acc) {
                 Ok(t) => t.into_raw(),
@@ -157,14 +152,7 @@ pub unsafe extern "C" fn ef_image_processor_create_image(
 }
 
 /// Rebuild an `ImageDesc` from the scalar view `ef_tensor_image_desc_get`
-/// fills -- the single reconstruction site for this direction, paired with
-/// tensor-capi's `desc::view_of` for the other. `the_view_round_trips_...`
-/// tests there and `a_view_built_by_hand_reconstructs_correctly` below are
-/// the proof the two agree.
-///
-/// `None` for an unrecognized code: a stale vocabulary between two
-/// independently-versioned leaves is a real possibility (see `lib.rs`), so
-/// this is a request this library declines, never a panic.
+/// fills. `None` for an unrecognized code.
 fn image_desc_from_view(v: &EfImageDescView) -> Option<ImageDesc> {
     let fmt = PixelFormat::from_code(v.format)?;
     let dt = DType::from_code(v.dtype)?;
@@ -174,10 +162,7 @@ fn image_desc_from_view(v: &EfImageDescView) -> Option<ImageDesc> {
         desc = desc.with_memory(Some(TensorMemory::from_code(v.memory)?));
     }
     if v.has_compression != 0 {
-        // `Any` is the only compression request any `ef_tensor_image_desc_set_*`
-        // entry point can create; `Scheme` ("a specific vendor scheme") has no
-        // decodable detail behind it here, so it is refused rather than
-        // silently downgraded to `Any` or dropped.
+        // Refuses a compression request other than `Any`.
         if v.compression != EfCompressionRequest::Any as u32 {
             return None;
         }
@@ -188,11 +173,7 @@ fn image_desc_from_view(v: &EfImageDescView) -> Option<ImageDesc> {
 
 /// Allocate the image an `ef_tensor_image_desc` request describes.
 ///
-/// The request comes from `libedgefirst-tensor`, the type's single
-/// implementation home (see `edgefirst_tensor_capi::desc`); this library
-/// never dereferences the handle itself, only the scalar view
-/// `ef_tensor_image_desc_get` fills. The request is not consumed and may be
-/// reused, so one description can fill a pool.
+/// The request is not consumed and may be reused.
 ///
 /// The declared access is widened as for `ef_image_processor_create_image`,
 /// except for a compression request, which keeps `EF_CPU_ACCESS_NONE`.
@@ -218,7 +199,6 @@ pub unsafe extern "C" fn ef_image_processor_create_image_desc(
             let Some(mut desc) = image_desc_from_view(&view) else {
                 return std::ptr::null_mut();
             };
-            // Not part of the fixed-size view; read through its own getter.
             if ef_tensor_image_desc_contiguous(d) == 1 {
                 desc = desc.with_contiguous(true);
             }
@@ -237,13 +217,6 @@ pub(crate) fn cpu_access_from_code(code: u32) -> Option<CpuAccess> {
 }
 
 /// Borrow the `TensorDyn` behind a handle without taking ownership of it.
-///
-/// There is now exactly one implementation of `ef_tensor` (all four sibling
-/// `-capi` leaves link this crate's shared `libedgefirst_tensor.so` rather
-/// than embedding their own copy), so every handle is read the same way
-/// regardless of which library minted it -- no per-library dispatch table,
-/// no re-import from a foreign platform handle. `TensorDyn::with_raw` borrows
-/// the handle without freeing it, so the caller still owns its lifetime.
 ///
 /// # Safety
 /// `t` must be `NULL` or a live handle from an EdgeFirst library.
@@ -650,10 +623,8 @@ pub(crate) fn image_errno(e: &edgefirst_image::Error) -> c_int {
 
 /// Convert `src` into `dst`, scaling, converting colour and rotating as needed.
 ///
-/// `src`/`dst` may have been minted by any EdgeFirst library -- every library
-/// links the same shared tensor implementation, so both are read the same
-/// way regardless of which one minted them. `options` may be `NULL` for the
-/// defaults.
+/// `src` and `dst` may come from any EdgeFirst library. `options` may be
+/// `NULL` for the defaults.
 ///
 /// @return 0 on success; `EINVAL` for options that cannot apply to `dst`
 /// (such as a normalization on an integer destination without quantization),
@@ -769,9 +740,8 @@ pub unsafe extern "C" fn ef_align_width_for_pixel_format(
 
 /// Create a processor forced to one backend.
 ///
-/// `backend` is an `EF_COMPUTE_BACKEND_*` code. A forced backend
-/// disables the fallback chain entirely — if it is unavailable the call fails
-/// rather than quietly using another, which is the point of forcing one.
+/// `backend` is an `EF_COMPUTE_BACKEND_*` code. A forced backend disables the
+/// fallback chain: the call fails when the backend is unavailable.
 ///
 /// @return `NULL` when the backend is unknown or unavailable here.
 #[no_mangle]
@@ -780,8 +750,6 @@ pub extern "C" fn ef_image_processor_new_with_backend(backend: u32) -> *mut EfIm
         let Some(b) = edgefirst_image::ComputeBackend::from_code(backend) else {
             return std::ptr::null_mut();
         };
-        // `needless_update` fires on macOS, where the config has only
-        // `backend`; on Linux it also has a cfg-gated `egl_display`.
         #[allow(clippy::needless_update)]
         let config = edgefirst_image::ImageProcessorConfig {
             backend: b,
@@ -797,7 +765,7 @@ pub extern "C" fn ef_image_processor_new_with_backend(backend: u32) -> *mut EfIm
 
 /// Set the RGBA palette used when drawing class masks and boxes.
 ///
-/// Copied, not borrowed, so the caller may free its array immediately.
+/// The palette is copied; the caller may free its array after the call.
 ///
 /// The alpha byte sets the coverage of both the mask fill and the box
 /// outline: each is blended over `dst` with `alpha / 255` scaled by the
@@ -929,10 +897,9 @@ pub unsafe extern "C" fn ef_image_processor_flush(p: *mut EfImageProcessor) -> c
 ///
 /// Convert, returning a sync-fence fd instead of blocking on the GPU.
 ///
-/// The GL to NPU handoff. `*fence_fd` receives a descriptor the caller owns and
-/// must close, or `-1` when the platform has no native fence and the convert
-/// therefore completed synchronously — in which case the destination is already
-/// safe to read.
+/// `*fence_fd` receives a descriptor the caller owns and must close, or `-1`
+/// when the platform has no native fence and the convert completed
+/// synchronously.
 ///
 /// `options` as for [`ef_image_processor_convert`].
 ///
@@ -954,8 +921,6 @@ pub unsafe extern "C" fn ef_image_processor_convert_fence(
             if p.is_null() || fence_fd.is_null() {
                 return libc::EINVAL;
             }
-            // Written before any early return, so a caller never reads an
-            // uninitialised descriptor after a failure.
             *fence_fd = -1;
             #[cfg(not(unix))]
             {
@@ -975,8 +940,7 @@ pub unsafe extern "C" fn ef_image_processor_convert_fence(
                         *fence_fd = owned.into_raw_fd();
                         0
                     }
-                    // No native fence here: the convert already completed, which the
-                    // -1 reports. Not an error.
+                    // No native fence: the convert completed synchronously.
                     Ok(Ok(Ok(None))) => 0,
                     Ok(Ok(Err(e))) => image_errno(&e),
                     Ok(Err(e)) | Err(e) => e,
@@ -1014,9 +978,6 @@ pub unsafe extern "C" fn ef_image_processor_convert_fence_handle(
             if p.is_null() || fence.is_null() {
                 return libc::EINVAL;
             }
-            // Written before any early return, as the fd sibling above does,
-            // so a caller reading `*fence` after a failure never sees an
-            // uninitialised pointer.
             *fence = std::ptr::null_mut();
             #[cfg(not(target_os = "windows"))]
             {
@@ -1036,9 +997,7 @@ pub unsafe extern "C" fn ef_image_processor_convert_fence_handle(
                         *fence = owned.into_raw_handle();
                         0
                     }
-                    // No fence on this display: the convert already
-                    // completed, which the NULL `*fence` reports. Not an
-                    // error.
+                    // No fence on this display: the convert completed synchronously.
                     Ok(Ok(Ok(None))) => 0,
                     Ok(Ok(Err(e))) => image_errno(&e),
                     Ok(Err(e)) | Err(e) => e,
@@ -1078,10 +1037,7 @@ mod tests {
 
     #[test]
     fn an_unknown_backend_is_refused_rather_than_falling_back() {
-        // Forcing a backend exists to disable the fallback chain; quietly
-        // substituting another would defeat the only reason to call this.
         assert!(ef_image_processor_new_with_backend(99).is_null());
-        // Auto and CPU are available on every host this builds for.
         let p = ef_image_processor_new_with_backend(0);
         assert!(!p.is_null());
         unsafe { ef_image_processor_free(p) };
@@ -1106,10 +1062,7 @@ mod tests {
         let p = processor();
         unsafe {
             {
-                // Heap-allocated and scoped on purpose: it is freed before
-                // the palette is used, so a borrow rather than a copy would
-                // read freed memory. A stack array would not prove that -- the
-                // bytes would still be readable after it went out of scope.
+                // Freed before the palette is used.
                 let colors = [[255u8, 0, 0, 255], [0, 255, 0, 255]].to_vec();
                 assert_eq!(
                     ef_image_processor_set_class_colors(p, colors.as_ptr(), colors.len()),
@@ -1132,8 +1085,6 @@ mod tests {
 
     #[test]
     fn an_unknown_option_code_is_refused() {
-        // Treating an unknown code as "none" would rotate nothing and read as
-        // a backend failure rather than a caller mistake.
         unsafe {
             let o = ef_convert_options_new();
             assert_eq!(ef_convert_options_set_rotation(o, 99), libc::EINVAL);
@@ -1417,8 +1368,7 @@ mod tests {
         }
     }
 
-    /// A CPU convert into a destination declared read-only, and a CPU draw
-    /// into one declared write-only, are `EACCES`, as a tensor map is.
+    /// A CPU convert into a read-only destination or a CPU draw into a write-only one is `EACCES`.
     #[test]
     fn a_cpu_access_refusal_is_eacces() {
         let p = ef_image_processor_new_with_backend(1);
@@ -1471,8 +1421,7 @@ mod tests {
         );
     }
 
-    /// A `create_image` destination requested with no CPU access still takes
-    /// the CPU backend's convert: the processor adds the write it needs.
+    /// A `create_image` destination requested with no CPU access takes the CPU backend's convert.
     #[test]
     fn create_image_none_then_cpu_convert_succeeds() {
         let p = ef_image_processor_new_with_backend(1);
@@ -1575,11 +1524,6 @@ mod tests {
 
     #[test]
     fn create_image_mints_a_real_usable_tensor() {
-        // A tensor from here is an ordinary `ef_tensor`, minted inside
-        // `libedgefirst_tensor.so` (this library's own allocation strategy
-        // chose PBO/mem/etc, but the implementation is the shared one) --
-        // read with the real exported accessors, freed with the real
-        // exported `ef_tensor_free`, exactly like one from `ef_tensor_new`.
         let p = processor();
         let nv12 = std::ffi::CString::new("NV12").unwrap();
         let t = unsafe { ef_image_processor_create_image(p, 64, 48, nv12.as_ptr(), 0, 0, 3) };
@@ -1635,8 +1579,8 @@ mod tests {
         assert_eq!(cpu_access_from_code(CpuAccess::all().len() as u32), None);
     }
 
-    /// A view with every field away from its default -- 64x48 NV12 U8,
-    /// `Shm`, `ReadWrite`, `Any` compression.
+    /// A view with every field away from its default: 64x48 NV12 U8, `Shm`,
+    /// `ReadWrite`, `Any` compression.
     fn full_view() -> EfImageDescView {
         EfImageDescView {
             width: 64,
@@ -1653,14 +1597,6 @@ mod tests {
 
     #[test]
     fn a_view_built_by_hand_reconstructs_correctly() {
-        // `image_desc_from_view` is the one place this crate turns a scalar
-        // view back into an `ImageDesc`, paired with tensor-capi's
-        // `desc::view_of` for the forward direction (see that crate's
-        // `the_view_round_trips_every_field`, which builds a view through
-        // the real setters and checks the same fields the other way).
-        // Cross-library linking to run both directions through the real
-        // FFI is `an_image_desc_request_crosses_the_library_boundary_intact`
-        // in `lib.rs`; this is the reconstruction logic in isolation.
         let d = image_desc_from_view(&full_view()).expect("a full view must decode");
         assert_eq!(d.width(), 64);
         assert_eq!(d.height(), 48);
@@ -1683,9 +1619,6 @@ mod tests {
 
     #[test]
     fn an_unrecognized_code_in_any_field_is_refused_not_guessed_at() {
-        // A stale wire vocabulary between two independently-versioned leaves
-        // (see `lib.rs`) must be a declined request, never a panic or a
-        // silent default.
         let mut v = full_view();
         v.format = 9999;
         assert!(image_desc_from_view(&v).is_none(), "bad format");
@@ -1709,19 +1642,12 @@ mod tests {
 
     #[test]
     fn a_specific_compression_scheme_is_refused_here_too() {
-        // `Scheme` ("a specific vendor scheme") is a real state
-        // `ef_tensor_image_desc_get` can report, but no C setter can ever
-        // request one, so there is nothing to reconstruct -- refused, same
-        // as an unrecognized code, not silently treated as `Any`.
         let mut v = full_view();
         v.compression = EfCompressionRequest::Scheme as u32;
         assert!(image_desc_from_view(&v).is_none());
     }
 
-    /// `p`/`fence` are checked before any platform arm runs, so a `NULL`
-    /// here is `EINVAL` on every platform this family is declared on --
-    /// unlike a bad `src`/`dst`, whose errno differs by platform (see the
-    /// Windows-only round trip below).
+    /// A `NULL` processor or fence is `EINVAL`.
     #[test]
     fn convert_fence_handle_refuses_a_null_processor_or_fence() {
         let mut fence: *mut c_void = std::ptr::null_mut();
@@ -1752,16 +1678,7 @@ mod tests {
         }
     }
 
-    /// The Windows path end to end, on the real GPU: mint a texture-backed
-    /// src/dst through this same library, convert without blocking, and wait
-    /// on the returned event.
-    ///
-    /// `tests/c/test_cross_library.c` drives
-    /// `ef_image_processor_convert_fence_handle` from C on Windows as well
-    /// (the MSVC harness in `lib.rs`); this is the Rust-side check of the
-    /// same event contract, with no compiler between the test and the
-    /// export, the role `a_texture_tensor_round_trips_through_the_exports`
-    /// plays for the tensor leaf's D3D11 family (`tensor-capi/src/d3d11.rs`).
+    /// A fenced convert between texture-backed tensors returns an event that is set on completion.
     #[cfg(target_os = "windows")]
     #[test]
     fn convert_fence_handle_returns_an_owned_event_set_on_completion() {
@@ -1772,12 +1689,7 @@ mod tests {
         let p = processor();
         let rgba = std::ffi::CString::new("rgba8").unwrap();
         let rgb = std::ffi::CString::new("rgb8").unwrap();
-        // `storage` has no dedicated "auto" enumerator (see
-        // `TensorMemory::from_code`): any code outside the 0-5 vocabulary
-        // maps to `None`, which is what lets `create_image` reach its
-        // Dma-first arm and hand back a D3D11 texture. Code 0 is `Mem` --
-        // a real, valid request, not "unspecified" -- so it would allocate
-        // a host tensor here and make this test vacuous.
+        // A storage code outside the 0-5 vocabulary maps to `None`: `create_image` chooses.
         const AUTO: u32 = u32::MAX;
         unsafe {
             let src = ef_image_processor_create_image(p, 64, 48, rgba.as_ptr(), 0, AUTO, 3);
@@ -1799,9 +1711,7 @@ mod tests {
             );
             close_handle(fence);
 
-            // The event and the destination's own completion name one value:
-            // a fenced convert into a texture flushes and signals once, and
-            // records that value on `dst`. A consumer may wait on either.
+            // The destination records the same completion the event signals.
             let mut dvalue: u64 = 0;
             let mut dfence: *mut c_void = std::ptr::null_mut();
             assert_eq!(
@@ -1819,18 +1729,13 @@ mod tests {
         }
     }
 
-    /// `WaitForSingleObject`/`CloseHandle` without pulling the `windows`
-    /// crate into this leaf: the handle crossing this ABI is a plain
-    /// `void *`, and the test needs exactly two Win32 calls to wait on and
-    /// give back the owned one. Mirrors `tensor-capi/src/d3d11.rs`'s
-    /// `close_handle` test helper.
+    /// `WaitForSingleObject` on a raw handle.
     #[cfg(target_os = "windows")]
     fn wait_for_single_object(h: *mut c_void, millis: u32) -> u32 {
         extern "system" {
             fn WaitForSingleObject(h: *mut c_void, millis: u32) -> u32;
         }
-        // SAFETY: `h` is a live NT event handle this test received from an
-        // export documented to transfer ownership.
+        // SAFETY: `h` is a live NT event handle.
         unsafe { WaitForSingleObject(h, millis) }
     }
 
@@ -1839,8 +1744,7 @@ mod tests {
         extern "system" {
             fn CloseHandle(h: *mut c_void) -> i32;
         }
-        // SAFETY: `h` is an owned NT handle this test received from an
-        // export documented to transfer ownership.
+        // SAFETY: `h` is an owned NT handle.
         assert_ne!(unsafe { CloseHandle(h) }, 0);
     }
 }

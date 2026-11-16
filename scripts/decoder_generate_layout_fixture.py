@@ -4,21 +4,14 @@
 PURPOSE
 -------
 Capture a TFLite model's raw outputs + embedded schema into a single
-``.safetensors`` file for HAL decoder unit tests. Unlike the
-``decoder_generate_fixture.py`` companion script, this one supports
-*all three* converter output layouts produced by the EdgeFirst
-tflite-converter:
+``.safetensors`` file for HAL decoder unit tests. Supports the three
+converter output layouts produced by the EdgeFirst tflite-converter:
 
 - **combined** (single fused detection tensor + protos)
 - **logical** (separate boxes / scores / mask_coefs / protos)
 - **smart** / per-scale (per-stride FPN children with DFL)
 
-The companion ``decoder_generate_fixture.py`` is per-scale-only and
-captures per-stage intermediates (DFL / sigmoid / dist2bbox) for
-parity testing. This script is layout-agnostic and captures **only
-the model outputs** plus the embedded schema, so HAL tests can drive
-the decoder against bit-exact real-world outputs without running an
-inference runtime.
+Captures only the model outputs and the embedded schema.
 
 FIXTURE LAYOUT
 --------------
@@ -96,8 +89,8 @@ def build_shape_to_logical_name(schema: dict) -> dict[tuple[int, ...], str]:
     """Map physical-tensor shapes -> the schema name they realise.
 
     For flat outputs (no `outputs` children) the logical's name applies
-    directly. For per-scale outputs (with children), each child carries
-    its own name and shape; we register the children, not the parent.
+    directly. For per-scale outputs each child's name and shape are
+    registered, not the parent's.
     """
     table: dict[tuple[int, ...], str] = {}
     for entry in schema.get("outputs", []):
@@ -140,7 +133,6 @@ def main() -> None:
     edgefirst_json_str = extract_edgefirst_json(model_bytes)
     schema = json.loads(edgefirst_json_str)
 
-    # Lazy import so the script's --help doesn't require TF.
     try:
         from tflite_runtime.interpreter import Interpreter  # type: ignore
     except ImportError:
@@ -151,15 +143,13 @@ def main() -> None:
     interp = Interpreter(model_path=str(args.model))
     interp.allocate_tensors()
     in_det = interp.get_input_details()[0]
-    # interp returns numpy ints; cast to Python int so json serialises.
+    # Cast numpy ints to Python ints.
     in_shape = [int(d) for d in in_det["shape"]]  # [N, H, W, C]
     n, h, w, c = in_shape
     if n != 1 or c not in (1, 3, 4):
         raise SystemExit(f"unexpected input shape {in_shape}")
 
-    # Plain resize (no letterbox) — keeps the fixture independent of
-    # any host-side preprocessing choice. Tests that need letterbox
-    # outputs should generate their own image array.
+    # Plain resize (no letterbox).
     img = Image.open(args.image).convert("RGB").resize((w, h))
     img_np = np.array(img, dtype=np.uint8)
     interp.set_tensor(in_det["index"], img_np[np.newaxis])
@@ -173,10 +163,8 @@ def main() -> None:
     used_names: set[str] = set()
     for od in interp.get_output_details():
         out_shape = tuple(od["shape"].tolist())
-        # Prefer the schema's own naming so HAL tests can match by
-        # `LogicalOutput.name` (or `PhysicalOutput.name` for per-scale
-        # children). Fall back to the TFLite tensor name with `:` and
-        # `/` sanitised, then to a positional fallback.
+        # Name by the schema's own naming, then by the TFLite tensor name with
+        # `:` and `/` sanitised, then by position.
         name = shape_to_name.get(out_shape)
         if name is None:
             tflite_name = od.get("name") or f"output_{od['index']}"

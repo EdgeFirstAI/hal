@@ -306,6 +306,4 @@ if __name__ == "__main__":
     gen_mask_table(data_dir)
     gen_hybrid_comparison_table(data_dir)
     gen_decode_cost_table(data_dir)
-    # gen_opencv_letterbox_4k / gen_opencv_convert_1080p are defined above
-    # for local developer use (run by hand after `cargo bench --features opencv`)
-    # but not emitted into BENCHMARKS.md.
+    # gen_opencv_letterbox_4k / gen_opencv_convert_1080p are not emitted.

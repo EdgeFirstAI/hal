@@ -1,44 +1,18 @@
 // SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! One opaque C type must have one implementation. `EfTensorImageDesc` was
-//! F10 in review round 1 of the single-tensor-home work: `image-capi`
-//! carried a `#[repr(transparent)]` copy of a struct `tensor-capi` also
-//! defined, with no `repr` at all on tensor-capi's side, so the two were not
-//! even formally guaranteed to agree -- exactly the `ef_detect_box_list`
-//! situation Task 3 undid, minus the vtable that would have made it safe.
+//! One opaque C type must have one implementation.
 //!
-//! This test makes "no other struct name is duplicated this way" mechanical
-//! rather than a claim re-verified by hand every review round: it scans
-//! every `struct` declaration in the five `-capi` crates and fails on any
-//! name declared by more than one, outside a named allow-list.
-//!
-//! Scoped to the five `-capi` crates only. `EfTensorBuilder` pairs with a
-//! matching `_opaque: [u8; 0]` marker in `tensor-ffi`, and that is the
-//! correct pattern, not a violation: `tensor-ffi` is declarations-only (no
-//! `#[no_mangle]`, nothing to implement, so nothing that can drift out of
-//! sync with the real definition), which is exactly why it is deliberately
-//! out of scope here.
+//! This test scans every `struct` declaration in the five `-capi` crates and
+//! fails on any name declared by more than one, outside a named allow-list.
+//! `tensor-ffi`, which holds declarations only, is not scanned.
 
 use std::collections::BTreeMap;
 
-/// Struct names that legitimately appear in more than one `-capi` crate.
-///
-/// Used to hold the transition vtable's dispatch machinery (`EfTensor`, its
-/// per-library dispatch-table struct, `EfTensorImpl`), present once per
-/// sibling so each could dispatch to whichever library minted a handle.
-/// Task 10 (single-tensor-home) deleted that machinery: every sibling now
-/// links `libedgefirst_tensor.so`
-/// dynamically instead of embedding its own copy, so `EfTensor` and friends
-/// are declared exactly once, in `tensor-capi` itself, and the siblings only
-/// `use edgefirst_tensor_ffi::EfTensor` -- an import, not a declaration. This
-/// list may only ever shrink, never grow -- a new entry here is a new
-/// duplicate, not something to silence.
+/// Struct names that may appear in more than one `-capi` crate.
 const ALLOWED_DUPLICATES: &[&str] = &[];
 
-/// `struct Name` declarations in one file's text, `pub`/`pub(crate)`/private
-/// alike -- visibility does not change whether two crates defining the same
-/// name is a hazard.
+/// `struct Name` declarations in one file's text, at any visibility.
 fn struct_names_in(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     for line in text.lines() {
@@ -121,8 +95,6 @@ fn no_struct_name_is_declared_by_two_capi_crates_outside_the_allow_list() {
 
 #[test]
 fn the_allow_list_only_names_things_actually_present() {
-    // A name sitting in the list after the code it described is deleted
-    // would silently stop testing anything -- this keeps the list honest.
     let owners = struct_owners();
     for name in ALLOWED_DUPLICATES {
         assert!(

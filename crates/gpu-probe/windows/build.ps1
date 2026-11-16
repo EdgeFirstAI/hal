@@ -2,24 +2,17 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Builds d3d11_probe.exe with the MSVC toolchain found through vswhere.
-# Output goes to <repo>/target/d3d11-probe/. The CUDA headers are used for
-# types only; every CUDA, ANGLE and DirectML entry point is loaded at run
-# time, so nothing beyond the Windows SDK is linked.
+# Output goes to <repo>/target/d3d11-probe/. Every CUDA, ANGLE and DirectML
+# entry point is loaded at run time; only the Windows SDK is linked.
 #
 #   pwsh crates/gpu-probe/windows/build.ps1            # build
 #   pwsh crates/gpu-probe/windows/build.ps1 -Run       # build and run on the default adapter
 #   pwsh crates/gpu-probe/windows/build.ps1 -Run -Warp # build and run on WARP
 #   pwsh crates/gpu-probe/windows/build.ps1 -Run -ProbeArgs @("--only","s1,s5")
 #
-# One spelling for the probe's own arguments, matching README.md: this is an
-# advanced script ([CmdletBinding()]), so PowerShell reads a bare `--` as an
-# ambiguous parameter name rather than as an end-of-options marker.
+# Probe arguments are passed through `-ProbeArgs`.
 #
-# Invoke it as `pwsh <path>` as shown, not as `& ./build.ps1` or by
-# dot-sourcing: `Launch-VsDevShell.ps1` below sets PATH, INCLUDE and LIB in
-# the *calling* process and never restores them, so the MSVC environment
-# would leak into the shell you ran it from. `pwsh <path>` spawns a child
-# process, which takes the leak with it.
+# Invoke it as `pwsh <path>`, not as `& ./build.ps1` or by dot-sourcing.
 [CmdletBinding()]
 param(
     [switch]$Run,

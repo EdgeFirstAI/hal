@@ -4,39 +4,18 @@
 //! Advisory last-error detail, and the lazy quiet panic hook.
 //!
 //! `ef_tensor_last_error_message` follows the `dlerror` convention: the
-//! errno return of a `tensor-capi` call stays the contract a caller programs
-//! against, and this string is advisory only, a one-line reason meant for a
-//! log line, never parsed. It is `""` when nothing has failed, thread-local
-//! (each OS thread has its own outstanding message), and valid on the
-//! calling thread only until that thread's next failing `tensor-capi` call
-//! -- a caller that wants to keep it must copy the bytes out before making
-//! another call.
-//!
-//! Only the entry points introduced during the R3 map/refcount work (the map
-//! family in `map.rs`, `ef_tensor_retain` in `handle.rs`) record a message
-//! on their failure paths. Retrofitting the pre-R3 surface (the plain
-//! accessors, the builder, serialize/detect) is out of scope here and left
-//! to Plan R6.
+//! errno return of a `tensor-capi` call is the contract, and this string is
+//! an advisory one-line reason for a log line. It is `""` when nothing has
+//! failed, thread-local, and valid on the calling thread only until that
+//! thread's next failing `tensor-capi` call.
 //!
 //! # The panic hook
 //!
-//! A shielded entry point already turns an unwind into a benign errno via
-//! `catch_unwind`; without a custom hook, Rust's default hook still prints a
-//! backtrace-shaped message to stderr on the way past, which is exactly the
-//! noise a C caller embedding this library does not want. So the first
-//! shielded catch anywhere in the process installs (once, via
-//! [`std::sync::Once`]) a replacement hook that captures the panic payload
-//! into [`set_last_error`] instead of printing it, and stays installed for
-//! the rest of the process -- it is not scoped back down afterwards.
-//!
-//! Installation is lazy, on first use, rather than at library load: a
-//! library that unconditionally imposes a process-global panic hook the
-//! moment it is `dlopen`ed, before any of its functions have even been
-//! called, is rude to whatever else lives in the same process. Once
-//! installed the hook chains to whatever hook was active before it
-//! (typically the default one) only when `EF_PANIC_VERBOSE=1` is set --
-//! checked on every panic, not cached at install time, so a caller can flip
-//! it on for one debugging run without relinking.
+//! The first shielded catch in the process installs, once, a panic hook that
+//! captures the panic payload into [`set_last_error`] instead of printing
+//! it. The hook stays installed for the rest of the process. It chains to
+//! the hook that was active before it only when `EF_PANIC_VERBOSE=1` is set,
+//! which is checked on every panic.
 
 use std::ffi::{c_char, c_int, CString};
 
@@ -44,43 +23,24 @@ use edgefirst_tensor_abi::EfErrorClass;
 
 thread_local! {
     /// The calling thread's most recent failure detail. Defaults to empty;
-    /// a successful call never touches this -- only a failing one overwrites
-    /// it, so the message from the last *failure* survives across
-    /// intervening successes on the same thread.
+    /// only a failing call overwrites it.
     static LAST: std::cell::RefCell<CString> = std::cell::RefCell::new(CString::default());
 
-    /// The class of that same failure. Kept beside the message rather than
-    /// inside it because the message's own contract is "never parse this"
-    /// -- and `ef_tensor_batch` was parsing it, for want of anywhere else
-    /// to put the distinction.
-    ///
-    /// Written by every path that writes `LAST`, always, so the two cannot
-    /// describe different failures. [`set_last_error`] resets it to
-    /// `Unspecified`; only [`set_last_error_classified`] records a real
-    /// class. That direction matters: a stale class left behind by an
-    /// earlier failure would be read as *this* call's, which is the
-    /// confident-falsehood shape this mechanism exists to remove.
+    /// The class of that same failure. Written by every path that writes
+    /// `LAST`: [`set_last_error`] resets it to `Unspecified`, and
+    /// [`set_last_error_classified`] records a class.
     static LAST_CLASS: std::cell::Cell<EfErrorClass> =
         const { std::cell::Cell::new(EfErrorClass::Unspecified) };
 }
 
-/// Record one line of failure detail for the calling thread.
-///
-/// NUL bytes in `msg` are not a caller bug worth panicking over -- a payload
-/// string or a backend error's `Display` could contain one incidentally --
-/// so they are sanitized to `?` rather than rejected.
+/// Record one line of failure detail for the calling thread, with the class
+/// `Unspecified`. NUL bytes in `msg` are replaced by `?`.
 pub(crate) fn set_last_error(msg: &str) {
     set_last_error_classified(EfErrorClass::Unspecified, msg);
 }
 
-/// Record one line of failure detail **and its class** for the calling
-/// thread.
-///
-/// Use this wherever a real [`edgefirst_tensor::Error`] is in hand;
-/// [`class_of`] does the mapping. Plain [`set_last_error`] stays correct
-/// for the ad-hoc argument checks that have no `Error` to classify -- it
-/// records `Unspecified`, which is the honest answer and, critically, is
-/// still a *write*: it clears any class an earlier failure left behind.
+/// Record one line of failure detail and its class for the calling thread.
+/// NUL bytes in `msg` are replaced by `?`.
 pub(crate) fn set_last_error_classified(class: EfErrorClass, msg: &str) {
     let sanitized = if msg.contains('\0') {
         msg.replace('\0', "?")
@@ -94,23 +54,13 @@ pub(crate) fn set_last_error_classified(class: EfErrorClass, msg: &str) {
 
 /// Re-class the failure just recorded, keeping its message.
 ///
-/// Use immediately after a helper that already wrote an accurate message
-/// (and, after Stage E, class) when the entry point still needs to force
-/// `InvalidArgument` while keeping the helper's wording.
-///
-/// Only ever call this **immediately** after the write it re-classes, on
-/// the same thread, with nothing in between. Anywhere else it would attach
-/// a class to a message describing a different failure, which is the exact
-/// confident falsehood `LAST_CLASS` exists to prevent.
+/// Must be called immediately after the write it re-classes, on the same
+/// thread.
 pub(crate) fn reclass_last_error(class: EfErrorClass) {
     LAST_CLASS.with(|c| c.set(class));
 }
 
 /// The calling thread's last recorded class, for this crate's own tests.
-///
-/// The C surface reads this through `ef_tensor_last_error_class`, which
-/// takes no handle and so cannot be pointed at another thread's slot; this
-/// is the same read without going through the entry point.
 #[cfg(test)]
 pub(crate) fn last_class() -> EfErrorClass {
     LAST_CLASS.with(|c| c.get())
@@ -118,22 +68,11 @@ pub(crate) fn last_class() -> EfErrorClass {
 
 /// Set the calling thread's `errno`, for the entry points whose only
 /// failure channel is a `NULL` return.
-///
-/// Lives beside [`set_last_error`] because the two are written together on
-/// every such path: the errno is what the caller programs against, the
-/// message is the advisory detail. `hardware.rs` had a private copy of this
-/// before `d3d11.rs` needed the same thing; one definition rather than two
-/// that could drift on which crate sets errno at all.
 pub(crate) fn set_errno(code: c_int) {
     errno::set_errno(errno::Errno(code));
 }
 
 /// Map a backend error onto the wire class.
-///
-/// A deliberate many-to-one: the vocabulary names the distinctions a caller
-/// acts on differently, not every Rust variant. `NixError`/`IoError` are
-/// both "the syscall behind an allocation or an fd failed", and a consumer
-/// does the same thing about either.
 pub(crate) fn class_of(e: &edgefirst_tensor::Error) -> EfErrorClass {
     use edgefirst_tensor::Error as E;
     match e {
@@ -156,10 +95,6 @@ pub(crate) fn class_of(e: &edgefirst_tensor::Error) -> EfErrorClass {
         E::IoError(_) => EfErrorClass::AllocationFailed,
         #[cfg(unix)]
         E::NixError(_) => EfErrorClass::AllocationFailed,
-        // Deliberately exhaustive, with no `_` arm: `Error` is not
-        // `#[non_exhaustive]`, so adding a variant should be a compile
-        // error here rather than silently classifying as `Unspecified` and
-        // costing a consumer the distinction without telling anyone.
     }
 }
 
@@ -168,8 +103,8 @@ pub(crate) fn class_of(e: &edgefirst_tensor::Error) -> EfErrorClass {
 ///
 /// The returned pointer is valid only until this thread's next failing
 /// `tensor-capi` call (or the thread's exit); a caller that wants to keep
-/// the text must copy it out before calling in again. Never parse this
-/// string -- program against the errno return, this is a log line.
+/// the text must copy it out before calling in again. The string is a log
+/// line and is not meant to be parsed.
 ///
 /// # Safety
 /// The returned pointer must not be read after this thread makes another
@@ -179,51 +114,31 @@ pub unsafe extern "C" fn ef_tensor_last_error_message() -> *const c_char {
     LAST.with(|l| l.borrow().as_ptr())
 }
 
-/// Which *kind* of failure the calling thread's last failing
-/// `ef_tensor_*` call was; `EF_ERROR_CLASS_UNSPECIFIED` (0) if none has
-/// failed yet, or if that failure recorded no class.
+/// Which kind of failure the calling thread's last failing `ef_tensor_*`
+/// call was; `EF_ERROR_CLASS_UNSPECIFIED` (0) if none has failed yet, or if
+/// that failure recorded no class.
 ///
-/// The companion to [`ef_tensor_last_error_message`], and unlike that
-/// string this **is** meant to be programmed against. It exists for the
-/// entry points that report failure by returning `NULL`: those have no
-/// errno to carry a class, so before this a caller rebuilding a typed error
-/// from one had only the advisory message -- and `ef_tensor_batch`'s Rust
-/// wrapper really did match on a fragment of it, because there was nowhere
-/// else for the distinction to live.
+/// The companion to [`ef_tensor_last_error_message`]. Unlike that string,
+/// this value may be programmed against. It serves the entry points that
+/// report failure by returning `NULL`.
 ///
-/// Same lifetime rules as the message: thread-local, set by every failing
-/// call, unchanged by a successful one. Read it immediately after the call
-/// that returned `NULL`, before making another.
+/// Thread-local, set by every failing call, unchanged by a successful one.
+/// Read it immediately after the call that returned `NULL`, before making
+/// another.
 ///
 /// # Safety
-/// Safe to call at any time; declared `unsafe` only for symmetry with the
-/// rest of this ABI.
+/// Safe to call at any time.
 #[no_mangle]
 pub unsafe extern "C" fn ef_tensor_last_error_class() -> u32 {
-    LAST_CLASS.with(std::cell::Cell::get) as u32 // NOSONAR: C ABI is uint32_t; EfErrorClass is #[repr(u32)]
+    LAST_CLASS.with(std::cell::Cell::get) as u32 // NOSONAR
 }
 
-/// Runs the lazy hook install exactly once per process, on the first
-/// shielded catch anywhere -- never at library load.
+/// Runs the hook install once per process.
 static HOOK_ONCE: std::sync::Once = std::sync::Once::new();
 
-/// Install the quiet panic hook, so a caught panic writes the thread-local
-/// instead of printing.
-///
-/// [`shield_int`] does this for the errno-returning entry points. The
-/// **pointer**-returning ones must do it too, and for a sharper reason than
-/// tidy stderr: a `NULL`-returning entry carries no errno, so a Rust
-/// consumer reads [`ef_tensor_last_error_class`] to learn what failed --
-/// and that read is only sound if *every* failure path of that call wrote
-/// the thread-local. Without the hook, a caught panic writes nothing, and
-/// the consumer then reads a class left behind by some **earlier** failure
-/// and reports it as this call's. That is exactly the confident-falsehood
-/// shape the class was added to remove, so an unwritten panic path would
-/// have reintroduced it through the back door.
-///
-/// With the hook installed, a caught panic runs [`set_last_error`], which
-/// writes the payload as the message and resets the class to `Unspecified`
-/// -- "no class recorded", which is the truth.
+/// Install the quiet panic hook, once per process: a caught panic records
+/// its payload through [`set_last_error`], which resets the class to
+/// `Unspecified`, instead of printing.
 pub(crate) fn ensure_hook_installed() {
     HOOK_ONCE.call_once(|| {
         let previous = std::panic::take_hook();
@@ -237,8 +152,7 @@ pub(crate) fn ensure_hook_installed() {
                 "panic".to_string()
             };
             set_last_error(&msg);
-            // Read per invocation, not cached at install time, so a caller
-            // can turn this on for one run without relinking.
+            // Read on every panic.
             if std::env::var("EF_PANIC_VERBOSE").as_deref() == Ok("1") {
                 previous(info);
             }
@@ -246,15 +160,8 @@ pub(crate) fn ensure_hook_installed() {
     });
 }
 
-/// Run `f`, catching any unwind and turning it into `EINVAL`.
-///
-/// Ensures the quiet panic hook is installed *before* invoking `f` --
-/// otherwise a panic inside the very call that would have installed it
-/// prints the default backtrace-shaped message on its way past. Adopted by
-/// the R3 entry points whose C return type is already `c_int`
-/// (`ef_tensor_map`, `ef_tensor_unmap`, `ef_tensor_retain`);
-/// `ef_tensor_copy_to` returns `i64` and so calls [`ensure_hook_installed`]
-/// directly instead of going through this wrapper.
+/// Run `f`, catching any unwind and turning it into `EINVAL`. Installs the
+/// quiet panic hook before invoking `f`.
 pub(crate) fn shield_int(f: impl FnOnce() -> c_int) -> c_int {
     ensure_hook_installed();
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or(libc::EINVAL)
@@ -280,9 +187,8 @@ mod tests {
         let msg = unsafe { std::ffi::CStr::from_ptr(super::ef_tensor_last_error_message()) };
         assert!(msg.to_str().unwrap().contains("access"));
 
-        // A subsequent success must not disturb the recorded detail: map a
-        // valid access, unmap it, and confirm the message from the earlier
-        // failure is still there.
+        // A subsequent successful map and unmap leave the recorded detail in
+        // place.
         assert_eq!(unsafe { crate::map::ef_tensor_map(t, 1, &mut view) }, 0); // Read
         let msg_after_success =
             unsafe { std::ffi::CStr::from_ptr(super::ef_tensor_last_error_message()) };
@@ -297,9 +203,6 @@ mod tests {
 
     #[test]
     fn a_shielded_panic_is_captured_quietly() {
-        // Drives the shield with a panicking body and asserts the hook
-        // recorded the message instead of printing a backtrace (asserted
-        // via the thread-local, not by scraping stderr).
         let code = crate::last_error::shield_int(|| panic!("deliberate: boom"));
         assert_eq!(code, libc::EINVAL);
         let msg = unsafe { std::ffi::CStr::from_ptr(super::ef_tensor_last_error_message()) };
@@ -309,19 +212,15 @@ mod tests {
     #[test]
     fn a_caught_panic_resets_the_class_rather_than_leaving_a_stale_one() {
         use edgefirst_tensor_abi::EfErrorClass;
-        // Leave a real class behind, as an earlier failing call would.
+        // Leave a class behind, as an earlier failing call would.
         super::set_last_error_classified(EfErrorClass::RegionOutOfBounds, "earlier failure");
         assert_eq!(
             unsafe { super::ef_tensor_last_error_class() },
             EfErrorClass::RegionOutOfBounds as u32
         );
 
-        // A panic on a NULL-returning entry must not leave that class
-        // standing: a consumer reading it would attribute someone else's
-        // failure to this call.
-        // What a pointer-returning entry point does: install the hook,
-        // then catch. Without the install, nothing writes the thread-local
-        // and the stale class above survives.
+        // Install the hook, then catch, as a pointer-returning entry point
+        // does.
         super::ensure_hook_installed();
         let caught = std::panic::catch_unwind(|| panic!("deliberate: pointer boom"));
         assert!(caught.is_err());
@@ -343,9 +242,7 @@ mod tests {
 
     #[test]
     fn no_failure_yet_on_this_thread_reads_as_empty() {
-        // A fresh OS thread's thread-local starts at its default, never
-        // touched by another test's failures -- proves the "" contract
-        // without depending on test execution order.
+        // A fresh OS thread's thread-local starts at its default.
         let handle = std::thread::spawn(|| {
             let msg = unsafe { std::ffi::CStr::from_ptr(super::ef_tensor_last_error_message()) };
             msg.to_str().unwrap().to_string()

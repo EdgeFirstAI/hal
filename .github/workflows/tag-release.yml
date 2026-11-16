@@ -1,8 +1,7 @@
 # Caller of the shared tag workflow. Merged release/X.Y.Z PR → annotated vX.Y.Z.
-# Never tag by hand.
 #
 # Step 2 of 3: release.yml builds on the release branch, this names the result,
-# publish.yml ships it. The tag itself builds nothing.
+# publish.yml ships it.
 
 name: Tag Release
 
@@ -16,9 +15,6 @@ jobs:
     if: github.event.pull_request.merged == true && startsWith(github.event.pull_request.head.ref, 'release/')
     uses: EdgeFirstAI/.github/.github/workflows/tag-release.yml@c7876194b9fe9f7f72daf0efadaf32d7dff1b257
     with:
-      # No tag unless release.yml is green for the exact commit being merged.
-      # Branch protection requires ci-gate alone and the release build runs on
-      # a branch push rather than on the PR, so this is the one place "the
-      # artifacts exist before the tag does" is actually enforced.
+      # No tag unless release.yml is green for the commit being merged.
       require-build: release.yml
     secrets: inherit

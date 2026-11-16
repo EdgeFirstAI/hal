@@ -1,10 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! Integer texture format probe — verifies GL_R8UI, GL_RGBA8UI, GL_R8I,
+//! Integer texture format probe: verifies GL_R8UI, GL_RGBA8UI, GL_R8I,
 //! GL_RGBA8I support for texture creation, FBO color-renderability, and
-//! the XOR 0x80 uint8→int8 reinterpretation trick used to feed quantized
-//! model inputs through a uint8 render surface.
+//! the XOR 0x80 uint8→int8 reinterpretation.
 
 use crate::egl_context::GpuContext;
 
@@ -295,7 +294,7 @@ fn test_xor_render(w: i32, h: i32) {
         edgefirst_gl::gl::DeleteTextures(1, &tex);
     }
 
-    // --- Test 2: R8UI single-channel (model input scenario) ---
+    // --- Test 2: R8UI single-channel ---
     println!("\n  [2] R8UI single-channel (model input path):");
     drain_errors();
 

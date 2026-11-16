@@ -2,22 +2,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright © 2026 Au-Zone Technologies. All Rights Reserved.
 """
-Collect the `WARNING:` lines tests print, so skips and other warnings are
-audited rather than lost in passing-test output.
+Collect the `WARNING:` lines tests print.
 
 Tests report a run that could not exercise its subject with
-`WARNING: SKIPPED: <reason>` written straight to stderr
-(crates/tensor/tests/support/outcome.rs). nextest hides a passing test's
-output, so those lines only survive in JUnit `system-out`/`system-err` and in
-raw logs (scripts/on-target-run.sh keeps one per test binary). This script
-reads both, groups identical warnings, and prints a markdown table. Under
-GitHub Actions it also appends the table to the step summary and raises one
-annotation per distinct warning, up to a cap.
+`WARNING: SKIPPED: <reason>` written to stderr
+(crates/tensor/tests/support/outcome.rs). This script reads those lines from
+JUnit `system-out`/`system-err` and from raw logs, groups identical warnings,
+and prints a markdown table. Under GitHub Actions it also appends the table to
+the step summary and raises one annotation per distinct warning, up to a cap.
 
 Usage:
   test_warnings.py PATH [PATH ...]   # files or directories; *.xml is JUnit, anything else is a log
 
-The exit status is always 0: a warning is for auditing, not a failure.
+The exit status is always 0.
 """
 
 import os
@@ -28,7 +25,7 @@ from collections import Counter
 from pathlib import Path
 
 WARNING = re.compile(r"WARNING: (.+)")
-# GitHub shows at most 10 warning annotations per step; the rest are summarized.
+# Most warning annotations raised per step; the rest are summarized.
 ANNOTATION_CAP = 10
 
 

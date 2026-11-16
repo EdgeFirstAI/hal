@@ -4,12 +4,7 @@
 //! nvJPEG GPU decode benchmark — JPEG decode into a CUDA-registered PBO
 //! (`ImageProcessor::create_image` destination) on Jetson/CUDA targets.
 //!
-//! Lives in `edgefirst-image` rather than `edgefirst-codec` because it needs
-//! `ImageProcessor` to allocate the CUDA-backed destination tensor, and `image`
-//! already depends on `codec` — keeping it here avoids a circular dev-dep.
-//!
-//! Skips cleanly on any host without nvJPEG/CUDA; `bench_compare.py` treats
-//! absent cells as one-sided and never gates on them.
+//! Skips on a host without nvJPEG/CUDA.
 //!
 //! ## Run
 //! ```bash
@@ -37,9 +32,7 @@ static GIRAFFE_JPG: LazyLock<Vec<u8>> =
 // =============================================================================
 // nvJPEG GPU decode (on-target only: Linux + CUDA + libnvjpeg)
 //
-// Decodes straight into a CUDA-registered PBO (what ImageProcessor::create_image
-// yields on Jetson), emitting GPU-resident RGB. Skips cleanly on any host
-// without nvJPEG/CUDA.
+// Decodes into a CUDA-registered PBO, emitting GPU-resident RGB.
 //
 //   codec/jpeg/nvjpeg/rgbi/<fixture>  — decode-only into the PBO device pointer
 // =============================================================================
@@ -66,7 +59,7 @@ fn bench_nvjpeg(suite: &mut BenchSuite) {
     ];
 
     for (w, h, jpeg, name) in cases {
-        // RGB PBO destination — auto-selected backend (PBO + CUDA on Jetson).
+        // RGB destination on the auto-selected backend.
         let mut tensor = match processor.create_image(
             w,
             h,
@@ -82,8 +75,7 @@ fn bench_nvjpeg(suite: &mut BenchSuite) {
             }
         };
         let mut decoder = ImageDecoder::new();
-        // Warm once and confirm nvJPEG actually fired (RGB) rather than the CPU
-        // path silently producing NV12 into a non-CUDA tensor.
+        // Warm once and confirm the decode produced RGB.
         let info = tensor.load_image(&mut decoder, jpeg).unwrap();
         if info.format != PixelFormat::Rgb {
             println!(

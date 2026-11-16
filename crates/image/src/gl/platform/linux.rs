@@ -4,13 +4,9 @@
 //! Linux implementation of [`GlPlatform`]: EGL display bring-up via
 //! GBM/PlatformDevice/Default and DMA-BUF buffer import.
 //!
-//! Pure delegation — the actual machinery predates this seam and lives in
-//! [`super::super::context`] (display/context bring-up, transfer-backend
-//! probe) and [`super::super::dma_import`] (DMA-BUF attribute assembly).
-//! This file only binds it to the cross-platform contract; it must stay
-//! free of logic so the platform trait remains the single source of truth
-//! for *what* a platform provides, with `context.rs`/`dma_import.rs`
-//! owning *how* Linux provides it.
+//! Delegates to [`super::super::context`] (display/context bring-up,
+//! transfer-backend probe) and [`super::super::dma_import`] (DMA-BUF
+//! attribute assembly).
 
 use super::super::context::{egl_ext, Egl, GlContext};
 use super::super::dma_import::DmaImportAttrs;
@@ -21,16 +17,15 @@ use edgefirst_tensor::{PixelFormat, Tensor, TensorDyn};
 use std::rc::Rc;
 
 /// An owned EGLImage import over a DMA-BUF. Dropping destroys the
-/// EGLImage under the same display-level lifecycle lock as creation.
-/// This is the Linux [`GlPlatform::Import`]; the macOS analogue is
-/// `angle::IoSurfacePbuffer`.
+/// EGLImage under the display-level lifecycle lock. This is the Linux
+/// [`GlPlatform::Import`].
 pub(in crate::opengl_headless) struct EglImage {
     pub(in crate::opengl_headless) egl_image: egl::Image,
     pub(in crate::opengl_headless) egl: Rc<Egl>,
     pub(in crate::opengl_headless) display: egl::Display,
     /// Texel the logical image starts at inside this import, and the
-    /// import's own texel size — both `(0, 0)` / `None` unless a source was
-    /// rebased onto an aligned DMA-BUF offset (issue #170).
+    /// import's own texel size: `(0, 0)` / `None` unless a source was
+    /// rebased onto an aligned DMA-BUF offset.
     pub(in crate::opengl_headless) sample_origin_px: (u32, u32),
     pub(in crate::opengl_headless) sample_extent_px: Option<(u32, u32)>,
 }
@@ -42,10 +37,9 @@ impl Drop for EglImage {
         }
 
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            // Display-level EGL op — same dedicated lock as creation.
+            // Display-level EGL op, under the image lifecycle lock.
             let _image_guard = super::super::context::image_lifecycle_guard();
-            // Adreno unmaps the import's driver mapping twice inside one
-            // eglDestroyImage; no tensor mapping may be created meanwhile.
+            // Destroy the image with tensor CPU mappings excluded.
             let e = edgefirst_tensor::pin::with_cpu_mappings_excluded(|| {
                 GlContext::egl_destroy_image_with_fallback(&self.egl, self.display, self.egl_image)
             });
@@ -56,8 +50,8 @@ impl Drop for EglImage {
     }
 }
 
-/// Marker type: Linux EGL + DMA-BUF platform. Stateless — all state
-/// lives in the [`GlContext`] created by [`GlPlatform::init_display`].
+/// Marker type: Linux EGL + DMA-BUF platform. All state lives in the
+/// [`GlContext`] created by [`GlPlatform::init_display`].
 pub(crate) struct LinuxEgl;
 
 impl GlPlatform for LinuxEgl {
@@ -65,12 +59,10 @@ impl GlPlatform for LinuxEgl {
     type Import = EglImage;
     type ImportHandle = egl::Image;
 
-    // EGLImage targets persist on the texture object — the engine's
-    // binding-skip cache (BufferImportKey on Texture) applies.
+    // EGLImage targets persist on the texture object.
     const PERSISTENT_TEX_BINDINGS: bool = true;
 
-    /// The planar F16 zero-copy render only -- the one float path this leaf
-    /// has ever executed. The rest were written and measured on Windows.
+    /// The planar F16 zero-copy render only.
     const ZERO_COPY_FLOAT: super::super::float_dispatch::ZeroCopyFloatSet =
         super::super::float_dispatch::ZeroCopyFloatSet::PlanarF16;
     const EXTERNAL_OES: bool = true;
@@ -98,10 +90,8 @@ impl GlPlatform for LinuxEgl {
     }
 
     fn import_extent(import: &EglImage) -> Option<(u32, u32)> {
-        // The DMA-BUF EGLImage is created at the tensor's logical size --
-        // the buffer's physical pitch is a separate import attribute -- so
-        // this is `None` except for a source rebased onto an aligned offset
-        // (issue #170), which imports `x_shift_px` texels wider.
+        // `None` except for a source rebased onto an aligned offset, which
+        // imports `x_shift_px` texels wider.
         import.sample_extent_px
     }
 
@@ -144,17 +134,14 @@ impl GlPlatform for LinuxEgl {
     }
 
     fn begin_gpu_pass(_display: &GlContext) {
-        // Each processor's context is current on its own thread and the
-        // driver keeps per-context state; nothing to re-sync.
+        // No-op on native EGL.
     }
 
     fn end_gpu_pass(_display: &GlContext) {
-        // EGLImage texture targets persist by design; nothing to release.
+        // Nothing to release.
     }
 
     fn native_fence_sync(_display: &GlContext) -> bool {
-        // Some Linux drivers do expose EGL_ANDROID_native_fence_sync, but
-        // no Linux consumer takes a sync-fence fd today — out of scope.
         false
     }
 
@@ -166,13 +153,11 @@ impl GlPlatform for LinuxEgl {
     }
 
     fn record_completion(_display: &GlContext, _dst: &mut TensorDyn, _submit: bool) -> Option<u64> {
-        // No device fence on Linux — convert() returning means the GPU
-        // work is complete.
         None
     }
 
     fn submit_recorded(_display: &GlContext) {
-        // Nothing is ever queued unsubmitted: there is no device fence.
+        // No device fence: nothing to submit.
     }
 
     fn import_buffer_packed<T>(
@@ -196,9 +181,6 @@ impl GlPlatform for LinuxEgl {
             }
         };
         let bpp = fmt.bytes_per_pixel();
-        // `dmabuf()`, not `as_dma().fd` -- see `gl/dma_import.rs`'s own
-        // note: `as_dma` is `None` on the `dynamic` backend for every
-        // tensor, DMA-backed or not.
         let fd = img
             .dmabuf()
             .map_err(|e| {
@@ -208,8 +190,7 @@ impl GlPlatform for LinuxEgl {
             })?
             .as_raw_fd();
 
-        // Use the tensor's stored stride when available (externally
-        // allocated buffers with row padding), otherwise compute the
+        // The tensor's stored stride when available, otherwise the
         // tightly-packed pitch.
         let pitch = img.effective_row_stride().unwrap_or(width * bpp);
         let offset = img.plane_offset().unwrap_or(0);
@@ -242,13 +223,8 @@ impl GlPlatform for LinuxEgl {
         let attrs = DmaImportAttrs::from_tensor(img, fmt, for_dst)?;
         let mut image =
             new_egl_image_owned(display, egl_ext::LINUX_DMA_BUF, &attrs.to_egl_attribs())?;
-        // A source rebased onto an aligned base imports wider than the
-        // logical image and starts it `x_shift_px` texels in; the engine
-        // folds both through `import_extent` / `import_origin`. Zero for
-        // every other import, which then reports the logical image as
-        // before. The extent travels WITH the origin: the fold ignores an
-        // origin whose map has no extent, which would put the shift nowhere
-        // and show up only as a black frame on the one board that rebases.
+        // A source rebased onto an aligned base records its origin and its
+        // widened extent.
         if attrs.x_shift_px != 0 {
             image.sample_origin_px = (attrs.x_shift_px, 0);
             image.sample_extent_px = Some((attrs.width as u32, attrs.height as u32));
@@ -311,27 +287,16 @@ fn dma_buf_import_formats(display: &GlContext) -> Vec<u32> {
     formats.into_iter().map(|f| f as u32).collect()
 }
 
-/// Create an owned EGLImage from raw EGL import attributes.
-///
-/// Every EGLImage creation funnels through here (DMA-BUF, NV R8, and the
-/// float path's RGB renderbuffer import), so one span = one actual
-/// `eglCreateImageKHR`. Steady-state frame loops must show ZERO of these
-/// after warmup — the span count is the observable for cache-behavior
-/// equality gates.
-///
-/// Module-scoped (not a trait method): the attribute list is
-/// EGL/DRM-specific, so only Linux-side code (the float path's
-/// dims-override import in `processor/mod.rs`) may call it directly;
-/// portable code goes through [`GlPlatform::import_buffer`].
+/// Create an owned EGLImage from raw EGL import attributes. Every EGLImage
+/// creation goes through here (DMA-BUF, NV R8, and the float path's RGB
+/// renderbuffer import).
 pub(in crate::opengl_headless) fn new_egl_image_owned(
     display: &GlContext,
     target: egl::Enum,
     attrib_list: &[egl::Attrib],
 ) -> crate::Result<EglImage> {
     let _span = tracing::trace_span!("image.convert.gl.egl_import", target).entered();
-    // EGLImage creation is a display-level EGL op shared by every
-    // processor — serialized by a dedicated short lock (zero cost in
-    // steady state: creations are cache-miss-only).
+    // EGLImage creation runs under the image lifecycle lock.
     let _image_guard = super::super::context::image_lifecycle_guard();
     let image = GlContext::egl_create_image_with_fallback(
         &display.egl,

@@ -80,13 +80,8 @@ def test_from_yaml():
 
 
 def test_from_json_v2_ara2_int8():
-    # Schema v2 metadata for an ARA-2 YOLOv8-seg model. The boxes
-    # logical splits into xy + wh physical children with independent
-    # int8 quantization, so the HAL must compile a DecodeProgram and
-    # merge them at decode time. Zero-filled tensors dequantize to
-    # near-zero scores (well under 0.25) so the smoke test asserts
-    # the full parse → validate → plan → dequant → merge → dispatch
-    # pipeline runs without panicking and yields no detections.
+    # Schema v2 metadata for an ARA-2 YOLOv8-seg model whose boxes split into
+    # xy and wh children. Zero-filled tensors yield no detections.
     with open("testdata/ara2_int8_edgefirst.json") as f:
         config = f.read()
 
@@ -160,14 +155,7 @@ def test_from_dict_yaml():
 
 
 def test_from_dict_v2_minimal():
-    """EDGEAI-1081: Schema v2 dict with object-style quantization must succeed.
-
-    Regression test for the blocker where `Decoder(dict)` routed v2 dicts
-    through the legacy `ConfigOutputs` deserializer, producing the
-    misleading "invalid type: map, expected tuple struct QuantTuple" error
-    because the legacy `QuantTuple(f32, i32)` expects a JSON array while
-    v2 prescribes `{"scale": ..., "zero_point": ..., "dtype": ...}`.
-    """
+    """Schema v2 dict with object-style quantization must succeed."""
     cfg = {
         "schema_version": 2,
         "decoder_version": "yolov8",
@@ -213,13 +201,7 @@ def test_from_dict_v2_minimal():
 
 
 def test_from_dict_v2_ara2_full_surface():
-    """EDGEAI-1081: Full v2 surface (per-channel quant, split xy/wh, mask_coefs).
-
-    Feeds the canonical ARA-2 fixture through the dict constructor. This
-    exercises the same DecodeProgram compilation path `new_from_json_str`
-    already covers via string, but via dict so the Python binding's smart
-    constructor is the one doing the heavy lifting.
-    """
+    """The ARA-2 fixture's full v2 surface builds through the dict constructor."""
     import json
 
     with open("testdata/ara2_int8_edgefirst.json") as f:
@@ -243,12 +225,7 @@ def test_from_dict_v2_ara2_full_surface():
 
 
 def test_from_dict_v2_rejects_unsupported_schema_version():
-    """EDGEAI-1081: `schema_version` above MAX_SUPPORTED must be rejected.
-
-    Without version gating the document would silently fall through to the
-    legacy deserialiser and produce a confusing QuantTuple error. The
-    smart constructor must surface a NotSupported-shaped error instead.
-    """
+    """`schema_version` above MAX_SUPPORTED is rejected, naming the version."""
     cfg = {
         "schema_version": 99,
         "outputs": [
@@ -263,12 +240,7 @@ def test_from_dict_v2_rejects_unsupported_schema_version():
 
 
 def test_from_dict_v2_mask_coefs_type_tag():
-    """EDGEAI-1081: v2 vocabulary 'mask_coefs' is accepted by the dict path.
-
-    The v2 spec defines the mask coefficients type as `mask_coefs`; the
-    legacy enum spelled it `mask_coefficients`. Both must continue to
-    parse — v2 as the primary tag, legacy as an alias.
-    """
+    """The v2 type tag 'mask_coefs' is accepted by the dict path."""
     cfg = {
         "schema_version": 2,
         "nms": "class_agnostic",
@@ -348,10 +320,6 @@ def test_nms():
         config = f.read()
 
     decoder = ef.Decoder.new_from_yaml_str(config, 0.0, 1.0)
-    # Raise max_det so the iou=1.0 fast-path returns ALL anchors, not just
-    # the top 300.  Without this the reference set is truncated and HAL NMS
-    # (which processes the full set) can produce survivors that TF NMS never
-    # sees, causing false-positive mismatches.
     decoder.max_det = 100_000
     boxes, scores, classes, _masks = decoder.decode([output0, output1], 100000)
 
@@ -999,7 +967,7 @@ def numpy_nms(
     x2 = boxes[:, 2]
     y2 = boxes[:, 3]
 
-    # Calculate areas (remove the +1 for normalized coordinates)
+    # Calculate areas
     areas = (x2 - x1) * (y2 - y1)
 
     # Sort by scores in descending order
@@ -1016,7 +984,7 @@ def numpy_nms(
         xx2 = np.minimum(x2[i], x2[order[1:]])
         yy2 = np.minimum(y2[i], y2[order[1:]])
 
-        # Calculate intersection area (remove +1 for normalized coords)
+        # Calculate intersection area
         w = np.maximum(0.0, xx2 - xx1)
         h = np.maximum(0.0, yy2 - yy1)
         inter = w * h
@@ -1131,7 +1099,6 @@ def multi_label_decoder(ctor, **kwargs):
             json.dumps(MULTI_LABEL_DET), 0.5, 0.5, **kwargs
         )
     if ctor == "yaml":
-        # JSON is valid YAML, so the YAML parser accepts it unchanged.
         return ef.Decoder.new_from_yaml_str(
             json.dumps(MULTI_LABEL_DET), 0.5, 0.5, **kwargs
         )

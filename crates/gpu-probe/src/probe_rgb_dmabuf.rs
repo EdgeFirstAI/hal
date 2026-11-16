@@ -3,28 +3,24 @@
 
 //! Packed RGB DMA-buf import probe.
 //!
-//! A packed 24-bit `Rgb` source has no native GPU texel format, so the
-//! zero-copy GL path refuses it and the convert runs on the CPU. This probe
-//! measures, per GPU, every way the HAL could put such a buffer in front of a
-//! shader, against the exact allocation [`Tensor::image`] produces:
+//! Measures, per GPU, the ways a packed 24-bit `Rgb` buffer allocated by
+//! [`Tensor::image`] can be put in front of a shader:
 //!
-//! * **native-2d / native-ext** — import as `DRM_FORMAT_BGR888` (`BG24`,
+//! * **native-2d / native-ext**: import as `DRM_FORMAT_BGR888` (`BG24`,
 //!   memory order R,G,B) and sample through `sampler2D` or
-//!   `samplerExternalOES`. Filtered by the texture unit, one fetch per pixel,
-//!   if the driver accepts the fourcc at all.
-//! * **r8** — import the whole buffer as one R8 texture `stride` texels wide,
-//!   as Path B imports NV16/NV24, and assemble each pixel from three
-//!   `texelFetch`es (twelve for a bilinear sample).
-//! * **rgba8** — import as `ABGR8888` (`AB24`) at `stride / 4` texels and
+//!   `samplerExternalOES`.
+//! * **r8**: import the whole buffer as one R8 texture `stride` texels wide
+//!   and assemble each pixel from three `texelFetch`es (twelve for a
+//!   bilinear sample).
+//! * **rgba8**: import as `ABGR8888` (`AB24`) at `stride / 4` texels and
 //!   pick each pixel's three bytes out of one or two RGBA texels (eight
 //!   fetches for a bilinear sample).
-//! * **upload** — not zero-copy: `glTexSubImage2D` of `GL_RGB` from the mapped
-//!   buffer, the route a non-DMA `Rgb` source already takes.
+//! * **upload**: `glTexSubImage2D` of `GL_RGB` from the mapped buffer.
 //!
 //! Each path is first checked for exactness with a 1:1 draw whose every byte
 //! is compared against the source, at even and odd logical sizes, then timed
-//! on warm bilinear resizes. An RGBA source through the existing external
-//! import is timed alongside as the reference cost of a zero-copy source.
+//! on warm bilinear resizes. An RGBA source through the external import is
+//! timed alongside.
 
 use crate::bench_render::{compile_program, create_quad_vao, VERTEX_SRC};
 use crate::egl_context::{EglPlane, GpuContext};
@@ -38,8 +34,7 @@ use std::time::Instant;
 const WARMUP: usize = 5;
 const ITERS: usize = 30;
 
-/// Byte written into the row padding, so a path that reads past the logical
-/// row shows up as a mismatch instead of a plausible pixel.
+/// Byte written into the row padding.
 const PAD_BYTE: u8 = 0xEE;
 
 /// Bilinear (or, at scale 1, exact) sample from an R8 import `stride` texels
@@ -70,8 +65,7 @@ void main() {
 ";
 
 /// [`R8_FRAGMENT_SRC`] with each `texelFetch` replaced by a NEAREST
-/// `texture()` at the texel centre, to tell a slow `texelFetch` apart from a
-/// slow fetch count.
+/// `texture()` at the texel centre.
 const R8_TEX_FRAGMENT_SRC: &str = "\
 #version 300 es
 precision highp float;
@@ -128,8 +122,7 @@ void main() {
 }
 ";
 
-/// Nearest sample from the R8 import: three `texelFetch`es per pixel, the
-/// floor of what any R8 assembly costs.
+/// Nearest sample from the R8 import: three `texelFetch`es per pixel.
 const R8_NEAREST_FRAGMENT_SRC: &str = "\
 #version 300 es
 precision highp float;
@@ -223,7 +216,7 @@ enum Path {
     R8Nearest,
     Rgba8,
     Upload,
-    /// An `Rgba` source through the external import: the reference cost.
+    /// An `Rgba` source through the external import.
     RgbaRefExt,
 }
 
@@ -324,8 +317,8 @@ fn pattern(x: usize, y: usize, c: usize) -> u8 {
     ((x * 7 + y * 13 + c * 101) ^ (x >> 3) ^ (y << 2)) as u8
 }
 
-/// A source allocated exactly as the HAL allocates it, filled with
-/// [`pattern`] and [`PAD_BYTE`] in the row padding.
+/// A source from [`Tensor::image`], filled with [`pattern`] and
+/// [`PAD_BYTE`] in the row padding.
 fn alloc_src(fmt: PixelFormat, w: usize, h: usize) -> Result<(Tensor<u8>, usize), String> {
     let src = Tensor::<u8>::image(
         w,
@@ -480,8 +473,7 @@ fn upload_into(src: &Tensor<u8>, w: usize, h: usize, stride: usize) -> Result<()
                 data.as_ptr().cast(),
             );
         } else {
-            // A row length is counted in pixels, so a stride that is not a
-            // whole number of RGB pixels has to go up a row at a time.
+            // Upload a row at a time.
             gl::PixelStorei(gl::UNPACK_ROW_LENGTH, 0);
             for y in 0..h {
                 gl::TexSubImage2D(
@@ -612,10 +604,7 @@ fn check_exact(
         .ok_or("GL_OES_EGL_image_external_essl3 absent")?;
     let (src, stride) = alloc_src(PixelFormat::Rgb, w, h)?;
     let tex = import(ctx, path, &src, w, h, stride)?;
-    // NEAREST: a LINEAR sample at a computed texel centre may pick up a
-    // sliver of its neighbour on GPUs with coarse sub-texel precision, which
-    // says nothing about whether the import's layout is right. The vlerp
-    // path keeps LINEAR: its horizontal taps rely on exactly that precision.
+    // NEAREST for every path but the vlerp ones, which keep LINEAR.
     if !matches!(path, Path::R8VLerp | Path::R8VLerpNudge) {
         unsafe {
             gl::BindTexture(tex.target, tex.tex);
@@ -801,8 +790,7 @@ fn report_formats(ctx: &GpuContext) {
 }
 
 /// `RGB_PROBE_PATHS` (comma-separated path names) and `RGB_PROBE_SIZES`
-/// (comma-separated `WxH`) narrow a run to single cases, so a kernel GPU
-/// fault can be pinned on the case that raised it.
+/// (comma-separated `WxH`) narrow a run to single cases.
 fn selected<T>(items: Vec<T>, var: &str, key: impl Fn(&T) -> String) -> Vec<T> {
     match std::env::var(var) {
         Ok(v) => {

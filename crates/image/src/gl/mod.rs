@@ -9,25 +9,16 @@
     target_os = "windows"
 ))]
 #![cfg(feature = "opengl")]
-// Several types defined at the `gl` module root (EglDisplayKind,
-// TransferBackend, RegionOfInterest, etc.) are consumed only by the
-// Linux-only inner modules (`context`, `dma_import`, `fourcc`). The
-// macOS/iOS and Android paths import platform buffers through their own
-// modules (`iosurface_import`, `ahardwarebuffer_import`) and do not
-// touch every shared type, so some appear unused off Linux.
-// Rather than fragmenting the type definitions per platform, suppress
-// the dead-code/unused-import lints on non-Linux targets.
 #![cfg_attr(not(target_os = "linux"), allow(dead_code, unused_imports))]
 
 // Module layout:
 //   - `platform/` — cross-platform display/EGL-loader seam (all OSes)
 //   - Linux-only:   `context`, `dma_import`, `fourcc`
 //   - macOS/iOS:    `iosurface_import`
-//   - Android-only: `ahardwarebuffer_import`
-//   - Windows:      `platform/windows.rs` (ANGLE/D3D11, PBO transfers only)
+//   - Android-only: `ahardwarebuffer_import`, `native_fence`
+//   - Windows:      `d3d11_import`, `platform/windows.rs` (ANGLE/D3D11)
 // The engine (`processor`, `threaded`, `cache`, `resources`, `shaders`)
-// is portable and reaches platform buffers only through the `GlPlatform`
-// trait — see `crates/image/ARCHITECTURE.md`.
+// reaches platform buffers only through the `GlPlatform` trait.
 
 macro_rules! function {
     () => {{
@@ -50,36 +41,20 @@ mod cache;
 mod context;
 #[cfg(target_os = "linux")]
 mod dma_import;
-// Cfg-agnostic: the float render-path classifier is the single source of
-// truth for the "(PixelFormat, DType, TensorMemory) → float path" decision and
-// is compiled on every platform so both the Linux and macOS backends share one
-// definition (see `crates/image/ARCHITECTURE.md`, review item #4).
-// Portable renderer helpers (crop uniforms, …) shared by both platform
-// backends. No gbm/IOSurface types; compiled on both.
+// Portable renderer helpers and the float render-path classifier.
 mod core;
 mod float_dispatch;
-// Pure decision table for the proto-segmentation render path (upload
-// strategy × program × count uniform). No GL types; host-tested
-// exhaustively. See `proto_dispatch.rs`.
+// Decision table for the proto-segmentation render path.
 mod proto_dispatch;
 // Portable GL render lowering (y-flip viewport, source UV, batch chunk planner).
-// No platform types; compiled on both platforms, consumed by the converged
-// tile/batch renderer. See `render.rs`.
 mod render;
-// PixelFormat -> DRM FourCC mapping via the portable `drm_fourcc` crate (NOT
-// `gbm`). DRM FourCC is a Linux/DMA-BUF concept, so this lives with the other
-// Linux graphics modules; the point is that it carries no `gbm` coupling, so
-// `shaders.rs` and the format code no longer pull in `gbm`.
+// AHardwareBuffer EGLImage import.
 #[cfg(target_os = "android")]
 mod ahardwarebuffer_import;
-// CUDA test policy: turns a vacuous CUDA skip into a required-coverage
-// failure under HAL_TEST_REQUIRE_CUDA=1. Test-only -- every item in it is
-// consumed by `tests.rs` under #[cfg(test)] and by its own unit tests, so an
-// ungated module would be empty (and dead-code-flagged) in a release build.
+// CUDA test policy.
 #[cfg(test)]
 mod cuda_policy;
-// `EGL_ANGLE_image_d3d11_texture` attribute assembly (pure); consumed by the
-// Windows leaf (`platform/windows.rs`) to build the EGLImage import target.
+// `EGL_ANGLE_image_d3d11_texture` attribute assembly.
 #[cfg(target_os = "windows")]
 pub(super) mod d3d11_import;
 #[cfg(target_os = "linux")]
@@ -93,33 +68,20 @@ mod processor;
 mod resources;
 mod shaders;
 mod shaders_common;
-// Engine GL tests, in three tiers (see crates/image/TESTING.md):
-//   portable                       — run on Linux AND macOS/ANGLE
-//   cfg(target_os = "linux")       — display probing, PBO/CUDA paths
-//   cfg(target_os = "linux") + DMA probe — DMA-BUF import/pool specifics
-// Per-item cfg gates inside the module select the tier; the mount
-// itself is unconditional so the macOS lane runs the portable tier.
+// Engine GL tests; per-item cfg gates inside the modules select what runs
+// on each platform.
 mod norm_tests;
 mod tests;
 mod threaded;
 
 #[cfg(target_os = "linux")]
 pub use context::probe_egl_displays;
-// These are accessed by sibling sub-modules via `super::context::` directly.
-// No re-export needed at the mod.rs level.
+// Cache statistics and the threaded processor.
 pub use cache::{CacheStats, ConvertStats, GlCacheStats};
 pub use threaded::GLProcessorThreaded;
 
-/// Dynamically-loaded EGL 1.4 instance. The lifetime parameter is
-/// `'static` because the underlying `libloading::Library` is intentionally
-/// leaked at first load (see `EGL_LIB` in `context.rs` and the equivalent
-/// on macOS — drivers may retain internal state past explicit cleanup, so
-/// dlclose can SIGBUS on process exit).
-///
-/// Defined here at the `gl` module root so the `platform/` trait and both
-/// platform implementations can name it without dragging in a cross-cfg
-/// re-export. The Linux `context.rs` and the macOS `platform/macos.rs`
-/// both use this same alias.
+/// Dynamically-loaded EGL 1.4 instance over the leaked, `'static`
+/// `libloading::Library`.
 pub(super) type Egl = edgefirst_egl::Instance<
     edgefirst_egl::Dynamic<&'static libloading::Library, edgefirst_egl::EGL1_4>,
 >;
@@ -128,8 +90,6 @@ pub(super) type Egl = edgefirst_egl::Instance<
 /// by `convert_with_fence`): a sync_file fd on Unix
 /// (`EGL_ANDROID_native_fence_sync`), an event NT handle on Windows, set
 /// when the D3D11 device fence reaches the value the convert queued.
-/// Keeps the engine free of `cfg` branches (precedent: `BlobFd` in
-/// `crates/tensor/src/blob.rs`).
 pub use crate::CompletionFence;
 
 /// Identifies the type of EGL display used for headless OpenGL ES rendering.
@@ -139,9 +99,9 @@ pub use crate::CompletionFence;
 /// renders exclusively through FBOs backed by EGLImages imported from
 /// DMA-buf file descriptors. No window or PBuffer surface is created.
 ///
-/// Displays are probed in priority order: PlatformDevice first (zero
-/// external dependencies), then GBM, then Default. Use
-/// [`probe_egl_displays`] to discover which are available and
+/// Displays are probed in priority order: PlatformDevice first, then GBM,
+/// then Default. Use [`probe_egl_displays`] to discover which are available
+/// and
 /// [`ImageProcessorConfig::egl_display`](crate::ImageProcessorConfig::egl_display)
 /// to override the auto-detection.
 ///
@@ -150,15 +110,14 @@ pub use crate::CompletionFence;
 /// - **`PlatformDevice`** — Uses `EGL_EXT_device_enumeration` to query
 ///   available EGL devices via `eglQueryDevicesEXT`, then selects the first
 ///   device with `eglGetPlatformDisplay(EGL_EXT_platform_device, ...)`.
-///   Headless and compositor-free with zero external library dependencies.
-///   Works on NVIDIA GPUs and newer Vivante drivers. Skipped on Qualcomm
-///   Adreno, whose device display crashes in `eglQueryString`; GBM is used
-///   there instead.
+///   Headless and compositor-free with no external library dependencies.
+///   Available on NVIDIA GPUs and newer Vivante drivers. Skipped on Qualcomm
+///   Adreno, where GBM is used.
 ///
 /// - **`Gbm`** — Opens a DRM render node (e.g. `/dev/dri/renderD128`) and
 ///   creates a GBM (Generic Buffer Manager) device, then calls
 ///   `eglGetPlatformDisplay(EGL_PLATFORM_GBM_KHR, gbm_device)`. Requires
-///   `libgbm` and a DRM render node. Needed on ARM Mali (i.MX95) and older
+///   `libgbm` and a DRM render node. Used on ARM Mali (i.MX95) and older
 ///   Vivante drivers that do not expose `EGL_EXT_platform_device`.
 ///
 /// - **`Default`** — Calls `eglGetDisplay(EGL_DEFAULT_DISPLAY)`, letting the
@@ -196,47 +155,36 @@ pub struct EglDisplayInfo {
 /// between CPU memory and GPU textures/framebuffers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TransferBackend {
-    /// Zero-copy via EGLImage imported from DMA-buf file descriptors.
-    /// Available on i.MX8 (Vivante), i.MX95 (Mali), Jetson, and any
-    /// platform where `EGL_EXT_image_dma_buf_import` is present AND
-    /// the GPU can actually render through DMA-buf-backed textures.
+    /// Zero-copy via EGLImage imported from DMA-buf file descriptors
+    /// (`EGL_EXT_image_dma_buf_import`).
     DmaBuf,
 
-    /// Zero-copy via `EGL_ANGLE_iosurface_client_buffer` (macOS/iOS).
-    /// Available when ANGLE's Metal backend is loaded and the EGL
-    /// extension is advertised. The IOSurface is wrapped as an EGL
-    /// pbuffer and bound to a 2D texture via `eglBindTexImage`.
+    /// Zero-copy via `EGL_ANGLE_iosurface_client_buffer` (macOS/iOS). The
+    /// IOSurface is wrapped as an EGL pbuffer and bound to a 2D texture via
+    /// `eglBindTexImage`.
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     IOSurface,
 
     /// Zero-copy via `EGL_ANDROID_image_native_buffer` (Android). The
     /// AHardwareBuffer is wrapped as an EGLImage via
     /// `eglGetNativeClientBufferANDROID` → `eglCreateImageKHR` and bound
-    /// to a 2D texture via `glEGLImageTargetTexture2DOES` — persistent
-    /// bindings, like Linux DMA-BUF (unlike the per-pass IOSurface
-    /// pbuffer binds).
+    /// to a 2D texture via `glEGLImageTargetTexture2DOES`.
     #[cfg(target_os = "android")]
     AHardwareBuffer,
 
     /// Zero-copy via `EGL_ANGLE_image_d3d11_texture` (Windows): the tensor's
     /// `ID3D11Texture2D` wrapped as an EGLImage and bound with
-    /// `glEGLImageTargetTexture2DOES`. Unlike Linux and Android the binding
-    /// is re-issued per use, because ANGLE does not observe writes made to
-    /// the texture outside GL (see `AngleD3d11::PERSISTENT_TEX_BINDINGS`).
+    /// `glEGLImageTargetTexture2DOES` on every use.
     #[cfg(target_os = "windows")]
     D3d11Texture,
 
     /// GPU buffer via Pixel Buffer Object. Used when DMA-buf is unavailable
-    /// but OpenGL is present. Data stays in GPU-accessible memory. Windows
-    /// took this path until the D3D11 texture import landed and now reports
-    /// [`TransferBackend::D3d11Texture`]; PBO destinations still exist there
-    /// as `TensorMemory::Pbo` tensors.
+    /// but OpenGL is present. Data stays in GPU-accessible memory.
     Pbo,
 
     /// Synchronous `glTexSubImage2D` upload + `glReadPixels` readback.
     /// Used when DMA-buf is unavailable or when the DMA-buf verification
-    /// probe fails (e.g. NVIDIA discrete GPUs where EGLImage creation
-    /// succeeds but rendered data is all zeros).
+    /// probe fails.
     Sync,
 }
 
@@ -247,10 +195,9 @@ impl TransferBackend {
     }
 
     /// Returns `true` if the platform can import `TensorMemory::DmaBuf`
-    /// tensors zero-copy: DMA-BUF EGLImages on Linux, IOSurface pbuffers
-    /// on macOS. Path-selection sites use this; probes that are
-    /// specifically about DMA-BUF semantics (e.g. the render-roundtrip
-    /// verification) keep `is_dma`.
+    /// tensors zero-copy: DMA-BUF EGLImages on Linux, IOSurface pbuffers on
+    /// macOS/iOS, AHardwareBuffer EGLImages on Android, D3D11 textures on
+    /// Windows.
     pub(crate) fn is_zero_copy(self) -> bool {
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         if self == TransferBackend::IOSurface {
@@ -268,14 +215,14 @@ impl TransferBackend {
     }
 }
 
-/// Interpolation mode for int8 proto textures (GL_R8I cannot use GL_LINEAR).
+/// Interpolation mode for int8 proto textures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Int8InterpolationMode {
-    /// texelFetch at nearest texel — simplest, fastest GPU execution.
+    /// texelFetch at nearest texel.
     Nearest,
     /// texelFetch × 4 neighbors with shader-computed bilinear weights (default).
     Bilinear,
-    /// Two-pass: dequant int8→f16 FBO, then existing f16 shader with GL_LINEAR.
+    /// Two-pass: dequant int8→f16 FBO, then the f16 shader with GL_LINEAR.
     TwoPass,
 }
 
@@ -290,12 +237,7 @@ pub(super) struct RegionOfInterest {
 
 impl RegionOfInterest {
     /// Build a source ROI spanning a pixel-space crop rectangle's true edges,
-    /// clamped to [0, 1]. The `LINEAR` paths keep their kernel inside the crop
-    /// by clamping each sample to
-    /// [`render::sample_clamp_rect_within`](super::render::sample_clamp_rect_within)
-    /// of [`Self::uv_bounds`], not by insetting these coordinates: an inset
-    /// maps the crop's edge pixels to the edge texels' centres, which shifts
-    /// every sample of a 1:1 crop by up to half a texel and blurs it.
+    /// clamped to [0, 1].
     ///
     /// `crop`: pixel-space rectangle (left, top, width, height).
     /// `tex_w`, `tex_h`: full texture dimensions in pixels.

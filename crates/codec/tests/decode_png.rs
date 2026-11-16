@@ -11,7 +11,7 @@
 
 use edgefirst_codec::{ImageDecoder, ImageLoad};
 use edgefirst_tensor::{PixelFormat, Tensor, TensorMemory, TensorTrait};
-// colorimetry types used in the new test below
+// Colorimetry types.
 use edgefirst_tensor::{ColorRange, ColorSpace};
 
 fn testdata(name: &str) -> Vec<u8> {
@@ -94,9 +94,8 @@ fn decode_png_into_larger_tensor() {
     .unwrap();
     let mut decoder = ImageDecoder::new();
     let info = tensor.load_image(&mut decoder, &png).unwrap();
-    // The decoder reconfigures the oversized tensor to the image's true dims,
-    // so the reported stride is the image row stride (1280 * 3), not the
-    // allocation width.
+    // The decoder reconfigures the oversized tensor to the image's dims: the
+    // stride is 1280 * 3.
     assert_eq!(info.width, 1280);
     assert_eq!(info.height, 720);
     assert_eq!(info.format, PixelFormat::Rgb);
@@ -199,7 +198,6 @@ fn decode_png_i16() {
 
 #[test]
 fn decode_png_i8_xor_consistency() {
-    // Verify PNG i8 decode matches manual u8→i8 XOR conversion.
     let png = testdata("zidane.png");
 
     let mut u8_tensor = Tensor::<u8>::image(

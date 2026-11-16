@@ -44,27 +44,28 @@
 //! Every label source — `edgefirst.json` `dataset.classes`, `labels.txt` and
 //! the ONNX `labels` key, Hugging Face `id2label` / `label2id`, Ultralytics
 //! `names` and the `labels` override — has leading and trailing whitespace
-//! removed from each name ([`str::trim`]), so ADE20K's `"bed "` resolves to
-//! `"bed"`. Whitespace inside a name (`"chest of drawers"`) is kept.
+//! removed from each name ([`str::trim`]); whitespace inside a name
+//! (`"chest of drawers"`) is kept.
+//!
 //! Discovered class names never fail resolution: a source whose names are
 //! unusable (a name empty after trimming, a malformed `id2label`, or a count
 //! that disagrees with `num_labels` or the output) is ignored with a warning
 //! and a note naming the source and the index (`id2label[7]`), and the next
 //! source supplies the labels. The count is checked against the class count
 //! the decoder builder derives from the outputs, or the segmentation
-//! channels of a semantic model, so an earlier source that miscounts yields
-//! to a later one that fits; end-to-end detections and class maps carry no
-//! count, so there the first source wins. A ModelPack segmentation output
+//! channels of a semantic model; end-to-end detections and class maps carry
+//! no count, so there the first source wins. A ModelPack segmentation output
 //! has one channel more than its classes: the last is background and has no
-//! label, so a multitask model's masks and boxes share class indices. Ultralytics `names` that disagree with the output are
-//! ignored and the schema is laid out from the count a `labels` override
-//! gives, or else from the one output whose class count fits; when several
-//! could, the layout is ambiguous and resolution fails, naming the override
-//! and a sidecar `edgefirst.json` as the ways to settle it.
-//! When no source fits, the labels are empty with a warning.
-//! `labels.txt` skips blank lines, so it cannot name an empty class.
-//! Names that repeat ignoring case add a note, since they make matching
-//! classes by name ambiguous. The `labels` override is checked strictly.
+//! label.
+//!
+//! Ultralytics `names` that disagree with the output are ignored and the
+//! schema is laid out from the count a `labels` override gives, or else from
+//! the one output whose class count fits; when several could, the layout is
+//! ambiguous and resolution fails.
+//!
+//! When no source fits, the labels are empty with a warning. `labels.txt`
+//! skips blank lines. Names that repeat ignoring case add a note. The
+//! `labels` override is checked strictly.
 //!
 //! [`infer_ultralytics_schema`]: crate::infer_ultralytics_schema
 
@@ -79,9 +80,8 @@ mod resolve;
 #[cfg(feature = "model-files")]
 mod ziptrailer;
 
-/// Reads `rel` from the workspace `testdata/` tree. `EDGEFIRST_TESTDATA_DIR`
-/// wins when set: the manifest-relative fallback is baked in at compile time,
-/// so a cross-compiled test binary run on a board cannot reach it.
+/// Reads `rel` from `$EDGEFIRST_TESTDATA_DIR` when set, else from the
+/// workspace `testdata/` tree.
 #[cfg(test)]
 fn read_testdata(rel: &str) -> String {
     let root = std::env::var("EDGEFIRST_TESTDATA_DIR")

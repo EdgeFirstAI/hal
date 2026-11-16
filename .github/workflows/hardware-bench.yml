@@ -4,10 +4,8 @@
 # named, one job per board entry, and rolls every board's medians into one
 # summary: a headline table across boards, every case in full, and a CSV of
 # every median. Per-board artifacts keep each case's JSON (the harness's
-# --json output, the shape BENCHMARKS.md's tables are generated from), its
-# log, and system.txt recording the governors, clocks and temperatures the
-# numbers depend on. Governors are read, never changed: a benchmark measures a
-# board as it ships.
+# --json output), its log, and system.txt recording the governors, clocks and
+# temperatures. Governors are read, never changed.
 #
 #   plan     resolve board entries; drop, and report, any no online runner serves
 #   build    cross-build one aarch64 bench bundle (scripts/on-target-bundle.sh)
@@ -15,9 +13,7 @@
 #   summary  one report naming the runner each entry ran on; red if any failed
 #
 # Board entries are runner labels, `+` joining labels one runner must all
-# carry (`imx95-frdm+ara240`). The default is one board per SoC for general
-# HAL work: the EVK where a family has other carriers. Board prerequisites:
-# Confluence "Self-Hosted Runner Fleet Inventory".
+# carry (`imx95-frdm+ara240`). The default is one board per SoC.
 #
 # The runner check needs FLEET_RUNNERS_TOKEN; see hardware-test.yml.
 #
@@ -64,7 +60,6 @@ jobs:
     name: Build bench bundle (aarch64)
     needs: plan
     if: needs.plan.outputs.has_boards == 'true'
-    # Free hosted runner: on demand, nothing waits on it.
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -95,14 +90,12 @@ jobs:
           tar -xJf "$archive" -C "$RUNNER_TEMP/zig" --strip-components=1
           echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
 
-      # rust-toolchain.toml pins the compiler; rustup honours it on first use.
       - name: Add the aarch64 target
         run: rustup target add aarch64-unknown-linux-gnu
 
       - name: Build the bundle
         run: ./scripts/on-target-bundle.sh bench aarch64 "$RUNNER_TEMP/bundle"
 
-      # A tarball, not the directory: an artifact loses file modes.
       - name: Pack the bundle
         run: tar -C "$RUNNER_TEMP/bundle" -cf "$RUNNER_TEMP/on-target-bench.tar" .
 
@@ -126,9 +119,6 @@ jobs:
     name: Board ${{ matrix.runner }}
     needs: [plan, build]
     runs-on: ${{ matrix.labels }}
-    # Every case, measured: Orin Nano 5 min, IQ-9075 8 min, i.MX 95 22 min,
-    # RPi5 31 min, i.MX 8M Plus (4x Cortex-A53) 60 min. 120 keeps the slowest
-    # board at half its budget.
     timeout-minutes: 120
     strategy:
       fail-fast: false
@@ -201,7 +191,6 @@ jobs:
           UNAVAILABLE: ${{ needs.plan.outputs.unavailable }}
           BUILD_RESULT: ${{ needs.build.result }}
         run: |
-          # Not -e: a failing roll-up must still write its report below.
           set +e -uo pipefail
           mkdir -p results
           python3 .github/scripts/fleet_summary.py bench --results results \

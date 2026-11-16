@@ -7,10 +7,7 @@ SPDX-License-Identifier: Apache-2.0
 
 ## Overview
 
-The Python bindings are **independent extension modules** rather than one
-`edgefirst_hal` module. `python-common` is the rlib holding the shared PyO3
-binding code; each `python-<pkg>` crate is a thin `cdylib` that selects the
-parts it needs by cargo feature and registers them into one module.
+The Python bindings are **independent extension modules**, one per package. `python-common` is the rlib holding the shared PyO3 binding code; each `python-<pkg>` crate is a thin `cdylib` that selects the parts it needs by cargo feature and registers them into one module.
 
 ```
 crates/python-common/          rlib — all binding code, feature-gated
@@ -46,7 +43,7 @@ selected by the `.cargo/config.toml` in each crate directory: maturin and
 pip run from there (`make wheel`, `make install-python`), and release.yml,
 which runs maturin from the root, passes `--config .cargo/tensor-dynamic.toml`.
 A build without either fails in `build.rs` rather than quietly producing a wheel with its own tensor
-copy. Each extension reports `__tensor_backend__`. The one exception is G13's
+copy. Each extension reports `__tensor_backend__`. The one exception is the
 static comparison build, opted into with `EDGEFIRST_TENSOR_STATIC_COMPARISON=1`.
 The link, rpath and nested `tensor-capi` build logic lives in `crates/build-support`.
 
@@ -76,14 +73,7 @@ the descriptor without ever naming the producer's type.
 The capsule owns both the descriptor **and** the producer's `HostPin`, so
 the address stays valid for the capsule's life.
 
-For a PBO-backed tensor the descriptor's `ptr` names a `PboOpsVtable` rather
-than a host address, and that vtable now embeds an `ef_client_state` (an
-opaque context plus a `retain`/`release` pair) beside the map and unmap
-function pointers. A consumer's reconstruction takes its own reference on that
-channel, so it no longer depends on the producer's keepalive still being held.
-The payload layout is unchanged by this, so the capsule name stays
-`edgefirst_tensor_v2`; see INTEROP.md § Versioning for why, and for why
-retiring the now-redundant `pbo_keepalive` field is a separate decision.
+For a PBO-backed tensor the descriptor's `ptr` names a `PboOpsVtable` rather than a host address, and that vtable embeds an `ef_client_state` (an opaque context plus a `retain`/`release` pair) beside the map and unmap function pointers. A consumer's reconstruction takes its own reference on that channel, so it does not depend on the producer's keepalive still being held. The capsule name is `edgefirst_tensor_v2`; see INTEROP.md § Versioning.
 
 ## PEP 420 namespace
 

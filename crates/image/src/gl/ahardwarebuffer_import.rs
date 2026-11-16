@@ -3,11 +3,8 @@
 
 //! AHardwareBuffer → EGLImage import for the Android GL backend.
 //!
-//! The Android counterpart of `dma_import.rs` (Linux DMA-BUF) and
-//! `iosurface_import.rs` (macOS IOSurface) — and by far the thinnest of
-//! the three: an AHardwareBuffer is **self-describing** (it carries its
-//! own format, dimensions, and stride from allocation), so the import
-//! needs no per-format attribute assembly. The whole path is:
+//! The import takes the AHardwareBuffer's own format, dimensions and stride
+//! and no per-format attributes:
 //!
 //! ```text
 //! AHardwareBuffer* ── eglGetNativeClientBufferANDROID ──▶ EGLClientBuffer
@@ -15,29 +12,14 @@
 //!                                       {EGL_IMAGE_PRESERVED=TRUE}) ──▶ EGLImage
 //! ```
 //!
-//! `EGL_IMAGE_PRESERVED = TRUE` is REQUIRED: without it the buffer's
-//! existing contents are undefined after import — a silent-garbage
-//! correctness bug, not an error.
-//!
-//! The three entry points are EGL *extension* functions
+//! The three entry points are EGL extension functions
 //! (`eglGetNativeClientBufferANDROID` from
 //! `EGL_ANDROID_get_native_client_buffer`; `eglCreateImageKHR` /
 //! `eglDestroyImageKHR` from `EGL_KHR_image_base`, accepting the
-//! `EGL_ANDROID_image_native_buffer` target), not core EGL 1.4, so they
-//! are resolved once per process via `eglGetProcAddress` and cached — the
-//! same pattern `context.rs` uses for the Linux KHR image functions and
-//! `macos.rs` for `eglGetPlatformDisplayEXT`.
+//! `EGL_ANDROID_image_native_buffer` target). They are resolved once per
+//! process via `eglGetProcAddress` and cached.
 //!
-//! ## Locking
-//!
-//! No process-wide lifecycle lock is taken around create/destroy (unlike
-//! the Linux funnel's `image_lifecycle_guard`): that guard exists for
-//! embedded Linux drivers (Vivante) whose display-level EGL entry points
-//! race across threads. Android's system EGL is specification-conformant
-//! thread-safe (same reasoning as the ANGLE path, which relies on ANGLE's
-//! internal synchronization). If a vendor driver ever proves otherwise
-//! on-device, a dedicated guard can be added here — every create/destroy
-//! funnels through this module.
+//! No process-wide lifecycle lock is taken around create/destroy.
 
 #![cfg(target_os = "android")]
 
@@ -52,13 +34,8 @@ use std::sync::OnceLock;
 const EGL_NATIVE_BUFFER_ANDROID: u32 = 0x3140;
 
 type FnGetNativeClientBuffer = unsafe extern "C" fn(buffer: *mut c_void) -> egl::EGLClientBuffer;
-// ABI note: `eglCreateImageKHR` (EGL_KHR_image_base) takes `const EGLint*`
-// — 32-bit attributes. Only the EGL 1.5 CORE `eglCreateImage` takes the
-// pointer-width `EGLAttrib*`. Passing a usize-stride array here would make
-// every 64-bit driver misparse the list (EGL_IMAGE_PRESERVED's value read
-// as 0 = FALSE, the next key read from TRUE's low half) — the same reason
-// the Linux funnel (`context.rs::egl_create_image_with_fallback`)
-// down-converts to `egl::Int` before calling the KHR entry point.
+// `eglCreateImageKHR` (EGL_KHR_image_base) takes `const EGLint*`: 32-bit
+// attributes.
 type FnCreateImageKHR = unsafe extern "C" fn(
     dpy: egl::EGLDisplay,
     ctx: egl::EGLContext,
@@ -68,9 +45,8 @@ type FnCreateImageKHR = unsafe extern "C" fn(
 ) -> egl::EGLImage;
 type FnDestroyImageKHR = unsafe extern "C" fn(dpy: egl::EGLDisplay, image: egl::EGLImage) -> u32;
 
-/// The resolved extension entry points. Function pointers obtained from
-/// `eglGetProcAddress` are process-global on Android (one system EGL), so
-/// a single resolution serves every display/context.
+/// The resolved extension entry points, shared by every display and
+/// context.
 struct AhbEglFns {
     get_native_client_buffer: FnGetNativeClientBuffer,
     create_image_khr: FnCreateImageKHR,
@@ -120,20 +96,12 @@ fn fns(egl: &Egl) -> Result<&'static AhbEglFns> {
         .map_err(|s| Error::NotSupported(s.clone()))
 }
 
-/// Create an EGLImage over an AHardwareBuffer.
-///
-/// Every Android EGLImage creation funnels through here, carrying the
-/// same `image.convert.gl.egl_import` tracing span as the Linux funnel
-/// (`platform/linux.rs::new_egl_image_owned`) — one span = one actual
-/// `eglCreateImageKHR`. Steady-state frame loops must show ZERO of these
-/// after warmup; the span count is the observable for cache-behavior
-/// equality gates.
+/// Create an EGLImage over an AHardwareBuffer, inside an
+/// `image.convert.gl.egl_import` tracing span.
 ///
 /// # Safety
 ///
-/// `buffer_ptr` must be a valid live AHardwareBuffer pointer (borrowed
-/// from a live tensor — the import cache entry's `guard` ties the
-/// EGLImage's lifetime to it).
+/// `buffer_ptr` must be a valid live AHardwareBuffer pointer.
 pub(super) unsafe fn create_ahardwarebuffer_eglimage(
     egl: &Egl,
     display: egl::Display,
@@ -152,9 +120,8 @@ pub(super) unsafe fn create_ahardwarebuffer_eglimage(
             ))));
         }
 
-        // EGL_IMAGE_PRESERVED = TRUE: the buffer's existing contents MUST
-        // survive the import (see module docs — absence is silent garbage).
-        // EGLint-typed per the KHR signature — see the FnCreateImageKHR note.
+        // EGL_IMAGE_PRESERVED = TRUE keeps the buffer's existing contents
+        // across the import. EGLint-typed per the KHR signature.
         let attribs: [egl::Int; 3] = [egl::IMAGE_PRESERVED, egl::TRUE as egl::Int, egl::NONE];
         let image_raw = (fns.create_image_khr)(
             display.as_ptr(),
@@ -169,15 +136,13 @@ pub(super) unsafe fn create_ahardwarebuffer_eglimage(
                 egl.get_error()
             ))));
         }
-        // SAFETY: image_raw is a valid, non-NO_IMAGE EGLImage per the check above;
-        // the enclosing `unsafe` block is the one that covers `from_ptr`.
+        // SAFETY: `image_raw` is a valid, non-NO_IMAGE EGLImage per the check above.
         Ok(egl::Image::from_ptr(image_raw))
     }
 }
 
 /// Destroy an EGLImage created by [`create_ahardwarebuffer_eglimage`].
-/// Failures are logged, not propagated — this runs on the owned import's
-/// Drop path.
+/// Failures are logged, not propagated.
 pub(super) fn destroy_ahardwarebuffer_eglimage(
     egl: &Egl,
     display: egl::Display,

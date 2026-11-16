@@ -4,7 +4,7 @@
 //! TFLite v2.19.0 integer helpers (and the gemmlowp primitives they use), ported bit for bit.
 //!
 //! Where the C++ has undefined behaviour (signed overflow, out-of-range shifts) these wrap or
-//! clamp instead of panicking; callers keep their inputs out of those ranges.
+//! clamp; callers keep their inputs out of those ranges.
 
 /// Number of interpolation steps in a 16-bit table; the table has one more entry.
 const LUT_STEPS: usize = 512;
@@ -59,7 +59,7 @@ pub(crate) fn saturating_rounding_doubling_high_mul(a: i32, b: i32) -> i32 {
     } else {
         1 - (1i64 << 30)
     };
-    // Truncating division, as in C++; the quotient always fits in an i32.
+    // Truncating division, as in C++.
     ((ab + nudge) / (1i64 << 31)) as i32
 }
 
@@ -99,7 +99,7 @@ fn cpp_clamp(v: f64, lo: f64, hi: f64) -> f64 {
 /// `LUTPopulateInt16<double>`: 512 interpolation steps of `f` over the input range, plus the end point.
 ///
 /// Each entry is the rounded sample less half the rounded error of the chord at the step's
-/// midpoint, so linear interpolation between entries tracks `f` more closely.
+/// midpoint.
 pub(crate) fn lut_populate_i16(
     in_scale: f64,
     in_zp: i32,
@@ -147,7 +147,6 @@ pub(crate) fn lut_populate_i16(
 /// interpolated by the low 7 bits.
 #[inline(always)]
 pub(crate) fn lut_lookup_i16(v: i16, lut: &[i16; 513]) -> i16 {
-    // `256 + (v >> 7)` lies in 0..=511, so both reads are in bounds.
     let index = (256 + (i32::from(v) >> 7)) as usize;
     let offset = i32::from(v & 0x7f);
     let base = lut[index];
@@ -210,8 +209,7 @@ pub(crate) const SIGMOID_TABLE_U16: [u16; 256] = [
 
 /// `reference_integer_ops::Logistic(int32_t, int32_t, ..., const int16_t*, int16_t*)` for one element.
 ///
-/// The product of the input and the multiplier wraps, as the C++ does in practice; the plan only
-/// uses multipliers up to 65535, for which it cannot overflow.
+/// The product of the input and the multiplier wraps.
 #[inline(always)]
 pub(crate) fn logistic_i16_reference(input_multiplier: i32, input_left_shift: i32, x: i16) -> i16 {
     let (multiplier, shift) = if input_multiplier == 0 {
@@ -486,7 +484,6 @@ mod tests {
             assert_eq!(*bit, 10 + k as u32);
             assert_eq!(*m, c(*r));
         }
-        // exp(-8) and exp(-16) only apply with more than 3 integer bits.
         assert_eq!(q16::C48_OVER_17, c(1_515_870_810));
         assert_eq!(q16::NEG_32_OVER_17, c(-1_010_580_540));
         assert_eq!(q16::ONE_HALF, c(1 << 30));
@@ -518,7 +515,7 @@ mod tests {
         assert_eq!(checked_log2(2f32.powi(-12)), (true, -12));
         assert_eq!(checked_log2(0.25), (true, -2));
         assert!(!checked_log2(0.0005).0);
-        // Within 1e-3 in log2 of 2^-12 still counts as a power of two.
+        // Within 1e-3 in log2 of 2^-12 counts as a power of two.
         assert_eq!(checked_log2(2f32.powi(-12) * 1.0005), (true, -12));
         assert_eq!(logistic_i16_prepare(2f32.powi(-12)), (0, 0));
         // A power of two other than 2^-12 takes the multiplier path: 2^-11·12288 = 6, then 6·2^12.
@@ -632,7 +629,7 @@ mod tests {
             recip.windows(2).all(|w| w[0] >= w[1]),
             "recip table decreases"
         );
-        // Spot values and sums from an independent float64 port of `LUTPopulateInt16<double>`.
+        // Spot values and sums of `LUTPopulateInt16<double>`.
         let at = |t: &[i16; 513], idx: [usize; 10]| idx.map(|i| t[i]);
         let idx = [0, 1, 2, 100, 255, 256, 400, 510, 511, 512];
         assert_eq!(

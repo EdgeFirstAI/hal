@@ -1,9 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! Scratch tool: dump the fused native-4:2:0-\>RGB decode of a JPEG as a raw
-//! PPM (P6), for accuracy comparison against a reference decoder (e.g. PIL).
-//! Not part of the public API surface; not wired into CI.
+//! Dump the fused native-4:2:0-\>RGB decode of a JPEG as a raw PPM (P6).
 
 use edgefirst_codec::{peek_info, ImageDecoder, ImageLoad};
 use edgefirst_tensor::{CpuAccess, PixelFormat, Tensor, TensorMemory, TensorTrait};
@@ -17,8 +15,7 @@ fn main() {
     let mut decoder = ImageDecoder::new();
     decoder.set_output_format(Some(PixelFormat::Rgb));
 
-    // Peek dimensions first so the tensor is sized exactly (Rgb stride is
-    // img_w*3, no even-width padding needed).
+    // Peek the dimensions so the tensor is sized exactly.
     let info = peek_info(&jpeg).expect("peek");
     let mut tensor = Tensor::<u8>::image(
         info.width,

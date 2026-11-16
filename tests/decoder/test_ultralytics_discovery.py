@@ -3,10 +3,9 @@
 
 """On-demand discovery integration test over real Ultralytics exports.
 
-This repository ships no Ultralytics code and installs none. Export the
-models yourself with your own Ultralytics installation and point
+Export the models with your own Ultralytics installation and point
 EF_ULTRALYTICS_EXPORTS at the directory (see TESTING.md); anything missing
-is skipped rather than failed.
+is skipped.
 
 Deselected by default (see pyproject addopts). Run:
     source venv/bin/activate
@@ -32,11 +31,7 @@ pytestmark = pytest.mark.ultralytics
 
 
 def _spec(t):
-    """Maps one captured tensor signal onto the binding's tensor spec.
-
-    `inputs` and `outputs` take the same 3-or-4-tuple shape, so one mapper
-    serves both.
-    """
+    """Maps one captured tensor signal onto the binding's tensor spec."""
     q = t["quantization"]
     return (
         t["name"],
@@ -88,17 +83,16 @@ def test_supported_family_discovers(name, version, n_outputs, seg):
     if seg:
         assert any(o.get("type") == "protos" for o in schema["outputs"])
 
-    # "detections" (plural) is the schema vocabulary's fully-decoded
-    # post-NMS type, which is what a YOLO26 end-to-end head emits;
-    # "detection" is the anchor-grid output that still needs decoding.
+    # "detections" (plural) is the fully-decoded post-NMS type a YOLO26
+    # end-to-end head emits; "detection" is the anchor-grid output.
     det_type = "detections" if version == "yolo26" else "detection"
     det = next(o for o in schema["outputs"] if o.get("type") == det_type)
 
     # Ultralytics TFLite exports emit [0,1] boxes, ONNX emits pixel-space.
     assert det["normalized"] is name.endswith(".tflite")
 
-    # The schema must pin Ultralytics' own class-aware NMS for pre-NMS
-    # heads, and add none for end-to-end heads that ran it in-graph.
+    # The schema pins class-aware NMS for pre-NMS heads and none for
+    # end-to-end heads.
     assert schema.get("nms") == (None if version == "yolo26" else "class_aware")
     assert "Ultralytics" in description
 
@@ -113,7 +107,7 @@ def test_unsupported_family_rejected_gracefully(name):
         pytest.skip(f"{name} not found in {EXPORTS} — see TESTING.md")
     with pytest.raises(ValueError) as e:
         _infer(model)
-    # Graceful: the message names the problem, never a panic/crash.
+    # The message names the problem.
     msg = str(e.value).lower()
     assert "task" in msg or "layout" in msg or "ultralytics" in msg
 
@@ -121,9 +115,6 @@ def test_unsupported_family_rejected_gracefully(name):
 def test_non_ultralytics_metadata_rejected():
     from edgefirst.decoder import infer_ultralytics_schema
 
-    # `match=` is load-bearing: a bare `pytest.raises(ValueError)` here used
-    # to pass on a tuple-arity error from argument marshalling, never
-    # reaching the check this test is named for.
     with pytest.raises(ValueError, match="no Ultralytics signature"):
         infer_ultralytics_schema(
             "onnx",

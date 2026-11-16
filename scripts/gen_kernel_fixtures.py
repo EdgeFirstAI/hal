@@ -669,10 +669,7 @@ BIN_LHS = (0.0579, -128)
 BIN_RHS = (0.0391, 5)
 BIN_OUT = (0.0811, -3)
 ODD = (3, 1001)  # 3003 elements: 187 blocks of 16 and a tail of 11
-# Every (lhs, rhs) pair. TFLite's NEON-block ADD (one shift and one rounding per input) and
-# its scalar ADD almost never differ: at this quantization, one pair of the 65536 does. A
-# MUL multiplier above one, where the NEON blocks saturate the product to int16 and add the
-# output zero point with wrap-around, separates the two MUL kernels on many elements.
+# Every (lhs, rhs) pair.
 PAIRS = (256, 256)
 ADD_SPLIT = ((0.002_458_421, -125), (0.001_481_796_5, -48), (0.007_060_605_6, 73))
 

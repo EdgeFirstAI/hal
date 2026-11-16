@@ -1,18 +1,9 @@
 # SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 # SPDX-License-Identifier: Apache-2.0
 #
-# cbindgen configuration for edgefirst/tensor.h.
+# cbindgen configuration for edgefirst/tracker.h.
 #
-# NOTE: the include guard is written by hand in `header`/`trailer` rather than
-# via cbindgen's `include_guard`, which wraps only the *generated* body and
-# leaves `header` and `trailer` outside it. Everything below the trailer marker
-# -- the vtable struct and every `static inline` accessor -- would then be
-# re-emitted on a second #include and fail to compile with a redefinition.
-#
-# NOTE: cbindgen emits declarations for `extern "C"` functions only. It cannot
-# emit a `static inline` body, and `static inline` is the entire mechanism that
-# makes the vtable accessors non-interposable. Those therefore live in the
-# hand-written `trailer` below, not in generated output.
+# The include guard is written by hand in `header`/`trailer`.
 
 language = "C"
 autogen_warning = "/* WARNING: The generated portion of this file is produced by cbindgen. Do not modify it directly. */"
@@ -34,10 +25,9 @@ header = """
  *
  * Associates detections across frames, giving each object a stable identity.
  *
- * Takes detections as a plain `(const ef_detect_box *, size_t)` pair — the
- * same view `ef_detect_box_list_data()`/`_len()` give back — so this library
- * needs only the by-value `ef_detect_box` type, declared in
- * edgefirst/detect.h, and never links the decoder.
+ * Takes detections as a `(const ef_detect_box *, size_t)` pair, the view
+ * `ef_detect_box_list_data()`/`_len()` give back. `ef_detect_box` is
+ * declared in edgefirst/detect.h.
  */
 
 #include <stdarg.h>
@@ -54,9 +44,6 @@ extern "C" {
 
 /**
  * @brief An opaque tracker.
- *
- * Forward-declared so callers write `ef_bytetrack *` without the `struct`
- * keyword. Its definition is private: tracker state is not part of the ABI.
  */
 typedef struct ef_bytetrack ef_bytetrack;
 
@@ -74,11 +61,8 @@ trailer = """
 
 [export]
 prefix = ""
-# `EfDetectBox` (used by `ef_bytetrack_update`'s signature) comes from
-# edgefirst/decoder.h, which this header includes. The `EfTensor*` family is
-# unused by this crate today but excluded defensively, matching the sibling
-# `-capi` crates: they are declared once, in edgefirst/tensor.h. Emitting any
-# of these again here would be a second, conflicting definition.
+# Types declared in edgefirst/detect.h and edgefirst/tensor.h, and the handles
+# forward-declared in `header`.
 exclude = ["EfTensor", "EfTensorImpl", "EfTensorPlane", "EfDetectBox", "EfDetectBoxList", "EfByteTrack", "EfTrackInfoList"]
 
 

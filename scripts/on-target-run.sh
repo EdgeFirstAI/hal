@@ -150,7 +150,7 @@ for bin in "${bins[@]}"; do
   name="$(basename "${bin}")"
   echo "  -- ${name}"
   log="${RESULTS}/${name}.log"
-  # shellcheck disable=SC2086  # FILTER is word-split
+  # shellcheck disable=SC2086
   if env EDGEFIRST_TESTDATA_DIR="${BUNDLE}/testdata" ${extra_env[@]+"${extra_env[@]}"} \
       "./${bin}" --test-threads=1 ${FILTER} > "${log}" 2>&1; then
     pass=$((pass + 1))
@@ -170,33 +170,27 @@ for bin in "${bins[@]}"; do
   fi
 done
 
-# Runs check-single-home.sh and counts the failures of the gates a board
-# can run. The footprint and Miri gates need the build host and are
-# reported as gaps.
-echo "  -- check-single-home.sh (G1/G2/G2t/G4/G9/G11)"
-ghlog="${RESULTS}/check-single-home.log"
-./scripts/check-single-home.sh > "${ghlog}" 2>&1
-gh_real_fail="$(grep -cE '^\s*(G1|G1b|G2|G2t|G4|G9|G11)\s+FAIL' "${ghlog}")"
-gh_expected_gap="$(grep -cE '^\s*(G5|G7)\s+FAIL' "${ghlog}")"
-if [[ "${gh_real_fail}" -eq 0 ]]; then
+# Runs the checks of check-single-home.sh that apply to a deployed bundle.
+echo "  -- check-single-home.sh"
+single_home_log="${RESULTS}/check-single-home.log"
+if ./scripts/check-single-home.sh --on-target > "${single_home_log}" 2>&1; then
   pass=$((pass + 1))
-  echo "     ok -- G1/G1b/G2/G2t/G4/G9/G11 clean; ${gh_expected_gap} expected gap(s) (G5/G7 need the build host)"
 else
   fail=$((fail + 1)); failed_bins+=("check-single-home.sh")
-  echo "     FAILED: ${gh_real_fail} real gate failure(s)"
-  grep -E 'FAIL' "${ghlog}" | sed 's/^/     /'
+  echo "     FAILED"
+  grep -E 'FAIL' "${single_home_log}" | sed 's/^/     /'
 fi
 
 # Runs the two-library C program.
-echo "  -- test_two_library_user (G3)"
-g3log="${RESULTS}/test_two_library_user.log"
+echo "  -- test_two_library_user"
+two_lib_log="${RESULTS}/test_two_library_user.log"
 if env ${extra_env[@]+"${extra_env[@]}"} ./target/debug/test_two_library_user \
-    > "${g3log}" 2>&1; then
+    > "${two_lib_log}" 2>&1; then
   pass=$((pass + 1))
 else
   fail=$((fail + 1)); failed_bins+=("test_two_library_user")
   echo "     FAILED"
-  sed 's/^/     /' "${g3log}"
+  sed 's/^/     /' "${two_lib_log}"
 fi
 
 # Runs test_codec_api and rewrites its `SKIP: <reason>` lines as
@@ -265,5 +259,5 @@ elif [[ ${ran_nothing} -eq ${#bins[@]} ]]; then
 fi
 detail="${pass} binaries, ${skipped} tests skipped"
 [[ ${ran_nothing} -gt 0 ]] && detail="${detail}, ${ran_nothing} ran 0 tests"
-write_summary PASS "${detail}, G1/G2/G2t/G3/G4/G9/G11 clean"
+write_summary PASS "${detail}"
 exit 0

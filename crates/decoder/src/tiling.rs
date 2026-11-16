@@ -9,73 +9,36 @@
 //! the small tile-input model and decoded independently to normalized `[0,1]`
 //! detections over the model input. This module lifts those to full-frame
 //! pixels ([`lift_tile_boxes`]) and merges duplicates at tile seams
-//! ([`merge_tiled_detections`]): a greedy, class-aware pass under the **IOS**
-//! (intersection-over-smaller) match metric that, by default, **keeps the
-//! highest-scoring box of each overlapping group unchanged** rather than
-//! growing it ([`MergeMode::KeepBest`]). [`TiledFrameAccumulator`] is a streaming
-//! collector so a pipelined runtime can push each tile's detections as
-//! inference completes and finalize once the frame's last tile arrives.
+//! ([`merge_tiled_detections`]) with a greedy, class-aware pass under the IOS
+//! (intersection-over-smaller) match metric. [`TiledFrameAccumulator`] is a
+//! streaming collector: a pipelined runtime pushes each tile's detections as
+//! inference completes and finalizes once the frame's last tile arrives.
 //!
-//! IOS matters because an object split across a tile overlap appears as two
-//! partial boxes whose IoU is low but whose IoS is high, so IoS joins them
-//! where IoU leaves duplicates.
+//! # Merge mode
 //!
-//! # Merge mode (affects mAP)
+//! [`MergeMode::KeepBest`] is the default: the highest-scoring box of each
+//! matched group is kept unchanged and the boxes it matched are dropped.
+//! [`MergeMode::Union`] replaces each matched group with its enclosing union
+//! carrying the group's max score.
 //!
-//! The original GREEDYNMM merge replaced each matched group with its
-//! **enclosing union** carrying the group's max score. On the Ocean Cleanup
-//! ADIS 4K validation set (5823 frames, one evaluator; TOP2-836) that union
-//! cost about **0.05 AP50 on every frame, tiled or not**: a whole frame with
-//! plain NMS scored 0.491 AP50, the same predictions after the union merge
-//! 0.437, and the same IoS-0.5 class-aware matching with the best box kept
-//! unchanged 0.490; a 28-tile pipeline scored 0.500 with keep-best against
-//! 0.442 with the union. Only ~5 % of boxes are touched, but a union inflates
-//! a true positive past IoU 0.5 and swallows the small, low-score true
-//! positives that lie mostly inside a larger same-class box. The seam case
-//! the union was built for is negligible next to that, so
-//! [`MergeMode::KeepBest`] is the default and [`MergeMode::Union`] is opt-in
-//! (it stays bit-exact with the original reference for parity work).
+//! # Per-tile decode
 //!
-//! # Per-tile decode guidance (affects mAP)
+//! Run the per-tile [`crate::Decoder`] with a low score threshold (e.g.
+//! 0.05), class-aware NMS and a modest per-tile `max_det`. The merge's own
+//! [`MergeConfig::score_threshold`] defaults to `0.0`; final score gating
+//! belongs there.
 //!
-//! Run the per-tile [`crate::Decoder`] with a **low score threshold** (e.g.
-//! 0.05) and **class-aware** NMS, and a modest per-tile `max_det`. The merge's
-//! own [`MergeConfig::score_threshold`] defaults to `0.0` precisely because
-//! per-tile decode is the real flood control — a high per-tile threshold
-//! discards true-positive fragments before the merge can join them, collapsing
-//! the recall the IOS design buys. Final score gating belongs in
-//! [`MergeConfig::score_threshold`].
+//! # Limitations
 //!
-//! # Known limitations
-//!
-//! - **Objects larger than one tile** are not reconstructed: every tile sees
-//!   only a fragment. Keep-best reports the highest-scoring fragment;
-//!   [`MergeMode::Union`] grows the kept box over the fragments that match
-//!   it, but with no whole-object box to anchor the group the fragments may
-//!   not mutually pass the IOS threshold either. Choose a tile size that
-//!   exceeds the largest expected object, or add the optional full-frame
-//!   downscaled pass (push it as one extra tile into the accumulator).
-//!
-//! # Reference implementations
-//!
-//! - **Grid spacing (EvenDist):** the canonical authority is HAL's own
-//!   `edgefirst_image::tile_grid` (ported from the adis-uav-model `sahi()`
-//!   function). `overlap_ratio` is a *minimum*; realized overlap is never
-//!   rounded below it. ModelPack's validator is slated to adopt this same grid.
-//! - **Merge:** ModelPack `metrics/tiled.py::merge_tiled_detections` — mirrored
-//!   here numerically, mode for mode (ModelPack carries the same `merge_mode`
-//!   switch with the same keep-best default; its original union-only merge is
-//!   [`MergeMode::Union`]). The only deliberate difference is tie-breaking on
-//!   exactly equal scores (ascending original index here vs NumPy's unstable
-//!   `argsort`), which makes the streaming accumulator order-independent;
-//!   results are identical on non-degenerate inputs.
+//! Objects larger than one tile are not reconstructed: every tile sees only
+//! a fragment. Keep-best reports the highest-scoring fragment;
+//! [`MergeMode::Union`] grows the kept box over the fragments that match it.
+//! Choose a tile size that exceeds the largest expected object, or add a
+//! full-frame downscaled pass as one extra tile in the accumulator.
 
 use crate::float::{box_area, intersection_area, ios_value, iou_value};
 use crate::{BoundingBox, DetectBox};
-// `pub use`: TilePlacement is part of this module's public surface --
-// `lift_tile_boxes` and `push_tile` take one, and the doctests below
-// import it from here. A private import compiles but leaves the type
-// unnameable by callers.
+// `TilePlacement` is part of this module's public surface.
 pub use edgefirst_decoder_abi::TilePlacement;
 use edgefirst_tensor::unletter_norm;
 
@@ -89,8 +52,7 @@ edgefirst_tensor::ef_vocabulary! {
     pub enum MatchMetric {
         /// Intersection-over-Union (standard NMS metric).
         Iou = 0, "iou", IOU,
-        /// Intersection-over-Smaller (default): `inter / min(area_a, area_b)`. A
-        /// seam-split object has low IoU but high IoS, so IoS merges the fragment.
+        /// Intersection-over-Smaller (default): `inter / min(area_a, area_b)`.
         #[default]
         Ios = 1, "ios", IOS,
     }
@@ -113,11 +75,8 @@ edgefirst_tensor::ef_vocabulary! {
     /// What the tiled-detection merge emits for a group of boxes the match
     /// metric has joined.
     ///
-    /// Measured on the Ocean Cleanup ADIS 4K validation set (TOP2-836), the
-    /// enclosing union cost about 0.05 AP50 on every frame (whole frame: 0.491
-    /// AP50 with plain NMS, 0.437 after the union merge, 0.490 with keep-best;
-    /// 28-tile pipeline: 0.500 keep-best vs 0.442 union), so [`Self::KeepBest`]
-    /// is the default. See the [module docs](self#merge-mode-affects-map).
+    /// [`Self::KeepBest`] is the default. See the
+    /// [module docs](self#merge-mode).
     ///
     /// The code is the one the C `EF_MERGE_MODE_*` enumerators and the
     /// Python `MergeMode` enum use.
@@ -127,15 +86,12 @@ edgefirst_tensor::ef_vocabulary! {
         /// — and drop the boxes it matched. Greedy NMS under the configured
         /// metric. Default.
         ///
-        /// The kept box is never grown, rescored or relabelled. It is emitted
-        /// [canonicalized](crate::BoundingBox::to_canonical), which every box
-        /// entering the merge is, so it differs from the input only for a
-        /// degenerate input box whose `min` exceeded its `max`.
+        /// The kept box is not grown, rescored or relabelled. It is emitted
+        /// [canonicalized](crate::BoundingBox::to_canonical).
         #[default]
         KeepBest = 0, "keep_best", KEEP_BEST,
         /// Replace the group with its enclosing union carrying the group's max
-        /// score: the original GREEDYNMM merge (ModelPack `metrics/tiled.py`
-        /// before `merge_mode`). Opt-in; inflates boxes and costs mAP.
+        /// score: the GREEDYNMM merge.
         Union = 1, "union", UNION,
     }
     #[doc(hidden)]
@@ -145,9 +101,7 @@ edgefirst_tensor::ef_vocabulary! {
 /// Configuration for the tiled-detection merge.
 ///
 /// The defaults are IoS at 0.5, class-aware, [`MergeMode::KeepBest`],
-/// `max_det` 300 and no score gate. Keep-best rather than the enclosing union
-/// because the union measured about −0.05 AP50 on every frame of the Ocean
-/// Cleanup ADIS 4K validation (TOP2-836); see [`MergeMode`].
+/// `max_det` 300 and no score gate.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MergeConfig {
     /// Overlap metric (default [`MatchMetric::Ios`]).
@@ -159,7 +113,7 @@ pub struct MergeConfig {
     /// Cap on returned detections after the merge (default 300).
     pub max_det: usize,
     /// Drop merged groups whose max score is below this (default 0.0 = keep
-    /// all; per-tile decode is the real flood control).
+    /// all).
     pub score_threshold: f32,
     /// What a matched group becomes (default [`MergeMode::KeepBest`]).
     pub mode: MergeMode,
@@ -178,9 +132,8 @@ impl Default for MergeConfig {
     }
 }
 
-/// Lift tile-local **normalized** `[0,1]` xyxy detections (over the model
-/// input) to full-frame **pixel** xyxy. Mirrors
-/// `metrics/tiled.py::lift_tile_boxes`: optionally invert the letterbox, then
+/// Lift tile-local normalized `[0,1]` xyxy detections (over the model
+/// input) to full-frame pixel xyxy: optionally invert the letterbox, then
 /// `full = origin + norm * crop_size`. Consumes and rewrites `boxes` in place.
 ///
 /// # Examples
@@ -217,8 +170,7 @@ pub fn lift_tile_boxes(mut boxes: Vec<DetectBox>, placement: &TilePlacement) -> 
     boxes
 }
 
-/// Match metric using precomputed areas (avoids recomputing both operands'
-/// areas on every pair in the O(N^2) merge). Equivalent to
+/// Match metric using precomputed areas. Equivalent to
 /// [`MatchMetric::value`].
 #[inline]
 fn metric_value_with_areas(
@@ -236,26 +188,19 @@ fn metric_value_with_areas(
     inter / denom.max(1e-9)
 }
 
-/// Greedy merge of lifted full-frame detections. Mirrors
-/// `metrics/tiled.py::merge_tiled_detections`:
+/// Greedy merge of lifted full-frame detections:
 ///
-/// 1. Sort descending by score (ties broken by ascending original index so the
-///    result is deterministic — this differs from NumPy's unstable `argsort`
-///    only on exact ties).
+/// 1. Sort descending by score, ties broken by ascending original index.
 /// 2. For each unused `base` in order, find later unused boxes (same class
-///    unless `class_agnostic`) whose `metric.value(base, cand) >= threshold` —
-///    matched against the **original** base box — and mark them used. With
+///    unless `class_agnostic`) whose `metric.value(base, cand) >= threshold`,
+///    matched against the original base box, and mark them used. With
 ///    [`MergeMode::KeepBest`] (default) the base box is emitted unchanged
-///    (canonicalized, never grown or rescored); with [`MergeMode::Union`] the group is
-///    replaced by its **enclosing union** carrying the group's **max** score.
-///    Either way the output carries the base's label.
+///    (canonicalized); with [`MergeMode::Union`] the group is replaced by its
+///    enclosing union carrying the group's max score. Either way the output
+///    carries the base's label.
 /// 3. Drop groups below `score_threshold` and truncate to `max_det`.
 ///
-/// Keep-best is the default because the union measured about −0.05 AP50 on
-/// every frame of the Ocean Cleanup ADIS 4K validation (TOP2-836): whole
-/// frame 0.491 AP50 with plain NMS, 0.437 after the union, 0.490 with
-/// keep-best. Operates in pixel space (the metric's `1e-9` epsilon is
-/// calibrated to pixel areas).
+/// Operates in pixel space.
 ///
 /// # Examples
 /// ```
@@ -277,8 +222,8 @@ fn metric_value_with_areas(
 /// let cfg = MergeConfig { metric: MatchMetric::Iou, ..MergeConfig::default() };
 /// assert_eq!(merge_tiled_detections(vec![a, b], &cfg).len(), 2);
 ///
-/// // A box that extends past A at IoS 0.5: keep-best still returns A as is,
-/// // the legacy union mode grows A to the group's enclosing union.
+/// // A box that extends past A at IoS 0.5: keep-best returns A as is, and
+/// // union mode grows A to the group's enclosing union.
 /// let c = DetectBox { bbox: BoundingBox::new(350.0, 100.0, 450.0, 300.0), score: 0.7, label: 0 };
 /// let keep = merge_tiled_detections(vec![a, c], &MergeConfig::default());
 /// assert_eq!(keep[0].bbox, a.bbox);
@@ -293,13 +238,11 @@ pub fn merge_tiled_detections(dets: Vec<DetectBox>, cfg: &MergeConfig) -> Vec<De
         return dets;
     }
 
-    // Descending score, ties by ascending original index (deterministic).
+    // Descending score, ties by ascending original index.
     let mut order: Vec<usize> = (0..dets.len()).collect();
     order.sort_by(|&i, &j| dets[j].score.total_cmp(&dets[i].score).then(i.cmp(&j)));
 
-    // Canonicalize once so degenerate (inverted) boxes have well-defined areas,
-    // and precompute each box's area once (the O(N^2) loop below would otherwise
-    // recompute both operands' areas on every pair).
+    // Canonicalize each box and precompute its area.
     let boxes: Vec<BoundingBox> = dets.iter().map(|d| d.bbox.to_canonical()).collect();
     let areas: Vec<f32> = boxes.iter().map(box_area).collect();
 
@@ -316,8 +259,8 @@ pub fn merge_tiled_detections(dets: Vec<DetectBox>, cfg: &MergeConfig) -> Vec<De
         let base_box = boxes[i];
         let base_area = areas[i];
         let base_label = dets[i].label;
-        // What the group becomes. Keep-best never touches these; union grows
-        // the box over every matched candidate and takes the max score.
+        // What the group becomes: keep-best leaves these unchanged; union
+        // grows the box over every matched candidate and takes the max score.
         let mut out_box = base_box;
         let mut out_score = dets[i].score;
 
@@ -328,8 +271,8 @@ pub fn merge_tiled_detections(dets: Vec<DetectBox>, cfg: &MergeConfig) -> Vec<De
             if !cfg.class_agnostic && dets[j].label != base_label {
                 continue;
             }
-            // Metric measured against the ORIGINAL base box (parity with the
-            // reference), using cached areas.
+            // Metric measured against the original base box, using cached
+            // areas.
             if metric_value_with_areas(cfg.metric, &base_box, base_area, &boxes[j], areas[j])
                 >= cfg.threshold
             {
@@ -364,16 +307,13 @@ pub fn merge_tiled_detections(dets: Vec<DetectBox>, cfg: &MergeConfig) -> Vec<De
 
 /// Streaming collector for one frame's tiled detections. A pipelined runtime
 /// pushes each tile's per-tile-decoded boxes as inference completes (any
-/// order), then finalizes once every tile has arrived — the "collect after the
-/// final tile" fan-in. Not internally synchronized; keep one accumulator per
-/// in-flight frame.
+/// order), then finalizes once every tile has arrived. Not internally
+/// synchronized; keep one accumulator per in-flight frame.
 #[derive(Debug, Clone)]
 pub struct TiledFrameAccumulator {
     frame_dims: (f32, f32),
     tiles_total: usize,
-    /// Per-tile-index arrival flags — makes `push_tile` idempotent and the
-    /// completion fence robust to duplicate / out-of-range / retried pushes
-    /// (an at-least-once async pipeline can deliver the same tile twice).
+    /// Per-tile-index arrival flags.
     seen: Vec<bool>,
     received: usize,
     dets: Vec<DetectBox>,
@@ -412,13 +352,12 @@ impl TiledFrameAccumulator {
     /// them. Idempotent per `placement.index`: a duplicate, out-of-range, or
     /// foreign placement (one whose `count` disagrees with this accumulator's
     /// `tiles_total`, i.e. from a different plan/frame) is ignored and its boxes
-    /// dropped, so out-of-order **and** at-least-once delivery both converge to
-    /// the same result. Returns `true` if the tile was newly accepted, `false`
+    /// dropped. Returns `true` if the tile was newly accepted, `false`
     /// otherwise.
     pub fn push_tile(&mut self, tile_boxes: Vec<DetectBox>, placement: &TilePlacement) -> bool {
         let idx = placement.index;
-        // Runtime guard (not debug-only): reject placements from a different
-        // plan so a mixed-frame mistake can't corrupt fan-in completion.
+        // Reject placements from a different plan, out-of-range indices and
+        // duplicates.
         if placement.count != self.tiles_total || idx >= self.tiles_total || self.seen[idx] {
             return false;
         }
@@ -455,11 +394,9 @@ impl TiledFrameAccumulator {
         out
     }
 
-    /// Merge then renormalize to `[0,1]` by `frame_dims` (for the tracker,
-    /// matching the non-tiled normalized-detection contract).
+    /// Merge then renormalize to `[0,1]` by `frame_dims`.
     ///
-    /// Returns an empty list when `frame_dims` are non-finite or non-positive
-    /// rather than emitting Inf/NaN coordinates.
+    /// Returns an empty list when `frame_dims` are non-finite or non-positive.
     #[must_use]
     pub fn finalize_normalized(self) -> Vec<DetectBox> {
         let (fw, fh) = self.frame_dims;
@@ -531,8 +468,8 @@ mod tests {
 
     #[test]
     fn lift_with_letterbox_inverts_then_scales() {
-        // A box filling the letterbox content region should, after un-padding,
-        // fill the crop and lift identically to the no-letterbox full-crop box.
+        // A box filling the letterbox content region fills the crop after
+        // un-padding.
         let mut p = placement((0.0, 0.0), (640.0, 640.0));
         p.content_region = Some([0.1, 0.1, 0.9, 0.9]);
         let lifted = lift_tile_boxes(vec![det([0.1, 0.1, 0.9, 0.9], 0.9, 0)], &p);
@@ -591,7 +528,7 @@ mod tests {
     #[test]
     fn lift_letterbox_clamp_fires_and_no_div_by_zero() {
         // A box outside the letterbox content region clamps to the edge; a
-        // degenerate (zero-span) letterbox axis must not divide by zero.
+        // degenerate (zero-span) letterbox axis gives a finite result.
         let p = TilePlacement {
             index: 0,
             count: 1,
@@ -618,8 +555,7 @@ mod tests {
 
     #[test]
     fn ios_merges_fragment_iou_does_not() {
-        // From modelpack tests/test_tiled_merge.py: B fully inside A
-        // (IoS=1.0, IoU=0.167).
+        // B fully inside A (IoS=1.0, IoU=0.167).
         let a = det([100.0, 100.0, 400.0, 300.0], 0.9, 0);
         let b = det([350.0, 100.0, 400.0, 300.0], 0.7, 0);
 
@@ -672,7 +608,7 @@ mod tests {
 
     #[test]
     fn merge_enclosing_union_for_partial_overlap() {
-        // Legacy `Union` mode: two boxes overlapping >=0.5 IoS merge to their
+        // `Union` mode: two boxes overlapping >=0.5 IoS merge to their
         // enclosing union carrying the group's max score.
         let a = det([0.0, 0.0, 100.0, 100.0], 0.9, 0);
         let b = det([50.0, 0.0, 150.0, 100.0], 0.8, 0); // IoS = 0.5
@@ -692,10 +628,9 @@ mod tests {
 
     #[test]
     fn keep_best_keeps_base_box_unchanged_for_partial_overlap() {
-        // Same geometry as the union test: the lower-scoring box extends
-        // beyond the base and matches at IoS >= 0.5. `KeepBest` (the
-        // default) suppresses it and leaves the base box's coordinates and
-        // score unchanged -- it must not grow into the union.
+        // The lower-scoring box extends beyond the base and matches at IoS
+        // >= 0.5: `KeepBest` suppresses it and leaves the base box's
+        // coordinates and score unchanged.
         let a = det([0.0, 0.0, 100.0, 100.0], 0.9, 0);
         let b = det([50.0, 0.0, 150.0, 100.0], 0.8, 0); // IoS = 0.5
         let merged = merge_tiled_detections(
@@ -712,7 +647,7 @@ mod tests {
         assert_eq!(merged[0].score, a.score);
         assert_eq!(merged[0].label, a.label);
 
-        // The default config is keep-best, so it must give the same answer.
+        // The default config is keep-best.
         let by_default = merge_tiled_detections(vec![a, b], &MergeConfig::default());
         assert_eq!(by_default.len(), 1);
         assert_eq!(by_default[0].bbox, a.bbox);
@@ -721,10 +656,8 @@ mod tests {
 
     #[test]
     fn keep_best_still_suppresses_every_matched_box_in_the_group() {
-        // Suppression, not a no-op: three same-class boxes chained through
-        // the base collapse to the base alone, and a box matched only
-        // against a suppressed box (not the base) survives, exactly as the
-        // reference's "metric against the ORIGINAL base box" rule dictates.
+        // Three same-class boxes chained through the base collapse to the
+        // base alone; a box matched only against a suppressed box survives.
         let base = det([0.0, 0.0, 100.0, 100.0], 0.9, 0);
         let right = det([50.0, 0.0, 150.0, 100.0], 0.8, 0); // IoS 0.5 with base
         let inside = det([10.0, 10.0, 40.0, 40.0], 0.7, 0); // fully inside base
@@ -740,8 +673,6 @@ mod tests {
 
     #[test]
     fn default_merge_mode_is_keep_best() {
-        // The Ocean Cleanup ADIS 4K study (TOP2-836) measured the enclosing
-        // union at about -0.05 AP50 on every frame; keep-best is the default.
         assert_eq!(MergeConfig::default().mode, MergeMode::KeepBest);
         assert_eq!(MergeMode::default(), MergeMode::KeepBest);
     }
@@ -761,7 +692,7 @@ mod tests {
 
     #[test]
     fn merge_threshold_boundary_is_inclusive() {
-        // IoS exactly == threshold must merge (>=, not >).
+        // IoS exactly == threshold merges.
         let a = det([0.0, 0.0, 100.0, 100.0], 0.9, 0);
         let b = det([50.0, 0.0, 150.0, 100.0], 0.8, 0); // IoS = 0.5 exactly
         let merged = merge_tiled_detections(
@@ -897,27 +828,26 @@ mod tests {
     fn accumulator_dedups_and_ignores_overpush() {
         let mut acc = TiledFrameAccumulator::new((640.0, 640.0), 2, MergeConfig::default(), 8);
         assert!(acc.push_tile(vec![], &empty_placement(0, 2)));
-        // Duplicate index 0 is ignored (idempotent under at-least-once delivery).
+        // Duplicate index 0 is ignored.
         assert!(!acc.push_tile(vec![], &empty_placement(0, 2)));
         assert_eq!(acc.remaining(), 1);
         assert!(!acc.is_complete());
         assert!(acc.push_tile(vec![], &empty_placement(1, 2)));
         assert!(acc.is_complete());
-        // Out-of-range index is ignored, never over-counts.
+        // Out-of-range index is ignored.
         assert!(!acc.push_tile(vec![], &empty_placement(2, 2)));
         assert_eq!(acc.remaining(), 0);
     }
 
     #[test]
     fn accumulator_rejects_foreign_plan_count() {
-        // A placement from a different plan (count != tiles_total) is rejected
-        // at runtime — not just under debug_assert — so a mixed-frame mistake
-        // can't corrupt fan-in completion.
+        // A placement from a different plan (count != tiles_total) is
+        // rejected.
         let mut acc = TiledFrameAccumulator::new((640.0, 640.0), 3, MergeConfig::default(), 8);
         assert!(!acc.push_tile(vec![], &empty_placement(0, 4)));
         assert_eq!(acc.remaining(), 3);
         assert!(!acc.is_complete());
-        // The same index from the correct plan is still accepted afterward.
+        // The same index from the matching plan is accepted.
         assert!(acc.push_tile(vec![], &empty_placement(0, 3)));
         assert_eq!(acc.remaining(), 2);
     }
@@ -1024,19 +954,17 @@ mod tests {
 
     // --- end-to-end: accumulator -> merge -> tracker ----------------------
 
-    /// One tile sees the whole object, an overlapping tile sees a contained
-    /// fragment of it. IOS merges them into a single full-frame detection that
-    /// the tracker resolves to ONE track; IOU leaves two, yielding TWO tracks
-    /// (the negative control proving IOS does its job, not that it collapses
-    /// everything).
+    /// A whole object in one tile and a contained fragment in an overlapping
+    /// tile merge under IOS into one detection and one track; IOU leaves two
+    /// detections and two tracks.
     #[cfg(feature = "tracker")]
     #[test]
     fn e2e_ios_one_track_iou_two_tracks() {
         use edgefirst_tracker::{ByteTrackBuilder, Tracker};
 
-        // Two distinct tiles (indices 0 and 1) of a 2-tile frame, each lifted via
-        // a whole-frame placement so tile 0 yields the full object and tile 1 a
-        // contained fragment — simulating overlapping tiles seeing the same object.
+        // Two tiles of a 2-tile frame, each lifted via a whole-frame
+        // placement: tile 0 yields the full object, tile 1 a contained
+        // fragment.
         let p0 = TilePlacement {
             index: 0,
             count: 2,

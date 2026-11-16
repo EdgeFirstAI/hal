@@ -22,15 +22,15 @@ pub enum EfCodec {
     Png = 1,
     /// H.264, as an Annex B byte stream.
     H264 = 2,
-    /// HEVC, as an Annex B byte stream. No engine runs it yet.
+    /// HEVC, as an Annex B byte stream. No engine runs it.
     Hevc = 3,
     /// Motion JPEG: a stream of JPEG pictures.
     Mjpeg = 4,
-    /// VP8. No engine runs it yet.
+    /// VP8. No engine runs it.
     Vp8 = 5,
-    /// VP9. No engine runs it yet.
+    /// VP9. No engine runs it.
     Vp9 = 6,
-    /// AV1. No engine runs it yet.
+    /// AV1. No engine runs it.
     Av1 = 7,
 }
 
@@ -276,8 +276,7 @@ impl EfCodecCapabilities {
                 }
             })
             .collect();
-        // The pointers are to the strings' heap buffers, which stay put when
-        // the vectors holding them move into the list.
+        // Pointers to the strings' heap buffers.
         let items = found
             .iter()
             .zip(&strings)
@@ -301,8 +300,8 @@ impl EfCodecCapabilities {
 
 /// Probes the codec engines on this machine.
 ///
-/// Probing opens no stream, but it opens device nodes and enumerates (on
-/// Windows, activates) transforms, so it is not free: call it once.
+/// Probing opens no stream; it opens device nodes and enumerates (on
+/// Windows, activates) transforms.
 ///
 /// @return the list, freed with [`ef_codec_capabilities_free`]; `NULL` only
 ///         if allocation fails.
@@ -378,8 +377,7 @@ mod tests {
         );
     }
 
-    /// The CPU JPEG encoder is on every machine, so the probe always has an
-    /// entry whose strings can be read back.
+    /// The probe lists the CPU JPEG encoder, and its strings read back.
     #[test]
     fn the_probe_lists_the_cpu_jpeg_encoder_with_its_formats() {
         let list = ef_codec_capabilities_new();

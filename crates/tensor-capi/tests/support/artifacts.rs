@@ -2,39 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Finding, freshness-checking and reading the built C libraries.
 //!
-//! The five modular C-API leaves are workspace-excluded standalone packages,
-//! so where cargo puts their artifacts depends on how they were built, and
-//! every leaf's tests need the same three answers: which directory holds the
-//! library, is it newer than the sources it is supposed to prove something
-//! about, and what does it export. This module is the one place those live.
-//!
-//! Test support only, `#[path]`-included by each leaf's test module. `env!`
-//! expands during the *including* crate's compilation, so
-//! `CARGO_MANIFEST_DIR` here is that leaf's own directory; nothing needs to
-//! be passed in.
+//! Test support only, `#[path]`-included by each modular C-API leaf's test
+//! module. `env!` expands during the including crate's compilation, so
+//! `CARGO_MANIFEST_DIR` here is that leaf's own directory.
 
 use std::path::{Path, PathBuf};
 
-/// Report a skipped check on stderr as `SKIPPED: {reason}`.
-///
-/// Straight to the handle, not `eprintln!`: libtest captures a passing
-/// test's `eprintln!`, and a skip nobody sees is indistinguishable from a
-/// pass.
-///
-/// The `SKIPPED:` spelling is the wire format, not a nicety --
-/// `scripts/on-target-test.sh` greps each board's captured log for that
-/// literal to report a skip count, and `edgefirst-image`'s
-/// `test_support::report_skip` emits the same line. The earlier `SKIP:`
-/// prefix here was invisible to that count.
-///
-/// Every skip line the five leaves EMIT carries that prefix. Three places
-/// cannot call this function and write it themselves, each for a stated
-/// reason: `msvc.rs` beside this file (its own `#[path]`-included twin),
-/// `tests/check_abi.rs` (an integration test cannot see the library
-/// crate's `#[cfg(test)]` items -- its header says so), and the
-/// `codec`/`decoder`/`tracker` leaves, which do not `#[path]`-include this
-/// module at all. A C leaf test's `SKIP:` lines are captured into its
-/// `std::process::Output`; the Rust caller forwards them with [`relay_skips`].
+/// Report a skipped check by writing `WARNING: SKIPPED: {reason}` directly
+/// to stderr.
 pub fn skip(reason: &str) {
     use std::io::Write;
     let _ = writeln!(std::io::stderr(), "WARNING: SKIPPED: {reason}");
@@ -52,14 +27,9 @@ pub fn relay_skips(test: &str, out: &std::process::Output) {
 }
 
 /// Directories that may hold this leaf's built C libraries, in the order
-/// they are searched.
-///
-/// The target directory depends on how the leaf was built:
-/// `CARGO_TARGET_DIR`, an explicit `--target-dir` (what the Makefile and CI
-/// pass), or the leaf's own `crates/<leaf>/target`. This test binary itself
-/// sits in `<target dir>/<profile>/deps`, so its own path names the
-/// directory and profile cargo actually used; the rest are fallbacks for a
-/// `cargo build` and a `cargo test` that were given different ones.
+/// they are searched: the profile directory of this test binary,
+/// `CARGO_TARGET_DIR/debug`, the workspace `target/debug`, and the leaf's
+/// own `target/debug`.
 pub fn artifact_dirs() -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = Vec::new();
     let mut add = |dir: PathBuf| {
@@ -101,14 +71,7 @@ pub fn cdylib_name(stem: &str) -> String {
     }
 }
 
-/// Is `artifact` newer than everything in `src_dir`?
-///
-/// Every check that reads a compiled artifact needs this, because neither
-/// `cargo test` nor `cargo test --all-targets` builds the `staticlib` /
-/// `cdylib` targets -- only `cargo build` does. A check that skips it
-/// silently validates a library built *before* the change under test, which
-/// is exactly how the "no accessor is exported" check was found to be
-/// vacuous.
+/// Checks that `artifact` is at least as new as every file in `src_dir`.
 pub fn freshness(artifact: &Path, src_dir: &Path) -> Result<(), String> {
     let built = std::fs::metadata(artifact)
         .and_then(|m| m.modified())
@@ -137,18 +100,9 @@ pub fn freshness(artifact: &Path, src_dir: &Path) -> Result<(), String> {
 /// The first directory in [`artifact_dirs`] holding a `name` newer than
 /// `src_dir`.
 ///
-/// A stale hit is passed over rather than returned: a leaf built into the
-/// workspace `target/` and a `cargo test` run with a different target
-/// directory both leave a copy behind, and the older one proves nothing. A
-/// stale copy is only reported when no candidate is fresh, so the reason a
-/// caller prints names the real problem.
-///
-/// Default is a **loud skip**, not a panic: panicking would make plain
-/// `cargo test` fail for everyone after any edit, and a clearly-reported
-/// skip does not carry the failure mode being guarded -- nobody reads "NOT
-/// CHECKED" as a pass. Set `EF_REQUIRE_FRESH_ARTIFACTS=1` where build order
-/// is guaranteed (the Makefile's capi lane and CI) to turn a stale-only
-/// result into a hard failure.
+/// A stale copy is passed over, and reported only when no candidate is
+/// fresh. A stale-only result returns `Err`, or panics when
+/// `EF_REQUIRE_FRESH_ARTIFACTS` is set.
 pub fn find_artifact(name: &str, src_dir: &Path) -> Result<PathBuf, String> {
     let dirs = artifact_dirs();
     let mut stale = Vec::new();
@@ -185,12 +139,7 @@ pub fn find_cdylib(stem: &str, src_dir: &Path) -> Result<PathBuf, String> {
     find_artifact(&cdylib_name(stem), src_dir)
 }
 
-/// File names starting with `prefix` in **every** candidate directory.
-///
-/// The `_capi` check reads this: a stale `libedgefirst_tensor_capi.so` in a
-/// target directory this run did not build into is exactly the file an
-/// install or link step can still pick up, so scanning only the directory
-/// that happened to hold the fresh library would miss it.
+/// File names starting with `prefix` in every candidate directory.
 pub fn artifacts_named(prefix: &str) -> Vec<String> {
     let mut found: Vec<String> = Vec::new();
     for dir in artifact_dirs() {
@@ -210,8 +159,7 @@ pub fn artifacts_named(prefix: &str) -> Vec<String> {
 /// Every symbol `lib` exports, read with `nm`.
 #[cfg(not(windows))]
 pub fn symbols_of(lib: &Path) -> Result<Vec<String>, String> {
-    // -g: external symbols only. -U/--defined-only: skip undefined ones,
-    // which would otherwise include every libc symbol we merely call.
+    // -g: external symbols only. -U/--defined-only: skip undefined ones.
     let args: &[&str] = if cfg!(target_os = "macos") {
         &["-gU"]
     } else {
@@ -236,16 +184,12 @@ pub fn symbols_of(lib: &Path) -> Result<Vec<String>, String> {
         .map(|s| s.trim_start_matches('_').to_string())
         .collect();
     if syms.is_empty() {
-        // An empty list would make every "X is absent" assertion pass.
         return Err(format!("nm listed no symbol in {}", lib.display()));
     }
     Ok(syms)
 }
 
 /// Every symbol `lib` exports, read with `dumpbin /exports`.
-///
-/// `super::msvc` is the sibling support module each leaf includes beside
-/// this one, by the same `#[path]`.
 #[cfg(windows)]
 pub fn symbols_of(lib: &Path) -> Result<Vec<String>, String> {
     super::msvc::toolchain()?.exports(lib)

@@ -1,10 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 //
-// S4: synchronization. What a same-device consumer needs after GL work,
-// the D3D11 fence as the completion primitive (event wait, shared handle,
-// cross-device wait), and the immediate context driven from a non-GL
-// thread while two GL contexts alternate the way HAL processors do.
+// S4: synchronization. A same-device consumer after GL work, the D3D11
+// fence as the completion primitive (event wait, shared handle, cross-device
+// wait), and the immediate context driven from a non-GL thread while two GL
+// contexts alternate.
 #include "probe.h"
 
 #include <atomic>
@@ -222,15 +222,14 @@ void run_s4(GlSession& s, const char* prefix) {
 
   // ---- S4.4 two GL contexts on two threads + a non-GL consumer thread -----
   // Worker A renders a 512x512 gradient, worker B a 256x256 gradient, each
-  // with its own context permanently current, serialized by one mutex the
-  // way HAL processors are. The consumer copies both textures to staging
-  // and checks them from a third thread.
-  // Variant 0: HAL model (per-message re-sync, consumer under the mutex).
+  // with its own context permanently current, serialized by one mutex. The
+  // consumer copies both textures to staging and checks them from a third
+  // thread.
+  // Variant 0: per-message re-sync, consumer under the mutex.
   // Variant 1: consumer without the mutex, ID3D11Multithread protection on.
-  // Variant 2: no re-sync (control; the ANGLE state quirk the HAL hit).
+  // Variant 2: no re-sync (control).
   for (int variant = 0; variant < 2; variant++) s4_variant(s, ID("4"), variant);
-  // The control crashed the process on the RTX (ANGLE state manager with
-  // no re-sync), so it runs in a child and only its exit code is recorded.
+  // The control runs in a child; only its exit code is recorded.
   {
     DWORD code = spawn_self(L"--s4-control", 60000);
     report(ID("4"), Verdict::Info, "control (no per-message re-sync) in a child process: exit code 0x%08lx%s",
@@ -284,9 +283,7 @@ void s4_variant(GlSession& s, const char* id, int variant) {
     const int kFramesPerThread = 1500;
     bool resync = variant != 2;
     eglMakeCurrent(s.dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
-    // Context creation and teardown on the ANGLE/D3D11 display are not
-    // safe concurrently (the HAL holds its lifecycle lock around processor
-    // bring-up for that reason), so both happen under the mutex.
+    // Context creation and teardown happen under the mutex.
     auto worker = [&](ID3D11Texture2D* t, uint32_t tw, uint32_t th, std::atomic<int>& frames) {
       EGLContext c;
       EGLSurface d;

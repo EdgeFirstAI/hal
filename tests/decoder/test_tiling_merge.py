@@ -3,9 +3,7 @@
 
 """Pure-numpy tests for the tiled-detection postprocessing bindings.
 
-No GPU is touched: these exercise ``lift_tile_boxes``, ``merge_tiled_detections``
-and ``TiledFrameAccumulator`` against the canonical IOS-vs-IOU cases ported from
-ModelPack ``tests/test_tiled_merge.py``.
+Covers ``lift_tile_boxes``, ``merge_tiled_detections`` and ``TiledFrameAccumulator``.
 """
 
 import numpy as np
@@ -81,8 +79,8 @@ def test_merge_respects_class_unless_agnostic():
 
 
 def test_merge_enclosing_union_for_partial_overlap():
-    # Legacy ``MergeMode.Union``: two boxes overlapping exactly IoS == 0.5
-    # merge to their enclosing union.
+    # ``MergeMode.Union``: two boxes overlapping at exactly IoS == 0.5 merge to
+    # their enclosing union.
     bbox, sc, cl = _triple([[0, 0, 100, 100], [50, 0, 150, 100]], [0.9, 0.8], [0, 0])
     b, s, _ = merge_tiled_detections(
         bbox,
@@ -108,11 +106,9 @@ def test_keep_best_keeps_the_base_box_for_partial_overlap():
 
 
 def test_default_merge_mode_is_keep_best():
-    # TOP2-836: the enclosing union measured about -0.05 AP50 on every frame
-    # of the Ocean Cleanup ADIS 4K validation, so suppression is the default.
     assert MergeConfig().mode == MergeMode.KeepBest
     assert MergeConfig(mode=MergeMode.Union).mode == MergeMode.Union
-    # ``mode`` is the last keyword so positional callers keep working.
+    # ``mode`` is the last positional argument.
     positional = MergeConfig(MatchMetric.Ios, 0.5, False, 300, 0.0, MergeMode.Union)
     assert positional.mode == MergeMode.Union
     assert "mode=Union" in repr(positional)
@@ -251,7 +247,7 @@ def test_accumulator_dedups_duplicate_push():
     frame, (p0, t0), (_p1, _t1) = _seam_tiles()
     acc = TiledFrameAccumulator(frame, 2, MergeConfig())
     assert acc.push_tile(*t0, p0) is True
-    # Duplicate index is ignored (idempotent under at-least-once delivery).
+    # A duplicate index is ignored.
     assert acc.push_tile(*t0, p0) is False
     assert acc.remaining() == 1
 

@@ -1,13 +1,9 @@
 #!/usr/bin/env python3
 """Fix coverage.py XML report paths for SonarCloud compatibility.
 
-The issue: coverage.py/pytest-cov/slipcover generate relative file paths
-that may not match the repository structure expected by SonarCloud.
-
-This script post-processes the Cobertura XML to:
+Post-processes the Cobertura XML to:
 1. Set <source> to the current directory (.)
 2. Ensure filenames have the correct package prefix
-3. Make paths resolvable by SonarCloud
 
 Known repo-relative roots (``tests/``, ``crates/``, ``scripts/``,
 ``.github/``) are left unchanged. Only bare or otherwise ambiguous
@@ -23,7 +19,7 @@ import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-# Paths that are already repo-relative and must not be rewritten.
+# Roots of paths that are left unchanged.
 KNOWN_ROOTS = ("tests/", "crates/", "scripts/", ".github/")
 
 
@@ -61,7 +57,7 @@ def fix_coverage_xml(xml_file: str, source_dir: str = "tests") -> None:
 
     fixed_count = 0
 
-    # Sonar expects <source> to be the root directory where files are located
+    # Set <source> to the root directory.
     sources = root.findall(".//sources/source")
     if sources:
         for source_elem in sources:

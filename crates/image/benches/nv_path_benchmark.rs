@@ -4,17 +4,16 @@
 //! NV12/NV16/NV24 conversion-path A/B benchmark (`ExternalSampler` vs
 //! `ShaderR8`), cross-platform.
 //!
-//! Self-contained: sources are synthesized (Y luma gradient + neutral chroma),
-//! so NO testdata files are required on the target. Run twice per platform,
-//! forcing each path, then compare:
+//! Sources are synthesized (Y luma gradient + neutral chroma), so no testdata
+//! files are required. Run twice per platform, forcing each path:
 //!
 //! ```bash
 //! EDGEFIRST_NV_CONVERT_PATH=sampler ./nv_path_benchmark --json sampler.json
 //! EDGEFIRST_NV_CONVERT_PATH=shader  ./nv_path_benchmark --json shader.json
 //! ```
 //!
-//! On non-DMA backends (e.g. orin) NV* takes the R8-upload `ShaderR8` path
-//! regardless of the env var; the run still records its latency.
+//! On non-DMA backends NV* takes the R8-upload `ShaderR8` path regardless of
+//! the env var.
 
 mod common;
 
@@ -62,8 +61,7 @@ fn main() {
         }
     };
 
-    // Camera 1280x720 → model 640x640 (the profiler's letterbox geometry).
-    // Placement is now derived by `Crop::resolve` from the src/dst dims.
+    // Camera 1280x720 → model 640x640.
     let (in_w, in_h) = (1280usize, 720usize);
     let (out_w, out_h) = (640usize, 640usize);
     let lb_crop = Crop::letterbox([114, 114, 114, 255]);
@@ -90,7 +88,7 @@ fn main() {
         }
         let src_bytes = nv_len(fmt, in_w, in_h) as u64;
 
-        // (1) Convert, same size → RGBA (sampling cost, no resize).
+        // (1) Convert, same size → RGBA (no resize).
         if let Ok(mut dst) = proc.create_image(
             in_w,
             in_h,
@@ -111,7 +109,7 @@ fn main() {
             }
         }
 
-        // (2) Letterbox 720p → 640x640 packed RGB (the profiler op).
+        // (2) Letterbox 720p → 640x640 packed RGB.
         if let Ok(mut dst) = proc.create_image(
             out_w,
             out_h,

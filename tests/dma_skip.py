@@ -3,15 +3,8 @@
 
 """Skip when DMABUF allocation fails because the host has no usable dma-heap.
 
-The C API wraps ``PermissionDenied`` as ``IoError(Custom { kind: Other })``,
-so the Python message is ``image_alloc: … Permission denied`` rather than a
-bare ``PermissionDenied`` kind. Matching only ``errno`` / ``e.kind()``
-misses that wrap. Other I/O errors must still fail the test.
-
-Windows has no ``TensorMemory::DmaBuf`` backing at all (the GPU path there
-is PBO via ANGLE), so the allocator reports ``NotImplemented`` rather than a
-permission problem; that is the same "this host cannot allocate DMA" fact
-and skips too.
+A permission-denied message and, on Windows, a not-implemented message count as
+unavailable; any other error fails the test.
 """
 
 from __future__ import annotations
@@ -38,12 +31,7 @@ def dma_unavailable(exc: BaseException) -> bool:
 
 
 def skip_dma(reason: str) -> None:
-    """Skip a DMA-BUF test, or fail it under ``HAL_TEST_REQUIRE_DMA=1``.
-
-    The Python counterpart of ``crates/tensor/tests/support/dma_require.rs``:
-    a lane that is meant to have a usable heap must not report a skipped DMA
-    test as a pass.
-    """
+    """Skip a DMA-BUF test, or fail it under ``HAL_TEST_REQUIRE_DMA=1``."""
     if os.environ.get("HAL_TEST_REQUIRE_DMA") == "1":
         pytest.fail(
             f"HAL_TEST_REQUIRE_DMA=1 but a DMA test would have skipped: {reason}"

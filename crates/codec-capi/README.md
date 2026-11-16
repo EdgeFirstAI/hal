@@ -115,7 +115,7 @@ Every codec runs on an engine (`ef_codec_engine`). `EF_CODEC_ENGINE_AUTO` takes 
 
 There is no software video codec: where no engine runs a codec, opening it fails with `ENOTSUP` or `ENODEV`. `ef_codec_capabilities_new` lists what this machine's engines do, with each one's device, pixel formats and how frames move (`EF_CODEC_TRANSFER_ZERO_COPY`, `_GPU_COPY`, `_CPU_COPY`). Probing opens devices, so do it once.
 
-`ef_codec_v4l2_available` and `ef_codec_nvjpeg_available` remain as quick probes for the JPEG decoders.
+`ef_codec_v4l2_available` and `ef_codec_nvjpeg_available` are quick probes for the JPEG decoders.
 
 ## Errors
 

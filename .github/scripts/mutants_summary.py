@@ -2,19 +2,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright © 2026 Au-Zone Technologies. All Rights Reserved.
 """
-Roll tonight's cargo-mutants shards up into one markdown report and gate on it.
+Roll the cargo-mutants shards up into one markdown report and gate on it.
 
 Each shard uploads a `mutants.out/` directory, plus a `leg.json` marker the
-workflow writes beside it. The authoritative source is `outcomes.json`, which
-carries a record per mutant: the file, the function, the mutation applied, the
-diff, and the log of the build and test phases. The per-outcome `.txt` files
-carry the same mutants as bare names and are used only when a shard failed to
-write its JSON.
+workflow writes beside it. `outcomes.json` carries a record per mutant: the
+file, the function, the mutation applied, the diff, and the log of the build
+and test phases. The per-outcome `.txt` files carry the same mutants as bare
+names and are read when a shard has no JSON.
 
-cargo-mutants mutates source text and knows nothing about `#[cfg]`. A mutant
-in code the leg's target does not compile passes the suite by construction, so
-a raw "missed" says nothing about the tests until it is known that the leg
-built the mutated code. Every mutant is therefore classified per leg:
+Every mutant is classified per leg:
 
 * **unbuilt** when the build phase left the mutated crate `Fresh` (the file is
   not in the crate's dependency graph on this target), when the file's module
@@ -33,8 +29,8 @@ Usage:
 
 Exit codes:
     0  every mutant built on some leg was caught (timeouts are reported, not gated)
-    1  at least one legitimate survivor, or a leg left unbuilt a file its
-       target is expected to compile (the leg is broken, not the tests weak)
+    1  at least one survivor, or a leg left unbuilt a file its target is
+       expected to compile
     2  no shard produced a readable report, or no mutant was tested
 """
 
@@ -46,13 +42,10 @@ import re
 import sys
 from pathlib import Path
 
-# GitHub truncates $GITHUB_STEP_SUMMARY above 1 MiB, and truncation lands
-# mid-markdown: the last table or <details> renders as raw text. Staying under
-# the cap deliberately keeps the report well formed.
+# Size cap of $GITHUB_STEP_SUMMARY.
 STEP_SUMMARY_LIMIT = 1024 * 1024
 
-# cargo-mutants diffs span the whole mutated function, which for a long
-# function buries the one changed line under a screen of context.
+# Context lines kept either side of a changed line in a mutant's diff.
 DIFF_CONTEXT = 3
 
 SUMMARY_TO_KEY = {
@@ -64,8 +57,7 @@ SUMMARY_TO_KEY = {
 
 OUTCOME_KEYS = ("caught", "missed", "timeout", "unviable", "unbuilt")
 
-# `tested` excludes unviable and unbuilt: neither was put to the suite, so
-# counting them would flatter the caught percentage.
+# Outcomes counted as tested; unviable and unbuilt are excluded.
 TESTED_KEYS = ("caught", "missed", "timeout")
 
 MEANINGS = {
@@ -88,7 +80,7 @@ LABELS = {
 MUTANT_NAME = re.compile(r"^(?P<file>.+?):(?P<line>\d+):(?P<col>\d+): (?P<what>.*)$")
 
 # `mutants-shard-7-ubuntu-24.04-arm`, `mutants-shard-tensor-3-windows-latest`.
-# The corpus prefix is optional so older artifact names still parse.
+# The corpus prefix is optional.
 SHARD_DIR = re.compile(
     r"^mutants-shard-(?:(?P<corpus>[a-z][a-z0-9_]*)-)?(?P<index>\d+)(?:-(?P<runner>.+))?$"
 )
@@ -120,7 +112,7 @@ def target_for_runner(runner):
     """Map a runner label to its compile target, or None when it is unknown.
 
     An unknown runner still has its outcomes merged; only the cfg evaluation
-    is skipped for it, so its survivors are never discounted by guesswork.
+    is skipped for it.
     """
     if not runner:
         return None
@@ -188,8 +180,7 @@ CFG_TOKEN = re.compile(r'[A-Za-z_][A-Za-z0-9_]*|"(?:[^"\\]|\\.)*"|[(),=]')
 def cfg_eval(expr, target, features):
     """Evaluate a cfg predicate: True, False, or None when it cannot be decided.
 
-    None is treated as "built" by every caller, so a predicate this evaluator
-    does not understand can only ever keep a survivor counted, never hide one.
+    Callers treat None as built.
     """
     tokens = CFG_TOKEN.findall(expr)
     pos = [0]
@@ -268,11 +259,8 @@ def cfg_eval(expr, target, features):
 def mask_source(src):
     """Blank comments and the contents of string/char literals, keeping offsets.
 
-    The result has the same length as `src` and the same newlines, so offsets
-    and line numbers carry over. Quote characters are kept, contents are
-    replaced with spaces, which keeps `#[cfg(` inside a doc comment or a
-    string from being read as an attribute and keeps a `{` inside a string
-    from unbalancing the brace matching.
+    The result has the same length as `src` and the same newlines. Quote
+    characters are kept and contents are replaced with spaces.
     """
     out = list(src)
     n = len(src)
@@ -325,8 +313,7 @@ def mask_source(src):
         if c == "'":
             # A char literal ('x', '\n', '\u{1F600}') or a lifetime ('a).
             if i + 1 < n and src[i + 1] == "\\":
-                # Search from past the escaped character so '\'' ends at
-                # its last quote.
+                # Search from past the escaped character.
                 j = src.find("'", i + 3)
                 if j != -1 and j - i < 14:
                     blank(i + 1, j)
@@ -687,14 +674,12 @@ def build_signal(out_dir, log_path, package):
     file is not in the crate's dependency graph on this target -- or
     ("dirty", file) naming the file cargo said changed, ("compiled", None)
     when it rebuilt without saying why, and (None, None) when the log is
-    missing or has no build phase. The dirty file is not always the mutated
-    one: when a shard moves on to a new file, cargo-mutants has just restored
-    the previous file, and cargo may name that instead.
+    missing or has no build phase. The dirty file can be the previously
+    mutated file that cargo-mutants restored.
     """
     if not log_path or not package:
         return None, None
-    # Paths recorded on the Windows leg use backslashes; the roll-up runs on
-    # Linux.
+    # Paths recorded on the Windows leg use backslashes.
     path = out_dir / log_path.replace("\\", "/")
     try:
         handle = path.open(encoding="utf-8", errors="replace")
@@ -814,8 +799,7 @@ def read_outcomes_json(out_dir, leg_label=""):
         line = start.get("line", line)
         col = start.get("column", col)
         function = (record.get("function") or {}).get("function_name", "")
-        # Only survivors get their diff read; the caught ones are the bulk of
-        # the corpus and nobody needs to see a mutation a test already failed.
+        # Only survivors get their diff read.
         diff = read_diff(out_dir, outcome.get("diff_path")) if key == "missed" else None
         mutant = Mutant(
             key=key,
@@ -874,10 +858,7 @@ def read_diff(out_dir, diff_path):
 def focus_diff(text):
     """Drop the file header and elide context far from any changed line.
 
-    cargo-mutants emits the whole mutated function, so a one-character change
-    inside a long function arrives under dozens of unchanged lines. Keeping
-    DIFF_CONTEXT lines either side of each change makes the mutation the thing
-    you see first.
+    Keeps DIFF_CONTEXT lines either side of each change.
     """
     lines = text.splitlines()
     while lines and lines[0].startswith(("--- ", "+++ ")):
@@ -918,9 +899,8 @@ def read_leg_marker(shard_dir):
 def names_same_file(dirty, workspace_path):
     """Whether cargo's `Dirty ...: the file X` names `workspace_path`.
 
-    Cargo prints the path relative to the workspace root on every leg seen so
-    far, but the form is cargo's choice: accept it crate-relative
-    (`src/lib.rs`) or absolute as well, by matching on whole path components.
+    Accepts the path workspace-relative, crate-relative (`src/lib.rs`) or
+    absolute, matching on whole path components.
     """
     if not dirty:
         return False
@@ -940,7 +920,7 @@ def classify(mutant, leg, index):
     Also records on the leg any file whose build contradicts the static scan.
     """
     if mutant.key == "unviable":
-        # It failed to compile, so the compiler read it.
+        # An unviable mutant counts as built.
         return None
     out_dir, log_path = mutant.log
     signal, dirty_file = (None, None)
@@ -972,8 +952,7 @@ def classify(mutant, leg, index):
 
     if file_ok is False:
         if signal == "dirty" and names_same_file(dirty_file, mutant.file):
-            # cargo rebuilt because this very file changed, so it is in the
-            # dependency graph and the scan was wrong. Trust the build.
+            # cargo rebuilt for this file while the scan called it cfg'd out.
             leg.scan_disagreements[mutant.file] = (
                 leg.scan_disagreements.get(mutant.file, 0) + 1
             )
@@ -1029,25 +1008,21 @@ def collect(shards_dir, repo=None):
     return merge_legs(mutants), list(legs.values()), shards
 
 
-# Best outcome first: one leg catching a mutant settles it. Unbuilt ranks last
-# because a leg that never compiled the mutant has no say in its outcome.
+# Best outcome first.
 OUTCOME_RANK = {"caught": 0, "timeout": 1, "missed": 2, "unviable": 3, "unbuilt": 4}
 
 
 def merge_legs(mutants):
     """Fold the same mutant seen on several legs into one.
 
-    Every leg mutates the same source, but cfg-gated code is compiled into only
-    some of the builds. A mutant is therefore caught when any leg caught it,
-    unbuilt when no leg built it, and only counts as having survived when every
-    leg that built it let it through. Survivors carry the legs that ran them.
+    A mutant is caught when any leg caught it, unbuilt when no leg built it,
+    and missed when every leg that built it missed it. Survivors carry the
+    legs that ran them.
     """
     merged = {}
     order = []
-    # A line holding two of the same operator produces two mutants that
-    # cargo-mutants names identically, so the name alone cannot pair them up
-    # across legs. Every leg enumerates the same corpus in the same order,
-    # which makes "the nth mutant with this name" a stable identity.
+    # Mutants are paired across legs by name and by their order among the
+    # mutants sharing that name.
     seen = {}
     for mutant in mutants:
         base = (mutant.file, mutant.line, mutant.col, mutant.what)
@@ -1072,9 +1047,7 @@ def merge_legs(mutants):
                 best.unbuilt_on.update(mutant.unbuilt_on)
                 if best.diff is None and mutant.diff is not None:
                     best.diff = mutant.diff
-        # Only legs that actually ran it. An unviable mutant never compiled
-        # and an unbuilt one was never compiled, so naming either leg would
-        # claim a build tested a mutation it never produced.
+        # Record only the legs that tested the mutant.
         if mutant.leg and mutant.key in TESTED_KEYS:
             best.arches.add(mutant.leg)
     return [merged[key] for key in order]
@@ -1128,8 +1101,7 @@ def render_header(counts, shards, total, start, legs=()):
     if total and start is not None:
         scope += f" from index {start} of {total}"
     labels = [leg.label for leg in legs if leg.label]
-    # Naming the legs only when more than one ran keeps a single-leg dispatch
-    # quiet and makes the split obvious on the nights it matters.
+    # Legs are named only when more than one ran.
     if len(labels) > 1:
         scope += f", on {', '.join(sorted(labels))}"
 
@@ -1152,8 +1124,7 @@ def render_header(counts, shards, total, start, legs=()):
     lines.append("| outcome | count | share of tested | what it means |")
     lines.append("| --- | ---: | ---: | --- |")
     for key in OUTCOME_KEYS:
-        # Unviable and unbuilt mutants are not part of `tested`, so a share of
-        # it would be arithmetic on two different denominators.
+        # Unviable and unbuilt mutants have no share of `tested`.
         share = "—" if key in ("unviable", "unbuilt") else pct(counts[key], tested)
         lines.append(f"| {key} | {counts[key]} | {share} | {MEANINGS[key]} |")
     lines.append("")
@@ -1195,9 +1166,7 @@ def render_legs(legs):
 def missing_shards(shards_dir, expected_matrix):
     """Shards the plan scheduled that left no report.
 
-    `expected_matrix` is the plan job's `{"include": [...]}` matrix. A shard
-    that timed out or was cancelled uploads nothing, so without this check
-    the night's totals would silently cover fewer mutants than scheduled.
+    `expected_matrix` is the plan job's `{"include": [...]}` matrix.
     """
     if not expected_matrix:
         return []
@@ -1275,9 +1244,7 @@ def render_gaps(groups, mutants):
         if mutant.key in TESTED_KEYS:
             tested_per_file[mutant.file] = tested_per_file.get(mutant.file, 0) + 1
 
-    # By rate first: four survivors out of four tested is a worse gap than
-    # five out of a hundred, and the count alone puts them the wrong way round.
-    # Count breaks ties so the bigger job of the two comes first.
+    # Sorted by survival rate, then survivor count, then file.
     rows = sorted(
         (
             (file, survivors, tested_per_file.get(file, survivors))
@@ -1300,7 +1267,7 @@ def render_gaps(groups, mutants):
 
 
 def render_files(mutants):
-    """Every file's merged outcomes, collapsed: the full picture per file."""
+    """Every file's merged outcomes, in a collapsed section."""
     per_file = {}
     for mutant in mutants:
         row = per_file.setdefault(mutant.file, {key: 0 for key in OUTCOME_KEYS})
@@ -1393,8 +1360,7 @@ def render_survivors(groups, with_diffs, limit=None, name_arch=False):
                 else:
                     pending_function.append(f"- {where}{mutant.what}")
                 shown += 1
-            # Two lines means the heading and its blank line, with every mutant
-            # under it dropped by the limit; emitting it would be a lie.
+            # A heading with no mutants under it is not emitted.
             if len(pending_function) > 2:
                 if not with_diffs:
                     pending_function.append("")
@@ -1419,9 +1385,6 @@ def render(mutants, legs, shards, total, start, budget):
     if not counts["missed"]:
         clean = "No mutant survived: every tested mutant failed a test."
         if counts["timeout"]:
-            # A timeout is not a pass. The mutant ran long enough to look like
-            # a hang, so whether a test would have caught it stays unresolved,
-            # and calling that a clean sweep overstates the run.
             clean = (
                 f"No mutant survived, but {plural(counts['timeout'], 'mutant')} "
                 "timed out rather than failing a test, so this is not a clean "
@@ -1439,9 +1402,8 @@ def render(mutants, legs, shards, total, start, budget):
         text = "\n".join(header + body + tail) + "\n"
         return text if len(text.encode("utf-8")) <= budget else None
 
-    # Prefer the full report, then the same list without diffs, then a list cut
-    # to whatever fits. Diffs are the first thing to go because the grouped
-    # names still say which functions to look at.
+    # Tries the full report, then the list without diffs, then a list cut
+    # to fit.
     body, _ = render_survivors(groups, with_diffs=True, name_arch=name_arch)
     text = fits(body, [])
     if text:
@@ -1545,8 +1507,6 @@ def main(argv=None):
     else:
         sys.stdout.write(report)
 
-    # A run that enumerates mutants but tests none is a no-op wearing a green
-    # tick, which is how this lane's first execution presented.
     for name in missing:
         print(f"::error::{name} was scheduled but uploaded no report", file=sys.stderr)
     if not shards:

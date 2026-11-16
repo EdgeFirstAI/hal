@@ -1,26 +1,9 @@
 # HAL-only Full lanes. Called from ci.yml (ci:full) and nightly.yml.
 #
 # runner-class: larger
-#   Full is speed-optimised and bills for it. These lanes name the billed
-#   labels directly rather than going through rust-full's runner-class inputs,
-#   because they are hal-specific jobs, not shared ones. The marker above tells
-#   the org runner audit this is intended rather than a Quick lane that leaked
-#   onto a billed runner.
-#
-#   Assignment follows the pre-migration measurements: the x86 workspace and
-#   software-GL lanes were xlarge and ran a 37 min median; Windows was standard
-#   and set the wall-clock floor at 55-63 job-minutes, so it moves up too.
-#   Phase 2 replaces linux and windows with the self-hosted fleet; macOS stays
-#   billed because there is no free equivalent.
-#
-#   Windows stays on the standard runner: the org has no Windows larger
-#   runner provisioned (orgs/EdgeFirstAI/actions/hosted-runners lists Linux
-#   images only), so windows-latest-8-cores would queue until the job timed
-#   out. Provisioning one is the remaining lever on hal's wall-clock floor.
 # Shared workflows: EdgeFirstAI/.github, pinned in the `uses:` lines below.
 # Generic Linux/arm/hardware/scancode live in rust-full.yml.
-# macOS (codesign + ANGLE) and Windows (gating pass + WARP) stay here because
-# rust-full runs unsigned nextest with a single nextest-args string.
+# The macOS (codesign + ANGLE) and Windows (gating pass + WARP) lanes are here.
 
 name: HAL Full extras
 
@@ -90,16 +73,9 @@ jobs:
         with:
           shared-key: rust-x86_64-extras
           cache-on-failure: true
-      # setup-coverage-env.sh and the report step below both shell out to
-      # cargo llvm-cov. The split of test.yml into this file dropped the tool
-      # install that the original build-and-test-x86 lane had, and Full had
-      # never run, so nothing caught it. Same pin as the old lane.
       - uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68  # v2.88.1
         with:
           tool: cargo-llvm-cov@0.6.16,cargo-nextest
-      # Folded in from the old doc-tests job: same runner, deps and toolchain,
-      # so it reuses this job's warm cache instead of compiling the workspace
-      # again under its own.
       - run: make test-doc
       - run: make lint-capi-modular
       - run: make lint-tensor-dynamic
@@ -114,28 +90,12 @@ jobs:
       - run: make test-tensor-dynamic
       - name: Set up coverage instrumentation
         run: .github/scripts/setup-coverage-env.sh
-      # These four stages are deliberately separate steps, not one run block.
-      # /tmp/coverage-env.sh points CARGO_TARGET_DIR and LLVM_PROFILE_FILE at
-      # the llvm-cov tree so maturin and the Python interpreter write profraw
-      # where the report can find it. cargo llvm-cov sets that environment up
-      # itself, so it must NOT inherit the sourced copy. In one shell the
-      # source leaks into every later command and splits the profraw into two
-      # pools, which is what made python-common report zero lines. Separate
-      # steps mean separate shells. test.yml had this shape; the migration
-      # collapsed it.
-      # Built on stable, like every other lane and like the wheels we ship.
-      # Coverage measures the configuration that reaches users: the
-      # `#[cfg(nightly)]` native-f16 path is not in a released wheel, so
-      # instrumenting it measured code nobody runs. `build_info()` reports
-      # which implementation is compiled in.
+      # /tmp/coverage-env.sh points CARGO_TARGET_DIR and LLVM_PROFILE_FILE at the
+      # llvm-cov tree; the steps that source it write profraw there.
       - name: Build Python bindings with coverage instrumentation
         run: |
           source /tmp/coverage-env.sh
-          # The wheels are built instrumented: loading them from Python writes
-          # profraw as pytest drives pyo3 into the real crates. python-common is
-          # an rlib linked into each cdylib, so those .so files are the only
-          # object carrying its lines.
-          # From each crate directory, whose .cargo/config.toml selects the dynamic tensor backend.
+          # Builds each wheel instrumented, from its crate directory.
           for pkg in tensor codec image decoder tracker kernels; do
             (cd "crates/python-$pkg" && "$GITHUB_WORKSPACE/venv/bin/maturin" build \
               --out "$GITHUB_WORKSPACE/target/wheels" \
@@ -143,14 +103,10 @@ jobs:
               --features abi3-py311 \
               --auditwheel skip)
           done
-          # --no-deps: every edgefirst-* sibling is in this same wheel set, so
-          # resolving the pins could fetch a published sibling over the local one.
           venv/bin/pip install --no-deps --force-reinstall target/wheels/*.whl
 
       - name: Run Rust tests with coverage
         run: |
-          # No source here: cargo llvm-cov manages its own environment.
-          # --exclude the python-* crates: they are built and measured as wheels above.
           cargo llvm-cov nextest --cargo-profile profiling --features default,edgefirst-decoder/model-files --workspace \
             --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-kernels --exclude edgefirst-python-common \
             --no-report -j 1 \
@@ -169,7 +125,6 @@ jobs:
 
       - name: Generate combined Rust coverage report
         run: |
-          # No source here either, for the same reason as the test step above.
           cargo llvm-cov report --profile profiling \
             --ignore-filename-regex '(\.cargo|/rustc/|/target/)' \
             --lcov --output-path target/coverage_rust.lcov
@@ -177,8 +132,7 @@ jobs:
           echo "source files: $(grep -c '^SF:' target/coverage_rust.lcov)"
           echo "PyO3 files with coverage:"
           grep '^SF:.*crates/python' target/coverage_rust.lcov || echo "  (none found)"
-          # One dynamic object per package can silently UNDER-report rather
-          # than error, so assert attribution explicitly.
+          # Asserts coverage attribution per package.
           bash tests/packaging/check_coverage_split.sh target/coverage_rust.lcov
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
@@ -530,7 +484,6 @@ jobs:
       - name: Build modular C-API leaves
         shell: pwsh
         run: |
-          # From each crate directory, whose .cargo/config.toml selects the dynamic tensor backend.
           $root = $PWD
           foreach ($leaf in @('tensor','image','codec','decoder','tracker','kernels')) {
             Push-Location "crates/${leaf}-capi"
@@ -592,7 +545,6 @@ jobs:
           python3 -m venv venv
           venv/bin/pip install --upgrade pip
           venv/bin/pip install maturin pytest numpy pillow
-          # From each crate directory, whose .cargo/config.toml selects the dynamic tensor backend.
           for pkg in tensor codec image decoder tracker kernels; do
             (cd "crates/python-$pkg" && "$GITHUB_WORKSPACE/venv/bin/maturin" build \
               --out "$GITHUB_WORKSPACE/target/wheels" \
@@ -600,13 +552,7 @@ jobs:
               --features abi3-py311 \
               --auditwheel skip)
           done
-          # rustc strips Apple binaries with its own in-process
-          # Mach-O writer, which leaves the LINKEDIT string pool 4-byte
-          # aligned whenever a binary's nindirectsyms is odd -- dyld on macOS
-          # 26+ then refuses the import below. Checked explicitly rather than
-          # left to the import: the parity is a coin flip per binary, so on
-          # any given run some wheels can be fine and others not, and a
-          # passing import proves nothing about the next build.
+          # Checks the wheels' Mach-O LINKEDIT string-pool alignment.
           python3 scripts/check_macho_alignment.py target/wheels
           venv/bin/pip install --no-deps --force-reinstall target/wheels/*.whl
           PY=$(python3 -c "import os; print(os.path.realpath('venv/bin/python3'))")
@@ -614,20 +560,7 @@ jobs:
           venv/bin/python -m pytest tests/ -m gpu -v --tb=short
 
       - name: Source-directory install path
-        # Everything above installs from `target/wheels/*.whl`, built by
-        # `maturin build`. So does every other lane. `pip install <dir>/` is a
-        # different code path -- it drives maturin's PEP 517 backend, which is
-        # the one call site that cannot take CLI flags and therefore the only
-        # one whose wheel-repair step runs. On macOS that step fails on the
-        # library python-tensor/build.rs bundles, and nothing exercised that
-        # because `make test-python` runs in no lane.
-        #
-        # Narrowed to `tensor` on purpose: it is the package that bundles
-        # libedgefirst_tensor, so it is the one that reproduces the failure,
-        # and one wheel keeps this to a couple of minutes instead of pulling
-        # in the full suite's dependency tail (tensorflow, ...) for a
-        # packaging check. The import is the point -- a wheel that builds but
-        # will not load is the alignment failure, so this covers both at once.
+        # Installs python-tensor through `pip install <dir>/` and imports it.
         run: |
           make install-python PYTHON_PACKAGES=tensor
           venv/bin/python -c "import edgefirst.tensor; print(edgefirst.tensor.__name__, 'imported')"

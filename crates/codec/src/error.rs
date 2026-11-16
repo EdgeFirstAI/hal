@@ -7,9 +7,9 @@ use std::fmt;
 
 /// A specific image-format feature that the codec does not implement.
 ///
-/// Carried by [`CodecError::Unsupported`]. Use this to distinguish "the byte
-/// string is well-formed but uses a feature we don't decode" from "the byte
-/// string is corrupt" ([`CodecError::InvalidData`]).
+/// Carried by [`CodecError::Unsupported`]: the data is well-formed but uses
+/// a feature the codec does not decode. Corrupt data is
+/// [`CodecError::InvalidData`].
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UnsupportedFeature {
@@ -29,8 +29,7 @@ pub enum UnsupportedFeature {
         /// The unsupported precision reported in the SOF marker.
         bits: u8,
     },
-    /// JPEG with a component count we do not handle (anything other than 1
-    /// for greyscale or 3 for YCbCr).
+    /// JPEG with a component count other than 1 (greyscale) or 3 (YCbCr).
     JpegComponentCount {
         /// The unsupported component count reported in the SOF marker.
         components: u8,
@@ -38,8 +37,7 @@ pub enum UnsupportedFeature {
     /// PNG data was recognised but the `png` feature is disabled in this build.
     PngNotEnabled,
     /// JPEG chroma subsampling configuration where a chroma component is
-    /// sampled at a higher rate than luma along some axis (rejected so the
-    /// downstream upsampler does not divide by zero).
+    /// sampled at a higher rate than luma along some axis.
     JpegChromaSubsampling,
     /// An engine that cannot encode or decode a codec, or, for
     /// [`Engine::Auto`](crate::Engine::Auto), no engine on this machine that
@@ -113,10 +111,8 @@ pub enum CodecError {
     UnsupportedFormat(edgefirst_tensor::PixelFormat),
     /// The request is well-formed but not supported: image data using a
     /// feature this decoder does not implement, or a codec the chosen engine
-    /// cannot run ([`UnsupportedFeature::Codec`]). Callers can pattern-match
-    /// on the carried [`UnsupportedFeature`] to react programmatically (e.g.
-    /// transcode before retry, surface a precise message, or skip
-    /// gracefully).
+    /// cannot run ([`UnsupportedFeature::Codec`]). The carried
+    /// [`UnsupportedFeature`] says which.
     Unsupported(UnsupportedFeature),
     /// The image data is corrupted, truncated, or not a recognized format.
     InvalidData(String),

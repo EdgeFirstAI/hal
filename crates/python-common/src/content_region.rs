@@ -8,7 +8,7 @@ use pyo3::prelude::*;
 
 /// A content region as normalized `[xmin, ymin, xmax, ymax]`: a 4-sequence,
 /// or any object with a `normalized` attribute such as
-/// `edgefirst.image.ContentRegion` (duck-typed so it crosses packages).
+/// `edgefirst.image.ContentRegion`.
 #[derive(FromPyObject)]
 pub enum ContentRegionArg {
     Values([f32; 4]),

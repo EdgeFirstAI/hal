@@ -1,19 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! AVX2 8×8 IDCT.
-//!
-//! The islow kernel in [`super::sse2`] works in 16-bit lanes, so a whole row of
-//! eight coefficients already fills a 128-bit register. Widening a *single*
-//! block to 256-bit lanes would put two rows in one register and pay for the
-//! lane-crossing shuffles that AVX2 charges for, which is why the previous
-//! 32-bit-lane AVX2 kernel lost to libjpeg-turbo's plain SSE2 one.
-//!
-//! What AVX2 does buy here is the three-operand VEX encoding: recompiling the
-//! same kernel with `avx2` enabled removes the register-copy `movdqa`s that the
-//! destructive two-operand SSE encoding forces. Genuine 256-bit width needs two
-//! blocks side by side, one per 128-bit half, which requires a two-block entry
-//! point in the MCU loop rather than a wider kernel here.
+//! AVX2 8×8 IDCT: the kernel of [`super::sse2`] compiled with `avx2`
+//! enabled (VEX encoding, 128-bit lanes).
 
 /// AVX2 8×8 IDCT with in-kernel dequantisation, bit-exact with the scalar path.
 pub fn idct_8x8_avx2(coeffs: &[i16; 64], quant: &[u16; 64], output: &mut [u8], stride: usize) {
@@ -38,9 +27,9 @@ mod tests {
     use super::*;
     use crate::jpeg::idct::scalar::idct_8x8_scalar;
 
-    /// The AVX2 build of the kernel must stay bit-exact with the scalar
-    /// reference, including the clamp at both ends and on a strided
-    /// destination, and must not write past column 8.
+    /// The AVX2 build of the kernel is bit-exact with the scalar reference,
+    /// including the clamp at both ends and a strided destination, and does not
+    /// write past column 8.
     #[test]
     fn idct_8x8_parity_random_strided() {
         if !is_x86_feature_detected!("avx2") {
@@ -57,8 +46,7 @@ mod tests {
         for case in 0..256 {
             let mut coeffs = [0i16; 64];
             for (i, c) in coeffs.iter_mut().enumerate() {
-                // Later cases push hard on the [0, 255] clamp. Dequantised
-                // values stay inside the i16 range the islow IDCT assumes.
+                // Later cases reach the [0, 255] clamp within the i16 dequantised range.
                 let mag = if case < 64 { 32 } else { 256 };
                 let v = (next() % (2 * mag)) as i32 - mag as i32;
                 *c = if i < 16 || next().is_multiple_of(4) {

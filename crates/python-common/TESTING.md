@@ -1,11 +1,6 @@
 # EdgeFirst HAL Python Bindings — Testing
 
-Covers all four published wheels (`edgefirst-tensor`, `edgefirst-codec`,
-`edgefirst-image`, `edgefirst-decoder`) and the `python-common` rlib they
-share. Since 0.29 there is no single `edgefirst_hal` module — the bindings
-are four independent extension modules under the `edgefirst.` PEP 420
-namespace, so testing has to cover both the per-package behaviour *and* the
-packaging invariants that keep them installable independently.
+Covers all four published wheels (`edgefirst-tensor`, `edgefirst-codec`, `edgefirst-image`, `edgefirst-decoder`) and the `python-common` rlib they share. The bindings are four independent extension modules under the `edgefirst.` PEP 420 namespace, so testing has to cover both the per-package behaviour *and* the packaging invariants that keep them installable independently.
 
 ## Test Layout
 
@@ -15,7 +10,7 @@ tests/                          # Workspace-root Python tests
 ├── image/                      # ImageProcessor tests
 ├── decoder/                    # Decoder tests
 ├── python/                     # PyO3 binding-specific edge cases
-├── packaging/                  # NEW in 0.29 — the split's invariants
+├── packaging/                  # Packaging invariants
 │   ├── test_namespace.py       # PEP 420: no edgefirst/__init__.py anywhere
 │   ├── test_wheel_layout.py    # self-contained wheels, py.typed, abi3 tags
 │   ├── test_size_baseline.py   # codec-only install stays small
@@ -59,13 +54,12 @@ drives maturin's PEP 517 backend. That backend is the one maturin call site
 in the repo that cannot take CLI flags directly, so the target passes
 `MATURIN_PEP517_ARGS="--auditwheel skip"` to reach maturin's own argv —
 matching every other call site. Without it the repair step runs and, on
-macOS, fails on the very library this crate's `build.rs` bundles (issue
-#199). Use the same variable if you install these directories by hand.
+macOS, fails on the very library this crate's `build.rs` bundles. Use the
+same variable if you install these directories by hand.
 
 ## What the packaging gates protect
 
-These are cheap and catch the failure modes that the split introduced. They
-are not optional extras; each one corresponds to a bug already hit once.
+These gates are cheap and catch the failure modes of shipping the bindings as independent packages.
 
 | Gate | Failure it catches |
 |------|--------------------|
@@ -73,7 +67,7 @@ are not optional extras; each one corresponds to a bug already hit once.
 | `test_wheel_layout.py` | A wheel that is not self-contained, or is missing `py.typed`/stubs |
 | abi3 tag-set check | Mixed `cp38-abi3` and `cp311-abi3` across packages, which forks the supported interpreter range silently. The comparison must include the **python** tag — `cp38-abi3` and `cp311-abi3` share abi and platform tags, so comparing only those two passes a genuinely mixed set |
 | `test_size_baseline.py` | A codec-only install regaining a dependency on `edgefirst-image` |
-| `test_macho_alignment.py` | A macOS wheel whose extension dyld refuses to load — rustc's in-process Apple strip leaves the LINKEDIT string pool 4-byte aligned when `nindirectsyms` is odd. The parity is a coin flip per binary, so an import smoke test on one build says nothing about the next; this parses the Mach-O instead, and therefore runs on every OS (issue #200) |
+| `test_macho_alignment.py` | A macOS wheel whose extension dyld refuses to load — rustc's in-process Apple strip leaves the LINKEDIT string pool 4-byte aligned when `nindirectsyms` is odd. The parity varies per binary, so an import smoke test on one build says nothing about the next; this parses the Mach-O instead, and therefore runs on every OS |
 
 ## Special Requirements
 
@@ -81,13 +75,7 @@ are not optional extras; each one corresponds to a bug already hit once.
   Python; activate `venv/` at the workspace root first.
 - **`maturin develop` rebuilds the Rust shared object** when the Rust source
   changes. Re-run after any change under `crates/`.
-- **Per-module type identity is not shared.** Each extension module caches
-  its own `#[pyclass]` type objects, so `edgefirst.tensor.Tensor is
-  edgefirst.image.Tensor` is **False** by design. Never write an
-  `isinstance`/`is` assertion across packages — cross-package handoff goes
-  through the `__edgefirst_tensor__` capsule protocol and is duck-typed on
-  purpose. A test that asserts type identity across two wheels is asserting
-  the thing the architecture deliberately gave up.
+- **Per-module type identity is not shared.** Each extension module caches its own `#[pyclass]` type objects, so `edgefirst.tensor.Tensor is edgefirst.image.Tensor` is **False** by design. Never write an `isinstance`/`is` assertion across packages — cross-package handoff goes through the `__edgefirst_tensor__` capsule protocol and is duck-typed.
 - **Single-threaded execution** — the Python suite inherits the
   [project-wide single-threaded rule](https://github.com/EdgeFirstAI/hal/blob/main/TESTING.md#single-threaded-execution)
   whenever GL or G2D paths are exercised. `make test-python` invokes plain
@@ -123,7 +111,7 @@ setup (model load, EGL init) does not appear in the sampled profile.
   rather than `coverage.py` — it handles native extensions without losing
   line-level attribution.
 - `tests/packaging/check_coverage_split.sh` verifies coverage is attributed
-  to the right package now that one `.so` no longer covers everything.
+  to the right package.
 - XML output merges with the Rust lcov and uploads to SonarCloud.
 
 ## Cross-References

@@ -1,14 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! `EGL_ANDROID_native_fence_sync` export — the GL→NPU handoff fence.
+//! `EGL_ANDROID_native_fence_sync` export.
 //!
-//! A convert whose destination is a zero-copy AHardwareBuffer does not
-//! need the CPU to wait for the GPU at all: the NPU runtime can wait on
-//! a kernel sync-fence fd instead
-//! (`ANeuralNetworksExecution_startComputeWithDependencies`). This module
-//! turns "all GL commands submitted so far on this context" into such an
-//! fd:
+//! Turns "all GL commands submitted so far on this context" into a kernel
+//! sync-fence fd:
 //!
 //! ```text
 //! eglCreateSyncKHR(EGL_SYNC_NATIVE_FENCE_ANDROID)   // insert fence
@@ -20,11 +16,8 @@
 //!
 //! The entry points are EGL extension functions (`EGL_KHR_fence_sync` +
 //! `EGL_ANDROID_native_fence_sync`), resolved once per process via
-//! `eglGetProcAddress` — the same pattern as `ahardwarebuffer_import.rs`.
-//! Callers gate on the display's extension probe
-//! (`SharedAndroidDisplay::supports_native_fence`) rather than on
-//! resolution: `eglGetProcAddress` may return a non-NULL stub for
-//! unsupported extensions, so the extension string is the authority.
+//! `eglGetProcAddress`. Callers gate on the display's extension probe
+//! (`SharedAndroidDisplay::supports_native_fence`).
 
 #![cfg(target_os = "android")]
 
@@ -91,10 +84,9 @@ fn fns(egl: &Egl) -> Result<&'static FenceEglFns> {
 }
 
 /// Export a native sync-fence fd guarding every GL command submitted so
-/// far on the CURRENT context. Must be called on the GL worker thread
+/// far on the current context. Must be called on the GL worker thread
 /// with the convert's context current. The returned fd is owned by the
-/// caller; the EGL sync object itself is destroyed before returning (the
-/// dup'd fd is independent per the extension spec).
+/// caller; the EGL sync object is destroyed before returning.
 pub(super) fn export_native_fence_fd(egl: &Egl, display: egl::Display) -> Result<OwnedFd> {
     let fns = fns(egl)?;
 
@@ -116,9 +108,7 @@ pub(super) fn export_native_fence_fd(egl: &Egl, display: egl::Display) -> Result
         )));
     }
 
-    // The native fence object is not created until the command stream is
-    // flushed — the spec REQUIRES a flush between create and dup, or dup
-    // returns EGL_NO_NATIVE_FENCE_FD_ANDROID.
+    // Flush between create and dup, as the extension requires.
     unsafe { edgefirst_gl::gl::Flush() };
 
     // SAFETY: sync is the live object created above on this display.

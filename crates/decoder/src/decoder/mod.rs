@@ -16,64 +16,34 @@ pub struct Decoder {
     model_type: ModelType,
     pub iou_threshold: f32,
     pub score_threshold: f32,
-    /// NMS mode (always a concrete variant after build — `Nms::Auto` is
-    /// resolved during `DecoderBuilder::build()` and never stored here):
+    /// NMS mode, always a concrete variant after build:
     /// - `Some(ClassAgnostic)` — class-agnostic NMS
     /// - `Some(ClassAware)` — class-aware NMS
     /// - `None` — NMS bypassed (end-to-end models)
     ///
-    /// Assigning `Some(Nms::Auto)` to this field directly violates that
-    /// invariant: `Nms::Auto` must be resolved by
-    /// [`DecoderBuilder::build`](crate::DecoderBuilder::build). Debug builds
-    /// panic on it at decode (a `debug_assert!` in NMS dispatch); release
-    /// builds treat it as class-aware without consulting the config.
+    /// `Nms::Auto` is resolved by
+    /// [`DecoderBuilder::build`](crate::DecoderBuilder::build). When
+    /// `Some(Nms::Auto)` is assigned to this field, debug builds panic at
+    /// decode and release builds treat it as class-aware.
     pub nms: Option<configs::Nms>,
     /// Maximum number of candidate boxes fed into NMS after score filtering.
-    /// Reduces O(N²) NMS cost when many low-confidence proposals pass the
-    /// threshold (common during COCO mAP evaluation with threshold ≈ 0.001).
     /// Candidates are ranked by score, equal scores by anchor index; only the
     /// top `pre_nms_top_k` proceed to NMS. Applies to every NMS decode path;
     /// ignored when `nms` is `None`.
     ///
     /// - `None` (the default unless the builder was given a cap): resolved
     ///   per decode by [`Decoder::pre_nms_top_k_for`] —
-    ///   [`MULTI_LABEL_PRE_NMS_TOP_K`] (30 000, Ultralytics' `max_nms`) for a
-    ///   multi-label decode, [`DEFAULT_PRE_NMS_TOP_K`] (300) for an argmax
-    ///   decode, including the tracking entry points of a multi-label decoder.
+    ///   [`MULTI_LABEL_PRE_NMS_TOP_K`] (30 000) for a multi-label decode,
+    ///   [`DEFAULT_PRE_NMS_TOP_K`] (300) for an argmax decode, including the
+    ///   tracking entry points of a multi-label decoder.
     /// - `Some(n)`: an explicit cap used by every decode as given; `Some(0)`
-    ///   is unbounded. Assigning it after build is as explicit as
-    ///   [`DecoderBuilder::with_pre_nms_top_k`](crate::DecoderBuilder::with_pre_nms_top_k).
-    ///
-    /// # ⚠️ Validation vs Deployment
-    ///
-    /// The default of 300 is tuned for **deployment** (score threshold ≥ 0.25)
-    /// where few anchors pass the score filter, making top-K a no-op in
-    /// practice while bounding worst-case NMS cost.
-    ///
-    /// For **mAP evaluation** (score threshold ≈ 0.001), most of the 8 400
-    /// YOLO anchors pass the score filter. At `pre_nms_top_k = 300`, roughly
-    /// 74 % of candidates that would survive NMS are discarded *before* NMS
-    /// runs, causing **~9 pp box mAP loss** — a measurement artifact, not a
-    /// model quality issue.
-    ///
-    /// | Use case | `pre_nms_top_k` | `score_threshold` |
-    /// |----------|----------------:|------------------:|
-    /// | Deployment | `None` (300) | ≥ 0.25 |
-    /// | COCO mAP evaluation, argmax | `Some(0)`, or ≥ the anchor count (8 400) | 0.001 |
-    /// | COCO mAP evaluation, multi-label | `Some(0)`, or `None` (30 000) | 0.001 |
-    ///
-    /// Post-processing latency scales with the number of candidates entering
-    /// NMS. At deployment thresholds the candidate count is already small, so
-    /// raising `pre_nms_top_k` has negligible cost. At validation thresholds
-    /// the increase is measurable but necessary for correct recall.
+    ///   is unbounded.
     pub pre_nms_top_k: Option<usize>,
-    /// Maximum number of detections returned after NMS. Matches the
-    /// Ultralytics `max_det` parameter.  Default: 300.
+    /// Maximum number of detections returned after NMS. Default: 300.
     ///
-    /// This bound applies uniformly across all segmentation and detection
-    /// decode paths reached via [`Decoder::decode`] / [`Decoder::decode_proto`].
-    /// The output `Vec`'s capacity is only an allocation hint; the post-NMS
-    /// detection count is bounded solely by `max_det` (EDGEAI-1302).
+    /// Applies to every decode path reached via [`Decoder::decode`] /
+    /// [`Decoder::decode_proto`]. The output `Vec`'s capacity does not bound
+    /// the detection count.
     pub max_det: usize,
     /// Whether decoded boxes are in normalized [0,1] coordinates.
     /// - `Some(true)`: Coordinates in [0,1] range
@@ -83,11 +53,9 @@ pub struct Decoder {
     normalized: Option<bool>,
     /// Model input spatial dimensions `(width, height)`, captured from
     /// the schema's `input.shape` / `input.dshape` at builder time.
-    /// Required to honour `normalized: false`: pixel-space box coords
-    /// emitted by the model are divided by these dimensions before NMS
-    /// so the post-NMS bbox is in `[0, 1]`. `None` when no schema input
-    /// spec is available — the legacy >2.0 reject in `protobox` then
-    /// preserves the previous safety net (EDGEAI-1303).
+    /// With `normalized: false`, pixel-space box coords are divided by
+    /// these dimensions before NMS. `None` when no schema input spec is
+    /// available; `protobox` then rejects coordinates above 2.0.
     input_dims: Option<(usize, usize)>,
     /// Schema v2 merge program. Present when the decoder was built from
     /// a [`crate::schema::SchemaV2`] whose logical outputs carry
@@ -101,23 +69,17 @@ pub struct Decoder {
     /// decode functions in, when it is not the schema's.
     merged_order: Option<Vec<usize>>,
     /// When `true`, emit one detection per (anchor, class) pair for every
-    /// class whose score meets the threshold — matching Ultralytics `val`
-    /// multi-label decode.  **OFF by default.**
-    ///
-    /// # Deployment safety
-    /// `Decoder::decode_tracked` ignores this and decodes one label per
-    /// box: ByteTrack matches on IoU only, so per-class duplicates of one
-    /// anchor would spawn phantom tracks.
+    /// class whose score meets the threshold. Off by default.
+    /// `Decoder::decode_tracked` ignores this and decodes one label per box.
     pub(crate) multi_label: bool,
     /// Where `multi_label` came from; named in the tracked-decode warning.
     pub(crate) multi_label_source: MultiLabelSource,
     /// Set once this decoder has logged that tracked decode ignores
-    /// multi-label, so each decoder warns once.
+    /// multi-label.
     tracked_multi_label_warned: std::sync::atomic::AtomicBool,
-    /// Per-scale fast path. Constructed at build time from a schema-v2
-    /// document with per-scale children. Wrapped in `Mutex` because
-    /// `Decoder::decode_proto` and `Decoder::decode` are `&self` but
-    /// the per-scale buffers are mutated per-frame.
+    /// Per-scale path. Constructed at build time from a schema-v2 document
+    /// with per-scale children. The `Mutex` guards the per-frame buffers,
+    /// which the `&self` decode calls mutate.
     pub(crate) per_scale: Option<std::sync::Mutex<crate::per_scale::PerScaleDecoder>>,
     /// Semantic segmentation output: a `decoder: semantic` output, or the
     /// segmentation output of a ModelPack model.
@@ -142,8 +104,7 @@ fn semantic_only() -> DecoderError {
 
 impl PartialEq for Decoder {
     fn eq(&self, other: &Self) -> bool {
-        // DecodeProgram and PerScaleDecoder have non-comparable embedded
-        // data; compare by the config-derived fields only.
+        // Compares the config-derived fields only.
         self.model_type == other.model_type
             && self.iou_threshold == other.iou_threshold
             && self.score_threshold == other.score_threshold
@@ -162,12 +123,8 @@ impl PartialEq for Decoder {
 }
 
 impl Clone for Decoder {
-    /// Cloning a `Decoder` preserves the legacy decode path
-    /// (`decode_program`) but drops the per-scale fast path:
-    /// `PerScaleDecoder` owns mutable per-frame scratch buffers and is
-    /// not `Clone`. Decoders built from a per-scale schema should be
-    /// rebuilt via [`DecoderBuilder`] rather than cloned to preserve the
-    /// fast path; cloning is intended for tests and rare configs.
+    /// The clone keeps `decode_program` and has no per-scale path
+    /// (`per_scale` is `None`).
     fn clone(&self) -> Self {
         Self {
             model_type: self.model_type.clone(),
@@ -268,12 +225,8 @@ impl<'a> ArrayViewDQuantized<'a> {
     }
 }
 
-/// WARNING: Do NOT nest `with_quantized!` calls. Each level multiplies
-/// monomorphized code paths by 6 (one per integer variant), so nesting
-/// N levels deep produces 6^N instantiations.
-///
-/// Instead, dequantize each tensor sequentially with `dequant_3d!`/`dequant_4d!`
-/// (6*N paths) or split into independent phases that each nest at most 2 levels.
+/// Binds `$var` to the typed array of an [`ArrayViewDQuantized`] and expands
+/// `$body` once per integer variant.
 macro_rules! with_quantized {
     ($x:expr, $var:ident, $body:expr) => {
         match $x {
@@ -318,11 +271,9 @@ pub use builder::{DecoderBuilder, DEFAULT_PRE_NMS_TOP_K, MULTI_LABEL_PRE_NMS_TOP
 pub use config::{ConfigOutput, ConfigOutputRef, ConfigOutputs};
 
 impl Decoder {
-    /// Static label identifying which dispatch path `decode` / `decode_proto`
-    /// will take, used as a tracing-span attribute. Lets profiling tools
-    /// distinguish `per_scale` (the fast path), `decode_program` (schema-v2
-    /// merge), and `legacy` (config-driven) without requiring callers to
-    /// inspect the model.
+    /// Static label naming the dispatch path `decode` / `decode_proto` take:
+    /// `per_scale`, `decode_program` (schema-v2 merge) or `legacy`
+    /// (config-driven). Used as a tracing-span attribute.
     fn decode_path_label(&self) -> &'static str {
         if self.per_scale.is_some() {
             "per_scale"
@@ -441,44 +392,15 @@ impl Decoder {
     /// - `None`: Unknown, caller must infer (e.g., check if any coordinate
     ///   > 1.0)
     ///
-    /// This describes the **post-decode** coordinate space, not the raw
-    /// schema annotation. The decoder applies EDGEAI-1303 normalization
-    /// (dividing bbox channels by `(input_w, input_h)`) on a per-path
-    /// basis, not unconditionally. Four paths are known to invoke the
-    /// helper uniformly across all of their entry points (`decode`,
-    /// `decode_proto`, and — where applicable — `decode_tracked` and
-    /// `decode_tracked_proto`):
+    /// This describes the post-decode coordinate space. The per-scale path,
+    /// [`ModelType::YoloSegDet`](crate::configs::ModelType::YoloSegDet),
+    /// [`ModelType::YoloSplitSegDet`](crate::configs::ModelType::YoloSplitSegDet)
+    /// and [`ModelType::YoloSegDet2Way`](crate::configs::ModelType::YoloSegDet2Way)
+    /// divide box coordinates by [`input_dims`](Self::input_dims) on every
+    /// entry point; for those, a schema that declares `normalized: false`
+    /// with valid `input_dims` reports `Some(true)`.
     ///
-    /// 1. The **per-scale fast path** (DFL/LTRB → dist2bbox → sigmoid),
-    ///    which emits pixel-space boxes by design and always normalizes
-    ///    before returning.
-    /// 2. [`ModelType::YoloSegDet`](crate::configs::ModelType::YoloSegDet), whose
-    ///    quantized and float, tracked and untracked, masks and proto
-    ///    variants each call the helper after NMS.
-    /// 3. [`ModelType::YoloSplitSegDet`](crate::configs::ModelType::YoloSplitSegDet),
-    ///    aligned across `decode`, `decode_proto`, `decode_tracked`,
-    ///    and `decode_tracked_proto` for both quantized and float
-    ///    variants.
-    /// 4. [`ModelType::YoloSegDet2Way`](crate::configs::ModelType::YoloSegDet2Way),
-    ///    aligned across the same four entry points and both element
-    ///    type variants.
-    ///
-    /// When any of those paths is active and the schema declares
-    /// `normalized: false` with valid [`input_dims`](Self::input_dims),
-    /// this accessor reports `Some(true)` to match what the caller
-    /// actually receives.
-    ///
-    /// The remaining model types still surface the raw schema flag
-    /// because their post-decode contract differs:
-    /// [`ModelType::YoloDet`](crate::configs::ModelType::YoloDet) and
-    /// [`ModelType::YoloSplitDet`](crate::configs::ModelType::YoloSplitDet)
-    /// (detection-only, no protobox crop coupling), the
-    /// `YoloEndToEnd*` family (model embeds its own NMS and emits its
-    /// own coordinate space), and the `ModelPack*` family (separate
-    /// model conventions). For those, this accessor returns
-    /// `self.normalized` verbatim and leaves it to the caller to
-    /// handle pixel-space output explicitly (e.g. divide by
-    /// `input_dims()` themselves).
+    /// Every other model type returns the schema's flag unchanged.
     ///
     /// # Examples
     ///
@@ -495,28 +417,9 @@ impl Decoder {
     /// # }
     /// ```
     pub fn normalized_boxes(&self) -> Option<bool> {
-        // Four paths invoke `yolo::maybe_normalize_boxes_in_place`
-        // uniformly across every entry point that can reach them:
-        //   - the per-scale fast path (always normalizes by design),
-        //   - `ModelType::YoloSegDet` (helper fires in
-        //     `decode`/`decode_proto` via `yolo::impl_yolo_segdet_*` and
-        //     in `decode_tracked`/`decode_tracked_proto` via the
-        //     `process_tracked_yolo_segmentation!` macro and
-        //     `process_tracked_yolo_segdet_float`),
-        //   - `ModelType::YoloSplitSegDet` (helper fires in
-        //     `decode_yolo_split_segdet_*`, `impl_yolo_split_segdet_*`,
-        //     `process_tracked_yolo_segmentation_split!`, and
-        //     `process_tracked_yolo_segdet_split_float`), and
-        //   - `ModelType::YoloSegDet2Way` (helper fires in
-        //     `decode_yolo_segdet_2way_*`, the float decode routes
-        //     through `impl_yolo_split_segdet_float*`,
-        //     `process_tracked_yolo_segmentation_2way!`, and the
-        //     inline tracked-2way float helpers).
-        // For those, `normalized == Some(false)` with valid `input_dims`
-        // upgrades to a post-decode `Some(true)`. Other paths invoke
-        // the helper inconsistently across `ModelType` variants and
-        // tracked/proto entry points — surface the raw schema flag
-        // there and let callers handle pixel-space output explicitly.
+        // The per-scale path and the model types that normalize on every entry
+        // point report `Some(true)` for `normalized == Some(false)` with valid
+        // `input_dims`. The other paths return the schema flag.
         if self.per_scale.is_some() || self.legacy_path_normalizes_uniformly() {
             match (self.normalized, self.input_dims) {
                 (Some(true), _) => Some(true),
@@ -529,16 +432,10 @@ impl Decoder {
         }
     }
 
-    /// Returns true for legacy `ModelType` dispatch paths that are known
-    /// to call `yolo::maybe_normalize_boxes_in_place` on every entry
-    /// point (`decode`, `decode_proto`, `decode_tracked`,
-    /// `decode_tracked_proto`, both quantized and float variants).
-    ///
-    /// Used by [`normalized_boxes`](Self::normalized_boxes) to gate the
-    /// pixel→normalized upgrade for non-per-scale model types whose
-    /// post-decode contract matches the per-scale path. Extend this
-    /// list as additional `ModelType` variants are brought into
-    /// uniform-normalization alignment.
+    /// Returns true for the `ModelType` dispatch paths that call
+    /// `yolo::maybe_normalize_boxes_in_place` on every entry point
+    /// (`decode`, `decode_proto`, `decode_tracked`, `decode_tracked_proto`,
+    /// both quantized and float variants).
     fn legacy_path_normalizes_uniformly(&self) -> bool {
         matches!(
             self.model_type,
@@ -553,21 +450,11 @@ impl Decoder {
     /// schema did not declare an input spec (e.g. flat YAML configs
     /// or `DecoderBuilder::add_output(...)` programmatic builds).
     ///
-    /// Drives EDGEAI-1303 normalization on the paths that invoke the
-    /// helper uniformly: when the schema declares pixel-space outputs
-    /// and `input_dims()` is `Some((w, h))`, the per-scale bridge and
-    /// the `ModelType::YoloSegDet`, `ModelType::YoloSplitSegDet`, and
-    /// `ModelType::YoloSegDet2Way` dispatch paths divide post-NMS
-    /// bbox coordinates by `(w, h)` so they enter the canonical
-    /// `[0, 1]` range before mask cropping / tracker dispatch, and
-    /// [`normalized_boxes`](Self::normalized_boxes) reports
-    /// `Some(true)` to match. The remaining legacy `ModelType`
-    /// dispatch paths (detection-only `YoloDet`/`YoloSplitDet`, the
-    /// `YoloEndToEnd*` family, and the `ModelPack*` family) do not
-    /// apply this division — see
-    /// [`normalized_boxes`](Self::normalized_boxes) for the per-path
-    /// contract. The legacy `protobox` `> 2.0` reject acts as a safety
-    /// net for paths that emit pixel-space coordinates.
+    /// When the schema declares pixel-space outputs and `input_dims()` is
+    /// `Some((w, h))`, the per-scale path and the `ModelType::YoloSegDet`,
+    /// `ModelType::YoloSplitSegDet` and `ModelType::YoloSegDet2Way` paths
+    /// divide post-NMS box coordinates by `(w, h)`. The other model types
+    /// do not; see [`normalized_boxes`](Self::normalized_boxes).
     ///
     /// # Examples
     ///
@@ -1299,9 +1186,8 @@ impl Decoder {
 
     /// Decode model outputs into detection boxes and segmentation masks.
     ///
-    /// This is the primary decode API. Accepts `TensorDyn` outputs directly
-    /// from model inference. Automatically dispatches to quantized or float
-    /// paths based on the tensor dtype.
+    /// Accepts `TensorDyn` outputs directly from model inference and
+    /// dispatches to quantized or float paths based on the tensor dtype.
     ///
     /// # Arguments
     ///
@@ -1311,13 +1197,10 @@ impl Decoder {
     ///
     /// # `output_boxes` / `output_masks` capacity
     ///
-    /// The capacity of the supplied `Vec`s is **only** an allocation hint —
-    /// it is **not** a cap on the number of detections returned. The
-    /// post-NMS detection count is bounded by [`Decoder::max_det`] (set
-    /// via [`DecoderBuilder::with_max_det`], default `300`). Passing
-    /// `Vec::new()` (capacity 0) returns up to `max_det` detections;
-    /// pre-allocating with [`Vec::with_capacity`] only avoids the
-    /// reallocation when the decoder grows the buffer.
+    /// The capacity of the supplied `Vec`s is an allocation hint and does not
+    /// cap the number of detections returned. The post-NMS detection count is
+    /// bounded by [`Decoder::max_det`] (set via
+    /// [`DecoderBuilder::with_max_det`], default `300`).
     ///
     /// # Errors
     ///
@@ -1332,16 +1215,14 @@ impl Decoder {
         self.decode_impl(outputs, output_boxes, output_masks, self.multi_label)
     }
 
-    /// Decode with one label per box, whatever [`Self::multi_label`] says.
+    /// Decode with one label per box, whatever [`Self::multi_label`] says,
+    /// for boxes that feed an external tracker.
     ///
-    /// Use this when the boxes feed an external tracker: trackers match on
-    /// IoU only, so per-class duplicates of one anchor become phantom tracks.
     /// Logs a warning once per decoder when the decoder has multi-label
     /// enabled. `Decoder::decode_tracked` and `Decoder::decode_proto_tracked`
-    /// (behind the `tracker` feature) apply the same rule. When the builder
-    /// raised [`Self::pre_nms_top_k`] to [`MULTI_LABEL_PRE_NMS_TOP_K`] only
-    /// because multi-label was on, this argmax decode uses
-    /// [`DEFAULT_PRE_NMS_TOP_K`]; an explicit cap is used as given.
+    /// (behind the `tracker` feature) apply the same rule. Uses
+    /// [`DEFAULT_PRE_NMS_TOP_K`] unless [`Self::pre_nms_top_k`] holds an
+    /// explicit cap.
     ///
     /// # Errors
     ///
@@ -1368,9 +1249,9 @@ impl Decoder {
     /// resolution.
     ///
     /// `confidence`, when given, receives the winning class's probability as
-    /// an `[H, W]` map of `f32` or `u8` (scaled to 255); it is approximate
-    /// and meant for overlays. See [`crate::semantic`] for the decode modes
-    /// and [`crate::semantic::SemanticOptions`] for the letterbox and the
+    /// an `[H, W]` map of `f32` or `u8` (scaled to 255); it is approximate.
+    /// See [`crate::semantic`] for the decode modes and
+    /// [`crate::semantic::SemanticOptions`] for the letterbox and the
     /// runtime mode override.
     ///
     /// # Errors
@@ -1392,7 +1273,6 @@ impl Decoder {
         crate::semantic::decode_semantic(input, config, dst, confidence, options)
     }
 
-    /// [`Self::decode`] with an explicit multi-label setting.
     /// `outputs` as the decode functions look them up: each role's tensor,
     /// in lookup order, when the model's outputs share shapes; as passed
     /// otherwise.
@@ -1414,6 +1294,7 @@ impl Decoder {
         }
     }
 
+    /// [`Self::decode`] with an explicit multi-label setting.
     fn decode_impl(
         &self,
         outputs: &[&edgefirst_tensor::TensorDyn],
@@ -1424,8 +1305,7 @@ impl Decoder {
         let path = self.decode_path_label();
         let _span = tracing::trace_span!("decoder.decode", path = path, n_outputs = outputs.len())
             .entered();
-        // Per-scale fast path — selected at builder time when the schema
-        // declares per-scale children with DFL or LTRB encoding.
+        // Per-scale path.
         if let Some(per_scale_mutex) = &self.per_scale {
             let mut ps = per_scale_mutex
                 .lock()
@@ -1491,11 +1371,10 @@ impl Decoder {
     ///
     /// # `output_boxes` capacity
     ///
-    /// The capacity of `output_boxes` is **only** an allocation hint — it
-    /// is **not** a cap on the number of detections returned. The
-    /// post-NMS detection count is bounded by [`Decoder::max_det`] (set
-    /// via [`DecoderBuilder::with_max_det`], default `300`). Passing
-    /// `Vec::new()` (capacity 0) returns up to `max_det` detections.
+    /// The capacity of `output_boxes` is an allocation hint and does not cap
+    /// the number of detections returned. The post-NMS detection count is
+    /// bounded by [`Decoder::max_det`] (set via
+    /// [`DecoderBuilder::with_max_det`], default `300`).
     ///
     /// # Errors
     ///
@@ -1523,8 +1402,7 @@ impl Decoder {
             n_outputs = outputs.len()
         )
         .entered();
-        // Per-scale fast path — selected at builder time when the schema
-        // declares per-scale children with DFL or LTRB encoding.
+        // Per-scale path.
         if let Some(per_scale_mutex) = &self.per_scale {
             let mut ps = per_scale_mutex
                 .lock()
@@ -1597,10 +1475,8 @@ impl Decoder {
 
     /// Run the per-scale pipeline and return pre-NMS buffers as owned f32.
     ///
-    /// Test-only entry point used by the parity-fixture tests to compare
-    /// HAL stage output against the NumPy reference's stage output
-    /// without NMS ordering noise. Returns an error if the decoder
-    /// isn't configured for per-scale decoding.
+    /// Test-only entry point. Returns an error if the decoder isn't
+    /// configured for per-scale decoding.
     #[doc(hidden)]
     pub fn _testing_run_per_scale_pre_nms(
         &self,
@@ -1612,7 +1488,6 @@ impl Decoder {
         let mut ps = mutex.lock().map_err(|e| {
             crate::error::DecoderError::Internal(format!("per_scale mutex poisoned: {e}"))
         })?;
-        // Drop the borrowed view immediately so we can reborrow buffers below.
         {
             ps.run(outputs, None)?;
         }
@@ -1649,8 +1524,8 @@ impl Decoder {
         output_masks.clear();
         output_tracks.clear();
 
-        // yolo segdet variants require special handling to separate boxes that come from decoding vs active tracks.
-        // Only boxes that come from decoding can be used for proto/mask generation.
+        // The yolo segdet variants keep the boxes that come from decoding apart
+        // from active tracks; only decoded boxes get protos and masks.
         match &self.model_type {
             ModelType::YoloSegDet { boxes, protos } => self.decode_tracked_yolo_segdet_quantized(
                 tracker,
@@ -2077,11 +1952,10 @@ impl Decoder {
     /// dispatches to quantized or float paths based on the tensor dtype, then
     /// updates the tracker with the decoded boxes.
     ///
-    /// Always decodes one label per box, regardless of [`Self::multi_label`]:
-    /// trackers match on IoU only, so per-class duplicates of one anchor would
-    /// spawn phantom tracks. Logs a warning once per decoder when the decoder
-    /// has multi-label enabled. Like [`Self::decode_for_tracking`], it uses
-    /// the argmax default pre-NMS cap unless the cap was set explicitly.
+    /// Always decodes one label per box, regardless of [`Self::multi_label`].
+    /// Logs a warning once per decoder when the decoder has multi-label
+    /// enabled. Like [`Self::decode_for_tracking`], it uses the argmax
+    /// default pre-NMS cap unless the cap was set explicitly.
     ///
     /// # Arguments
     ///
@@ -2106,9 +1980,7 @@ impl Decoder {
         output_tracks: &mut Vec<edgefirst_tracker::TrackInfo>,
     ) -> Result<(), DecoderError> {
         self.warn_once_tracked_multi_label();
-        // Per-scale fast path: route via the basic decode then update the
-        // tracker. The current implementation keeps the tracker integration simple; per-frame
-        // decoupling between detection and tracking is preserved.
+        // Per-scale path: decodes, then updates the tracker.
         if self.per_scale.is_some() {
             output_tracks.clear();
             self.decode_impl(outputs, output_boxes, output_masks, false)?;
@@ -2173,11 +2045,10 @@ impl Decoder {
     /// Returns `Ok(None)` for detection-only and ModelPack models.
     /// Returns `Ok(Some(ProtoData))` for YOLO segmentation models.
     ///
-    /// Always decodes one label per box, regardless of [`Self::multi_label`]:
-    /// trackers match on IoU only, so per-class duplicates of one anchor would
-    /// spawn phantom tracks. Logs a warning once per decoder when the decoder
-    /// has multi-label enabled. Like [`Self::decode_for_tracking`], it uses
-    /// the argmax default pre-NMS cap unless the cap was set explicitly.
+    /// Always decodes one label per box, regardless of [`Self::multi_label`].
+    /// Logs a warning once per decoder when the decoder has multi-label
+    /// enabled. Like [`Self::decode_for_tracking`], it uses the argmax
+    /// default pre-NMS cap unless the cap was set explicitly.
     ///
     /// # Arguments
     ///
@@ -2200,8 +2071,8 @@ impl Decoder {
         output_tracks: &mut Vec<edgefirst_tracker::TrackInfo>,
     ) -> Result<Option<ProtoData>, DecoderError> {
         self.warn_once_tracked_multi_label();
-        // Per-scale fast path: route via the basic decode_proto then
-        // update the tracker on the resulting boxes.
+        // Per-scale path: runs `decode_proto`, then updates the tracker on the
+        // resulting boxes.
         if self.per_scale.is_some() {
             output_tracks.clear();
             let proto = self.decode_proto_impl(outputs, output_boxes, false)?;

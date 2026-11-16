@@ -1,27 +1,12 @@
 // SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! The dynamic backend: a thin newtype over the opaque C handle that calls
-//! into `libedgefirst_tensor.so` instead of embedding this crate's own
-//! implementation.
+//! The dynamic backend: a newtype over the opaque C handle that calls into
+//! `libedgefirst_tensor.so`.
 //!
-//! Every method here is a caller of an already-`#[no_mangle]`-exported
-//! `ef_tensor_*` function declared in `edgefirst-tensor-ffi` -- none of the
-//! logic that produces a tensor's bytes, geometry, or metadata lives in this
-//! file; it lives in `libedgefirst_tensor.so` (the `static`-backend build of
-//! `edgefirst-tensor-capi`). See `docs/superpowers/plans/
-//! PRIMITIVE-INVENTORY.md` for which methods are primitive (a direct
-//! `ef_tensor_*` call, here) versus derived (expressible over the primitives,
-//! in `derived.rs`, identical on both backends).
-//!
-//! Not `#[repr(transparent)]`: unlike the brief's original stub, this struct
-//! also caches the shape as `Vec<usize>` (because `shape()` must return a
-//! borrowed `&[usize]`, but `ef_tensor_shape` returns a borrowed `*const
-//! u64` -- a different element width) and a locally-derived
-//! [`crate::BufferIdentity`] (because there is no `ef_tensor_*` primitive
-//! that exposes one). Neither extra field changes `into_raw`/`from_raw`'s
-//! contract: they only ever read/write the handle field explicitly, never
-//! `transmute` the whole struct.
+//! A primitive method is a direct `ef_tensor_*` call; a derived method is built
+//! from the primitives and lives in `derived.rs`. The struct also caches the
+//! shape and a locally derived [`crate::BufferIdentity`].
 
 use std::fmt;
 use std::ptr::NonNull;
@@ -33,85 +18,30 @@ use crate::{
     Region, Result, TensorMemory, ViewOrigin,
 };
 
-/// The tensor handle, plus the facts this backend cannot re-derive from the
-/// handle alone on every call (see the module docs).
+/// The tensor handle and the values cached alongside it.
 pub struct TensorDyn {
     handle: Handle,
     shape_cache: Vec<usize>,
     identity: BufferIdentity,
-    /// Lazily-fetched quantization, read back through the two-call
-    /// `ef_tensor_quantization_{info,get}` idiom the first time
-    /// [`Self::quantization`] is called on *this* Rust value, then served
-    /// from cache. Exists because `quantization(&self) -> Option<&Quantization>`
-    /// must hand back a borrow with a stable address for as long as `self`
-    /// lives, and `Quantization` is variable-length -- there is nowhere
-    /// else on `Tensor<T>` to put owned storage for it without adding a
-    /// field there, which would break its `#[repr(transparent)]` layout
-    /// over `TensorDyn` (see `dynamic_tensor.rs`'s module docs). `OnceLock`
-    /// specifically (not a raw `&mut` cast, the F12 colorimetry race's
-    /// shape) is what makes concurrent reads from multiple threads sharing
-    /// one `&TensorDyn` sound: `get_or_init` serializes concurrent
-    /// initializers itself, so no `&mut TensorDyn` is ever materialized
-    /// while a `&TensorDyn` could be alive elsewhere. [`Self::set_quantization`]/
-    /// [`Self::clear_quantization`] take `&mut self`, so Rust's own
-    /// aliasing rules already guarantee no `&TensorDyn` (hence no
-    /// in-flight `get_or_init`) can coexist with the write that replaces
-    /// this field wholesale -- unlike colorimetry's cross-thread
-    /// read/write race, this write path is Rust-borrow-checked, not
-    /// merely documented. What this does **not** cover: a *different*
-    /// `TensorDyn` Rust value wrapping the same underlying C handle (via a
-    /// separate `retain` + `from_raw`) has its own, independent cache, so
-    /// a `set_quantization` through one wrapper does not invalidate an
-    /// already-cached read through another -- a documented staleness
-    /// limitation, not a memory-safety one (each wrapper's cache is its
-    /// own allocation).
+    /// Quantization, read through `ef_tensor_quantization_{info,get}` on the
+    /// first [`Self::quantization`] call and cached. Replaced by
+    /// [`Self::set_quantization`] and [`Self::clear_quantization`]. Each
+    /// `TensorDyn` wrapping the same handle has its own cache.
     quantization_cache: std::sync::OnceLock<Option<crate::Quantization>>,
-    /// Lazily-derived retained lens over the library-owned chroma plane.
-    ///
-    /// This is a cache, not a second source of truth: the first
-    /// [`Self::chroma`] call obtains it from `ef_tensor_chroma`, and wrappers
-    /// reconstructed with [`Self::from_raw`] derive their own cache from the
-    /// handle again. Keeping the retained lens for this parent's lifetime
-    /// lets the typed API return the same borrowed `Option<&Tensor<T>>` as
-    /// the static backend and keeps native handles borrowed from that chroma
-    /// lens valid through downstream imports.
+    /// Retained lens over the library-owned chroma plane, obtained from
+    /// `ef_tensor_chroma` on the first [`Self::chroma`] call.
     chroma_cache: std::sync::OnceLock<Option<Box<TensorDyn>>>,
-    /// The texture NT handle [`Self::descriptor_pinned`] puts in a
-    /// [`crate::protocol::kind::D3D11_TEXTURE`] descriptor, kept here for as
-    /// long as this value lives.
-    ///
-    /// The static backend borrows the tensor's own handle
-    /// (`d3d11_shared_handle_value`); across the C ABI there is no such
-    /// accessor -- `ef_tensor_d3d11_shared_handle` transfers ownership of a
-    /// *duplicate*, which a descriptor cannot own (it is `Copy` and has no
-    /// drop). Writing the duplicate's value into the descriptor and dropping
-    /// it leaves the descriptor naming a closed handle; leaking it leaks one
-    /// handle per descriptor, and a per-frame producer builds one every
-    /// frame. Holding it here gives it the same lifetime the static
-    /// backend's borrowed handle has -- the producing tensor's, which the
-    /// capsule keepalive already holds for the descriptor's whole life --
-    /// and closes it exactly once, when this tensor drops.
-    ///
-    /// `OnceLock` for the reason [`Self::quantization_cache`] documents:
-    /// `descriptor_pinned` takes `&self`, and `get_or_init` serializes
-    /// concurrent initializers without ever materializing a `&mut`.
+    /// The duplicated texture NT handle [`Self::descriptor_pinned`] puts in a
+    /// [`crate::protocol::kind::D3D11_TEXTURE`] descriptor, closed when this
+    /// value drops.
     #[cfg(target_os = "windows")]
     descriptor_texture_handle: std::sync::OnceLock<Option<std::os::windows::io::OwnedHandle>>,
 }
 
-// SAFETY: `TensorTrait<T>: Send + Sync` is a supertrait bound every consumer
-// (e.g. `edgefirst-image`'s `gl/threaded.rs`, which wraps a `TensorDyn` for
-// cross-thread GL work) relies on, and `NonNull<EfTensor>` is neither by
-// default. The C ABI's handles are designed to cross threads: ownership is
-// tracked by refcount (`ef_tensor_retain`/`ef_tensor_free`), not by Rust's
-// aliasing rules, and every mutating entry point this backend calls
-// (`ef_tensor_map`/`unmap`, `ef_tensor_set_colorimetry`, ...) is documented
-// as safe to call from any thread holding a valid reference. `shape_cache`
-// and `identity` are ordinary owned `Send + Sync` data;
-// `quantization_cache` and `chroma_cache` are `OnceLock`s, `Sync` by
-// construction whenever their contents are -- see those fields' own doc
-// comments for why concurrent access through them specifically is sound,
-// not just asserted here.
+// SAFETY: the C handle is reference-counted and its entry points may be called
+// from any thread holding a valid reference. `shape_cache` and `identity` are
+// owned `Send + Sync` data, and the caches are `OnceLock`s over `Send + Sync`
+// contents.
 unsafe impl Send for TensorDyn {}
 unsafe impl Sync for TensorDyn {}
 
@@ -164,8 +94,7 @@ impl fmt::Debug for BorrowedTensor<'_> {
     }
 }
 
-/// Same name, same meaning as the static backend's -- here it is the real
-/// handle rather than a boxed Rust value.
+/// The raw C handle.
 pub type Raw = *mut EfTensor;
 
 impl TensorDyn {
@@ -191,51 +120,12 @@ impl TensorDyn {
 
     /// Derive this handle's [`BufferIdentity`].
     ///
-    /// On Windows, a texture-backed handle uses the `ID3D11Texture2D*` behind
-    /// `ef_tensor_d3d11_texture`, the same key the static backend's
-    /// `d3d11::texture::tex_key` derives, so one texture has one identity
-    /// whichever backend names it.
-    ///
-    /// For a DMA-BUF-backed handle, uses the native fd's `(st_dev, st_ino)`
-    /// -- survives `dup`, and is the same value for every independent
-    /// import of the same underlying buffer, matching the static backend's
-    /// own `IdentityKind::DmaBuf` strategy exactly (`dma.rs::
-    /// identity_from_stat`) rather than the handle's own process-local
-    /// address. Observable from the Rust side today via an `fstat` on the
-    /// native fd [`Self::plane0`] already exposes, so it needs no new
-    /// `ef_tensor_*` primitive (proposed by task 15's report, implemented
-    /// here by task 17).
-    ///
-    /// **Why this matters beyond `aliases()` returning the right bool.**
-    /// `edgefirst-image`'s GL import cache (`gl/cache.rs`) keys a cached
-    /// EGLImage on `buffer_identity().id()` and is documented as safe to
-    /// outlive the tensor that produced it *specifically because* a
-    /// DMA-BUF/IOSurface-kind identity is an OS-level key: the kernel
-    /// cannot recycle an inode onto a different buffer while any reference
-    /// (including the cache's own retained import) is alive. The
-    /// `HostPtr` fallback this replaces has no such guarantee -- it is a
-    /// process address, and this library's own C-side allocator can (and,
-    /// under allocation churn, will) reuse a just-freed `EfTensorImpl`'s
-    /// address for the next handle it mints. A cache entry keyed on that
-    /// reused address, for a request with matching geometry, would serve a
-    /// *different* buffer's stale imported texture: wrong pixels, no
-    /// error, no crash -- an ABA hazard the design a `IdentityKind` doc
-    /// comment (`lib.rs`) explicitly says a process-local kind must not be
-    /// exposed to a cache like this without exactly this kind of stable,
-    /// unrecyclable-while-live key. The D3D11 branch is the same argument on
-    /// Windows: an `ID3D11Texture2D*` is process-local like a handle address,
-    /// but ANGLE's EGLImage holds a reference to the texture, so the address
-    /// cannot be recycled while a cache entry keyed on it can be found --
-    /// which a handle address, held by nothing, can. Falls back to `HostPtr`
-    /// (this handle's own address) for every other storage kind, or if the fd
-    /// cannot be `fstat`-ed -- no `ef_tensor_*` primitive exposes a
-    /// system-level identity key for those, so a process-local one is the best
-    /// answer available, same as the static backend's own `Mem`/`Pbo` tensors,
-    /// neither of which any GPU import path accepts.
+    /// On Windows a texture-backed handle is keyed on the `ID3D11Texture2D*`
+    /// returned by `ef_tensor_d3d11_texture`. On Unix a DMA-BUF-backed handle
+    /// is keyed on the `(st_dev, st_ino)` of its plane 0 fd. Every other
+    /// storage kind, and an fd that cannot be `fstat`-ed, is keyed on the
+    /// handle's own address as `HostPtr`.
     fn derive_identity(handle: NonNull<EfTensor>) -> BufferIdentity {
-        // Gated on the storage kind first, as the Unix branch is, so a `Mem`
-        // or PBO handle does not pay an `ENOTSUP` that overwrites the ABI's
-        // last-error slot on every construction.
         #[cfg(target_os = "windows")]
         {
             // SAFETY: `handle` is live for the duration of this call.
@@ -357,8 +247,7 @@ impl TensorDyn {
         Ok(unsafe { Self::from_raw(self.handle.as_ptr()) })
     }
 
-    /// Give up ownership, yielding the handle itself. The caches are
-    /// dropped: they are derived state that `from_raw` re-derives.
+    /// Give up ownership, yielding the handle. The caches are dropped.
     pub fn into_raw(self) -> Raw {
         let TensorDyn { mut handle, .. } = self;
         handle.owned = false;
@@ -395,20 +284,13 @@ impl TensorDyn {
         f(&mut t)
     }
 
-    // --- The 9 primitives `TensorTrait<T>`'s method set requires a
-    // per-backend implementation for (`lib.rs`'s trait definition; see
-    // `docs/superpowers/plans/PRIMITIVE-INVENTORY.md`). Each is a direct
-    // `ef_tensor_*` call, same as the static backend's own inherent methods
-    // of the same names dispatch to `Tensor<T>`'s.
+    // --- Primitives: each is a direct `ef_tensor_*` call.
 
     /// Create a type-erased tensor with the given shape and element type.
     ///
-    /// Drives the builder (`ef_tensor_builder_{new,dtype,shape,storage,
-    /// alloc}`) rather than the shortcut `ef_tensor_new`, because that
-    /// shortcut only ever allocates host memory -- the builder is what lets
-    /// `memory` name a specific backing, matching the static backend's own
-    /// contract. `name` is accepted for signature parity but has no effect:
-    /// no `ef_tensor_*` primitive carries a tensor's name across the ABI.
+    /// Allocates through the builder
+    /// (`ef_tensor_builder_{new,dtype,shape,storage,alloc}`); `memory` selects
+    /// the backing. `name` has no effect.
     pub fn new(
         shape: &[usize],
         dtype: DType,
@@ -442,15 +324,11 @@ impl TensorDyn {
         }
     }
 
-    /// Import an existing buffer as a type-erased tensor, taking ownership
-    /// of its file descriptor. No bytes are copied.
+    /// Import an existing buffer as a type-erased tensor, taking ownership of
+    /// its file descriptor. No bytes are copied.
     ///
-    /// Drives the builder's adopt path (`ef_tensor_builder_{new,dtype,shape,
-    /// add_plane,wrap}`) -- `ef_tensor_builder_wrap` is exactly this
-    /// primitive: it adopts the first plane's handle and dispatches to the
-    /// static backend's own `TensorDyn::from_fd` internally (backend
-    /// detection from the fd's filesystem magic included), inside
-    /// `libedgefirst_tensor.so`.
+    /// Adopts the fd through the builder
+    /// (`ef_tensor_builder_{new,dtype,shape,add_plane,wrap}`).
     #[cfg(unix)]
     pub fn from_fd(
         fd: std::os::fd::OwnedFd,
@@ -461,8 +339,7 @@ impl TensorDyn {
         use std::os::fd::{FromRawFd, IntoRawFd};
         // SAFETY: every call below either takes a value or a pointer to data
         // this function owns for the call's duration; `raw_fd` is reclaimed
-        // into an `OwnedFd` (and so closed) on every path that does not hand
-        // it to `wrap`.
+        // into an `OwnedFd` on every path that does not hand it to `wrap`.
         unsafe {
             let b = edgefirst_tensor_ffi::ef_tensor_builder_new();
             if b.is_null() {
@@ -479,8 +356,7 @@ impl TensorDyn {
             let result = match NonNull::new(handle) {
                 Some(h) => Ok(Self::from_handle(h)),
                 None => {
-                    // `wrap` adopts the fd only on success, so it is still
-                    // ours -- reclaim it so it is closed instead of leaked.
+                    // Close the fd `wrap` did not adopt.
                     drop(std::os::fd::OwnedFd::from_raw_fd(raw_fd));
                     let errno = edgefirst_tensor_ffi::ef_tensor_builder_error(b);
                     Err(Error::NotImplemented(format!(
@@ -500,34 +376,21 @@ impl TensorDyn {
 
     /// Reshape this tensor. Total element count must remain the same.
     ///
-    /// No `ef_tensor_reshape` primitive exists yet -- `PRIMITIVE-INVENTORY.md`
-    /// found no call site across any of the four `-capi` siblings that
-    /// reaches this on `TensorDyn` under the dynamic backend, so adding one
-    /// was out of this task's scope. Rather than silently updating only the
-    /// local `shape_cache` (which `ef_tensor_shape` itself would then
-    /// contradict for any other consumer of the same handle), this refuses
-    /// with a clear error until a real primitive lands.
+    /// Drives `ef_tensor_reshape`.
     pub fn reshape(&mut self, shape: &[usize]) -> Result<()> {
         self.reshape_impl(shape, false)
     }
 
     /// Set the logical shape to any shape whose bytes fit the allocation,
-    /// without [`reshape`](Self::reshape)'s equal-count constraint --
-    /// the pool-reuse primitive. Drives `ef_tensor_set_logical_shape`.
-    ///
-    /// Not a convenience over `reshape`: `TensorTrait::set_logical_shape`'s
-    /// *default* body is `self.reshape(shape)`, which is precisely the bug
-    /// task P2e fixed. Without a real implementation here the dynamic
-    /// backend would inherit that default and apply the strict rule to a
-    /// pool tensor, silently refusing the reconfigure the method exists for.
+    /// without [`reshape`](Self::reshape)'s equal-count constraint. Drives
+    /// `ef_tensor_set_logical_shape`.
     pub fn set_logical_shape(&mut self, shape: &[usize]) -> Result<()> {
         self.reshape_impl(shape, true)
     }
 
     /// The shared body of [`reshape`](Self::reshape) and
-    /// [`set_logical_shape`](Self::set_logical_shape) -- one place to
-    /// marshal the dims and refresh the cache, so the two cannot drift into
-    /// leaving different state behind.
+    /// [`set_logical_shape`](Self::set_logical_shape): marshals the dims and
+    /// refreshes the shape cache.
     fn reshape_impl(&mut self, shape: &[usize], by_capacity: bool) -> Result<()> {
         let dims: Vec<u64> = shape.iter().map(|&d| d as u64).collect();
         // SAFETY: `self.handle` is live; `dims` is a live local for the call.
@@ -547,78 +410,33 @@ impl TensorDyn {
             }
         };
         if rc != 0 {
-            // The C side already prefixes its message with the operation
-            // name, so this does not add a second one.
             let msg = ffi_last_error();
-            // ERANGE is "this shape does not fit"; anything else is a
-            // malformed argument. The static backend distinguishes further
-            // and the ABI has no room for it, so several of its variants
-            // collapse into these two. The message survives every one of
-            // them, which is what a caller actually sees (`python-common`
-            // renders `Display` into a `PyErr`), and nothing in this
-            // workspace matches on the variants. Enumerated so the next
-            // reader does not have to re-derive it:
-            //
-            //   static                              dynamic
-            //   ShapeMismatch (count mismatch)      ShapeMismatch
-            //   InsufficientCapacity {needed, cap}  ShapeMismatch (numbers
-            //                                       do not cross the ABI)
-            //   InvalidOperation ("cannot reshape   InvalidShape
-            //     a multiplane tensor")
-            //   InvalidSize(0) (empty shape)        InvalidShape -- the C
-            //                                       entry rejects ndim == 0
-            //                                       before the backend sees it
             return Err(if rc == libc::ERANGE {
                 Error::ShapeMismatch(msg)
             } else {
                 Error::InvalidShape(msg)
             });
         }
-        // `shape()` serves the cached vector, not the handle, so it would
-        // keep reporting the OLD geometry the moment after this succeeded.
         self.shape_cache = Self::query_shape(self.handle.ptr);
-        // A PBO-backed handle keeps its geometry in ONE place now -- the
-        // library's own `TensorStorage::Pbo` -- so there is no second copy
-        // to sync. Before Stage B this had to mirror every shape change onto
-        // a `PboTensor` stashed beside the handle.
         Ok(())
     }
 
     /// Return the tensor name.
     ///
-    /// Always empty: no `ef_tensor_*` primitive carries a tensor's name
-    /// across the ABI (confirmed in `PRIMITIVE-INVENTORY.md` and by task 7's
-    /// investigation of this same gap).
+    /// Always empty on this backend.
     pub fn name(&self) -> String {
         String::new()
     }
 
-    /// Return the memory allocation type, as the library reports it.
-    ///
-    /// No PBO special case: since Stage B a PBO-backed handle *is*
-    /// `TensorStorage::Pbo` inside `libedgefirst_tensor.so`, so
-    /// `ef_tensor_storage_kind` returns `TensorMemory::Pbo` on its own. The
-    /// override this replaces existed because the handle underneath was
-    /// ordinary host memory.
+    /// Return the memory allocation type reported by `ef_tensor_storage_kind`.
     pub fn memory(&self) -> TensorMemory {
         // SAFETY: `self.handle` is a live handle for as long as `self` exists.
         let code = unsafe { edgefirst_tensor_ffi::ef_tensor_storage_kind(self.handle.as_ptr()) };
         TensorMemory::from_code(code).unwrap_or(TensorMemory::Mem)
     }
 
-    /// Clone the file descriptor backing this tensor, for any storage kind
-    /// that has one.
-    ///
-    /// Drives `ef_tensor_clone_fd`. This used to read plane 0's native
-    /// handle (`ef_tensor_plane_at`) and `dup` it directly, which needed no
-    /// new primitive -- and was wrong for SHM. A plane's native handle is a
-    /// dma-buf fd on Linux and an IOSurface id on Apple, and `-1` for every
-    /// other backing, so deriving "clone this tensor's fd" from it refused
-    /// SHM-backed tensors, which do have a real fd and which the static
-    /// backend clones without complaint (`TensorStorage::Shm(t) =>
-    /// t.clone_fd()`). Asking the library, which owns the storage and knows
-    /// which kinds have an fd, is what the split is for -- the same rule
-    /// every other method here follows.
+    /// Clone the file descriptor backing this tensor, for any storage kind that
+    /// has one. Drives `ef_tensor_clone_fd`.
     #[cfg(unix)]
     pub fn clone_fd(&self) -> Result<std::os::fd::OwnedFd> {
         use std::os::fd::FromRawFd;
@@ -629,17 +447,6 @@ impl TensorDyn {
             return Err(if -rc == libc::ENOTSUP {
                 Error::NotImplemented(msg)
             } else {
-                // `Error::other`, not `from_raw_os_error`: the latter
-                // discarded `msg` on exactly the path where it is most
-                // useful -- a `dup` that failed for a reason worth reading,
-                // reduced to a bare errno. The errno is kept in the text.
-                //
-                // Variant note: the static backend returns `NixError` here
-                // (it calls `nix::unistd::dup` directly), and this returns
-                // `IoError`. The ABI carries an errno, not a Rust variant,
-                // and no caller in this workspace matches on either -- both
-                // render the same way through `Display`. Stated rather than
-                // left for the next reader to re-derive.
                 Error::IoError(std::io::Error::other(format!(
                     "clone_fd: {msg} (errno {})",
                     -rc
@@ -651,44 +458,27 @@ impl TensorDyn {
         Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(rc) })
     }
 
-    /// Return the [`BufferIdentity`] of the underlying allocation.
-    ///
-    /// See [`from_handle`](Self::from_handle): derived once at construction
-    /// from the handle's own address, because no `ef_tensor_*` primitive
-    /// exposes a system-level identity key (a dma-buf `(st_dev, st_ino)`,
-    /// say) to derive one from instead.
+    /// Return the [`BufferIdentity`] of the underlying allocation, derived once
+    /// at construction.
     pub fn buffer_identity(&self) -> &BufferIdentity {
         &self.identity
     }
 
     /// The shared core of [`map_bytes`](Self::map_bytes) and
-    /// [`pin_host`](Self::pin_host): `ef_tensor_map` plus an
-    /// `ef_tensor_retain`'d [`MapKeepalive`] so the resulting pin is
-    /// genuinely `'static` (shares ownership through the keepalive, never a
-    /// borrow of `self` -- same contract the static backend's `map_bytes`
-    /// documents).
-    ///
-    /// `pub(crate)`, not `pub`: `dynamic_tensor.rs`'s `Tensor<T>::map_with`
-    /// also calls this directly (to build a typed `HostView<T>` instead of
-    /// the byte-level one [`map_bytes`](Self::map_bytes) returns), which is
-    /// why this is not `pub(self)` -- it is shared plumbing within the
-    /// crate, not a second public byte-mapping entry point.
+    /// [`pin_host`](Self::pin_host): `ef_tensor_map` plus a retained
+    /// [`MapKeepalive`], giving a `'static` pin that shares ownership of the
+    /// handle.
     pub(crate) fn map_pin(&self, access: CpuAccess) -> Result<crate::pin::HostPin<'static>> {
         self.map_pin_with(access, false)
     }
 
     /// [`map_pin`](Self::map_pin), with the choice of `ef_tensor_map` or
     /// `ef_tensor_try_map`.
-    ///
-    /// One body rather than two: the retain that makes the pin `'static`
-    /// and the unmap-on-retain-failure unwind are identical for both, and
-    /// the ABI call is the only line that differs.
     pub(crate) fn map_pin_with(
         &self,
         access: CpuAccess,
         non_blocking: bool,
     ) -> Result<crate::pin::HostPin<'static>> {
-        // Checked here so the error matches the static backend's, not an errno.
         self.cpu_access().require_direction(access, "map_with")?;
         let code = access.code();
         let mut view = edgefirst_tensor_ffi::EfTensorView {
@@ -704,10 +494,8 @@ impl TensorDyn {
             }
         };
         if rc == libc::EAGAIN && non_blocking {
-            // Not a failure: the GPU copy this map depends on is still in
-            // flight and a retry makes progress. Rebuilt as the exact error
-            // the static backend raises, so `try_map_with` means one thing
-            // on both backends.
+            // The GPU copy this map depends on is in flight: report
+            // `WouldBlock`.
             return Err(Error::IoError(std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,
                 ffi_last_error(),
@@ -723,8 +511,7 @@ impl TensorDyn {
                 "{what} failed: errno {rc}"
             )));
         }
-        // Retain so the pin can genuinely outlive `self` -- released by
-        // `MapKeepalive::drop`.
+        // Take the reference `MapKeepalive::drop` releases.
         // SAFETY: `self.handle` is live.
         let retain_rc = unsafe { edgefirst_tensor_ffi::ef_tensor_retain(self.handle.as_ptr()) };
         if retain_rc != 0 {
@@ -739,53 +526,32 @@ impl TensorDyn {
         Ok(crate::pin::HostPin::new(keepalive, view.ptr, view.len))
     }
 
-    /// Map this tensor's whole extent for CPU access, type-erased to raw
-    /// bytes. Returns a `'static` view, same contract as the static
-    /// backend's own `map_bytes`.
+    /// Map this tensor's whole extent for CPU access, type-erased to raw bytes.
+    /// Returns a `'static` view.
     pub fn map_bytes(&self, access: CpuAccess) -> Result<crate::view::HostView<'static, u8>> {
         let pin = self.map_pin(access)?;
         let len = pin.len();
         Ok(crate::view::HostView::new(pin, vec![len], None, access))
     }
 
-    /// Non-blocking [`map_bytes`](Self::map_bytes), same contract as the
-    /// static backend's own `try_map_bytes`.
+    /// Non-blocking [`map_bytes`](Self::map_bytes).
     ///
     /// Drives `ef_tensor_try_map`, whose `EAGAIN` becomes
-    /// `Error::IoError(WouldBlock)` -- the same error the static backend
-    /// raises for the same reason, so a caller sees one contract on both.
-    /// Only the Windows D3D11 texture can actually answer it; every other
-    /// backing reaches the identical code `ef_tensor_map` does.
+    /// `Error::IoError(WouldBlock)`. Only a Windows D3D11 texture can return
+    /// it; every other backing behaves as [`map_bytes`](Self::map_bytes).
     pub fn try_map_bytes(&self, access: CpuAccess) -> Result<crate::view::HostView<'static, u8>> {
         let pin = self.map_pin_with(access, true)?;
         let len = pin.len();
         Ok(crate::view::HostView::new(pin, vec![len], None, access))
     }
 
-    /// Pin a stable host address for this tensor's data. Returns a
-    /// `'static` pin, same contract as the static backend's own `pin_host`.
+    /// Pin a stable host address for this tensor's data. Returns a `'static`
+    /// pin built on [`map_pin`](Self::map_pin).
     ///
-    /// No dedicated `ef_tensor_pin_host` primitive exists; `ef_tensor_map`
-    /// plus a retained reference (the same primitive `map_bytes` uses) is
-    /// the only mapping operation the ABI exposes, so this shares
-    /// [`map_pin`](Self::map_pin) rather than duplicating it.
+    /// # Errors
     ///
-    /// Which is why the PBO refusal has to be **repeated** here rather than
-    /// forwarded. `Tensor::pin_host` (`lib.rs`) refuses `TensorStorage::Pbo`
-    /// -- `glMapBufferRange`'s address is valid only until `glUnmapBuffer`,
-    /// so a pin would have to hold the buffer mapped across GL work -- but
-    /// `ef_tensor_map` is `map`, not `pin_host`, and the library cannot tell
-    /// the two callers apart. Without this guard a PBO pinned on this
-    /// backend and refused on the other, from the same call. The message is
-    /// [`crate::pbo::PIN_HOST_PBO_REFUSAL`], the one both arms read, so they
-    /// cannot drift. A real `ef_tensor_pin_host` entry point (Stage E) is
-    /// what removes the duplication.
-    ///
-    /// The AHardwareBuffer arm, which the static backend refuses for the
-    /// same reason, is deliberately **not** mirrored: Android reports it as
-    /// `TensorMemory::DmaBuf`, indistinguishable here from a Linux DMA-BUF
-    /// or an IOSurface, both of which pin. Guessing from the storage kind
-    /// would refuse two backings that work.
+    /// [`Error::NotImplemented`] with [`crate::pbo::PIN_HOST_PBO_REFUSAL`] for
+    /// a PBO-backed tensor.
     pub fn pin_host(&self, access: CpuAccess) -> Result<crate::pin::HostPin<'static>> {
         if self.memory() == TensorMemory::Pbo {
             return Err(Error::NotImplemented(
@@ -795,25 +561,8 @@ impl TensorDyn {
         self.map_pin(access)
     }
 
-    /// This tensor's plane-0 geometry (`ef_tensor_plane_at`, already
-    /// exported), or `None` for an invalid handle or one with no planes.
-    /// Shared by [`clone_fd`](Self::clone_fd), [`aliases`](Self::aliases),
-    /// and [`effective_row_stride`](Self::effective_row_stride).
-    ///
-    /// `pub`, not `pub(crate)`: each `-capi` leaf's own transition vtable
-    /// (`vtable.rs`, scheduled for removal once G4 closes -- see the
-    /// single-tensor-home plan's task 10) mints tensors under its own
-    /// private `EfTensorImpl` wrapper and needs exactly this to answer its
-    /// own `ef_tensor_plane_at`-equivalent dispatch (the formatless-tensor
-    /// fallback geometry, and the shareable native handle for any plane
-    /// index -- every plane of one tensor shares plane 0's handle). Before
-    /// task 9 switched the leaves onto this backend, those call sites used
-    /// `TensorDyn::capacity_bytes()`/`dmabuf()`/`iosurface_id()`, which
-    /// only exist on the `static` backend this crate no longer embeds in
-    /// those libraries; delegating to the already-correct primitive here
-    /// (rather than re-deriving capacity/native-handle logic on the
-    /// consumer side) is the same rule task 15's report states for every
-    /// other dynamic-backend method.
+    /// This tensor's plane-0 geometry and native handle (`ef_tensor_plane_at`),
+    /// or `None` for an invalid handle or one with no planes.
     pub fn plane0(&self) -> Option<edgefirst_tensor_ffi::EfTensorPlane> {
         let mut plane = edgefirst_tensor_ffi::EfTensorPlane::default();
         // SAFETY: `self.handle` is live; `plane` is a valid local out-param.
@@ -823,17 +572,14 @@ impl TensorDyn {
         (rc == 0).then_some(plane)
     }
 
-    /// Effective row stride: the padded byte pitch a stride-aware CPU
-    /// reader must honor, sourced from plane 0's stride -- which is exactly
-    /// what the static backend's own `effective_row_stride()` computes
-    /// (`vtable.rs`'s `ef_tensor_plane_at` implementation reads that same
-    /// value on the producing side).
+    /// Effective row stride: the padded byte pitch a stride-aware CPU reader
+    /// must honor, taken from plane 0's stride.
     pub fn effective_row_stride(&self) -> Option<usize> {
         self.plane0().map(|p| p.stride as usize)
     }
 
-    /// Image width in pixels (`None` if not an image tensor). Pure function
-    /// of `shape()` + `format()`, mirroring `Tensor::width`.
+    /// Image width in pixels (`None` if not an image tensor), computed from
+    /// `shape()` and `format()`.
     pub fn width(&self) -> Option<usize> {
         let (fmt, dims) = self.image_dims()?;
         match fmt.layout() {
@@ -843,9 +589,9 @@ impl TensorDyn {
         }
     }
 
-    /// The format and the trailing shape dims that describe one image,
-    /// allowing one leading batch `N`; `None` when unformatted or when the
-    /// shape has any other rank. Mirrors `Tensor::image_dims`.
+    /// The format and the trailing shape dims that describe one image, allowing
+    /// one leading batch `N`; `None` when unformatted or when the shape has any
+    /// other rank.
     fn image_dims(&self) -> Option<(PixelFormat, &[usize])> {
         let fmt = self.format()?;
         let shape = self.shape();
@@ -857,9 +603,8 @@ impl TensorDyn {
         Some((fmt, &shape[batch_dims..]))
     }
 
-    /// Image height in pixels (`None` if not an image tensor). Pure
-    /// function of `shape()` + `format()`, mirroring `Tensor::height`.
-    ///
+    /// Image height in pixels (`None` if not an image tensor), computed from
+    /// `shape()` and `format()`.
     pub fn height(&self) -> Option<usize> {
         let (fmt, dims) = self.image_dims()?;
         match fmt.layout() {
@@ -880,10 +625,9 @@ impl TensorDyn {
         }
     }
 
-    /// True if `self` and `other` reference the same underlying buffer.
-    /// Same matching rules as the static backend's `aliases`: identity
-    /// equality, then (Linux DMA tensors only) a same-fd-number compare
-    /// via plane 0's native handle.
+    /// True if `self` and `other` reference the same underlying buffer:
+    /// identity equality, then (Linux DMA tensors only) a same-fd-number
+    /// compare via plane 0's native handle.
     pub fn aliases(&self, other: &Self) -> bool {
         if self.buffer_identity().id() == other.buffer_identity().id() {
             return true;
@@ -901,8 +645,7 @@ impl TensorDyn {
         false
     }
 
-    // --- The three primitives `PRIMITIVE-INVENTORY.md` found genuinely new:
-    // `colorimetry`, `set_colorimetry`, `view_origin`.
+    // --- `colorimetry`, `set_colorimetry`, `view_origin`.
 
     /// Colorimetry metadata (`None` = undefined; never auto-filled).
     pub fn colorimetry(&self) -> Option<Colorimetry> {
@@ -918,13 +661,11 @@ impl TensorDyn {
     /// Attach/clear colorimetry metadata.
     pub fn set_colorimetry(&mut self, c: Option<Colorimetry>) {
         let packed = c.map(|c| c.pack()).unwrap_or(0);
-        // SAFETY: `self.handle` is live and own-mint (every dynamic-backend
-        // handle is minted by this same `libedgefirst_tensor.so`).
+        // SAFETY: `self.handle` is live and was minted by this library.
         unsafe { edgefirst_tensor_ffi::ef_tensor_set_colorimetry(self.handle.as_ptr(), packed) };
     }
 
-    /// Builder-style [`Self::set_colorimetry`]. Same signature as the
-    /// static backend's, so a shared call site needs no backend branch.
+    /// Builder-style [`Self::set_colorimetry`].
     pub fn with_colorimetry(mut self, c: Colorimetry) -> Self {
         self.set_colorimetry(Some(c));
         self
@@ -963,17 +704,15 @@ impl TensorDyn {
         let _ = unsafe { edgefirst_tensor_ffi::ef_tensor_mark_view(self.handle.as_ptr()) };
     }
 
-    /// Return the runtime element type discriminant. Already-exported
-    /// (`ef_tensor_dtype`); needed by `derived.rs`'s pure functions of
-    /// `dtype()`/`shape()`/`format()`.
+    /// Return the runtime element type discriminant (`ef_tensor_dtype`).
     pub fn dtype(&self) -> DType {
         // SAFETY: `self.handle` is live.
         let code = unsafe { edgefirst_tensor_ffi::ef_tensor_dtype(self.handle.as_ptr()) };
         DType::from_code(code).unwrap_or(DType::U8)
     }
 
-    /// Return the pixel format (`None` if not an image tensor).
-    /// Already-exported (`ef_tensor_format`).
+    /// Return the pixel format (`None` if not an image tensor), read from
+    /// `ef_tensor_format`.
     pub fn format(&self) -> Option<PixelFormat> {
         // SAFETY: `self.handle` is live; the returned pointer is borrowed
         // for as long as the handle lives, which outlives this call.
@@ -990,14 +729,8 @@ impl TensorDyn {
         }
     }
 
-    /// Allocate an image tensor with the given geometry, memory backing,
-    /// and CPU access declaration -- dispatching on `dtype`, same as
-    /// `static`'s `TensorDyn::image` (`static_backend.rs`). Drives
-    /// `ef_tensor_image_alloc`, a thin wrapper the producer side
-    /// (`tensor-capi`, always the `static` backend) resolves by calling the
-    /// real `static::TensorDyn::image` -- the platform image geometry lives
-    /// there, not here. Real callers under `dynamic`: `edgefirst-image`'s
-    /// `cpu/mod.rs`.
+    /// Allocate an image tensor with the given geometry, memory backing, and
+    /// CPU access declaration. Drives `ef_tensor_image_alloc`.
     pub fn image(
         width: usize,
         height: usize,
@@ -1023,19 +756,15 @@ impl TensorDyn {
         };
         match NonNull::new(handle) {
             Some(h) => Ok(Self::from_handle(h)),
-            // `NotImplemented` was a guess: an allocation that failed for
-            // want of memory, or a format the platform declined, is not
-            // "not implemented". `ffi_error` takes the producing side's own
-            // class, and falls back to the old variant only when the
-            // library recorded none.
+            // The library's recorded error class, or `NotImplemented` when it
+            // recorded none.
             None => Err(ffi_error(Error::NotImplemented)),
         }
     }
 
-    /// See [`Self::image`]: same primitive family, full-featured request
-    /// form. Drives `ef_tensor_image_desc_alloc`, which resolves the
-    /// request (including any compression negotiation) through the
-    /// producer side's real `static::TensorDyn::image_desc`.
+    /// Allocate an image tensor from a full [`crate::ImageDesc`] request,
+    /// including any compression negotiation. Drives
+    /// `ef_tensor_image_desc_alloc`.
     pub fn image_desc(desc: &crate::ImageDesc) -> Result<Self> {
         let c_format = format_cstring(desc.format())?;
         // SAFETY: every call below either takes a value or a pointer to
@@ -1057,12 +786,8 @@ impl TensorDyn {
             }
             edgefirst_tensor_ffi::ef_tensor_image_desc_set_access(d, desc.access().code());
             if desc.compression().is_some() {
-                // Both `Compression::Any` and `Compression::Scheme(_)` request
-                // "any scheme": `Scheme` has no C setter (see
-                // `ef_tensor_image_desc_set_compression`'s own doc), so this
-                // is the closest expressible request rather than silently
-                // dropping it. A caller that specifically needs a named
-                // scheme has no ABI path to it today.
+                // `Compression::Any` and `Compression::Scheme(_)` both request
+                // any scheme.
                 edgefirst_tensor_ffi::ef_tensor_image_desc_set_compression(
                     d,
                     edgefirst_tensor_ffi::EfCompressionRequest::Any as u32,
@@ -1081,8 +806,8 @@ impl TensorDyn {
         }
     }
 
-    /// See [`Self::image`]: same primitive family, externally-strided form.
-    /// Drives `ef_tensor_image_with_stride_alloc`.
+    /// Allocate an image tensor with a caller-supplied row stride. Drives
+    /// `ef_tensor_image_with_stride_alloc`.
     pub fn image_with_stride(
         width: usize,
         height: usize,
@@ -1114,21 +839,9 @@ impl TensorDyn {
         }
     }
 
-    /// Borrow a rectangular spatial sub-region as a zero-copy view sharing
-    /// this tensor's allocation. Same signature as `static`'s
-    /// `TensorDyn::view` (`static_backend.rs`), which dispatches to
-    /// `Tensor<T>::view` (`lib.rs`) -- real production code calls it
-    /// (`edgefirst-image`'s tiled multi-slot convert path,
-    /// `tiling.rs::render_tile`, views a row-band out of a tall parent
-    /// destination tensor).
-    ///
-    /// Drives `ef_tensor_view_region`, which is *not* a composition over
-    /// `ef_tensor_builder_wrap`/`add_plane` (that path would mint a fresh
-    /// identity by duplicating a plane's fd, breaking
-    /// [`TensorTrait::view`]'s "must never mint a fresh identity" contract)
-    /// -- it calls the producer side's real `static::TensorDyn::view`
-    /// directly, which shares the parent's allocation and
-    /// [`BufferIdentity`] the same way the static backend's own callers get.
+    /// Borrow a rectangular spatial sub-region as a zero-copy view sharing this
+    /// tensor's allocation and [`BufferIdentity`]. Drives
+    /// `ef_tensor_view_region`.
     pub fn view(&self, region: Region) -> Result<TensorDyn> {
         // SAFETY: `self.handle` is a live handle for the call's duration.
         let handle = unsafe {
@@ -1143,18 +856,7 @@ impl TensorDyn {
         match NonNull::new(handle) {
             Some(h) => Ok(Self::from_handle(h)),
             None => {
-                // Only claim "out of bounds" when the producing side says
-                // that is what happened. This used to assert it for *every*
-                // NULL -- including an unresolvable handle and a region a
-                // format rejected for reasons other than fit -- and to
-                // fabricate the `bounds` from `width()`/`height()`, which
-                // for a non-image tensor are `None` and rendered as `(0,
-                // 0)`. Same shape of confident falsehood `batch` had, found
-                // by the P2c sweep rather than by a failing test.
                 if ffi_last_error_class() == edgefirst_tensor_ffi::EfErrorClass::RegionOutOfBounds {
-                    // Rebuilt with real numbers rather than through
-                    // `ffi_error`: this caller has them (`region` is its own
-                    // argument, and the frame comes from the tensor).
                     Err(Error::RegionOutOfBounds {
                         region,
                         bounds: (self.width().unwrap_or(0), self.height().unwrap_or(0)),
@@ -1167,20 +869,10 @@ impl TensorDyn {
     }
 
     /// Attach pixel format metadata to this tensor, validating shape
-    /// compatibility. Same contract as `static`'s `TensorDyn::set_format`
-    /// (`static_backend.rs`). Drives `ef_tensor_set_format`, the live-handle
-    /// mutator (as opposed to the pre-alloc `ef_tensor_builder_format`
-    /// setter). Real caller: `edgefirst-image`'s `import_image` (`lib.rs`),
-    /// which tags an already-imported DMA-BUF fd with its pixel format
-    /// immediately after `TensorDyn::from_fd`.
+    /// compatibility. Drives `ef_tensor_set_format`.
     ///
-    /// **Concurrency**: `ef_tensor_set_format` is narrower than
-    /// `ef_tensor_set_colorimetry` -- not safe to call while any other
-    /// `tensor-capi` call is in flight on the same underlying handle from
-    /// another thread (see `mutate.rs`'s module docs in `tensor-capi`).
-    /// `&mut self` here already gives this call exclusive access to *this*
-    /// Rust value, which is what every real caller (`import_image`, once,
-    /// right after construction) relies on.
+    /// Must not be called while another thread has a call in flight on the same
+    /// underlying handle.
     pub fn set_format(&mut self, format: PixelFormat) -> Result<()> {
         let c_format = format_cstring(format)?;
         // SAFETY: `self.handle` is a live handle; `c_format` is valid for
@@ -1203,11 +895,9 @@ impl TensorDyn {
         Ok(self)
     }
 
-    /// Set the row stride without format validation. Same contract as
-    /// `static`'s `TensorDyn::set_row_stride`. Drives
-    /// `ef_tensor_set_row_stride`. Real caller: `edgefirst-image`'s
-    /// `import_image` (`lib.rs`), immediately after [`Self::with_format`].
-    /// Same concurrency note as [`Self::set_format`].
+    /// Set the row stride in bytes. The format must be set first. Drives
+    /// `ef_tensor_set_row_stride`. Same concurrency rule as
+    /// [`Self::set_format`].
     pub fn set_row_stride(&mut self, stride: usize) -> Result<()> {
         // SAFETY: `self.handle` is a live handle.
         let rc =
@@ -1221,14 +911,10 @@ impl TensorDyn {
         Ok(())
     }
 
-    /// Set the row stride in bytes without format validation. Same contract
-    /// as `static`'s `TensorDyn::set_row_stride_unchecked`
-    /// (`static_backend.rs`). Drives `ef_tensor_set_row_stride_unchecked`
-    /// (task 17) -- unlike [`Self::set_row_stride`], needs no format on this
-    /// tensor first, which is what makes it usable on a raw multiplane
-    /// chroma plane (`from_planes` requires that plane to carry no format;
-    /// see [`crate::Tensor::from_planes`]'s doc comment). Same concurrency
-    /// note as [`Self::set_format`].
+    /// Set the row stride in bytes without format validation. Drives
+    /// `ef_tensor_set_row_stride_unchecked`. Unlike [`Self::set_row_stride`],
+    /// needs no format on this tensor first. Same concurrency rule as
+    /// [`Self::set_format`].
     pub fn set_row_stride_unchecked(&mut self, stride: usize) {
         // SAFETY: `self.handle` is a live handle.
         unsafe {
@@ -1236,17 +922,8 @@ impl TensorDyn {
         };
     }
 
-    /// Retag this tensor's element type, keeping its bytes untouched.
-    ///
-    /// Drives `ef_tensor_set_dtype`. Needed here and not on the static
-    /// backend because of where the element type lives: `static`'s
-    /// `TensorDyn` is an enum over eleven `Tensor<T>`, so the dtype **is**
-    /// the Rust type and a layout-identical `transmute` changes it for free.
-    /// This backend's `Tensor<T>` is `#[repr(transparent)]` over a handle
-    /// that records its own dtype, so the same transmute changes a
-    /// `PhantomData` and nothing else -- the handle keeps saying `U8`. See
-    /// [`crate::TensorDyn::set_dtype`]'s static counterpart for the contract
-    /// and why a width change is refused.
+    /// Retag this tensor's element type, keeping its bytes untouched. Drives
+    /// `ef_tensor_set_dtype`.
     pub fn set_dtype(&mut self, dtype: DType) -> Result<()> {
         if self.dtype() == dtype {
             return Ok(());
@@ -1264,29 +941,16 @@ impl TensorDyn {
         )))
     }
 
-    /// Set the byte offset within the DMA-BUF where image data starts.
-    /// Drives `ef_tensor_set_plane_offset`. Same caller as
-    /// [`Self::set_row_stride`] (`import_image`'s `image_offset`
-    /// parameter), same concurrency note as [`Self::set_format`].
-    ///
-    /// `static`'s signature returns `()`, not `Result` -- there is no
-    /// channel to report a failure through, but with the real primitive in
-    /// place there is also nothing left that can fail here short of a
-    /// process-level handle corruption `ef_tensor_set_plane_offset` itself
-    /// would only hit for a null/foreign handle, neither reachable through
-    /// `&mut self` on an owned, already-validated `TensorDyn`.
+    /// Set the byte offset within the DMA-BUF where image data starts. Drives
+    /// `ef_tensor_set_plane_offset`. Same concurrency rule as
+    /// [`Self::set_format`].
     pub fn set_plane_offset(&mut self, offset: usize) {
         // SAFETY: `self.handle` is a live handle.
         unsafe { edgefirst_tensor_ffi::ef_tensor_set_plane_offset(self.handle.as_ptr(), offset) };
     }
 
     /// Byte offset within the DMA-BUF where image data starts (`None` = 0).
-    /// Drives `ef_tensor_plane_offset` -- found missing while proving
-    /// `set_plane_offset` above (task 15): the only other candidate,
-    /// `plane0().offset` (`ef_tensor_plane_at`), is `plane_table`'s
-    /// intra-buffer layout offset, always 0 for plane 0 by construction, a
-    /// different quantity entirely from what this setter writes. Same
-    /// contract as `static`'s `TensorDyn::plane_offset` (`static_backend.rs`).
+    /// Drives `ef_tensor_plane_offset`.
     pub fn plane_offset(&self) -> Option<usize> {
         // SAFETY: `self.handle` is live.
         let raw = unsafe { edgefirst_tensor_ffi::ef_tensor_plane_offset(self.handle.as_ptr()) };
@@ -1294,15 +958,8 @@ impl TensorDyn {
     }
 
     /// Set this tensor's logical dimensions and pixel format to a decoded
-    /// image, reusing the existing allocation -- the pool-reuse primitive a
-    /// JPEG decode-into-pool destination tensor needs before each decode.
-    /// Same contract as `static`'s `TensorDyn::configure_image`
-    /// (`static_backend.rs`). Drives `ef_tensor_configure_image`, whose
-    /// producer-side implementation is the real `static::Tensor::configure_image`
-    /// -- the pool-reuse stride-preservation and alignment rules live there,
-    /// not here. Real caller: `edgefirst-codec`'s JPEG decode-into-pool path,
-    /// via [`dynamic_tensor::Tensor::configure_image`](crate::Tensor::configure_image),
-    /// which forwards straight to this. Same concurrency note as
+    /// image, reusing the existing allocation. Drives
+    /// `ef_tensor_configure_image`. Same concurrency rule as
     /// [`Self::set_format`].
     pub fn configure_image(
         &mut self,
@@ -1327,44 +984,26 @@ impl TensorDyn {
                 ffi_last_error()
             )));
         }
-        // `shape_cache` was captured once at construction and does not
-        // track `inner`'s live shape the way the C side's own
-        // `EfTensorImpl` caches do -- `configure_image` just changed it, so
-        // it must be re-derived the same way `from_handle` derives it the
-        // first time, or `Self::shape()`/`Self::width()`/`Self::height()`
-        // would report the pre-reconfigure geometry forever after.
         self.shape_cache = Self::query_shape(self.handle.ptr);
         Ok(())
     }
 
-    // --- Quantization: family 2's primitives. `Tensor<T>` (integer-gated
-    // via `IntegerType`, `dynamic_tensor.rs`) forwards straight to these;
-    // the type gating lives entirely at that layer, matching how
-    // `static`'s own `TensorDyn::quantization`/etc. (`static_backend.rs`)
-    // already fold every float variant to `None`/an error without a
-    // separate type-erased gate of their own.
+    // --- Quantization.
 
-    /// Quantization metadata for this tensor (`None` for a tensor that
-    /// carries none, *or* a float-dtype tensor). Drives the two-call
-    /// `ef_tensor_quantization_info`/`ef_tensor_quantization_get` idiom,
-    /// caching the result in [`Self::quantization_cache`] the first time
-    /// this particular `TensorDyn` value reads it -- see that field's doc
-    /// comment for why the cache is sound under concurrent access.
+    /// Quantization metadata for this tensor (`None` for a tensor that carries
+    /// none, or a float-dtype tensor). Read through
+    /// `ef_tensor_quantization_info`/`ef_tensor_quantization_get` on the first
+    /// call and cached in [`Self::quantization_cache`].
     pub fn quantization(&self) -> Option<&crate::Quantization> {
         self.quantization_cache
             .get_or_init(|| self.fetch_quantization())
             .as_ref()
     }
 
-    /// The actual `ef_tensor_quantization_{info,get}` two-call fetch,
-    /// isolated from [`Self::quantization`] so the `OnceLock::get_or_init`
-    /// closure stays a one-line call. Reconstructs the exact `Quantization`
-    /// mode (symmetric vs. not, per-tensor vs. per-channel) the producer
-    /// attached, not merely a numerically-equivalent one -- the wire
-    /// encoding always returns a full `zero_point` array (zero-filled for
-    /// symmetric, see `ef_tensor_quantization_get`'s own doc comment), so
-    /// this re-derives symmetry from an all-zero check rather than losing
-    /// it.
+    /// Fetch the quantization through `ef_tensor_quantization_{info,get}`,
+    /// reconstructing the mode the producer attached (symmetric or not,
+    /// per-tensor or per-channel). An all-zero `zero_point` array reads back as
+    /// symmetric.
     fn fetch_quantization(&self) -> Option<crate::Quantization> {
         let mut info = edgefirst_tensor_ffi::EfQuantizationInfo::default();
         // SAFETY: `self.handle` is live; `info` is a valid local out-param.
@@ -1410,19 +1049,12 @@ impl TensorDyn {
 
     /// Attach quantization metadata to this tensor. Drives
     /// `ef_tensor_quantization_set`, then refreshes
-    /// [`Self::quantization_cache`] so a subsequent [`Self::quantization`]
-    /// call on this same `TensorDyn` value observes it immediately rather
-    /// than the value cached before this call (see that field's doc
-    /// comment: `&mut self` here means no concurrent reader on *this*
-    /// value can be mid-`get_or_init` while the field is replaced).
+    /// [`Self::quantization_cache`].
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidArgument`] if the underlying call fails -- including
-    /// a float-dtype tensor, matching `static`'s own
-    /// `QuantizationInvalid { field: "dtype_is_integer", .. }` refusal
-    /// (folded here into the same generic errno-derived message every
-    /// other setter in this file uses, not the structured variant).
+    /// [`Error::InvalidArgument`] if the underlying call fails, including for a
+    /// float-dtype tensor.
     pub fn set_quantization(&mut self, q: crate::Quantization) -> Result<()> {
         let axis = q.axis().map(|a| a as i32).unwrap_or(-1);
         let scales = q.scale();
@@ -1463,8 +1095,7 @@ impl TensorDyn {
 
     /// Clear any quantization metadata on this tensor. Drives
     /// `ef_tensor_quantization_clear`, then resets
-    /// [`Self::quantization_cache`] the same way [`Self::set_quantization`]
-    /// does.
+    /// [`Self::quantization_cache`].
     pub fn clear_quantization(&mut self) {
         // SAFETY: `self.handle` is live.
         unsafe { edgefirst_tensor_ffi::ef_tensor_quantization_clear(self.handle.as_ptr()) };
@@ -1473,94 +1104,43 @@ impl TensorDyn {
     }
 
     // --- The `edgefirst-python-common` surface.
-    //
-    // `crates/python-common/src/tensor.rs` is the first consumer to call
-    // `TensorDyn` at the Rust level under `dynamic` -- every earlier one
-    // reached it through the `ef_tensor_*` C ABI instead -- so this block
-    // is the set of methods it needs that the `-capi` leaves never did.
-    // Some are pure derivations over primitives that already existed; the
-    // ones that are not name the `ef_tensor_*` entry they drive and why no
-    // existing primitive could answer. See `.superpowers/sdd/
-    // 2026-08-25-python-single-tensor-home/task-P2a-report.md`.
 
-    /// Total logical size of this tensor in bytes.
-    ///
-    /// Derived, with no `ef_tensor_*` entry of its own:
-    /// [`crate::TensorTrait::size`] is defined as `len() * size_of::<T>()`
-    /// and `len()` as `shape().iter().product()`, both of which this
-    /// backend can already answer exactly -- `DType::size()` is
-    /// `size_of::<T>()` for every one of the eleven element types.
-    ///
-    /// Logical, **not** the allocation: a pitch-aligned or pool-sized
-    /// tensor's allocation is larger. [`Self::capacity_bytes`] is that one.
+    /// Total logical size of this tensor in bytes: the shape's element count
+    /// times the element size. The allocation may be larger; see
+    /// [`Self::capacity_bytes`].
     pub fn size(&self) -> usize {
         self.shape().iter().product::<usize>() * self.dtype().size()
     }
 
-    /// Bytes of the underlying allocation, which is `>=` [`Self::size`].
-    ///
-    /// Drives `ef_tensor_capacity_bytes`. Not derivable from
-    /// `ef_tensor_plane_at`: for a *formatted* tensor that reports per-plane
-    /// geometry computed from the format's plane table, whose sum is the
-    /// logical image size rather than the allocation's -- the two differ for
-    /// exactly the pool-sized and pitch-padded tensors that make the
-    /// distinction matter.
+    /// Bytes of the underlying allocation, which is `>=` [`Self::size`]. Drives
+    /// `ef_tensor_capacity_bytes`.
     pub fn capacity_bytes(&self) -> usize {
         // SAFETY: `self.handle` is live for as long as `self` exists.
         let n = unsafe { edgefirst_tensor_ffi::ef_tensor_capacity_bytes(self.handle.as_ptr()) };
-        // `-1` is the entry point's invalid-handle sentinel. Falling back to
-        // the logical size matches `TensorTrait::capacity_bytes`'s own
-        // default ("the logical size for storages without spare capacity")
-        // rather than inventing a zero.
+        // A negative result (invalid handle) falls back to the logical size.
         usize::try_from(n).unwrap_or_else(|_| self.size())
     }
 
-    /// The *recorded* row stride in bytes; `None` when the tensor is
-    /// tightly packed.
+    /// The recorded row stride in bytes; `None` when the tensor is tightly
+    /// packed.
     ///
-    /// Drives `ef_tensor_row_stride`, and is deliberately **not**
-    /// [`Self::effective_row_stride`]: that one reports plane 0's pitch,
-    /// which falls back to a pitch computed from the format and width when
-    /// nothing is recorded. The difference is load-bearing for
-    /// [`Self::descriptor_pinned`] -- the cross-package protocol carries
-    /// `None` for a tight tensor and lets the consumer recompute, and
-    /// baking a computed pitch in instead would turn "no stride recorded"
-    /// into "this exact stride is required" across a package boundary.
+    /// Drives `ef_tensor_row_stride`. Unlike [`Self::effective_row_stride`], it
+    /// computes no pitch when none is recorded.
     pub fn row_stride(&self) -> Option<usize> {
         // SAFETY: `self.handle` is live for as long as `self` exists.
         let n = unsafe { edgefirst_tensor_ffi::ef_tensor_row_stride(self.handle.as_ptr()) };
         usize::try_from(n).ok()
     }
 
-    /// The vendor tile-compression scheme recorded at allocation; `None`
-    /// for a linear layout.
+    /// The vendor tile-compression scheme recorded at allocation; `None` for a
+    /// linear layout.
     ///
-    /// Drives `ef_tensor_compression`. The scheme is chosen by the
-    /// allocator inside `libedgefirst_tensor.so` (today only an Android
-    /// AHardwareBuffer allocation ever resolves to one), so it is a fact
-    /// only that library holds -- `ef_tensor_image_desc_get`'s own
-    /// `compression` field is the *request* a caller made, which is a
-    /// different question and routinely disagrees with the answer.
-    /// An unrecognised code is reported as `None` and **logged**, not
-    /// silently passed off as a linear layout. `Option<CompressionScheme>`
-    /// has no variant for "some scheme this build cannot name", so `None`
-    /// is the only value available -- but a consumer acting on it will
-    /// treat a tile-compressed buffer as linear, and a compressed tensor
-    /// has no meaningful linear row stride (see [`crate::Tensor::
-    /// compression`]). The one way a code lands here unrecognised is a
-    /// `libedgefirst_tensor.so` newer than this build; the loader's own
-    /// undefined-symbol failure catches deployment skew that *adds a
-    /// symbol*, and says nothing about skew that adds a *value* returned
-    /// through an existing one. The log line is what makes that case
-    /// visible instead of silent -- there is no ABI-version negotiation to
-    /// refuse it first (`ef_tensor_abi_version` is defined and declared but
-    /// nothing in the tree compares it to anything).
+    /// Drives `ef_tensor_compression`. An unrecognised code is logged and
+    /// reported as `None`.
     pub fn compression(&self) -> Option<crate::CompressionScheme> {
         // SAFETY: `self.handle` is live for as long as `self` exists.
         let code = unsafe { edgefirst_tensor_ffi::ef_tensor_compression(self.handle.as_ptr()) };
-        // 0 is the wire code for "linear", a real answer rather than an
-        // unrecognised one, so it must not warn -- it is what almost every
-        // allocation on almost every platform reports.
+        // Code 0 is the linear layout and is not logged.
         let scheme = crate::CompressionScheme::from_code(code);
         if scheme.is_none() && code != edgefirst_tensor_ffi::EfCompression::None as u32 {
             log::warn!(
@@ -1574,7 +1154,7 @@ impl TensorDyn {
 
     /// The CPU access declared at allocation (see
     /// [`crate::Tensor::cpu_access`]). Drives `ef_tensor_cpu_access`; a code
-    /// this build does not recognise, from a newer library, is `None`.
+    /// this build does not recognise is `None`.
     pub fn cpu_access(&self) -> CpuAccess {
         // SAFETY: `self.handle` is live for as long as `self` exists.
         let code = unsafe { edgefirst_tensor_ffi::ef_tensor_cpu_access(self.handle.as_ptr()) };
@@ -1593,23 +1173,15 @@ impl TensorDyn {
 
     /// Whether the memory is known to be physically contiguous (see
     /// [`crate::Tensor::contiguity`]). Drives `ef_tensor_contiguity`; a code
-    /// this build does not recognise, from a newer library, is `Unknown`.
+    /// this build does not recognise is `Unknown`.
     pub fn contiguity(&self) -> crate::Contiguity {
         // SAFETY: `self.handle` is live for as long as `self` exists.
         let code = unsafe { edgefirst_tensor_ffi::ef_tensor_contiguity(self.handle.as_ptr()) };
         crate::Contiguity::from_code(code).unwrap_or(crate::Contiguity::Unknown)
     }
 
-    /// Acquire the buffer for CPU access -- the standalone cache-maintenance
-    /// bracket. See [`crate::Tensor::sync_for_cpu`].
-    ///
-    /// Drives `ef_tensor_sync_for_cpu`. Not derivable here: the maintenance
-    /// is per-backing (a dma-buf ioctl, an IOSurface lock, a no-op for
-    /// coherent host memory, an honest refusal for a PBO), and this backend
-    /// holds none of that state -- it holds a handle. Re-deriving the
-    /// dma-buf arm locally from [`Self::clone_fd`] would work on Linux and
-    /// be silently wrong everywhere else, which is exactly the shape of
-    /// answer this backend must not invent.
+    /// Acquire the buffer for CPU access. See [`crate::Tensor::sync_for_cpu`].
+    /// Drives `ef_tensor_sync_for_cpu`.
     pub fn sync_for_cpu(&self, access: CpuAccess) -> Result<()> {
         self.sync(access, true)
     }
@@ -1618,25 +1190,19 @@ impl TensorDyn {
     /// [`crate::Tensor::sync_for_device`].
     ///
     /// Drives `ef_tensor_sync_for_device`; `access` must match the one that
-    /// opened the bracket. See [`Self::sync_for_cpu`].
+    /// opened the bracket.
     pub fn sync_for_device(&self, access: CpuAccess) -> Result<()> {
         self.sync(access, false)
     }
 
-    /// Shared body of the two sync brackets -- one place to translate the
-    /// access code and the errno, so the two ends cannot drift into
-    /// accepting or reporting different things.
+    /// Shared body of the two sync brackets: translates the access code and the
+    /// errno.
     fn sync(&self, access: CpuAccess, to_cpu: bool) -> Result<()> {
         let what = if to_cpu {
             "sync_for_cpu"
         } else {
             "sync_for_device"
         };
-        // No PBO guard: the library refuses a PBO's sync bracket itself
-        // (`TensorStorage::Pbo` in `Tensor::sync_for_cpu`/`_for_device`),
-        // and its message -- which names "PBO" -- travels back through
-        // `ffi_last_error` as a `NotImplemented`, the same error kind the
-        // static backend raises.
         self.cpu_access().require_direction(access, what)?;
         let code = access.code();
         // SAFETY: `self.handle` is live for as long as `self` exists.
@@ -1650,12 +1216,6 @@ impl TensorDyn {
         if rc == 0 {
             return Ok(());
         }
-        // `ENOTSUP` is the C surface's translation of the
-        // backing-has-no-independent-coherency-window refusal
-        // (AHardwareBuffer on Android). Preserving it as `NotImplemented`
-        // keeps the static backend's own error *kind* for the same
-        // condition, so a caller matching on it behaves identically on both
-        // backends.
         let msg = ffi_last_error();
         if rc == libc::ENOTSUP {
             return Err(Error::NotImplemented(msg));
@@ -1665,16 +1225,9 @@ impl TensorDyn {
         )))
     }
 
-    /// Borrow batch element `n` of a batched tensor (leading `N` dimension)
-    /// as a zero-copy view sharing this tensor's allocation. See
-    /// [`crate::Tensor::batch`].
-    ///
-    /// Drives `ef_tensor_batch`, which is a genuinely distinct primitive
-    /// from `ef_tensor_view_region`: that one crops a spatial rectangle
-    /// *within* one image and cannot express dropping the leading
-    /// dimension. Like `view`, it calls the producer side's real
-    /// `static::TensorDyn::batch`, so the result shares the parent's
-    /// allocation instead of minting a fresh one.
+    /// Borrow batch element `n` of a batched tensor (leading `N` dimension) as
+    /// a zero-copy view sharing this tensor's allocation. See
+    /// [`crate::Tensor::batch`]. Drives `ef_tensor_batch`.
     pub fn batch(&self, n: usize) -> Result<TensorDyn> {
         // SAFETY: `self.handle` is a live handle for the call's duration.
         let handle =
@@ -1682,8 +1235,6 @@ impl TensorDyn {
         match NonNull::new(handle) {
             Some(h) => Ok(Self::from_handle(h)),
             None => {
-                // Read the class before anything else on this thread can
-                // overwrite it -- same lifetime rule as the message.
                 let is_index = ffi_last_error_class()
                     == edgefirst_tensor_ffi::EfErrorClass::BatchIndexOutOfBounds;
                 Err(batch_error(n, self.shape().first().copied(), is_index))
@@ -1720,10 +1271,6 @@ impl TensorDyn {
 
     /// Clone the DMA-BUF file descriptor backing this tensor (Linux only).
     ///
-    /// Derived, with no `ef_tensor_*` entry of its own: the same
-    /// memory-kind check the static backend performs, then
-    /// [`Self::clone_fd`], which already `dup`s plane 0's native fd.
-    ///
     /// # Errors
     ///
     /// * [`Error::NotImplemented`] if the tensor is not DMA-backed
@@ -1754,11 +1301,8 @@ impl TensorDyn {
         }
     }
 
-    /// Physical IOSurface dimensions in texels, independent of logical shape.
-    ///
-    /// There is no `ef_tensor_iosurface_physical_dims` primitive (unlike the
-    /// AHardwareBuffer counterpart), so this reads `IOSurfaceGetWidth` /
-    /// `IOSurfaceGetHeight` on the borrowed ref. `None` when
+    /// Physical IOSurface dimensions in texels, independent of logical shape,
+    /// read with `IOSurfaceGetWidth`/`IOSurfaceGetHeight`. `None` when
     /// [`Self::iosurface_ref`] is `None`.
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     pub fn iosurface_physical_dims(&self) -> Option<(usize, usize)> {
@@ -1771,9 +1315,8 @@ impl TensorDyn {
     /// The borrowed `ID3D11Texture2D*` backing this tensor (Windows only).
     /// `None` when the tensor is not texture-backed.
     ///
-    /// Drives `ef_tensor_d3d11_texture`. Same contract as the static
-    /// backend's own `TensorDyn::d3d11_texture`: the pointer is valid while
-    /// the tensor lives and carries no reference of its own.
+    /// Drives `ef_tensor_d3d11_texture`. The pointer is valid while the tensor
+    /// lives and carries no reference of its own.
     #[cfg(target_os = "windows")]
     pub fn d3d11_texture(&self) -> Option<*mut std::ffi::c_void> {
         // SAFETY: `self.handle` is live for as long as `self` exists.
@@ -1781,12 +1324,8 @@ impl TensorDyn {
         (!p.is_null()).then_some(p)
     }
 
-    /// The texture geometry the HAL chose for this image (Windows only).
-    /// `None` when the tensor is not texture-backed.
-    ///
-    /// Drives `ef_tensor_d3d11_layout`, whose `ef_d3d11_layout` is the wire
-    /// form of the same five fields `D3d11ImageLayout` carries -- widened
-    /// back to `usize` here, since the ABI struct pins them at `uint32_t`.
+    /// The texture geometry the HAL chose for this image (Windows only). `None`
+    /// when the tensor is not texture-backed. Drives `ef_tensor_d3d11_layout`.
     #[cfg(target_os = "windows")]
     pub fn d3d11_layout(&self) -> Option<crate::d3d11_layout::D3d11ImageLayout> {
         let mut out = edgefirst_tensor_ffi::EfD3d11Layout::default();
@@ -1802,12 +1341,8 @@ impl TensorDyn {
         })
     }
 
-    /// A duplicated NT handle the caller owns (Windows only).
-    ///
-    /// Drives `ef_tensor_d3d11_shared_handle`, which is documented to
-    /// transfer ownership of the duplicate -- so wrapping it in an
-    /// `OwnedHandle` is what closes it, exactly once, when this value is
-    /// dropped.
+    /// A duplicated NT handle the caller owns (Windows only). Drives
+    /// `ef_tensor_d3d11_shared_handle`.
     #[cfg(target_os = "windows")]
     pub fn d3d11_shared_handle(&self) -> Result<std::os::windows::io::OwnedHandle> {
         use std::os::windows::io::FromRawHandle;
@@ -1821,15 +1356,11 @@ impl TensorDyn {
         Ok(unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(h) })
     }
 
-    /// The fence handle plus value a GPU consumer waits on before reading
-    /// this texture (Windows only), or `None` when no GPU write has been
-    /// recorded.
+    /// The fence handle plus value a GPU consumer waits on before reading this
+    /// texture (Windows only), or `None` when no GPU write has been recorded.
     ///
-    /// Drives `ef_tensor_gpu_completion`, which writes `NULL`/0 before doing
-    /// anything else -- so a returned `NULL` fence with rc 0 is genuinely
-    /// "nothing recorded", not a stale local. The fence handle it hands back
-    /// is an owned duplicate, wrapped here for the same reason
-    /// [`d3d11_shared_handle`](Self::d3d11_shared_handle) wraps its own.
+    /// Drives `ef_tensor_gpu_completion`. The returned fence handle is an owned
+    /// duplicate.
     #[cfg(target_os = "windows")]
     pub fn gpu_completion(&self) -> Result<Option<crate::d3d11::GpuCompletion>> {
         use std::os::windows::io::FromRawHandle;
@@ -1858,10 +1389,8 @@ impl TensorDyn {
     /// when there is none; every platform, 0 off Windows. See
     /// [`Tensor::gpu_write_value`](crate::Tensor::gpu_write_value).
     ///
-    /// Drives `ef_tensor_gpu_write_value`, declared on every platform. Only a
-    /// texture can carry a recorded write, so any other backing is answered
-    /// here: the export would cost an FFI round trip and leave a refusal in
-    /// the thread-local last error that no caller of this reads.
+    /// Drives `ef_tensor_gpu_write_value` for a `DmaBuf`-kind handle; any other
+    /// backing returns 0 without the call.
     pub fn gpu_write_value(&self) -> u64 {
         if self.memory() != TensorMemory::DmaBuf {
             return 0;
@@ -1873,10 +1402,7 @@ impl TensorDyn {
     /// Record that GPU work writing this texture completes at `value` of the
     /// process device's fence (Windows only).
     ///
-    /// Drives `ef_tensor_set_gpu_write`. Takes `&self`, matching the static
-    /// backend: the export records a monotonic maximum into an atomic and
-    /// needs no exclusive access, so a producer can record a write on a
-    /// tensor its consumers are reading.
+    /// Drives `ef_tensor_set_gpu_write`, which records a monotonic maximum.
     #[cfg(target_os = "windows")]
     pub fn set_gpu_write(&self, value: u64) -> Result<()> {
         // SAFETY: `self.handle` is live; the export records a monotonic
@@ -1889,10 +1415,8 @@ impl TensorDyn {
         Ok(())
     }
 
-    /// The registration lives in the library after Stage C. This lens cannot
-    /// borrow that `CudaHandle`, so the getter is always `None` even after
-    /// [`Self::set_cuda_handle`]; use [`Self::is_cuda_attached`] or
-    /// [`Self::cuda_map`].
+    /// Always `None`: the registration lives in the library. Use
+    /// [`Self::is_cuda_attached`] or [`Self::cuda_map`].
     #[deprecated(
         since = "0.32.0",
         note = "On the dynamic backend use is_cuda_attached() or cuda_map() — the CudaHandle is not borrowable through this lens."
@@ -1961,10 +1485,7 @@ impl TensorDyn {
     }
 
     /// GL buffer ID for this PBO; `None` when the tensor is not PBO-backed.
-    ///
-    /// Drives `ef_tensor_pbo_id`. Before Stage B this read a `PboTensor`
-    /// stashed on this struct; the buffer now lives in the library, which is
-    /// the only place that can answer.
+    /// Drives `ef_tensor_pbo_id`.
     pub fn pbo_id(&self) -> Option<u32> {
         let mut id: u32 = 0;
         // SAFETY: `self.handle` is live; `id` is a valid out-param.
@@ -1972,11 +1493,11 @@ impl TensorDyn {
         (rc == 0).then_some(id)
     }
 
-    /// Whether this PBO holds (or is establishing) a CPU mapping; `None`
-    /// when the tensor is not PBO-backed.
+    /// Whether this PBO holds (or is establishing) a CPU mapping; `None` when
+    /// the tensor is not PBO-backed.
     ///
-    /// Drives `ef_tensor_pbo_is_mapped`, whose answer is three-valued: `1`
-    /// mapped, `0` not, negative "not a PBO".
+    /// Drives `ef_tensor_pbo_is_mapped`, which returns `1` for mapped, `0` for
+    /// not mapped and a negative value for a tensor that is not a PBO.
     pub fn pbo_is_mapped(&self) -> Option<bool> {
         // SAFETY: `self.handle` is live for the call.
         let rc = unsafe { edgefirst_tensor_ffi::ef_tensor_pbo_is_mapped(self.handle.as_ptr()) };
@@ -1987,26 +1508,21 @@ impl TensorDyn {
         }
     }
 
-    /// The C-ABI `PboOpsVtable` address for this PBO, for cross-cdylib
-    /// export via [`crate::TensorDesc::ptr`]; `None` when not PBO-backed.
+    /// The C-ABI `PboOpsVtable` address for this PBO, for cross-cdylib export
+    /// via [`crate::TensorDesc::ptr`]; `None` when not PBO-backed.
     ///
-    /// Drives `ef_tensor_pbo_vtable`. The address is the library's, borrowed
-    /// for as long as this handle lives -- which is exactly what
-    /// [`Self::pbo_keepalive`] holds.
+    /// Drives `ef_tensor_pbo_vtable`. The address is valid while this handle
+    /// lives; [`Self::pbo_keepalive`] holds it.
     pub fn pbo_vtable_ptr(&self) -> Option<*const std::ffi::c_void> {
         // SAFETY: `self.handle` is live for the call.
         let p = unsafe { edgefirst_tensor_ffi::ef_tensor_pbo_vtable(self.handle.as_ptr()) };
         (!p.is_null()).then_some(p)
     }
 
-    /// A keepalive holding [`Self::pbo_vtable_ptr`]'s address valid: a
-    /// retained reference on this tensor's own handle, which owns the
-    /// library-side `PboTensor` the vtable belongs to.
+    /// A keepalive holding [`Self::pbo_vtable_ptr`]'s address valid: a retained
+    /// reference on this tensor's own handle.
     ///
     /// `None` when the tensor is not PBO-backed, or when the retain fails.
-    /// Under `static` this is an `Arc<PboHandle>`; here it is a handle
-    /// reference, which is the same guarantee expressed in this backend's
-    /// own currency.
     pub fn pbo_keepalive(&self) -> Option<std::sync::Arc<dyn Send + Sync>> {
         self.pbo_id()?;
         // SAFETY: `self.handle` is live for the call.
@@ -2017,24 +1533,17 @@ impl TensorDyn {
         Some(std::sync::Arc::new(HandleKeepalive(self.handle.as_ptr())))
     }
 
-    /// Wrap a producer's host pointer as a type-erased tensor without
-    /// copying, aliasing rather than owning it -- the consumer half of the
-    /// capsule protocol's host-memory kinds ([`crate::protocol::kind::MEM`],
-    /// [`crate::protocol::kind::SHM`]).
-    ///
-    /// Drives `ef_tensor_wrap_host`. Not expressible over the builder the
-    /// way [`Self::from_fd`] is: `ef_tensor_builder_add_plane` takes a
-    /// *native handle* (an fd or surface id), and a host address is neither
-    /// -- there was no primitive that could hand `libedgefirst_tensor.so` a
-    /// raw pointer to alias.
+    /// Wrap a producer's host pointer as a type-erased tensor without copying,
+    /// aliasing rather than owning it. This is the consumer half of the capsule
+    /// protocol's host-memory kinds ([`crate::protocol::kind::MEM`],
+    /// [`crate::protocol::kind::SHM`]). Drives `ef_tensor_wrap_host`.
     ///
     /// # Safety
     ///
-    /// Same as the static backend's `from_raw_host_with_capacity`: `ptr`
-    /// must be non-null, aligned to `dtype`, and valid for
-    /// `max(capacity_bytes, shape.product() * dtype.size())` bytes for as
-    /// long as the returned tensor -- and every view/map sharing its
-    /// backing -- is used. Nothing here extends that lifetime.
+    /// `ptr` must be non-null, aligned to `dtype`, and valid for
+    /// `max(capacity_bytes, shape.product() * dtype.size())` bytes for as long
+    /// as the returned tensor, and every view or map sharing its backing, is
+    /// used.
     pub unsafe fn from_raw_host_with_capacity(
         ptr: *mut u8,
         shape: &[usize],
@@ -2064,13 +1573,12 @@ impl TensorDyn {
     }
 
     /// Wrap a live `IOSurfaceRef` (macOS/iOS). Looks up the surface's
-    /// `IOSurfaceID` and drives [`Self::from_iosurface_id`]: the C ABI
-    /// does not take a raw ref, so the id is the portable handle.
+    /// `IOSurfaceID` and drives [`Self::from_iosurface_id`].
     ///
     /// # Safety
     ///
-    /// `surface_ref` must be a valid live `IOSurfaceRef`. `shape` must
-    /// match the IOSurface's pixel dimensions and chosen element type.
+    /// `surface_ref` must be a valid live `IOSurfaceRef`. `shape` must match
+    /// the IOSurface's pixel dimensions and chosen element type.
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     pub unsafe fn from_iosurface(
         surface_ref: *mut std::ffi::c_void,
@@ -2102,16 +1610,11 @@ impl TensorDyn {
     }
 
     /// Wrap a live IOSurface named by its cross-process `IOSurfaceID`
-    /// (macOS/iOS only) -- the consumer half of the capsule protocol's
+    /// (macOS/iOS only). This is the consumer half of the capsule protocol's
     /// [`crate::protocol::kind::IOSURFACE`].
     ///
-    /// Drives `ef_tensor_from_iosurface_id`. The lookup, the liveness
-    /// check, and the retain all happen inside `libedgefirst_tensor.so`:
-    /// `IOSurfaceRef` is a CoreFoundation object with its own refcount
-    /// discipline, and splitting "look it up" from "retain it" across an
-    /// ABI boundary would put a window between them in which the surface
-    /// can be freed. Passing the *id* rather than the ref is what closes
-    /// that window.
+    /// Drives `ef_tensor_from_iosurface_id`, which looks up, checks and retains
+    /// the surface inside the library.
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     pub fn from_iosurface_id(
         id: u32,
@@ -2142,18 +1645,15 @@ impl TensorDyn {
     /// only). See
     /// [`Tensor::from_d3d11_texture`](crate::Tensor::from_d3d11_texture).
     ///
-    /// Drives `ef_tensor_from_d3d11_texture`. Same signature as the static
-    /// backend's, so a caller compiles against either; the C constructor
-    /// takes the tensor's *shape* rather than `width`/`height`, so those are
-    /// turned into the allocation shape here and validated back against the
-    /// texture description on the far side.
+    /// Drives `ef_tensor_from_d3d11_texture`, passing `width`/`height` as the
+    /// allocation shape.
     ///
     /// # Safety
     ///
     /// `texture` must be null or a live `ID3D11Texture2D` created on the HAL
     /// device ([`crate::d3d11::device()`]).
     #[cfg(target_os = "windows")]
-    #[allow(clippy::too_many_arguments)] // one image description, spelled out
+    #[allow(clippy::too_many_arguments)]
     pub unsafe fn from_d3d11_texture(
         texture: *mut std::ffi::c_void,
         width: usize,
@@ -2189,17 +1689,15 @@ impl TensorDyn {
     /// (Windows only). See
     /// [`Tensor::from_d3d11_shared_handle`](crate::Tensor::from_d3d11_shared_handle).
     ///
-    /// Drives `ef_tensor_from_d3d11_shared_handle`, with the same
-    /// dimensions-to-shape conversion
-    /// [`from_d3d11_texture`](Self::from_d3d11_texture) documents. Both
-    /// handles stay the caller's: the export duplicates what it keeps.
+    /// Drives `ef_tensor_from_d3d11_shared_handle`. Both handles stay the
+    /// caller's: the export duplicates what it keeps.
     ///
     /// # Safety
     ///
     /// `handle` must be an NT shared handle of a D3D11 texture, valid in
     /// this process, and `completion`'s handle a shared fence handle.
     #[cfg(target_os = "windows")]
-    #[allow(clippy::too_many_arguments)] // one image description, spelled out
+    #[allow(clippy::too_many_arguments)]
     pub unsafe fn from_d3d11_shared_handle(
         handle: std::os::windows::io::RawHandle,
         width: usize,
@@ -2235,10 +1733,8 @@ impl TensorDyn {
         }
     }
 
-    /// See the static backend's `TensorDyn::from_client_pbo`.
-    ///
-    /// Drives `ef_tensor_wrap_pbo`: the library owns the `PboTensor`, this
-    /// side owns only the handle.
+    /// Build a PBO-backed tensor from a client's callback channel. Drives
+    /// `ef_tensor_wrap_pbo`.
     ///
     /// # Safety
     /// `state`, `map_fn` and `unmap_fn` must satisfy
@@ -2269,26 +1765,15 @@ impl TensorDyn {
         };
         match NonNull::new(handle) {
             Some(h) => Ok(Self::from_handle(h)),
-            // `ffi_error`, not a hand-rolled variant: the library just
-            // recorded a class through `set_last_error_classified`, and
-            // throwing it away would make `dynamic` report
-            // `InvalidOperation` where `static` reports `InvalidArgument`
-            // for the very same malformed channel. `InvalidArgument` is the
-            // fallback the neighbouring `from_d3d11_*` constructors use, and
-            // it is only reached for an `Unspecified` class -- every
-            // classified failure keeps the class the library recorded.
+            // The library's recorded error class, or `InvalidArgument` when it
+            // recorded none.
             None => Err(ffi_error(Error::InvalidArgument)),
         }
     }
 
     /// The per-kind construction switch [`TensorDyn::import_descriptor`]
-    /// (`derived.rs`) drives, once the descriptor has been validated and
-    /// its `dtype`/`shape` decoded.
-    ///
-    /// Backend-specific because it is the one part of the import that names
-    /// *constructors*; everything around it (validation, and the
-    /// format/stride/colorimetry restore afterward) is shared. See
-    /// `derived.rs` for the whole function's contract.
+    /// (`derived.rs`) drives, once the descriptor has been validated and its
+    /// `dtype`/`shape` decoded.
     pub(crate) fn import_storage(
         desc: &crate::TensorDesc,
         shape: &[usize],
@@ -2316,9 +1801,8 @@ impl TensorDyn {
             crate::protocol::kind::MEM | crate::protocol::kind::SHM => {
                 crate::protocol::check_descriptor_host_ptr(desc)?;
                 // SAFETY: the caller guarantees the producer's keepalive
-                // outlives the returned tensor -- that is the capsule
-                // contract `import_descriptor` documents. `desc.capacity`
-                // comes from the same trusted producer as `ptr`/`shape`.
+                // outlives the returned tensor, and `desc.capacity` comes from
+                // the same producer as `ptr`/`shape`.
                 unsafe {
                     Self::from_raw_host_with_capacity(
                         desc.ptr.0,
@@ -2352,10 +1836,8 @@ impl TensorDyn {
             crate::protocol::kind::D3D11_TEXTURE => {
                 let (tex, completion) = crate::protocol::descriptor_d3d11_handles(desc)?;
                 // SAFETY: the caller guarantees the producer's keepalive
-                // outlives the returned tensor -- the capsule contract
-                // `import_descriptor` documents -- so both handles are the
-                // producer's own and live for this call. The producer's
-                // declaration picks the staging path; none declared is `ReadWrite`.
+                // outlives the returned tensor, so both handles are live for
+                // this call. An undeclared CPU access imports as `ReadWrite`.
                 unsafe {
                     let (format, width, height) =
                         crate::protocol::descriptor_d3d11_geometry(desc, tex, shape)?;
@@ -2388,42 +1870,20 @@ impl TensorDyn {
         self.descriptor_pinned(None)
     }
 
-    /// Descriptor carrying a pinned host address. See the static backend's
-    /// `TensorDyn::descriptor_pinned` for the contract -- this is the same
-    /// function over the same [`crate::protocol::from_parts`], which is
-    /// compiled into both backends precisely so the two cannot describe the
-    /// same tensor differently.
-    ///
-    /// The one input fetched differently here is `handle`: the static
-    /// backend branches on the platform to pick `dmabuf()`'s fd or
-    /// `iosurface_id()`, whereas this reads plane 0's `handle` --
-    /// `ef_tensor_plane_at`'s own `native_handle` (`tensor-capi`'s
-    /// `vtable.rs`) already makes exactly that platform choice on the
-    /// producing side, so re-deriving it here would be a second copy of the
-    /// same decision, free to drift.
+    /// Descriptor carrying `pin`'s host address when one is given, built by
+    /// [`crate::protocol::from_parts`]. The native handle is the PBO's GL
+    /// buffer id, the D3D11 texture's NT handle, or plane 0's handle.
     pub fn descriptor_pinned(&self, pin: Option<&crate::HostPin<'_>>) -> crate::TensorDesc {
         let memory = self.memory();
         let handle: i64 = match memory {
-            // A PBO's "native handle" is its GL buffer id, which only
-            // `ef_tensor_pbo_id` can answer -- plane 0 would report `-1`
-            // here, since a GL buffer name is not a value
-            // `ef_tensor_plane_at`'s `native_handle` carries.
             TensorMemory::Pbo => self.pbo_id().map(|id| id as i64).unwrap_or(-1),
-            // A D3D11 texture's plane 0 reports `-1`: an NT handle is not a
-            // value `ef_tensor_plane_at` carries. The handle comes from
-            // `ef_tensor_d3d11_shared_handle`, and this tensor keeps it --
-            // see `descriptor_texture_handle`.
+            // The duplicate kept in `descriptor_texture_handle`.
             #[cfg(target_os = "windows")]
             TensorMemory::DmaBuf => self.descriptor_texture_handle_value(),
             _ => self.plane0().map(|p| p.handle).unwrap_or(-1),
         };
-        // The fence is the process device's, shared with the library that
-        // owns this handle through the rendezvous, so its handle value is
-        // borrowed rather than duplicated -- the device outlives the
-        // descriptor, and a copy whose own fence is private exports no handle
-        // at all rather than pairing two timelines. Only the value comes from
-        // the library, through `ef_tensor_gpu_write_value`, which duplicates
-        // no fence handle for a number the descriptor only forwards.
+        // The fence handle is the process device's, borrowed; the fence value
+        // comes from `ef_tensor_gpu_write_value`.
         #[cfg(target_os = "windows")]
         let (fence_handle, sync) = match memory {
             TensorMemory::DmaBuf => (
@@ -2472,60 +1932,21 @@ impl TensorDyn {
 /// Turn `ef_tensor_batch`'s `NULL` into the error [`crate::Tensor::batch`]
 /// would have returned.
 ///
-/// `ef_tensor_batch` returns `NULL` for four distinct conditions -- an
-/// unresolvable handle, an `n` not representable as `usize` on the
-/// producing side, an out-of-range index, and `Tensor::batch`'s "this
-/// tensor is not batched" shape refusal. Collapsing them into
-/// [`Error::BatchIndexOutOfBounds`] produced a statement that was not
-/// merely unhelpful but **false**: `.batch(0)` on an ordinary NV12 image
-/// reported "batch index 0 out of bounds for batch size 720", pointing the
-/// reader at the one argument they got right.
-///
-/// The first fix for that reconstructed the variant by matching a fragment
-/// of `BatchIndexOutOfBounds`'s own `Display` in the message -- an ABI
-/// programmed against a `Display` string, tolerable only because it
-/// degraded to a truth. `ef_tensor_last_error_class` (task P2c) is the
-/// structured signal it wanted, and the string matching is gone.
-///
-/// The out-of-bounds case is rebuilt with its real numbers rather than
-/// taking `ffi_error`'s generic mapping, because this caller has them: `n`
-/// is its own argument and the leading dimension is on the cached shape.
-/// Every other class falls through to [`ffi_error`], carrying the
-/// producing side's own message.
+/// An out-of-range index with a known leading dimension becomes
+/// [`Error::BatchIndexOutOfBounds`] built from `n` and `leading`. Every other
+/// failure goes through [`ffi_error`].
 fn batch_error(n: usize, leading: Option<usize>, class_is_index: bool) -> Error {
     match leading {
         Some(batch) if class_is_index => Error::BatchIndexOutOfBounds { index: n, batch },
-        // `InvalidShape` is the fallback because it is what `Tensor::batch`
-        // (`lib.rs`) itself returns for both of its shape refusals, which
-        // are the failures an older library would report unclassified.
         _ => ffi_error(Error::InvalidShape),
     }
 }
 
-/// Turn a builder's sticky errno into the typed [`Error`] the static
-/// backend would have returned.
-///
-/// Driven by the **builder's own errno**, not by the thread-local error
-/// class P2c added. That is deliberate: `ef_tensor_builder_error(b)` is set
-/// by this call on this builder, so it cannot be stale, whereas the
-/// thread-local is only as fresh as the last path that wrote it -- and
-/// `terminal`'s early returns (a null builder, a sticky error from an
-/// earlier call) write no message at all. The errno is the sound channel
-/// here; [`ffi_last_error`] supplies advisory text on top of it.
-///
-/// Before this, every refusal came back as
-/// `NotImplemented("ef_tensor_builder_alloc failed: errno 12")` -- ENOMEM
-/// for everything, with the real reason discarded on the producing side.
-/// A caller could not tell "try a smaller allocation" from "this build has
-/// no such backing", and `tests/vocabulary.rs`'s
-/// `a_defined_but_unbacked_code_errors_instead_of_panicking` failed under
-/// `dynamic` for exactly that reason -- which is why that file was excluded
-/// by name from the dynamic test lane.
+/// Turn a builder's sticky errno into a typed [`Error`] whose message is
+/// [`ffi_last_error`]'s text.
 fn builder_error(errno: std::ffi::c_int) -> Error {
     let msg = ffi_last_error();
-    // Mirrors `errno_for` (`tensor-capi/src/map.rs`) in reverse; that
-    // function is the single place the forward mapping lives, so the two
-    // are read together rather than each inventing a table.
+    // The inverse of `errno_for` in `tensor-capi/src/map.rs`.
     match errno {
         libc::ENOTSUP => Error::NotImplemented(msg),
         libc::ENOMEM => Error::IoError(std::io::Error::from_raw_os_error(libc::ENOMEM)),
@@ -2537,15 +1958,7 @@ fn builder_error(errno: std::ffi::c_int) -> Error {
     }
 }
 
-/// Derive a [`BufferIdentity`] from an fd's `(st_dev, st_ino)`. See
-/// [`TensorDyn::derive_identity`]'s doc comment for why this is the correct
-/// key for a DMA-BUF handle. Mirrors `dma.rs::identity_from_stat` exactly
-/// (that one is `static`-backend-private and `target_os = "linux"`-gated;
-/// this one only needs `unix`, since it works from a bare fd via `nix`
-/// rather than any Linux-specific DMA-BUF API).
-// See `dma.rs::identity_from_stat`'s own `#[allow]` for why this cast is
-// needed on exactly one platform per field and both are needed to compile
-// on both.
+/// Derive a [`BufferIdentity`] from an fd's `(st_dev, st_ino)`.
 #[cfg(unix)]
 #[allow(clippy::unnecessary_cast)]
 fn identity_from_stat(stat: &nix::sys::stat::FileStat) -> BufferIdentity {
@@ -2557,23 +1970,17 @@ fn identity_from_stat(stat: &nix::sys::stat::FileStat) -> BufferIdentity {
 ///
 /// # Errors
 ///
-/// [`Error::InvalidArgument`] in the (unreachable in practice) case that a
-/// format's wire string somehow contains a NUL byte -- `PixelFormat::as_str`
-/// always returns a static ASCII string, but the fallible `CString::new`
-/// path is kept explicit rather than `.unwrap()`-ed, matching this crate's
-/// standing rule against silently swallowing an error class just because
-/// it looks unreachable today.
+/// [`Error::InvalidArgument`] if the wire string contains a NUL byte.
 fn format_cstring(format: PixelFormat) -> Result<std::ffi::CString> {
     std::ffi::CString::new(format.as_str())
         .map_err(|e| Error::InvalidArgument(format!("pixel format string contains a NUL: {e}")))
 }
 
-/// `NUL`-terminate an optional debug name for a C call.
+/// `NUL`-terminate an optional debug name for a C call. `None` stays `None`.
 ///
-/// Unlike [`format_cstring`]'s input, this string comes from the caller and
-/// really can contain a NUL, so the refusal is a reachable path rather than
-/// a defensive one. `None` stays `None`, which is the ABI's own "no name"
-/// spelling.
+/// # Errors
+///
+/// [`Error::InvalidArgument`] if the name contains a NUL byte.
 #[cfg(target_os = "windows")]
 fn name_cstring(name: Option<&str>) -> Result<Option<std::ffi::CString>> {
     name.map(std::ffi::CString::new)
@@ -2582,13 +1989,6 @@ fn name_cstring(name: Option<&str>) -> Result<Option<std::ffi::CString>> {
 }
 
 /// `width`x`height` as the `uint64_t[]` shape a D3D11 constructor takes.
-///
-/// The C constructors are given the tensor's shape, not its pixel
-/// dimensions, so that `ef_tensor_shape` reports back exactly what was
-/// passed in and the far side can check it against the texture. The static
-/// backend's constructors take `width`/`height` and derive the same shape
-/// internally, so converting here is what keeps the two signatures
-/// identical.
 ///
 /// # Errors
 ///
@@ -2613,9 +2013,7 @@ fn allocation_dims(
 }
 
 /// Encode `Option<TensorMemory>` as the `(has_memory, memory)` pair every
-/// `ef_tensor_image_*` constructor takes -- 0/0 for "auto-select", matching
-/// `ef_tensor_image_desc_view`'s own `has_memory` convention rather than a
-/// sentinel code (every `ef_storage_kind` value 0..=6 is real).
+/// `ef_tensor_image_*` constructor takes; `(0, 0)` requests auto-selection.
 fn memory_code(memory: Option<TensorMemory>) -> (std::ffi::c_int, u32) {
     match memory {
         Some(m) => (1, m.code()),
@@ -2623,12 +2021,8 @@ fn memory_code(memory: Option<TensorMemory>) -> (std::ffi::c_int, u32) {
     }
 }
 
-/// Read the calling thread's most recent `tensor-capi` failure detail, for
-/// enriching the `Error` this backend returns on a constructor/mutator
-/// failure -- see `ef_tensor_last_error_message`'s own doc comment for the
-/// "advisory, `dlerror`-style, valid until this thread's next call"
-/// contract. Never `""`-checked by the caller: an empty string is a
-/// perfectly fine (if uninformative) suffix to a message.
+/// Read the calling thread's most recent `tensor-capi` failure message. The
+/// text is advisory, may be empty, and is valid until this thread's next call.
 pub(crate) fn ffi_last_error() -> String {
     // SAFETY: `ef_tensor_last_error_message` always returns a valid,
     // NUL-terminated string (possibly empty), read immediately and copied
@@ -2642,13 +2036,7 @@ pub(crate) fn ffi_last_error() -> String {
     }
 }
 
-/// Read the calling thread's most recent `tensor-capi` failure **class**,
-/// beside [`ffi_last_error`]'s message.
-///
-/// The entry points that report failure by returning `NULL` carry no errno,
-/// so this is the only structured signal available for them. Unlike the
-/// message -- whose contract is "never parse this" -- this is meant to be
-/// programmed against.
+/// Read the calling thread's most recent `tensor-capi` failure class.
 fn ffi_last_error_class() -> edgefirst_tensor_ffi::EfErrorClass {
     use edgefirst_tensor_ffi::EfErrorClass as C;
     // SAFETY: a plain thread-local read on the producing side; no pointers.
@@ -2664,9 +2052,7 @@ fn ffi_last_error_class() -> edgefirst_tensor_ffi::EfErrorClass {
         C::AllocationFailed,
         C::QuantizationInvalid,
     ];
-    // Unspecified, and anything a newer library added that this build does
-    // not know: "no class recorded", which is exactly how an unclassified
-    // failure already reads. Never a guess at the nearest neighbour.
+    // A code outside `CLASSES` reads as `Unspecified`.
     CLASSES
         .into_iter()
         .find(|c| *c as u32 == code)
@@ -2676,24 +2062,10 @@ fn ffi_last_error_class() -> edgefirst_tensor_ffi::EfErrorClass {
 /// Rebuild a typed [`Error`] from the class and message the last failing
 /// `ef_tensor_*` call recorded.
 ///
-/// This replaces the string matching `TensorDyn::batch` used to do. That
-/// coupling was tolerable only because it degraded to a truth rather than a
-/// falsehood, but it was still an ABI programmed against a `Display`
-/// fragment; `ef_tensor_last_error_class` is the structured signal it
-/// wanted and did not have.
-///
-/// The message is always the producing side's own, whatever the class. An
-/// `Unspecified` class -- an older library, or a failure path that recorded
-/// only a message -- yields `fallback`, so this degrades exactly the way
-/// the string match did: to a less specific truth, never to a confident
-/// wrong answer.
-///
-/// Variants carrying structured fields (`RegionOutOfBounds`,
-/// `BatchIndexOutOfBounds`, `InsufficientCapacity`) are not rebuilt here:
-/// their numbers do not cross the boundary. The two callers that can supply
-/// them from their own arguments do so themselves; everyone else gets a
-/// message-carrying variant of the right *kind*, which is what a consumer
-/// reads.
+/// The message is the producing side's own. An `Unspecified` class yields
+/// `fallback`. The classes whose variants carry structured fields
+/// (`RegionOutOfBounds`, `BatchIndexOutOfBounds`, `InsufficientCapacity`) map
+/// to [`Error::ShapeMismatch`].
 pub(crate) fn ffi_error(fallback: fn(String) -> Error) -> Error {
     use edgefirst_tensor_ffi::EfErrorClass as C;
     let msg = ffi_last_error();
@@ -2711,9 +2083,8 @@ pub(crate) fn ffi_error(fallback: fn(String) -> Error) -> Error {
     }
 }
 
-/// Holds one `ef_tensor_retain` on a handle for a keepalive's lifetime, so
-/// an address borrowed out of that handle (a `PboOpsVtable`, today) stays
-/// valid independently of the `TensorDyn` it came from.
+/// Holds one `ef_tensor_retain` on a handle for a keepalive's lifetime, keeping
+/// an address borrowed from that handle valid.
 struct HandleKeepalive(*mut EfTensor);
 
 // SAFETY: an `ef_tensor` handle is refcounted and documented as safe to
@@ -2730,9 +2101,7 @@ impl Drop for HandleKeepalive {
 }
 
 /// The keepalive behind [`TensorDyn::map_bytes`]'s pin. Holds its own
-/// `ef_tensor_retain`'d reference (independent of the `TensorDyn` that
-/// created it, matching the static backend's "genuinely `'static`" pin
-/// contract) and releases it on `Drop`, after unmapping.
+/// `ef_tensor_retain`'d reference and, on drop, unmaps and then releases it.
 struct MapKeepalive(*mut EfTensor);
 
 // SAFETY: the referenced handle is `libedgefirst_tensor`'s own C ABI object,
@@ -2743,9 +2112,8 @@ unsafe impl Sync for MapKeepalive {}
 
 impl Drop for MapKeepalive {
     fn drop(&mut self) {
-        // SAFETY: `self.0` was retained in `map_bytes` and is released here,
-        // symmetrically -- unmap first (the sync bracket), then the retained
-        // reference.
+        // SAFETY: `self.0` was retained when the pin was built and is released
+        // here, after the unmap.
         unsafe {
             edgefirst_tensor_ffi::ef_tensor_unmap(self.0);
             edgefirst_tensor_ffi::ef_tensor_free(self.0);
@@ -2753,19 +2121,7 @@ impl Drop for MapKeepalive {
     }
 }
 
-/// Lighter than the static backend's. `static_backend.rs`'s `Debug` prints
-/// every field of the boxed `Tensor<T>` (`storage`, `format`, `chroma`,
-/// `row_stride`, `quantization`, `colorimetry`, the CUDA handle, ...); this
-/// one prints only `dtype` and `shape`, because those are the only two facts
-/// `libedgefirst_tensor.so` exposes a *reader* for today (`ef_tensor_dtype`,
-/// `ef_tensor_shape`/`ef_tensor_ndim`). Byte parity with the static backend
-/// is not reachable without a new `ef_tensor_*` getter -- `quantization` in
-/// particular has only a pre-alloc builder setter, no runtime reader -- so
-/// matching it is a future primitive, not an impl choice made here. Safe to
-/// reduce fidelity like this because nothing in the codebase parses or
-/// compares `TensorDyn`'s `Debug` output; it exists only so
-/// `detect::ProtoData`'s `#[derive(Debug)]` (unconditionally compiled, real
-/// cross-backend surface `decoder` constructs) has something to call.
+/// Prints `dtype` and `shape` only.
 impl fmt::Debug for TensorDyn {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TensorDyn")

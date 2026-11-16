@@ -3,23 +3,17 @@
 
 //! Layout-only C ABI contract for the EdgeFirst detection vocabulary.
 //!
-//! Decoding model outputs into user-consumable structures — detection boxes,
-//! segmentation masks, tile placements — is what the decoder library *is*, so
-//! these types belong to it. They lived in `edgefirst-tensor` because of the
-//! r2 "plain-values-only boundary rule", whose premise (sibling libraries
-//! never link each other) spec Revision 3 overturned. A plain value that
-//! crosses needs a shared DECLARATION, not a shared LINK.
+//! Detection boxes, segmentation masks and tile placements as plain C
+//! values, declared once for the decoder, image and tracker libraries.
 //!
-//! Emitted into `edgefirst/decoder.h` by cbindgen's `[parse] include`,
-//! exactly as `edgefirst-tensor-abi`'s types are emitted into `tensor.h`.
+//! The C declarations are in `edgefirst/detect.h`.
 
 use std::ffi::c_int;
 
 /// A detection: a normalized box, a score, and a label index.
 ///
-/// Coordinates are normalized to `[0, 1]` against the *model input*, not the
-/// source image — un-letterboxing is the consumer's job and needs the letterbox
-/// parameters, which this type deliberately does not carry.
+/// Coordinates are normalized to `[0, 1]` against the model input, not the
+/// source image.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct EfDetectBox {
@@ -35,13 +29,11 @@ pub struct EfDetectBox {
 
 /// One segmentation result, as plain values.
 ///
-/// Crosses library boundaries by the same rule as [`EfDetectBox`]: plain
-/// values, never a handle. `mask` **borrows** the producing list's buffer and
-/// is valid only until that list is freed — stated here because C gives a
-/// caller no way to discover it.
+/// `mask` borrows the producing list's buffer and is valid only until that
+/// list is freed.
 ///
-/// The bounds describe the **mask region**, which is snapped to the proto grid
-/// and therefore encloses rather than equals the companion detection's box.
+/// The bounds describe the mask region, which is snapped to the proto grid
+/// and encloses the companion detection's box.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct EfSegmentation {
@@ -59,11 +51,8 @@ pub struct EfSegmentation {
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct EfMergeConfig {
-    /// An `EF_MATCH_METRIC_*` code: IoU, or Intersection-over-Smaller.
-    ///
-    /// IoS is the default for a reason: an object split across a tile seam has
-    /// *low* IoU with its own fragment but high IoS, so IoU would keep both
-    /// halves as separate detections.
+    /// An `EF_MATCH_METRIC_*` code: IoU, or Intersection-over-Smaller (the
+    /// default).
     pub metric: u32,
     pub threshold: f32,
     /// Non-zero to merge across classes.
@@ -75,14 +64,11 @@ pub struct EfMergeConfig {
     /// matched are dropped. `EF_MERGE_MODE_UNION`: the group becomes its
     /// enclosing union carrying the max score.
     ///
-    /// Keep-best is `0`, but note that a zero-initialised struct is still
-    /// not the library default: `metric` defaults to `EF_MATCH_METRIC_IOS`,
-    /// so an all-zero struct selects IoU. Fill with `ef_merge_config_default`.
-    /// The union measured about 0.05 AP50 worse on every frame of the Ocean
-    /// Cleanup ADIS 4K validation (TOP2-836), which is why it is opt-in.
+    /// A zero-initialised struct is not the library default: `metric`
+    /// defaults to `EF_MATCH_METRIC_IOS`, so an all-zero struct selects IoU.
+    /// Fill with `ef_merge_config_default`.
     ///
-    /// Occupies what was this struct's 4-byte tail pad, so adding it left
-    /// every other field's offset and the 32-byte size unchanged.
+    /// Occupies the last 4 bytes of the 32-byte struct.
     pub mode: u32,
 }
 
@@ -90,14 +76,12 @@ pub struct EfMergeConfig {
 ///
 /// Produced by `edgefirst_image::ImageProcessor::plan_tiles` and consumed by
 /// `edgefirst_decoder::tiling` to lift per-tile detections back to full-frame
-/// coordinates. It lives here because it is the contract *between* those two
-/// crates: it was previously defined in `decoder` and re-exported by `image`,
-/// so the producer imported its own output type from its consumer.
+/// coordinates.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TilePlacement {
     /// Tile index within the frame grid, `0..count`.
     pub index: usize,
-    /// Total tiles for this frame (the streaming fan-in fence).
+    /// Total tiles for this frame.
     pub count: usize,
     /// Native crop origin `(ox, oy)` in full-frame pixels.
     pub origin: (f32, f32),
@@ -106,16 +90,13 @@ pub struct TilePlacement {
     pub crop_size: (f32, f32),
     /// The image content on the model input as normalized
     /// `[xmin, ymin, xmax, ymax]` (a letterbox's content region), or `None`
-    /// when the crop was stretched to fill it (the hot path).
+    /// when the crop was stretched to fill it.
     pub content_region: Option<[f32; 4]>,
     /// Full-frame dimensions `(frame_w, frame_h)` in pixels.
     pub frame_dims: (f32, f32),
 }
 
 /// C layout of `ef_tile_placement` in `detect.h`.
-///
-/// One declaration for image-capi (producer) and decoder-capi (consumer).
-/// cbindgen excludes this type so the header-only `detect.h` definition wins.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct EfTilePlacement {
@@ -243,9 +224,7 @@ pub struct EfPreprocessSpec {
 mod tests {
     use super::*;
 
-    /// Load-bearing: `edgefirst-image` and `edgefirst-tracker` depend on this
-    /// crate to NAME decoder's types without linking decoder's implementation.
-    /// A single dependency here would drag code into both and defeat that.
+    /// The manifest's `[dependencies]` table is empty.
     #[test]
     fn this_crate_has_no_dependencies_and_never_may() {
         let manifest = include_str!("../Cargo.toml");
@@ -284,8 +263,8 @@ mod tests {
     #[test]
     fn merge_config_layout_is_pinned() {
         // `max_det: usize` forces 8-byte alignment and 4 bytes of pad after
-        // `class_agnostic`; `mode` fills what was the tail pad at 28, so the
-        // struct is 32 bytes with or without it. Matches `detect.h`.
+        // `class_agnostic`; `mode` sits at 28, so the struct is 32 bytes.
+        // Matches `detect.h`.
         assert_eq!(std::mem::size_of::<EfMergeConfig>(), 32);
         assert_eq!(std::mem::align_of::<EfMergeConfig>(), 8);
         assert_eq!(std::mem::offset_of!(EfMergeConfig, metric), 0);

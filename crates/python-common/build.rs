@@ -4,10 +4,10 @@
 fn main() {
     pyo3_build_config::use_pyo3_cfgs();
 
-    // Declare the custom cfg to avoid warnings
+    // Declare the custom cfg.
     println!("cargo::rustc-check-cfg=cfg(nightly)");
 
-    // Detect if we're using nightly Rust
+    // Detect a nightly toolchain.
     let is_nightly = rustc_version::version_meta()
         .map(|meta| meta.channel == rustc_version::Channel::Nightly)
         .unwrap_or(false);
@@ -16,7 +16,7 @@ fn main() {
         println!("cargo:rustc-cfg=nightly");
     }
 
-    // Coverage-capture resilience: the SIGABRT handler ctor is compiled in under `coverage`.
+    // The SIGABRT handler ctor is compiled in under `coverage`.
     if edgefirst_build_support::coverage_instrumented() {
         println!("cargo::rustc-cfg=coverage");
     }

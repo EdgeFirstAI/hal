@@ -1,9 +1,8 @@
-//! Persistent host pinning (issue #134).
+//! Persistent host pinning.
 
 use edgefirst_tensor::{CpuAccess, Error, PixelFormat, Tensor, TensorMemory, TensorTrait};
 
-// Used only by the DMA tests below. Importing these unconditionally makes them
-// dead on macOS, which fails that lane under `-D warnings`.
+// Used only by the DMA tests below.
 #[cfg(target_os = "linux")]
 use edgefirst_tensor::Region;
 #[cfg(unix)]
@@ -15,7 +14,7 @@ use edgefirst_tensor::TensorMapTrait;
 #[allow(dead_code)]
 mod outcome;
 
-/// Skip marker that survives libtest's output capture. See `skip` below.
+/// Writes a skip marker directly to stderr.
 #[cfg(unix)]
 fn skip_unix(why: &str) {
     use std::io::Write;
@@ -40,10 +39,7 @@ fn pin_yields_a_stable_usable_address() {
 
 #[test]
 fn pin_does_not_borrow_the_tensor() {
-    // The #134 blocker in its purest form: a guard that borrowed the tensor
-    // could not coexist with the `&mut` that ImageProcessor::convert takes on
-    // its destination every frame. Taking that &mut while a pin is live must
-    // COMPILE -- that is the whole property, and it is checked at build time.
+    // Taking `&mut` on the tensor while a pin is live compiles.
     let mut t = Tensor::<u8>::image(
         32,
         32,
@@ -54,8 +50,8 @@ fn pin_does_not_borrow_the_tensor() {
     .expect("alloc");
     let pin = t.pin_host(CpuAccess::ReadWrite).expect("pin");
 
-    let borrowed: &mut Tensor<u8> = &mut t; // <- would not compile if the
-    borrowed.set_logical_shape(&[3072]).unwrap(); //    pin borrowed the tensor
+    let borrowed: &mut Tensor<u8> = &mut t;
+    borrowed.set_logical_shape(&[3072]).unwrap();
 
     assert!(
         !pin.as_ptr().is_null(),
@@ -95,7 +91,7 @@ fn pin_outlives_the_tensor_via_its_keepalive() {
         let p = t.pin_host(CpuAccess::ReadWrite).expect("pin");
         unsafe { std::ptr::write_bytes(p.as_mut_ptr(), 0x5A, p.len()) };
         p
-    }; // tensor dropped here; the Arc keepalive must hold the allocation
+    }; // tensor dropped here
     unsafe { assert!(pin.as_slice().iter().all(|b| *b == 0x5A)) };
 }
 
@@ -117,7 +113,6 @@ fn cpu_access_none_is_an_error_not_a_silent_downgrade() {
 
 #[test]
 fn alignment_is_queryable_for_tflite() {
-    // TFLite requires 64-byte alignment unless the caller opts out.
     let t = Tensor::<u8>::image(
         64,
         64,
@@ -145,12 +140,7 @@ fn alignment_of_a_float_pin_covers_the_element_and_divides_the_address() {
 
 #[test]
 fn sync_is_a_documented_noop_on_coherent_backends() {
-    // `sync_for_cpu`'s rustdoc table says Mem and Shm are no-ops and NOTHING
-    // ELSE is: DMA-BUF issues an ioctl, IOSurface locks/unlocks, and
-    // AHardwareBuffer and PBO report NotImplemented because their platform
-    // fuses addressing with coherency. This asserts the no-op half of that
-    // table for BOTH rows -- Shm is claimed by the docs and was previously
-    // untested, so the claim rested on reading the match arm.
+    // Mem and Shm sync calls are no-ops.
     for memory in [
         TensorMemory::Mem,
         #[cfg(unix)]
@@ -190,8 +180,8 @@ fn sync_rejects_an_access_that_describes_nothing() {
 
 #[test]
 fn pin_then_bracket_then_mutate_is_the_intended_frame_loop() {
-    // The whole #134 shape in one test: pin once, then each "frame" bracket a
-    // CPU read and still take &mut on the tensor.
+    // Pins once, then brackets a CPU read each frame while taking `&mut` on
+    // the tensor.
     let mut t = Tensor::<u8>::image(
         16,
         16,
@@ -215,7 +205,7 @@ fn pin_then_bracket_then_mutate_is_the_intended_frame_loop() {
 
 // --- DMA (Linux) ----------------------------------------------------------
 
-/// The DMA require gate: a skip here fails under `HAL_TEST_REQUIRE_DMA=1`.
+/// The DMA-heap skip policy: a skip under `HAL_TEST_REQUIRE_DMA=1` fails.
 #[cfg(target_os = "linux")]
 #[path = "support/dma_require.rs"]
 mod dma_require;
@@ -223,19 +213,15 @@ mod dma_require;
 #[cfg(target_os = "linux")]
 #[test]
 fn dma_pin_of_a_subview_is_offset_adjusted() {
-    // Requirement 2 of #134: a pin must hand back the *view's* address, not the
-    // raw mmap base. A freshly allocated tensor has mmap_offset == 0, so it
-    // cannot show this -- only a subview can. Proven by writing through the
-    // pin and reading the bytes back through the PARENT at the same offset.
+    // A pin of a subview hands back the view's address: written through the
+    // pin, read back through the parent at the same offset.
     if !dma_require::available_or_skip(
         edgefirst_tensor::is_dma_available(),
         "dma_pin_of_a_subview_is_offset_adjusted",
     ) {
         return;
     }
-    // `view()` is the public crop primitive; it delegates to the same offset
-    // machinery. A bottom-half view at x=0 avoids the documented bottom-right
-    // multi-row limitation while still producing a non-zero mmap_offset.
+    // A bottom-half view at x=0 has a non-zero mmap offset.
     let parent = Tensor::<u8>::image(
         64,
         64,
@@ -273,8 +259,7 @@ fn dma_pin_of_a_subview_is_offset_adjusted() {
 #[cfg(target_os = "linux")]
 #[test]
 fn dma_pin_survives_guard_drops() {
-    // Issue #134 criterion 1: the address must stay valid after every map
-    // guard has dropped. Skips where no DMA heap is available.
+    // The address stays valid after every map guard has dropped.
     if !dma_require::available_or_skip(
         edgefirst_tensor::is_dma_available(),
         "dma_pin_survives_guard_drops",
@@ -292,7 +277,7 @@ fn dma_pin_survives_guard_drops() {
     let pin = t.pin_host(CpuAccess::ReadWrite).expect("pin DMA");
     assert!(!pin.as_ptr().is_null());
 
-    // Take and drop a conventional map guard; the pin must be unaffected.
+    // Takes and drops a conventional map guard.
     {
         let _guard = t.map().expect("map");
     }
@@ -322,51 +307,38 @@ fn dma_sync_brackets_round_trip_in_every_direction() {
         CpuAccess::ReadWrite,
     )
     .expect("alloc");
-    // The direction passed to sync_for_device MUST match sync_for_cpu; the
-    // kernel skips a writeback or an invalidate based on it.
+    // The direction passed to `sync_for_device` matches the one passed to `sync_for_cpu`.
     for access in [CpuAccess::Read, CpuAccess::Write, CpuAccess::ReadWrite] {
         t.sync_for_cpu(access).expect("start");
         t.sync_for_device(access).expect("end");
     }
 }
 
-// --- sync must never silently claim success -------------------------------
+// --- IOSurface (macOS/iOS) ------------------------------------------------
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 #[test]
 fn iosurface_pin_is_stable_and_sync_brackets_lock_unlock() {
-    // IOSurface is the reference implementation this whole design generalises:
-    // it already separates the surface's ADDRESS (IOSurfaceGetBaseAddress,
-    // stable for the surface's life) from the CPU ACCESS WINDOW
-    // (IOSurfaceLock/Unlock). So the pin takes the address and the sync calls
-    // take the lock, rather than fusing both into a map guard.
-    //
-    // A raw tensor, not an image: IOSurface rounds its row pitch up to 64
-    // bytes, and a contiguous write through the pin would not respect that
-    // stride. Pitch handling belongs to the map guard.
+    // A raw tensor: the pin takes the surface's address and the sync calls take the lock.
     let t = Tensor::<u8>::new(&[1024], Some(TensorMemory::DmaBuf), None).expect("alloc iosurface");
 
     let pin = t.pin_host(CpuAccess::ReadWrite).expect("pin iosurface");
     let addr = pin.as_ptr();
     assert!(!addr.is_null());
 
-    // A conventional guard takes and releases its own lock; the pinned address
-    // must be unaffected -- that is the property map() could not offer.
+    // A conventional guard takes and releases its own lock.
     {
         let _g = t.map().expect("map");
     }
     assert_eq!(pin.as_ptr(), addr, "pin address moved when a guard dropped");
 
-    // Write bracket. The lock options are derived from `access`, and Apple
-    // requires the SAME options at unlock -- which is exactly why the API
-    // makes the caller name the direction on both halves.
+    // Write bracket.
     t.sync_for_cpu(CpuAccess::Write).expect("IOSurfaceLock");
     unsafe { std::ptr::write_bytes(pin.as_mut_ptr(), 0x5E, pin.len()) };
     t.sync_for_device(CpuAccess::Write)
         .expect("IOSurfaceUnlock");
 
-    // Read bracket, which takes the read-only lock (it skips the cache flush
-    // at unlock, so a mismatched pairing here would be a real bug).
+    // Read bracket, which takes the read-only lock.
     t.sync_for_cpu(CpuAccess::Read)
         .expect("IOSurfaceLock read-only");
     unsafe { assert!(pin.as_slice().iter().all(|b| *b == 0x5E)) };
@@ -379,9 +351,7 @@ fn iosurface_pin_is_stable_and_sync_brackets_lock_unlock() {
 #[cfg(unix)]
 #[test]
 fn shm_pin_is_stable_across_guard_drops() {
-    // SHM is plain CPU memory behind an fd: the mapping can outlive a guard,
-    // and sync owes nothing. Skips where allocation is unavailable (Android's
-    // bionic has no POSIX shared memory; see shm.rs module docs).
+    // Skips where SHM allocation is unavailable.
     if !edgefirst_tensor::is_shm_available() {
         skip_unix("SHM allocation unavailable on this platform");
         return;
@@ -399,7 +369,7 @@ fn shm_pin_is_stable_across_guard_drops() {
     let addr = pin.as_ptr();
     assert_eq!(pin.len(), 32 * 32);
 
-    // A conventional guard comes and goes; the pinned address must not move.
+    // A conventional guard comes and goes.
     {
         let _g = t.map().expect("map");
     }
@@ -411,8 +381,7 @@ fn shm_pin_is_stable_across_guard_drops() {
     t.sync_for_device(CpuAccess::Write)
         .expect("shm sync is a no-op");
 
-    // Read back through a fresh guard: the pin and the guard must address the
-    // same bytes, which is what makes the pin a real view of the tensor.
+    // Reads back through a fresh guard.
     let g = t.map().expect("remap");
     assert!(
         g.as_slice().iter().all(|b| *b == 0x3C),
@@ -425,18 +394,7 @@ fn shm_pin_is_stable_across_guard_drops() {
 #[cfg(target_os = "android")]
 #[test]
 fn ahardwarebuffer_reports_why_it_cannot_pin() {
-    // Not a TODO: the NDK exposes allocate/acquire/release/describe/lock/
-    // unlock and nothing else, so there is no CPU address outside the lock. A
-    // "persistent" address would mean holding AHardwareBuffer_lock for the
-    // pin's lifetime, which both blocks the GPU from the buffer and makes any
-    // further lock undefined -- the NDK does not document refcounted nesting.
-    //
-    // The error must explain that, because "not implemented" would invite
-    // someone to implement it unsafely.
-    // An IMAGE, not a raw byte-bag: the emulator's allocator rejects
-    // FORMAT_BLOB (AHardwareBuffer_allocate rc=0x80000000 for 1024x1), while
-    // image formats allocate fine. Skip if even that is unavailable, so a
-    // device without a usable gralloc reports a skip rather than a failure.
+    // An image tensor; skips when no AHardwareBuffer can be allocated.
     let expect = if edgefirst_tensor::is_ahardwarebuffer_available() {
         outcome::Expect::Succeeds
     } else {
@@ -466,7 +424,7 @@ fn ahardwarebuffer_reports_why_it_cannot_pin() {
         }
         other => panic!("expected an explained NotImplemented, got {other:?}"),
     }
-    // Sync is unavailable for the same reason, and must not silently succeed.
+    // Sync reports `NotImplemented` too.
     assert!(matches!(
         t.sync_for_cpu(CpuAccess::Read),
         Err(Error::NotImplemented(_))
@@ -476,7 +434,7 @@ fn ahardwarebuffer_reports_why_it_cannot_pin() {
         Err(Error::NotImplemented(_))
     ));
 
-    // The supported path must still work.
+    // A map still works.
     let g = t.map().expect("map must work where pin cannot");
     assert!(!g.as_slice().is_empty(), "map must expose the buffer");
 }
@@ -485,16 +443,7 @@ fn ahardwarebuffer_reports_why_it_cannot_pin() {
 
 #[test]
 fn relayout_while_pinned_is_safe_and_the_pin_is_a_snapshot() {
-    // Plan 2b Task 3 assumed a live pin had to BLOCK re-layout, on the theory
-    // that a remap would move the address underneath it. No backend does that:
-    // set_logical_shape only rewrites `shape` after a capacity check, and each
-    // pin owns its own mapping (Mem an Arc over a never-resized allocation,
-    // SHM/DMA their own mmap, IOSurface the retained surface). So a pin stays
-    // valid across re-layout; what it does NOT do is follow the new shape.
-    //
-    // That snapshot semantic is the thing worth pinning down, because the
-    // alternative reading -- "len() tracks the tensor" -- would be a silent
-    // buffer-overrun waiting to happen if it were ever true.
+    // A pin stays valid across re-layout and does not follow the new shape.
     let mut t = Tensor::<u8>::image(
         64,
         64,
@@ -509,7 +458,7 @@ fn relayout_while_pinned_is_safe_and_the_pin_is_a_snapshot() {
     assert_eq!(len, 64 * 64);
     unsafe { std::ptr::write_bytes(pin.as_mut_ptr(), 0xD4, len) };
 
-    // Shrink the logical shape. Allowed: it fits inside the same allocation.
+    // Shrinks the logical shape within the same allocation.
     t.configure_image(32, 32, PixelFormat::Grey)
         .expect("re-layout within capacity");
 
@@ -522,17 +471,13 @@ fn relayout_while_pinned_is_safe_and_the_pin_is_a_snapshot() {
     );
     unsafe { assert!(pin.as_slice().iter().all(|b| *b == 0xD4)) };
 
-    // Growing beyond capacity is refused, which is what keeps the snapshot
-    // inside the allocation in every case.
+    // Growing beyond capacity is refused.
     assert!(t.set_logical_shape(&[64 * 64 * 4]).is_err());
 }
 
 #[cfg(target_os = "linux")]
 #[test]
 fn dma_relayout_while_pinned_does_not_move_the_mapping() {
-    // The Mem case is the easy one -- its base pointer is trivially stable.
-    // DMA is where the "a remap moves the address" theory would have to hold
-    // if it held anywhere, since the pin owns a real mmap of a heap buffer.
     if !dma_require::available_or_skip(
         edgefirst_tensor::is_dma_available(),
         "dma_relayout_while_pinned_does_not_move_the_mapping",

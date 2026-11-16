@@ -3,25 +3,21 @@
 
 //! NEON-optimised 8×8 IDCT on 16-bit coefficients (libjpeg-turbo model).
 //!
-//! The entropy decoder hands us **quantised** `i16` coefficients; this kernel
-//! dequantises 8 lanes at a time (`vmulq_s16`, wrapping — same contract as
-//! turbo's `jsimd_idct_islow_neon`), runs the Loeffler butterfly with
-//! `vmull_s16` 16×16→32 multiplies, and keeps the inter-pass workspace in
-//! `int16x8` registers (no memory round-trip). Sparse shortcuts skip the
-//! arithmetic for the two dominant block shapes of quantised natural images:
-//! all-zero bottom rows (4–7) in pass 1 and all-zero right columns (4–7) in
-//! pass 2. A further per-half DC-only path (rows 1–7 of a 4×8 half all zero)
-//! broadcasts `dequant(row0) << PASS1_BITS`, matching turbo islow special
-//! case 2 — the remaining in-order gap after whole-block DC-only is taken in
-//! the MCU loop.
+//! Takes quantised `i16` coefficients, dequantises 8 lanes at a time
+//! (`vmulq_s16`, wrapping), runs the Loeffler butterfly with `vmull_s16`
+//! 16×16→32 multiplies, and keeps the inter-pass workspace in `int16x8`
+//! registers. Sparse shortcuts skip the arithmetic for all-zero bottom rows
+//! (4–7) in pass 1 and all-zero right columns (4–7) in pass 2. A per-half
+//! DC-only path (rows 1–7 of a 4×8 half all zero) broadcasts
+//! `dequant(row0) << PASS1_BITS`.
 
 use std::arch::aarch64::*;
 
-/// Fixed-point precision (must match scalar).
+/// Fixed-point precision, as in the scalar kernel.
 const PASS1_BITS: i32 = 2;
 const CONST_BITS: i32 = 13;
 
-/// Loeffler constants (must match scalar). All fit in i16 for `vmull_s16`.
+/// Loeffler constants, as in the scalar kernel. All fit in i16 for `vmull_s16`.
 const FIX_0_298: i16 = 2446;
 const FIX_0_390: i16 = 3196;
 const FIX_0_541: i16 = 4433;
@@ -37,13 +33,7 @@ const FIX_3_072: i16 = 25172;
 /// FIX_0_541 + FIX_0_765 — single multiply in the sparse even part.
 const FIX_1_306: i16 = FIX_0_541 + FIX_0_765;
 
-/// Butterfly constants packed for lane-indexed multiplies.
-///
-/// Written as `vmull_s16(x, vdup_n_s16(K))`, each constant is rebuilt with a
-/// `mov`/`dup` pair at every use site: the butterfly is inlined four times
-/// (two halves × two passes), so the kernel carried 64 `dup`s per block —
-/// 17% of its instructions. The `_laneq_` forms below name the constant as a
-/// lane of a register instead, so each multiply is a bare `smull`/`smlal`.
+/// Butterfly constants packed for lane-indexed (`_laneq_`) multiplies.
 const K0: [i16; 8] = [
     FIX_0_541, FIX_0_765, FIX_1_847, FIX_1_175, FIX_0_298, FIX_2_053, FIX_3_072, FIX_1_501,
 ];
@@ -52,9 +42,9 @@ const K1: [i16; 8] = [
 ];
 
 /// Full Loeffler butterfly on 4 lanes of 8 inputs. Returns the 8 outputs in
-/// natural order **before** descaling (32-bit, no rounding bias applied).
+/// natural order before descaling (32-bit, no rounding bias applied).
 #[inline(always)]
-#[allow(clippy::too_many_arguments)] // eight DCT coefficients is the Loeffler contract
+#[allow(clippy::too_many_arguments)]
 unsafe fn butterfly8(
     s0: int16x4_t,
     s1: int16x4_t,
@@ -116,9 +106,9 @@ unsafe fn butterfly8(
     ]
 }
 
-/// Sparse Loeffler butterfly: inputs 4–7 are known zero (bottom rows in
-/// pass 1, right columns in pass 2). Algebraically identical to [`butterfly8`]
-/// with `s4 = s5 = s6 = s7 = 0`; ten multiplies instead of fourteen.
+/// Sparse Loeffler butterfly: inputs 4–7 are zero (bottom rows in pass 1,
+/// right columns in pass 2). Equal to [`butterfly8`] with
+/// `s4 = s5 = s6 = s7 = 0`; ten multiplies.
 #[inline(always)]
 unsafe fn butterfly8_sparse(
     s0: int16x4_t,
@@ -166,12 +156,7 @@ unsafe fn butterfly8_sparse(
 }
 
 /// Descale one pass-1 output: round-to-nearest shift by CONST_BITS-PASS1_BITS,
-/// **saturating** into `i16`.
-///
-/// `sqrshrn` rather than plain `rshrn`, at identical cost, so that a coefficient
-/// stream extreme enough to overflow the 16-bit workspace lands on the same
-/// pixels here as under the x86 kernels' `packssdw` and the scalar reference —
-/// see [`super::IdctFn`]. Real streams never come near the saturation point.
+/// saturating into `i16`.
 #[inline(always)]
 unsafe fn descale_p1(x: int32x4_t) -> int16x4_t {
     vqrshrn_n_s32::<{ CONST_BITS - PASS1_BITS }>(x)
@@ -187,24 +172,17 @@ pub fn idct_8x8_neon(coeffs: &[i16; 64], quant: &[u16; 64], output: &mut [u8], s
 /// NEON 8×8 IDCT with an entropy-derived sparsity hint.
 ///
 /// `last_k` is the highest zigzag index the block decoder wrote (an upper
-/// bound on occupancy — see [`huffman::BlockInfo`]). Because the zigzag order
-/// fills the top-left corner first, small `last_k` proves whole regions zero
-/// without touching the coefficient memory:
+/// bound on occupancy; see [`huffman::BlockInfo`]). It selects a tier:
 ///
-/// - `last_k ≤ 1`: AC only at (0,1) — left 4×8 half is DC-broadcast shape,
+/// - `last_k ≤ 1`: AC only at (0,1): left 4×8 half is DC-broadcast shape,
 ///   right half entirely zero.
-/// - `last_k ≤ 9`: the prefix stays in rows 0–3 / cols 0–2 — sparse pass-1
+/// - `last_k ≤ 9`: the prefix stays in rows 0–3 / cols 0–2: sparse pass-1
 ///   butterfly on the left half, right half zero.
 /// - `last_k ≤ 13`: adds naturals 32/25/18/11 (row 4 possible, cols still
-///   ≤ 3) — full-width pass-1 with rows 5–7 as zero registers.
-/// - otherwise: the value-based detection kernel (which still finds shapes
-///   the prefix bound cannot prove, e.g. all-zero bottom rows behind a high
-///   `last_k`).
+///   ≤ 3): full-width pass-1 with rows 5–7 as zero registers.
+/// - otherwise: the value-based detection kernel.
 ///
-/// The proven-sparse tiers use only 64-bit `vld1_s16` loads for the rows that
-/// participate — the Cortex-A53's load path is 64 bits wide, and the skipped
-/// rows/halves never touch the cache. Bit-exact with [`idct_8x8_neon`]: every
-/// dropped term is exactly zero, and the shared tail is the same code.
+/// Bit-exact with [`idct_8x8_neon`].
 ///
 /// [`huffman::BlockInfo`]: crate::jpeg::huffman::BlockInfo
 #[inline(always)]
@@ -234,7 +212,7 @@ unsafe fn idct_8x8_neon_k_inner(
     let k1 = vld1q_s16(std::hint::black_box(K1.as_ptr()));
     let zero4 = vdup_n_s16(0);
 
-    // Dequantise one 4-lane left-half row (cols 0–3): 64-bit loads only.
+    // Dequantise one 4-lane left-half row (cols 0–3).
     let dqd = |i: usize| -> int16x4_t {
         vmul_s16(
             vld1_s16(coeffs.as_ptr().add(i * 8)),
@@ -286,8 +264,7 @@ unsafe fn idct_8x8_neon_inner(
     output: &mut [u8],
     stride: usize,
 ) {
-    // Load quantised rows and detect the two dominant sparsity shapes before
-    // dequantising (zero quantised ⇒ zero dequantised).
+    // Load quantised rows and detect the sparsity shapes before dequantising.
     let c0 = vld1q_s16(coeffs.as_ptr());
     let c1 = vld1q_s16(coeffs.as_ptr().add(8));
     let c2 = vld1q_s16(coeffs.as_ptr().add(16));
@@ -305,16 +282,12 @@ unsafe fn idct_8x8_neon_inner(
     let bottom_zero = (vgetq_lane_u64::<0>(bottom_u64) | vgetq_lane_u64::<1>(bottom_u64)) == 0;
     // Columns 4–7 across all rows sit in the high 64 bits of each row vector.
     let right_zero = vgetq_lane_u64::<1>(vreinterpretq_u64_s16(all_or)) == 0;
-    // Rows 1–7 of a 4×8 half all zero → that half is DC-only (turbo islow).
-    // Whole-block DC-only is already taken in the MCU loop via `has_ac`; this
-    // catches the common "AC only in the top-left 4×4" / "row 0 only" shapes
-    // that still enter the full kernel.
+    // Rows 1–7 of a 4×8 half all zero: that half is DC-only.
     let ac_u64 = vreinterpretq_u64_s16(ac_or);
     let left_ac_zero = vgetq_lane_u64::<0>(ac_u64) == 0;
     let right_ac_zero = vgetq_lane_u64::<1>(ac_u64) == 0;
 
-    // Dequantise (16-bit wrapping multiply — turbo's contract; valid baseline
-    // streams never overflow, corrupt ones only garble their own pixels).
+    // Dequantise (16-bit wrapping multiply).
     let dq = |c: int16x8_t, i: usize| -> int16x8_t {
         vmulq_s16(
             c,
@@ -341,13 +314,7 @@ unsafe fn idct_8x8_neon_inner(
         )
     };
 
-    // Butterfly constants, loaded once per block rather than rebuilt at every
-    // multiply (see [`K0`]). The barrier is load-bearing: with the addresses
-    // visible LLVM folds each lane back to its literal value and re-emits the
-    // `dup`s the lane form was meant to remove, undoing the whole change. Hiding
-    // the pointers forces one real load and keeps both vectors live across the
-    // four butterflies. Costs two more spill slots and saves ~100 instructions
-    // per block; a no-op for correctness if a future LLVM stops honouring it.
+    // Butterfly constants, loaded once per block through `black_box`.
     let k0 = vld1q_s16(std::hint::black_box(K0.as_ptr()));
     let k1 = vld1q_s16(std::hint::black_box(K1.as_ptr()));
 
@@ -383,7 +350,7 @@ unsafe fn idct_8x8_neon_inner(
 
     let wl = if left_ac_zero {
         // Column IDCT of [dc, 0,0,0,0,0,0,0] is saturate(dc << PASS1_BITS)
-        // in every row — same as descale_p1 of the 32-bit even part.
+        // in every row.
         let dc = vqmovn_s32(vshll_n_s16::<{ PASS1_BITS }>(vget_low_s16(r0)));
         [dc; 8]
     } else {
@@ -422,8 +389,8 @@ unsafe fn idct_8x8_neon_inner(
 }
 
 /// Shared tail of the 8×8 kernels: combine the pass-1 half results, transpose,
-/// run pass 2 (sparse when the right workspace half is known zero), descale,
-/// and store. `#[inline(always)]` so each caller keeps its registers.
+/// run pass 2 (sparse when the right workspace half is zero), descale, and
+/// store.
 #[inline(always)]
 unsafe fn finish_pass2_store(
     wl: [int16x4_t; 8],
@@ -446,8 +413,8 @@ unsafe fn finish_pass2_store(
 
     let (t0, t1, t2, t3, t4, t5, t6, t7) = transpose_8x8_s16(w0, w1, w2, w3, w4, w5, w6, w7);
 
-    // Pass 2 (rows): lanes are rows. If the right workspace half was zero the
-    // transposed columns 4–7 are zero — sparse butterfly, no check needed.
+    // Pass 2 (rows): lanes are rows. A zero right workspace half takes the
+    // sparse butterfly.
     let pass2_half = |g0: int16x4_t,
                       g1: int16x4_t,
                       g2: int16x4_t,
@@ -633,9 +600,6 @@ pub fn idct_dc_only_neon(dc_value: i32, output: &mut [u8], stride: usize) {
     let range_shift = CONST_BITS + PASS1_BITS + 3;
     let round = 1 << (range_shift - 1);
     let bias = round + (128 << range_shift);
-    // Wrapping: in-contract values cannot overflow here, but the argument is an
-    // i32 and a caller that hands over a wider one must get the same defined
-    // result the block kernels give, not a debug-build panic.
     let scaled = dc_value.wrapping_shl((CONST_BITS + PASS1_BITS) as u32);
     let val = (scaled.wrapping_add(bias) >> range_shift).clamp(0, 255) as u8;
 
@@ -656,13 +620,11 @@ mod tests {
 
     const UNIT_QUANT: [u16; 64] = [1u16; 64];
 
-    /// Deterministic synthetic IDCT coefficient block: DC + a few AC terms.
-    /// Values chosen so that no output pixel saturates (all outputs stay in ~30..220).
+    /// Synthetic IDCT coefficient block: DC plus a few AC terms; no output pixel
+    /// saturates.
     fn make_test_coeffs() -> [i16; 64] {
         let mut c = [0i16; 64];
-        // DC coefficient
         c[0] = 256;
-        // A handful of AC terms at positions that give non-trivial output
         c[1] = 32;
         c[8] = 16;
         c[2] = -24;
@@ -696,8 +658,7 @@ mod tests {
             crate::test_support::report_skip("SIMD feature not available");
             return;
         }
-        // Default coefficients live in rows 0–3 / cols 0–3: exercises both
-        // sparse shortcuts (bottom rows zero + right columns zero).
+        // Coefficients in rows 0–3 / cols 0–3: both sparse shortcuts.
         assert_parity(&make_test_coeffs(), &UNIT_QUANT, "sparse");
     }
 
@@ -719,8 +680,7 @@ mod tests {
         assert_parity(&coeffs, &UNIT_QUANT, "row0-both-halves");
     }
 
-    /// Left 4×8 is DC-only; right 4×8 has AC — the two halves take different
-    /// shortcuts.
+    /// Left 4×8 is DC-only; right 4×8 has AC.
     #[test]
     fn idct_8x8_parity_left_dc_right_ac() {
         if !std::arch::is_aarch64_feature_detected!("neon") {
@@ -735,8 +695,7 @@ mod tests {
         assert_parity(&coeffs, &UNIT_QUANT, "left-dc-right-ac");
     }
 
-    /// Coefficients in columns 4–7 defeat the right-half skip; parity must
-    /// hold on the full-width path too.
+    /// Coefficients in columns 4–7: the full-width path.
     #[test]
     fn idct_8x8_parity_right_half_coeffs() {
         if !std::arch::is_aarch64_feature_detected!("neon") {
@@ -750,8 +709,8 @@ mod tests {
         assert_parity(&coeffs, &UNIT_QUANT, "right-half");
     }
 
-    /// Coefficients in rows 4–7 defeat the bottom-rows skip (full pass-1
-    /// butterfly), while columns 4–7 stay zero (sparse pass 2).
+    /// Coefficients in rows 4–7 (full pass-1 butterfly) with columns 4–7 zero
+    /// (sparse pass 2).
     #[test]
     fn idct_8x8_parity_bottom_row_coeffs() {
         if !std::arch::is_aarch64_feature_detected!("neon") {
@@ -765,7 +724,7 @@ mod tests {
         assert_parity(&coeffs, &UNIT_QUANT, "bottom-rows");
     }
 
-    /// Dense block: every sparsity shortcut defeated.
+    /// Dense block: no sparsity shortcut applies.
     #[test]
     fn idct_8x8_parity_dense() {
         if !std::arch::is_aarch64_feature_detected!("neon") {
@@ -779,7 +738,7 @@ mod tests {
         assert_parity(&coeffs, &UNIT_QUANT, "dense");
     }
 
-    /// Real-shape quant table must be applied identically to scalar.
+    /// A real-shape quant table gives the scalar result.
     #[test]
     fn idct_8x8_parity_with_quant() {
         if !std::arch::is_aarch64_feature_detected!("neon") {
@@ -838,10 +797,7 @@ mod tests {
         }
     }
 
-    /// The entropy-hinted kernel must be bit-identical to the value-detection
-    /// kernel for every tier. For each `last_k`, build a block whose occupied
-    /// zigzag prefix ends exactly at `last_k` (worst case for the tier bound)
-    /// and compare against the scalar reference.
+    /// The entropy-hinted kernel matches the scalar reference for every `last_k` tier.
     #[test]
     fn idct_8x8_k_tiers_match_scalar() {
         if !std::arch::is_aarch64_feature_detected!("neon") {
@@ -855,8 +811,7 @@ mod tests {
         for last_k in 1..64u8 {
             let mut coeffs = [0i16; 64];
             coeffs[0] = 300;
-            // Fill the whole prefix with non-zeros: every position the bound
-            // permits is occupied, so a tier that loads too little fails loudly.
+            // Fill the whole prefix with non-zeros.
             for k in 1..=last_k {
                 let natural = ZIGZAG[k as usize] as usize;
                 coeffs[natural] = if k % 2 == 0 { 17 } else { -13 };
@@ -874,8 +829,7 @@ mod tests {
                     simd_out[i]
                 );
             }
-            // A sparser block under the same bound (only the last position
-            // occupied) must also match — the hint is an upper bound.
+            // A sparser block under the same bound: only the last position occupied.
             let mut coeffs2 = [0i16; 64];
             coeffs2[0] = -180;
             coeffs2[ZIGZAG[last_k as usize] as usize] = 21;

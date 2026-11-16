@@ -4,10 +4,7 @@
 //! Internal YOLO decoder kernels.
 //!
 //! All items in this module are `pub(crate)`. The public API surface for
-//! decoding is [`crate::Decoder`] + [`crate::DecoderBuilder`]; external
-//! callers must go through that entry point so we can evolve the kernels
-//! (split paths, dispatch tables, NEON tiers) without breaking semver.
-//! See `CHANGELOG.md` for the 0.20.0 narrowing.
+//! decoding is [`crate::Decoder`] + [`crate::DecoderBuilder`].
 
 use ndarray::{
     parallel::prelude::{IntoParallelIterator, ParallelIterator},
@@ -31,23 +28,9 @@ use crate::{
     Quantization, Segmentation, XYWH, XYXY,
 };
 
-/// Maximum number of above-threshold candidates fed to NMS.
-///
-/// At very low score thresholds (e.g., t=0.01 on YOLOv8 with
-/// 8400 anchors × 80 classes), the number of survivors approaches
-/// the full 672 000-entry score grid. NMS is O(n²) and the
-/// downstream mask matmul runs once per survivor, so an
-/// unbounded set produces minutes-per-frame decode times.
-///
-/// `MAX_NMS_CANDIDATES` matches the Ultralytics `max_nms` default
-/// and is applied as a top-K-by-score truncation immediately
-/// before NMS. Values above the cap are silently dropped — at the
-/// score thresholds where the cap activates the bottom of the
-/// candidate list is dominated by noise that NMS would discard
-/// anyway.
-///
-/// Production callers configure this via [`crate::DecoderBuilder::with_pre_nms_top_k`];
-/// only the test-only seg-det wrappers reach for this constant directly.
+/// Maximum number of above-threshold candidates the test-only seg-det
+/// wrappers feed to NMS, applied as a top-K-by-score truncation before
+/// NMS. Matches the Ultralytics `max_nms` default.
 #[cfg(test)]
 pub(crate) const MAX_NMS_CANDIDATES: usize = 30_000;
 
@@ -61,7 +44,7 @@ pub(crate) const DEFAULT_MAX_DETECTIONS: usize = 300;
 /// mask coefficients).
 pub(crate) trait ScoredCandidate: Sized + Send + Sync {
     /// Score used for ranking. Quantized boxes rank on the raw quantized
-    /// score, which preserves order under monotonic dequantization.
+    /// score.
     type Score: Copy;
 
     fn score_key(&self) -> Self::Score;
@@ -130,9 +113,7 @@ impl<S: PrimInt + AsPrimitive<f32> + Send + Sync, E: Send + Sync> ScoredCandidat
 /// Keep the `top_k` highest-scoring candidates in place, in their original
 /// order. No-op when `top_k` is 0 (unbounded) or when `boxes.len() <= top_k`.
 ///
-/// Candidates arrive in anchor order (then class order under multi-label),
-/// so equal scores at the cut keep the lower anchor index, which makes the
-/// selection reproducible against a reference decoder. Runs in O(N): one
+/// Equal scores at the cut keep the earlier candidates. Runs in O(N): one
 /// partial select over a copy of the scores, then one `retain` pass.
 pub(crate) fn truncate_to_top_k_by_score<T: ScoredCandidate>(boxes: &mut Vec<T>, top_k: usize) {
     use std::cmp::Ordering;
@@ -200,13 +181,11 @@ pub(crate) fn nms_and_cap<T: ScoredCandidate>(
 
 /// Dispatches to the appropriate NMS function based on mode for float boxes.
 ///
-/// `max_det` is the post-NMS detection cap; when present it lets the greedy
-/// inner loop break as soon as that many survivors are confirmed (the survivors
-/// are guaranteed to be the top-`max_det` by score because the input is sorted
-/// descending). Pass `None` to run the full O(N²) suppression.
+/// `max_det` is the post-NMS detection cap; when present the greedy loop
+/// stops once that many survivors are confirmed. Pass `None` to run the
+/// full suppression.
 ///
-/// `nms` must be a concrete mode: the builder resolves `Nms::Auto` before a
-/// `Decoder` exists.
+/// `nms` must be a concrete mode, not `Nms::Auto`.
 pub(crate) fn dispatch_nms_float(
     isa: Isa,
     nms: Option<Nms>,
@@ -305,10 +284,8 @@ pub(crate) fn cap_or_default<T>(v: &Vec<T>) -> usize {
 
 // ─── Public free decode_yolo_* convenience wrappers ────────────────────────
 //
-// These crate-internal wrappers take the detection cap (`max_det`) and the
-// pre-NMS candidate cap (`pre_nms_top_k`) explicitly, so `Decoder` bounds
-// every path by its own settings; a caller's `Vec` capacity is only an
-// allocation hint.
+// These wrappers take the detection cap (`max_det`) and the pre-NMS
+// candidate cap (`pre_nms_top_k`) explicitly.
 
 /// Decodes YOLO detection outputs from quantized tensors into detection boxes.
 ///
@@ -388,11 +365,6 @@ where
 
 /// Test-only seg-det quantized decode shim.
 ///
-/// Production callers go through [`crate::Decoder::decode`]; this wrapper
-/// exists only so the parity tests in `lib.rs` and `yolo.rs` can compare the
-/// kernel output against the Decoder output without duplicating the
-/// `impl_yolo_segdet_quant` argument plumbing.
-///
 /// Boxes are expected to be in XYWH format. Expected shapes:
 /// - `boxes`: `(4 + num_classes + num_protos, num_boxes)`
 /// - `protos`: `(proto_height, proto_width, num_protos)`
@@ -415,10 +387,7 @@ pub(crate) fn decode_yolo_segdet_quant<
 where
     f32: AsPrimitive<BOX>,
 {
-    // Pre-Decoder convenience wrapper: no schema-derived `normalized`
-    // or `input_dims`, so the EDGEAI-1303 normalization is a no-op.
-    // Callers that need that path should go through `DecoderBuilder`
-    // with a schema.
+    // No `normalized` flag or `input_dims`: box normalization is a no-op.
     let cap = cap_or_default(output_boxes);
     impl_yolo_segdet_quant::<XYWH, _, _>(
         boxes,
@@ -430,7 +399,7 @@ where
         cap,
         None,
         None,
-        false, // multi_label: test shim stays on argmax
+        false, // multi_label
         output_boxes,
         output_masks,
     )
@@ -451,8 +420,7 @@ where
     T: Float + AsPrimitive<f32> + Send + Sync + 'static,
     f32: AsPrimitive<T>,
 {
-    // Pre-Decoder convenience wrapper: schema-derived normalization is
-    // not available here (see EDGEAI-1303 note in the quantized sibling).
+    // No `normalized` flag or `input_dims`: box normalization is a no-op.
     let cap = cap_or_default(output_boxes);
     impl_yolo_segdet_float::<XYWH, _, _>(
         boxes,
@@ -464,7 +432,7 @@ where
         cap,
         None,
         None,
-        false, // multi_label: test shim stays on argmax
+        false, // multi_label
         output_boxes,
         output_masks,
     )
@@ -603,7 +571,6 @@ where
         b.label = classes[i].as_() as usize;
         output_boxes.push(b);
     }
-    // No NMS — model output is already post-NMS
     Ok(())
 }
 
@@ -646,8 +613,6 @@ where
         score_threshold,
         cap,
     )?;
-
-    // No NMS — model output is already post-NMS
 
     impl_yolo_split_segdet_process_masks(boxes, mask_coeff, protos, output_boxes, output_masks)
 }
@@ -1117,9 +1082,7 @@ where
 }
 
 /// Divide each survivor's bbox by `(input_w, input_h)` when the schema
-/// declares `normalized: false`. Pixel-space box coords from the model
-/// are pulled into the canonical `[0, 1]` range expected by `protobox`
-/// and downstream callers — see EDGEAI-1303.
+/// declares `normalized: false`, giving coordinates in `[0, 1]`.
 ///
 /// No-op when `normalized` is `Some(true)` / `None`, when `input_dims`
 /// is `None`, or when there are no survivors.
@@ -1374,8 +1337,6 @@ pub(crate) fn impl_yolo_split_segdet_process_masks<
         mode = "float"
     )
     .entered();
-    // Boxes are already bounded by the upstream `max_det` cap from
-    // `_get_boxes`; no second cap is needed here (EDGEAI-1302).
 
     let boxes = decode_segdet_f32(boxes, masks_tensor, protos_tensor)?;
     output_boxes.clear();
@@ -1475,9 +1436,6 @@ pub(crate) fn impl_yolo_split_segdet_quant_process_masks<
     .entered();
     let (masks, quant_masks) = mask_coeff;
     let (protos, quant_protos) = protos;
-
-    // Boxes are already bounded by the upstream `max_det` cap from
-    // `_get_boxes`; no second cap is needed here (EDGEAI-1302).
 
     let boxes = decode_segdet_quant(boxes, masks, protos, quant_masks, quant_protos)?;
     output_boxes.clear();
@@ -1794,8 +1752,8 @@ where
 ///
 /// Builds [`ProtoData`] with both `protos` and `mask_coefficients` as
 /// [`edgefirst_tensor::TensorDyn`]. Preserves the native element type for
-/// `f16` and `f32`; narrows `f64` to `f32` (there is no native f64 kernel
-/// path). `mask_coefficients` shape is `[num_detections, num_protos]`.
+/// `f16` and `f32`; narrows `f64` to `f32`. `mask_coefficients` shape is
+/// `[num_detections, num_protos]`.
 pub(super) fn extract_proto_data_float<
     MASK: Float + AsPrimitive<f32> + Copy + Send + Sync + FloatProtoElem,
     PROTO: Float + AsPrimitive<f32> + Copy + Send + Sync + FloatProtoElem,
@@ -1817,10 +1775,8 @@ pub(super) fn extract_proto_data_float<
     let num_protos = mask_tensor.ncols();
     let n = det_indices.len();
 
-    // Per-detection coefficients packed row-major into a contiguous buffer,
-    // preserving the source dtype. Shape: [N, num_protos] — N=0 is permitted
-    // (tracker path emits no detections this frame) since Mem-backed tensors
-    // accept zero-element shapes as "empty collection" sentinels.
+    // Per-detection coefficients packed row-major into a contiguous buffer
+    // in the source dtype. Shape: [N, num_protos]; N may be 0.
     let mut coeff_rows: Vec<MASK> = Vec::with_capacity(n * num_protos);
     output_boxes.clear();
     for (det, idx) in det_indices {
@@ -1845,12 +1801,10 @@ pub(super) fn extract_proto_data_float<
 ///
 /// Keeps i8 protos raw, attaching the dequantization params as
 /// [`edgefirst_tensor::Quantization::per_tensor`] metadata on the proto
-/// tensor; the GPU shader / CPU kernel reads `protos.quantization()` and
-/// dequantizes per-texel. Protos of any other integer type (u8, i16, u16)
-/// are dequantized to f32 NHWC here, since narrowing them to i8 would
-/// discard their range. Mask coefficients stay raw for i8 and i16 and are
-/// dequantized to f32 otherwise. The dtypes do not depend on whether any
-/// detection survived.
+/// tensor. Protos of any other integer type (u8, i16, u16) are
+/// dequantized to f32 NHWC. Mask coefficients stay raw for i8 and i16 and
+/// are dequantized to f32 otherwise. The dtypes do not depend on whether
+/// any detection survived.
 pub(crate) fn extract_proto_data_quant<
     MASK: PrimInt + AsPrimitive<f32> + AsPrimitive<i8> + Send + Sync + 'static,
     PROTO: PrimInt + AsPrimitive<f32> + AsPrimitive<i8> + Send + Sync + 'static,
@@ -1878,11 +1832,8 @@ pub(crate) fn extract_proto_data_quant<
     let n = det_indices.len();
     span.record("num_protos", num_protos);
 
-    // Mask coefficients: keep i8 losslessly when MASK == i8 (preserves
-    // the fast i8×i8→i32 integer kernel in materialize_masks). Preserve
-    // i16 natively so the downstream i16×i8 integer path can avoid lossy
-    // truncation. Other wider types (u16, …) dequantize to f32 at
-    // extraction because the downstream mask kernels accept F32 natively.
+    // Mask coefficients: i8 and i16 stay raw; other types are dequantized
+    // to f32.
     let mask_coefficients: TensorDyn = if std::any::TypeId::of::<MASK>()
         == std::any::TypeId::of::<i8>()
     {
@@ -1911,8 +1862,7 @@ pub(crate) fn extract_proto_data_quant<
             .expect("per-tensor quantization on mask coefficients");
         coeff_tensor.into()
     } else if std::any::TypeId::of::<MASK>() == std::any::TypeId::of::<i16>() {
-        // i16 path: preserve natively for the fast i16×i8→i32 integer kernel.
-        // f32 has 24-bit mantissa, so all i16 values are exactly representable.
+        // i16 coefficients stay raw.
         let mut coeff_i16 = Vec::<i16>::with_capacity(n * num_protos);
         output_boxes.clear();
         for (det, idx) in det_indices {
@@ -1938,7 +1888,7 @@ pub(crate) fn extract_proto_data_quant<
             .expect("per-tensor quantization on mask coefficients");
         coeff_tensor.into()
     } else {
-        // Other types (u8, u16, etc.): dequantize to f32 to avoid lossy truncation.
+        // Other types (u8, u16, etc.): dequantize to f32.
         let scale = quant_masks.scale;
         let zp = quant_masks.zero_point as f32;
         let mut coeff_f32 = Vec::<f32>::with_capacity(n * num_protos);
@@ -1964,14 +1914,11 @@ pub(crate) fn extract_proto_data_quant<
 
     let (h, w, k) = protos.dim();
 
-    // With no detections the protos are never read (`materialize_masks`
-    // returns early on an empty slice), so the tensors below keep their
-    // shape and dtype but skip the copy (819 KB for 160×160×32).
+    // With no detections the proto tensors keep their shape and dtype and
+    // skip the copy.
 
-    // Protos of any other integer type (u8, i16, u16, …) cannot be narrowed
-    // to i8 without discarding their range, so dequantize them to f32 NHWC.
-    // `protos.iter()` walks the logical [H, W, K] order whatever the
-    // physical strides, so the copy also normalizes NCHW sources.
+    // Protos of any integer type other than i8 are dequantized to f32 in
+    // logical [H, W, K] order.
     if std::any::TypeId::of::<PROTO>() != std::any::TypeId::of::<i8>() {
         let scale = quant_protos.scale;
         let zp = quant_protos.zero_point as f32;
@@ -1995,19 +1942,17 @@ pub(crate) fn extract_proto_data_quant<
         };
     }
 
-    // Keep i8 protos raw — consumers dequantize via protos.quantization().
-    // Detect the physical layout and copy without transposing; the mask
-    // materialisation kernels dispatch on the layout.
+    // i8 protos stay raw and are copied in their physical layout, which
+    // `proto_layout` records.
     let (proto_shape, proto_layout) = if protos.is_standard_layout() {
-        // Already NHWC [H, W, K] in contiguous memory.
+        // NHWC [H, W, K] in contiguous memory.
         (&[h, w, k][..], ProtoLayout::Nhwc)
     } else if protos.ndim() == 3 && protos.strides() == [w as isize, 1, (h * w) as isize] {
-        // NCHW reinterpreted as NHWC via stride swap. Physical storage
-        // is [K, H, W] contiguous. Keep in NCHW — eliminates the costly
-        // 3.1ms transpose entirely.
+        // NCHW viewed as NHWC by a stride swap: physical storage is
+        // contiguous [K, H, W].
         (&[k, h, w][..], ProtoLayout::Nchw)
     } else {
-        // Unknown layout — fall back to iter copy as NHWC.
+        // Any other layout is copied element by element as NHWC.
         (&[h, w, k][..], ProtoLayout::Nhwc)
     };
 
@@ -2016,19 +1961,17 @@ pub(crate) fn extract_proto_data_quant<
     if n > 0 {
         let mut m = protos_tensor.map().expect("mapping protos tensor");
         let dst = m.as_mut_slice();
-        // SAFETY: PROTO == i8 checked via TypeId above; the cast slice view
-        // is size/alignment-compatible by construction.
+        // SAFETY: `PROTO` is `i8` (checked by `TypeId` above) and a
+        // standard-layout view is contiguous over `protos.len()` elements.
         if protos.is_standard_layout() {
             let src: &[i8] =
                 unsafe { std::slice::from_raw_parts(protos.as_ptr() as *const i8, protos.len()) };
             dst.copy_from_slice(src);
         } else if protos.ndim() == 3 && protos.strides() == [w as isize, 1, (h * w) as isize] {
-            // NCHW physical layout — sequential copy WITHOUT transpose.
-            // This saves ~3.1ms on A53/A55 by avoiding the tiled
-            // NCHW→NHWC transpose of the 819KB proto buffer.
+            // NCHW physical layout: sequential copy without a transpose.
             let total = h * w * k;
-            // SAFETY: ArrayView was constructed from a contiguous slice of
-            // `total` elements. as_ptr() points to the base of that slice.
+            // SAFETY: `protos.as_ptr()` points to `total` contiguous `i8`
+            // elements.
             let src: &[i8] =
                 unsafe { std::slice::from_raw_parts(protos.as_ptr() as *const i8, total) };
             dst.copy_from_slice(src);
@@ -2057,12 +2000,9 @@ pub(crate) fn extract_proto_data_quant<
 /// Per-float-dtype construction of an [`edgefirst_tensor::TensorDyn`] from a
 /// flat slice or a 3-D `ArrayView`. Each implementor either passes its element
 /// type straight to `Tensor::from_slice` / `Tensor::from_arrayview3`, or
-/// narrows `f64` to `f32` — there is no native f64 kernel path, so `f64` protos
-/// lose precision here rather than at some later, less obvious point.
+/// narrows `f64` to `f32`.
 ///
-/// Implemented for `f32`, `f64`, and `half::f16`. It is public because it
-/// appears in the bounds of the proto-extraction paths; there is no reason to
-/// implement it outside this crate.
+/// Implemented for `f32`, `f64`, and `half::f16`.
 pub trait FloatProtoElem: Copy + 'static {
     /// Wrap a flat slice with the given `shape` as a tensor of this element
     /// type.
@@ -2111,7 +2051,6 @@ impl FloatProtoElem for f64 {
         values: &[f64],
         shape: &[usize],
     ) -> edgefirst_tensor::Result<edgefirst_tensor::TensorDyn> {
-        // Narrow to f32 — no native f64 kernel path.
         let narrowed: Vec<f32> = values.iter().map(|&v| v as f32).collect();
         edgefirst_tensor::Tensor::<f32>::from_slice(&narrowed, shape).map(Into::into)
     }
@@ -2208,10 +2147,8 @@ pub(crate) fn decode_segdet_f32_on<
         .into_par_iter()
         .map(|b| {
             let ind = b.1;
-            // `protobox` returns the cropped proto slice for `make_segmentation`
-            // and a `roi` snapped to the 1/proto-grid step. The detection bbox
-            // stays untouched (EDGEAI-1304); the snapped roi is reported back
-            // separately so callers can describe where the cropped mask lives.
+            // `protobox` returns the cropped proto slice and a `roi` snapped
+            // to the proto grid; the detection bbox is unchanged.
             let (protos, roi) = protobox(&protos, &b.0.bbox)?;
             Ok((b.0, roi, make_segmentation(masks.row(ind), protos.view())))
         })
@@ -2276,9 +2213,8 @@ pub(crate) fn decode_segdet_quant_on<
         .into_iter()
         .map(|b| {
             let i = b.1;
-            // See EDGEAI-1304: the caller's bbox stays untouched; the
-            // proto-grid-snapped `roi` is reported back so the Segmentation's
-            // bounds can describe the actual cropped mask region.
+            // `roi` is the crop snapped to the proto grid; the bbox is
+            // unchanged.
             let (protos, roi) = protobox(&protos, &b.0.bbox.to_canonical())?;
             let seg = match total_bits {
                 0..=64 => make_segmentation_quant::<MASK, PROTO, i64>(
@@ -2322,17 +2258,8 @@ pub(crate) fn proto_crop(
     let width = proto_w as f32;
     let height = proto_h as f32;
 
-    // Detect un-normalized bounding boxes (pixel-space coordinates).
-    // protobox expects normalized coordinates in [0, 1]. The decoder will
-    // normalize pixel-space coords automatically when the schema declares
-    // `Detection::normalized = false` AND model input dimensions are known
-    // (EDGEAI-1303); reaching this guard means at least one of those is
-    // missing.
-    //
-    // The limit is set to 2.0 (not 1.01) because YOLO models legitimately
-    // predict coordinates slightly > 1.0 for objects near frame edges.
-    // Any value > 2.0 is clearly pixel-space (even the smallest practical
-    // model input of 32×32 would produce coordinates >> 2.0).
+    // Coordinates above `NORM_LIMIT` are treated as pixel-space and
+    // rejected.
     const NORM_LIMIT: f32 = 2.0;
     if roi.xmin > NORM_LIMIT
         || roi.ymin > NORM_LIMIT
@@ -2346,7 +2273,7 @@ pub(crate) fn proto_crop(
              (1) declare `Detection::normalized = false` in the model schema \
              AND make sure the schema's `input.shape` / `input.dshape` carries \
              the model input dims so the decoder can divide by (W, H) before NMS \
-             (EDGEAI-1303 — verify with `Decoder::input_dims().is_some()`); or \
+             (verify with `Decoder::input_dims().is_some()`); or \
              (2) normalize the boxes in-graph before decode().",
             roi.xmin, roi.ymin, roi.xmax, roi.ymax,
         )));
@@ -2368,7 +2295,7 @@ pub(crate) fn proto_crop(
     ]
     .into();
 
-    // An inverted box crops nothing, as an ndarray slice whose end precedes its start.
+    // An inverted box crops nothing.
     let crop = crate::instance_mask::Crop {
         x0,
         y0,
@@ -2392,14 +2319,12 @@ fn make_segmentation<
 ) -> Array3<u8> {
     let shape = protos.shape();
 
-    // Safe to unwrap since the shapes will always be compatible
     let mask = mask.to_shape((1, mask.len())).unwrap();
     let protos = protos.to_shape([shape[0] * shape[1], shape[2]]).unwrap();
     let protos = protos.reversed_axes();
     let mask = mask.map(|x| x.as_());
     let protos = protos.map(|x| x.as_());
 
-    // Safe to unwrap since the shapes will always be compatible
     let mask = mask
         .dot(&protos)
         .into_shape_with_order((shape[0], shape[1], 1))
@@ -2416,8 +2341,7 @@ fn make_segmentation<
 ///
 /// Computes `Σ (m − zm)(p − zp)` per pixel in `DEST`, applies the combined
 /// scale and the sigmoid, and maps to `[0, 255]`. The arithmetic wraps modulo
-/// `DEST`'s width; zero points within their element type's range never reach
-/// that. Returns an `(H, W, 1)` u8 array.
+/// `DEST`'s width. Returns an `(H, W, 1)` u8 array.
 fn make_segmentation_quant<
     MASK: PrimInt + AsPrimitive<DEST> + Send + Sync,
     PROTO: PrimInt + AsPrimitive<DEST> + Send + Sync,
@@ -2453,7 +2377,7 @@ where
     for px in protos.lanes(Axis(2)) {
         let dot = match px.as_slice() {
             Some(p) => {
-                // Four partial sums: integer addition wraps the same in any order.
+                // Four partial sums.
                 let mut acc = [DEST::zero(); 4];
                 let (cv, pv) = (coeff.chunks_exact(4), p.chunks_exact(4));
                 let (ct, pt) = (cv.remainder(), pv.remainder());
@@ -2595,9 +2519,8 @@ mod tests {
 
     #[test]
     fn multi_label_honours_class_agnostic_nms_on_every_kernel() {
-        // Agnostic NMS runs over the multi-label candidates, as Ultralytics
-        // `non_max_suppression(multi_label=True, agnostic=True)` does: the
-        // lower-scoring class of the shared bbox is suppressed.
+        // Agnostic NMS over the multi-label candidates suppresses the
+        // lower-scoring class of the shared bbox.
         for (path, labels) in multi_label_kernel_labels(Nms::ClassAgnostic)
             .into_iter()
             .enumerate()
@@ -2636,7 +2559,6 @@ mod tests {
         decode_yolo_end_to_end_det_float(output.view(), 0.5, cap_or_default(&boxes), &mut boxes)
             .unwrap();
 
-        // Only 1 detection should pass threshold of 0.5
         assert_eq!(boxes.len(), 1);
         assert_eq!(boxes[0].label, 0);
         assert!((boxes[0].score - 0.9).abs() < 0.01);
@@ -2648,7 +2570,6 @@ mod tests {
 
     #[test]
     fn test_end_to_end_det_all_pass_threshold() {
-        // All detections above threshold
         let data: Vec<f32> = vec![
             10.0, 20.0, // x1
             10.0, 20.0, // y1
@@ -2670,7 +2591,6 @@ mod tests {
 
     #[test]
     fn test_end_to_end_det_none_pass_threshold() {
-        // All detections below threshold
         let data: Vec<f32> = vec![
             10.0, 20.0, // x1
             10.0, 20.0, // y1
@@ -2690,7 +2610,6 @@ mod tests {
 
     #[test]
     fn test_end_to_end_det_capacity_limit() {
-        // Test that output is truncated to capacity
         let data: Vec<f32> = vec![
             0.1, 0.2, 0.3, 0.4, 0.5, // x1
             0.1, 0.2, 0.3, 0.4, 0.5, // y1
@@ -2710,7 +2629,6 @@ mod tests {
 
     #[test]
     fn test_end_to_end_det_empty_output() {
-        // Test with zero detections
         let output = Array2::<f32>::zeros((6, 0));
 
         let mut boxes = Vec::with_capacity(10);
@@ -2722,7 +2640,6 @@ mod tests {
 
     #[test]
     fn test_end_to_end_det_pixel_coordinates() {
-        // Test with pixel coordinates (non-normalized)
         let data: Vec<f32> = vec![
             100.0, // x1
             200.0, // y1
@@ -2747,7 +2664,6 @@ mod tests {
 
     #[test]
     fn test_end_to_end_det_invalid_shape() {
-        // Test with too few rows (needs at least 6)
         let output = Array2::<f32>::zeros((5, 3));
 
         let mut boxes = Vec::with_capacity(10);
@@ -2777,7 +2693,6 @@ mod tests {
         let num_detections = 2;
         let num_features = 6 + num_protos;
 
-        // Build detection tensor
         let mut data = vec![0.0f32; num_features * num_detections];
         // Detection 0: passes threshold
         data[0] = 0.1; // x1[0]
@@ -2792,7 +2707,6 @@ mod tests {
         data[4 * num_detections + 1] = 0.3; // conf[1] - fails
         data[5 * num_detections] = 1.0; // class[0]
         data[5 * num_detections + 1] = 2.0; // class[1]
-                                            // Fill mask coefficients with small values
         for i in 6..num_features {
             data[i * num_detections] = 0.1;
             data[i * num_detections + 1] = 0.1;
@@ -2815,7 +2729,6 @@ mod tests {
         )
         .unwrap();
 
-        // Only detection 0 should pass
         assert_eq!(boxes.len(), 1);
         assert_eq!(masks.len(), 1);
         assert_eq!(boxes[0].label, 1);
@@ -2824,7 +2737,6 @@ mod tests {
 
     #[test]
     fn test_end_to_end_segdet_mask_coordinates() {
-        // Test that mask coordinates match box coordinates
         let num_protos = 32;
         let num_features = 6 + num_protos;
 
@@ -2855,8 +2767,8 @@ mod tests {
         assert_eq!(masks.len(), 1);
 
         // Mask region is the proto-grid-aligned crop and encloses the
-        // post-NMS bbox (EDGEAI-1304); on a 16x16 grid each side may snap
-        // by up to 1/16 = 0.0625.
+        // post-NMS bbox; on a 16x16 grid each side may snap by up to
+        // 1/16 = 0.0625.
         let step = 1.0 / 16.0;
         assert!(masks[0].xmin <= boxes[0].bbox.xmin);
         assert!(masks[0].ymin <= boxes[0].bbox.ymin);
@@ -2928,7 +2840,6 @@ mod tests {
 
     #[test]
     fn test_end_to_end_segdet_invalid_shape_too_few_rows() {
-        // Test with too few rows (needs at least 7: 6 base + 1 mask coeff)
         let output = Array2::<f32>::zeros((6, 3));
         let protos = Array3::<f32>::zeros((16, 16, 32));
 
@@ -2952,7 +2863,6 @@ mod tests {
 
     #[test]
     fn test_end_to_end_segdet_invalid_shape_protos_mismatch() {
-        // Test with mismatched mask coefficients and protos count
         let num_protos = 32;
         let output = Array2::<f32>::zeros((6 + 16, 3)); // 16 mask coeffs
         let protos = Array3::<f32>::zeros((16, 16, num_protos)); // 32 protos
@@ -2987,7 +2897,6 @@ mod tests {
         let num_detections = 2;
         let num_features = 6 + num_protos;
 
-        // Build detection tensor
         let mut data = vec![0.0f32; num_features * num_detections];
         // Detection 0: passes threshold
         data[0] = 0.1; // x1[0]
@@ -3002,7 +2911,6 @@ mod tests {
         data[4 * num_detections + 1] = 0.3; // conf[1] - fails
         data[5 * num_detections] = 1.0; // class[0]
         data[5 * num_detections + 1] = 2.0; // class[1]
-                                            // Fill mask coefficients with small values
         for i in 6..num_features {
             data[i * num_detections] = 0.1;
             data[i * num_detections + 1] = 0.1;
@@ -3031,7 +2939,6 @@ mod tests {
         )
         .unwrap();
 
-        // Only detection 0 should pass
         assert_eq!(boxes.len(), 1);
         assert_eq!(masks.len(), 1);
         assert_eq!(boxes[0].label, 1);
@@ -3093,12 +3000,12 @@ mod tests {
     }
 
     // ========================================================================
-    // Tests for protobox / NORM_LIMIT regression
+    // Tests for protobox / NORM_LIMIT
     // ========================================================================
 
     #[test]
     fn test_protobox_clamps_edge_coordinates() {
-        // bbox with xmax=1.0 should not panic (OOB guard)
+        // bbox with xmax=1.0
         let protos = Array3::<f32>::zeros((16, 16, 4));
         let view = protos.view();
         let roi = BoundingBox {
@@ -3110,7 +3017,6 @@ mod tests {
         let result = protobox(&view, &roi);
         assert!(result.is_ok(), "protobox should accept xmax=1.0");
         let (cropped, _roi_norm) = result.unwrap();
-        // Cropped region must have non-zero spatial dimensions
         assert!(cropped.shape()[0] > 0);
         assert!(cropped.shape()[1] > 0);
         assert_eq!(cropped.shape()[2], 4);
@@ -3151,7 +3057,8 @@ mod tests {
             "protobox should accept coords <= NORM_LIMIT (2.0)"
         );
         let (cropped, _roi_norm) = result.unwrap();
-        // Entire proto map should be selected when coords > 1.0 (clamped to boundary)
+        // Coordinates above 1.0 clamp to the boundary: the entire proto map
+        // is selected.
         assert_eq!(cropped.shape()[0], 16);
         assert_eq!(cropped.shape()[1], 16);
     }
@@ -3160,7 +3067,7 @@ mod tests {
     fn test_segdet_float_proto_no_panic() {
         // Simulates YOLOv8n-seg: output0 = [116, 8400] (4 box + 80 class + 32 mask coeff)
         // output1 (protos) = [32, 160, 160]
-        let num_proposals = 100; // enough to produce idx >= 32
+        let num_proposals = 100;
         let num_classes = 80;
         let num_mask_coeffs = 32;
         let rows = 4 + num_classes + num_mask_coeffs; // 116
@@ -3179,15 +3086,11 @@ mod tests {
         }
         let boxes = ndarray::Array2::from_shape_vec((rows, num_proposals), data).unwrap();
 
-        // Protos must be in HWC order. Under the HAL physical-order
-        // contract, callers declare shape+dshape matching producer memory
-        // and swap_axes_if_needed permutes the stride tuple into canonical
-        // [batch, height, width, num_protos] before this function sees it.
+        // Protos in HWC order.
         let protos = ndarray::Array3::<f32>::zeros((160, 160, num_mask_coeffs));
 
         let mut output_boxes = Vec::with_capacity(300);
 
-        // This panicked before fix: mask_tensor.row(idx) with idx >= 32
         let proto_data = impl_yolo_segdet_float_proto::<XYWH, _, _>(
             boxes.view(),
             protos.view(),
@@ -3198,16 +3101,14 @@ mod tests {
             300,
             None,
             None,
-            false, // multi_label: argmax for this test
+            false, // multi_label
             &mut output_boxes,
         )
         .unwrap();
 
-        // Should produce detections (NMS will collapse many overlapping boxes)
         assert!(!output_boxes.is_empty());
         let coeffs_shape = proto_data.mask_coefficients.shape();
         assert_eq!(coeffs_shape[0], output_boxes.len());
-        // Each mask coefficient vector should have 32 elements
         assert_eq!(coeffs_shape[1], num_mask_coeffs);
     }
 
@@ -3215,30 +3116,20 @@ mod tests {
     // Pre-NMS top-K cap (MAX_NMS_CANDIDATES)
     // ========================================================================
 
-    /// At very low score thresholds (e.g., t=0.01 on YOLOv8 with 8400×80
-    /// candidates) almost every score passes the filter, feeding O(n²)
-    /// NMS and a per-survivor mask matmul. The decoder caps the
-    /// candidate set fed to NMS at `MAX_NMS_CANDIDATES` (Ultralytics
-    /// default 30 000) to bound worst-case decode time.
-    ///
-    /// This regression test pumps 50 000 above-threshold candidates
-    /// into `impl_yolo_segdet_get_boxes` with NMS bypassed (Nms=None)
-    /// and a generous post-NMS cap. Before the fix, the function
-    /// returned all 50 000; after the fix, exactly 30 000.
+    /// 50 000 above-threshold candidates with NMS bypassed are truncated
+    /// to `MAX_NMS_CANDIDATES`.
     #[test]
     fn test_pre_nms_cap_truncates_excess_candidates() {
         let n: usize = 50_000;
         let num_classes = 1;
 
-        // Identical valid boxes. Distinct scores (descending) so the
-        // top-K cap keeps the highest-scoring ones in deterministic
-        // order — letting us assert *which* ones survived.
+        // Identical boxes with distinct, descending scores.
         let mut boxes_data = Vec::with_capacity(n * 4);
         let mut scores_data = Vec::with_capacity(n * num_classes);
         for i in 0..n {
             boxes_data.extend_from_slice(&[0.1f32, 0.1, 0.5, 0.5]);
-            // score_i = 0.99 - i * 1e-7 keeps everything well above 0.1
-            // threshold but strictly decreasing.
+            // score_i = 0.99 - i * 1e-7: above the 0.1 threshold and
+            // strictly decreasing.
             scores_data.push(0.99 - (i as f32) * 1e-7);
         }
         let boxes = Array2::from_shape_vec((n, 4), boxes_data).unwrap();
@@ -3249,10 +3140,10 @@ mod tests {
             scores.view(),
             0.1,
             1.0,                             // IoU 1.0 → NMS suppresses nothing
-            Some(Nms::ClassAgnostic),        // NMS enabled so pre_nms_top_k applies
+            Some(Nms::ClassAgnostic),        // NMS enabled
             crate::yolo::MAX_NMS_CANDIDATES, // pre_nms_top_k
             usize::MAX,                      // no post-NMS truncation
-            false,                           // multi_label: argmax for this test
+            false,                           // multi_label
         )
         .unwrap();
 
@@ -3262,8 +3153,8 @@ mod tests {
             "pre-NMS cap should truncate to MAX_NMS_CANDIDATES; got {}",
             result.len()
         );
-        // Top-K survivors: highest scores were the first n indices,
-        // so survivor 0 must have score ~0.99.
+        // The highest scores are the first indices, so survivor 0 scores
+        // ~0.99.
         let top_score = result[0].0.score;
         assert!(
             top_score > 0.98,
@@ -3271,18 +3162,15 @@ mod tests {
         );
     }
 
-    /// Counterpart for the quantized split path. Same contract: feed
-    /// more than `MAX_NMS_CANDIDATES` survivors above the quantized
-    /// threshold, confirm `impl_yolo_split_segdet_quant_get_boxes`
-    /// truncates before NMS.
+    /// The quantized split path truncates to `MAX_NMS_CANDIDATES` before
+    /// NMS.
     #[test]
     fn test_pre_nms_cap_truncates_excess_candidates_quant() {
         use crate::Quantization;
         let n: usize = 50_000;
         let num_classes = 1;
 
-        // i8 boxes with simple scale/zp; the box value 50 dequantizes
-        // to 0.5 with scale=0.01, zp=0 — fine for a flat box set.
+        // i8 boxes: value 50 dequantizes to 0.5 with scale=0.01, zp=0.
         let boxes_data = (0..n).flat_map(|_| [10i8, 10, 50, 50]).collect::<Vec<_>>();
         let boxes = Array2::from_shape_vec((n, 4), boxes_data).unwrap();
         let quant_boxes = Quantization {
@@ -3290,10 +3178,8 @@ mod tests {
             zero_point: 0,
         };
 
-        // u8 scores: distinct descending values, all well above threshold.
-        // value 250 → 0.98 with scale 0.00392, zp 0.
-        // value (250 - i % 200) keeps a wide spread above the dequant
-        // threshold of 0.5.
+        // u8 scores (250 - i % 200) with scale 0.00392, zp 0: all above the
+        // 0.5 threshold.
         let scores_data: Vec<u8> = (0..n)
             .map(|i| 250u8.saturating_sub((i % 200) as u8))
             .collect();
@@ -3308,7 +3194,7 @@ mod tests {
             (scores.view(), quant_scores),
             0.1,
             1.0,                             // IoU 1.0 → NMS suppresses nothing
-            Some(Nms::ClassAgnostic),        // NMS enabled so pre_nms_top_k applies
+            Some(Nms::ClassAgnostic),        // NMS enabled
             crate::yolo::MAX_NMS_CANDIDATES, // pre_nms_top_k
             usize::MAX,                      // no post-NMS truncation
             false,
@@ -3323,19 +3209,9 @@ mod tests {
         );
     }
 
-    /// Regression test for HAILORT_BUG.md — the YoloSegDet path
-    /// (combined `(4 + nc + nm, N)` detection tensor + separate protos)
-    /// must pair each surviving detection with the mask coefficient
-    /// row at the SAME anchor index the box came from. The validator
-    /// sees this path miss the pairing under schema-v2 Hailo inputs
-    /// (mAP collapse from 46.8 → 3.65 while mask IoU stays at 66.9,
-    /// the fingerprint of mask-to-detection misalignment).
-    ///
-    /// Construction: three anchors with distinct mask-coef signatures
-    /// that, after dot(coefs, protos) + sigmoid, produce HIGH vs LOW
-    /// mask pixel values. Two anchors survive (one high, one low); if
-    /// the mask row is looked up at the wrong index, the per-detection
-    /// mean mask value would cross the threshold and we catch it.
+    /// The YoloSegDet path (combined `(4 + nc + nm, N)` detection tensor +
+    /// separate protos) pairs each surviving detection with the mask
+    /// coefficient row at the anchor index the box came from.
     #[test]
     fn segdet_combined_tensor_pairs_detection_with_matching_mask_row() {
         let nc = 2; // num_classes
@@ -3359,7 +3235,6 @@ mod tests {
         // Proto[0] = Proto[1] = all-ones (8x8), so
         //   mask(a0) = sigmoid(3 + 3) ≈ 0.9975 → 254
         //   mask(a2) = sigmoid(-3 + -3) ≈ 0.0025 → 1
-        // 250-point gap makes any misalignment trivially detectable.
         let mut data = vec![0.0f32; feat * n];
         let set = |d: &mut [f32], r: usize, c: usize, v: f32| d[r * n + c] = v;
         set(&mut data, 0, 0, 0.2);
@@ -3404,11 +3279,8 @@ mod tests {
             boxes.len()
         );
 
-        // Build a (anchor_index → mask_mean) mapping from the results.
-        // Anchor 0 has centre (0.2, 0.2), anchor 2 has centre (0.8,
-        // 0.8). The DetectBox bbox is the post-XYWH-to-XYXY conversion
-        // of the original xywh; cropping inside protobox may shrink it,
-        // so match by centre (0.2 vs 0.8) rather than exact bbox.
+        // Match results to anchors by box centre: anchor 0 is at (0.2,
+        // 0.2), anchor 2 at (0.8, 0.8).
         for (b, m) in boxes.iter().zip(masks.iter()) {
             let cx = (b.bbox.xmin + b.bbox.xmax) * 0.5;
             let mean = {
@@ -3420,13 +3292,13 @@ mod tests {
                 total as f32 / s.len() as f32
             };
             if cx < 0.3 {
-                // anchor 0 — expect HIGH mask values ≈ 254
+                // anchor 0: mask values ≈ 254
                 assert!(
                     mean > 200.0,
                     "anchor 0 detection (centre {cx:.2}) should have high-value mask; got mean {mean}"
                 );
             } else if cx > 0.7 {
-                // anchor 2 — expect LOW mask values ≈ 1
+                // anchor 2: mask values ≈ 1
                 assert!(
                     mean < 50.0,
                     "anchor 2 detection (centre {cx:.2}) should have low-value mask; got mean {mean}"
@@ -3504,7 +3376,7 @@ mod tests {
         let mut boxes = make_float_boxes(&[0.9, 0.1, 0.5, 0.3, 0.7]);
         truncate_to_top_k_by_score(&mut boxes, 3);
         assert_eq!(boxes.len(), 3);
-        // The top-3 scores should be 0.9, 0.7, 0.5 (order within top-K is unspecified)
+        // The top-3 scores are 0.9, 0.7, 0.5.
         let mut retained: Vec<f32> = boxes.iter().map(|(b, _)| b.score).collect();
         retained.sort_by(|a, b| b.total_cmp(a));
         assert_eq!(retained, vec![0.9, 0.7, 0.5]);
@@ -3611,13 +3483,13 @@ mod tests {
 
     #[test]
     fn nms_and_cap_bypass_keeps_highest_scores() {
-        // Anchor order is not score order: the cap must keep scores, not the
-        // first anchors, and return them in descending score order.
+        // Anchor order is not score order: the cap keeps the highest scores,
+        // in descending score order.
         let boxes = make_float_boxes(&[0.1, 0.2, 0.9, 0.3, 0.8, 0.8]);
         let kept = nms_and_cap(Isa::current_or_scalar(), boxes.clone(), None, 0.5, 0, 3);
         let labels: Vec<usize> = kept.iter().map(|(b, _)| b.label).collect();
         assert_eq!(labels, vec![2, 4, 5]);
-        // Without truncation every candidate stays, still in score order.
+        // Without truncation every candidate stays, in score order.
         let kept = nms_and_cap(Isa::current_or_scalar(), boxes, None, 0.5, 0, 300);
         let labels: Vec<usize> = kept.iter().map(|(b, _)| b.label).collect();
         assert_eq!(labels, vec![2, 4, 5, 3, 1, 0]);

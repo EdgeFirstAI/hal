@@ -3,10 +3,8 @@
 
 //! The C API for `edgefirst-decoder`: model output to detections and masks.
 //!
-//! Produces `ef_detect_box_list`, declared here — this is its one
-//! implementation home. A consumer such as the tracker reads a list through
-//! the exported `ef_detect_box_list_data()`/`_len()` without linking this
-//! library: those give back a plain `(ef_detect_box *, size_t)` view.
+//! Produces `ef_detect_box_list`. `ef_detect_box_list_data()`/`_len()` give a
+//! plain `(ef_detect_box *, size_t)` view of a list.
 
 #[cfg(not(edgefirst_tensor_dynamic))]
 compile_error!(
@@ -25,22 +23,6 @@ pub mod tiling;
 mod test_alloc;
 
 /// ABI version of this library's C surface.
-///
-/// 4: `ef_tile_placement.has_letterbox`/`letterbox` are
-/// `has_content_region`/`content_region` (same offsets and meaning), and
-/// `ef_semantic_options_set_letterbox` is `ef_semantic_options_set_content_region`.
-/// A caller built against generation 3 fails to compile or link.
-///
-/// 3: the `dtype` argument of `ef_infer_signals_add_input` and
-/// `ef_infer_signals_add_output` is an `EF_DTYPE_*` code (it was a
-/// `0x100`-based `EF_INFER_DTYPE_*` code), and `ef_decoder_params_add_output`
-/// refuses an unknown `dims` code.
-///
-/// 2: `ef_merge_config` gained a `mode` field in its old tail pad.
-///
-/// Generations 2 and 3 alter no symbol or layout, so a caller built against an
-/// older generation gets no link error and no size mismatch; the probe is
-/// the only signal. Changed defaults do not move it.
 #[no_mangle]
 pub extern "C" fn ef_decoder_abi_version() -> u32 {
     4
@@ -56,9 +38,8 @@ mod tests {
         .expect("cbindgen wrote include/edgefirst/decoder.h")
     }
 
-    /// `-Werror`: a header that merely parses is not enough. The vtable once
-    /// declared a type before it existed and warned on every dispatch while
-    /// still exiting 0.
+    /// Syntax-checks `src` against the headers with `-Werror -Wall`. `None`
+    /// when no C compiler is available.
     fn cc_syntax_check(src: &str) -> Option<std::process::Output> {
         let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
         match std::process::Command::new(&cc)
@@ -89,11 +70,6 @@ mod tests {
     }
 
     /// Like [`cc_syntax_check`], but pins `-std=c11`.
-    ///
-    /// `_Static_assert` is a C11 feature; a toolchain's bare `cc` default can
-    /// predate it (or, on some vendors, silently accept it as an extension
-    /// under an older `-std=`, which would not be testing what the golden
-    /// file claims to test).
     fn cc_syntax_check_c11(src: &str) -> Option<std::process::Output> {
         let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
         match std::process::Command::new(&cc)
@@ -130,21 +106,20 @@ mod tests {
     }
 
     #[test]
-    fn the_abi_probe_is_generation_4() {
+    fn the_abi_probe_reports_the_current_version() {
         assert_eq!(super::ef_decoder_abi_version(), 4);
     }
 
     #[test]
-    fn the_header_carries_none_of_the_monoliths_symbols() {
+    fn the_header_carries_no_hal_symbols() {
         assert!(
             !header_text().contains("hal_"),
-            "decoder.h must not carry the monolith's hal_* symbols"
+            "decoder.h must not carry hal_* symbols"
         );
     }
 
     #[test]
     fn decoder_h_includes_the_tensor_header() {
-        // The detection types it takes are declared there.
         assert!(
             header_text().contains(r#"#include "edgefirst/tensor.h""#),
             "decoder.h must include edgefirst/tensor.h"
@@ -199,10 +174,6 @@ mod tests {
 
     #[test]
     fn the_layout_goldens_hold() {
-        // By-value structs in `detect.h` (`ef_detect_box`, `ef_segmentation`,
-        // `ef_merge_config`, `ef_tile_placement`, `ef_preprocess_spec`) are the
-        // drift class no name-level check can see, and are identical on
-        // every LP64 target this header ships for.
         let src = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/c/test_layout_goldens.c");
         let Some(out) = cc_syntax_check_c11(src) else {
             return;

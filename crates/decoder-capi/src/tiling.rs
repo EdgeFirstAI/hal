@@ -3,11 +3,8 @@
 
 //! Tiled inference: merging detections from many tiles back into one frame.
 //!
-//! Here rather than in a sibling of its own because the types live in
-//! `edgefirst-decoder` and the work is detection merging. The four tiling
-//! entry points that need an `ImageProcessor` — planning a grid, allocating a
-//! tile batch, and blitting into it — belong to `libedgefirst-image` instead,
-//! since that is where the processor is.
+//! The tiling entry points that take an `ImageProcessor` (planning a grid,
+//! allocating a tile batch, blitting into it) are in `libedgefirst-image`.
 
 use std::ffi::c_int;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -60,8 +57,7 @@ fn to_c(d: &DetectBox) -> EfDetectBox {
 ///
 /// The default `mode` is `0` (keep-best): the highest-scoring box of each
 /// matched group is kept and the boxes it matched are dropped. Set `mode = 1`
-/// for the enclosing-union merge, which measured about 0.05 AP50 worse on
-/// every frame of the Ocean Cleanup ADIS 4K validation (TOP2-836).
+/// for the enclosing-union merge.
 ///
 /// # Safety
 /// `out` must be writable.
@@ -93,7 +89,7 @@ pub struct EfTiledFrameAccumulator {
 }
 
 /// Create an accumulator for a frame of `tiles_total` tiles, merging as
-/// `cfg` says — including its `mode`.
+/// `cfg` says, including its `mode`.
 ///
 /// @return the accumulator, or `NULL` for a null `cfg`, zero tiles, or a
 ///         `metric`/`mode` value this library does not know.
@@ -145,15 +141,11 @@ pub unsafe extern "C" fn ef_tiled_frame_accumulator_free(a: *mut EfTiledFrameAcc
 
 /// Add one tile's detections.
 ///
-/// **Idempotent per tile index.** A duplicate index, an out-of-range one, or a
+/// Idempotent per tile index. A duplicate index, an out-of-range one, or a
 /// placement from a different plan (its `count` disagreeing with this
-/// accumulator's tile total) is ignored and its detections dropped. That is
-/// what makes out-of-order *and* at-least-once delivery converge to the same
-/// frame — a retried tile does not double-count, and a tile from another
-/// frame cannot corrupt this one's fan-in.
+/// accumulator's tile total) is ignored and its detections dropped.
 ///
-/// Use [`ef_tiled_frame_accumulator_is_complete`] to test for completion; this
-/// return value answers a different question.
+/// Use [`ef_tiled_frame_accumulator_is_complete`] to test for completion.
 ///
 /// @return 1 when the tile was newly accepted, 0 when it was ignored as a
 ///         duplicate or foreign placement, `-1` on a bad argument or after
@@ -174,8 +166,7 @@ pub unsafe extern "C" fn ef_tiled_frame_accumulator_push_tile(
                 return -1;
             }
             let Some(acc) = (*a).inner.as_mut() else {
-                // Already finalized; pushing more would silently produce a result
-                // the caller can never retrieve.
+                // Already finalized.
                 return -1;
             };
             let tile: Vec<DetectBox> = if count == 0 {
@@ -235,9 +226,7 @@ pub unsafe extern "C" fn ef_tiled_frame_accumulator_remaining(
 
 /// Merge every pushed tile into one detection list.
 ///
-/// Consumes the accumulator's contents: a second call returns `NULL`, because
-/// merging is destructive and returning an empty list would be
-/// indistinguishable from a frame that genuinely found nothing.
+/// Consumes the accumulator's contents: a second call returns `NULL`.
 ///
 /// `normalized` non-zero returns frame-normalized coordinates.
 ///
@@ -302,7 +291,7 @@ pub unsafe extern "C" fn ef_lift_tile_boxes(
 }
 
 /// Merge overlapping detections that already share one coordinate space,
-/// merging as `cfg` says — including its `mode`.
+/// merging as `cfg` says, including its `mode`.
 ///
 /// @return a list the caller frees with `ef_detect_box_list_free`, or `NULL`
 ///         for a null `cfg`, a null `boxes` with a non-zero `count`, or a
@@ -345,10 +334,8 @@ mod tests {
     use super::*;
     use crate::decode::{ef_detect_box_list_free, ef_detect_box_list_get, ef_detect_box_list_len};
 
-    /// The library default, seeded from a struct whose every field is wrong
-    /// (`mode: 99` is not a value this library knows) so a `default()` that
-    /// skipped a field would fail the assertions below rather than pass by
-    /// accident.
+    /// The library default, written over a struct whose every field holds
+    /// another value.
     fn cfg() -> EfMergeConfig {
         let mut c = EfMergeConfig {
             metric: 0,
@@ -373,8 +360,7 @@ mod tests {
         }
     }
 
-    /// Copy the boxes out of a list (and free it) so a test can assert on
-    /// coordinates without holding a borrowed pointer.
+    /// Copy the boxes out of a list and free it.
     unsafe fn drain(l: *mut crate::decode::EfDetectBoxList) -> Vec<EfDetectBox> {
         unsafe {
             assert!(!l.is_null(), "merge returned NULL");
@@ -390,9 +376,8 @@ mod tests {
         }
     }
 
-    /// The partial-overlap pair the merge-mode tests share: `b` matches `a`
-    /// at IoS exactly 0.5 and extends past it, so the two modes give
-    /// visibly different boxes.
+    /// A partial-overlap pair: `b` matches `a` at IoS exactly 0.5 and extends
+    /// past it.
     fn overlapping_pair() -> [EfDetectBox; 2] {
         [
             ebox([0.0, 0.0, 100.0, 100.0], 0.9, 0),
@@ -417,18 +402,12 @@ mod tests {
 
     #[test]
     fn the_default_merge_metric_is_intersection_over_smaller() {
-        // Not cosmetic: an object split across a tile seam has LOW IoU with
-        // its own fragment, so an IoU default would keep both halves.
         let c = cfg();
         assert_eq!(c.metric, 1, "default must be IoS, not IoU");
     }
 
     #[test]
     fn the_default_merge_mode_is_keep_best() {
-        // The Ocean Cleanup ADIS 4K study (TOP2-836) put the enclosing union
-        // at about -0.05 AP50 on every frame; keep-best is the default and
-        // `0`, though a zero-initialised struct still is not the library
-        // default -- `metric` would be IoU rather than the IoS default.
         let c = cfg();
         assert_eq!(c.mode, 0, "default must be keep-best (0), not union (1)");
         assert_eq!(c.metric, 1, "IoS stays the default metric");
@@ -468,9 +447,6 @@ mod tests {
 
     #[test]
     fn a_default_config_merges_keep_best_through_both_entry_points() {
-        // The standalone merge and the accumulator must agree: a config
-        // straight from `ef_merge_config_default` keeps the base box rather
-        // than growing it to the union these inputs used to produce.
         unsafe {
             let boxes = overlapping_pair();
             let c = cfg();
@@ -595,9 +571,6 @@ mod tests {
 
     #[test]
     fn a_retried_or_foreign_tile_is_ignored_rather_than_double_counted() {
-        // The property that makes at-least-once delivery safe: a retried tile
-        // must not advance completion or contribute its boxes twice, and a
-        // tile from a different plan must not corrupt this frame's fan-in.
         unsafe {
             let c = cfg();
             let a = ef_tiled_frame_accumulator_new(640.0, 480.0, 2, &c, 4);
@@ -608,7 +581,7 @@ mod tests {
             );
             assert_eq!(ef_tiled_frame_accumulator_remaining(a), 1);
 
-            // Same index again -- a retry.
+            // Same index again.
             assert_eq!(
                 ef_tiled_frame_accumulator_push_tile(a, std::ptr::null(), 0, &p0),
                 0,
@@ -641,8 +614,6 @@ mod tests {
 
     #[test]
     fn finalize_is_destructive_and_says_so() {
-        // Returning an empty list on the second call would be
-        // indistinguishable from a frame that genuinely found nothing.
         unsafe {
             let c = cfg();
             let a = ef_tiled_frame_accumulator_new(640.0, 480.0, 1, &c, 1);

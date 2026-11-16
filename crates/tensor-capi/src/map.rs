@@ -5,16 +5,12 @@
 //! `ef_tensor_unmap` / `ef_tensor_copy_to`.
 //!
 //! One CPU-access window per tensor at a time, held for the caller between
-//! `ef_tensor_map` and `ef_tensor_unmap` -- the C counterpart to
-//! [`edgefirst_tensor::TensorDyn::map_bytes`]'s `HostView` guard, whose
-//! `Drop` is the platform sync bracket (mmap unlock, IOSurface unlock,
-//! dma-buf sync-for-device, ...). `ef_tensor_copy_to` sidesteps the window
-//! entirely: it takes its own short-lived guard, copies, and drops it before
-//! returning, so it needs no outstanding map and leaves none behind.
+//! `ef_tensor_map` and `ef_tensor_unmap`. `ef_tensor_copy_to` takes its own
+//! short-lived guard, copies, and drops it before returning.
 //!
-//! Whole-tensor only: a caller wanting one plane's bytes maps the whole
-//! tensor and offsets into it using the plane's `offset`/`stride` from
-//! `ef_tensor_plane_at` -- there is no per-plane map entry point.
+//! The window covers the whole tensor: a caller wanting one plane's bytes
+//! offsets into it using the plane's `offset`/`stride` from
+//! `ef_tensor_plane_at`.
 
 use std::ffi::c_int;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -25,29 +21,15 @@ use edgefirst_tensor_abi::{EfErrorClass, EfTensorView};
 use crate::handle::{impl_of, EfTensor};
 use crate::last_error::{class_of, set_last_error, set_last_error_classified, shield_int};
 
-/// The live state behind an outstanding `ef_tensor_map`.
-///
-/// Holds the mapping guard itself; there is nothing else to track; `unmap`
-/// is exactly "drop this". No lifetime games: `TensorDyn::map_bytes` already
-/// returns a genuinely `'static` `HostView` (it shares ownership through the
-/// pin's keepalive `Arc` rather than borrowing the tensor -- see that
-/// method's doc comment), so this field just holds it as-is.
+/// The live state behind an outstanding `ef_tensor_map`: the mapping guard.
 pub(crate) struct MapState {
-    /// The RAII guard whose `Drop` is the platform sync bracket.
-    ///
-    /// Held, never read: its whole purpose is its `Drop`, same as
-    /// `HostPin::keepalive` (`edgefirst-tensor/src/pin.rs`) -- clippy cannot
-    /// see that a field exists only for the side effect of going out of
-    /// scope.
+    /// The RAII guard whose `Drop` runs the platform sync bracket.
     #[allow(dead_code)]
     view: edgefirst_tensor::view::HostView<'static, u8>,
 }
 
-/// Test-only observation points. `release_own`'s drain of an outstanding
-/// map is otherwise invisible from a test (its warning goes to `log`, and
-/// the handle is gone the instant it matters), so the drain bumps this
-/// counter under `cfg(test)` -- deleting the drain turns the test red
-/// instead of leaving the field-order fallback to pass it silently.
+/// Test-only counter of tensors freed with an outstanding map, incremented
+/// by `release_own`.
 #[cfg(test)]
 pub(crate) mod test_support {
     use std::sync::atomic::AtomicUsize;
@@ -56,20 +38,6 @@ pub(crate) mod test_support {
 
 /// Map a [`edgefirst_tensor::Error`] from the map/copy path to a POSIX
 /// errno.
-///
-/// No shared conversion existed to extend: `builder.rs` and `serialize.rs`
-/// each collapse every backend error to one hardcoded code inline
-/// (`.map_err(|_| libc::EINVAL)`), which loses exactly the distinction this
-/// entry points' contract needs (`EACCES` for a declined access, `ERANGE`
-/// for a too-small window, `ENOTSUP` for an unimplemented backend, ...). This
-/// is that conversion, written once here rather than inline at each of the
-/// three call sites below.
-///
-/// `pub(crate)`: task 15's new mutators (`mutate.rs`, `quant.rs`) and
-/// constructors (`image.rs`) reuse this rather than each collapsing to a
-/// single hardcoded code the way `builder.rs`/`serialize.rs` still do --
-/// the same reasoning that motivated writing this once applies to every
-/// later call site, not just the original three.
 pub(crate) fn errno_for(e: &edgefirst_tensor::Error) -> c_int {
     use edgefirst_tensor::Error;
     if e.cpu_access_denied().is_some() {
@@ -79,25 +47,10 @@ pub(crate) fn errno_for(e: &edgefirst_tensor::Error) -> c_int {
         Error::QuantizationInvalid { .. } => libc::EINVAL,
         Error::RegionOutOfBounds { .. } | Error::BatchIndexOutOfBounds { .. } => libc::EINVAL,
         Error::InvalidMemoryType(_) => libc::EINVAL,
-        // `InvalidOperation` covers two shapes that deserve different
-        // errnos. Misaligned-offset refusals (every backend's `view`/typed
-        // map path phrases them "offset N not aligned to align_of") are a
-        // caller-argument defect -- EINVAL. Unreachable through this entry
-        // point today (`map_bytes` maps the whole extent at offset 0 as
-        // `u8`, align 1), but `errno_for` is the shared conversion and a
-        // future offset-taking entry point must not inherit the wrong code.
+        // A misaligned-offset refusal is `EINVAL`.
         Error::InvalidOperation(msg) if msg.contains("not aligned") => libc::EINVAL,
-        // The remaining operation-refusal arm hard-refused by a live Rust
-        // map path today is AHardwareBuffer's "a narrower map is held; this
-        // request needs wider access" (`ahardwarebuffer.rs`) -- a platform
-        // lock declining the request, the same shape of failure as "this
-        // access is not permitted right now". A future backend that hard
-        // -refuses a requested access would fall in here too.
+        // Every other operation refusal is `EACCES`.
         Error::InvalidOperation(_) => libc::EACCES,
-        // A write-only D3D11 map refused only because this exact window
-        // needs `CpuAccess::ReadWrite` to publish safely -- the same shape
-        // of declined-access failure as the `InvalidOperation` arm above,
-        // and a caller that retries with `CpuAccess::ReadWrite` succeeds.
         Error::PartialWriteRequiresReadWrite(_) => libc::EACCES,
         Error::InvalidArgument(_) | Error::InvalidShape(_) | Error::ShapeMismatch(_) => {
             libc::EINVAL
@@ -106,11 +59,8 @@ pub(crate) fn errno_for(e: &edgefirst_tensor::Error) -> c_int {
         Error::InsufficientCapacity { .. } => libc::ERANGE,
         Error::NotImplemented(_) => libc::ENOTSUP,
         Error::PboDisconnected | Error::PboMapped => libc::EBUSY,
-        // `WouldBlock` is not a failure: it is `ef_tensor_try_map` reporting
-        // that the GPU copy the map depends on has not finished and the
-        // caller should come back. `EAGAIN` is the POSIX spelling of exactly
-        // that, and keeping it out of the `EIO` arm below is what lets a
-        // caller tell "retry me" from "this map is broken".
+        // `WouldBlock` is `ef_tensor_try_map` reporting that the GPU copy
+        // the map depends on has not finished.
         Error::IoError(e) if e.kind() == std::io::ErrorKind::WouldBlock => libc::EAGAIN,
         Error::IoError(_) => libc::EIO,
         #[cfg(unix)]
@@ -126,34 +76,22 @@ pub(crate) fn errno_for(e: &edgefirst_tensor::Error) -> c_int {
 /// the mapping direction: `EF_CPU_ACCESS_READ`, `_WRITE`, or `_READ_WRITE`.
 /// `EF_CPU_ACCESS_NONE` is not a mappable direction.
 ///
-/// A read-only map (`EF_CPU_ACCESS_READ`) still populates `out->ptr` --
-/// `ef_tensor_view` is one shared shape for both directions -- but writing
-/// through it is a contract violation this C signature cannot itself
-/// enforce; the Rust-side guard does enforce it (a debug assertion fires if
-/// the guard is ever asked for a mutable slice while read-only), so misuse
-/// is a caught bug on the Rust side even though nothing stops the raw
-/// pointer write from C directly.
+/// A read-only map (`EF_CPU_ACCESS_READ`) populates `out->ptr`; the caller
+/// must not write through it.
 ///
-/// Exclusive write, CPU-side only: a writable map (`_WRITE`/`_READ_WRITE`)
-/// is refused with `EBUSY` unless the tensor's CPU-side handle count
-/// (`ef_tensor_retain`/`ef_tensor_free`) is exactly one -- a second EBUSY
-/// trigger distinct from the double-map one above, with its own
-/// `ef_tensor_last_error_message` text so the two are distinguishable. This
-/// is the C surface's honesty limit on exclusivity: the gate sees only the
-/// CPU-side handle count, because a refcount cannot see a device -- the
-/// GPU/NPU hold no reference of their own, so a dma-buf a device is
-/// concurrently writing is not exclusive no matter what this count says.
-/// Device-side ordering is not this gate's job; it stays with the fence
-/// field.
+/// A writable map (`_WRITE`/`_READ_WRITE`) is refused with `EBUSY` unless
+/// the tensor's CPU-side handle count (`ef_tensor_retain`/`ef_tensor_free`)
+/// is exactly one. `ef_tensor_last_error_message` distinguishes this from
+/// the double-map `EBUSY`. The count covers CPU-side handles only; it does
+/// not order access against a device writing the same buffer.
 ///
 /// @return 0 on success, `EINVAL` (null tensor/out, or bad access code),
 ///         `EBUSY` (a map is already outstanding on this tensor, or a
 ///         writable map was requested while the CPU-side handle count is
-///         greater than one -- see above), `EACCES` (the requested direction
-///         is not covered by the tensor's declared CPU access -- reads and
-///         writes alike; see `ef_tensor_cpu_access`. Backend-level mapping
-///         refusals, e.g. AHardwareBuffer lock exclusivity, also surface as
-///         `EACCES`), or another errno translated from the backend's error.
+///         greater than one), `EACCES` (the requested direction is not
+///         covered by the tensor's declared CPU access, see
+///         `ef_tensor_cpu_access`, or the backend refused the mapping), or
+///         another errno translated from the backend's error.
 ///
 /// # Safety
 /// `t` must be `NULL` or a live handle; `out` must be writable for one
@@ -168,21 +106,14 @@ pub unsafe extern "C" fn ef_tensor_map(
     unsafe { map_window(t, access, out, false) }
 }
 
-/// Non-blocking [`ef_tensor_map`]: identical in every way except that a
-/// backing whose map has to wait for a GPU copy answers `EAGAIN` instead of
-/// stalling until that copy lands.
+/// Non-blocking [`ef_tensor_map`]: identical except that a backing whose
+/// map has to wait for a GPU copy returns `EAGAIN` instead of waiting.
 ///
-/// Only the Windows D3D11 texture has such a copy today (its staging
-/// refresh). Every other backing -- host memory, shared memory, dma-buf,
-/// IOSurface, AHardwareBuffer, PBO -- reaches exactly the code
-/// `ef_tensor_map` reaches and can never answer `EAGAIN`, so a caller can
-/// use this unconditionally and only ever actually retry where the wait is
-/// real.
+/// Only the Windows D3D11 texture has such a copy. Every other backing
+/// behaves as `ef_tensor_map` and never returns `EAGAIN`.
 ///
-/// `EAGAIN` takes nothing: no map is left outstanding, `out` is untouched,
-/// and a later call (this one or `ef_tensor_map`) makes progress. Yield or
-/// sleep between attempts: on the WARP software adapter the CPU threads are
-/// the GPU, so a tight retry loop starves the copy it is waiting for.
+/// On `EAGAIN` no map is left outstanding and `out` is untouched. Yield or
+/// sleep between attempts.
 ///
 /// @return the codes [`ef_tensor_map`] returns, plus `EAGAIN` when the map
 ///         would have had to wait for a GPU copy.
@@ -201,13 +132,6 @@ pub unsafe extern "C" fn ef_tensor_try_map(
 }
 
 /// The shared body of [`ef_tensor_map`] and [`ef_tensor_try_map`].
-///
-/// Written once rather than twice: the two differ only in which `TensorDyn`
-/// mapping call they make at the end, and every gate before it -- the null
-/// checks, the access decode, the declared-access refusal, the exclusive-write
-/// refcount gate, the outstanding-map check -- is a contract both must
-/// enforce identically. Two hand-written copies is exactly how one of those
-/// gates ends up applying to only one of them.
 ///
 /// # Safety
 /// `t` must be `NULL` or a live handle; `out` must be writable for one
@@ -233,35 +157,20 @@ unsafe fn map_window(
                 set_last_error(&format!("{what}: could not resolve handle"));
                 return libc::EINVAL;
             };
-            // Ahead of the refcount and outstanding-map gates, so it names the declaration.
+            // Refuse a direction the declared CPU access does not cover.
             if let Err(e) = imp.inner.cpu_access().require(access) {
                 set_last_error_classified(class_of(&e), &format!("{what}: {e}"));
                 return errno_for(&e);
             }
-            // A poisoned lock means a shielded panic unwound while the lock was
-            // held. The slot is a single-assignment `Option` -- no intermediate
-            // state a panic could expose -- so recovering the guard is sound,
-            // and the alternative (refusing forever) would brick this tensor's
-            // CPU access on the first caught panic.
+            // A poisoned lock is recovered.
             let mut slot = imp
                 .map_state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            // Exclusive write, CPU-side only (spec Revision 4, "Exclusive write
-            // is adopted only as far as it is honest"): a refcount cannot see a
-            // device, so a dma-buf the NPU is writing is not exclusive no matter
-            // what this count says. This gate refuses a writable map only when
-            // more than one CPU-side handle exists; device-side ordering stays
-            // the fence field's job, not this gate's.
+            // A writable map requires a single CPU-side handle.
             if access.writes() {
                 let refs = imp.refs.load(std::sync::atomic::Ordering::Acquire);
                 if refs > 1 {
-                    // `InvalidOperation`, not `Unspecified`: the vocabulary's
-                    // own word for "legal, but not permitted right now -- a
-                    // live map, a shared handle". A caller that must
-                    // distinguish this from a malformed argument cannot be
-                    // asked to parse the advisory message, whose contract is
-                    // "never parse this".
                     set_last_error_classified(
                         EfErrorClass::InvalidOperation,
                         &format!(
@@ -273,12 +182,6 @@ unsafe fn map_window(
                 }
             }
             if slot.is_some() {
-                // Stage B, controller ruling 2: a second concurrent map on
-                // one handle fails LOUDLY -- the outstanding guard is never
-                // dropped or replaced. A PBO's own `PboHandle` does support N
-                // concurrent readers, but routed through this entry point it
-                // gets the same one-guard rule as every other backing, and a
-                // caller that hits it is told which rule it hit.
                 set_last_error_classified(
                     EfErrorClass::InvalidOperation,
                     &format!("{what}: a map is already outstanding on this tensor"),
@@ -299,13 +202,6 @@ unsafe fn map_window(
                 }
             };
             let len = view.as_slice().len();
-            // Writable maps hand out `as_mut_ptr` -- the guard's own DerefMut
-            // enforces writability, so this cannot silently succeed on a
-            // read-only guard. A read map deliberately does NOT call
-            // `as_mut_slice` (that would panic via `assert_map_writable`); it
-            // still returns a `*mut u8` because `ef_tensor_view` has one field
-            // for both directions, and the read-only contract is documentation
-            // plus the Rust-side guard, not something this C struct can express.
             let ptr: *mut u8 = if access.writes() {
                 view.as_mut_slice().as_mut_ptr()
             } else {
@@ -320,10 +216,9 @@ unsafe fn map_window(
 
 /// Release the outstanding map taken by `ef_tensor_map`.
 ///
-/// Dropping the guard runs the platform sync bracket (mmap stays resident,
-/// but e.g. IOSurface/dma-buf run their unlock/sync-for-device here). The
-/// pointer handed out by the matching `ef_tensor_map` is invalid the instant
-/// this returns 0.
+/// Runs the platform sync bracket (for example the IOSurface unlock or the
+/// dma-buf sync-for-device). The pointer returned by the matching
+/// `ef_tensor_map` is invalid once this returns 0.
 ///
 /// @return 0 on success, `EINVAL` (null tensor, or no map is outstanding).
 ///
@@ -341,9 +236,7 @@ pub unsafe extern "C" fn ef_tensor_unmap(t: *mut EfTensor) -> c_int {
                 set_last_error("unmap: could not resolve handle");
                 return libc::EINVAL;
             };
-            // Poison recovery: same reasoning as in `ef_tensor_map` -- the slot
-            // has no intermediate state, and a bricked unmap would leak the
-            // outstanding guard's sync bracket forever.
+            // A poisoned lock is recovered.
             let mut slot = imp
                 .map_state
                 .lock()
@@ -362,24 +255,18 @@ pub unsafe extern "C" fn ef_tensor_unmap(t: *mut EfTensor) -> c_int {
     }
 }
 
-/// Acquire the buffer for CPU access -- the standalone cache-maintenance
-/// bracket, without a mapping.
+/// Acquire the buffer for CPU access: the cache-maintenance bracket,
+/// without a mapping.
 ///
 /// `DMA_BUF_IOCTL_SYNC` with `DMA_BUF_SYNC_START` on Linux; the IOSurface
 /// lock on Apple platforms; a no-op for coherent host memory. Pairs with
-/// [`ef_tensor_sync_for_device`], which **must** be called with the same
-/// `access`: the direction tells the kernel which half of the maintenance
-/// this access needs, and a mismatched pair skips one of them (a read-only
-/// bracket lets the kernel skip the writeback, a write-only one skips the
-/// invalidate).
+/// [`ef_tensor_sync_for_device`], which must be called with the same
+/// `access`.
 ///
-/// Distinct from `ef_tensor_map`, which establishes an address *and* the
-/// coherency window together. This is for a caller that already holds the
-/// address -- one that mapped once at init and now brackets each frame's
-/// CPU access -- so it takes no map state and leaves none behind.
+/// Unlike `ef_tensor_map`, this takes no map state and returns no address.
 ///
 /// `EF_CPU_ACCESS_NONE` is not a sync direction and is refused with
-/// `EINVAL`, exactly as it is for `ef_tensor_map`.
+/// `EINVAL`.
 ///
 /// @return 0 on success, `EINVAL` (null tensor, or a bad/`NONE` access
 ///         code), `EACCES` (the direction is not covered by the tensor's
@@ -395,11 +282,10 @@ pub unsafe extern "C" fn ef_tensor_sync_for_cpu(t: *const EfTensor, access: u32)
     unsafe { sync_bracket(t, access, true) }
 }
 
-/// Release the buffer back to the device -- the CPU is done accessing it.
+/// Release the buffer back to the device after CPU access.
 ///
-/// `DMA_BUF_SYNC_END`. See [`ef_tensor_sync_for_cpu`] for the pairing rule
-/// and the direction's meaning; `access` must match the one that opened the
-/// bracket.
+/// `DMA_BUF_SYNC_END` on Linux. `access` must match the one passed to the
+/// [`ef_tensor_sync_for_cpu`] that opened the bracket.
 ///
 /// @return the same codes as [`ef_tensor_sync_for_cpu`].
 ///
@@ -411,13 +297,6 @@ pub unsafe extern "C" fn ef_tensor_sync_for_device(t: *const EfTensor, access: u
 }
 
 /// The shared body of the two sync entry points.
-///
-/// Written once rather than twice: the two differ only in which end of the
-/// bracket they call, and duplicating the null/access/handle checks is
-/// exactly how the two ends drift into accepting different arguments.
-/// Not itself `#[no_mangle]` -- see this crate's note in `handle.rs` about
-/// cbindgen not expanding macros; a plain helper is invisible to cbindgen
-/// too, which is what we want here.
 ///
 /// # Safety
 /// `t` must be `NULL` or a live handle.
@@ -461,14 +340,7 @@ unsafe fn sync_bracket(t: *const EfTensor, access: u32, to_cpu: bool) -> c_int {
 /// Copy a tensor's whole extent into a caller-provided buffer.
 ///
 /// Needs no outstanding `ef_tensor_map`: it takes its own short-lived read
-/// guard, copies, and drops the guard before returning. On `edgefirst-tensor`
-/// backends today (`Mem`, at minimum -- see the test below) a plain read
-/// guard coexists freely with an outstanding stored map, because the
-/// underlying platform mapping carries no single-writer lock of its own;
-/// this call does not special-case that, so if a future backend's map ever
-/// does refuse a second concurrent guard, the refusal surfaces here as
-/// whatever errno `errno_for` gives that backend's error (in practice
-/// `EACCES` or `EBUSY` depending on the backend), not a hardcoded one.
+/// guard, copies, and drops the guard before returning.
 ///
 /// @return bytes written (`>= 0`) on success, or a negative errno: `-EINVAL`
 ///         (null tensor/out), `-EACCES` (the tensor's declared CPU access
@@ -482,9 +354,6 @@ unsafe fn sync_bracket(t: *const EfTensor, access: u32, to_cpu: bool) -> c_int {
 #[no_mangle]
 pub unsafe extern "C" fn ef_tensor_copy_to(t: *mut EfTensor, out: *mut u8, cap: usize) -> i64 {
     unsafe {
-        // `shield_int` does not fit here -- it returns `c_int`, and this entry
-        // point's contract is a signed byte count (`i64`) -- so the Once is
-        // driven directly rather than through that wrapper.
         crate::last_error::ensure_hook_installed();
         catch_unwind(AssertUnwindSafe(|| {
             if t.is_null() || out.is_null() {
@@ -510,9 +379,7 @@ pub unsafe extern "C" fn ef_tensor_copy_to(t: *mut EfTensor, out: *mut u8, cap: 
             }
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), out, bytes.len());
             bytes.len() as i64
-            // `view` drops here -- the local guard's sync bracket runs, and it
-            // was never stored, so there is nothing for a later `ef_tensor_unmap`
-            // to find.
+            // `view` drops here, running its sync bracket.
         }))
         .unwrap_or(-(libc::EINVAL as i64))
     }
@@ -520,12 +387,9 @@ pub unsafe extern "C" fn ef_tensor_copy_to(t: *mut EfTensor, out: *mut u8, cap: 
 
 /// Runs `f(ctx)` while no tensor CPU mapping can be created in this process.
 ///
-/// For a consumer about to make a GPU-driver call that may unmap an address
-/// range twice (Adreno `eglDestroyImage`): a mapping created between the two
-/// `munmap`s would be destroyed by the second. Every tensor mapping this
-/// library creates waits until `f` returns, so `f` must not map a tensor
-/// itself. `f` is called exactly once, on the calling thread; a NULL `f` is
-/// a no-op.
+/// Every tensor mapping this library creates waits until `f` returns; `f`
+/// must not map a tensor itself. `f` is called exactly once, on the calling
+/// thread; a NULL `f` is a no-op.
 ///
 /// # Safety
 ///
@@ -556,9 +420,6 @@ mod tests {
 
     #[test]
     fn a_write_map_on_a_read_only_declared_tensor_is_eacces_but_a_read_map_succeeds() {
-        // Cheapest constructor yielding a non-writable declaration: a
-        // Read-declared image tensor via `TensorDyn::image`, wrapped into a
-        // handle the same way every constructor in `handle.rs` does.
         let t = edgefirst_tensor::TensorDyn::image(
             4,
             4,
@@ -571,7 +432,6 @@ mod tests {
         let handle = crate::handle::into_handle(t);
 
         let mut view = empty_view();
-        // The read direction is declared, so a read map succeeds.
         assert_eq!(
             unsafe { ef_tensor_map(handle, 1, &mut view) }, // Read
             0,
@@ -579,14 +439,13 @@ mod tests {
         );
         assert_eq!(unsafe { ef_tensor_unmap(handle) }, 0);
 
-        // ReadWrite (3) needs the write bit, which this tensor did not
-        // declare -- EACCES.
+        // ReadWrite (3).
         assert_eq!(
             unsafe { ef_tensor_map(handle, 3, &mut view) },
             libc::EACCES,
             "a writable map on a Read-declared tensor must be refused"
         );
-        // The refused request must not have left a stale outstanding map.
+        // The refused request leaves no outstanding map.
         assert_eq!(unsafe { ef_tensor_unmap(handle) }, libc::EINVAL);
 
         unsafe { ef_tensor_free(handle) };
@@ -685,16 +544,11 @@ mod tests {
 
     #[test]
     fn write_map_requires_a_unique_cpu_side_handle() {
-        // Spec Revision 4's exclusive-write rule (docs/superpowers/specs/
-        // 2026-08-20-modular-tensor-abi-design.md:416, Resolved decision 8):
-        // uniqueness checking applies to the CPU-side handle count only. A
-        // second CPU-side reference is enough to refuse a writable map, even
-        // though nothing here can or does see a device-side reference.
         let dims = [4u64];
         let t = unsafe { ef_tensor_new(0, dims.as_ptr(), 1) };
         let mut view = empty_view();
 
-        // Two CPU-side handles to the same tensor: refcount 2.
+        // Two CPU-side handles to the same tensor.
         assert_eq!(unsafe { ef_tensor_retain(t) }, 0);
 
         assert_eq!(
@@ -710,7 +564,7 @@ mod tests {
              double-map EBUSY, got: {msg:?}"
         );
 
-        // The gate is write-only: a read map at the same refcount succeeds.
+        // A read map at the same refcount succeeds.
         assert_eq!(
             unsafe { ef_tensor_map(t, 1, &mut view) }, // Read
             0,
@@ -718,7 +572,7 @@ mod tests {
         );
         assert_eq!(unsafe { ef_tensor_unmap(t) }, 0);
 
-        // Release one reference, back to refcount 1: the write gate lifts.
+        // Release one reference, back to refcount 1.
         unsafe { ef_tensor_free(t) };
         assert_eq!(
             unsafe { ef_tensor_map(t, 3, &mut view) },
@@ -732,14 +586,7 @@ mod tests {
 
     #[test]
     fn host_view_static_u8_is_send() {
-        // The Send question the brief flags: `HostView` holds `Option<HostPin>`
-        // (explicitly `unsafe impl Send`/`Sync` in `pin.rs`), a `Vec<usize>`
-        // shape, an `Option<usize>` override, a `bool`, and a
-        // `PhantomData<u8>` -- every field is `Send` on its own, so
-        // `HostView<'static, u8>` is automatically `Send` with no unsafe impl
-        // needed. This is a compile-time proof, not a runtime assertion: it
-        // exists so that if a future field ever breaks the auto-derive, this
-        // fails to *compile* rather than passing silently.
+        // Compile-time check that `MapState` is `Send`.
         fn assert_send<T: Send>() {}
         assert_send::<MapState>();
         assert_send::<std::sync::Mutex<Option<MapState>>>();
@@ -747,13 +594,7 @@ mod tests {
 
     #[test]
     fn tensor_dyn_is_send_and_sync() {
-        // The map window's thread-safety story leans on this: concurrent C
-        // threads calling `ef_tensor_map`/`ef_tensor_copy_to` share
-        // `&TensorDyn` through `EfTensorImpl` (`&EfTensor` from C fans out to
-        // `&TensorDyn` on every call). This is a compile-time proof, not a
-        // runtime assertion, exactly like `host_view_static_u8_is_send`
-        // above: it exists so a future `TensorDyn` variant that loses either
-        // auto trait fails to *compile* rather than passing silently.
+        // Compile-time check that `TensorDyn` is `Send + Sync`.
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<edgefirst_tensor::TensorDyn>();
     }
@@ -798,7 +639,7 @@ mod tests {
         let t = unsafe { ef_tensor_new(0, dims.as_ptr(), 1) };
         let mut view = empty_view();
         assert_eq!(unsafe { ef_tensor_map(t, 3, &mut view) }, 0);
-        unsafe { ef_tensor_free(t) }; // must not crash; guard dropped before the Box
+        unsafe { ef_tensor_free(t) }; // the guard is dropped before the Box
         assert_eq!(
             test_support::FREED_WITH_OUTSTANDING_MAP.load(Ordering::Relaxed),
             before + 1,
@@ -809,10 +650,7 @@ mod tests {
 
     #[test]
     fn a_poisoned_map_state_lock_recovers_instead_of_bricking_the_tensor() {
-        // A shielded panic that unwinds while holding `map_state` poisons
-        // the mutex. The slot is a single-assignment `Option`, so recovery
-        // is sound -- and without it, every later map/unmap on this tensor
-        // would fail forever.
+        // A panic while holding `map_state` poisons the mutex.
         let dims = [4u64];
         let t = unsafe { ef_tensor_new(0, dims.as_ptr(), 1) };
         let addr = t as usize;
@@ -821,7 +659,7 @@ mod tests {
             let _guard = imp.map_state.lock().unwrap();
             panic!("deliberately poisoning map_state");
         })
-        .join(); // the Err is the panic we caused
+        .join(); // the Err is the spawned thread's panic
         let imp = unsafe { &*(t as *const EfTensorImpl) };
         assert!(
             imp.map_state.is_poisoned(),
@@ -841,9 +679,6 @@ mod tests {
     #[test]
     fn errno_for_distinguishes_misaligned_offsets_from_access_refusals() {
         use edgefirst_tensor::Error;
-        // The two live `InvalidOperation` shapes (both message texts taken
-        // verbatim from `edgefirst-tensor`'s map paths): misalignment is a
-        // caller-argument defect, an access refusal is a permission one.
         let misaligned =
             Error::InvalidOperation("DMA map: offset 3 not aligned to align_of::<T>()=4".into());
         assert_eq!(errno_for(&misaligned), libc::EINVAL);
@@ -869,9 +704,6 @@ mod tests {
 
     #[test]
     fn null_arguments_are_errors_not_crashes() {
-        // Follows the sibling convention in builder.rs/serialize.rs/detect.rs:
-        // every null a C caller could plausibly pass is exercised, not just
-        // the ones the RED tests happened to cover.
         let mut view = empty_view();
         assert_eq!(
             unsafe { ef_tensor_map(std::ptr::null_mut(), 3, &mut view) },
@@ -903,14 +735,7 @@ mod tests {
 
     #[test]
     fn dma_buf_map_write_unmap_copy_to_round_trip() {
-        // Runtime-gated, not `#[cfg(target_os = "linux")]`: `is_dma_available`
-        // is compiled on every platform and returns `false` wherever the
-        // dma-heap device is missing or unprivileged (every non-Linux host,
-        // and most Linux dev machines), so this test compiles and *runs* --
-        // loudly skipped -- everywhere, the same gating pattern
-        // `crates/tensor/tests/pin.rs`'s DMA tests use. It is the only path
-        // that exercises the map window's `DMA_BUF_IOCTL_SYNC` sync-bracket
-        // arm, which a `Mem`-backed tensor never reaches.
+        // Skipped at runtime where the dma-heap device is unavailable.
         if !crate::dma_require::available_or_skip(
             edgefirst_tensor::is_dma_available(),
             "dma_buf_map_write_unmap_copy_to_round_trip",
@@ -932,7 +757,7 @@ mod tests {
         for i in 0..4096 {
             unsafe { *view.ptr.add(i) = (i % 256) as u8 };
         }
-        // The sync-for-device bracket runs here, inside unmap.
+        // The sync-for-device bracket runs inside unmap.
         assert_eq!(unsafe { ef_tensor_unmap(handle) }, 0);
 
         let mut out = vec![0u8; 4096];
@@ -950,12 +775,6 @@ mod tests {
 
     #[test]
     fn copy_to_coexists_with_an_outstanding_stored_map() {
-        // The empirical answer the brief asks for: on the `Mem` backend, a
-        // local read guard (what `copy_to` takes) coexists freely with an
-        // outstanding stored map -- `MemTensor::map_inner` has no
-        // single-writer lock of its own (see `mem.rs`), unlike
-        // AHardwareBuffer's refcounted CPU lock. So `copy_to` needs no
-        // EBUSY special-case for this backend; it just works.
         let dims = [2u64, 2];
         let t = unsafe { ef_tensor_new(0, dims.as_ptr(), 2) };
         let mut view = empty_view();
@@ -971,20 +790,9 @@ mod tests {
         unsafe { ef_tensor_free(t) };
     }
 
-    /// Stage B, controller ruling 2: a second concurrent map on one handle
-    /// must fail *loudly* -- never drop the outstanding guard, never
-    /// silently replace it. `EBUSY` alone was already the return; the class
-    /// was `Unspecified`, which a caller cannot distinguish from "some
-    /// unclassified failure". `InvalidOperation` is the vocabulary's own
-    /// word for "legal, but not permitted right now -- a live map".
-    ///
-    /// This matters most for a PBO-backed handle, whose `PboHandle` does
-    /// support N concurrent readers directly; routed through
-    /// `ef_tensor_map` it gets this one-guard rule instead, the same rule
-    /// every other backing already has. No in-tree caller holds two maps on
-    /// one handle (the tiling and convert paths take a separate tensor per
-    /// plane or per tile), so nothing loses a working path -- but a caller
-    /// that tries must be told which rule it hit.
+    /// A second concurrent map on one handle returns `EBUSY` with the
+    /// `InvalidOperation` class, and the outstanding guard is neither
+    /// dropped nor replaced.
     #[test]
     fn a_second_map_on_one_handle_is_refused_with_a_classified_error() {
         let dims = [2u64, 2];
@@ -1009,13 +817,13 @@ mod tests {
             "the refused map must not hand back a view"
         );
 
-        // The first map is untouched: it still unmaps cleanly.
+        // The first map still unmaps.
         assert_eq!(unsafe { ef_tensor_unmap(t) }, 0);
         unsafe { ef_tensor_free(t) };
     }
 
-    /// The shared-handle write gate is the same failure class: the map is
-    /// legal, just not permitted while another handle holds a reference.
+    /// A write map on a shared handle returns `EBUSY` with the
+    /// `InvalidOperation` class.
     #[test]
     fn a_write_map_on_a_shared_handle_is_refused_with_a_classified_error() {
         let dims = [2u64, 2];
@@ -1055,7 +863,7 @@ mod tests {
 
     #[test]
     fn mapping_exclusion_accepts_a_null_callback() {
-        // SAFETY: a NULL callback is documented as a no-op.
+        // SAFETY: a NULL callback is a no-op.
         unsafe { ef_tensor_with_cpu_mappings_excluded(None, std::ptr::null_mut()) };
     }
 }

@@ -38,22 +38,7 @@ def load_bytes_to_image(bytes, format, size, resize=None, rotate=None):
 
 
 def _tensor_from_bytes(data, fmt):
-    """Test helper that replaces the removed Tensor.load_from_bytes() convenience.
-
-    Decode emits the source's native pixel format (color JPEG → NV12), so this
-    decodes natively and then converts to the requested ``fmt`` — mirroring the
-    new recommended decode-then-convert pipeline. Production code should follow
-    the same pattern explicitly.
-
-    ``Tensor`` (the destination, from ``edgefirst.image``) and
-    ``peek_image_info``/``decode_into`` (from ``edgefirst.codec``) are two
-    different packages -- this is the documented cross-package pipeline
-    (`ImageProcessor.create_image()`-style destination, decoded via
-    `edgefirst.codec`), not a same-module decode. `Tensor.peek_image_info`/
-    `.decode_image` never existed on `edgefirst.image.Tensor`; this helper
-    used to call them anyway and was invisible because this whole module is
-    deselected by the `benchmark` marker in every default suite run.
-    """
+    """Decodes ``data`` in its native format and converts it to ``fmt``."""
     info = CodecTensor.peek_image_info(data)
     native = Tensor.image(info.width, info.height, info.format, access="readwrite")
     decode_into(native, data)
@@ -65,11 +50,7 @@ def _tensor_from_bytes(data, fmt):
 
 
 def _tensor_from_file(path, fmt):
-    """Test helper that replaces the removed Tensor.load() convenience.
-
-    Peeks the file header, decodes in the source's native format, then converts
-    to the requested ``fmt``.
-    """
+    """Decodes the file in its native format and converts it to ``fmt``."""
     with open(path, "rb") as f:
         data = f.read()
     return _tensor_from_bytes(data, fmt)
@@ -88,10 +69,7 @@ def calculate_similarity_rms_u8(imageA, imageB) -> float:
     return 1.0 - rms
 
 
-# JPEG sources decode to native NV12 tagged with JFIF colorimetry (BT.601
-# full-range); convert() honors it, so the NV12->RGB(A) conversion matches PIL's
-# direct JPEG RGB decode. Only the codec's 4:2:0 chroma downsampling differs, so
-# these JPEG-sourced comparisons hold the same 0.98 threshold as the YUYV paths.
+# Similarity threshold for JPEG-sourced comparisons.
 JPEG_NV12_RMS = 0.98
 
 
@@ -534,7 +512,7 @@ def test_cv2_rotate_90(benchmark):
 
 @pytest.mark.benchmark(group="rotate_90", warmup_iterations=3)
 def test_gl_rotate_90(benchmark):
-    """Benchmark CPU 90 degree rotation."""
+    """Benchmark OpenGL 90 degree rotation."""
     with open("testdata/zidane.jpg", "rb") as f:
         data = f.read()
 
@@ -560,7 +538,7 @@ def test_gl_rotate_90(benchmark):
 
 @pytest.mark.benchmark(group="rotate_90", warmup_iterations=3)
 def test_g2d_rotate_90(benchmark):
-    """Benchmark CPU 90 degree rotation."""
+    """Benchmark G2D 90 degree rotation."""
     with open("testdata/zidane.jpg", "rb") as f:
         data = f.read()
 

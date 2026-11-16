@@ -1,25 +1,12 @@
 //! `edgefirst-tensor` must carry no process-wide state that affects behaviour.
 //!
-//! This is the invariant the whole modular design rests on: each C library and
-//! each Python extension statically links its own copy of this crate, so any
-//! behavioural static is duplicated per artifact and the copies diverge. That
-//! is what produced the GL import-cache blocker, and what the mobile-sdk
-//! notes record as an iPhone NULL-jump.
-//!
-//! Benign statics -- probe caches and diagnostics, where N copies cost N
-//! probes and nothing else -- are listed here with the reason each is safe.
-//! Test-only state (mock structs and locals under `#[cfg(test)] mod ...`)
-//! never ships in a linked artifact, so it is out of scope and skipped
-//! rather than allowlisted.
+//! Scans the crate's sources for `static` and `thread_local!` declarations and
+//! fails on any that is not in the allowlist. `#[cfg(test)] mod` blocks are
+//! skipped.
 
 use std::path::{Path, PathBuf};
 
-/// Reports a test skip with `reason`, writing `SKIPPED: {reason}` directly
-/// to stderr (not via `eprintln!`) so libtest's output capture cannot hide
-/// it -- see `edgefirst_tensor`'s (crate-internal) `test_support` module
-/// for the same mechanism in the library's own `#[cfg(test)]` code; this
-/// integration test binary is a separate compilation unit and cannot reach
-/// that `pub(crate)` helper, so it carries a local copy.
+/// Reports a test skip by writing `SKIPPED: {reason}` directly to stderr.
 fn report_skip(reason: &str) {
     use std::io::Write;
     let _ = writeln!(&mut std::io::stderr(), "WARNING: SKIPPED: {reason}");
@@ -156,12 +143,8 @@ fn walk_rs_files(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// The name of the static declared on this line, if any.
-///
-/// Matches `static X`, `pub static X` and `pub(crate) static X` by looking at
-/// the first two whitespace tokens rather than requiring the line to *start*
-/// with `static ` — an earlier version required that, and `pub static X:
-/// Mutex<u64>` slipped through green.
+/// The name of the static declared on this line, if any. Matches `static X`,
+/// `pub static X` and `pub(crate) static X`.
 fn declared_static_name(t: &str) -> Option<&str> {
     let mut tok = t.split_whitespace();
     let first = tok.next()?;
@@ -178,31 +161,17 @@ fn declared_static_name(t: &str) -> Option<&str> {
     Some(name.trim_end_matches(':'))
 }
 
-/// Process-wide state is declared exactly two ways in Rust: a `static` item,
-/// or `thread_local!`. Matching the declaration is both complete and precise.
-///
-/// Matching *types* or *constructors* instead — `Mutex::new`, `Atomic*::new`,
-/// `OnceLock<` — was the earlier approach and it is neither. Those appear in
-/// struct-field initialisers and field declarations, which are per-instance
-/// and perfectly fine: it flagged `lock: Mutex::new(..)` in `ahardwarebuffer.rs`
-/// and `map_state: Mutex::new(..)` in `pbo.rs`, neither of which is shared
-/// state. Nothing is lost by dropping them, because a multi-line static's type
-/// always follows a line this function already matches.
-///
-/// A `const` is inlined at each use rather than shared, so it is out of scope.
+/// Whether the line declares process-wide state: a `static` item or `thread_local!`.
 fn is_state_line(t: &str) -> bool {
     declared_static_name(t).is_some() || t.starts_with("thread_local!")
 }
 
 /// Scan one source file for process-wide state declarations, skipping
-/// `#[cfg(test)] mod ...` blocks (test-only state never ships).
+/// `#[cfg(test)] mod ...` blocks.
 fn scan_file_for_global_state(path: &Path, text: &str, offenders: &mut Vec<String>) {
     let lines: Vec<&str> = text.lines().collect();
 
-    // Test-only state (mock structs' Atomic fields, locals inside test
-    // functions) never ships in a linked artifact, so `#[cfg(test)] mod
-    // ...` blocks are out of scope. Track brace depth from the `mod`
-    // line to find where the block ends.
+    // Tracks brace depth from a `#[cfg(test)] mod` line to find where the block ends.
     let mut pending_test_cfg = false;
     let mut skip_depth: i32 = 0;
 
@@ -233,9 +202,7 @@ fn scan_file_for_global_state(path: &Path, text: &str, offenders: &mut Vec<Strin
         if !is_state_line(t) {
             continue;
         }
-        // Exact identifier match, never `contains`: allowlisting `TABLE`
-        // by substring also silently permits `INTERN_TABLE`, which is
-        // close to the exact type this invariant exists to keep deleted.
+        // Exact identifier match against the allowlist.
         let declared = declared_static_name(t);
         if ALLOWED
             .iter()
@@ -249,11 +216,7 @@ fn scan_file_for_global_state(path: &Path, text: &str, offenders: &mut Vec<Strin
 
 #[test]
 fn edgefirst_tensor_declares_no_new_global_state() {
-    // Resolved at compile time, so the scan works regardless of the runner's
-    // CWD. On a board the source tree is absent entirely -- announce that and
-    // return, rather than scanning zero files and reporting a green pass. An
-    // earlier version used a relative "src" and passed vacuously on every
-    // board, which is the exact failure mode this gate exists to catch.
+    // Resolved at compile time. When the source tree is absent the test reports a skip.
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     if !src.is_dir() {
         report_skip(&format!(

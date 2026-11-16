@@ -2,30 +2,16 @@
 # SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 # SPDX-License-Identifier: Apache-2.0
 #
-# Extract a packaged edgefirst-hal archive and compile+run one consumer per
-# library using ONLY pkg-config (no source-tree -I). This is the test that
-# catches a missing detect.h, a broken .pc Requires line, or a SONAME that
-# does not resolve at runtime.
-#
-# Also compiles the C example extracted from the packaged INSTALL.txt so
-# the two cannot drift. The archive is shared-library only (no
-# libedgefirst_*.a); static linking is not part of the package contract.
+# Extract a packaged edgefirst-hal archive and compile and run one consumer per
+# library using only pkg-config (no source-tree -I). Also compiles the C
+# example extracted from the packaged INSTALL.txt.
 #
 # Usage: scripts/smoke-capi-archive.sh <archive.tar.gz|archive.zip>
 set -euo pipefail
 ARCHIVE="${1:?usage: $0 <archive.tar.gz|archive.zip>}"
 CC="${CC:-cc}"
 
-# macos-latest is an Apple Silicon (arm64) runner, but this script also
-# smokes the x86_64-macos archive (cross-compiled via `--target
-# x86_64-apple-darwin`, a genuine x86_64 .dylib). Left to its host default,
-# `cc` compiles the smoke test itself for arm64, and linking an arm64 stub
-# against an x86_64 .dylib silently "ignores" it (a warning, not an error --
-# the trivial per-leaf stubs below call nothing, so nothing forces a real
-# link) right up until the INSTALL.txt example, which calls real functions
-# and fails hard with "Undefined symbols for architecture arm64". The
-# archive name carries the target triple, so pick the matching `-arch`
-# rather than trusting the host default.
+# On macOS, compiles for the architecture named in the archive file name.
 CC_ARCH_FLAGS=()
 CROSS_ARCH=0
 if [[ "$(uname -s)" == "Darwin" ]]; then
@@ -35,11 +21,7 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
     *aarch64-macos*) CC_ARCH_FLAGS=(-arch arm64); [[ "${host_arch}" != "arm64" ]] && CROSS_ARCH=1 ;;
   esac
 fi
-# When cross-arch, only compile+link (still proves the header/.pc/SONAME
-# contract this script exists to check) -- do not assume Rosetta (or an
-# aarch64 emulator) is installed on the runner to actually EXECUTE a
-# foreign-arch binary; that risks trading this failure for an unrelated
-# "Bad CPU type in executable" one.
+# Runs a binary. A cross-architecture binary is compiled and linked only.
 run_bin() {
   if [[ "${CROSS_ARCH}" -eq 1 ]]; then
     echo "  (skipping execution: ${CC_ARCH_FLAGS[*]} binary, host is $(uname -m) -- compiled+linked only)"

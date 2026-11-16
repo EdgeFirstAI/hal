@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 # SPDX-License-Identifier: Apache-2.0
 #
-# Profile the software JPEG **decode-only** path (no letterbox/convert) and
+# Profile the software JPEG decode-only path (no letterbox/convert) and
 # bucket samples into decode stages: entropy, IDCT, colour, plane write.
 #
 # Usage:
@@ -12,9 +12,8 @@
 # Env:
 #   LIMIT / WARMUP   images / warmup (default 1000 / 20; 300 on remote)
 #   FORMATS          yuv,rgb (default both)
-#   FREQ             perf sample frequency (default 3999 local, 999 remote:
-#                    the small cores spend long enough in the handler at 3999
-#                    to skew what is being measured). Set it to pin both.
+#   FREQ             perf sample frequency (default 3999 local, 999 remote).
+#                    Set it to pin both.
 #   BOARD            label for outputs (default host name)
 #
 # Outputs under benchmarks/results/<board>/perf-decode/:
@@ -131,7 +130,6 @@ for fmt in "${fmts[@]}"; do
     ./hal_cpu --limit ${LIMIT} --warmup ${WARMUP} --board '${BOARD}' \
     --tensor-mem mem --decode-only --decode-fmt ${dfmt}" \
     >/dev/null 2>"${OUT}/hal_${fmt}.run.log" || true
-  # perf report on small cores is slow; keep the sample set modest.
   ssh "${HOST}" "cd '${REMOTE_DIR}' && perf report -i perf_${fmt}.data --stdio \
     --no-children -s sym --percent-limit 1 2>/dev/null" \
     > "${OUT}/hal_${fmt}.report.txt" || true

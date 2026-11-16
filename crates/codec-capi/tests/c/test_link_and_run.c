@@ -1,8 +1,7 @@
 /* SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
  * SPDX-License-Identifier: Apache-2.0
  *
- * Links and RUNS against libedgefirst_codec + libedgefirst_tensor.
- * A header that compiles is not the same as a library that loads. */
+ * Links and runs against libedgefirst_codec + libedgefirst_tensor. */
 #include <edgefirst/codec.h>
 #include <stdio.h>
 

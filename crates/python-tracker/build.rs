@@ -3,6 +3,6 @@
 
 fn main() {
     pyo3_build_config::use_pyo3_cfgs();
-    // Tracker does not link libedgefirst_tensor: ByteTrack consumes plain DetectBox values.
+    // Tracker does not link libedgefirst_tensor.
     edgefirst_build_support::python_extension();
 }

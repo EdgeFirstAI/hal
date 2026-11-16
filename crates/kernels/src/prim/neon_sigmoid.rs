@@ -227,9 +227,7 @@ mod tests {
         }
     }
 
-    /// At every tail length 1..=15, the integer f16 kernels equal the f32 kernels rounded once,
-    /// on values whose vector and libm sigmoids round to different f16s; a tail that took the
-    /// wrong path for any element would fail.
+    /// At every tail length 1..=15, the integer f16 kernels equal the f32 kernels rounded once.
     #[test]
     fn integer_f16_tails_match_the_f32_kernel() {
         macro_rules! check {

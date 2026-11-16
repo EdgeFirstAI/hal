@@ -312,7 +312,7 @@ where
         .map(|&(a, dt, role)| InArray::new(a, dt, role))
         .collect::<PyResult<Vec<_>>>()?;
     let mut out_guard = OutArray::new(output, out_dtype)?;
-    // Each view's slice covers its whole span, so overlapping spans must not both become views.
+    // An input whose byte span overlaps the output's is refused.
     let out_span = out_guard.span()?;
     for (g, &(_, _, role)) in in_guards.iter().zip(inputs) {
         if g.span()?.overlaps(&out_span) {

@@ -4,30 +4,23 @@
 //! SSE2 8×8 IDCT in 16-bit lanes (libjpeg-turbo `jpeg_idct_islow` shape).
 //!
 //! One `__m128i` holds a whole row of eight `i16` coefficients, so pass 1 is a
-//! butterfly *across* the eight row registers with lane *j* carrying column
-//! *j* — no transpose is needed until the two passes meet.
+//! butterfly across the eight row registers with lane *j* carrying column
+//! *j*.
 //!
-//! Every multiply is a `pmaddwd`. The Loeffler butterfly computes each output
-//! as a sum of products of pairs of inputs, so interleaving the two source rows
-//! with `punpck?wd` turns each term into one `pmaddwd`: one uop and 5 cycles
-//! for two multiplies *and* their add, against `pmulld`'s two uops and 10
-//! cycles for a single multiply. The constant pairs in [`K`] are an exact
-//! integer regrouping of [`super::scalar`], so this kernel is bit-exact with
-//! the scalar reference rather than merely close (see `parity_vs_scalar`).
+//! Every multiply is a `pmaddwd`: interleaving the two source rows with
+//! `punpck?wd` turns each sum of two products into one `pmaddwd`. The
+//! constant pairs in [`K`] are an exact integer regrouping of
+//! [`super::scalar`], so this kernel is bit-exact with the scalar reference.
 //!
-//! Dequantisation is folded into the load as `pmullw`, which keeps the block in
-//! `i16` and avoids materialising a 256-byte `[i32; 64]` scratch. As in
-//! libjpeg-turbo, this assumes the dequantised coefficient fits in `i16`;
-//! encoders pair large quantiser values with small coefficients, so real
-//! streams stay well inside that range.
+//! Dequantisation is folded into the load as `pmullw`, which keeps the block
+//! in `i16`; the dequantised coefficient is assumed to fit in `i16`.
 //!
-//! Only SSE2 is required — `pmullw`, `pmaddwd`, `packssdw` and `packuswb` are
-//! all baseline — so SSE4.1 targets share this kernel too.
+//! Only SSE2 is required; SSE4.1 targets share this kernel.
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
-/// Fixed-point precision (must match scalar).
+/// Fixed-point precision, as in the scalar kernel.
 const PASS1_BITS: i32 = 2;
 const CONST_BITS: i32 = 13;
 
@@ -44,10 +37,8 @@ const fn pair(a: i16, b: i16) -> i32 {
 /// `pmaddwd` constant pairs, regrouped from the scalar Loeffler constants.
 ///
 /// Each entry folds the scalar form's shared sub-expressions into per-input
-/// coefficients. For example the scalar even part computes
-/// `tmp13 = (s2 + s6) * FIX_0_541 + s2 * FIX_0_765`, which is exactly
-/// `s2 * (FIX_0_541 + FIX_0_765) + s6 * FIX_0_541` — the [`K::EVEN_26_13`]
-/// pair. The regrouping is an integer identity, so no precision is lost.
+/// coefficients: `(s2 + s6) * FIX_0_541 + s2 * FIX_0_765` becomes the
+/// [`K::EVEN_26_13`] pair `s2 * (FIX_0_541 + FIX_0_765) + s6 * FIX_0_541`.
 mod k {
     use super::pair;
 
@@ -102,14 +93,10 @@ macro_rules! transpose8x8_i16 {
 
 /// One Loeffler pass over eight `i16` rows, lane *j* being column *j*.
 ///
-/// Returns the eight results as `i32` lo/hi half-pairs (`[(lo, hi); 8]`) still
-/// at full precision: the caller applies the pass-specific descale and pack,
-/// which differ between pass 1 (to `i16`) and pass 2 (to `u8`).
+/// Returns the eight results as `i32` lo/hi half-pairs (`[(lo, hi); 8]`) at
+/// full precision; the caller applies the pass-specific descale and pack.
 ///
-/// `bias` is added to the even part exactly where the scalar reference adds it.
-///
-/// Inlined into the `sse2`-enabled caller rather than carrying its own
-/// `target_feature`, so the two passes share one register allocation.
+/// `bias` is added to the even part.
 #[inline(always)]
 unsafe fn idct_pass(s: &[__m128i; 8], bias: __m128i) -> [(__m128i, __m128i); 8] {
     let p04l = _mm_unpacklo_epi16(s[0], s[4]);
@@ -124,7 +111,7 @@ unsafe fn idct_pass(s: &[__m128i; 8], bias: __m128i) -> [(__m128i, __m128i); 8] 
     let madd = |v, c: i32| _mm_madd_epi16(v, _mm_set1_epi32(c));
 
     // Even part: tmp10/tmp11 are (s0 ± s4) << CONST_BITS, tmp13/tmp12 the
-    // s2/s6 rotation. The bias folds in here, as in the scalar reference.
+    // s2/s6 rotation, with the bias added.
     let t10l = madd(p04l, k::EVEN_04_ADD);
     let t10h = madd(p04h, k::EVEN_04_ADD);
     let t11l = madd(p04l, k::EVEN_04_SUB);
@@ -191,9 +178,7 @@ unsafe fn idct_8x8_sse2_inner(
     islow_body(coeffs, quant, output, stride)
 }
 
-/// The kernel proper, kept free of `target_feature` so each tier can stamp out
-/// its own copy: AVX2 callers get the same code VEX-encoded, which drops the
-/// register-copy `movdqa`s that the two-operand SSE encoding forces.
+/// The kernel body, without `target_feature`: each tier compiles its own copy.
 ///
 /// # Safety
 /// Caller must guarantee SSE2 and that `output` holds `7 * stride + 8` bytes.
@@ -223,8 +208,8 @@ pub(super) unsafe fn islow_body(
 
     transpose8x8_i16!(r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]);
 
-    // Pass 2 over rows. The bias carries both the rounding term and the +128
-    // level shift, so the descale lands directly in [0, 255] before packuswb.
+    // Pass 2 over rows. The bias carries the rounding term and the +128
+    // level shift.
     let bias = _mm_set1_epi32((1 << (PASS2_SHIFT - 1)) + (128 << PASS2_SHIFT));
     let p2 = idct_pass(&r, bias);
     for (slot, (lo, hi)) in r.iter_mut().zip(p2) {
@@ -234,14 +219,11 @@ pub(super) unsafe fn islow_body(
         );
     }
 
-    // A pass butterflies *across* registers, so its results come out
-    // column-major; transposing here puts each output row back in one register.
+    // Transpose the column-major results so each output row is in one register.
     transpose8x8_i16!(r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]);
 
     for (row, v) in r.into_iter().enumerate() {
-        // packuswb saturates to [0, 255], matching the scalar clamp. storel
-        // writes the low 8 bytes straight out of the register — going via a
-        // stack temporary here costs a store-forwarding stall per row.
+        // packuswb saturates to [0, 255]; storel writes the low 8 bytes.
         let bytes = _mm_packus_epi16(v, v);
         _mm_storel_epi64(output.as_mut_ptr().add(row * stride) as *mut __m128i, bytes);
     }
@@ -251,9 +233,6 @@ pub(super) unsafe fn islow_body(
 pub fn idct_dc_only_sse2(dc_value: i32, output: &mut [u8], stride: usize) {
     let round = 1 << (PASS2_SHIFT - 1);
     let bias = round + (128 << PASS2_SHIFT);
-    // Wrapping: in-contract values cannot overflow here, but the argument is an
-    // i32 and a caller that hands over a wider one must get the same defined
-    // result the block kernels give, not a debug-build panic.
     let scaled = dc_value.wrapping_shl((CONST_BITS + PASS1_BITS) as u32);
     let val = (scaled.wrapping_add(bias) >> PASS2_SHIFT).clamp(0, 255) as u8;
 
@@ -272,7 +251,7 @@ mod tests {
     use super::*;
     use crate::jpeg::idct::scalar::{idct_8x8_scalar, idct_dc_only_scalar};
 
-    /// Deterministic xorshift so failures reproduce exactly.
+    /// Deterministic xorshift.
     fn rng(seed: &mut u64) -> u64 {
         *seed ^= *seed << 13;
         *seed ^= *seed >> 7;
@@ -280,17 +259,15 @@ mod tests {
         *seed
     }
 
-    /// The regrouped `pmaddwd` constants must reproduce the scalar reference
-    /// exactly, not approximately — including the clamp at both output ends and
-    /// with a stride wider than the block.
+    /// The kernel reproduces the scalar reference exactly, including the clamp
+    /// at both output ends and a stride wider than the block.
     #[test]
     fn parity_vs_scalar() {
         let mut seed = 0x1234_5678_9ABC_DEF0u64;
         for case in 0..512 {
             let mut coeffs = [0i16; 64];
             for (i, c) in coeffs.iter_mut().enumerate() {
-                // Later cases push hard on the [0, 255] clamp while keeping the
-                // dequantised product inside the i16 range the kernel assumes.
+                // Later cases reach the [0, 255] clamp within the i16 dequantised range.
                 let mag = if case < 64 { 32 } else { 256 };
                 let v = (rng(&mut seed) % (2 * mag)) as i32 - mag as i32;
                 *c = if i < 16 || rng(&mut seed).is_multiple_of(4) {

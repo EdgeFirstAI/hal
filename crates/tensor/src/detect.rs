@@ -3,26 +3,9 @@
 
 //! Shared vocabulary for describing detections and masks.
 //!
-//! These types say *what a model reported about a buffer*, as plain data with
-//! no decoding and no drawing behaviour. They live here, beside
-//! [`PixelFormat`](crate::PixelFormat), [`Region`](crate::Region) and
-//! [`Colorimetry`](crate::Colorimetry), because `edgefirst-tensor` is this
-//! project's datatype crate.
-//!
-//! # Why here and not in `edgefirst-decoder`
-//!
-//! `edgefirst-image` needs this vocabulary to draw — `draw_decoded_masks` and
-//! `draw_proto_masks` take nothing else — but it has no business knowing how a
-//! YOLO or ModelPack head is decoded. Defining it in the decoder made a
-//! rendering crate depend on a model-postprocessing crate, which linked
-//! `serde_json`, `serde_yaml_ng`, `unsafe-libyaml`, `ndarray-stats`,
-//! `argminmax`, `rand`, `indexmap`, `hashbrown` and `itertools` into every
-//! image build: a YAML parser, because drawing a rectangle needed
-//! [`DetectBox`]. With the vocabulary here, `image` and `decoder` are siblings
-//! over a common base instead of a stack.
-//!
-//! Nothing in this module adds a dependency to `edgefirst-tensor`: every field
-//! is a primitive or a [`TensorDyn`].
+//! These types say what a model reported about a buffer, as plain data with no
+//! decoding and no drawing behaviour. Every field is a primitive or a
+//! [`TensorDyn`].
 
 use crate::TensorDyn;
 
@@ -123,12 +106,12 @@ pub struct DetectBox {
 /// IoU evaluation, drawing detection rectangles, etc. The mask region always
 /// encloses the detection bbox.
 ///
-/// The `xmin`/`ymin`/`xmax`/`ymax` fields describe the **mask region** — the
+/// The `xmin`/`ymin`/`xmax`/`ymax` fields describe the mask region — the
 /// proto-grid-aligned crop the `segmentation` tensor was sliced from. They are
 /// quantized to the proto grid step (`1/proto_height` and `1/proto_width`,
 /// typically `1/160`), so the region's origin floors and its extent ceils
 /// relative to the companion [`DetectBox`]'s `bbox`. The detection bbox itself
-/// stays un-snapped (see EDGEAI-1304).
+/// stays un-snapped.
 #[derive(Debug)]
 pub struct Segmentation {
     /// Left-most normalized coordinate of the mask region (proto-grid
@@ -152,29 +135,18 @@ pub struct Segmentation {
     ///
     /// For semantic segmentation (e.g. ModelPack): `C=num_classes` — per-pixel
     /// class scores where the object class is the argmax index.
-    ///
-    /// A [`TensorDyn`] rather than an `ndarray::Array3<u8>`, matching
-    /// [`ProtoData`]. That is what keeps this crate free of an `ndarray`
-    /// dependency; callers who want ndarray ergonomics already have
-    /// [`TensorMapTrait::view`](crate::TensorMapTrait::view) behind the
-    /// existing optional `ndarray` feature.
     pub segmentation: TensorDyn,
 }
 
-/// Memory layout of the prototype tensor within [`ProtoData`].
-///
-/// Models may output protos in either channel-last (NHWC) or channel-first
-/// (NCHW) layout. The mask materialisation kernels dispatch on this field to
-/// avoid a costly per-frame transpose.
+/// Memory layout of the prototype tensor within [`ProtoData`]: channel-last
+/// (NHWC) or channel-first (NCHW). The mask materialisation kernels dispatch on
+/// it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProtoLayout {
     /// Channel-last: tensor shape is `[H, W, K]`, contiguous along K.
-    /// This is the traditional layout produced by the `extract_proto_data`
-    /// path after transposing from NCHW model outputs.
     Nhwc,
     /// Channel-first: tensor shape is `[K, H, W]`, each channel plane is
-    /// contiguous. Skipping the NCHW→NHWC transpose saves ~3 ms per frame
-    /// on Cortex-A53/A55 targets (819 KB for 32×160×160 protos).
+    /// contiguous.
     Nchw,
 }
 
@@ -184,9 +156,7 @@ pub enum ProtoLayout {
 /// renderer to compute `mask_coeff @ protos` directly (e.g. in a GPU fragment
 /// shader) without materializing intermediate masks.
 ///
-/// Both fields are carried as [`TensorDyn`] so downstream consumers (Rust, C
-/// API, Python) get zero-copy typed access through the HAL's shared tensor
-/// infrastructure. Dtype policy:
+/// Both fields are carried as [`TensorDyn`]. Dtype policy:
 ///
 /// | Source model | protos dtype | mask_coefficients dtype | protos.quantization |
 /// |---|---|---|---|
@@ -198,9 +168,8 @@ pub enum ProtoLayout {
 /// | f64 (narrowed) | [`TensorDyn::F32`] | [`TensorDyn::F32`] | `None` |
 ///
 /// Quantization metadata lives on the proto tensor itself via
-/// [`Tensor::quantization`](crate::Tensor::quantization) — float tensors
-/// cannot carry quantization (compile-time gated on the `IntegerType` sealed
-/// trait).
+/// [`Tensor::quantization`](crate::Tensor::quantization); float tensors cannot
+/// carry quantization.
 ///
 /// `TensorDyn` is not `Clone`, so neither is `ProtoData`. Consumers that need
 /// to share the proto buffer across threads should use `TensorDyn::clone_fd`
@@ -223,11 +192,6 @@ pub struct ProtoData {
 /// `[lx0, ly0, lx1, ly1]`. The box is canonicalised first, a degenerate
 /// (zero-span) letterbox axis maps with unit scale (no divide-by-zero), and the
 /// result is clamped to `[0, 1]`.
-///
-/// This is the single home for the inverse-letterbox transform; both
-/// `edgefirst_decoder::tiling`'s detection lift and `edgefirst_image`'s mask
-/// path call it, which is why it belongs beside the type it transforms rather
-/// than in either consumer.
 #[must_use]
 #[inline]
 pub fn unletter_norm(b: BoundingBox, lb: [f32; 4]) -> BoundingBox {
@@ -249,8 +213,6 @@ mod tests {
 
     #[test]
     fn bounding_box_is_c_compatible() {
-        // The C API exposes this layout; `#[repr(C)]` and the field order are
-        // load-bearing, not stylistic.
         assert_eq!(std::mem::size_of::<BoundingBox>(), 16);
         assert_eq!(std::mem::align_of::<BoundingBox>(), 4);
     }
@@ -270,8 +232,6 @@ mod tests {
 
     #[test]
     fn unletter_norm_canonicalises_and_clamps() {
-        // Inverted input must come back canonical (xmin <= xmax) and inside
-        // [0,1] -- the contract `image`'s mask path relies on.
         let got = unletter_norm(
             BoundingBox::new(0.9, 0.9, 0.1, 0.1),
             [0.0, 0.125, 1.0, 0.875],
@@ -284,8 +244,6 @@ mod tests {
 
     #[test]
     fn unletter_norm_survives_a_degenerate_letterbox_axis() {
-        // A zero-span axis must map with unit scale rather than dividing by
-        // zero and producing NaN/inf.
         let got = unletter_norm(BoundingBox::new(0.2, 0.2, 0.8, 0.8), [0.5, 0.0, 0.5, 1.0]);
         for v in [got.xmin, got.ymin, got.xmax, got.ymax] {
             assert!(v.is_finite(), "degenerate axis produced {v}");
@@ -294,8 +252,6 @@ mod tests {
 
     #[test]
     fn unletter_norm_removes_offset_and_rescales_by_the_content_span() {
-        // Every operand is a short binary fraction, so the exact result is
-        // representable and the comparison can be exact.
         let got = unletter_norm(
             BoundingBox::new(0.375, 0.25, 0.625, 0.5),
             [0.25, 0.125, 0.75, 0.625],

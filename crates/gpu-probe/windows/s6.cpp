@@ -3,8 +3,8 @@
 //
 // S6: device ownership. ANGLE on a device the probe created (hardware and
 // WARP), behaviour diff against the ANGLE-owned display, device lifetime
-// across display teardown, and the third option: a separate allocation
-// device whose textures reach ANGLE's device through shared handles.
+// across display teardown, and a separate allocation device whose textures
+// reach ANGLE's device through shared handles.
 #include "probe.h"
 
 #include <cstring>
@@ -150,7 +150,7 @@ void run_s6(GlSession& s) {
     inj2.shutdown();
   }
 
-  // ---- S6.4 injected WARP (the CI shape) ----------------------------------
+  // ---- S6.4 injected WARP -------------------------------------------------
   if (!warp) {
     GlSession w;
     if (w.bring_up(DisplayMode::InjectWarp)) {
@@ -164,7 +164,7 @@ void run_s6(GlSession& s) {
   }
   s.restore_current();
 
-  // ---- S6.5 third option: separate allocation device + shared handles -----
+  // ---- S6.5 separate allocation device + shared handles -------------------
   {
     AdapterInfo ad;
     D3D alloc;

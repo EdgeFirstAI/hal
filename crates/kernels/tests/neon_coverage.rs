@@ -4,10 +4,9 @@
 //! Every op path runs the NEON kernel `crates/kernels/ARCHITECTURE.md`'s tier table names on
 //! aarch64; only a CPU without NEON runs the scalar tier.
 //!
-//! A new operator adds its plan, every (input, output) dtype pair it accepts, every quant
-//! variant and its expected tier to `neon_coverage_of_every_op_path`. The int8-only ops
-//! (`binary_i8`, `matmul_i8`, `softmax_dot_i8`, `attention_i8`) enumerate their rounding
-//! (`TfliteKernels`), fused activation and requantization variants instead.
+//! The int8-only ops (`binary_i8`, `matmul_i8`, `softmax_dot_i8`, `attention_i8`) are enumerated
+//! by rounding (`TfliteKernels`), fused activation and requantization variant; the others by
+//! (input, output) dtype pair and quant variant.
 
 #![cfg(target_arch = "aarch64")]
 
@@ -48,7 +47,7 @@ const PROBS: Quant = Quant {
     zero_point: -128,
 };
 
-/// Plans checked so far, to catch an enumeration that silently shrinks.
+/// Counts the plans checked.
 #[derive(Default)]
 struct Gate {
     cases: usize,

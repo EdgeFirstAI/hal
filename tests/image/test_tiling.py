@@ -21,15 +21,13 @@ from edgefirst.image import (
 
 
 def test_tile_grid_axis_worked_example():
-    # adis-uav-model sahi(1920, 640, 0.1) origins along one axis => 0..1280.
-    # tile_grid is width-first; use a 1920x640 frame with a 640x640 tile so
-    # the y axis collapses to a single row and we read column origins.
+    # A 1920x640 frame with a 640x640 tile has a single row; read the column
+    # origins.
     specs = tile_grid(1920, 640, 640, 640, 0.1)
     xs = [s.source.x for s in specs]
     assert xs[0] == 0
     assert xs[-1] == 1920 - 640  # 1280
     assert xs == sorted(xs)
-    # adis worked example: [0, 427, 853, 1280]
     assert xs == [0, 427, 853, 1280]
 
 
@@ -55,8 +53,7 @@ def test_tile_grid_frame_smaller_than_tile_single():
 
 
 def test_tile_grid_rejects_bad_config():
-    # Same validation as TilingConfig / the C API: a degenerate overlap or tile
-    # size raises instead of generating an enormous grid.
+    # A degenerate overlap or tile size raises.
     with pytest.raises(RuntimeError, match="overlap_ratio must be in"):
         tile_grid(1920, 1080, 640, 640, 1.0)
     with pytest.raises(RuntimeError, match="overlap_ratio must be in"):
@@ -131,14 +128,7 @@ def test_alloc_tile_batch_rejects_zero_tile_size():
 
 
 def test_tile_into_round_trip():
-    """tile_into binding smoke test: it returns one placement per grid tile and
-    the packed parent is shaped to stack the tiles vertically.
-
-    This exercises the Python wiring (config -> grid -> render -> placements),
-    not pixel parity — band-vs-standalone content parity is covered by the Rust
-    ``tile_into_auto_dma_parity`` / ``tile_into_cpu_distinct_content_parity``
-    tests, which can assert exact/structural pixel equality directly.
-    """
+    """tile_into returns one placement per tile and a vertically stacked parent."""
     proc = ImageProcessor()
     cfg = TilingConfig(64, 64, overlap=0.0)
 
@@ -153,8 +143,7 @@ def test_tile_into_round_trip():
 
     assert n == 2
 
-    # Confirm the source is CPU-mappable and at least its logical size (the
-    # buffer may be row-padded); otherwise this backend can't run the render.
+    # Skip unless the source is CPU-mappable and at least its logical size.
     try:
         with src.map() as m:
             buf = np.asarray(m.numpy())

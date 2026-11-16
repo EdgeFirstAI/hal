@@ -5,8 +5,7 @@
 //!
 //! Fast-table width is selected per CPU tier ([`cpu::entropy_huffman_fast_bits`]):
 //! 10 bits everywhere except the widest tiers (aarch64 `High`, x86 `Avx2`),
-//! which take 11 — see the tier docs for the memory/hit-rate trade-off.
-//! Entries are packed `u16 = (symbol << 8) | len` (libjpeg-turbo style).
+//! which take 11. Entries are packed `u16 = (symbol << 8) | len`.
 
 use crate::error::CodecError;
 use crate::jpeg::bitstream::{BitCursor, BitStream};
@@ -21,51 +20,35 @@ pub struct HuffmanTable {
     /// Packed fast lookup: `(symbol << 8) | code_length`. `code_length == 0`
     /// means the code is longer than `fast_bits` (slow path).
     fast: Vec<u16>,
-    /// Combined code+magnitude fast lookup (stb_image `fast_ac` style). For
-    /// lookahead windows where the Huffman code **and** its magnitude bits both
-    /// fit in `fast_bits`, the entry packs the fully decoded coefficient:
+    /// Combined code+magnitude fast lookup. For lookahead windows where the
+    /// Huffman code and its magnitude bits both fit in `fast_bits`, the entry
+    /// packs the fully decoded coefficient:
     ///
     /// `(sign-extended value as u16) << 16 | run << 8 | total_bits`
     ///
-    /// where `total_bits = code_len + magnitude_bits` is the single `consume`
-    /// amount. `0` means miss (size-0 symbols other than the baked ones below,
-    /// or codes that spill past the window) — fall back to the two-step path.
+    /// where `total_bits = code_len + magnitude_bits` is the `consume` amount.
+    /// `0` means miss (size-0 symbols other than the ones below, or codes that
+    /// spill past the window).
     ///
-    /// Three size-0 symbols are baked in rather than treated as misses:
+    /// Three size-0 symbols are stored as hits:
     ///
-    /// - **DC size 0** (`is_ac == false`, symbol 0x00): predictor unchanged —
-    ///   a plain hit with `value = 0, run = 0`. Very common in flat regions.
-    /// - **EOB** (`is_ac == true`, symbol 0x00): encoded with the sentinel
-    ///   `run = 0xFF`, which forces `k += run` past 63 so the block decoder's
-    ///   *existing* bounds branch resolves end-of-block — no extra hot-path
-    ///   compare, and the two-step fallback disappears from the common exit.
-    /// - **ZRL** (`is_ac == true`, symbol 0xF0): `value = 0, run = 15` writes
-    ///   a zero into a slot the clear discipline already guarantees is zero —
-    ///   sixteen positions are skipped, matching the two-step path.
+    /// - **DC size 0** (`is_ac == false`, symbol 0x00): `value = 0, run = 0`.
+    /// - **EOB** (`is_ac == true`, symbol 0x00): the sentinel `run = 0xFF`,
+    ///   which moves `k` past 63.
+    /// - **ZRL** (`is_ac == true`, symbol 0xF0): `value = 0, run = 15`.
     ///
-    /// For DC tables the symbol *is* the size, so `run == 0` on every valid
-    /// hit and the sentinels never appear.
+    /// For DC tables the symbol is the size, so `run == 0` on every valid hit.
     fast_ac: Vec<u32>,
     /// Paired-coefficient lookup (AC tables only; empty for DC). Decodes up to
-    /// **two** coefficients per probe when both fit the lookahead window —
-    /// on COCO val2017 ~54% of AC coefficients pair at 10 bits, and the serial
-    /// peek → load → consume chain is the in-order bottleneck, so halving the
-    /// probes on paired coefficients attacks it directly.
+    /// two coefficients per probe when both fit the lookahead window.
     ///
     /// Entry: `val2:i8 << 24 | val1:i8 << 16 | run2:u4 << 12 | run1:u4 << 8 |
     /// total_bits:u8`. `0` = miss (EOB/ZRL windows, codes past the window,
     /// magnitudes over 7 bits).
     ///
-    /// Single coefficients are baked as **phantom pairs** (`val2 = 0,
-    /// run2 = 0`) so the probe branch keeps the ~94% hit rate of the single
-    /// table instead of introducing a ~50/50 pair-vs-single branch that an
-    /// in-order branch predictor would keep missing. The block decoder
-    /// discriminates real-vs-phantom *branchlessly*: it always stores `val2`
-    /// at the second position — a phantom writes `0` into the next undecoded
-    /// slot, which the clear discipline already guarantees is zero — and
-    /// advances `k` by `(val2 != 0)`. Sound because a real second value is
-    /// never zero: JPEG magnitude coding cannot encode 0 (`size ≥ 1 ⇒
-    /// |value| ≥ 1`), and `size ≤ 7 ⇒ |value| ≤ 127` fits the i8 lane.
+    /// Single coefficients are stored as phantom pairs (`val2 = 0, run2 = 0`).
+    /// The block decoder always stores `val2` at the second position and
+    /// advances `k` by `(val2 != 0)`; a real second value is never zero.
     pair_ac: Vec<u32>,
     /// Lookahead width used to index `fast`.
     fast_bits: u8,
@@ -78,10 +61,10 @@ pub struct HuffmanTable {
 }
 
 impl HuffmanTable {
-    /// Build a Huffman table using the process-wide NEON tier's fast-bit width.
+    /// Build a Huffman table using the process-wide CPU tier's fast-bit width.
     ///
-    /// `is_ac` selects the run/size interpretation of size-0 symbols when
-    /// baking the combined table — see [`Self::fast_ac`].
+    /// `is_ac` selects the run/size interpretation of size-0 symbols in the
+    /// combined table; see [`Self::fast_ac`].
     pub fn build(counts: &[u8; 16], values: &[u8], is_ac: bool) -> crate::Result<Self> {
         Self::build_with_fast_bits(counts, values, cpu::entropy_huffman_fast_bits(), is_ac)
     }
@@ -102,12 +85,8 @@ impl HuffmanTable {
             ));
         }
 
-        // The counts come straight from an attacker-controlled DHT segment, and
-        // the fast-table fill below only stays inside its allocation for a
-        // canonical prefix code: `base` is the code value shifted up to
-        // `fast_bits`, so an oversubscribed level walks off the end (three
-        // 1-bit codes put the third `base` exactly at the table length).
-        // Kraft: after `count` codes of length L, no more than 2^L can exist.
+        // Reject code lengths that are not a prefix code (Kraft): after `count`
+        // codes of length L, no more than 2^L can exist.
         let mut assigned: u32 = 0;
         for (i, &count) in counts.iter().enumerate() {
             assigned += count as u32;
@@ -156,10 +135,9 @@ impl HuffmanTable {
             code <<= 1;
         }
 
-        // Combined code+magnitude table: for every window whose code hit the
-        // fast table AND whose magnitude bits also fit in the window, bake the
-        // sign-extended coefficient value so the hot loop decodes run + value
-        // + consume-length with a single lookup.
+        // Combined code+magnitude table: for every window whose code hits the
+        // fast table and whose magnitude bits fit in the window, store the
+        // sign-extended coefficient value.
         let mut fast_ac = vec![0u32; fast_size];
         for (idx, &packed) in fast.iter().enumerate() {
             let len = (packed & 0xFF) as u8;
@@ -170,9 +148,8 @@ impl HuffmanTable {
             let run = (symbol >> 4) as u32;
             let size = symbol & 0x0F;
             if size == 0 {
-                // Size-0 symbols: bake the three meaningful ones (see the
-                // `fast_ac` field docs); everything else stays a miss so the
-                // two-step path can reject it.
+                // Size-0 symbols: store the three listed in the `fast_ac` field
+                // docs; the rest stay a miss.
                 fast_ac[idx] = match (is_ac, symbol) {
                     (false, 0x00) => len as u32,              // DC diff 0
                     (true, 0x00) => (0xFF << 8) | len as u32, // EOB sentinel
@@ -189,8 +166,7 @@ impl HuffmanTable {
             fast_ac[idx] = ((val as u16 as u32) << 16) | (run << 8) | (len + size) as u32;
         }
 
-        // Paired-coefficient table (see the `pair_ac` field docs). Decodes a
-        // window as coefficient-1 [+ coefficient-2] entirely at build time.
+        // Paired-coefficient table (see the `pair_ac` field docs).
         let mut pair_ac = Vec::new();
         if is_ac {
             pair_ac = vec![0u32; fast_size];
@@ -257,13 +233,8 @@ impl HuffmanTable {
         unsafe { *self.pair_ac.get_unchecked(window) }
     }
 
-    /// Probe the combined code+magnitude table with a `fast_bits`-wide window.
-    /// Non-zero hit ⇒ `(value << 16) | (run << 8) | total_bits`.
-    ///
-    /// Takes the cursor rather than a caller-computed index: the window is
-    /// `peek(self.fast_bits)`, so reading it here makes "index is in range" a
-    /// property of this function instead of an invariant every call site has to
-    /// re-establish for the unchecked load to stay sound.
+    /// Probe the combined code+magnitude table with a `fast_bits`-wide window
+    /// read from `cur`. Non-zero hit ⇒ `(value << 16) | (run << 8) | total_bits`.
     #[inline(always)]
     pub fn probe_fast_ac(&self, cur: &BitCursor<'_>) -> u32 {
         let window = cur.peek(self.fast_bits) as usize;
@@ -274,9 +245,7 @@ impl HuffmanTable {
 
     /// Decode one Huffman symbol from the bit cursor.
     ///
-    /// Contract: the caller refilled the buffer to ≥ 32 bits ([`BitCursor::refill`]),
-    /// covering the longest code (16) plus its magnitude bits without another
-    /// memory touch. Pure register ops on the fast path: peek → LUT → consume.
+    /// The caller must have refilled the buffer to ≥ 32 bits ([`BitCursor::refill`]).
     #[inline(always)]
     pub fn decode_symbol(&self, cur: &mut BitCursor<'_>) -> crate::Result<u8> {
         let peek = cur.peek(self.fast_bits) as usize;
@@ -290,13 +259,8 @@ impl HuffmanTable {
         self.decode_slow(cur)
     }
 
-    /// Slow Huffman decode for codes longer than `fast_bits` (rare: <1% of
-    /// symbols at 10-bit lookahead). Consumes at most 16 buffered bits, within
-    /// the caller's refill guarantee.
-    ///
-    /// Inlined for the same reason as [`BitCursor::refill_slow`]: taking
-    /// the cursor out of line escapes the pointer and pushes the bit
-    /// buffer out of registers for the whole coefficient loop.
+    /// Slow Huffman decode for codes longer than `fast_bits`. Consumes at most
+    /// 16 buffered bits.
     #[inline(always)]
     fn decode_slow(&self, cur: &mut BitCursor<'_>) -> crate::Result<u8> {
         let fb = self.fast_bits;
@@ -320,10 +284,8 @@ impl HuffmanTable {
 
 /// Per-slot DHT fingerprint plus the built LUT, reused across frames.
 ///
-/// Camera streams keep the same DHT for every frame; rebuilding the lookahead
-/// tables is then pure overhead. The LUTs are **moved** into the parse result
-/// for the decode (no `clone` of the `Vec` tables) and [`Self::restore`]d
-/// afterwards so the hot loop stays allocation-free on a cache hit.
+/// The LUTs are moved into the parse result for the decode and
+/// [`Self::restore`]d afterwards.
 #[derive(Debug, Default)]
 pub(crate) struct HuffmanCache {
     dc: [CachedDht; 4],
@@ -357,12 +319,7 @@ impl HuffmanCache {
                 return Ok(table);
             }
         }
-        // Rebuilding for a different payload: drop any table still parked in
-        // the slot. It was built for the OLD payload, and leaving it there
-        // lets a later matching intern hand it out under the new fingerprint
-        // (reachable via a duplicate DHT for the same slot within one frame,
-        // or an error exit that skipped `restore`) — decoding with the wrong
-        // codes.
+        // Drop any table left in the slot from the previous payload.
         slot.table = None;
         let table = HuffmanTable::build(counts, values, class != 0)?;
         slot.counts = *counts;
@@ -390,10 +347,7 @@ impl HuffmanCache {
 
 /// Entropy-decode result for one block: whether any AC coefficient was
 /// written, and the highest zigzag index that was written (`last_k`, 0 for a
-/// DC-only block). `last_k` is a free by-product of the scan order — zigzag
-/// indices only grow — and bounds the block's occupied zigzag prefix, which
-/// the NEON IDCT uses to pick a sparse tier without re-deriving sparsity from
-/// the coefficient vectors.
+/// DC-only block), which bounds the block's occupied zigzag prefix.
 #[derive(Debug, Clone, Copy)]
 pub struct BlockInfo {
     /// Any non-zero AC coefficient decoded (DC-only shortcut gate).
@@ -402,35 +356,21 @@ pub struct BlockInfo {
     pub last_k: u8,
 }
 
-/// Decode one 8×8 block of **quantised** DCT coefficients from the
-/// entropy-coded data. Dequantisation happens inside the IDCT kernels
-/// (libjpeg-turbo `JCOEF` model): the entropy loop stays multiply-free and the
-/// coefficient block is a 128-byte `i16` array instead of 256-byte `i32`.
+/// Decode one 8×8 block of quantised DCT coefficients from the
+/// entropy-coded data. Dequantisation happens inside the IDCT kernels.
 ///
-/// `prev_has_ac` tracks whether the shared `coeffs` scratch still holds stale AC
-/// values from the previous block. When the previous block was DC-only only
-/// `coeffs[0]` needs clearing — avoids a 128-byte memset on every MCU block
-/// (COCO 4:4:4 does ~3× more blocks than 4:2:0).
+/// `prev_has_ac` tracks whether the shared `coeffs` scratch holds AC values
+/// from the previous block. When the previous block was DC-only, only
+/// `coeffs[0]` is cleared.
 ///
-/// Refill discipline (turbo `decode_mcu_fast` shape): one [`BitCursor::refill`]
-/// per coefficient covers the Huffman code (≤ 16 bits) plus its magnitude bits
-/// (≤ 11), so everything between refills is register arithmetic. The combined
-/// `fast_ac` probe additionally resolves code + run + sign-extended value with
-/// a single table load and a single `consume` when both fit the lookahead;
-/// EOB arrives through the same probe as a `run = 0xFF` sentinel that the
-/// existing `k >= 64` bounds branch resolves (see [`HuffmanTable::fast_ac`]).
+/// One [`BitCursor::refill`] per coefficient covers the Huffman code (≤ 16
+/// bits) plus its magnitude bits (≤ 11). The combined `fast_ac` probe
+/// resolves code, run and sign-extended value with one table load and one
+/// `consume` when both fit the lookahead; EOB arrives through the same probe
+/// as a `run = 0xFF` sentinel (see [`HuffmanTable::fast_ac`]).
 ///
-/// The whole block runs on a [`BitCursor`] so the bit buffer lives in
-/// registers; state is committed back to the stream on every exit, error
-/// exits included.
-///
-/// `#[inline(never)]` is load-bearing. With the cursor pattern LLVM finds
-/// inlining this into the MCU loop attractive (it can then eliminate the
-/// cursor copies against the caller's `BitStream`), but `decode_image`'s
-/// frame already spills, and merging the two register-allocation problems
-/// costs ~20% of decode time on Cortex-A53 (measured: 7.68 ms → 9.23 ms
-/// p50 on imx8mp COCO when this inlines). Outlined, the cursor is this
-/// function's own non-escaping local and lives entirely in registers.
+/// The block runs on a [`BitCursor`]; state is committed back to the stream
+/// on every exit, error exits included.
 #[inline(never)]
 pub fn decode_block<const PAIR: bool>(
     bs: &mut BitStream<'_>,
@@ -446,9 +386,7 @@ pub fn decode_block<const PAIR: bool>(
     res
 }
 
-/// Cursor-side body of [`decode_block`]. `#[inline(always)]` so the cursor
-/// stays a provably non-escaping local of the caller and its fields live in
-/// registers for the whole coefficient loop.
+/// Cursor-side body of [`decode_block`].
 #[inline(always)]
 fn decode_block_cur<const PAIR: bool>(
     cur: &mut BitCursor<'_>,
@@ -465,10 +403,9 @@ fn decode_block_cur<const PAIR: bool>(
     }
 
     cur.refill(); // ≥ 32 bits: DC code (≤16) + DC magnitude (≤11)
-                  // Combined fast path: one lookup yields the sign-extended DC diff and the
-                  // total bits to consume. `run != 0` never occurs in a valid DC hit (the
-                  // symbol is the size, ≤ 11, and size 0 is baked with run 0), so any
-                  // non-zero-run entry falls through.
+                  // Combined fast path: one lookup yields the sign-extended DC diff and
+                  // the total bits to consume. An entry with a non-zero run falls
+                  // through.
     let dc_fa = dc_table.probe_fast_ac(cur);
     if dc_fa != 0 && dc_fa & 0xFF00 == 0 {
         cur.consume((dc_fa & 0xFF) as u8);
@@ -493,17 +430,13 @@ fn decode_block_cur<const PAIR: bool>(
         cur.refill(); // ≥ 32 bits: covers every probe below (pair total ≤ 12)
 
         // Paired fast path: up to two coefficients in one probe and one
-        // consume (~54% of COCO AC coefficients pair at 10 bits; singles hit
-        // as phantom pairs, so this branch keeps the single table's ~94% hit
-        // rate). The second store is branchless: a phantom writes value 0
-        // into the next undecoded slot — already zero by the clear
-        // discipline — and `k` advances by `(val2 != 0)`.
+        // consume. A phantom writes value 0 into the next undecoded slot and `k`
+        // advances by `(val2 != 0)`.
         let pa = if PAIR { ac_table.probe_pair_ac(cur) } else { 0 };
         if pa != 0 {
             let run1 = ((pa >> 8) & 0xF) as usize;
             let k1 = k + run1;
-            // SAFETY: k1 ≤ 63 + 15 < ZIGZAG_EXT length (320). Issued before
-            // the bounds branch to hide the L1 hit from the store below.
+            // SAFETY: k1 ≤ 63 + 15 < ZIGZAG_EXT length (320).
             let zz1 = unsafe { *crate::jpeg::types::ZIGZAG_EXT.get_unchecked(k1) } as usize;
             if k1 >= 64 {
                 return Err(CodecError::InvalidData(
@@ -514,10 +447,7 @@ fn decode_block_cur<const PAIR: bool>(
             let pos2 = k1 + 1 + ((pa >> 12) & 0xF) as usize;
             if pos2 < 64 {
                 cur.consume((pa & 0xFF) as u8);
-                // SAFETY: k1 < 64 and pos2 < 64 (checked above) — both
-                // indices come from the real zigzag prefix. A phantom's
-                // second store writes 0 at the next undecoded position
-                // (pos2 == k1 + 1), which is already zero.
+                // SAFETY: k1 < 64 and pos2 < 64 (checked above).
                 unsafe {
                     *coeffs.get_unchecked_mut(zz1) = ((pa >> 16) as u8 as i8) as i16;
                     *coeffs.get_unchecked_mut(
@@ -530,12 +460,8 @@ fn decode_block_cur<const PAIR: bool>(
                 continue;
             }
             if val2 == 0 || k1 == 63 {
-                // The block ends exactly at coefficient 1 — the entry's
-                // "second symbol" was decoded from the next block's bits at
-                // build time and must not be consumed. The single-coefficient
-                // probe is a guaranteed hit here (the pair conditions are a
-                // strict subset of its own) and carries coefficient 1's true
-                // bit count.
+                // The block ends at coefficient 1: consume only its bits, taken
+                // from the single-coefficient probe.
                 let fa = ac_table.probe_fast_ac(cur);
                 debug_assert!(fa != 0);
                 debug_assert_eq!((fa >> 8) & 0xFF, run1 as u32);
@@ -554,17 +480,14 @@ fn decode_block_cur<const PAIR: bool>(
             ));
         }
 
-        // Combined fast path: code + run + sign-extended value in one probe,
-        // one consume. Still first choice for what the pair table skips:
-        // EOB (run-0xFF sentinel), ZRL (run 15, value 0), and single
-        // coefficients with magnitudes wider than 7 bits.
+        // Combined fast path: code, run and sign-extended value in one probe
+        // and one consume. Covers EOB (run-0xFF sentinel), ZRL (run 15, value 0)
+        // and single coefficients with magnitudes wider than 7 bits.
         let fa = ac_table.probe_fast_ac(cur);
         if fa != 0 {
             cur.consume((fa & 0xFF) as u8);
             let run = ((fa >> 8) & 0xFF) as usize;
             k += run;
-            // Issued before the bounds branch so the L1 hit is underway by the
-            // time the coefficient store needs the address.
             // SAFETY: k <= 63 + 255 < ZIGZAG_EXT length (320).
             let natural_idx = unsafe { *crate::jpeg::types::ZIGZAG_EXT.get_unchecked(k) } as usize;
             if k >= 64 {
@@ -575,8 +498,7 @@ fn decode_block_cur<const PAIR: bool>(
                     "JPEG: AC coefficient past end".into(),
                 ));
             }
-            // SAFETY: k < 64 (checked above), so natural_idx came from the
-            // real zigzag prefix and is < 64.
+            // SAFETY: k < 64 (checked above), so natural_idx is < 64.
             unsafe {
                 *coeffs.get_unchecked_mut(natural_idx) = (fa >> 16) as u16 as i16;
             }
@@ -595,8 +517,7 @@ fn decode_block_cur<const PAIR: bool>(
         let size = symbol & 0x0F;
 
         if size == 0 {
-            // ZRL (0xF0) — sixteen zero coefficients; any other size-0 is invalid
-            // except EOB (handled above).
+            // ZRL (0xF0): sixteen zero coefficients; any other size-0 symbol is invalid.
             if symbol != 0xF0 {
                 return Err(CodecError::InvalidData("JPEG: invalid AC RS".into()));
             }
@@ -655,9 +576,8 @@ mod tests {
         assert_eq!(table.decode_symbol(&mut cur).unwrap(), 1);
     }
 
-    /// DC size-0 (predictor unchanged) must be a `fast_ac` hit with value 0;
-    /// the same symbol in an AC table is EOB and must carry the 0xFF run
-    /// sentinel; ZRL must decode as run 15 / value 0.
+    /// `fast_ac` stores DC size-0 as value 0, AC EOB with the 0xFF run sentinel
+    /// and ZRL as run 15 / value 0.
     #[test]
     fn fast_ac_bakes_size_zero_symbols() {
         let mut counts = [0u8; 16];
@@ -701,10 +621,7 @@ mod tests {
         assert!(result.is_err());
     }
 
-    /// A DHT segment is attacker-controlled, and only a canonical prefix code
-    /// keeps the fast-table fill inside its allocation: three 1-bit codes make
-    /// the third `base` land exactly at the table length. Rejected up front, so
-    /// a malformed table is an error rather than a panic.
+    /// Code lengths that are not a canonical prefix code are rejected.
     #[test]
     fn build_rejects_oversubscribed_code_lengths() {
         let mut counts = [0u8; 16];
@@ -719,7 +636,7 @@ mod tests {
         let values = [0u8, 1, 2, 3];
         assert!(HuffmanTable::build(&counts, &values, true).is_err());
 
-        // A full canonical code must still build: 2 one-bit codes is the limit.
+        // A full canonical code builds: two 1-bit codes.
         let mut counts = [0u8; 16];
         counts[0] = 2;
         let values = [0u8, 1];
@@ -820,9 +737,8 @@ mod tests {
         }
     }
 
-    /// DHT with 4 three-bit DC size codes and enough four-bit AC codes to
-    /// cover the shapes the pair table bakes (small runs/sizes, ZRL, EOB) plus
-    /// a size-8 symbol that must fall back to the single-coefficient probe.
+    /// DHT with 4 three-bit DC size codes and four-bit AC codes covering small
+    /// runs/sizes, ZRL, EOB and a size-8 symbol.
     fn test_tables() -> (
         HuffmanTable,
         HuffmanTable,
@@ -842,12 +758,8 @@ mod tests {
         (dc, ac, dc_counts, dc_values, ac_counts, ac_values)
     }
 
-    /// Encode blocks, decode them with `decode_block`, and compare the full
-    /// coefficient array against a directly constructed expectation.
-    /// Exercises the pair fast path, phantom singles, the block-boundary
-    /// rewind (coefficient landing exactly on zigzag 63), ZRL, EOB, and the
-    /// size-8 fallback — across consecutive blocks sharing one bit stream so
-    /// any over-consume corrupts the following block and fails loudly.
+    /// Blocks encoded then decoded with `decode_block` match the expected
+    /// coefficients across the pair, phantom, boundary, ZRL, EOB and size-8 paths.
     #[test]
     fn decode_block_roundtrip_pair_paths() {
         use crate::jpeg::types::ZIGZAG;
@@ -863,14 +775,13 @@ mod tests {
             (-1, vec![(2, 1)], true),
             // DC-only block (EOB immediately).
             (0, vec![], true),
-            // Coefficient landing exactly at zigzag 63: no EOB after —
-            // the boundary rewind must not eat the next block's bits.
+            // Coefficient landing exactly at zigzag 63: no EOB after.
             (1, vec![(15, 1), (15, -1), (15, 1), (14, 1)], false),
             // Next block right after the boundary case: pairs again.
             (3, vec![(0, -3), (0, 3)], true),
             // ZRL then a coefficient, then a size-8 value (single-probe path).
             (0, vec![(15, 1), (0, 1), (0, 200)], true),
-            // Dense run of 63 alternating values (max pair pressure).
+            // Dense run of 63 alternating values.
             (
                 -2,
                 (0..63)
@@ -952,10 +863,7 @@ mod tests {
         assert!(!bs.overran(), "stream over-consumed");
     }
 
-    /// A fingerprint change must evict any table still parked in the slot:
-    /// intern payload A, restore it, intern payload B (miss) with NO restore
-    /// (as after a decode error), then intern B again — the hit must not hand
-    /// back A's table under B's fingerprint.
+    /// A fingerprint change evicts the table left in the slot.
     #[test]
     fn cache_rebuild_evicts_stale_table() {
         let mut counts = [0u8; 16];
@@ -973,7 +881,7 @@ mod tests {
         // Payload change; the returned table is dropped without a restore.
         let _tb = cache.intern(1, 0, &counts, &values_b).unwrap();
 
-        // Same payload again: must be a freshly built B table, not stale A.
+        // Same payload again.
         let tb2 = cache.intern(1, 0, &counts, &values_b).unwrap();
         let data = [0b0000_0000];
         let bs = BitStream::new(&data, 0);
@@ -1001,13 +909,13 @@ mod tests {
 
         let t2 = cache.intern(0, 0, &counts, &values).unwrap();
         assert!(cache.dc[0].table.is_none());
-        // Same payload: intern must not rebuild (fingerprint still matches).
+        // Same payload: intern does not rebuild.
         cache.restore(
             &mut [Some(t2), None, None, None],
             &mut [None, None, None, None],
         );
 
-        // Different symbols: miss, rebuild, then a subsequent matching intern hits.
+        // Different symbols: miss, rebuild, then a matching intern hits.
         let values_miss = [0u8, 2];
         let t3 = cache.intern(0, 0, &counts, &values_miss).unwrap();
         cache.restore(
