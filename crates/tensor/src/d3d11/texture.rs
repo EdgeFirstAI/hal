@@ -2083,8 +2083,7 @@ mod tests {
                 "{fmt:?} {w}x{h}: texture width {tex_w} is narrower than the image"
             );
 
-            // The public constructor reports that width as its row stride, or
-            // no stride when the driver added no padding.
+            // The public constructor reports that width as its row stride.
             let img = crate::Tensor::<u8>::image(
                 w,
                 h,
@@ -2098,12 +2097,10 @@ mod tests {
                 tex_w,
                 "{fmt:?} {w}x{h}: Tensor::image chose another texture width"
             );
-            let natural = w.next_multiple_of(2);
-            let expected = (tex_w > natural).then_some(tex_w);
             assert_eq!(
                 img.row_stride(),
-                expected,
-                "{fmt:?} {w}x{h}: recorded row stride (texture width {tex_w}, natural {natural})"
+                Some(tex_w),
+                "{fmt:?} {w}x{h}: recorded row stride (texture width {tex_w})"
             );
         }
     }
@@ -2149,8 +2146,8 @@ mod tests {
         let texture = t.d3d11_texture().expect("a texture-backed tensor");
         assert_eq!(
             t.row_stride(),
-            (stride > w).then_some(stride),
-            "a padded texture records its width as the row stride"
+            Some(stride),
+            "a semi-planar texture records its width as the row stride"
         );
 
         // Chroma line `i` is `2 * w` bytes at combined-plane row `h + 2 * i`.

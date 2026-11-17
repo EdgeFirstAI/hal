@@ -350,6 +350,8 @@ The alignment has to hold at **both** of the places a stride is decided:
 
 Host-only backings (Mem, Shm) keep the tight natural pitch for packed and planar images so the many flat CPU consumers are unaffected; semi-planar takes the aligned pitch on every backend because its chroma-plane offset arithmetic assumes it. On macOS, IOSurface picks its own 64-aligned `bytesPerRow` and the tensor records whatever the surface reports.
 
+A semi-planar image tensor records its row stride on every backing. Its shape carries the logical width while its rows advance by at least `even(width)`, so at an odd width `map()` spans the buffer's grid only through the recorded stride. A backing with a pitch of its own (IOSurface, AHardwareBuffer, D3D11 texture) records that pitch for a semi-planar image even when it equals the natural row (639 → 640), where a packed or planar image at the same pitch records none. `records_backing_pitch` decides this for the pitched backings.
+
 An odd or merely non-multiple-of-16 width (321 → 1284 bytes, 322 → 1288, neither divisible by 64) converts on V3D and Tegra and fails on imx95 and imx8mp.
 
 ### CPU access declaration (CpuAccess)

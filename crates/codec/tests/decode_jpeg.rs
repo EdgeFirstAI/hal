@@ -682,6 +682,128 @@ fn decode_coco_grey_odd_width() {
     assert!(y_mae < 1.0, "grey luma MAE {y_mae:.3} > 1.0");
 }
 
+/// The DMA require gate: a skip here fails under `HAL_TEST_REQUIRE_DMA=1`.
+#[path = "../../tensor/tests/support/dma_require.rs"]
+#[allow(dead_code)]
+mod dma_require;
+
+/// A `width`×`height` colour gradient as a baseline JPEG.
+fn gradient_jpeg(width: u32, height: u32) -> Vec<u8> {
+    let img = image::RgbImage::from_fn(width, height, |x, y| {
+        image::Rgb([(x % 256) as u8, (y * 3 % 256) as u8, ((x + y) % 256) as u8])
+    });
+    let mut jpeg = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 90)
+        .encode_image(&img)
+        .unwrap();
+    jpeg
+}
+
+/// The bytes of a mapped semi-planar image that belong to the picture: each
+/// luma row and each interleaved chroma line, without the row padding.
+fn semi_planar_logical_bytes(
+    buf: &[u8],
+    stride: usize,
+    width: usize,
+    height: usize,
+    format: PixelFormat,
+) -> Vec<u8> {
+    let chroma = format.chroma_layout().expect("a semi-planar format");
+    let mut out = Vec::new();
+    for y in 0..height {
+        out.extend_from_slice(&buf[y * stride..y * stride + width]);
+    }
+    let line_bytes = 2 * width.div_ceil(1 << chroma.shift_x);
+    for i in 0..height.div_ceil(1 << chroma.shift_y) {
+        let at = (height + i * chroma.uv_rows_per_luma) * stride;
+        out.extend_from_slice(&buf[at..at + line_bytes]);
+    }
+    out
+}
+
+/// Decodes `jpeg` into a `capacity`-sized tensor on `memory` and returns the
+/// picture's bytes.
+fn decode_logical_bytes(
+    jpeg: &[u8],
+    capacity: (usize, usize),
+    memory: TensorMemory,
+    what: &str,
+) -> Vec<u8> {
+    let peeked = peek_info(jpeg).unwrap();
+    let mut tensor = Tensor::<u8>::image(
+        capacity.0,
+        capacity.1,
+        peeked.format,
+        Some(memory),
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    )
+    .unwrap_or_else(|e| panic!("{what}: allocate: {e}"));
+    let mut decoder = ImageDecoder::new();
+    let info = tensor
+        .load_image(&mut decoder, jpeg)
+        .unwrap_or_else(|e| panic!("{what}: decode: {e}"));
+    assert_eq!(
+        (info.width, info.height, info.format),
+        (peeked.width, peeked.height, peeked.format),
+        "{what}: decoded geometry"
+    );
+    assert_eq!(tensor.width(), Some(info.width), "{what}: logical width");
+    let stride = tensor.effective_row_stride().unwrap();
+    let map = tensor.map().unwrap_or_else(|e| panic!("{what}: map: {e}"));
+    semi_planar_logical_bytes(&map, stride, info.width, info.height, info.format)
+}
+
+/// An odd width one short of the 64-byte pitch alignment decodes into a
+/// hardware buffer exactly as it does into host memory, both at the image
+/// size and from a wider pool.
+#[test]
+fn odd_width_at_the_pitch_alignment_decodes_into_a_hardware_buffer() {
+    // Android allocates no semi-planar hardware buffer.
+    let hardware = !cfg!(target_os = "android")
+        && dma_require::available_or_skip(
+            edgefirst_tensor::is_gpu_buffer_available(),
+            "odd_width_at_the_pitch_alignment_decodes_into_a_hardware_buffer",
+        );
+    for (width, height) in [(639usize, 64usize), (127, 33)] {
+        let jpeg = gradient_jpeg(width as u32, height as u32);
+        let info = peek_info(&jpeg).unwrap();
+        assert_eq!((info.width, info.height), (width, height));
+        assert_eq!(
+            info.format.layout(),
+            edgefirst_tensor::PixelLayout::SemiPlanar,
+            "a colour JPEG decodes to a semi-planar format"
+        );
+        let pool = (width + 1, height);
+
+        let what = format!("{width}x{height} {:?} in host memory", info.format);
+        let reference = decode_logical_bytes(&jpeg, (width, height), TensorMemory::Mem, &what);
+        assert!(
+            reference.iter().filter(|&&v| v != 0).count() > reference.len() / 2,
+            "{what}: the reference decode is not blank"
+        );
+        assert_eq!(
+            decode_logical_bytes(&jpeg, pool, TensorMemory::Mem, &what),
+            reference,
+            "{what}: pool decode"
+        );
+
+        if !hardware {
+            continue;
+        }
+        let what = format!("{width}x{height} {:?} in a hardware buffer", info.format);
+        assert_eq!(
+            decode_logical_bytes(&jpeg, (width, height), TensorMemory::DmaBuf, &what),
+            reference,
+            "{what}: exact-size decode"
+        );
+        assert_eq!(
+            decode_logical_bytes(&jpeg, pool, TensorMemory::DmaBuf, &what),
+            reference,
+            "{what}: pool decode"
+        );
+    }
+}
+
 /// Fast (AAN) DCT output stays close to the accurate default, and the
 /// default decode is bit-identical to an explicit Accurate decode.
 #[test]

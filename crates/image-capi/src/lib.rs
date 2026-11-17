@@ -439,10 +439,7 @@ mod tests {
             "ef_convert_options_set_interpolation",
             "ef_convert_options_content_region",
         ] {
-            assert!(
-                h.contains(sym),
-                "image.h must declare `{sym}`"
-            );
+            assert!(h.contains(sym), "image.h must declare `{sym}`");
         }
     }
 
