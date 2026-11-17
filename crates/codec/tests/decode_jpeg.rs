@@ -682,6 +682,11 @@ fn decode_coco_grey_odd_width() {
     assert!(y_mae < 1.0, "grey luma MAE {y_mae:.3} > 1.0");
 }
 
+/// The DMA require gate: a skip here fails under `HAL_TEST_REQUIRE_DMA=1`.
+#[path = "../../tensor/tests/support/dma_require.rs"]
+#[allow(dead_code)]
+mod dma_require;
+
 /// A `width`×`height` colour gradient as a baseline JPEG.
 fn gradient_jpeg(width: u32, height: u32) -> Vec<u8> {
     let img = image::RgbImage::from_fn(width, height, |x, y| {
@@ -753,6 +758,12 @@ fn decode_logical_bytes(
 /// size and from a wider pool.
 #[test]
 fn odd_width_at_the_pitch_alignment_decodes_into_a_hardware_buffer() {
+    // Android allocates no semi-planar hardware buffer.
+    let hardware = !cfg!(target_os = "android")
+        && dma_require::available_or_skip(
+            edgefirst_tensor::is_gpu_buffer_available(),
+            "odd_width_at_the_pitch_alignment_decodes_into_a_hardware_buffer",
+        );
     for (width, height) in [(639usize, 64usize), (127, 33)] {
         let jpeg = gradient_jpeg(width as u32, height as u32);
         let info = peek_info(&jpeg).unwrap();
@@ -776,8 +787,7 @@ fn odd_width_at_the_pitch_alignment_decodes_into_a_hardware_buffer() {
             "{what}: pool decode"
         );
 
-        if !edgefirst_tensor::is_gpu_buffer_available() {
-            eprintln!("SKIPPED hardware arm: no GPU buffer allocator on this host");
+        if !hardware {
             continue;
         }
         let what = format!("{width}x{height} {:?} in a hardware buffer", info.format);

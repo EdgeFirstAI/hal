@@ -3372,8 +3372,8 @@ where
             let mut t = Self::wrap(storage);
             t.format = Some(format);
             if let TensorStorage::Dma(ref ahb) = t.storage {
-                // Records the buffer's row pitch as the row stride when it
-                // exceeds the natural stride.
+                // Records the buffer's row pitch as the row stride when
+                // `records_backing_pitch` says so.
                 let bpr = ahb.bytes_per_row();
                 if let Some(natural) = t.effective_row_stride() {
                     if records_backing_pitch(format, bpr, natural) {
@@ -8617,12 +8617,20 @@ mod tests {
         assert_eq!(s, 64);
     }
 
-    /// Host memory, plus the hardware slot where the host can allocate one.
-    fn semi_planar_pitch_memories() -> Vec<TensorMemory> {
+    /// Host memory, plus the hardware slot where the host can allocate a
+    /// semi-planar image in one. Android allocates none.
+    fn semi_planar_pitch_memories(test: &str) -> Vec<TensorMemory> {
         let mut memories = vec![TensorMemory::Mem];
         #[cfg(unix)]
         memories.push(TensorMemory::Shm);
-        if is_gpu_buffer_available() {
+        let hardware = if cfg!(target_os = "android") {
+            false
+        } else if cfg!(target_os = "linux") {
+            crate::test_support::dma_or_skip(test)
+        } else {
+            is_gpu_buffer_available()
+        };
+        if hardware {
             memories.push(TensorMemory::DmaBuf);
         }
         memories
@@ -8654,7 +8662,7 @@ mod tests {
     #[test]
     fn semi_planar_image_maps_its_whole_pitched_grid() {
         let _lock = crate::tests::fd_lock_shared();
-        for memory in semi_planar_pitch_memories() {
+        for memory in semi_planar_pitch_memories("semi_planar_image_maps_its_whole_pitched_grid") {
             for format in SEMI_PLANAR_FORMATS {
                 for width in [63, 64, 65, 127, 639, 640, 641] {
                     let what = format!("{memory:?} {format:?} {width}x16");
@@ -8676,7 +8684,9 @@ mod tests {
     #[test]
     fn configure_image_semi_planar_maps_its_whole_pitched_grid() {
         let _lock = crate::tests::fd_lock_shared();
-        for memory in semi_planar_pitch_memories() {
+        for memory in
+            semi_planar_pitch_memories("configure_image_semi_planar_maps_its_whole_pitched_grid")
+        {
             for format in SEMI_PLANAR_FORMATS {
                 for width in [639, 640] {
                     let what = format!("{memory:?} 640x48 Nv24 pool -> {format:?} {width}x16");
