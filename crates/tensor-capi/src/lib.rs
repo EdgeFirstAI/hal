@@ -601,10 +601,7 @@ mod tests {
     #[test]
     fn the_header_carries_no_hal_symbols() {
         let h = header_text();
-        assert!(
-            !h.contains("hal_"),
-            "tensor.h must not carry hal_* symbols"
-        );
+        assert!(!h.contains("hal_"), "tensor.h must not carry hal_* symbols");
     }
 
     /// Parse cbindgen's `EF_NAME = VALUE,`-style enumerator lines out of the

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Semi-planar images at an odd width one short of the row alignment (`edgefirst-tensor`).** An NV12, NV16 or NV24 image tensor on an IOSurface, AHardwareBuffer or D3D11 texture now always records its row stride, so `map()` spans the whole buffer. A 639-wide JPEG decoded into such a tensor failed with `destination buffer … < required`.
+
 ## [0.41.0] - 2026-11-16
 
 ### Added

@@ -3305,12 +3305,12 @@ where
             )?;
             let mut t = Self::wrap(storage);
             t.format = Some(format);
-            // Records the surface's `bytes_per_row` as the row stride when it
-            // exceeds the natural row stride.
+            // Records the surface's `bytes_per_row` as the row stride when
+            // `records_backing_pitch` says so.
             if let TensorStorage::Dma(ref io) = t.storage {
                 let bpr = io.bytes_per_row();
                 if let Some(natural) = t.effective_row_stride() {
-                    if bpr > natural {
+                    if records_backing_pitch(format, bpr, natural) {
                         t.set_row_stride_unchecked(bpr);
                     }
                 }
@@ -3376,11 +3376,11 @@ where
                 // exceeds the natural stride.
                 let bpr = ahb.bytes_per_row();
                 if let Some(natural) = t.effective_row_stride() {
-                    if bpr > natural {
+                    if records_backing_pitch(format, bpr, natural) {
                         log::debug!(
-                            "Tensor::image: gralloc padded the {format:?} \
-                             AHardwareBuffer pitch to {bpr} bytes (natural \
-                             {natural}); recording row stride"
+                            "Tensor::image: the {format:?} AHardwareBuffer \
+                             pitch is {bpr} bytes (natural {natural}); \
+                             recording row stride"
                         );
                         t.set_row_stride_unchecked(bpr);
                     }
@@ -3763,7 +3763,7 @@ where
             target_os = "windows"
         ))]
         if let Some(pitch) = self.storage.backing_row_stride() {
-            let active_stride = if pitch > min_stride {
+            let active_stride = if records_backing_pitch(format, pitch, min_stride) {
                 self.set_row_stride_unchecked(pitch);
                 pitch
             } else {
@@ -4785,8 +4785,24 @@ where
     }
 }
 
-/// Records the D3D11 backing's row pitch on `t` when it exceeds the natural
-/// stride for its format and width.
+/// Whether a pitched backing's row `pitch` is recorded as the row stride of
+/// an image whose format and width give the `natural` stride: a wider pitch
+/// always, an equal pitch for a semi-planar format, a narrower pitch never.
+#[cfg(all(
+    not(edgefirst_tensor_dynamic),
+    any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "android",
+        target_os = "windows"
+    )
+))]
+fn records_backing_pitch(format: PixelFormat, pitch: usize, natural: usize) -> bool {
+    pitch > natural || (pitch == natural && format.layout() == PixelLayout::SemiPlanar)
+}
+
+/// Records the D3D11 backing's row pitch on `t` when its format and width
+/// call for it (see [`records_backing_pitch`]).
 ///
 /// `t.format` must already be set.
 #[cfg(all(not(edgefirst_tensor_dynamic), target_os = "windows"))]
@@ -4801,7 +4817,7 @@ where
     let (Some(pitch), Some(natural)) = (pitch, t.effective_row_stride()) else {
         return;
     };
-    if pitch > natural {
+    if records_backing_pitch(format, pitch, natural) {
         log::debug!(
             "{what}: the D3D11 backing pitch for the {format:?} texture is {pitch} bytes \
              (natural {natural}); recording row stride"
@@ -5170,12 +5186,13 @@ where
         let Some(pitch) = self.storage.backing_row_stride() else {
             return;
         };
-        let Some((rank, rows)) = self.format.map(|f| match f.layout() {
+        let Some(format) = self.format else {
+            return;
+        };
+        let (rank, rows) = match format.layout() {
             PixelLayout::Packed => (3, shape.first().copied()),
             PixelLayout::Planar => (3, shape.get(1).copied()),
             PixelLayout::SemiPlanar => (2, shape.first().copied()),
-        }) else {
-            return;
         };
         if rank != shape.len() {
             return;
@@ -5188,7 +5205,7 @@ where
         };
         if rows == Some(1) {
             self.set_row_stride_unchecked(natural);
-        } else if pitch > natural {
+        } else if records_backing_pitch(format, pitch, natural) {
             self.set_row_stride_unchecked(pitch);
         } else {
             self.row_stride = prior;
@@ -8598,6 +8615,110 @@ mod tests {
         assert_eq!(s % 64, 0, "stride must be 64-aligned");
         assert!(s >= 32, "stride must cover the even-width minimum");
         assert_eq!(s, 64);
+    }
+
+    /// Host memory, plus the hardware slot where the host can allocate one.
+    fn semi_planar_pitch_memories() -> Vec<TensorMemory> {
+        let mut memories = vec![TensorMemory::Mem];
+        #[cfg(unix)]
+        memories.push(TensorMemory::Shm);
+        if is_gpu_buffer_available() {
+            memories.push(TensorMemory::DmaBuf);
+        }
+        memories
+    }
+
+    /// Asserts `t` records a row stride of at least `even(width)` and maps
+    /// `stride × rows` bytes.
+    fn assert_semi_planar_grid(t: &Tensor<u8>, what: &str) {
+        let width = t.width().unwrap();
+        let rows = t.shape()[0];
+        let stride = t
+            .row_stride()
+            .unwrap_or_else(|| panic!("{what}: a semi-planar tensor must record its row stride"));
+        assert!(
+            stride >= width.next_multiple_of(2),
+            "{what}: stride {stride} splits a chroma pair at width {width}"
+        );
+        let map = t.map().unwrap_or_else(|e| panic!("{what}: map: {e}"));
+        assert_eq!(
+            map.as_slice().len(),
+            stride * rows,
+            "{what}: the map must span every pitched row"
+        );
+    }
+
+    const SEMI_PLANAR_FORMATS: [PixelFormat; 3] =
+        [PixelFormat::Nv12, PixelFormat::Nv16, PixelFormat::Nv24];
+
+    #[test]
+    fn semi_planar_image_maps_its_whole_pitched_grid() {
+        let _lock = crate::tests::fd_lock_shared();
+        for memory in semi_planar_pitch_memories() {
+            for format in SEMI_PLANAR_FORMATS {
+                for width in [63, 64, 65, 127, 639, 640, 641] {
+                    let what = format!("{memory:?} {format:?} {width}x16");
+                    let t = Tensor::<u8>::image(
+                        width,
+                        16,
+                        format,
+                        Some(memory),
+                        crate::CpuAccess::ReadWrite,
+                    )
+                    .unwrap_or_else(|e| panic!("{what}: {e}"));
+                    assert_eq!(t.width(), Some(width), "{what}: logical width");
+                    assert_semi_planar_grid(&t, &what);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn configure_image_semi_planar_maps_its_whole_pitched_grid() {
+        let _lock = crate::tests::fd_lock_shared();
+        for memory in semi_planar_pitch_memories() {
+            for format in SEMI_PLANAR_FORMATS {
+                for width in [639, 640] {
+                    let what = format!("{memory:?} 640x48 Nv24 pool -> {format:?} {width}x16");
+                    let mut t = Tensor::<u8>::image(
+                        640,
+                        48,
+                        PixelFormat::Nv24,
+                        Some(memory),
+                        crate::CpuAccess::ReadWrite,
+                    )
+                    .unwrap_or_else(|e| panic!("{what}: {e}"));
+                    t.configure_image(width, 16, format)
+                        .unwrap_or_else(|e| panic!("{what}: {e}"));
+                    assert_eq!(t.width(), Some(width), "{what}: logical width");
+                    assert_semi_planar_grid(&t, &what);
+                }
+            }
+        }
+    }
+
+    /// `set_logical_shape` adopts the backing's pitch for a semi-planar shape
+    /// on a tensor that arrives with no stride recorded.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn set_logical_shape_semi_planar_maps_its_whole_pitched_grid() {
+        let _lock = crate::tests::fd_lock_shared();
+        let mut t = Tensor::<u8>::image(
+            640,
+            24,
+            PixelFormat::Grey,
+            Some(TensorMemory::DmaBuf),
+            crate::CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        assert_eq!(t.row_stride(), None, "a 64-aligned grey row is flat");
+        t.reshape(&[24, 640]).unwrap();
+        t.set_format(PixelFormat::Nv12).unwrap();
+        assert_eq!(t.row_stride(), None, "set_format records no stride");
+
+        t.set_logical_shape(&[24, 639]).unwrap();
+        assert_eq!(t.width(), Some(639));
+        assert_semi_planar_grid(&t, "IOSurface Grey 640x24 -> Nv12 [24, 639]");
     }
 
     #[test]
