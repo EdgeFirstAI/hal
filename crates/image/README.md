@@ -157,6 +157,7 @@ Conversion behaviour:
 - `EDGEFIRST_COLORIMETRY` — `fast` (default) or `exact`. `fast` keeps single-plane NV12 on the driver's YUV sampler even when its colorimetry does not match; `exact` forces the in-shader matrix. See [ARCHITECTURE.md § Colorimetry](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/ARCHITECTURE.md#colorimetry-1).
 - `EDGEFIRST_NV_CONVERT_PATH` — `auto` (default), `sampler`, or `shader`. Pins the NV12 GPU conversion path for A/B measurement.
 - `EDGEFIRST_GL_SERIALIZE` — `full` or `lifecycle`. Overrides the per-driver GL serialization policy.
+- `EDGEFIRST_GL_CPU_LATENCY` — `on` or `off`. Whether GL operations hold a CPU wake-latency request on `/dev/cpu_dma_latency` (Linux) while they run; on by default for Adreno. The device must be writable by the process. See [Qualcomm Adreno on Linux](https://github.com/EdgeFirstAI/hal/blob/main/README.md#qualcomm-adreno-on-linux) for granting access without root.
 - `EDGEFIRST_PROTO_COMPUTE` — Set to `1` to enable the experimental GLES 3.1 compute shader path for proto repack. Requires GLES 3.1 hardware.
 
 ## Segmentation Mask Rendering

@@ -1568,6 +1568,20 @@ Correctness under parallelism is pinned by
 inputs × barrier × per-processor oracles, run on every lane) and the
 ignored on-demand `stress_parallel_processors_oracle` board tool.
 
+## GL CPU Wake Latency (Adreno on Linux)
+
+On Adreno with the Linux KGSL driver, a GL operation's completion reaches the caller through several thread wake-ups: the caller hands the message to the GL worker, the GPU completion interrupt wakes the `kgsl_dispatcher` kernel thread, which wakes `kgsl-events`, which wakes the worker blocked in `glFinish`, which replies to the caller. While the GPU runs, the cpuidle governor puts those cores into idle states whose exit latency is 1.45–1.76 ms on the IQ-9075, and each wake-up then costs 300–500 µs.
+
+`GLProcessorThreaded` holds a process-wide CPU latency request on `/dev/cpu_dma_latency` (`gl/cpu_latency.rs`) from the moment it sends a GPU-bound message (`convert`, `convert_deferred`, `flush`, `convert_with_fence`, `draw_decoded_masks`, `draw_proto_masks`) until the reply arrives. The request is reference-counted across processors: the first holder writes 0 µs, the last one releases it. Between operations the cores reach their deep idle states as usual.
+
+| | Policy |
+|---|---|
+| Default | On for Adreno (`PlatformCaps::cpu_latency_qos`), off for every other renderer |
+| Override | `EDGEFIRST_GL_CPU_LATENCY=on` or `off`, read when the processor is created |
+| Without write access to the device | One info log naming the overhead and the device; operations run without the request |
+
+Measurements and the udev setup for running without root are in the [README](https://github.com/EdgeFirstAI/hal/blob/main/README.md#qualcomm-adreno-on-linux).
+
 ## Tracing Spans
 
 `ImageProcessor::convert()`, `materialize_masks()`, and `draw_decoded_masks()`

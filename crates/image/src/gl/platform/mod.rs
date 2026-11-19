@@ -57,6 +57,8 @@ pub(crate) struct PlatformCaps {
     /// Whether `GL_EXT_texture_format_BGRA8888` is available, which makes
     /// BGRA a renderable destination format.
     pub(crate) has_bgra: bool,
+    /// Whether GL operations hold a CPU wake-latency request by default.
+    pub(crate) cpu_latency_qos: bool,
 }
 
 /// Platform-neutral identity of a packed render surface: the float paths
