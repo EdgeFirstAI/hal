@@ -3,7 +3,7 @@
 
 #![cfg(target_os = "linux")]
 
-use crate::colorimetry::effective_colorimetry;
+use crate::colorimetry::{effective_colorimetry, same_yuv_coding, tag_yuv_destination};
 use crate::{CPUProcessor, Error, Flip, ImageProcessorTrait, ResolvedCrop, Result, Rotation};
 use edgefirst_tensor::{
     ColorEncoding, ColorRange, Colorimetry, DType, PixelFormat, Tensor, TensorDyn, TensorMemory,
@@ -120,6 +120,7 @@ fn pixelfmt_to_fourcc(fmt: PixelFormat) -> FourCharCode {
 pub struct G2DProcessor {
     g2d: G2D,
     interpolation: crate::Interpolation,
+    soft_declines: bool,
 }
 
 unsafe impl Send for G2DProcessor {}
@@ -140,7 +141,23 @@ impl G2DProcessor {
         Ok(Self {
             g2d,
             interpolation: crate::Interpolation::default(),
+            soft_declines: true,
         })
+    }
+
+    /// Whether G2D returns `NotSupported` for conversions the CPU runs exactly,
+    /// so a caller with a CPU fallback can take them. On by default. With it
+    /// off, a YUV-to-YUV conversion into an untagged destination whose
+    /// colorimetry would differ from the source's is written in the source's
+    /// colorimetry and tagged with it.
+    pub fn set_soft_declines(&mut self, enabled: bool) {
+        self.soft_declines = enabled;
+    }
+
+    /// Test hook: whether soft declines apply.
+    #[cfg(test)]
+    pub(crate) fn soft_declines(&self) -> bool {
+        self.soft_declines
     }
 
     /// Sets how resizing converts resample (see [`crate::Interpolation`]).
@@ -209,8 +226,24 @@ impl G2DProcessor {
         // conversion: the source for YUV→RGB, the destination for RGB→YUV.
         // RGB→RGB leaves the matrix untouched. Full-range YUV and BT.2020 are
         // declined.
+        // A YUV→YUV pair is written in the source's coding. When the
+        // destination's coding differs, a tagged destination is declined, and
+        // an untagged one is declined while soft declines are on, otherwise
+        // tagged with the source's colorimetry after the blit.
         let src_is_yuv = src_fmt.is_yuv();
         let dst_is_yuv = dst_fmt.is_yuv();
+        let mut dst_tag = None;
+        if src_is_yuv && dst_is_yuv {
+            let src_cm = effective_colorimetry(src_dyn);
+            if !same_yuv_coding(&src_cm, &effective_colorimetry(dst_dyn)) {
+                if dst_dyn.colorimetry().is_some() || self.soft_declines {
+                    return Err(Error::NotSupported(format!(
+                        "G2D cannot convert {src_fmt} to {dst_fmt} between different colorimetries"
+                    )));
+                }
+                dst_tag = Some(src_cm);
+            }
+        }
         if src_is_yuv || dst_is_yuv {
             let cm = if src_is_yuv {
                 effective_colorimetry(src_dyn)
@@ -364,6 +397,9 @@ impl G2DProcessor {
             log::trace!("g2d int8 XOR 0x80 post-pass takes {:?}", start.elapsed());
         }
 
+        if dst_tag.is_some() {
+            dst_dyn.set_colorimetry(dst_tag);
+        }
         Ok(())
     }
 }
@@ -408,7 +444,9 @@ impl ImageProcessorTrait for G2DProcessor {
                 "G2D scales with a fixed filter; Interpolation::Nearest resizes elsewhere".into(),
             ));
         }
-        self.convert_impl(src, dst, rotation, flip, crop)
+        self.convert_impl(src, dst, rotation, flip, crop)?;
+        tag_yuv_destination(dst);
+        Ok(())
     }
 
     fn draw_decoded_masks(

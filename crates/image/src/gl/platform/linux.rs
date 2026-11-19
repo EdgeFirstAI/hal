@@ -11,7 +11,7 @@
 use super::super::context::{egl_ext, Egl, GlContext};
 use super::super::dma_import::DmaImportAttrs;
 use super::super::EglDisplayKind;
-use super::GlPlatform;
+use super::{GlPlatform, NvDstPlanes};
 use edgefirst_egl as egl;
 use edgefirst_tensor::{PixelFormat, Tensor, TensorDyn};
 use std::rc::Rc;
@@ -252,6 +252,34 @@ impl GlPlatform for LinuxEgl {
     ) -> crate::Result<EglImage> {
         let attrs = DmaImportAttrs::from_tensor_nv_chroma_gr88(img, fmt)?;
         new_egl_image_owned(display, egl_ext::LINUX_DMA_BUF, &attrs.to_egl_attribs())
+    }
+
+    const NV12_DST: bool = true;
+
+    /// A single-plane destination imports `Combined`, a multiplane one
+    /// `Split`.
+    fn import_nv12_dst(
+        display: &GlContext,
+        img: &Tensor<u8>,
+    ) -> crate::Result<NvDstPlanes<EglImage>> {
+        let import = |attrs: &DmaImportAttrs| {
+            new_egl_image_owned(display, egl_ext::LINUX_DMA_BUF, &attrs.to_egl_attribs())
+        };
+        if img.is_multiplane() {
+            let (luma, chroma) = DmaImportAttrs::from_tensor_nv12_dst_split(img)?;
+            Ok(NvDstPlanes::Split {
+                luma: import(&luma)?,
+                chroma: import(&chroma)?,
+                chroma_rows: chroma.height as u32,
+            })
+        } else {
+            let attrs = DmaImportAttrs::from_tensor_nv12_dst_r8(img)?;
+            Ok(NvDstPlanes::Combined {
+                plane: import(&attrs)?,
+                width: attrs.width as u32,
+                height: attrs.height as u32,
+            })
+        }
     }
 }
 

@@ -1280,6 +1280,14 @@ mod tc_precision {
                 "LUMA_2D_INT8_FRAGMENT",
                 super::super::shaders_common::LUMA_2D_INT8_FRAGMENT,
             ),
+            (
+                "NV12_LUMA_FRAGMENT",
+                super::super::shaders_common::NV12_LUMA_FRAGMENT,
+            ),
+            (
+                "NV12_CHROMA_R8_FRAGMENT",
+                super::super::shaders_common::NV12_CHROMA_R8_FRAGMENT,
+            ),
         ]
     }
 

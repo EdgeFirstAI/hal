@@ -42,6 +42,24 @@ pub(crate) struct ColorParams {
     pub dst_full_range: bool,
 }
 
+impl ColorParams {
+    /// Parameters of one resolved `(encoding, range)` on both sides.
+    pub(crate) fn uniform(
+        encoding: edgefirst_tensor::ColorEncoding,
+        range: edgefirst_tensor::ColorRange,
+    ) -> Self {
+        let full = range == edgefirst_tensor::ColorRange::Full;
+        ColorParams {
+            matrix: crate::colorimetry::yuv_matrix(encoding),
+            range: crate::colorimetry::yuv_range(range),
+            encoding,
+            range_kind: range,
+            src_full_range: full,
+            dst_full_range: full,
+        }
+    }
+}
+
 /// CPUConverter implements the ImageProcessor trait using the fallback CPU
 /// implementation for image processing.
 #[derive(Debug)]
@@ -191,6 +209,17 @@ fn tensor_row_stride(tensor: &Tensor<u8>) -> usize {
         let fmt = tensor.format().unwrap_or(PixelFormat::Rgb);
         row_stride_for(w, fmt)
     })
+}
+
+/// The luma and chroma row strides of a semi-planar tensor: each plane's
+/// explicit stride, else the width rounded up to even.
+pub(crate) fn semi_planar_strides(tensor: &Tensor<u8>) -> (usize, usize) {
+    let default = tensor.width().unwrap_or(0).next_multiple_of(2);
+    let luma = tensor.effective_row_stride().unwrap_or(default);
+    let chroma = tensor
+        .chroma()
+        .map_or(luma, |c| c.effective_row_stride().unwrap_or(default));
+    (luma, chroma)
 }
 
 /// The `(rows, row_bytes)` of an image tensor's **logical** pixel surface: how
@@ -442,6 +471,7 @@ impl CPUProcessor {
         matches!(
             (src, dst),
             (Nv12, Rgb)
+                | (Nv12, Nv12)
                 | (Nv12, Rgba)
                 | (Nv12, Grey)
                 | (Nv16, Rgb)
@@ -458,6 +488,7 @@ impl CPUProcessor {
                 | (Yuyv, PlanarRgb)
                 | (Yuyv, PlanarRgba)
                 | (Yuyv, Nv16)
+                | (Yuyv, Nv12)
                 | (Vyuy, Rgb)
                 | (Vyuy, Rgba)
                 | (Vyuy, Grey)
@@ -465,6 +496,7 @@ impl CPUProcessor {
                 | (Vyuy, PlanarRgb)
                 | (Vyuy, PlanarRgba)
                 | (Vyuy, Nv16)
+                | (Vyuy, Nv12)
                 | (Rgba, Rgb)
                 | (Rgba, Rgba)
                 | (Rgba, Grey)
@@ -472,6 +504,7 @@ impl CPUProcessor {
                 | (Rgba, PlanarRgb)
                 | (Rgba, PlanarRgba)
                 | (Rgba, Nv16)
+                | (Rgba, Nv12)
                 | (Rgb, Rgb)
                 | (Rgb, Rgba)
                 | (Rgb, Grey)
@@ -479,6 +512,7 @@ impl CPUProcessor {
                 | (Rgb, PlanarRgb)
                 | (Rgb, PlanarRgba)
                 | (Rgb, Nv16)
+                | (Rgb, Nv12)
                 | (Grey, Rgb)
                 | (Grey, Rgba)
                 | (Grey, Grey)
@@ -486,6 +520,7 @@ impl CPUProcessor {
                 | (Grey, PlanarRgb)
                 | (Grey, PlanarRgba)
                 | (Grey, Nv16)
+                | (Grey, Nv12)
                 | (Nv12, Bgra)
                 | (Yuyv, Bgra)
                 | (Vyuy, Bgra)
@@ -518,6 +553,7 @@ impl CPUProcessor {
         use PixelFormat::*;
         match (src_fmt, dst_fmt) {
             (Nv12, Rgb) => Self::convert_nv12_to_rgb(src, dst, cp),
+            (Nv12, Nv12) => Self::convert_nv12_to_nv12(src, dst),
             (Nv12, Rgba) => Self::convert_nv12_to_rgba(src, dst, cp),
             (Nv12, Grey) => Self::convert_nv12_to_grey(src, dst, cp),
             (Yuyv, Rgb) => Self::convert_yuyv_to_rgb(src, dst, cp),
@@ -527,6 +563,7 @@ impl CPUProcessor {
             (Yuyv, PlanarRgb) => Self::convert_yuyv_to_8bps(src, dst, cp),
             (Yuyv, PlanarRgba) => Self::convert_yuyv_to_prgba(src, dst, cp),
             (Yuyv, Nv16) => Self::convert_yuyv_to_nv16(src, dst),
+            (Yuyv, Nv12) => Self::convert_yuyv_to_nv12(src, dst),
             (Vyuy, Rgb) => Self::convert_vyuy_to_rgb(src, dst, cp),
             (Vyuy, Rgba) => Self::convert_vyuy_to_rgba(src, dst, cp),
             (Vyuy, Grey) => Self::convert_vyuy_to_grey(src, dst, cp),
@@ -534,6 +571,7 @@ impl CPUProcessor {
             (Vyuy, PlanarRgb) => Self::convert_vyuy_to_8bps(src, dst, cp),
             (Vyuy, PlanarRgba) => Self::convert_vyuy_to_prgba(src, dst, cp),
             (Vyuy, Nv16) => Self::convert_vyuy_to_nv16(src, dst),
+            (Vyuy, Nv12) => Self::convert_vyuy_to_nv12(src, dst),
             (Rgba, Rgb) => Self::convert_rgba_to_rgb(src, dst),
             (Rgba, Rgba) => Self::copy_image(src, dst),
             (Rgba, Grey) => Self::convert_rgba_to_grey(src, dst),
@@ -541,6 +579,7 @@ impl CPUProcessor {
             (Rgba, PlanarRgb) => Self::convert_rgba_to_8bps(src, dst),
             (Rgba, PlanarRgba) => Self::convert_rgba_to_prgba(src, dst),
             (Rgba, Nv16) => Self::convert_rgba_to_nv16(src, dst, cp),
+            (Rgba, Nv12) => Self::convert_rgba_to_nv12(src, dst, cp),
             (Rgb, Rgb) => Self::copy_image(src, dst),
             (Rgb, Rgba) => Self::convert_rgb_to_rgba(src, dst),
             (Rgb, Grey) => Self::convert_rgb_to_grey(src, dst),
@@ -548,6 +587,7 @@ impl CPUProcessor {
             (Rgb, PlanarRgb) => Self::convert_rgb_to_8bps(src, dst),
             (Rgb, PlanarRgba) => Self::convert_rgb_to_prgba(src, dst),
             (Rgb, Nv16) => Self::convert_rgb_to_nv16(src, dst, cp),
+            (Rgb, Nv12) => Self::convert_rgb_to_nv12(src, dst, cp),
             (Grey, Rgb) => Self::convert_grey_to_rgb(src, dst),
             (Grey, Rgba) => Self::convert_grey_to_rgba(src, dst),
             (Grey, Grey) => Self::copy_image(src, dst),
@@ -555,6 +595,7 @@ impl CPUProcessor {
             (Grey, PlanarRgb) => Self::convert_grey_to_8bps(src, dst),
             (Grey, PlanarRgba) => Self::convert_grey_to_prgba(src, dst),
             (Grey, Nv16) => Self::convert_grey_to_nv16(src, dst, cp),
+            (Grey, Nv12) => Self::convert_grey_to_nv12(src, dst, cp),
 
             (Nv16, Rgb) => Self::convert_nv16_to_rgb(src, dst, cp),
             (Nv16, Rgba) => Self::convert_nv16_to_rgba(src, dst, cp),
@@ -613,6 +654,7 @@ impl CPUProcessor {
         }
     }
 
+    #[cfg_attr(not(any(test, target_os = "linux")), allow(dead_code))]
     /// Tensor<u8>-based fill_image_outside_crop. `device_interior` marks an
     /// interior a device rendered, which makes this border a partial write.
     pub(crate) fn fill_image_outside_crop_u8(
@@ -621,20 +663,43 @@ impl CPUProcessor {
         crop: Rect,
         device_interior: bool,
     ) -> Result<()> {
-        let dst_fmt = dst.format().unwrap();
-        let dst_w = dst.width().unwrap();
-        let dst_h = dst.height().unwrap();
         // The YUV fill encoding is resolved from the destination tensor.
         // RGB/Grey fills ignore these params.
         let cm = crate::colorimetry::resolve_colorimetry(dst.colorimetry(), dst.height());
-        let cp = ColorParams {
-            matrix: crate::colorimetry::yuv_matrix(cm.encoding.unwrap()),
-            range: crate::colorimetry::yuv_range(cm.range.unwrap()),
-            encoding: cm.encoding.unwrap(),
-            range_kind: cm.range.unwrap(),
-            src_full_range: cm.range == Some(edgefirst_tensor::ColorRange::Full),
-            dst_full_range: cm.range == Some(edgefirst_tensor::ColorRange::Full),
-        };
+        let cp = ColorParams::uniform(cm.encoding.unwrap(), cm.range.unwrap());
+        Self::fill_image_outside_crop_with_params(dst, rgba, crop, device_interior, cp)
+    }
+
+    /// As [`Self::fill_image_outside_crop_u8`], encoding a YUV fill colour
+    /// with `cp`.
+    pub(crate) fn fill_image_outside_crop_with_params(
+        dst: &mut Tensor<u8>,
+        rgba: [u8; 4],
+        crop: Rect,
+        device_interior: bool,
+        cp: ColorParams,
+    ) -> Result<()> {
+        let dst_fmt = dst.format().unwrap();
+        let dst_w = dst.width().unwrap();
+        let dst_h = dst.height().unwrap();
+        if dst_fmt == PixelFormat::Nv12 {
+            let yuyv = Self::rgba_to_yuyv(rgba, cp);
+            return Self::with_nv12_dst_mapped(
+                dst,
+                device_interior,
+                |luma, luma_stride, chroma, chroma_stride| {
+                    Self::fill_image_outside_crop_yuv_planes(
+                        (luma, luma_stride),
+                        (chroma, chroma_stride),
+                        (dst_w, dst_h),
+                        yuyv[0],
+                        [yuyv[1], yuyv[3]],
+                        crop,
+                        2,
+                    )
+                },
+            );
+        }
         let dst_stride = tensor_row_stride(dst);
         let mut dst_map = if device_interior {
             dst.map_for_partial_write()?
@@ -691,7 +756,13 @@ impl CPUProcessor {
             PlanarRgba => Self::fill_image_outside_crop_planar(dst, rgba, crop),
             Nv16 => {
                 let yuyv = Self::rgba_to_yuyv(rgba, cp);
-                Self::fill_image_outside_crop_yuv_semiplanar(dst, yuyv[0], [yuyv[1], yuyv[3]], crop)
+                Self::fill_image_outside_crop_yuv_semiplanar(
+                    dst,
+                    yuyv[0],
+                    [yuyv[1], yuyv[3]],
+                    crop,
+                    1,
+                )
             }
             _ => Err(Error::Internal(format!(
                 "Found unexpected destination {fmt}",
@@ -814,7 +885,9 @@ impl ImageProcessorTrait for CPUProcessor {
             }
         };
         self.options = processor_options;
-        result
+        result?;
+        crate::colorimetry::tag_yuv_destination(dst);
+        Ok(())
     }
 
     fn draw_decoded_masks(
@@ -1170,15 +1243,23 @@ impl CPUProcessor {
 
         crop.check_crop_dims(src_w, src_h, dst_w, dst_h)?;
 
+        if dst_fmt == Nv12 && (!dst_w.is_multiple_of(2) || !dst_h.is_multiple_of(2)) {
+            return Err(Error::NotSupported(format!(
+                "NV12 destination must have even width and height, got {dst_w}x{dst_h}"
+            )));
+        }
+
         // Determine intermediate format for the resize step
         let intermediate = match (src_fmt, dst_fmt) {
             (Nv12, Rgb) => Rgb,
+            (Nv12, Nv12) => Rgba,
             (Nv12, Rgba) => Rgba,
             (Nv12, Grey) => Grey,
             (Nv12, Yuyv) => Rgba,
             (Nv12, Nv16) => Rgba,
             (Nv12, PlanarRgb) => Rgb,
             (Nv12, PlanarRgba) => Rgba,
+            (Nv16 | Nv24, Nv12) => Rgba,
             (Nv16, PlanarRgb) => Rgb,
             (Nv16, PlanarRgba) => Rgba,
             (Nv24, PlanarRgb) => Rgb,
@@ -1190,6 +1271,7 @@ impl CPUProcessor {
             (Yuyv, PlanarRgb) => Rgb,
             (Yuyv, PlanarRgba) => Rgba,
             (Yuyv, Nv16) => Rgba,
+            (Yuyv | Vyuy, Nv12) => Rgba,
             (Vyuy, Rgb) => Rgb,
             (Vyuy, Rgba) => Rgba,
             (Vyuy, Grey) => Grey,
@@ -1204,6 +1286,7 @@ impl CPUProcessor {
             (Rgba, PlanarRgb) => Rgba,
             (Rgba, PlanarRgba) => Rgba,
             (Rgba, Nv16) => Rgba,
+            (Rgba, Nv12) => Rgba,
             (Rgb, Rgb) => Rgb,
             (Rgb, Rgba) => Rgb,
             (Rgb, Grey) => Grey,
@@ -1211,6 +1294,7 @@ impl CPUProcessor {
             (Rgb, PlanarRgb) => Rgb,
             (Rgb, PlanarRgba) => Rgb,
             (Rgb, Nv16) => Rgb,
+            (Rgb, Nv12) => Rgb,
             (Grey, Rgb) => Rgb,
             (Grey, Rgba) => Rgba,
             (Grey, Grey) => Grey,
@@ -1218,6 +1302,8 @@ impl CPUProcessor {
             (Grey, PlanarRgb) => Grey,
             (Grey, PlanarRgba) => Grey,
             (Grey, Nv16) => Grey,
+            (Grey, Nv12) if crop.dst_color.is_some() => Rgb,
+            (Grey, Nv12) => Grey,
             (Nv12, Bgra) => Rgba,
             (Yuyv, Bgra) => Rgba,
             (Vyuy, Bgra) => Rgba,
@@ -1266,12 +1352,23 @@ impl CPUProcessor {
 
         // The colorimetry of a single conversion comes from its YUV side: the
         // source for YUV→RGB, the destination for RGB→YUV.
-        let direct_is_yuv_src = matches!(src_fmt, Nv12 | Nv16 | Nv24 | Yuyv | Vyuy);
+        let direct_is_yuv_src = src_fmt.is_yuv();
         let direct_params = if direct_is_yuv_src {
             src_params
         } else {
             dst_params
         };
+        // A YUV→YUV pair is converted directly only between equal codings;
+        // otherwise it is decoded to the intermediate and re-encoded.
+        let recodes_yuv = direct_is_yuv_src
+            && dst_fmt.is_yuv()
+            && (src_params.encoding, src_params.range_kind)
+                != (dst_params.encoding, dst_params.range_kind);
+        if recodes_yuv && dst_fmt == Vyuy {
+            return Err(Error::NotSupported(format!(
+                "Conversion from {src_fmt} to {dst_fmt} between different colorimetries"
+            )));
+        }
 
         // Fused NV→planar: decodes the YUV source into packed RGB one row strip
         // at a time and deinterleaves each strip into the destination planes.
@@ -1320,7 +1417,10 @@ impl CPUProcessor {
         }
 
         // check if a direct conversion can be done
-        if !need_resize_flip_rotation && Self::support_conversion_pf(src_fmt, dst_fmt) {
+        if !need_resize_flip_rotation
+            && !recodes_yuv
+            && Self::support_conversion_pf(src_fmt, dst_fmt)
+        {
             return Self::convert_format_pf(src, dst, src_fmt, dst_fmt, direct_params);
         }
 
@@ -1434,6 +1534,14 @@ impl CPUProcessor {
                 let _s = tracing::trace_span!("image.convert.cpu.resize_flip_rotate").entered();
                 self.resize_flip_rotate_pf(tmp, &mut tmp2, tmp_fmt, rotation, flip, crop)?;
             }
+            // Fills the intermediate outside the placement with the fill colour.
+            if let (Some(dst_rect), Some(dst_color)) = (crop.dst_rect, crop.dst_color) {
+                if dst_rect != Rect::new(0, 0, dst_w, dst_h) {
+                    Self::fill_image_outside_crop_with_params(
+                        &mut tmp2, dst_color, dst_rect, false, dst_params,
+                    )?;
+                }
+            }
             {
                 let _s = tracing::trace_span!(
                     "image.convert.cpu.format_convert",
@@ -1461,7 +1569,9 @@ impl CPUProcessor {
                 height: dst_h,
             };
             if dst_rect != full_rect {
-                Self::fill_image_outside_crop_u8(dst, dst_color, dst_rect, false)?;
+                Self::fill_image_outside_crop_with_params(
+                    dst, dst_color, dst_rect, false, dst_params,
+                )?;
             }
         }
 

@@ -19,7 +19,7 @@
 use super::super::iosurface_import;
 use super::super::Egl;
 use super::macos::ApplePlatform;
-use super::GlPlatform;
+use super::{GlPlatform, NvDstPlanes};
 use crate::{Error, Result};
 use edgefirst_egl as egl;
 use edgefirst_tensor::{DType, PixelFormat, Tensor, TensorDyn};
@@ -320,6 +320,7 @@ impl GlPlatform for AngleClientBuffer {
     const ZERO_COPY_FLOAT: super::super::float_dispatch::ZeroCopyFloatSet =
         super::super::float_dispatch::ZeroCopyFloatSet::PlanarF16;
     const EXTERNAL_OES: bool = false;
+    const NV12_DST: bool = true;
 
     fn load_gl_once(_display: &AngleDisplay) {
         // Loaded once at shared-display init.
@@ -578,6 +579,22 @@ impl GlPlatform for AngleClientBuffer {
             )?
         };
         Ok(IoSurfacePbuffer { shared, surface })
+    }
+
+    fn import_nv12_dst(
+        display: &AngleDisplay,
+        img: &Tensor<u8>,
+    ) -> Result<NvDstPlanes<IoSurfacePbuffer>> {
+        let (width, height) = img.iosurface_physical_dims().ok_or_else(|| {
+            Error::NotSupported(
+                "GL convert: NV12 destination has no IOSurface physical dims".into(),
+            )
+        })?;
+        Ok(NvDstPlanes::Combined {
+            plane: Self::import_buffer_nv_r8(display, img, PixelFormat::Nv12)?,
+            width: width as u32,
+            height: height as u32,
+        })
     }
 }
 

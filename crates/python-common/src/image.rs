@@ -1058,8 +1058,10 @@ impl PyImageProcessor {
                 Ok(())
             })?;
             let recorded = crate::interop::recorded_gpu_write(rendered.as_ref());
+            let colorimetry = rendered.as_ref().colorimetry();
             drop(rendered);
             crate::interop::publish_gpu_write(dst, recorded);
+            crate::interop::publish_colorimetry(dst, colorimetry);
         } else {
             // A PBO-backed argument: convert with the GIL held.
             let mut dst_arg = dst_arg;
@@ -1135,8 +1137,10 @@ impl PyImageProcessor {
                 Ok(l.convert_with_fence(src.as_ref(), target.as_mut(), Some(options))?)
             })?;
             let recorded = crate::interop::recorded_gpu_write(rendered.as_ref());
+            let colorimetry = rendered.as_ref().colorimetry();
             drop(rendered);
             crate::interop::publish_gpu_write(dst, recorded);
+            crate::interop::publish_colorimetry(dst, colorimetry);
         } else {
             // A PBO-backed argument: convert with the GIL held.
             let mut dst_arg = dst_arg;
@@ -1221,8 +1225,10 @@ impl PyImageProcessor {
                 Ok(())
             })?;
             let recorded = crate::interop::recorded_gpu_write(rendered.as_ref());
+            let colorimetry = rendered.as_ref().colorimetry();
             drop(rendered);
             crate::interop::publish_gpu_write(dst, recorded);
+            crate::interop::publish_colorimetry(dst, colorimetry);
         } else {
             // A PBO-backed argument: convert with the GIL held.
             let mut dst_arg = dst_arg;
@@ -1477,7 +1483,8 @@ impl PyImageProcessor {
     /// convert or draw) it does not cover. On Linux a ``"none"`` or
     /// ``"write"`` DMA-BUF image comes from the uncached CMA heap where
     /// available. When this processor may fill the image on the CPU (CPU
-    /// backend, host memory, or a format the GPU does not render)
+    /// backend, host memory, a format the GPU does not render, or an ``Nv12``
+    /// image)
     /// ``"write"`` is added to the declaration.
     ///
     /// ``compression`` requests a vendor tile-compressed layout:

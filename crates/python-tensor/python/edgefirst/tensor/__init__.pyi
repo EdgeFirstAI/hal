@@ -931,8 +931,10 @@ class Tensor:
 
         Set automatically by the codec on decode (JPEG → JFIF/BT.601-full,
         PNG → sRGB) and carried through ``convert()`` to pick the YUV→RGB
-        matrix and range. ``None`` is never auto-filled; consumers resolve
-        missing axes via an SD/HD height heuristic at use time.
+        matrix and range. ``None`` means undefined; consumers resolve missing
+        axes via an SD/HD height heuristic at use time, and
+        ``ImageProcessor.convert`` tags an untagged YUV destination with the
+        colorimetry it encoded.
         """
 
     @colorimetry.setter

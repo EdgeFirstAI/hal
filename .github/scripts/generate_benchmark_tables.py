@@ -91,9 +91,9 @@ def gen_letterbox_4k(data_dir: Path):
 
 
 def gen_convert_table(data_dir: Path):
-    print("\n**1080p → 1080p:**\n")
-    print("| Platform | Compute | Buffer | YUYV→RGBA | YUYV→RGB | NV12→RGBA | RGB→RGBA | RGBA→BGRA | RGBA→GREY |")
-    print("|----------|---------|--------|-----------|----------|-----------|----------|-----------|-----------|")
+    print("\n**Same-size conversion:**\n")
+    print("| Platform | Compute | Buffer | YUYV→RGBA | YUYV→RGB | NV12→RGBA | RGB→RGBA | RGBA→BGRA | RGBA→GREY | YUYV→NV12 | YUYV→NV12 (640×480) |")
+    print("|----------|---------|--------|-----------|----------|-----------|----------|-----------|-----------|-----------|-------------------|")
 
     for platform, compute, buf, jf in PIPELINE_CONFIGS:
         data = load_json(data_dir, platform, jf)
@@ -103,7 +103,9 @@ def gen_convert_table(data_dir: Path):
         rgb_rgba = get_bench(data, "convert/1920x1080/RGB->RGBA")
         rgba_bgra = get_bench(data, "convert/1920x1080/RGBA->BGRA")
         rgba_grey = get_bench(data, "convert/1920x1080/RGBA->GREY")
-        print(f"| {platform} | {compute} | {buf} | {fmt_us(yuyv_rgba)} | {fmt_us(yuyv_rgb)} | {fmt_us(nv12_rgba)} | {fmt_us(rgb_rgba)} | {fmt_us(rgba_bgra)} | {fmt_us(rgba_grey)} |")
+        yuyv_nv12 = get_bench(data, "convert/1920x1080/YUYV->NV12")
+        yuyv_nv12_vga = get_bench(data, "convert/640x480/YUYV->NV12")
+        print(f"| {platform} | {compute} | {buf} | {fmt_us(yuyv_rgba)} | {fmt_us(yuyv_rgb)} | {fmt_us(nv12_rgba)} | {fmt_us(rgb_rgba)} | {fmt_us(rgba_bgra)} | {fmt_us(rgba_grey)} | {fmt_us(yuyv_nv12)} | {fmt_us(yuyv_nv12_vga)} |")
 
 
 # ============================================================================

@@ -13,8 +13,9 @@ environments where hardware acceleration is not present or not suitable.
 
 What the crate covers:
 - Packed and planar RGB families (`Rgb`, `Rgba`, `Bgra`, `Grey`,
-  `PlanarRgb`, `PlanarRgba`), semi-planar YUV sources (`Nv12`, `Nv16`,
-  `Nv24`), and packed YUV (`Yuyv`, `Vyuy`).
+  `PlanarRgb`, `PlanarRgba`), semi-planar YUV (`Nv12`, `Nv16`, `Nv24`), and
+  packed YUV (`Yuyv`, `Vyuy`). `Yuyv`, `Vyuy`, `Nv16` and `Nv12` are also
+  conversion destinations.
 - Source crop, resize, letterbox, 90° rotation, and flipping in one call.
 - Segmentation-mask rendering, including a fused GPU proto path.
 - SAHI-style input tiling for small-object detection in large frames
@@ -382,11 +383,14 @@ use std::{fmt::Display, time::Instant};
 mod colorimetry;
 mod cpu;
 mod error;
+mod fallback_log;
 mod g2d;
 #[path = "gl/mod.rs"]
 mod opengl_headless;
 mod options;
 pub use options::ConvertOptions;
+#[cfg(test)]
+mod nv12_dst_tests;
 #[cfg(test)]
 mod test_support;
 mod tiling;
@@ -864,8 +868,30 @@ pub trait ImageProcessorTrait {
     ///
     /// The destination is normally an RGB-family colour — `Grey`, `Rgb`,
     /// `Rgba`/`Bgra`, packed `HWC` or planar `CHW`. The CPU backend also
-    /// accepts a handful of YUV destinations (`Yuyv`→`Yuyv`, `Yuyv`→`Nv16`,
-    /// and the `Vyuy` equivalents); those pairs always run on the CPU.
+    /// renders YUV destinations: `Yuyv` (from `Yuyv`, `Nv12`, `Rgb`, `Rgba`,
+    /// `Grey`), `Vyuy` (from `Vyuy`), `Nv16` and `Nv12` (each from `Yuyv`,
+    /// `Vyuy`, `Nv12`, `Rgb`, `Rgba` and `Grey`; `Nv12` also from `Nv16` and `Nv24`). An `Nv12` destination's
+    /// width and height must be even. An accelerator may render an `Nv12`
+    /// destination; a destination whose [`CpuAccess`](edgefirst_tensor::CpuAccess)
+    /// denies the CPU can be refused when the accelerator declines it.
+    ///
+    /// A YUV destination (`Nv12`, `Nv16`, `Yuyv`, `Vyuy`) is encoded with its
+    /// own colorimetry. An untagged one is encoded with the colorimetry its
+    /// height implies (720 rows or more: BT.709, otherwise BT.601; limited
+    /// range), and after a successful convert carries that colorimetry as its
+    /// tag. A failed convert leaves the tag unchanged. Tag the destination with
+    /// [`TensorDyn::set_colorimetry`](edgefirst_tensor::TensorDyn::set_colorimetry)
+    /// to choose another, for example to keep a source's colorimetry through a
+    /// resize. Tagging it with the source's colorimetry keeps a YUV-to-YUV
+    /// resize on engines that cannot re-encode, and
+    /// [`ComputeBackend::G2d`](crate::ComputeBackend::G2d) writes the source's
+    /// colorimetry into an untagged destination and tags it with it.
+    ///
+    /// A YUV source converted to a YUV destination with no resize, crop,
+    /// placement, flip or rotation is copied without colour conversion when
+    /// both resolve to the same matrix and range, and re-encoded otherwise. A
+    /// `Vyuy` destination that would need re-encoding returns
+    /// [`Error::NotSupported`].
     ///
     /// # Arguments
     ///
@@ -883,6 +909,8 @@ pub trait ImageProcessorTrait {
     /// - [`Error::CropInvalid`] if the source crop falls outside `src`.
     /// - [`Error::NotAnImage`] if either tensor carries no `PixelFormat`.
     /// - [`Error::InvalidOptions`] if the options cannot apply to `dst`.
+    /// - [`Error::NotSupported`] if an `Nv12` destination has an odd width or
+    ///   height.
     /// - [`Error::NoConverter`] if no backend accepts the format pair; the
     ///   dispatch tries OpenGL, then G2D, then CPU.
     /// - [`Error::Tensor`] with [`CpuAccessDenied`](edgefirst_tensor::Error::CpuAccessDenied)
@@ -1082,7 +1110,8 @@ pub struct ImageProcessorConfig {
     /// `EDGEFIRST_FORCE_BACKEND` and the `EDGEFIRST_DISABLE_*` environment
     /// variables.
     ///
-    /// - [`ComputeBackend::OpenGl`]: init OpenGL + CPU, skip G2D
+    /// - [`ComputeBackend::OpenGl`]: init OpenGL + CPU, skip G2D; it renders
+    ///   conversions that `Auto` leaves to the CPU for speed or exactness
     /// - [`ComputeBackend::G2d`]: init G2D + CPU, skip OpenGL
     /// - [`ComputeBackend::Cpu`]: init CPU only
     /// - [`ComputeBackend::Auto`]: env-var-driven selection
@@ -1397,6 +1426,10 @@ pub struct ImageProcessor {
     /// [`convert_fallback_count`](Self::convert_fallback_count).
     pub(crate) convert_fallbacks: std::sync::atomic::AtomicU64,
 
+    /// The shapes the auto chain has moved past a backend for.
+    #[cfg_attr(not(any(target_os = "linux", feature = "opengl")), allow(dead_code))]
+    pub(crate) fallback_log: fallback_log::FallbackLog,
+
     /// The interpolation a convert without its own uses, as the backends run it.
     pub(crate) interpolation: Interpolation,
 
@@ -1493,11 +1526,7 @@ impl ImageProcessor {
                         Ok(fd) => return Ok(fd),
                         Err(e) if gl_forced => return Err(e),
                         Err(e) => {
-                            // The blocking chain below counts the fallback.
-                            log::debug!(
-                                "convert_with_fence: opengl declined, \
-                                 falling back to the blocking chain: {e}"
-                            );
+                            self.fallback_log.note("opengl", src, dst, &e);
                         }
                     }
                 } else if gl_forced {
@@ -1553,10 +1582,79 @@ impl ImageProcessor {
     /// environment variables apply.
     pub fn with_config(config: ImageProcessorConfig) -> Result<Self> {
         let interpolation = config.interpolation;
+        let auto = config.backend == ComputeBackend::Auto;
         let mut processor = Self::with_config_backends(config)?;
+        let soft_declines = processor.soft_declines_apply(auto);
+        #[cfg(all(
+            any(
+                target_os = "linux",
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "android",
+                target_os = "windows"
+            ),
+            feature = "opengl"
+        ))]
+        processor.set_gl_soft_declines(soft_declines)?;
+        #[cfg(target_os = "linux")]
+        processor.set_g2d_soft_declines(soft_declines);
+        #[cfg(not(any(
+            target_os = "linux",
+            all(
+                any(
+                    target_os = "macos",
+                    target_os = "ios",
+                    target_os = "android",
+                    target_os = "windows"
+                ),
+                feature = "opengl"
+            )
+        )))]
+        let _ = soft_declines;
         processor.env_interpolation = interpolation_from_env().map(runnable_interpolation);
         processor.set_interpolation(interpolation)?;
         Ok(processor)
+    }
+
+    /// Whether GL and G2D soft-decline: under `ComputeBackend::Auto` (`auto`) with no
+    /// forced backend and a CPU backend present.
+    fn soft_declines_apply(&self, auto: bool) -> bool {
+        auto && self.forced_backend.is_none() && self.cpu.is_some()
+    }
+
+    /// Sets the G2D backend's soft declines.
+    #[cfg(target_os = "linux")]
+    fn set_g2d_soft_declines(&mut self, enabled: bool) {
+        if let Some(g2d) = self.g2d.as_mut() {
+            g2d.set_soft_declines(enabled);
+        }
+    }
+
+    /// Sets the GL backend's soft declines. When the GL worker takes no message, drops the GL
+    /// backend, or returns the error when GL is forced.
+    #[cfg(all(
+        any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android",
+            target_os = "windows"
+        ),
+        feature = "opengl"
+    ))]
+    fn set_gl_soft_declines(&mut self, enabled: bool) -> Result<()> {
+        let Some(gl) = self.opengl.as_mut() else {
+            return Ok(());
+        };
+        match gl.set_soft_declines(enabled) {
+            Ok(()) => Ok(()),
+            Err(e) if self.forced_backend == Some(ForcedBackend::OpenGl) => Err(e),
+            Err(e) => {
+                log::warn!("OpenGL backend disabled: its soft declines could not be set: {e}");
+                self.opengl = None;
+                Ok(())
+            }
+        }
     }
 
     /// The backend selection half of [`Self::with_config`].
@@ -1583,6 +1681,7 @@ impl ImageProcessor {
                     #[cfg(feature = "opengl")]
                     opengl: None,
                     convert_fallbacks: std::sync::atomic::AtomicU64::new(0),
+                    fallback_log: fallback_log::FallbackLog::default(),
                     interpolation: Interpolation::Bilinear,
                     env_interpolation: None,
                     forced_backend: None,
@@ -1605,6 +1704,7 @@ impl ImageProcessor {
                         #[cfg(feature = "opengl")]
                         opengl: None,
                         convert_fallbacks: std::sync::atomic::AtomicU64::new(0),
+                        fallback_log: fallback_log::FallbackLog::default(),
                         interpolation: Interpolation::Bilinear,
                         env_interpolation: None,
                         forced_backend: None,
@@ -1624,6 +1724,7 @@ impl ImageProcessor {
                         #[cfg(feature = "opengl")]
                         opengl: None,
                         convert_fallbacks: std::sync::atomic::AtomicU64::new(0),
+                        fallback_log: fallback_log::FallbackLog::default(),
                         interpolation: Interpolation::Bilinear,
                         env_interpolation: None,
                         forced_backend: None,
@@ -1651,6 +1752,7 @@ impl ImageProcessor {
                         #[cfg(feature = "opengl")]
                         opengl,
                         convert_fallbacks: std::sync::atomic::AtomicU64::new(0),
+                        fallback_log: fallback_log::FallbackLog::default(),
                         interpolation: Interpolation::Bilinear,
                         env_interpolation: None,
                         forced_backend: None,
@@ -1680,6 +1782,7 @@ impl ImageProcessor {
                         #[cfg(feature = "opengl")]
                         opengl,
                         convert_fallbacks: std::sync::atomic::AtomicU64::new(0),
+                        fallback_log: fallback_log::FallbackLog::default(),
                         interpolation: Interpolation::Bilinear,
                         env_interpolation: None,
                         forced_backend: None,
@@ -1707,6 +1810,7 @@ impl ImageProcessor {
                         #[cfg(feature = "opengl")]
                         opengl,
                         convert_fallbacks: std::sync::atomic::AtomicU64::new(0),
+                        fallback_log: fallback_log::FallbackLog::default(),
                         interpolation: Interpolation::Bilinear,
                         env_interpolation: None,
                         forced_backend: None,
@@ -1737,6 +1841,7 @@ impl ImageProcessor {
                         #[cfg(feature = "opengl")]
                         opengl,
                         convert_fallbacks: std::sync::atomic::AtomicU64::new(0),
+                        fallback_log: fallback_log::FallbackLog::default(),
                         interpolation: Interpolation::Bilinear,
                         env_interpolation: None,
                         forced_backend: None,
@@ -1755,6 +1860,7 @@ impl ImageProcessor {
                     return Ok(Self {
                         cpu: Some(CPUProcessor::new()),
                         convert_fallbacks: std::sync::atomic::AtomicU64::new(0),
+                        fallback_log: fallback_log::FallbackLog::default(),
                         interpolation: Interpolation::Bilinear,
                         env_interpolation: None,
                         forced_backend: None,
@@ -1800,6 +1906,7 @@ impl ImageProcessor {
                     #[cfg(feature = "opengl")]
                     opengl: None,
                     convert_fallbacks: std::sync::atomic::AtomicU64::new(0),
+                    fallback_log: fallback_log::FallbackLog::default(),
                     interpolation: Interpolation::Bilinear,
                     env_interpolation: None,
                     forced_backend: Some(ForcedBackend::Cpu),
@@ -1818,6 +1925,7 @@ impl ImageProcessor {
                             #[cfg(feature = "opengl")]
                             opengl: None,
                             convert_fallbacks: std::sync::atomic::AtomicU64::new(0),
+                            fallback_log: fallback_log::FallbackLog::default(),
                             interpolation: Interpolation::Bilinear,
                             env_interpolation: None,
                             forced_backend: Some(ForcedBackend::G2d),
@@ -1848,6 +1956,7 @@ impl ImageProcessor {
                             g2d: None,
                             opengl: Some(opengl),
                             convert_fallbacks: std::sync::atomic::AtomicU64::new(0),
+                            fallback_log: fallback_log::FallbackLog::default(),
                             interpolation: Interpolation::Bilinear,
                             env_interpolation: None,
                             forced_backend: Some(ForcedBackend::OpenGl),
@@ -1870,6 +1979,7 @@ impl ImageProcessor {
                             cpu: None,
                             opengl: Some(opengl),
                             convert_fallbacks: std::sync::atomic::AtomicU64::new(0),
+                            fallback_log: fallback_log::FallbackLog::default(),
                             interpolation: Interpolation::Bilinear,
                             env_interpolation: None,
                             forced_backend: Some(ForcedBackend::OpenGl),
@@ -1892,6 +2002,7 @@ impl ImageProcessor {
                             cpu: None,
                             opengl: Some(opengl),
                             convert_fallbacks: std::sync::atomic::AtomicU64::new(0),
+                            fallback_log: fallback_log::FallbackLog::default(),
                             interpolation: Interpolation::Bilinear,
                             env_interpolation: None,
                             forced_backend: Some(ForcedBackend::OpenGl),
@@ -1914,6 +2025,7 @@ impl ImageProcessor {
                             cpu: None,
                             opengl: Some(opengl),
                             convert_fallbacks: std::sync::atomic::AtomicU64::new(0),
+                            fallback_log: fallback_log::FallbackLog::default(),
                             interpolation: Interpolation::Bilinear,
                             env_interpolation: None,
                             forced_backend: Some(ForcedBackend::OpenGl),
@@ -2038,6 +2150,7 @@ impl ImageProcessor {
             #[cfg(feature = "opengl")]
             opengl,
             convert_fallbacks: std::sync::atomic::AtomicU64::new(0),
+            fallback_log: fallback_log::FallbackLog::default(),
             interpolation: Interpolation::Bilinear,
             env_interpolation: None,
             forced_backend: None,
@@ -2309,7 +2422,8 @@ impl ImageProcessor {
     ///   implied. The access this processor's own convert may need on the
     ///   image as a destination is added to the declaration: `Write` when it
     ///   may fill the whole destination on the CPU (the CPU backend, host
-    ///   memory, a format or float dtype the GPU path does not render),
+    ///   memory, a format or float dtype the GPU path does not render, or an
+    ///   `Nv12` image),
     ///   `ReadWrite` when a pass reads back what was written or writes only
     ///   part of the buffer (an `I8` destination through the CPU or G2D, a
     ///   `Bgra` destination through the CPU, a G2D `Rgb` letterbox border).
@@ -3055,12 +3169,7 @@ impl ImageProcessorTrait for ImageProcessor {
                 Err(e) => {
                     self.convert_fallbacks
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    log::debug!(
-                        "convert: auto opengl declined {src_fmt:?}@{:?}→{dst_fmt:?}@{:?}, \
-                         falling back toward G2D/CPU: {e}",
-                        src.memory(),
-                        dst.memory(),
-                    );
+                    self.fallback_log.note("opengl", src, dst, &e);
                     declined.push(("opengl", e));
                 }
             }
@@ -3084,9 +3193,13 @@ impl ImageProcessorTrait for ImageProcessor {
                 true
             };
             if !g2d_eligible {
-                log::trace!(
-                    "convert: auto g2d skipped {src_fmt:?}→{dst_fmt:?} \
-                     (colorimetry not expressible: full-range/BT.2020)"
+                self.fallback_log.note(
+                    "g2d",
+                    src,
+                    dst,
+                    &Error::NotSupported(
+                        "G2D does not express full-range or BT.2020 colorimetry".into(),
+                    ),
                 );
             } else {
                 match g2d.convert(src, dst, Some(options)) {
@@ -3098,7 +3211,7 @@ impl ImageProcessorTrait for ImageProcessor {
                         return Ok(());
                     }
                     Err(e) => {
-                        log::trace!("convert: auto g2d declined {src_fmt:?}→{dst_fmt:?}: {e}");
+                        self.fallback_log.note("g2d", src, dst, &e);
                         declined.push(("g2d", e));
                     }
                 }
@@ -4652,7 +4765,7 @@ mod image_tests {
         let dst = TensorDyn::image(
             640,
             360,
-            PixelFormat::Nv12,
+            PixelFormat::Nv24,
             DType::U8,
             None,
             edgefirst_tensor::CpuAccess::ReadWrite,
@@ -4670,7 +4783,7 @@ mod image_tests {
         log::debug!("result: {:?}", result);
         assert!(matches!(
             result,
-            Err(Error::NotSupported(e)) if e.starts_with("Conversion from NV12 to NV12")
+            Err(Error::NotSupported(e)) if e.starts_with("Conversion from NV12 to NV24")
         ));
     }
 
@@ -9646,18 +9759,30 @@ mod image_tests {
             &edgefirst_bench::testdata::read("camera720p.yuyv"),
         )
         .unwrap();
-
-        let g2d_dst = TensorDyn::image(
-            600,
-            400,
-            PixelFormat::Yuyv,
-            DType::U8,
-            Some(TensorMemory::DmaBuf),
-            edgefirst_tensor::CpuAccess::ReadWrite,
-        )
-        .unwrap();
+        let dst_image = |memory| {
+            TensorDyn::image(
+                600,
+                400,
+                PixelFormat::Yuyv,
+                DType::U8,
+                memory,
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .unwrap()
+        };
         let mut g2d_converter = G2DProcessor::new().unwrap();
 
+        let mut untagged = dst_image(Some(TensorMemory::DmaBuf));
+        let declined = g2d_converter.convert(&src, &mut untagged, None);
+        assert!(
+            matches!(declined, Err(Error::NotSupported(_))),
+            "{declined:?}"
+        );
+        assert_eq!(untagged.colorimetry(), None);
+
+        let src_cm = Some(crate::colorimetry::effective_colorimetry(&src));
+        let mut g2d_dst = dst_image(Some(TensorMemory::DmaBuf));
+        g2d_dst.set_colorimetry(src_cm);
         let (result, src, g2d_dst) = convert_img(
             &mut g2d_converter,
             src,
@@ -9668,15 +9793,8 @@ mod image_tests {
         );
         result.unwrap();
 
-        let cpu_dst = TensorDyn::image(
-            600,
-            400,
-            PixelFormat::Yuyv,
-            DType::U8,
-            None,
-            edgefirst_tensor::CpuAccess::ReadWrite,
-        )
-        .unwrap();
+        let mut cpu_dst = dst_image(None);
+        cpu_dst.set_colorimetry(src_cm);
         let mut cpu_converter: CPUProcessor = CPUProcessor::new();
 
         let (result, _src, cpu_dst) = convert_img(
@@ -9690,11 +9808,151 @@ mod image_tests {
         result.unwrap();
 
         // TODO: compare YUYV↔YUYV directly without a YUYV→RGB convert.
-        eprintln!(
-            "WARNING: G2D has poor colorimetry support — YUYV resize diverges from the \
-             CPU reference (~0.85 similarity); threshold held at 0.85, not 0.95."
+        compare_images_convert_to_rgb(&g2d_dst, &cpu_dst, 0.95, function!());
+    }
+
+    /// Whether this host has G2D and a usable DMA heap; reports a skip when it has not.
+    #[cfg(target_os = "linux")]
+    fn g2d_and_dma_or_skip(test: &str) -> bool {
+        let why = if let Some(why) = g2d_skip_reason() {
+            why
+        } else if !is_dma_available() {
+            "DMA not available"
+        } else {
+            return true;
+        };
+        crate::test_support::report_skip(&format!("{test} - {why}"));
+        false
+    }
+
+    /// An untagged 1280x720 YUYV image of eight saturated colour bars, encoded in BT.709
+    /// limited, the colorimetry its height implies.
+    #[cfg(target_os = "linux")]
+    fn colour_bars_yuyv_720p() -> TensorDyn {
+        const BARS: [[u8; 3]; 8] = [
+            [255, 255, 255],
+            [255, 255, 0],
+            [0, 255, 255],
+            [0, 255, 0],
+            [255, 0, 255],
+            [255, 0, 0],
+            [0, 0, 255],
+            [0, 0, 0],
+        ];
+        let (w, h) = (1280, 720);
+        let rgb = TensorDyn::image(
+            w,
+            h,
+            PixelFormat::Rgb,
+            DType::U8,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        {
+            let t = rgb.as_typed::<u8>().unwrap();
+            let mut map = t.map().unwrap();
+            for (i, px) in map.as_mut_slice().chunks_exact_mut(3).enumerate() {
+                px.copy_from_slice(&BARS[(i % w) * BARS.len() / w]);
+            }
+        }
+        let mut src = TensorDyn::image(
+            w,
+            h,
+            PixelFormat::Yuyv,
+            DType::U8,
+            Some(TensorMemory::DmaBuf),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        CPUProcessor::new().convert(&rgb, &mut src, None).unwrap();
+        src.set_colorimetry(None);
+        src
+    }
+
+    /// An untagged 640x360 YUYV image (BT.601 limited by its height).
+    #[cfg(target_os = "linux")]
+    fn yuyv_640x360(memory: Option<TensorMemory>) -> TensorDyn {
+        TensorDyn::image(
+            640,
+            360,
+            PixelFormat::Yuyv,
+            DType::U8,
+            memory,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap()
+    }
+
+    /// G2D declines a YUV-to-YUV conversion into an untagged destination of another
+    /// colorimetry while soft declines are on. With them off it writes the source's
+    /// colorimetry and tags the destination with it.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn g2d_mismatched_yuv_untagged_destination_is_a_soft_decline() {
+        if !g2d_and_dma_or_skip(function!()) {
+            return;
+        }
+        let src = colour_bars_yuyv_720p();
+        let src_cm = crate::colorimetry::effective_colorimetry(&src);
+        let mut g2d = G2DProcessor::new().unwrap();
+        assert!(g2d.soft_declines());
+
+        let mut g2d_dst = yuyv_640x360(Some(TensorMemory::DmaBuf));
+        let declined = g2d.convert(&src, &mut g2d_dst, None);
+        assert!(
+            matches!(declined, Err(Error::NotSupported(_))),
+            "{declined:?}"
         );
-        compare_images_convert_to_rgb(&g2d_dst, &cpu_dst, 0.85, function!());
+        assert_eq!(g2d_dst.colorimetry(), None);
+
+        g2d.set_soft_declines(false);
+        g2d.convert(&src, &mut g2d_dst, None).unwrap();
+        assert_eq!(g2d_dst.colorimetry(), Some(src_cm));
+
+        let mut cpu = CPUProcessor::new();
+        let mut cpu_src_coding = yuyv_640x360(None);
+        cpu_src_coding.set_colorimetry(Some(src_cm));
+        cpu.convert(&src, &mut cpu_src_coding, None).unwrap();
+        let mut cpu_dst_coding = yuyv_640x360(None);
+        cpu.convert(&src, &mut cpu_dst_coding, None).unwrap();
+        assert_ne!(cpu_dst_coding.colorimetry(), Some(src_cm));
+
+        let mean_abs_diff = |a: &TensorDyn, b: &TensorDyn| {
+            let a = a.as_typed::<u8>().unwrap().map().unwrap().to_vec();
+            let b = b.as_typed::<u8>().unwrap().map().unwrap().to_vec();
+            let sum: u64 = a.iter().zip(&b).map(|(x, y)| x.abs_diff(*y) as u64).sum();
+            sum as f64 / a.len() as f64
+        };
+        let to_src_coding = mean_abs_diff(&g2d_dst, &cpu_src_coding);
+        let to_dst_coding = mean_abs_diff(&g2d_dst, &cpu_dst_coding);
+        assert!(
+            to_src_coding < 1.0 && to_src_coding < to_dst_coding,
+            "mean byte difference from the CPU output in the source's colorimetry \
+             {to_src_coding:.3}, in the destination's {to_dst_coding:.3}"
+        );
+    }
+
+    /// G2D declines a YUV-to-YUV conversion into a destination tagged with another
+    /// colorimetry, with soft declines off.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn g2d_mismatched_yuv_tagged_destination_is_a_hard_decline() {
+        if !g2d_and_dma_or_skip(function!()) {
+            return;
+        }
+        let src = colour_bars_yuyv_720p();
+        let mut g2d = G2DProcessor::new().unwrap();
+        g2d.set_soft_declines(false);
+        let mut dst = yuyv_640x360(Some(TensorMemory::DmaBuf));
+        let bt601 = crate::colorimetry::effective_colorimetry(&dst);
+        dst.set_colorimetry(Some(bt601));
+        let declined = g2d.convert(&src, &mut dst, None);
+        assert!(
+            matches!(declined, Err(Error::NotSupported(_))),
+            "{declined:?}"
+        );
+        assert_eq!(dst.colorimetry(), Some(bt601));
     }
 
     #[test]
@@ -10692,6 +10950,45 @@ mod image_tests {
         compare_images_convert_to_rgb(&cpu_nv16_dst, &cpu_rgb_dst, 0.99, function!());
     }
 
+    #[test]
+    fn test_cpu_resize_nv12() {
+        let file = edgefirst_bench::testdata::read("zidane.jpg").to_vec();
+        let src = crate::load_image_test_helper(&file, Some(PixelFormat::Rgba), None).unwrap();
+        let mk = |fmt| {
+            TensorDyn::image(
+                640,
+                640,
+                fmt,
+                DType::U8,
+                None,
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .unwrap()
+        };
+        let mut cpu_converter = CPUProcessor::new();
+        let crop = Crop::letterbox([255, 128, 0, 255]);
+
+        let (result, src, cpu_nv12_dst) = convert_img(
+            &mut cpu_converter,
+            src,
+            mk(PixelFormat::Nv12),
+            Rotation::None,
+            Flip::None,
+            crop,
+        );
+        result.unwrap();
+        let (result, _src, cpu_rgb_dst) = convert_img(
+            &mut cpu_converter,
+            src,
+            mk(PixelFormat::Rgb),
+            Rotation::None,
+            Flip::None,
+            crop,
+        );
+        result.unwrap();
+        compare_images_convert_to_rgb(&cpu_nv12_dst, &cpu_rgb_dst, 0.99, function!());
+    }
+
     fn load_bytes_to_tensor(
         width: usize,
         height: usize,
@@ -11466,6 +11763,151 @@ mod image_tests {
                 }
             }
         }
+    }
+
+    /// The GL backend's soft declines are off when the processor has no CPU backend.
+    #[test]
+    #[cfg(all(
+        any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android",
+            target_os = "windows"
+        ),
+        feature = "opengl"
+    ))]
+    fn soft_declines_are_off_without_a_cpu_fallback() {
+        let _lock = acquire_env_lock();
+        let _guard = EnvGuard::snapshot(&[
+            "EDGEFIRST_FORCE_BACKEND",
+            "EDGEFIRST_DISABLE_GL",
+            "EDGEFIRST_DISABLE_CPU",
+        ]);
+        unsafe { std::env::remove_var("EDGEFIRST_FORCE_BACKEND") };
+        unsafe { std::env::remove_var("EDGEFIRST_DISABLE_GL") };
+        unsafe { std::env::set_var("EDGEFIRST_DISABLE_CPU", "1") };
+        let processor = ImageProcessor::new().unwrap();
+        assert!(processor.cpu.is_none());
+        let Some(gl) = processor.opengl.as_ref() else {
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
+            return;
+        };
+        assert!(!gl.soft_declines().unwrap());
+    }
+
+    /// Soft declines apply only under `ComputeBackend::Auto` with no forced backend and a
+    /// CPU backend present.
+    #[test]
+    fn soft_declines_apply_only_under_auto_with_a_cpu_fallback() {
+        let mut processor = ImageProcessor::with_config(ImageProcessorConfig {
+            backend: ComputeBackend::Cpu,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(processor.soft_declines_apply(true));
+        assert!(!processor.soft_declines_apply(false));
+        processor.forced_backend = Some(ForcedBackend::G2d);
+        assert!(!processor.soft_declines_apply(true));
+        processor.forced_backend = None;
+        processor.cpu = None;
+        assert!(!processor.soft_declines_apply(true));
+    }
+
+    /// The processor's G2D backend soft-declines under `ComputeBackend::Auto` and not when
+    /// `ComputeBackend::G2d` prefers it.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn image_processor_g2d_soft_declines_follow_the_backend_mode() {
+        if let Some(why) = g2d_skip_reason() {
+            crate::test_support::report_skip(&format!("{} - {why}", function!()));
+            return;
+        }
+        let _lock = acquire_env_lock();
+        let _guard = EnvGuard::snapshot(&[
+            "EDGEFIRST_FORCE_BACKEND",
+            "EDGEFIRST_DISABLE_G2D",
+            "EDGEFIRST_DISABLE_CPU",
+        ]);
+        unsafe { std::env::remove_var("EDGEFIRST_FORCE_BACKEND") };
+        unsafe { std::env::remove_var("EDGEFIRST_DISABLE_G2D") };
+        unsafe { std::env::remove_var("EDGEFIRST_DISABLE_CPU") };
+        let soft = |backend| {
+            ImageProcessor::with_config(ImageProcessorConfig {
+                backend,
+                ..Default::default()
+            })
+            .unwrap()
+            .g2d
+            .as_ref()
+            .map(G2DProcessor::soft_declines)
+        };
+        assert_eq!(soft(ComputeBackend::Auto), Some(true));
+        assert_eq!(soft(ComputeBackend::G2d), Some(false));
+        unsafe { std::env::set_var("EDGEFIRST_FORCE_BACKEND", "g2d") };
+        assert_eq!(soft(ComputeBackend::Auto), Some(false));
+    }
+
+    /// A GL backend whose worker takes no message when its soft declines are set is dropped
+    /// and the processor converts on the CPU; under forced GL the error is returned.
+    #[test]
+    #[cfg(all(
+        any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android",
+            target_os = "windows"
+        ),
+        feature = "opengl"
+    ))]
+    fn a_gl_backend_that_takes_no_message_is_dropped_outside_forced_gl() {
+        let _lock = acquire_env_lock();
+        let _guard = EnvGuard::snapshot(&[
+            "EDGEFIRST_FORCE_BACKEND",
+            "EDGEFIRST_DISABLE_GL",
+            "EDGEFIRST_DISABLE_CPU",
+        ]);
+        unsafe { std::env::remove_var("EDGEFIRST_FORCE_BACKEND") };
+        unsafe { std::env::remove_var("EDGEFIRST_DISABLE_GL") };
+        unsafe { std::env::remove_var("EDGEFIRST_DISABLE_CPU") };
+        let mut processor = ImageProcessor::new().unwrap();
+        let Some(gl) = processor.opengl.as_mut() else {
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
+            return;
+        };
+        gl.stop_worker();
+        processor.set_gl_soft_declines(true).unwrap();
+        assert!(processor.opengl.is_none());
+        let src = TensorDyn::image(
+            64,
+            48,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        let mut dst = TensorDyn::image(
+            32,
+            24,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        processor.convert(&src, &mut dst, None).unwrap();
+
+        let mut processor = ImageProcessor::with_config(ImageProcessorConfig {
+            backend: ComputeBackend::OpenGl,
+            ..Default::default()
+        })
+        .unwrap();
+        processor.forced_backend = Some(ForcedBackend::OpenGl);
+        processor.opengl.as_mut().unwrap().stop_worker();
+        assert!(processor.set_gl_soft_declines(false).is_err());
+        assert!(processor.opengl.is_some());
     }
 
     /// `EDGEFIRST_INTERPOLATION` accepts `nearest` and `bilinear` in any case and ignores anything else.

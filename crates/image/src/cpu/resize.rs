@@ -494,11 +494,15 @@ impl CPUProcessor {
             })
     }
 
+    /// Fills the border of a semi-planar YUV surface whose chroma plane has
+    /// one row per `luma_rows_per_chroma_row` luma rows and one UV pair per
+    /// two luma columns. The chroma pairs covering any part of `crop` are kept.
     pub(super) fn fill_image_outside_crop_yuv_semiplanar(
         (dst, dst_width, dst_height, dst_stride): (&mut [u8], usize, usize, usize),
         y: u8,
         uv: [u8; 2],
-        mut crop: Rect,
+        crop: Rect,
+        luma_rows_per_chroma_row: usize,
     ) -> Result<()> {
         // Checks that the buffer holds the luma plane before splitting.
         let luma = dst_stride.checked_mul(dst_height).ok_or_else(|| {
@@ -514,18 +518,47 @@ impl CPUProcessor {
             )));
         }
         let (y_plane, uv_plane) = dst.split_at_mut(luma);
-        Self::fill_image_outside_crop_::<1>(
-            (y_plane, dst_width, dst_height, dst_stride),
-            [y],
-            crop,
-        )?;
-        crop.left /= 2;
-        crop.width /= 2;
-        Self::fill_image_outside_crop_::<2>(
-            (uv_plane, dst_width / 2, dst_height, dst_stride),
+        Self::fill_image_outside_crop_yuv_planes(
+            (y_plane, dst_stride),
+            (uv_plane, dst_stride),
+            (dst_width, dst_height),
+            y,
             uv,
             crop,
-        )?;
-        Ok(())
+            luma_rows_per_chroma_row,
+        )
+    }
+
+    /// As [`Self::fill_image_outside_crop_yuv_semiplanar`] with the luma and
+    /// chroma planes given separately as `(bytes, stride)`.
+    pub(super) fn fill_image_outside_crop_yuv_planes(
+        (luma, luma_stride): (&mut [u8], usize),
+        (chroma, chroma_stride): (&mut [u8], usize),
+        (dst_width, dst_height): (usize, usize),
+        y: u8,
+        uv: [u8; 2],
+        crop: Rect,
+        luma_rows_per_chroma_row: usize,
+    ) -> Result<()> {
+        Self::fill_image_outside_crop_::<1>((luma, dst_width, dst_height, luma_stride), [y], crop)?;
+        let rows = luma_rows_per_chroma_row;
+        let top = crop.top / rows;
+        let left = crop.left / 2;
+        let chroma_crop = Rect {
+            left,
+            top,
+            width: (crop.left + crop.width).div_ceil(2) - left,
+            height: (crop.top + crop.height).div_ceil(rows) - top,
+        };
+        Self::fill_image_outside_crop_::<2>(
+            (
+                chroma,
+                dst_width / 2,
+                dst_height.div_ceil(rows),
+                chroma_stride,
+            ),
+            uv,
+            chroma_crop,
+        )
     }
 }

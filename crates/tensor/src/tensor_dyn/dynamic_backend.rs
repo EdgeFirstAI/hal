@@ -647,7 +647,7 @@ impl TensorDyn {
 
     // --- `colorimetry`, `set_colorimetry`, `view_origin`.
 
-    /// Colorimetry metadata (`None` = undefined; never auto-filled).
+    /// Colorimetry metadata. `None` = undefined; an image convert tags an untagged YUV destination.
     pub fn colorimetry(&self) -> Option<Colorimetry> {
         // SAFETY: `self.handle` is live.
         let packed = unsafe { edgefirst_tensor_ffi::ef_tensor_colorimetry(self.handle.as_ptr()) };

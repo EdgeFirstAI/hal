@@ -309,9 +309,10 @@ impl<'py> TensorArg<'py> {
 /// [`TensorDyn::import_descriptor`]. The reconstructed value refers to the
 /// same underlying buffer as the original.
 ///
-/// State a backend records on the reconstructed tensor, such as the fence
-/// value of a D3D11 texture's last GPU write, is copied back onto the caller's
-/// object by [`publish_gpu_write`].
+/// State a backend records on the reconstructed tensor is copied back onto
+/// the caller's object: the fence value of a D3D11 texture's last GPU write by
+/// [`publish_gpu_write`], and the colorimetry a convert tags by
+/// [`publish_colorimetry`].
 pub struct RawTensorAccess {
     repr: RawTensorRepr,
 }
@@ -467,6 +468,33 @@ pub(crate) fn publish_gpu_write(dst: &Bound<'_, PyAny>, value: Option<u64>) {
     }
     if let Err(e) = method.call1((value,)) {
         log::debug!("publishing a render completion onto the destination: {e}");
+    }
+}
+
+/// Tag the object the caller passed as the destination with `colorimetry`
+/// when its `colorimetry` attribute is `None`.
+///
+/// `colorimetry` is read from the tensor a convert wrote. The attribute is
+/// read and written by name. Every borrow of the destination must be dropped
+/// before the call.
+///
+/// Does not fail: a `None` value, a tagged destination and a destination
+/// without the attribute are left alone; a rejected write is debug-logged.
+#[cfg(feature = "image")]
+pub(crate) fn publish_colorimetry(
+    dst: &Bound<'_, PyAny>,
+    colorimetry: Option<edgefirst_tensor::Colorimetry>,
+) {
+    let Some(colorimetry) = colorimetry else {
+        return;
+    };
+    match dst.getattr("colorimetry") {
+        Ok(current) if current.is_none() => {}
+        _ => return,
+    }
+    let value = crate::colorimetry::PyColorimetry::from(colorimetry);
+    if let Err(e) = dst.setattr("colorimetry", value) {
+        log::debug!("publishing a convert's colorimetry onto the destination: {e}");
     }
 }
 

@@ -242,8 +242,7 @@ impl ColorRange {
     }
 }
 
-/// Full 4-axis colorimetry. Each axis is `Option`; `None` means undefined and
-/// is never auto-filled.
+/// Full 4-axis colorimetry. Each axis is `Option`; `None` means undefined.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub struct Colorimetry {
     pub space: Option<ColorSpace>,

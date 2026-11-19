@@ -12,7 +12,7 @@ use std::time::Instant;
 use super::EglDisplayKind;
 
 use super::cache::{BufferImportKey, CacheKind, GlCacheStats, ImportCache};
-use super::platform::{GlPlatform, Platform};
+use super::platform::{GlPlatform, NvDstPlanes, Platform};
 
 /// The platform display/context owned by this processor — `GlContext` on
 /// Linux, `AngleDisplay` (per-processor ANGLE context) on macOS.
@@ -584,6 +584,63 @@ impl PackedR8Locs {
     }
 }
 
+/// The route a refused zero-copy destination import takes instead.
+const TEXTURE_READBACK: &str =
+    "rendering to a texture and reading back through map() (slower, still correct)";
+
+/// The RGBA -> NV12 programs and their link-time uniform locations.
+struct Nv12Programs {
+    /// `NV12_LUMA_FRAGMENT`.
+    luma: GlProgram,
+    /// `NV12_CHROMA_R8_FRAGMENT`.
+    chroma: GlProgram,
+    /// `NV12_CHROMA_FILL_FRAGMENT`.
+    fill: GlProgram,
+    /// `y_coeffs`, `y_offset` of `luma`.
+    luma_locs: [i32; 2],
+    /// `u_coeffs`, `v_coeffs`, `c_offset`, `chroma_row` of `chroma`.
+    chroma_locs: [i32; 4],
+    /// `uv` of `fill`.
+    fill_uv: i32,
+}
+
+impl Nv12Programs {
+    fn new() -> Result<Self, crate::Error> {
+        let build = |fragment| GlProgram::new(generate_vertex_shader(), fragment);
+        let luma = build(super::shaders_common::NV12_LUMA_FRAGMENT)?;
+        let chroma = build(super::shaders_common::NV12_CHROMA_R8_FRAGMENT)?;
+        let fill = build(super::shaders_common::NV12_CHROMA_FILL_FRAGMENT)?;
+        luma.load_uniform_1i(c"tex", 0)?;
+        chroma.load_uniform_1i(c"tex", 0)?;
+        let loc = |program: &GlProgram, name: &CStr| {
+            // SAFETY: `program` is linked on this thread's current context.
+            unsafe { edgefirst_gl::gl::GetUniformLocation(program.id, name.as_ptr()) }
+        };
+        Ok(Self {
+            luma_locs: [loc(&luma, c"y_coeffs"), loc(&luma, c"y_offset")],
+            chroma_locs: [
+                loc(&chroma, c"u_coeffs"),
+                loc(&chroma, c"v_coeffs"),
+                loc(&chroma, c"c_offset"),
+                loc(&chroma, c"chroma_row"),
+            ],
+            fill_uv: loc(&fill, c"uv"),
+            luma,
+            chroma,
+            fill,
+        })
+    }
+}
+
+/// The NV12 programs of a processor, built on its first NV12 destination.
+enum Nv12ProgramState {
+    /// Not built yet.
+    Unbuilt,
+    Built(Nv12Programs),
+    /// The build failed with this message; NV12 destinations are declined.
+    Failed(String),
+}
+
 /// How the most recent packed-`Rgb` DMA-BUF source reached the GPU.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum RgbSourcePath {
@@ -669,6 +726,9 @@ pub struct GLProcessorST {
     /// `get_or_create_egl_image_rgb`).
     #[cfg(test)]
     pub(super) fail_dst_import: bool,
+    /// Test hook: make the NV12 program build fail.
+    #[cfg(test)]
+    pub(super) fail_nv12_programs: bool,
     /// While set, a failed zero-copy destination import propagates instead of
     /// falling back to the mapped-texture readback. Set by
     /// `verify_dma_buf_roundtrip`.
@@ -688,6 +748,12 @@ pub struct GLProcessorST {
     /// Whether the GPU is a Qualcomm Adreno on the proprietary driver
     /// (GL_RENDERER); see [`RendererTraits::adreno`].
     pub(super) is_adreno: bool,
+    /// The NV12 destinations this GPU renders.
+    nv12_policy: Nv12DstPolicy,
+    /// Whether [`DeclineClass::Soft`] declines apply.
+    pub(super) soft_declines: bool,
+    /// `GL_RENDERER`, or `"unknown"` when the driver reports none.
+    renderer_name: String,
     /// Whether to use renderbuffer-backed EGLImages for DMA destinations.
     /// Enabled by `EDGEFIRST_OPENGL_RENDERSURFACE=1`; defaults to `false`
     /// (texture path).
@@ -783,6 +849,10 @@ pub struct GLProcessorST {
     luma_2d_program: GlProgram,
     /// `luma_2d_program` plus the int8 bias.
     luma_2d_int8_program: GlProgram,
+    /// Passes 2 and 3 of `ConvertPlan::ThreePassNv12`.
+    nv12_programs: Nv12ProgramState,
+    /// Render target for the chroma plane of a split NV12 destination.
+    nv12_chroma_texture: Texture,
     /// Whether a packed `Rgb` DMA-BUF source imports natively (`BG24`);
     /// otherwise it takes the R8 view.
     rgb_native_import: bool,
@@ -995,6 +1065,7 @@ impl ImageProcessorTrait for GLProcessorST {
         options: Option<crate::ConvertOptions>,
     ) -> crate::Result<()> {
         self.convert_inner(src, dst, &options.unwrap_or_default())?;
+        crate::colorimetry::tag_yuv_destination(dst);
         // Records completion after every convert; inside a batch the device
         // submission is left to `flush_pending`.
         let submit = !self.defer_finish;
@@ -1248,6 +1319,8 @@ struct GlSupport {
     has_yuv_target: bool,
     has_bgra: bool,
     renderer: RendererTraits,
+    /// `GL_RENDERER`, or `"unknown"` when the driver reports none.
+    renderer_name: String,
     supports_f32_color: bool,
     supports_f16_color: bool,
 }
@@ -1718,6 +1791,135 @@ fn classify_renderer(renderer: &str) -> RendererTraits {
     }
 }
 
+/// How a GL decline applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DeclineClass {
+    /// Declines whether or not soft declines are on.
+    Hard,
+    /// Declines only while soft declines are on.
+    Soft,
+}
+
+/// Same-size NV12 conversions with fewer destination pixels are soft declines on Adreno.
+pub(super) const NV12_SAME_SIZE_MIN_PIXELS_ADRENO: usize = 1920 * 1080;
+
+/// Same-size NV12 conversions with fewer destination pixels are soft declines on ANGLE.
+pub(super) const NV12_SAME_SIZE_MIN_PIXELS_ANGLE: usize = 1600 * 900;
+
+/// Which NV12 destinations a GPU renders; see [`nv12_dst_decline`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Nv12DstPolicy {
+    /// Whether the GPU renders NV12 destinations at all.
+    pub gpu_renders: bool,
+    /// Whether a YUYV or VYUY source is a hard decline.
+    pub packed_yuv_src_broken: bool,
+    /// A same-size conversion into fewer destination pixels is a soft decline.
+    pub same_size_min_pixels: usize,
+    /// Whether an exact same-size YUV copy is a soft decline.
+    pub exact_copy_on_cpu: bool,
+    /// Whether the GPU has a policy of its own; every conversion is a soft decline otherwise.
+    pub measured: bool,
+}
+
+impl Nv12DstPolicy {
+    /// The policy for a GPU with `traits`.
+    fn for_renderer(traits: RendererTraits) -> Self {
+        let other = Self {
+            gpu_renders: true,
+            packed_yuv_src_broken: false,
+            same_size_min_pixels: usize::MAX,
+            exact_copy_on_cpu: true,
+            measured: false,
+        };
+        let measured = Self {
+            measured: true,
+            ..other
+        };
+        if traits.software {
+            Self {
+                gpu_renders: false,
+                ..measured
+            }
+        } else if traits.vivante {
+            Self {
+                packed_yuv_src_broken: true,
+                ..measured
+            }
+        } else if traits.mali {
+            Self {
+                same_size_min_pixels: 0,
+                exact_copy_on_cpu: false,
+                ..measured
+            }
+        } else if traits.adreno {
+            Self {
+                same_size_min_pixels: NV12_SAME_SIZE_MIN_PIXELS_ADRENO,
+                ..measured
+            }
+        } else if traits.angle {
+            Self {
+                same_size_min_pixels: NV12_SAME_SIZE_MIN_PIXELS_ANGLE,
+                ..measured
+            }
+        } else {
+            other
+        }
+    }
+}
+
+/// How GL declines a `src_fmt` source into a `w`x`h` NV12 destination under `policy`, and why,
+/// or `None` when it renders it. `same_size` is a conversion with no resize, crop, placement,
+/// flip or rotation; `exact_copy` is a same-size one from a YUV source with the destination's
+/// matrix and range. `renderer` is the GPU's `GL_RENDERER`.
+pub(super) fn nv12_dst_decline(
+    policy: Nv12DstPolicy,
+    renderer: &str,
+    src_fmt: PixelFormat,
+    same_size: bool,
+    exact_copy: bool,
+    (w, h): (usize, usize),
+) -> Option<(DeclineClass, String)> {
+    let gpu =
+        || format!("the GL backend does not render NV12 destinations on this GPU ({renderer})");
+    if !Platform::NV12_DST || !policy.gpu_renders {
+        return Some((DeclineClass::Hard, gpu()));
+    }
+    if policy.packed_yuv_src_broken && matches!(src_fmt, PixelFormat::Yuyv | PixelFormat::Vyuy) {
+        return Some((
+            DeclineClass::Hard,
+            format!(
+                "the GL backend does not render NV12 destinations from {src_fmt} on this GPU \
+                 ({renderer})"
+            ),
+        ));
+    }
+    if !policy.measured {
+        return Some((
+            DeclineClass::Soft,
+            format!(
+                "the GL backend leaves NV12 destinations on this unmeasured GPU ({renderer}) to \
+                 the CPU"
+            ),
+        ));
+    }
+    if exact_copy && policy.exact_copy_on_cpu {
+        return Some((
+            DeclineClass::Soft,
+            format!("the GL backend leaves an exact same-size {src_fmt} copy to NV12 to the CPU"),
+        ));
+    }
+    if same_size && w * h < policy.same_size_min_pixels {
+        return Some((
+            DeclineClass::Soft,
+            format!(
+                "the GL backend leaves a same-size {src_fmt} to NV12 conversion of {w}x{h} to \
+                 the CPU"
+            ),
+        ));
+    }
+    None
+}
+
 /// The plane-offset alignment, in bytes, checked for a DMA-BUF import on
 /// drivers that misplace unaligned offsets.
 pub(super) const DMA_IMPORT_OFFSET_ALIGN: usize = 64;
@@ -1820,18 +2022,19 @@ impl GLProcessorST {
             has_float_linear,
             has_yuv_target,
             has_bgra,
-            renderer:
-                RendererTraits {
-                    vivante: is_vivante,
-                    mali: is_mali,
-                    software: is_software_renderer,
-                    virtual_gpu: is_virtual_gpu,
-                    angle: is_angle,
-                    adreno: is_adreno,
-                },
+            renderer,
+            renderer_name,
             supports_f32_color,
             supports_f16_color,
         } = Self::gl_check_support()?;
+        let RendererTraits {
+            vivante: is_vivante,
+            mali: is_mali,
+            software: is_software_renderer,
+            virtual_gpu: is_virtual_gpu,
+            angle: is_angle,
+            adreno: is_adreno,
+        } = renderer;
 
         // Rejects software renderers (llvmpipe, softpipe, swrast) unless
         // `EDGEFIRST_ALLOW_SOFTWARE_GL=1`.
@@ -2201,6 +2404,8 @@ impl GLProcessorST {
             readback_scratch: Vec::new(),
             #[cfg(test)]
             fail_dst_import: false,
+            #[cfg(test)]
+            fail_nv12_programs: false,
             probe_dst_import_only: false,
             dst_import_warned: std::collections::HashSet::new(),
             is_vivante,
@@ -2208,6 +2413,9 @@ impl GLProcessorST {
             is_virtual_gpu,
             is_angle,
             is_adreno,
+            nv12_policy: Nv12DstPolicy::for_renderer(renderer),
+            soft_declines: true,
+            renderer_name,
             use_renderbuffer: std::env::var("EDGEFIRST_OPENGL_RENDERSURFACE")
                 .map(|v| v == "1")
                 .unwrap_or(false),
@@ -2234,6 +2442,8 @@ impl GLProcessorST {
             yuyv_luma_r8_locs,
             luma_2d_program,
             luma_2d_int8_program,
+            nv12_programs: Nv12ProgramState::Unbuilt,
+            nv12_chroma_texture: Texture::new(),
             rgb_native_import,
             packed_r8_import: Platform::PACKED_R8_IMPORT,
             last_rgb_source_path: None,
@@ -2900,6 +3110,7 @@ impl GLProcessorST {
             dst.memory(),
             dst_fmt,
             self.has_bgra,
+            Platform::NV12_DST,
         ) {
             return Err(crate::Error::NotSupported(format!(
                 "Opengl doesn't support {dst_fmt} destination texture",
@@ -2939,15 +3150,22 @@ impl GLProcessorST {
         flip: Flip,
         crop: ResolvedCrop,
     ) -> crate::Result<()> {
-        // Declines a view()/batch() destination in a packed-RGB or planar
-        // format.
+        // Declines a view()/batch() destination in a packed-RGB, NV12 or
+        // planar format.
         if dst.view_origin().is_some()
-            && (dst_fmt == PixelFormat::Rgb || dst_fmt.layout() == PixelLayout::Planar)
+            && (dst_fmt == PixelFormat::Rgb
+                || dst_fmt == PixelFormat::Nv12
+                || dst_fmt.layout() == PixelLayout::Planar)
         {
             return Err(crate::Error::NotSupported(
                 "GL view()/batch() destination not yet supported for packed-RGB / \
-                 planar formats (CPU fallback handles it)"
+                 NV12 / planar formats (CPU fallback handles it)"
                     .into(),
+            ));
+        }
+        if dst_fmt == PixelFormat::Nv12 && is_int8 {
+            return Err(crate::Error::NotSupported(
+                "GL renders NV12 destinations as U8 only".into(),
             ));
         }
         let dst_offset = view_collapsed_dst_base(dst.view_origin(), dst.plane_offset());
@@ -2985,11 +3203,17 @@ impl GLProcessorST {
                 // A probe returns the refusal without falling back.
                 Err(e) if self.probe_dst_import_only => return Err(e),
                 Err(e) => {
-                    self.note_dst_import_fallback(dst, dst_fmt, &e);
+                    self.note_dst_import_fallback(dst, dst_fmt, &e, TEXTURE_READBACK);
                     lowering = super::render::lower_dst(false, dst.memory());
                     plan = super::render::plan_convert(src_fmt, src_host, dst_fmt, lowering);
                 }
             }
+        }
+        if dst_fmt == PixelFormat::Nv12 && plan != super::render::ConvertPlan::ThreePassNv12 {
+            return Err(crate::Error::NotSupported(format!(
+                "GL renders an NV12 destination only into a zero-copy import, \
+                 not via {lowering:?}"
+            )));
         }
         let _span = tracing::trace_span!(
             "image.convert.gl.engine",
@@ -3039,6 +3263,9 @@ impl GLProcessorST {
                     lowering,
                     &convert_span,
                 )
+            }
+            super::render::ConvertPlan::ThreePassNv12 => {
+                return self.convert_to_nv12(src, dst, src_fmt, rotation, flip, crop, &convert_span)
             }
             super::render::ConvertPlan::SinglePass => {}
         }
@@ -3422,11 +3649,13 @@ impl GLProcessorST {
     }
 
     /// Whether the GL backend renders a `fmt` destination held in `memory`.
+    /// `nv12_dst` is the platform's [`GlPlatform::NV12_DST`].
     pub(crate) fn dst_format_renderable(
         backend: TransferBackend,
         memory: TensorMemory,
         fmt: PixelFormat,
         has_bgra: bool,
+        nv12_dst: bool,
     ) -> bool {
         if fmt == PixelFormat::Bgra && !has_bgra {
             return false;
@@ -3440,7 +3669,7 @@ impl GLProcessorST {
                     | PixelFormat::PlanarRgb
                     | PixelFormat::PlanarRgba
                     | PixelFormat::Rgb
-            )
+            ) || (fmt == PixelFormat::Nv12 && nv12_dst)
         } else {
             // Planar RGB(A) into heap (`Mem`) or `Pbo` memory renders through the
             // two-pass plan (`TwoPassNvPlanar`).
@@ -3466,12 +3695,15 @@ impl GLProcessorST {
         }
 
         // Detect GPU vendor / software / virtualized renderers via GL_RENDERER.
-        let mut traits = edgefirst_gl::get_string(edgefirst_gl::gl::RENDERER)
+        let renderer_name = edgefirst_gl::get_string(edgefirst_gl::gl::RENDERER).ok();
+        let mut traits = renderer_name
+            .as_deref()
             .map(|r| {
                 log::info!("GL_RENDERER: {r}");
-                classify_renderer(&r)
+                classify_renderer(r)
             })
             .unwrap_or_default();
+        let renderer_name = renderer_name.unwrap_or_else(|| "unknown".to_string());
         // The Adreno trait applies on Linux only.
         traits.adreno &= cfg!(target_os = "linux");
         let RendererTraits {
@@ -3588,6 +3820,7 @@ impl GLProcessorST {
             has_yuv_target,
             has_bgra,
             renderer: traits,
+            renderer_name,
             supports_f32_color,
             supports_f16_color,
         })
@@ -3634,11 +3867,18 @@ impl GLProcessorST {
     }
 
     /// Record a zero-copy destination import that the driver refused: count
-    /// it in [`ConvertStats::dst_import_fallbacks`], warn once per buffer and
-    /// log repeats at debug, and drain the GL error queue.
+    /// it in [`ConvertStats::dst_import_fallbacks`], warn once per buffer
+    /// naming `then`, the route the convert takes instead, log repeats at
+    /// debug, and drain the GL error queue.
     ///
     /// [`ConvertStats::dst_import_fallbacks`]: super::cache::ConvertStats::dst_import_fallbacks
-    fn note_dst_import_fallback(&mut self, dst: &Tensor<u8>, dst_fmt: PixelFormat, e: &Error) {
+    fn note_dst_import_fallback(
+        &mut self,
+        dst: &Tensor<u8>,
+        dst_fmt: PixelFormat,
+        e: &Error,
+        then: &str,
+    ) {
         self.convert_stats.dst_import_fallbacks += 1;
         let w = dst.width().unwrap_or(0);
         let h = dst.height().unwrap_or(0);
@@ -3646,8 +3886,7 @@ impl GLProcessorST {
         if self.dst_import_warned.insert(dst.buffer_identity().id()) {
             log::warn!(
                 "zero-copy destination import refused for {dst_fmt} ({w}x{h}) at plane \
-                 offset {offset}; rendering to a texture and reading back through map() \
-                 (slower, still correct): {e}"
+                 offset {offset}; {then}: {e}"
             );
         } else {
             log::debug!(
@@ -3682,7 +3921,7 @@ impl GLProcessorST {
                     Ok(()) => (DstTarget::ZeroCopyImage, lowering),
                     Err(e) if self.probe_dst_import_only => return Err(e),
                     Err(e) => {
-                        self.note_dst_import_fallback(dst, dst_fmt, &e);
+                        self.note_dst_import_fallback(dst, dst_fmt, &e, TEXTURE_READBACK);
                         self.setup_renderbuffer_non_dma(dst, dst_fmt, crop)?;
                         (
                             DstTarget::Texture {
@@ -5430,38 +5669,16 @@ impl GLProcessorST {
         // --- Pass 1: Render source → intermediate RGBA texture ---
         let _pass1 =
             tracing::trace_span!("image.convert.gl.pack_rgb.pass1_rgba", dst_w, dst_h).entered();
-        self.ensure_packed_rgb_intermediate(dst_w, dst_h)?;
-        self.packed_rgb_fbo.bind();
-        unsafe {
-            edgefirst_gl::gl::FramebufferTexture2D(
-                edgefirst_gl::gl::FRAMEBUFFER,
-                edgefirst_gl::gl::COLOR_ATTACHMENT0,
-                edgefirst_gl::gl::TEXTURE_2D,
-                self.packed_rgb_intermediate_tex.id,
-                0,
-            );
-            check_gl_error(function!(), line!())?;
-            edgefirst_gl::gl::Viewport(0, 0, dst_w as i32, dst_h as i32);
-        }
-        // convert_to() renders to the currently-bound FBO (packed_rgb_fbo →
-        // intermediate), un-biased, with the finish deferred. The flag is
-        // restored before an error propagates.
-        let saved_defer = self.defer_finish;
-        self.defer_finish = true;
-        let pass1 = self.convert_to(
+        self.render_to_intermediate(
             src,
             src_fmt,
-            dst,
+            (dst_w, dst_h),
             dst_fmt,
-            None,
-            false,
             rotation,
             flip,
             crop,
             convert_span,
-        );
-        self.defer_finish = saved_defer;
-        pass1?;
+        )?;
         drop(_pass1);
 
         // --- Pass 2: Pack intermediate RGBA → RGB DMA destination ---
@@ -5488,25 +5705,11 @@ impl GLProcessorST {
                     );
                 }
                 None => {
-                    edgefirst_gl::gl::ActiveTexture(edgefirst_gl::gl::TEXTURE0);
-                    edgefirst_gl::gl::BindTexture(
-                        edgefirst_gl::gl::TEXTURE_2D,
-                        self.render_texture.id,
-                    );
-                    super::core::set_tex_filter(
-                        edgefirst_gl::gl::TEXTURE_2D,
-                        edgefirst_gl::gl::NEAREST,
-                    );
-                    Platform::attach_tex_image_2d(&self.gl_context, dest_egl)?;
-                    // Drops the cached binding key before the raw re-target.
-                    self.render_texture.invalidate_egl_binding();
-                    edgefirst_gl::gl::FramebufferTexture2D(
-                        edgefirst_gl::gl::FRAMEBUFFER,
-                        edgefirst_gl::gl::COLOR_ATTACHMENT0,
-                        edgefirst_gl::gl::TEXTURE_2D,
-                        self.render_texture.id,
-                        0,
-                    );
+                    Self::attach_import_target(
+                        &self.gl_context,
+                        &mut self.render_texture,
+                        dest_egl,
+                    )?;
                 }
             }
             check_gl_error(function!(), line!())?;
@@ -5595,38 +5798,16 @@ impl GLProcessorST {
         // --- Pass 1: src→RGBA into intermediate texture ---
         let _pass1 = tracing::trace_span!("image.convert.gl.nv_to_planar.pass1_rgba", dst_w, dst_h)
             .entered();
-        self.ensure_packed_rgb_intermediate(dst_w, dst_h)?;
-        self.packed_rgb_fbo.bind();
-        unsafe {
-            edgefirst_gl::gl::FramebufferTexture2D(
-                edgefirst_gl::gl::FRAMEBUFFER,
-                edgefirst_gl::gl::COLOR_ATTACHMENT0,
-                edgefirst_gl::gl::TEXTURE_2D,
-                self.packed_rgb_intermediate_tex.id,
-                0,
-            );
-            check_gl_error(function!(), line!())?;
-            edgefirst_gl::gl::Viewport(0, 0, dst_w as i32, dst_h as i32);
-        }
-        // convert_to() renders to the currently-bound FBO (packed_rgb_fbo →
-        // intermediate RGBA), un-biased, with the finish deferred. `dst` is used
-        // only for width/height in ROI coordinate math.
-        let saved_defer = self.defer_finish;
-        self.defer_finish = true;
-        let pass1 = self.convert_to(
+        self.render_to_intermediate(
             src,
             src_fmt,
-            dst,
+            (dst_w, dst_h),
             dst_fmt,
-            None,
-            false,
             rotation,
             flip,
             crop,
             convert_span,
-        );
-        self.defer_finish = saved_defer;
-        pass1?;
+        )?;
         drop(_pass1);
 
         // --- Pass 2: RGBA→planar into the classified destination ---
@@ -5695,36 +5876,16 @@ impl GLProcessorST {
 
         let _pass1 =
             tracing::trace_span!("image.convert.gl.grey.pass1_rgba", dst_w, dst_h).entered();
-        self.ensure_packed_rgb_intermediate(dst_w, dst_h)?;
-        self.packed_rgb_fbo.bind();
-        unsafe {
-            edgefirst_gl::gl::FramebufferTexture2D(
-                edgefirst_gl::gl::FRAMEBUFFER,
-                edgefirst_gl::gl::COLOR_ATTACHMENT0,
-                edgefirst_gl::gl::TEXTURE_2D,
-                self.packed_rgb_intermediate_tex.id,
-                0,
-            );
-            check_gl_error(function!(), line!())?;
-            edgefirst_gl::gl::Viewport(0, 0, dst_w as i32, dst_h as i32);
-        }
-        // Pass 1 renders un-biased with the finish deferred.
-        let saved_defer = self.defer_finish;
-        self.defer_finish = true;
-        let pass1 = self.convert_to(
+        self.render_to_intermediate(
             src,
             src_fmt,
-            dst,
+            (dst_w, dst_h),
             PixelFormat::Rgba,
-            None,
-            false,
             rotation,
             flip,
             crop,
             convert_span,
-        );
-        self.defer_finish = saved_defer;
-        pass1?;
+        )?;
         drop(_pass1);
 
         let _pass2 =
@@ -5738,16 +5899,9 @@ impl GLProcessorST {
         };
         unsafe {
             edgefirst_gl::gl::UseProgram(program);
-            edgefirst_gl::gl::ActiveTexture(edgefirst_gl::gl::TEXTURE0);
-            edgefirst_gl::gl::BindTexture(
-                edgefirst_gl::gl::TEXTURE_2D,
-                self.packed_rgb_intermediate_tex.id,
-            );
-            // NEAREST: a 1:1 copy of pass 1's output.
-            super::core::set_tex_filter_clamp(
-                edgefirst_gl::gl::TEXTURE_2D,
-                edgefirst_gl::gl::NEAREST,
-            );
+        }
+        self.bind_intermediate();
+        unsafe {
             if is_int8 {
                 self.set_plane_quant(program, Some(0));
             }
@@ -5765,6 +5919,440 @@ impl GLProcessorST {
             self.readback_rendered(dst, PixelFormat::Grey, readback.pbo_id())?;
         }
         Ok(())
+    }
+
+    /// `ConvertPlan::ThreePassNv12` into a zero-copy NV12 destination;
+    /// `NotSupported` when GL leaves it to the CPU.
+    #[allow(clippy::too_many_arguments)]
+    fn convert_to_nv12(
+        &mut self,
+        src: &Tensor<u8>,
+        dst: &mut Tensor<u8>,
+        src_fmt: PixelFormat,
+        rotation: crate::Rotation,
+        flip: Flip,
+        crop: ResolvedCrop,
+        convert_span: &tracing::Span,
+    ) -> crate::Result<()> {
+        let band = self.nv12_admit(src, dst, src_fmt, rotation, flip, crop)?;
+        let (coeffs, fill) = Self::nv12_encoding(dst, band, crop.dst_color);
+        let planes = self.import_nv12_planes(dst)?;
+        Self::record_dst_feed(convert_span, DstTarget::ZeroCopyImage);
+        let (dst_w, dst_h) = (dst.width().unwrap_or(0), dst.height().unwrap_or(0));
+
+        let _pass1 =
+            tracing::trace_span!("image.convert.gl.nv12.pass1_rgba", dst_w, dst_h).entered();
+        self.render_to_intermediate(
+            src,
+            src_fmt,
+            (dst_w, dst_h),
+            PixelFormat::Rgba,
+            rotation,
+            flip,
+            crop,
+            convert_span,
+        )?;
+        drop(_pass1);
+
+        let drawn = self.draw_nv12_planes(planes, (dst_w, dst_h), band, fill, &coeffs);
+        // SAFETY: on the GL thread.
+        unsafe { edgefirst_gl::gl::Disable(edgefirst_gl::gl::SCISSOR_TEST) };
+        drawn?;
+        unsafe { edgefirst_gl::gl::Finish() };
+        check_gl_error(function!(), line!())
+    }
+
+    /// Whether GL renders `src` into the NV12 `dst`: the placement band, a sub-rectangle of
+    /// `dst`, or `None` for the whole destination.
+    ///
+    /// # Errors
+    ///
+    /// `NotSupported` for an odd destination size, a decline from [`nv12_dst_decline`], a
+    /// placement without a fill colour whose edges are odd, a destination the GPU misplaces,
+    /// and NV12 programs that failed to build.
+    fn nv12_admit(
+        &mut self,
+        src: &Tensor<u8>,
+        dst: &Tensor<u8>,
+        src_fmt: PixelFormat,
+        rotation: crate::Rotation,
+        flip: Flip,
+        crop: ResolvedCrop,
+    ) -> crate::Result<Option<crate::Rect>> {
+        let dst_w = dst.width().ok_or(Error::NotAnImage)?;
+        let dst_h = dst.height().ok_or(Error::NotAnImage)?;
+        if !dst_w.is_multiple_of(2) || !dst_h.is_multiple_of(2) {
+            return Err(Error::NotSupported(format!(
+                "NV12 destination must have even width and height, got {dst_w}x{dst_h}"
+            )));
+        }
+        let whole = |r: Option<crate::Rect>, w: usize, h: usize| {
+            r.is_none_or(|r| (r.left, r.top, r.width, r.height) == (0, 0, w, h))
+        };
+        let (src_w, src_h) = (
+            src.width().ok_or(Error::NotAnImage)?,
+            src.height().ok_or(Error::NotAnImage)?,
+        );
+        let same_size = (src_w, src_h) == (dst_w, dst_h)
+            && rotation == crate::Rotation::None
+            && flip == Flip::None
+            && whole(crop.src_rect, src_w, src_h)
+            && whole(crop.dst_rect, dst_w, dst_h);
+        let exact_copy = same_size
+            && matches!(
+                src_fmt,
+                PixelFormat::Nv12 | PixelFormat::Yuyv | PixelFormat::Vyuy
+            )
+            && crate::colorimetry::same_yuv_coding(
+                &crate::colorimetry::resolve_colorimetry(src.colorimetry(), src.height()),
+                &crate::colorimetry::resolve_colorimetry(dst.colorimetry(), dst.height()),
+            );
+        if let Some(why) = self.nv12_policy_decline(src_fmt, same_size, exact_copy, (dst_w, dst_h))
+        {
+            return Err(Error::NotSupported(why));
+        }
+        let band = crop
+            .dst_rect
+            .filter(|_| !whole(crop.dst_rect, dst_w, dst_h));
+        if let Some(r) = band {
+            if crop.dst_color.is_none()
+                && [r.left, r.top, r.width, r.height]
+                    .iter()
+                    .any(|v| !v.is_multiple_of(2))
+            {
+                return Err(Error::NotSupported(format!(
+                    "GL NV12 placement {r:?} without a fill colour needs even edges"
+                )));
+            }
+        }
+        if self.is_adreno
+            && dst
+                .chroma()
+                .and_then(|c| c.plane_offset())
+                .is_some_and(unaligned_import_offset)
+        {
+            return Err(Error::NotSupported(
+                "this GPU misplaces a destination imported at an unaligned plane offset".into(),
+            ));
+        }
+        self.ensure_nv12_programs()?;
+        Ok(band)
+    }
+
+    /// The decline message from [`nv12_dst_decline`] under this GPU's policy, or `None` when
+    /// GL renders the conversion. A soft decline applies only while `soft_declines` is set.
+    pub(super) fn nv12_policy_decline(
+        &self,
+        src_fmt: PixelFormat,
+        same_size: bool,
+        exact_copy: bool,
+        dst_size: (usize, usize),
+    ) -> Option<String> {
+        nv12_dst_decline(
+            self.nv12_policy,
+            &self.renderer_name,
+            src_fmt,
+            same_size,
+            exact_copy,
+            dst_size,
+        )
+        .filter(|(class, _)| *class == DeclineClass::Hard || self.soft_declines)
+        .map(|(_, why)| why)
+    }
+
+    /// The RGB to YUV coefficients for `dst`'s colorimetry, and the encoded `[Y, U, V]` of
+    /// `dst_color` when `band` is set.
+    fn nv12_encoding(
+        dst: &Tensor<u8>,
+        band: Option<crate::Rect>,
+        dst_color: Option<[u8; 4]>,
+    ) -> (crate::colorimetry::RgbToYuvCoeffs, Option<[u8; 3]>) {
+        let cm = crate::colorimetry::resolve_colorimetry(dst.colorimetry(), dst.height());
+        let encoding = cm
+            .encoding
+            .unwrap_or(edgefirst_tensor::ColorEncoding::Bt709);
+        let range = cm.range.unwrap_or(edgefirst_tensor::ColorRange::Limited);
+        let coeffs = crate::colorimetry::rgb_to_yuv_coeffs(encoding, range);
+        let fill = band.and(dst_color).map(|rgba| {
+            let cp = crate::cpu::ColorParams::uniform(encoding, range);
+            let yuyv = crate::cpu::CPUProcessor::rgba_to_yuyv(rgba, cp);
+            [yuyv[0], yuyv[1], yuyv[3]]
+        });
+        (coeffs, fill)
+    }
+
+    /// `dst`'s NV12 render targets.
+    ///
+    /// # Errors
+    ///
+    /// `NotSupported` when the import is refused, counted in
+    /// `ConvertStats::dst_import_fallbacks`.
+    fn import_nv12_planes(
+        &mut self,
+        dst: &Tensor<u8>,
+    ) -> crate::Result<NvDstPlanes<PlatformHandle>> {
+        self.get_or_create_nv12_dst(dst).map_err(|e| {
+            self.note_dst_import_fallback(dst, PixelFormat::Nv12, &e, "converting on the CPU");
+            Error::NotSupported(format!(
+                "NV12 destination ({}x{}) import refused: {e}",
+                dst.width().unwrap_or(0),
+                dst.height().unwrap_or(0)
+            ))
+        })
+    }
+
+    /// Build the NV12 programs on the first NV12 destination. A failed build
+    /// is logged once, and this and every later NV12 destination then
+    /// returns `NotSupported`.
+    fn ensure_nv12_programs(&mut self) -> crate::Result<()> {
+        if matches!(self.nv12_programs, Nv12ProgramState::Unbuilt) {
+            #[cfg(test)]
+            let built = if self.fail_nv12_programs {
+                Err(Error::OpenGl(
+                    "NV12 program build failed by the test hook".into(),
+                ))
+            } else {
+                Nv12Programs::new()
+            };
+            #[cfg(not(test))]
+            let built = Nv12Programs::new();
+            self.nv12_programs = match built {
+                Ok(programs) => Nv12ProgramState::Built(programs),
+                Err(e) => {
+                    log::warn!(
+                        "the NV12 destination programs failed to build; NV12 destinations \
+                         convert on the CPU: {e}"
+                    );
+                    Nv12ProgramState::Failed(e.to_string())
+                }
+            };
+        }
+        match &self.nv12_programs {
+            Nv12ProgramState::Failed(e) => Err(Error::NotSupported(format!(
+                "the NV12 destination programs failed to build: {e}"
+            ))),
+            _ => Ok(()),
+        }
+    }
+
+    /// The NV12 programs [`Self::ensure_nv12_programs`] built.
+    fn nv12_programs(&self) -> crate::Result<&Nv12Programs> {
+        match &self.nv12_programs {
+            Nv12ProgramState::Built(programs) => Ok(programs),
+            _ => Err(Error::Internal("the NV12 programs are not built".into())),
+        }
+    }
+
+    /// Passes 2 and 3 of [`Self::convert_to_nv12`]: fill, then luma and
+    /// chroma from `packed_rgb_intermediate_tex` into `planes`. `band` is the
+    /// placement and `fill` the encoded `[Y, U, V]` of its fill colour. Leaves
+    /// `SCISSOR_TEST` enabled when `band` is set.
+    fn draw_nv12_planes(
+        &mut self,
+        planes: NvDstPlanes<PlatformHandle>,
+        (w, h): (usize, usize),
+        band: Option<crate::Rect>,
+        fill: Option<[u8; 3]>,
+        coeffs: &crate::colorimetry::RgbToYuvCoeffs,
+    ) -> crate::Result<()> {
+        let (w, h) = (w as i32, h as i32);
+        let (luma, chroma, chroma_row, chroma_h) = match planes {
+            NvDstPlanes::Combined { plane, .. } => (plane, None, h, h / 2),
+            NvDstPlanes::Split {
+                luma,
+                chroma,
+                chroma_rows,
+            } => (luma, Some(chroma), 0, chroma_rows as i32),
+        };
+        let scissor = |x: i32, y: i32, sw: i32, sh: i32| unsafe {
+            edgefirst_gl::gl::Scissor(x, y, sw, sh);
+            edgefirst_gl::gl::Enable(edgefirst_gl::gl::SCISSOR_TEST);
+        };
+
+        let _pass2 = tracing::trace_span!("image.convert.gl.nv12.pass2_luma", w, h).entered();
+        self.convert_fbo.bind();
+        // SAFETY: `luma` is owned by `dst_egl_cache` for this convert.
+        unsafe { Self::attach_import_target(&self.gl_context, &mut self.render_texture, luma)? };
+        if let Some([y, _, _]) = fill {
+            scissor(0, 0, w, h);
+            unsafe {
+                edgefirst_gl::gl::ClearColor(y as f32 / 255.0, 0.0, 0.0, 1.0);
+                edgefirst_gl::gl::Clear(edgefirst_gl::gl::COLOR_BUFFER_BIT);
+            }
+        }
+        match band {
+            Some(r) => scissor(r.left as i32, r.top as i32, r.width as i32, r.height as i32),
+            None => unsafe { edgefirst_gl::gl::Disable(edgefirst_gl::gl::SCISSOR_TEST) },
+        }
+        let p = self.nv12_programs()?;
+        unsafe {
+            edgefirst_gl::gl::Viewport(0, 0, w, h);
+            edgefirst_gl::gl::UseProgram(p.luma.id);
+            let [y_coeffs, y_offset] = p.luma_locs;
+            edgefirst_gl::gl::Uniform3f(
+                y_coeffs,
+                coeffs.y[0] as f32,
+                coeffs.y[1] as f32,
+                coeffs.y[2] as f32,
+            );
+            edgefirst_gl::gl::Uniform1f(y_offset, coeffs.y_offset as f32);
+        }
+        self.bind_intermediate();
+        self.draw_fullscreen_quad()?;
+        drop(_pass2);
+
+        let _pass3 = tracing::trace_span!("image.convert.gl.nv12.pass3_chroma", w, h).entered();
+        if let Some(chroma) = chroma {
+            // SAFETY: `chroma` is owned by `dst_egl_cache` for this convert.
+            unsafe {
+                Self::attach_import_target(&self.gl_context, &mut self.nv12_chroma_texture, chroma)?
+            };
+        }
+        unsafe { edgefirst_gl::gl::Viewport(0, chroma_row, w, chroma_h) };
+        let p = self.nv12_programs()?;
+        if let Some([_, u, v]) = fill {
+            unsafe {
+                edgefirst_gl::gl::Disable(edgefirst_gl::gl::SCISSOR_TEST);
+                edgefirst_gl::gl::UseProgram(p.fill.id);
+                edgefirst_gl::gl::Uniform2f(p.fill_uv, u as f32 / 255.0, v as f32 / 255.0);
+            }
+            self.draw_fullscreen_quad()?;
+        }
+        if let Some(r) = band {
+            let (x0, x1) = (r.left / 2 * 2, (r.left + r.width).div_ceil(2) * 2);
+            let (y0, y1) = (r.top / 2, (r.top + r.height).div_ceil(2));
+            scissor(
+                x0 as i32,
+                chroma_row + y0 as i32,
+                (x1 - x0) as i32,
+                (y1 - y0) as i32,
+            );
+        }
+        let p = self.nv12_programs()?;
+        unsafe {
+            edgefirst_gl::gl::UseProgram(p.chroma.id);
+            let [u_coeffs, v_coeffs, c_offset, row] = p.chroma_locs;
+            edgefirst_gl::gl::Uniform3f(
+                u_coeffs,
+                coeffs.u[0] as f32,
+                coeffs.u[1] as f32,
+                coeffs.u[2] as f32,
+            );
+            edgefirst_gl::gl::Uniform3f(
+                v_coeffs,
+                coeffs.v[0] as f32,
+                coeffs.v[1] as f32,
+                coeffs.v[2] as f32,
+            );
+            edgefirst_gl::gl::Uniform1f(c_offset, coeffs.c_offset as f32);
+            edgefirst_gl::gl::Uniform1i(row, chroma_row);
+        }
+        self.bind_intermediate();
+        self.draw_fullscreen_quad()
+    }
+
+    /// Attach `handle` to `texture` and `texture` to `convert_fbo`'s colour
+    /// attachment, dropping the texture's cached EGLImage binding.
+    ///
+    /// # Errors
+    ///
+    /// `NotSupported` when the framebuffer is incomplete with the import
+    /// attached.
+    ///
+    /// # Safety
+    /// On the GL thread with `convert_fbo` bound and `handle`'s import alive.
+    unsafe fn attach_import_target(
+        gl_context: &PlatformDisplay,
+        texture: &mut Texture,
+        handle: PlatformHandle,
+    ) -> crate::Result<()> {
+        unsafe {
+            edgefirst_gl::gl::ActiveTexture(edgefirst_gl::gl::TEXTURE0);
+            edgefirst_gl::gl::BindTexture(edgefirst_gl::gl::TEXTURE_2D, texture.id);
+            super::core::set_tex_filter(edgefirst_gl::gl::TEXTURE_2D, edgefirst_gl::gl::NEAREST);
+            let attached = Platform::attach_tex_image_2d(gl_context, handle);
+            texture.invalidate_egl_binding();
+            attached?;
+            edgefirst_gl::gl::FramebufferTexture2D(
+                edgefirst_gl::gl::FRAMEBUFFER,
+                edgefirst_gl::gl::COLOR_ATTACHMENT0,
+                edgefirst_gl::gl::TEXTURE_2D,
+                texture.id,
+                0,
+            );
+            if let Err(status) = super::core::check_framebuffer_complete() {
+                edgefirst_gl::gl::BindFramebuffer(edgefirst_gl::gl::FRAMEBUFFER, 0);
+                return Err(Error::NotSupported(format!(
+                    "GL render target import leaves the framebuffer incomplete (0x{status:x})"
+                )));
+            }
+        }
+        check_gl_error(function!(), line!())
+    }
+
+    /// Bind `packed_rgb_intermediate_tex` to texture unit 0 with `NEAREST`
+    /// filtering and edge clamping.
+    fn bind_intermediate(&self) {
+        // SAFETY: on the GL thread.
+        unsafe {
+            edgefirst_gl::gl::ActiveTexture(edgefirst_gl::gl::TEXTURE0);
+            edgefirst_gl::gl::BindTexture(
+                edgefirst_gl::gl::TEXTURE_2D,
+                self.packed_rgb_intermediate_tex.id,
+            );
+            super::core::set_tex_filter_clamp(
+                edgefirst_gl::gl::TEXTURE_2D,
+                edgefirst_gl::gl::NEAREST,
+            );
+        }
+    }
+
+    /// Render `src` into `packed_rgb_intermediate_tex` at `dst_w`×`dst_h`
+    /// through [`Self::convert_to_dims`] with `dst_fmt` as the logical
+    /// destination format, un-biased and with the finish deferred. The
+    /// `defer_finish` flag is restored before an error propagates.
+    #[allow(clippy::too_many_arguments)]
+    fn render_to_intermediate(
+        &mut self,
+        src: &Tensor<u8>,
+        src_fmt: PixelFormat,
+        (dst_w, dst_h): (usize, usize),
+        dst_fmt: PixelFormat,
+        rotation: crate::Rotation,
+        flip: Flip,
+        crop: ResolvedCrop,
+        convert_span: &tracing::Span,
+    ) -> crate::Result<()> {
+        self.ensure_packed_rgb_intermediate(dst_w, dst_h)?;
+        self.packed_rgb_fbo.bind();
+        unsafe {
+            edgefirst_gl::gl::FramebufferTexture2D(
+                edgefirst_gl::gl::FRAMEBUFFER,
+                edgefirst_gl::gl::COLOR_ATTACHMENT0,
+                edgefirst_gl::gl::TEXTURE_2D,
+                self.packed_rgb_intermediate_tex.id,
+                0,
+            );
+            check_gl_error(function!(), line!())?;
+            edgefirst_gl::gl::Viewport(0, 0, dst_w as i32, dst_h as i32);
+        }
+        let saved_defer = self.defer_finish;
+        self.defer_finish = true;
+        let rendered = self.convert_to_dims(
+            src,
+            src_fmt,
+            dst_w,
+            dst_h,
+            None,
+            dst_fmt,
+            false,
+            rotation,
+            flip,
+            crop,
+            convert_span,
+        );
+        self.defer_finish = saved_defer;
+        rendered
     }
 
     /// Allocates or resizes the intermediate RGBA texture for two-pass packed RGB.
@@ -7263,17 +7851,11 @@ impl GLProcessorST {
         let id = BufferImportKey::from_tensor(img, img_fmt, false);
         let luma_id = id.luma_id;
 
-        {
-            let ts = self.nv_r8_egl_cache.next_timestamp();
-            if let Some(cached) = self.nv_r8_egl_cache.entries.get_mut(&id) {
-                self.nv_r8_egl_cache.hits += 1;
-                cached.last_used = ts;
-                log::trace!("nv_r8_egl_cache hit: id={luma_id:#x}");
-                return Ok(Platform::import_handle(&cached.import));
-            }
-            self.nv_r8_egl_cache.misses += 1;
-            log::trace!("nv_r8_egl_cache miss: id={luma_id:#x}");
+        if let Some(cached) = self.nv_r8_egl_cache.lookup(&id) {
+            log::trace!("nv_r8_egl_cache hit: id={luma_id:#x}");
+            return Ok(Platform::import_handle(cached));
         }
+        log::trace!("nv_r8_egl_cache miss: id={luma_id:#x}");
 
         let egl_image_obj = Platform::import_buffer_nv_r8(&self.gl_context, img, img_fmt)?;
         self.nv_r8_texture.invalidate_egl_binding();
@@ -7369,13 +7951,8 @@ impl GLProcessorST {
             )));
         }
         let id = BufferImportKey::from_tensor(img, img_fmt, false);
-        {
-            let ts = self.nv_uv_egl_cache.next_timestamp();
-            if let Some(cached) = self.nv_uv_egl_cache.entries.get_mut(&id) {
-                self.nv_uv_egl_cache.hits += 1;
-                cached.last_used = ts;
-                return Ok(Platform::import_handle(&cached.import));
-            }
+        if let Some(cached) = self.nv_uv_egl_cache.lookup(&id) {
+            return Ok(Platform::import_handle(cached));
         }
         // Records a refused import so it is not attempted again.
         let egl_image_obj = Platform::import_buffer_nv_chroma(&self.gl_context, img, img_fmt)
@@ -7387,7 +7964,6 @@ impl GLProcessorST {
                     self.nv_uv_import_refused = true;
                 }
             })?;
-        self.nv_uv_egl_cache.misses += 1;
         self.nv_uv_texture.invalidate_egl_binding();
         let handle = Platform::import_handle(&egl_image_obj);
         self.nv_uv_egl_cache.insert(id, egl_image_obj, None);
@@ -7465,21 +8041,15 @@ impl GLProcessorST {
         let id = BufferImportKey::from_tensor(img, img_fmt, cache == CacheKind::Dst);
         let luma_id = id.luma_id;
 
-        {
-            let egl_cache = match cache {
-                CacheKind::Src => &mut self.src_egl_cache,
-                CacheKind::Dst => &mut self.dst_egl_cache,
-            };
-            let ts = egl_cache.next_timestamp();
-            if let Some(cached) = egl_cache.entries.get_mut(&id) {
-                egl_cache.hits += 1;
-                cached.last_used = ts;
-                log::trace!("ImportCache {:?} hit: id={luma_id:#x}", cache);
-                return Ok(Platform::import_handle(&cached.import));
-            }
-            egl_cache.misses += 1;
-            log::trace!("ImportCache {:?} miss: id={luma_id:#x}", cache);
+        let egl_cache = match cache {
+            CacheKind::Src => &mut self.src_egl_cache,
+            CacheKind::Dst => &mut self.dst_egl_cache,
+        };
+        if let Some(cached) = egl_cache.lookup(&id) {
+            log::trace!("ImportCache {:?} hit: id={luma_id:#x}", cache);
+            return Ok(Platform::import_handle(cached));
         }
+        log::trace!("ImportCache {:?} miss: id={luma_id:#x}", cache);
 
         // Creates the EGL image before evicting. A destination view imports its
         // parent; a source view imports its own region.
@@ -7652,14 +8222,10 @@ impl GLProcessorST {
         Platform::validate_import_identity(img, "packed destination")?;
         let id = BufferImportKey::from_tensor(img, img_fmt, true);
 
-        let ts = self.dst_egl_cache.next_timestamp();
-        if let Some(cached) = self.dst_egl_cache.entries.get_mut(&id) {
-            self.dst_egl_cache.hits += 1;
-            cached.last_used = ts;
+        if let Some(cached) = self.dst_egl_cache.lookup(&id) {
             log::trace!("ImportCache dst (RGB) hit: id={:#x}", id.luma_id);
-            return Ok(Platform::import_handle(&cached.import));
+            return Ok(Platform::import_handle(cached));
         }
-        self.dst_egl_cache.misses += 1;
         log::trace!("ImportCache dst (RGB) miss: id={:#x}", id.luma_id);
         // Invalidates the destination texture binding state on a cache miss.
         self.invalidate_dst_textures();
@@ -7689,6 +8255,89 @@ impl GLProcessorST {
 
         self.dst_egl_cache.insert(id, egl_image_obj, rbo);
         Ok(handle)
+    }
+
+    /// Look up or create the render targets of an NV12 destination, cached in
+    /// `dst_egl_cache`: one entry for a single-plane destination, one per
+    /// plane for a multiplane one.
+    fn get_or_create_nv12_dst(
+        &mut self,
+        dst: &Tensor<u8>,
+    ) -> Result<NvDstPlanes<PlatformHandle>, crate::Error> {
+        // Test hook: refuses a destination import.
+        #[cfg(test)]
+        if self.fail_dst_import {
+            return Err(crate::Error::OpenGl(
+                "EDGEFIRST test hook: zero-copy destination import refused".to_string(),
+            ));
+        }
+        Platform::validate_import_identity(dst, "NV12 destination")?;
+        let (dst_w, dst_h) = (
+            dst.width().ok_or(Error::NotAnImage)?,
+            dst.height().ok_or(Error::NotAnImage)?,
+        );
+        let luma_key = BufferImportKey::from_tensor(dst, PixelFormat::Nv12, true);
+        let chroma_key = dst
+            .chroma()
+            .map(|c| BufferImportKey::from_tensor(c, PixelFormat::Nv12, true));
+        let luma_cached = self.dst_egl_cache.lookup(&luma_key).is_some();
+        let chroma_cached = chroma_key
+            .as_ref()
+            .map(|key| self.dst_egl_cache.lookup(key).is_some());
+
+        if !(luma_cached && chroma_cached.unwrap_or(true)) {
+            let planes = Platform::import_nv12_dst(&self.gl_context, dst)?;
+            self.invalidate_dst_textures();
+            match planes {
+                NvDstPlanes::Combined {
+                    plane,
+                    width,
+                    height,
+                } => {
+                    if (height as usize) != dst_h + dst_h / 2 || (width as usize) < dst_w {
+                        return Err(Error::NotSupported(format!(
+                            "NV12 destination import is {width}x{height}, which does not hold a \
+                             {dst_w}x{dst_h} image"
+                        )));
+                    }
+                    self.dst_egl_cache.insert(luma_key, plane, None);
+                }
+                NvDstPlanes::Split { luma, chroma, .. } => {
+                    if !luma_cached {
+                        self.dst_egl_cache.insert(luma_key, luma, None);
+                    }
+                    if let (Some(false), Some(key)) = (chroma_cached, chroma_key) {
+                        self.dst_egl_cache.insert(key, chroma, None);
+                    }
+                }
+            }
+        }
+
+        let handle = |cache: &ImportCache<PlatformImport>, key: &BufferImportKey| {
+            cache
+                .entries
+                .get(key)
+                .map(|cached| Platform::import_handle(&cached.import))
+                .ok_or_else(|| {
+                    Error::NotSupported(
+                        "the destination import cache is too small to hold an NV12 destination"
+                            .into(),
+                    )
+                })
+        };
+        let luma = handle(&self.dst_egl_cache, &luma_key)?;
+        Ok(match chroma_key {
+            Some(key) => NvDstPlanes::Split {
+                luma,
+                chroma: handle(&self.dst_egl_cache, &key)?,
+                chroma_rows: (dst_h / 2) as u32,
+            },
+            None => NvDstPlanes::Combined {
+                plane: luma,
+                width: dst_w as u32,
+                height: (dst_h + dst_h / 2) as u32,
+            },
+        })
     }
 
     // Reshapes the segmentation to be compatible with RGBA texture array rendering.
@@ -9004,6 +9653,19 @@ impl GLProcessorST {
         self.is_vivante
     }
 
+    /// Whether this GPU renders a resized RGBA source into an NV12 destination.
+    #[cfg(test)]
+    pub(super) fn renders_nv12_dst(&self) -> bool {
+        self.nv12_policy_decline(PixelFormat::Rgba, false, false, (640, 360))
+            .is_none()
+    }
+
+    /// The NV12 destination policy and whether soft declines apply.
+    #[cfg(test)]
+    pub(super) fn nv12_decline_state(&self) -> (Nv12DstPolicy, bool) {
+        (self.nv12_policy, self.soft_declines)
+    }
+
     /// The float render support this processor advertises.
     pub(super) fn supported_render_dtypes(&self) -> crate::RenderDtypeSupport {
         float_render_support(
@@ -9044,38 +9706,16 @@ impl GLProcessorST {
 
         // Pass 1: NV → RGBA with the caller's geometry, into the shared
         // intermediate texture.
-        self.ensure_packed_rgb_intermediate(dst_w, dst_h)?;
-        self.packed_rgb_fbo.bind();
-        unsafe {
-            edgefirst_gl::gl::FramebufferTexture2D(
-                edgefirst_gl::gl::FRAMEBUFFER,
-                edgefirst_gl::gl::COLOR_ATTACHMENT0,
-                edgefirst_gl::gl::TEXTURE_2D,
-                self.packed_rgb_intermediate_tex.id,
-                0,
-            );
-            check_gl_error(function!(), line!())?;
-            edgefirst_gl::gl::Viewport(0, 0, dst_w as i32, dst_h as i32);
-        }
-        // Defers the finish for pass 1 and restores the flag before an error
-        // propagates.
-        let saved_defer = self.defer_finish;
-        self.defer_finish = true;
-        let pass1 = self.convert_to_dims(
+        self.render_to_intermediate(
             src_u8,
             src_fmt,
-            dst_w,
-            dst_h,
-            None,
+            (dst_w, dst_h),
             PixelFormat::Rgba,
-            false,
             rotation,
             flip,
             crop,
             convert_span,
-        );
-        self.defer_finish = saved_defer;
-        pass1?;
+        )?;
 
         // Pass 2: 1:1 pack of the intermediate into the zero-copy float
         // destination. Samples the letterbox rectangle from the same rectangle
@@ -9171,11 +9811,273 @@ impl GLProcessorST {
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
+    #[test]
+    fn nv12_dst_policy_per_renderer() {
+        use super::{
+            Nv12DstPolicy, RendererTraits, NV12_SAME_SIZE_MIN_PIXELS_ADRENO,
+            NV12_SAME_SIZE_MIN_PIXELS_ANGLE,
+        };
+        let policy = |gpu_renders,
+                      packed_yuv_src_broken,
+                      same_size_min_pixels,
+                      exact_copy_on_cpu,
+                      measured| Nv12DstPolicy {
+            gpu_renders,
+            packed_yuv_src_broken,
+            same_size_min_pixels,
+            exact_copy_on_cpu,
+            measured,
+        };
+        let traits = RendererTraits::default();
+        let rows = [
+            (
+                "adreno",
+                RendererTraits {
+                    adreno: true,
+                    ..traits
+                },
+                policy(true, false, NV12_SAME_SIZE_MIN_PIXELS_ADRENO, true, true),
+            ),
+            (
+                "mali",
+                RendererTraits {
+                    mali: true,
+                    ..traits
+                },
+                policy(true, false, 0, false, true),
+            ),
+            (
+                "angle",
+                RendererTraits {
+                    angle: true,
+                    ..traits
+                },
+                policy(true, false, NV12_SAME_SIZE_MIN_PIXELS_ANGLE, true, true),
+            ),
+            (
+                "vivante",
+                RendererTraits {
+                    vivante: true,
+                    ..traits
+                },
+                policy(true, true, usize::MAX, true, true),
+            ),
+            (
+                "software",
+                RendererTraits {
+                    software: true,
+                    ..traits
+                },
+                policy(false, false, usize::MAX, true, true),
+            ),
+            (
+                "angle over a software rasterizer",
+                RendererTraits {
+                    angle: true,
+                    software: true,
+                    ..traits
+                },
+                policy(false, false, usize::MAX, true, true),
+            ),
+            (
+                "other",
+                traits,
+                policy(true, false, usize::MAX, true, false),
+            ),
+        ];
+        for (name, t, want) in rows {
+            assert_eq!(Nv12DstPolicy::for_renderer(t), want, "{name}");
+        }
+        assert_eq!(NV12_SAME_SIZE_MIN_PIXELS_ADRENO, 1920 * 1080);
+        assert_eq!(NV12_SAME_SIZE_MIN_PIXELS_ANGLE, 1600 * 900);
+    }
+
+    #[test]
+    fn nv12_dst_decline_classes() {
+        use super::{nv12_dst_decline, DeclineClass, GlPlatform, Nv12DstPolicy, Platform};
+        use crate::PixelFormat::{Nv12, Rgba, Vyuy, Yuyv};
+        use DeclineClass::{Hard, Soft};
+        let renders = Nv12DstPolicy {
+            gpu_renders: true,
+            packed_yuv_src_broken: false,
+            same_size_min_pixels: 0,
+            exact_copy_on_cpu: false,
+            measured: true,
+        };
+        let class = |policy, fmt, same_size, exact_copy, size| {
+            nv12_dst_decline(policy, "GPU-X", fmt, same_size, exact_copy, size).map(|(c, _)| c)
+        };
+        let vga = (640, 480);
+
+        let no_gpu = Nv12DstPolicy {
+            gpu_renders: false,
+            ..renders
+        };
+        assert_eq!(class(no_gpu, Rgba, false, false, vga), Some(Hard));
+        let (_, msg) = nv12_dst_decline(no_gpu, "GPU-X", Rgba, false, false, vga).unwrap();
+        assert!(msg.contains("GPU-X"), "{msg}");
+        if !Platform::NV12_DST {
+            assert_eq!(class(renders, Rgba, false, false, vga), Some(Hard));
+            return;
+        }
+        assert_eq!(class(renders, Rgba, false, false, vga), None);
+
+        let broken = Nv12DstPolicy {
+            packed_yuv_src_broken: true,
+            measured: false,
+            ..renders
+        };
+        assert_eq!(class(broken, Yuyv, false, false, vga), Some(Hard));
+        assert_eq!(class(broken, Vyuy, false, false, vga), Some(Hard));
+        assert_eq!(class(broken, Nv12, false, false, vga), Some(Soft));
+        let broken = Nv12DstPolicy {
+            measured: true,
+            ..broken
+        };
+        assert_eq!(class(broken, Nv12, false, false, vga), None);
+        assert_eq!(class(broken, Rgba, false, false, vga), None);
+
+        let unmeasured = Nv12DstPolicy {
+            measured: false,
+            ..renders
+        };
+        assert_eq!(class(unmeasured, Rgba, false, false, vga), Some(Soft));
+        assert_eq!(
+            class(unmeasured, Yuyv, false, false, (1920, 1080)),
+            Some(Soft)
+        );
+
+        let copy_on_cpu = Nv12DstPolicy {
+            exact_copy_on_cpu: true,
+            ..renders
+        };
+        assert_eq!(
+            class(copy_on_cpu, Nv12, true, true, (3840, 2160)),
+            Some(Soft)
+        );
+        assert_eq!(class(copy_on_cpu, Nv12, true, false, (3840, 2160)), None);
+        assert_eq!(class(renders, Nv12, true, true, (3840, 2160)), None);
+        let (_, msg) = nv12_dst_decline(copy_on_cpu, "GPU-X", Yuyv, true, true, vga).unwrap();
+        assert!(msg.contains("exact same-size"), "{msg}");
+
+        let threshold = Nv12DstPolicy {
+            same_size_min_pixels: 1920 * 1080,
+            ..renders
+        };
+        assert_eq!(class(threshold, Rgba, true, false, (1600, 900)), Some(Soft));
+        assert_eq!(class(threshold, Rgba, true, false, (1920, 1080)), None);
+        assert_eq!(class(threshold, Rgba, false, false, (320, 240)), None);
+        let (_, msg) =
+            nv12_dst_decline(threshold, "GPU-X", Rgba, true, false, (1600, 900)).unwrap();
+        assert!(msg.contains("1600x900"), "{msg}");
+        let every_same_size = Nv12DstPolicy {
+            same_size_min_pixels: usize::MAX,
+            ..renders
+        };
+        assert_eq!(
+            class(every_same_size, Rgba, true, false, (3840, 2160)),
+            Some(Soft)
+        );
+
+        for (_, msg) in [
+            nv12_dst_decline(no_gpu, "GPU-X", Rgba, false, false, vga),
+            nv12_dst_decline(broken, "GPU-X", Yuyv, false, false, vga),
+            nv12_dst_decline(unmeasured, "GPU-X", Rgba, false, false, vga),
+            nv12_dst_decline(copy_on_cpu, "GPU-X", Nv12, true, true, vga),
+            nv12_dst_decline(threshold, "GPU-X", Rgba, true, false, vga),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            assert!(!msg.contains("runs on the CPU"), "{msg}");
+        }
+    }
+
     use super::{
         pack_row_length, padded_readback_bytes, plan_pbo_readback, resolve_egl_cache_capacity,
         should_reject_software_gl, spread_rows, unpack_row_length, Error,
         DEFAULT_EGL_CACHE_CAPACITY,
     };
+
+    /// The RGBA->NV12 luma, chroma and chroma fill programs compile.
+    #[test]
+    fn nv12_encode_programs_compile() {
+        use super::super::resources::GlProgram;
+        use super::super::shaders::generate_vertex_shader;
+        use super::super::shaders_common::{
+            NV12_CHROMA_FILL_FRAGMENT, NV12_CHROMA_R8_FRAGMENT, NV12_LUMA_FRAGMENT,
+        };
+        let _gl = match super::GLProcessorST::new(None, None) {
+            Ok(g) => g,
+            Err(e) => {
+                crate::test_support::report_skip(&format!(
+                    "nv12_encode_programs_compile - GL not available: {e}"
+                ));
+                return;
+            }
+        };
+        for fragment in [
+            NV12_LUMA_FRAGMENT,
+            NV12_CHROMA_R8_FRAGMENT,
+            NV12_CHROMA_FILL_FRAGMENT,
+        ] {
+            GlProgram::new(generate_vertex_shader(), fragment).unwrap();
+        }
+    }
+
+    /// An NV12 destination is renderable only as a zero-copy DMA buffer on a
+    /// platform that imports NV12 destinations.
+    #[test]
+    fn nv12_destination_renders_only_zero_copy_where_the_platform_imports_it() {
+        use super::super::TransferBackend;
+        use edgefirst_tensor::{PixelFormat, TensorMemory};
+        let renderable = super::GLProcessorST::dst_format_renderable;
+        assert!(renderable(
+            TransferBackend::DmaBuf,
+            TensorMemory::DmaBuf,
+            PixelFormat::Nv12,
+            false,
+            true
+        ));
+        assert!(!renderable(
+            TransferBackend::DmaBuf,
+            TensorMemory::DmaBuf,
+            PixelFormat::Nv12,
+            false,
+            false
+        ));
+        for memory in [TensorMemory::Mem, TensorMemory::Shm, TensorMemory::Pbo] {
+            assert!(
+                !renderable(
+                    TransferBackend::DmaBuf,
+                    memory,
+                    PixelFormat::Nv12,
+                    false,
+                    true
+                ),
+                "{memory:?}"
+            );
+        }
+        for backend in [TransferBackend::Pbo, TransferBackend::Sync] {
+            assert!(
+                !renderable(
+                    backend,
+                    TensorMemory::DmaBuf,
+                    PixelFormat::Nv12,
+                    false,
+                    true
+                ),
+                "{backend:?}"
+            );
+        }
+        assert!(renderable(
+            TransferBackend::DmaBuf,
+            TensorMemory::DmaBuf,
+            PixelFormat::Rgba,
+            false,
+            false
+        ));
+    }
 
     /// Checks that `y2y_pays_off` holds below ten source pixels per output pixel.
     #[test]

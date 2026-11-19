@@ -841,6 +841,78 @@ pub(crate) const LUMA_2D_INT8_FRAGMENT: &str = concat!(
     "    color = vec4(quantize(rgb), 1.0);\n}\n"
 );
 
+// ---------------------------------------------------------------------------
+// RGBA -> NV12: passes 2 and 3 of a colour source into an NV12 destination.
+// The luma pass writes Y to an R8 plane at full resolution; the chroma pass
+// writes the interleaved UV bytes to an R8 plane of the same width and half
+// the height, averaging each 2x2 block of the RGBA intermediate.
+
+macro_rules! nv12_encode_header {
+    () => {
+        "#version 300 es
+precision highp float;
+precision highp int;
+uniform highp sampler2D tex;
+uniform vec3 y_coeffs;
+uniform vec3 u_coeffs;
+uniform vec3 v_coeffs;
+uniform float y_offset;
+uniform float c_offset;
+out vec4 color;
+
+"
+    };
+}
+
+/// RGBA->NV12 luma fragment shader; writes Y to the red channel.
+pub(crate) const NV12_LUMA_FRAGMENT: &str = concat!(
+    nv12_encode_header!(),
+    "in highp vec2 tc;
+
+void main() {
+    vec3 rgb = texture(tex, tc).rgb;
+    float y = dot(y_coeffs, rgb) + y_offset;
+    color = vec4(clamp(y, 0.0, 1.0), 0.0, 0.0, 1.0);
+}
+"
+);
+
+/// RGBA->NV12 chroma fragment shader; writes U at even output columns and V
+/// at odd ones, from the average of the 2x2 block of the RGBA intermediate.
+/// Framebuffer row `chroma_row + r` is chroma row `r`, read from intermediate
+/// rows `2r` and `2r + 1`.
+pub(crate) const NV12_CHROMA_R8_FRAGMENT: &str = concat!(
+    nv12_encode_header!(),
+    "uniform int chroma_row;
+
+void main() {
+    ivec2 p = ivec2(gl_FragCoord.xy) - ivec2(0, chroma_row);
+    ivec2 base = ivec2((p.x >> 1) << 1, p.y << 1);
+    vec3 rgb = (texelFetch(tex, base, 0).rgb
+        + texelFetch(tex, base + ivec2(1, 0), 0).rgb
+        + texelFetch(tex, base + ivec2(0, 1), 0).rgb
+        + texelFetch(tex, base + ivec2(1, 1), 0).rgb) * 0.25;
+    vec3 coeffs = ((p.x & 1) == 0) ? u_coeffs : v_coeffs;
+    float c = dot(coeffs, rgb) + c_offset;
+    color = vec4(clamp(c, 0.0, 1.0), 0.0, 0.0, 1.0);
+}
+"
+);
+
+/// NV12 chroma fill fragment shader; writes `uv.x` at even output columns and
+/// `uv.y` at odd ones.
+pub(crate) const NV12_CHROMA_FILL_FRAGMENT: &str = "\
+#version 300 es
+precision highp float;
+uniform vec2 uv;
+out vec4 color;
+
+void main() {
+    float c = ((int(gl_FragCoord.x) & 1) == 0) ? uv.x : uv.y;
+    color = vec4(c, 0.0, 0.0, 1.0);
+}
+";
+
 #[cfg(test)]
 mod nv_shader_golden {
     /// The golden with CRLF normalized to LF.
@@ -915,6 +987,36 @@ mod nv_shader_golden {
             super::LUMA_2D_FRAGMENT,
             golden(include_str!("golden/luma_2d_linux.glsl")).as_str(),
             "RGBA->Grey shader bytes drifted from the on-target-validated golden"
+        );
+    }
+
+    /// The RGBA->NV12 luma shader matches its golden byte for byte.
+    #[test]
+    fn nv12_luma_matches_its_golden() {
+        assert_eq!(
+            super::NV12_LUMA_FRAGMENT,
+            golden(include_str!("golden/nv12_luma_linux.glsl")).as_str(),
+            "NV12 luma shader bytes drifted from the golden"
+        );
+    }
+
+    /// The RGBA->NV12 chroma shader matches its golden byte for byte.
+    #[test]
+    fn nv12_chroma_r8_matches_its_golden() {
+        assert_eq!(
+            super::NV12_CHROMA_R8_FRAGMENT,
+            golden(include_str!("golden/nv12_chroma_r8_linux.glsl")).as_str(),
+            "NV12 chroma shader bytes drifted from the golden"
+        );
+    }
+
+    /// The NV12 chroma fill shader matches its golden byte for byte.
+    #[test]
+    fn nv12_chroma_fill_matches_its_golden() {
+        assert_eq!(
+            super::NV12_CHROMA_FILL_FRAGMENT,
+            golden(include_str!("golden/nv12_chroma_fill_linux.glsl")).as_str(),
+            "NV12 chroma fill shader bytes drifted from the golden"
         );
     }
 
