@@ -1139,7 +1139,7 @@ docker run --device /dev/cpu_dma_latency --group-add "$(getent group render | cu
 
 **Check it.** `ls -l /dev/cpu_dma_latency` shows the group and `crw-rw----`, and the HAL no longer logs the info line about `/dev/cpu_dma_latency`.
 
-**Undo it.** Delete the rules file and reboot. udev leaves the node's current mode in place until then; to reset it straight away, run `sudo chgrp root /dev/cpu_dma_latency && sudo chmod 0600 /dev/cpu_dma_latency`.
+**Undo it.** Delete the rules file and reboot. udev leaves the node's current owner, group and mode in place until then; to reset them straight away, run `sudo chown root:root /dev/cpu_dma_latency && sudo chmod 0600 /dev/cpu_dma_latency`.
 
 Any process with write access can hold a request that keeps every CPU core out of its deep idle states, which raises power use, so grant the device only to the users that run the pipeline. The kernel drops a process's request when the process exits.
 
