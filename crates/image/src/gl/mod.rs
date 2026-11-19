@@ -37,8 +37,10 @@ macro_rules! function {
 }
 
 mod cache;
+// CPU wake-latency request held around GL work.
 #[cfg(target_os = "linux")]
 mod context;
+mod cpu_latency;
 #[cfg(target_os = "linux")]
 mod dma_import;
 // Portable renderer helpers and the float render-path classifier.

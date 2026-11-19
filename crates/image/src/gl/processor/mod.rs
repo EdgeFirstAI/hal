@@ -9804,6 +9804,7 @@ impl GLProcessorST {
             external_oes: Platform::EXTERNAL_OES,
             native_fence_sync: Platform::native_fence_sync(&self.gl_context),
             has_bgra: self.has_bgra,
+            cpu_latency_qos: self.is_adreno,
         }
     }
 }

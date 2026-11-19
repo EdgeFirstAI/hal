@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Soft declines (`edgefirst-image`).** `GLProcessorThreaded::set_soft_declines` controls whether the GL backend leaves conversions the CPU runs faster or exactly to a CPU fallback.
 - **G2D soft declines (`edgefirst-image`).** `G2DProcessor::set_soft_declines` controls whether G2D leaves conversions the CPU runs exactly to a CPU fallback.
 - **Fallback logging (`edgefirst-image`).** Every backend fallback is logged at info the first time for a conversion shape, and at debug afterwards.
+- **CPU wake-latency request around GL operations (`edgefirst-image`, Linux).** On Adreno, `GLProcessorThreaded` holds a CPU latency request on `/dev/cpu_dma_latency` while a convert, flush or mask draw is in flight, so the cores relaying the GPU's completion do not enter deep idle states mid-operation. On the IQ-9075 a 30 fps YUYV 1080p to RGBA 720p convert takes 1.3 ms instead of 3.2–4.3 ms. `EDGEFIRST_GL_CPU_LATENCY=on|off` overrides the per-renderer default. The process needs write access to the device; without it the HAL logs once at info that GPU operations run with extra latency and that write access to `/dev/cpu_dma_latency` is needed for optimal performance, and runs as before. The README's Qualcomm Adreno on Linux section covers granting access to a group or user with a udev rule.
 
 ### Changed
 

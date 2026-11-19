@@ -787,6 +787,8 @@ native GLES driver directly (no translation layer) — see
 [Android](#android) below. On Windows the OpenGL backend runs the same
 engine on ANGLE over Direct3D 11, rendering zero-copy into D3D11 texture
 tensors — see [Windows GPU Acceleration](#windows-gpu-acceleration) below.
+On Qualcomm Adreno under Linux, see [Qualcomm Adreno on Linux](#qualcomm-adreno-on-linux)
+for the device access that keeps GPU completion latency low.
 
 ## macOS GPU Acceleration
 
@@ -1069,6 +1071,77 @@ allocation, `d3d11_device()`, or `is_gpu_buffer_available()`.
 Both are built by CI with `EDGEFIRST_ANGLE_PATH` set at build time; a local
 `maturin build` / `scripts/package-capi.sh` bundles ANGLE the same way when
 the variable is set, and produces a CPU-only artifact when it is not.
+
+## Qualcomm Adreno on Linux
+
+The OpenGL backend runs on Adreno GPUs with Qualcomm's proprietary KGSL driver, for example the Dragonwing IQ-9075 (Adreno 663), and imports DMA-BUF buffers zero-copy. The HAL recognizes Adreno from `GL_RENDERER` and applies its Adreno handling automatically; the GPU stays the preferred backend.
+
+### Known issue: completion latency from idle CPU cores
+
+On this driver a GPU operation's completion reaches the application through a chain of threads: the GPU's interrupt wakes a driver kernel thread, which wakes a second one, which wakes the HAL's GL worker, which wakes the caller. While the GPU is busy, those CPU cores drop into their deepest idle states, whose exit latency is 1.45–1.76 ms on the IQ-9075, and each wake-up in the chain then costs a few hundred microseconds. Left alone, every GL operation costs 1–3 ms more than the GPU work it does, whatever the image size or GPU clock, and running several `ImageProcessor`s in parallel hides little of it.
+
+### How the HAL handles it
+
+While a GL operation is in flight (`convert`, `convert_with_fence`, `flush` and the mask draws), the HAL holds a CPU wake-latency request through the kernel's PM QoS device, `/dev/cpu_dma_latency`, and releases it as soon as the operation returns. Concurrent processors share one request. Between frames the cores reach their deep idle states as usual.
+
+Measured on the IQ-9075, forced GL, DMA-BUF buffers:
+
+| Case | Without the request | With the request |
+|---|---|---|
+| YUYV 1080p → RGBA 1280x720 at 30 fps | 3.2–4.3 ms | 1.3 ms |
+| RGBA 64x64 → RGBA 64x64 | 1.19 ms | 0.13 ms |
+| `parallel_processors_benchmark` `gpu_bound`, one processor | 458–524 conv/s | 2356 conv/s |
+| Cores in deep idle at 30 fps | 96% | 95% |
+
+- The request is on by default for Adreno on Linux and off for every other GPU. `EDGEFIRST_GL_CPU_LATENCY=off` turns it off; `on` turns it on for another GPU.
+- The process needs write access to `/dev/cpu_dma_latency`, which is root-only on a stock install. Without it the HAL logs once, at info level, that GPU operations run with extra latency and that write access to `/dev/cpu_dma_latency` is needed for optimal performance. It then runs without the request.
+
+### Granting access without root
+
+A udev rule gives the device to a group or a user, so the pipeline runs unprivileged and still holds the request.
+
+**A group (recommended).** On Ubuntu the `render` group already grants access to the GPU, so it is a natural fit:
+
+```bash
+echo 'KERNEL=="cpu_dma_latency", GROUP="render", MODE="0660"' | \
+  sudo tee /etc/udev/rules.d/99-edgefirst-cpu-latency.rules
+sudo udevadm control --reload-rules
+sudo udevadm trigger --action=add --sysname-match=cpu_dma_latency
+sudo usermod -aG render "$USER"   # if the user is not a member yet; takes effect at the next login
+```
+
+To limit the request to a dedicated group instead:
+
+```bash
+sudo groupadd --system cpulatency
+sudo usermod -aG cpulatency <user>
+echo 'KERNEL=="cpu_dma_latency", GROUP="cpulatency", MODE="0660"' | \
+  sudo tee /etc/udev/rules.d/99-edgefirst-cpu-latency.rules
+sudo udevadm control --reload-rules
+sudo udevadm trigger --action=add --sysname-match=cpu_dma_latency
+```
+
+**One user.** Use `KERNEL=="cpu_dma_latency", OWNER="<user>", MODE="0600"` as the rule.
+
+**A systemd service.** Run the service as a member of the group, or add the group to its unit:
+
+```ini
+[Service]
+User=edgefirst
+SupplementaryGroups=render
+```
+
+**A container.** Pass the device through and add the group by its number:
+
+```bash
+docker run --device /dev/cpu_dma_latency --group-add "$(getent group render | cut -d: -f3)" ...
+```
+
+**Check it.** `ls -l /dev/cpu_dma_latency` shows the group and `crw-rw----`, and the HAL no longer logs the info line about `/dev/cpu_dma_latency`.
+
+**Undo it.** Delete the rules file and reboot. udev leaves the node's current mode in place until then; to reset it straight away, run `sudo chgrp root /dev/cpu_dma_latency && sudo chmod 0600 /dev/cpu_dma_latency`.
+
+Any process with write access can hold a request that keeps every CPU core out of its deep idle states, which raises power use, so grant the device only to the users that run the pipeline. The kernel drops a process's request when the process exits.
 
 ## iOS
 
@@ -1368,6 +1441,7 @@ and the sibling `*-capi` READMEs.
 | `EDGEFIRST_COLORIMETRY` | `fast` (default) or `exact`. High-performance colour conversion is the default; `exact` opts into the colorimetry-exact path where it costs more. Takes precedence over the per-processor setting |
 | `EDGEFIRST_INTERPOLATION` | `nearest` or `bilinear` (default). How `convert()` resamples when it resizes, on every backend. Bilinear uses half-pixel centres and two taps per axis on the CPU and GL backends, matching OpenCV `INTER_LINEAR`; G2D scales with its fixed hardware filter and declines resizing converts under `nearest`. Nearest is faster and less accurate on resized inputs. Takes precedence over `ImageProcessorConfig::interpolation` |
 | `EDGEFIRST_GL_SERIALIZE` | `full` or `lifecycle` — pin the GL command serialization policy instead of using the per-driver default (see [Rule 5](#rule-5--one-imageprocessor-per-pipeline)) |
+| `EDGEFIRST_GL_CPU_LATENCY` | `on` or `off` — whether GL operations hold a CPU wake-latency request on `/dev/cpu_dma_latency` (Linux) while they run; on by default for Adreno. The process needs write access to the device (see [Qualcomm Adreno on Linux](#qualcomm-adreno-on-linux)) |
 | `EDGEFIRST_ENABLE_NVJPEG` | `1` opts into the nvJPEG GPU JPEG decoder on CUDA hosts (off by default so it never silently contends with the inference engine) |
 | `EDGEFIRST_EGL_CACHE_CAPACITY` | Override the per-cache EGLImage capacity (default 64) for high-cardinality varied-geometry streams |
 | `EDGEFIRST_ALLOW_SOFTWARE_GL` | `1` opts in to running the GL backend on a software renderer (otherwise rejected); for CI / headless bring-up |

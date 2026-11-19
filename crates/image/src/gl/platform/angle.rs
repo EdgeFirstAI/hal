@@ -266,6 +266,7 @@ impl AngleDisplay {
             external_oes: false,
             native_fence_sync: false,
             has_bgra: false,
+            cpu_latency_qos: false,
         }
     }
 }

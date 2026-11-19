@@ -385,6 +385,8 @@ pub struct GLProcessorThreaded {
     /// support, serialization policy), captured once from the worker at
     /// construction.
     caps: super::platform::PlatformCaps,
+    /// Whether GPU-bound messages hold the CPU wake-latency request.
+    cpu_latency: bool,
 }
 
 unsafe impl Send for GLProcessorThreaded {}
@@ -1062,13 +1064,24 @@ impl GLProcessorThreaded {
             Ok(Ok(caps)) => caps,
         };
 
+        let cpu_latency = super::cpu_latency::enabled(caps.cpu_latency_qos);
+        log::debug!(
+            "GL CPU wake-latency request: {}",
+            if cpu_latency { "on" } else { "off" }
+        );
         Ok(Self {
             handle: Some(handle),
             sender: Some(send),
             worker_id,
             owned_pbos,
             caps,
+            cpu_latency,
         })
+    }
+
+    /// The CPU wake-latency request for one GPU-bound message, when enabled.
+    fn hold_cpu_latency(&self) -> Option<super::cpu_latency::CpuLatencyHold> {
+        self.cpu_latency.then(super::cpu_latency::hold).flatten()
     }
 }
 
@@ -1079,6 +1092,7 @@ impl ImageProcessorTrait for GLProcessorThreaded {
         dst: &mut TensorDyn,
         options: Option<ConvertOptions>,
     ) -> crate::Result<()> {
+        let _cpu_latency = self.hold_cpu_latency();
         let options = options.unwrap_or_default();
         let (err_send, err_recv) = tokio::sync::oneshot::channel();
         self.sender
@@ -1111,6 +1125,7 @@ impl ImageProcessorTrait for GLProcessorThreaded {
         dst: &mut TensorDyn,
         options: Option<ConvertOptions>,
     ) -> crate::Result<()> {
+        let _cpu_latency = self.hold_cpu_latency();
         let options = options.unwrap_or_default();
         let (err_send, err_recv) = tokio::sync::oneshot::channel();
         self.sender
@@ -1136,6 +1151,7 @@ impl ImageProcessorTrait for GLProcessorThreaded {
     }
 
     fn flush(&mut self) -> crate::Result<()> {
+        let _cpu_latency = self.hold_cpu_latency();
         let (err_send, err_recv) = tokio::sync::oneshot::channel();
         self.sender
             .as_ref()
@@ -1154,6 +1170,7 @@ impl ImageProcessorTrait for GLProcessorThreaded {
         segmentation: &[crate::Segmentation],
         overlay: crate::MaskOverlay<'_>,
     ) -> crate::Result<()> {
+        let _cpu_latency = self.hold_cpu_latency();
         let (err_send, err_recv) = tokio::sync::oneshot::channel();
         self.sender
             .as_ref()
@@ -1193,6 +1210,7 @@ impl ImageProcessorTrait for GLProcessorThreaded {
         proto_data: &ProtoData,
         overlay: crate::MaskOverlay<'_>,
     ) -> crate::Result<()> {
+        let _cpu_latency = self.hold_cpu_latency();
         let (err_send, err_recv) = tokio::sync::oneshot::channel();
         self.sender
             .as_ref()
@@ -1394,6 +1412,7 @@ impl GLProcessorThreaded {
         dst: &mut TensorDyn,
         options: Option<ConvertOptions>,
     ) -> Result<Option<super::CompletionFence>, Error> {
+        let _cpu_latency = self.hold_cpu_latency();
         let options = options.unwrap_or_default();
         use crate::ImageProcessorTrait as _;
         if !self.caps.native_fence_sync {
