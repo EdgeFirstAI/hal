@@ -7,8 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **NV12 destinations in convert (`edgefirst-image`).** `ImageProcessor::convert` writes `Nv12` destinations from YUYV, VYUY, NV12, NV16, NV24, RGB, RGBA and Grey sources. Destinations can be single-plane or two-plane, and conversions can resize, crop, flip, rotate and letterbox. The destination's width and height must be even.
+- **OpenGL NV12 destinations (`edgefirst-image`).** The OpenGL backend renders NV12 destinations into DMA-BUF (Linux) and IOSurface (macOS) images.
+- **Soft declines (`edgefirst-image`).** `GLProcessorThreaded::set_soft_declines` controls whether the GL backend leaves conversions the CPU runs faster or exactly to a CPU fallback.
+- **G2D soft declines (`edgefirst-image`).** `G2DProcessor::set_soft_declines` controls whether G2D leaves conversions the CPU runs exactly to a CPU fallback.
+- **Fallback logging (`edgefirst-image`).** Every backend fallback is logged at info the first time for a conversion shape, and at debug afterwards.
+
+### Changed
+
+- **YUV destination colorimetry (`edgefirst-image`).** An untagged YUV destination is encoded with the colorimetry its height implies, and is tagged with it after the conversion, in Python too.
+- **Same-size YUV-to-YUV conversion (`edgefirst-image`).** The conversion copies bytes only when both sides have the same matrix and range; otherwise it re-encodes. A VYUY destination that would need re-encoding returns `NotSupported`.
+- **G2D YUV-to-YUV conversion (`edgefirst-image`).** G2D writes a YUV-to-YUV conversion in the source's matrix and range. When the destination's differ, G2D declines a destination tagged with them, and declines an untagged one under `ComputeBackend::Auto`, leaving it to the CPU. Under `ComputeBackend::G2d` or `EDGEFIRST_FORCE_BACKEND=g2d` it converts into the untagged destination and tags it with the source's colorimetry.
+- **Forced OpenGL (`edgefirst-image`).** `ComputeBackend::OpenGl` and `EDGEFIRST_FORCE_BACKEND=opengl` render conversions that `ComputeBackend::Auto` leaves to the CPU for speed.
+- **Destination import fallbacks (`edgefirst-image`).** `ConvertStats::dst_import_fallbacks` also counts NV12 destinations converted on the CPU.
+
 ### Fixed
 
+- **YUV encoder rounding (`edgefirst-image`).** RGB to YUYV and NV16 conversions, and YUV letterbox fills, no longer wrap a Y, U or V value that rounds to 256 to 0.
+- **Letterbox at odd edges (`edgefirst-image`).** In a letterbox from an RGB, RGBA or YUV source into NV16 or YUYV, the chroma pair that straddles an odd edge of the placed image is encoded from its two pixels instead of being overwritten by the fill colour. In YUYV, the image's last column is no longer replaced by the fill colour when the placed image starts on an odd column.
 - **Semi-planar images at an odd width one short of the row alignment (`edgefirst-tensor`).** An NV12, NV16 or NV24 image tensor on an IOSurface, AHardwareBuffer or D3D11 texture now always records its row stride, so `map()` spans the whole buffer. A 639-wide JPEG decoded into such a tensor failed with `destination buffer … < required`.
 
 ## [0.41.0] - 2026-11-16

@@ -655,7 +655,8 @@ fused proto draws), and the CPU backend acts as the universal floor.
 GL handles tricky platform cases via in-backend workarounds (for
 example, NV12 → PlanarRgb on Vivante uses an automatic two-pass path
 within the GL backend rather than declining) — only true capability
-gaps cascade down the chain. Use `EDGEFIRST_FORCE_BACKEND=...` to pin
+gaps, and the conversions GL soft-declines as ones the CPU runs
+faster or exactly, cascade down the chain. Use `EDGEFIRST_FORCE_BACKEND=...` to pin
 a single backend; this disables the fallback chain entirely — if the
 forced backend cannot service the requested operation, the call fails
 with `Error::ForcedBackendUnavailable` rather than dropping down to

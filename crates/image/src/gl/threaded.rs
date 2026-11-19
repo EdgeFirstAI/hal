@@ -72,9 +72,16 @@ enum GLProcessorMessage {
         crate::Interpolation,
         tokio::sync::oneshot::Sender<Result<(), Error>>,
     ),
+    /// Set whether soft declines apply.
+    SetSoftDeclines(bool, tokio::sync::oneshot::Sender<Result<(), Error>>),
     /// Test hook: make every zero-copy destination import fail.
     #[cfg(test)]
     SetFailDstImport(bool, tokio::sync::oneshot::Sender<Result<(), Error>>),
+    /// Test hook: the NV12 destination policy and whether soft declines apply.
+    #[cfg(test)]
+    Nv12DeclineState(
+        tokio::sync::oneshot::Sender<Result<(super::processor::Nv12DstPolicy, bool), Error>>,
+    ),
     /// Snapshot the EGLImage cache counters.
     EglCacheStats(tokio::sync::oneshot::Sender<Result<super::cache::GlCacheStats, Error>>),
     /// Snapshot the per-convert source-feed counters.
@@ -453,8 +460,15 @@ fn reject_poisoned_message(msg: GLProcessorMessage) {
         GLProcessorMessage::SetInterpolation(_, resp) => {
             let _ = resp.send(Err(poison_err));
         }
+        GLProcessorMessage::SetSoftDeclines(_, resp) => {
+            let _ = resp.send(Err(poison_err));
+        }
         #[cfg(test)]
         GLProcessorMessage::SetFailDstImport(_, resp) => {
+            let _ = resp.send(Err(poison_err));
+        }
+        #[cfg(test)]
+        GLProcessorMessage::Nv12DeclineState(resp) => {
             let _ = resp.send(Err(poison_err));
         }
         GLProcessorMessage::EglCacheStats(resp) => {
@@ -712,6 +726,10 @@ fn handle_gl_message(
             }));
             reply_caught(result, resp, poisoned, "SetInt8Interpolation");
         }
+        GLProcessorMessage::SetSoftDeclines(enabled, resp) => {
+            gl_converter.soft_declines = enabled;
+            let _ = resp.send(Ok(()));
+        }
         #[cfg(test)]
         GLProcessorMessage::SetFailDstImport(fail, resp) => {
             let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
@@ -719,6 +737,10 @@ fn handle_gl_message(
                 Ok(())
             }));
             reply_caught(result, resp, poisoned, "SetFailDstImport");
+        }
+        #[cfg(test)]
+        GLProcessorMessage::Nv12DeclineState(resp) => {
+            let _ = resp.send(Ok(gl_converter.nv12_decline_state()));
         }
         GLProcessorMessage::EglCacheStats(resp) => {
             let result =
@@ -1068,7 +1090,7 @@ impl ImageProcessorTrait for GLProcessorThreaded {
                     len: 1,
                 },
                 SendablePtr {
-                    ptr: NonNull::from(dst),
+                    ptr: NonNull::from(&mut *dst),
                     len: 1,
                 },
                 options,
@@ -1078,7 +1100,9 @@ impl ImageProcessorTrait for GLProcessorThreaded {
             .map_err(|_| Error::Internal("GL converter thread exited".to_string()))?;
         err_recv.blocking_recv().map_err(|_| {
             Error::Internal("GL converter error messaging closed without update".to_string())
-        })?
+        })??;
+        crate::colorimetry::tag_yuv_destination(dst);
+        Ok(())
     }
 
     fn convert_deferred(
@@ -1257,6 +1281,59 @@ impl GLProcessorThreaded {
         })?
     }
 
+    /// Whether the GL backend returns `NotSupported` for conversions the CPU
+    /// runs faster or exactly, so a caller with a CPU fallback can take them.
+    /// On by default. In an `ImageProcessor` they are on only under `Auto` with no
+    /// forced backend and a CPU backend present.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Internal`] when the GL worker thread has exited or panicked.
+    pub fn set_soft_declines(&mut self, enabled: bool) -> Result<(), Error> {
+        let (err_send, err_recv) = tokio::sync::oneshot::channel();
+        self.sender
+            .as_ref()
+            .ok_or_else(|| Error::Internal("GL processor is shutting down".to_string()))?
+            .blocking_send(GLProcessorMessage::SetSoftDeclines(enabled, err_send))
+            .map_err(|_| Error::Internal("GL converter thread exited".to_string()))?;
+        err_recv.blocking_recv().map_err(|_| {
+            Error::Internal("GL converter error messaging closed without update".to_string())
+        })?
+    }
+
+    /// Test hook: ends the worker thread, so every later message fails.
+    #[cfg(test)]
+    pub(crate) fn stop_worker(&mut self) {
+        drop(self.sender.take());
+        let _ = self.handle.take().and_then(|h| h.join().ok());
+    }
+
+    /// Test hook: the NV12 destination policy and whether soft declines apply.
+    #[cfg(test)]
+    fn nv12_decline_state(&self) -> Result<(super::processor::Nv12DstPolicy, bool), Error> {
+        let (send, recv) = tokio::sync::oneshot::channel();
+        self.sender
+            .as_ref()
+            .ok_or_else(|| Error::Internal("GL processor is shutting down".to_string()))?
+            .blocking_send(GLProcessorMessage::Nv12DeclineState(send))
+            .map_err(|_| Error::Internal("GL converter thread exited".to_string()))?;
+        recv.blocking_recv().map_err(|_| {
+            Error::Internal("GL converter error messaging closed without update".to_string())
+        })?
+    }
+
+    /// Test hook: whether soft declines apply.
+    #[cfg(test)]
+    pub(crate) fn soft_declines(&self) -> Result<bool, Error> {
+        self.nv12_decline_state().map(|(_, soft)| soft)
+    }
+
+    /// Test hook: the NV12 destination policy.
+    #[cfg(test)]
+    pub(super) fn nv12_dst_policy(&self) -> Result<super::processor::Nv12DstPolicy, Error> {
+        self.nv12_decline_state().map(|(policy, _)| policy)
+    }
+
     /// Test hook: make every zero-copy destination import fail. The failure
     /// is injected at the import itself.
     #[cfg(test)]
@@ -1334,16 +1411,18 @@ impl GLProcessorThreaded {
                     len: 1,
                 },
                 SendablePtr {
-                    ptr: NonNull::from(dst),
+                    ptr: NonNull::from(&mut *dst),
                     len: 1,
                 },
                 options,
                 send,
             ))
             .map_err(|_| Error::Internal("GL converter thread exited".to_string()))?;
-        recv.blocking_recv().map_err(|_| {
+        let fence = recv.blocking_recv().map_err(|_| {
             Error::Internal("GL converter error messaging closed without update".to_string())
-        })?
+        })??;
+        crate::colorimetry::tag_yuv_destination(dst);
+        Ok(fence)
     }
 
     /// Snapshot the per-convert source-feed counters from the GL thread.
@@ -1506,7 +1585,7 @@ impl GLProcessorThreaded {
     /// The CPU access `convert` needs on a `format`/`dtype` destination held
     /// in `memory` when it renders it from an RGBA or NV source (`Write` for
     /// a host-memory readback, else `None`), or `None` when it declines it to
-    /// the CPU fallback.
+    /// the CPU fallback. An NV12 destination is reported as declined.
     pub(crate) fn dst_cpu_access(
         &self,
         memory: edgefirst_tensor::TensorMemory,
@@ -1520,6 +1599,7 @@ impl GLProcessorThreaded {
                 memory,
                 format,
                 self.caps.has_bgra,
+                false,
             ),
             DType::F16 | DType::F32 => {
                 super::float_dispatch::classify_float_render(

@@ -843,6 +843,714 @@ mod cpu_tests {
         )
     }
 
+    #[test]
+    fn test_cpu_yuyv_to_nv12() -> Result<()> {
+        generate_conversion_tests!(
+            PixelFormat::Yuyv,
+            "camera720p.yuyv",
+            PixelFormat::Nv12,
+            "camera720p.nv12"
+        )
+    }
+
+    #[test]
+    fn test_cpu_vyuy_to_nv12() -> Result<()> {
+        generate_conversion_tests!(
+            PixelFormat::Vyuy,
+            "camera720p.vyuy",
+            PixelFormat::Nv12,
+            "camera720p.nv12"
+        )
+    }
+
+    #[test]
+    fn test_cpu_rgba_to_nv12() -> Result<()> {
+        generate_conversion_tests!(
+            PixelFormat::Rgba,
+            "camera720p.rgba",
+            PixelFormat::Nv12,
+            "camera720p.nv12"
+        )
+    }
+
+    #[test]
+    fn test_cpu_rgb_to_nv12() -> Result<()> {
+        generate_conversion_tests!(
+            PixelFormat::Rgb,
+            "camera720p.rgb",
+            PixelFormat::Nv12,
+            "camera720p.nv12"
+        )
+    }
+
+    #[test]
+    fn grey_to_nv12_is_neutral_chroma() -> Result<()> {
+        let (w, h) = (64, 16);
+        let src = Tensor::<u8>::image(
+            w,
+            h,
+            PixelFormat::Grey,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )?;
+        {
+            let mut map = src.map_mut()?;
+            for (i, b) in map.as_mut_slice().iter_mut().enumerate() {
+                *b = if i % 2 == 0 { 0 } else { 255 };
+            }
+        }
+        let src = TensorDyn::from(src);
+        let mut dst = TensorDyn::image(
+            w,
+            h,
+            PixelFormat::Nv12,
+            DType::U8,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )?;
+        CPUProcessor::new().convert(&src, &mut dst, None)?;
+        let map = dst.as_u8().unwrap().map_read()?;
+        let (luma, chroma) = map.as_slice().split_at(w * h);
+        assert!(chroma[..w * h / 2].iter().all(|&c| c == 128));
+        for (i, &y) in luma.iter().enumerate() {
+            assert_eq!(y, if i % 2 == 0 { 16 } else { 235 }, "luma {i}");
+        }
+        Ok(())
+    }
+
+    /// A multiplane NV12 destination whose luma pitch is `luma_pitch` and chroma pitch is
+    /// `chroma_pitch`, with every byte set to `fill`.
+    fn padded_multiplane_nv12(
+        w: usize,
+        h: usize,
+        luma_pitch: usize,
+        chroma_pitch: usize,
+        fill: u8,
+    ) -> Result<TensorDyn> {
+        use edgefirst_tensor::TensorTrait;
+        let mut luma = Tensor::<u8>::new(&[h, luma_pitch], Some(TensorMemory::Mem), None)?;
+        let mut chroma = Tensor::<u8>::new(&[h / 2, chroma_pitch], Some(TensorMemory::Mem), None)?;
+        luma.map_mut()?.as_mut_slice().fill(fill);
+        chroma.map_mut()?.as_mut_slice().fill(fill);
+        luma.set_logical_shape(&[h, w])?;
+        chroma.set_logical_shape(&[h / 2, w])?;
+        chroma.set_row_stride_unchecked(chroma_pitch);
+        let mut dst = TensorDyn::from(Tensor::<u8>::from_planes(luma, chroma, PixelFormat::Nv12)?);
+        dst.set_row_stride(luma_pitch)?;
+        Ok(dst)
+    }
+
+    #[test]
+    fn nv12_to_nv12_copies_between_strides() -> Result<()> {
+        let (w, h, pitch) = (64, 16, 128);
+        let src = Tensor::<u8>::image(
+            w,
+            h,
+            PixelFormat::Nv12,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )?;
+        let bytes: Vec<u8> = (0..w * h * 3 / 2).map(|i| (i * 7 % 251) as u8).collect();
+        src.map_mut()?.as_mut_slice().copy_from_slice(&bytes);
+        let src = TensorDyn::from(src);
+        let mut dst = padded_multiplane_nv12(w, h, pitch, pitch, 0xA5)?;
+        CPUProcessor::new().convert(&src, &mut dst, None)?;
+        let dst = dst.as_u8().unwrap();
+        let luma_map = dst.map_read()?;
+        let chroma_map = dst.chroma().unwrap().map_read()?;
+        let (luma, chroma) = bytes.split_at(w * h);
+        for row in 0..h {
+            assert_eq!(
+                &luma_map.as_slice()[row * pitch..][..w],
+                &luma[row * w..][..w]
+            );
+            assert!(luma_map.as_slice()[row * pitch + w..][..pitch - w]
+                .iter()
+                .all(|&b| b == 0xA5));
+        }
+        for row in 0..h / 2 {
+            assert_eq!(
+                &chroma_map.as_slice()[row * pitch..][..w],
+                &chroma[row * w..][..w]
+            );
+            assert!(chroma_map.as_slice()[row * pitch + w..][..pitch - w]
+                .iter()
+                .all(|&b| b == 0xA5));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn rgba_to_nv12_writes_a_multiplane_destination() -> Result<()> {
+        let (w, h) = (64, 16);
+        let src = Tensor::<u8>::image(
+            w,
+            h,
+            PixelFormat::Rgba,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )?;
+        for (i, b) in src.map_mut()?.as_mut_slice().iter_mut().enumerate() {
+            *b = (i * 13 % 253) as u8;
+        }
+        let src = TensorDyn::from(src);
+        let mut want = TensorDyn::image(
+            w,
+            h,
+            PixelFormat::Nv12,
+            DType::U8,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )?;
+        CPUProcessor::new().convert(&src, &mut want, None)?;
+        let want = want.as_u8().unwrap().map_read()?;
+        let (want_luma, want_chroma) = want.as_slice().split_at(w * h);
+
+        for (luma_pitch, chroma_pitch) in [(w, w), (128, 128)] {
+            let mut dst = padded_multiplane_nv12(w, h, luma_pitch, chroma_pitch, 0xA5)?;
+            CPUProcessor::new().convert(&src, &mut dst, None)?;
+            let dst = dst.as_u8().unwrap();
+            let luma_map = dst.map_read()?;
+            let chroma_map = dst.chroma().unwrap().map_read()?;
+            for row in 0..h {
+                let got = &luma_map.as_slice()[row * luma_pitch..][..luma_pitch];
+                assert_eq!(&got[..w], &want_luma[row * w..][..w], "luma row {row}");
+                assert!(got[w..].iter().all(|&b| b == 0xA5), "luma pad row {row}");
+            }
+            for row in 0..h / 2 {
+                let got = &chroma_map.as_slice()[row * chroma_pitch..][..chroma_pitch];
+                assert_eq!(&got[..w], &want_chroma[row * w..][..w], "chroma row {row}");
+                assert!(got[w..].iter().all(|&b| b == 0xA5), "chroma pad row {row}");
+            }
+        }
+        Ok(())
+    }
+
+    /// Packed 4:2:2 source with `[Y0, U, Y1, V]` (or the VYUY rotation) at a padded stride.
+    fn packed422_source(
+        w: usize,
+        h: usize,
+        stride: usize,
+        fmt: PixelFormat,
+    ) -> Result<(TensorDyn, Vec<u8>)> {
+        let mut t = Tensor::<u8>::image(
+            stride / 2,
+            h,
+            fmt,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )?;
+        t.configure_image(w, h, fmt)?;
+        t.set_row_stride(stride)?;
+        let mut bytes = vec![0xEEu8; stride * h];
+        for y in 0..h {
+            for i in 0..w * 2 {
+                bytes[y * stride + i] = ((y * 37 + i * 11) % 251) as u8;
+            }
+        }
+        t.map_mut()?.as_mut_slice().copy_from_slice(&bytes);
+        Ok((TensorDyn::from(t), bytes))
+    }
+
+    /// Reference NV12 planes `(luma w*h, chroma w*h/2)` of a packed 4:2:2 buffer.
+    fn nv12_reference(
+        bytes: &[u8],
+        stride: usize,
+        w: usize,
+        h: usize,
+        fmt: PixelFormat,
+    ) -> (Vec<u8>, Vec<u8>) {
+        let (y0, u, y1, v) = if fmt == PixelFormat::Yuyv {
+            (0, 1, 2, 3)
+        } else {
+            (1, 2, 3, 0)
+        };
+        let mut luma = vec![0u8; w * h];
+        for y in 0..h {
+            for m in 0..w / 2 {
+                luma[y * w + m * 2] = bytes[y * stride + m * 4 + y0];
+                luma[y * w + m * 2 + 1] = bytes[y * stride + m * 4 + y1];
+            }
+        }
+        let mut chroma = vec![0u8; w * h / 2];
+        let mean = |a: u8, b: u8| ((a as u16 + b as u16 + 1) >> 1) as u8;
+        for r in 0..h / 2 {
+            for m in 0..w / 2 {
+                let (t, b) = (2 * r * stride + m * 4, (2 * r + 1) * stride + m * 4);
+                chroma[r * w + m * 2] = mean(bytes[t + u], bytes[b + u]);
+                chroma[r * w + m * 2 + 1] = mean(bytes[t + v], bytes[b + v]);
+            }
+        }
+        (luma, chroma)
+    }
+
+    fn packed422_to_nv12_matches_a_reference(fmt: PixelFormat) -> Result<()> {
+        let (w, h, stride) = (64, 16, 160);
+        let (src, bytes) = packed422_source(w, h, stride, fmt)?;
+        let mut dst = TensorDyn::image(
+            w,
+            h,
+            PixelFormat::Nv12,
+            DType::U8,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )?;
+        CPUProcessor::new().convert(&src, &mut dst, None)?;
+        let (luma, chroma) = nv12_reference(&bytes, stride, w, h, fmt);
+        let map = dst.as_u8().unwrap().map_read()?;
+        assert_eq!(&map.as_slice()[..w * h], &luma[..]);
+        assert_eq!(&map.as_slice()[w * h..w * h + w * h / 2], &chroma[..]);
+        Ok(())
+    }
+
+    #[test]
+    fn yuyv_to_nv12_matches_a_reference_on_a_padded_source() -> Result<()> {
+        packed422_to_nv12_matches_a_reference(PixelFormat::Yuyv)
+    }
+
+    #[test]
+    fn vyuy_to_nv12_matches_a_reference() -> Result<()> {
+        packed422_to_nv12_matches_a_reference(PixelFormat::Vyuy)
+    }
+
+    #[test]
+    fn yuyv_to_nv12_writes_a_multiplane_destination() -> Result<()> {
+        let (w, h, stride) = (64, 16, 160);
+        let (src, bytes) = packed422_source(w, h, stride, PixelFormat::Yuyv)?;
+        let luma = Tensor::<u8>::new(&[h, w], Some(TensorMemory::Mem), None)?;
+        let chroma = Tensor::<u8>::new(&[h / 2, w], Some(TensorMemory::Mem), None)?;
+        luma.map_mut()?.as_mut_slice().fill(0);
+        chroma.map_mut()?.as_mut_slice().fill(0);
+        let mut dst = TensorDyn::from(Tensor::<u8>::from_planes(luma, chroma, PixelFormat::Nv12)?);
+        CPUProcessor::new().convert(&src, &mut dst, None)?;
+        let (want_luma, want_chroma) = nv12_reference(&bytes, stride, w, h, PixelFormat::Yuyv);
+        let dst = dst.as_u8().unwrap();
+        let luma_map = dst.map_read()?;
+        let chroma_map = dst.chroma().unwrap().map_read()?;
+        assert_eq!(luma_map.as_slice(), &want_luma[..]);
+        assert_eq!(chroma_map.as_slice(), &want_chroma[..]);
+        Ok(())
+    }
+
+    #[test]
+    fn yuyv_to_nv12_leaves_destination_padding_alone() -> Result<()> {
+        let (w, h, pitch) = (96, 16, 128);
+        let (src, _) = packed422_source(w, h, w * 2, PixelFormat::Yuyv)?;
+        let mut dst = TensorDyn::image(
+            pitch,
+            h,
+            PixelFormat::Nv12,
+            DType::U8,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )?;
+        dst.configure_image(w, h, PixelFormat::Nv12)?;
+        dst.set_row_stride(pitch)?;
+        dst.as_u8().unwrap().map_mut()?.as_mut_slice().fill(0xA5);
+        CPUProcessor::new().convert(&src, &mut dst, None)?;
+        let map = dst.as_u8().unwrap().map_read()?;
+        let bytes = map.as_slice();
+        for row in 0..h + h / 2 {
+            assert!(
+                bytes[row * pitch + w..(row + 1) * pitch]
+                    .iter()
+                    .all(|&b| b == 0xA5),
+                "row {row} padding was written"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn an_odd_nv12_destination_is_refused() -> Result<()> {
+        let (src, _) = packed422_source(64, 16, 128, PixelFormat::Yuyv)?;
+        for (w, h) in [(63usize, 16usize), (64, 15)] {
+            let mut dst = TensorDyn::image(
+                w,
+                h,
+                PixelFormat::Nv12,
+                DType::U8,
+                Some(TensorMemory::Mem),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )?;
+            let err = CPUProcessor::new()
+                .convert(&src, &mut dst, None)
+                .unwrap_err();
+            assert!(
+                matches!(&err, Error::NotSupported(m) if m.contains(&format!("{w}x{h}"))),
+                "{w}x{h}: {err:?}"
+            );
+        }
+        Ok(())
+    }
+
+    fn nv12_dst(w: usize, h: usize) -> TensorDyn {
+        TensorDyn::image(
+            w,
+            h,
+            PixelFormat::Nv12,
+            DType::U8,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap()
+    }
+
+    fn rgb_dst(w: usize, h: usize) -> TensorDyn {
+        TensorDyn::image(
+            w,
+            h,
+            PixelFormat::Rgb,
+            DType::U8,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap()
+    }
+
+    fn to_rgb(src: &TensorDyn) -> TensorDyn {
+        let mut out = rgb_dst(src.width().unwrap(), src.height().unwrap());
+        CPUProcessor::new().convert(src, &mut out, None).unwrap();
+        out
+    }
+
+    fn rgb_bytes(t: &TensorDyn) -> Vec<u8> {
+        t.as_u8().unwrap().map_read().unwrap().as_slice().to_vec()
+    }
+
+    fn mean_abs_diff(a: &TensorDyn, b: &TensorDyn) -> f64 {
+        let (a, b) = (rgb_bytes(a), rgb_bytes(b));
+        assert_eq!(a.len(), b.len());
+        a.iter()
+            .zip(&b)
+            .map(|(&x, &y)| (x as f64 - y as f64).abs())
+            .sum::<f64>()
+            / a.len() as f64
+    }
+
+    fn rgb_ssim(a: &TensorDyn, b: &TensorDyn) -> f64 {
+        let to_img = |t: &TensorDyn| {
+            image::RgbImage::from_vec(
+                t.width().unwrap() as u32,
+                t.height().unwrap() as u32,
+                rgb_bytes(t),
+            )
+            .unwrap()
+        };
+        image_compare::rgb_similarity_structure(
+            &image_compare::Algorithm::RootMeanSquared,
+            &to_img(a),
+            &to_img(b),
+        )
+        .expect("Image Comparison failed")
+        .score
+    }
+
+    fn tagged(
+        mut t: TensorDyn,
+        encoding: edgefirst_tensor::ColorEncoding,
+        range: edgefirst_tensor::ColorRange,
+    ) -> TensorDyn {
+        t.set_colorimetry(Some(
+            edgefirst_tensor::Colorimetry::default()
+                .with_encoding(encoding)
+                .with_range(range),
+        ));
+        t
+    }
+
+    fn camera720p_yuyv() -> TensorDyn {
+        load_bytes_to_tensor(
+            1280,
+            720,
+            PixelFormat::Yuyv,
+            None,
+            &edgefirst_bench::testdata::read("camera720p.yuyv"),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_resized_yuyv_decodes_back_to_its_rgb() -> Result<()> {
+        let src = camera720p_yuyv();
+        let mut cpu = CPUProcessor::new();
+        let mut nv12 = nv12_dst(640, 360);
+        cpu.convert(&src, &mut nv12, None)?;
+        let mut want = rgb_dst(640, 360);
+        cpu.convert(&to_rgb(&src), &mut want, None)?;
+        let ssim = rgb_ssim(&to_rgb(&nv12), &want);
+        assert!(ssim >= 0.98, "ssim {ssim}");
+        Ok(())
+    }
+
+    #[test]
+    fn an_odd_height_source_resizes_into_nv12() -> Result<()> {
+        let bytes = edgefirst_bench::testdata::read("camera720p.yuyv");
+        let mut rows = bytes.to_vec();
+        rows.extend_from_slice(&bytes[..1280 * 2]);
+        assert_eq!(rows.len(), 1280 * 721 * 2);
+        let src = load_bytes_to_tensor(1280, 721, PixelFormat::Yuyv, None, &rows)?;
+        let mut nv12 = nv12_dst(640, 360);
+        CPUProcessor::new().convert(&src, &mut nv12, None)?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_letterboxed_nv12_fills_its_chroma_band() -> Result<()> {
+        let (w, h) = (64, 64);
+        let red = [255, 0, 0, 255];
+        let src = load_bytes_to_tensor(
+            w,
+            h / 2,
+            PixelFormat::Rgba,
+            None,
+            &vec![0x80; w * h / 2 * 4],
+        )?;
+        let mut dst = nv12_dst(w, h);
+        CPUProcessor::new().convert(
+            &src,
+            &mut dst,
+            Some(crate::ConvertOptions::new().crop(Crop::letterbox(red))),
+        )?;
+
+        let one = load_bytes_to_tensor(
+            64,
+            16,
+            PixelFormat::Rgba,
+            None,
+            &[255, 0, 0, 255].repeat(64 * 16),
+        )?;
+        let mut one_nv12 = nv12_dst(64, 16);
+        CPUProcessor::new().convert(&one, &mut one_nv12, None)?;
+        let one_map = one_nv12.as_u8().unwrap().map_read()?;
+        let (want_y, want_u, want_v) = (
+            one_map.as_slice()[0],
+            one_map.as_slice()[64 * 16],
+            one_map.as_slice()[64 * 16 + 1],
+        );
+
+        let map = dst.as_u8().unwrap().map_read()?;
+        let (luma, chroma) = map.as_slice().split_at(w * h);
+        for row in (0..16).chain(48..64) {
+            assert!(
+                luma[row * w..(row + 1) * w].iter().all(|&y| y == want_y),
+                "luma row {row}"
+            );
+        }
+        for row in (0..8).chain(24..32) {
+            for pair in chroma[row * w..(row + 1) * w].chunks(2) {
+                assert_eq!(pair, [want_u, want_v], "chroma row {row}");
+            }
+        }
+        Ok(())
+    }
+
+    /// A letterbox at odd edges, through a processor whose intermediate holds another colour,
+    /// encodes each chroma pair straddling an edge from the fill and image colours, with the
+    /// destination's colorimetry, and keeps every image pixel next to the edge.
+    #[test]
+    fn a_letterbox_at_odd_edges_encodes_straddling_chroma_from_the_fill() -> Result<()> {
+        use edgefirst_tensor::{ColorEncoding, ColorRange};
+        let (w, h) = (64usize, 32usize);
+        let (green, blue, red) = ([20u8, 200, 40, 255], [0u8, 0, 255, 255], [255u8, 0, 0, 255]);
+        let solid = |sw: usize, sh: usize, c: [u8; 4]| {
+            load_bytes_to_tensor(sw, sh, PixelFormat::Rgba, None, &c.repeat(sw * sh))
+        };
+        // Source size, and the destination columns and rows the image covers.
+        let shapes = [((50usize, 32usize), 7..57, 0..32), ((64, 25), 0..64, 3..28)];
+        for fmt in [PixelFormat::Nv12, PixelFormat::Nv16, PixelFormat::Yuyv] {
+            let chroma_rows = if fmt == PixelFormat::Nv12 { h / 2 } else { h };
+            let dst = || {
+                let t = TensorDyn::image(
+                    w,
+                    h,
+                    fmt,
+                    DType::U8,
+                    mem(),
+                    edgefirst_tensor::CpuAccess::ReadWrite,
+                )
+                .unwrap();
+                tagged(t, ColorEncoding::Bt709, ColorRange::Full)
+            };
+            for ((sw, sh), cols, rows) in shapes.clone() {
+                let label = format!("{fmt:?} {sw}x{sh}");
+                let mut cpu = CPUProcessor::new();
+                cpu.convert(&solid(w / 2, h, blue)?, &mut dst(), None)?;
+                let mut got = dst();
+                cpu.convert(
+                    &solid(sw, sh, green)?,
+                    &mut got,
+                    Some(crate::ConvertOptions::new().crop(Crop::letterbox(red))),
+                )?;
+
+                let mut picture = Vec::with_capacity(w * h * 4);
+                for y in 0..h {
+                    for x in 0..w {
+                        let inside = cols.contains(&x) && rows.contains(&y);
+                        picture.extend_from_slice(if inside { &green } else { &red });
+                    }
+                }
+                let mut want = dst();
+                CPUProcessor::new().convert(
+                    &load_bytes_to_tensor(w, h, PixelFormat::Rgba, None, &picture)?,
+                    &mut want,
+                    None,
+                )?;
+
+                let got_map = got.as_u8().unwrap().map_read()?;
+                let want_map = want.as_u8().unwrap().map_read()?;
+                if fmt == PixelFormat::Yuyv {
+                    let (got_b, want_b) = (got_map.as_slice(), want_map.as_slice());
+                    for (i, (g, e)) in got_b[..w * h * 2]
+                        .iter()
+                        .zip(&want_b[..w * h * 2])
+                        .enumerate()
+                    {
+                        assert!(
+                            g.abs_diff(*e) <= 1,
+                            "{label}: row {} column {} byte {}: {g} vs {e}",
+                            i / (w * 2),
+                            (i % (w * 2)) / 2,
+                            i % 4
+                        );
+                    }
+                    let chroma = |r: usize, m: usize| {
+                        let o = r * w * 2 + m * 4;
+                        [want_b[o + 1], want_b[o + 3]]
+                    };
+                    if sw < w {
+                        for m in [3, 28] {
+                            let mixed = chroma(0, m);
+                            assert!(
+                                mixed != chroma(0, 0) && mixed != chroma(10, 10),
+                                "{label}: straddling macropixel {m} chroma {mixed:?}"
+                            );
+                        }
+                    }
+                    continue;
+                }
+                let (got_y, got_uv) = got_map.as_slice().split_at(w * h);
+                let (want_y, want_uv) = want_map.as_slice().split_at(w * h);
+                for (i, (g, e)) in got_y.iter().zip(want_y).enumerate() {
+                    assert!(g.abs_diff(*e) <= 1, "{label}: luma {i}: {g} vs {e}");
+                }
+                for (i, (g, e)) in got_uv[..w * chroma_rows]
+                    .iter()
+                    .zip(&want_uv[..w * chroma_rows])
+                    .enumerate()
+                {
+                    assert!(
+                        g.abs_diff(*e) <= 1,
+                        "{label}: chroma row {} byte {}: {g} vs {e}",
+                        i / w,
+                        i % w
+                    );
+                }
+
+                // A straddling pair differs from the fill's and the image's.
+                let pair = |r: usize, cx: usize| &want_uv[r * w + 2 * cx..][..2];
+                let straddle = match (sw < w, fmt) {
+                    (true, _) => Some((0, 3)),
+                    (false, PixelFormat::Nv12) => Some((1, 0)),
+                    _ => None,
+                };
+                if let Some((r, cx)) = straddle {
+                    let mixed = pair(r, cx);
+                    assert!(
+                        mixed != pair(0, 0) && mixed != pair(10, 10),
+                        "{label}: straddling pair {mixed:?}"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn an_untagged_nv12_destination_takes_the_colorimetry_of_its_height() -> Result<()> {
+        use edgefirst_tensor::{ColorEncoding, ColorRange};
+        let mut bytes = Vec::with_capacity(1280 * 720 * 2);
+        for y in 0..720usize {
+            for m in 0..640usize {
+                let luma = 40 + (m * 170 / 640) as u8;
+                let (u, v) = (
+                    if y % 128 < 64 { 200 } else { 60 },
+                    70 + (y * 150 / 720) as u8,
+                );
+                bytes.extend_from_slice(&[luma, u, luma, v]);
+            }
+        }
+        let src = load_bytes_to_tensor(1280, 720, PixelFormat::Yuyv, None, &bytes)?;
+        let src = tagged(src, ColorEncoding::Bt709, ColorRange::Limited);
+        let mut cpu = CPUProcessor::new();
+        let mut nv12 = nv12_dst(640, 360);
+        cpu.convert(&src, &mut nv12, None)?;
+        let tag = nv12.colorimetry().expect("the destination is tagged");
+        assert_eq!(tag.encoding, Some(ColorEncoding::Bt601));
+        assert_eq!(tag.range, Some(ColorRange::Limited));
+        let mut want = rgb_dst(640, 360);
+        cpu.convert(&to_rgb(&src), &mut want, None)?;
+        let diff = mean_abs_diff(&to_rgb(&nv12), &want);
+        assert!(diff <= 3.0, "mean diff {diff}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_tagged_destination_encodes_with_its_own_colorimetry() -> Result<()> {
+        use edgefirst_tensor::{ColorEncoding, ColorRange};
+        let src = tagged(camera720p_yuyv(), ColorEncoding::Bt601, ColorRange::Limited);
+        let mut cpu = CPUProcessor::new();
+        let mut nv12 = tagged(nv12_dst(640, 360), ColorEncoding::Bt709, ColorRange::Full);
+        cpu.convert(&src, &mut nv12, None)?;
+        let mut want = rgb_dst(640, 360);
+        cpu.convert(&to_rgb(&src), &mut want, None)?;
+        let diff = mean_abs_diff(&to_rgb(&nv12), &want);
+        assert!(diff <= 3.0, "mean diff {diff}");
+        Ok(())
+    }
+
+    #[test]
+    fn flips_and_rotations_into_nv12_match_rgba() -> Result<()> {
+        let src = load_bytes_to_tensor(
+            1280,
+            720,
+            PixelFormat::Rgba,
+            None,
+            &edgefirst_bench::testdata::read("camera720p.rgba"),
+        )?;
+        let rgba_dst = |w, h| {
+            TensorDyn::image(
+                w,
+                h,
+                PixelFormat::Rgba,
+                DType::U8,
+                Some(TensorMemory::Mem),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .unwrap()
+        };
+        let cases = [
+            (Rotation::None, Flip::Horizontal, (640, 360)),
+            (Rotation::None, Flip::Vertical, (640, 360)),
+            (Rotation::Clockwise90, Flip::None, (360, 640)),
+        ];
+        for (rotation, flip, (w, h)) in cases {
+            let opts = crate::ConvertOptions::new().rotation(rotation).flip(flip);
+            let mut cpu = CPUProcessor::new();
+            let mut nv12 = nv12_dst(w, h);
+            cpu.convert(&src, &mut nv12, Some(opts))?;
+            let mut want = rgba_dst(w, h);
+            cpu.convert(&src, &mut want, Some(opts))?;
+            let mut back = rgb_dst(w, h);
+            cpu.convert(&nv12, &mut back, None)?;
+            let mut want_rgb = rgb_dst(w, h);
+            cpu.convert(&want, &mut want_rgb, None)?;
+            let ssim = rgb_ssim(&back, &want_rgb);
+            assert!(ssim >= 0.98, "{rotation:?} {flip:?}: ssim {ssim}");
+        }
+        Ok(())
+    }
+
     // ========================================================================
     // NV16 conversion tests
     // ========================================================================
@@ -1493,11 +2201,11 @@ mod cpu_tests {
 
     #[test]
     fn test_convert_unsupported_format_pair() {
-        // NV12 → NV12 is not supported by the CPU converter.
+        // NV16 → VYUY is not supported by the CPU converter.
         let src = TensorDyn::image(
             8,
             8,
-            PixelFormat::Nv12,
+            PixelFormat::Nv16,
             DType::U8,
             mem(),
             edgefirst_tensor::CpuAccess::ReadWrite,
@@ -1506,7 +2214,7 @@ mod cpu_tests {
         let mut dst = TensorDyn::image(
             8,
             8,
-            PixelFormat::Nv12,
+            PixelFormat::Vyuy,
             DType::U8,
             mem(),
             edgefirst_tensor::CpuAccess::ReadWrite,
@@ -1660,14 +2368,7 @@ mod cpu_tests {
         let (y_fill, u_fill, v_fill) = {
             let t = dst.as_u8().unwrap();
             let cm = crate::colorimetry::resolve_colorimetry(t.colorimetry(), t.height());
-            let cp = crate::cpu::ColorParams {
-                matrix: crate::colorimetry::yuv_matrix(cm.encoding.unwrap()),
-                range: crate::colorimetry::yuv_range(cm.range.unwrap()),
-                encoding: cm.encoding.unwrap(),
-                range_kind: cm.range.unwrap(),
-                src_full_range: cm.range == Some(edgefirst_tensor::ColorRange::Full),
-                dst_full_range: cm.range == Some(edgefirst_tensor::ColorRange::Full),
-            };
+            let cp = crate::cpu::ColorParams::uniform(cm.encoding.unwrap(), cm.range.unwrap());
             let yuyv = CPUProcessor::rgba_to_yuyv(rgba, cp);
             (yuyv[0], yuyv[1], yuyv[3])
         };
@@ -1733,6 +2434,65 @@ mod cpu_tests {
         }
     }
 
+    /// A chroma pair straddling a crop edge keeps its in-crop value.
+    #[test]
+    fn test_fill_image_outside_crop_nv16_odd_crop_edges() {
+        const SENTINEL: u8 = 0x11;
+        let (w, h) = (16usize, 4usize);
+        for crop in [Rect::new(3, 1, 5, 2), Rect::new(3, 1, 6, 2)] {
+            let mut dst = TensorDyn::image(
+                w,
+                h,
+                PixelFormat::Nv16,
+                DType::U8,
+                mem(),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .unwrap();
+            let stride = dst.effective_row_stride().unwrap();
+            dst.as_u8_mut()
+                .unwrap()
+                .map_mut()
+                .unwrap()
+                .as_mut_slice()
+                .fill(SENTINEL);
+
+            CPUProcessor::fill_image_outside_crop_u8(
+                dst.as_u8_mut().unwrap(),
+                [255, 0, 0, 255],
+                crop,
+                false,
+            )
+            .unwrap();
+
+            let map = dst.as_u8().unwrap().map().unwrap();
+            let (_, chroma) = map.as_slice().split_at(stride * h);
+            let first = crop.left / 2;
+            let end = (crop.left + crop.width).div_ceil(2);
+            for y in 0..h {
+                let in_rows = y >= crop.top && y < crop.top + crop.height;
+                for cx in 0..w / 2 {
+                    let kept = in_rows && cx >= first && cx < end;
+                    let off = y * stride + cx * 2;
+                    let pair = (chroma[off], chroma[off + 1]);
+                    if kept {
+                        assert_eq!(
+                            pair,
+                            (SENTINEL, SENTINEL),
+                            "pair {cx} of row {y} for {crop:?}"
+                        );
+                    } else {
+                        assert_ne!(
+                            pair,
+                            (SENTINEL, SENTINEL),
+                            "pair {cx} of row {y} for {crop:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn test_fill_image_outside_crop_yuyv_odd_width() {
         // An odd-width Yuyv fill covers the trailing unpaired pixel's `[Y, U]` bytes.
@@ -1761,14 +2521,7 @@ mod cpu_tests {
         let yuyv = {
             let t = dst.as_u8().unwrap();
             let cm = crate::colorimetry::resolve_colorimetry(t.colorimetry(), t.height());
-            let cp = crate::cpu::ColorParams {
-                matrix: crate::colorimetry::yuv_matrix(cm.encoding.unwrap()),
-                range: crate::colorimetry::yuv_range(cm.range.unwrap()),
-                encoding: cm.encoding.unwrap(),
-                range_kind: cm.range.unwrap(),
-                src_full_range: cm.range == Some(edgefirst_tensor::ColorRange::Full),
-                dst_full_range: cm.range == Some(edgefirst_tensor::ColorRange::Full),
-            };
+            let cp = crate::cpu::ColorParams::uniform(cm.encoding.unwrap(), cm.range.unwrap());
             CPUProcessor::rgba_to_yuyv(rgba, cp)
         };
 
@@ -5596,5 +6349,49 @@ mod cpu_tests {
         // Alpha 0 draws nothing.
         let flat = crate::test_support::draw_box_fixture(&mut cpu, [200, 100, 50, 0], Some(3), 1.0);
         assert!(crate::test_support::box_drawn_columns(&flat, mid).is_empty());
+    }
+
+    #[test]
+    fn full_range_saturated_red_saturates_yuyv_chroma() -> Result<()> {
+        let cp = crate::cpu::ColorParams::uniform(
+            edgefirst_tensor::ColorEncoding::Bt601,
+            edgefirst_tensor::ColorRange::Full,
+        );
+        assert_eq!(
+            CPUProcessor::rgba_to_yuyv([255, 0, 0, 255], cp),
+            [76, 85, 76, 255]
+        );
+
+        let (w, h) = (8, 2);
+        let src = Tensor::<u8>::image(
+            w,
+            h,
+            PixelFormat::Rgba,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )?;
+        for px in src.map_mut()?.as_mut_slice().chunks_exact_mut(4) {
+            px.copy_from_slice(&[255, 0, 0, 255]);
+        }
+        let src = TensorDyn::from(src);
+        let mut dst = TensorDyn::image(
+            w,
+            h,
+            PixelFormat::Yuyv,
+            DType::U8,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )?;
+        dst.set_colorimetry(Some(
+            edgefirst_tensor::Colorimetry::default()
+                .with_encoding(edgefirst_tensor::ColorEncoding::Bt601)
+                .with_range(edgefirst_tensor::ColorRange::Full),
+        ));
+        CPUProcessor::new().convert(&src, &mut dst, None)?;
+        let map = dst.as_u8().unwrap().map_read()?;
+        for macropixel in map.as_slice().chunks_exact(4) {
+            assert_eq!(macropixel, [76, 85, 76, 255]);
+        }
+        Ok(())
     }
 }

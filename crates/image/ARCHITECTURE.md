@@ -105,6 +105,25 @@ shape stays uniform.
 override this chain at runtime; see [`README.md` Environment
 Variables](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/README.md#environment-variables).
 
+### Backend selection
+
+A GL decline is hard or soft (`DeclineClass`). A hard decline (unsupported, a refused import, or output the GPU renders wrong) always returns `NotSupported` and is never overridden. A soft decline (a conversion the CPU runs faster or exactly) returns `NotSupported` only while the GL processor's soft declines are on (`GLProcessorThreaded::set_soft_declines`, on by default).
+
+G2D writes a YUV-to-YUV conversion in the source's matrix and range. When the destination's differ, a destination tagged with them is a hard decline, and an untagged one is a soft decline while G2D's soft declines are on (`G2DProcessor::set_soft_declines`, on by default). With them off, G2D writes the source's colorimetry and tags the destination with it.
+
+`ImageProcessor::with_config` turns GL and G2D soft declines on only under `ComputeBackend::Auto` with no `EDGEFIRST_FORCE_BACKEND` and a CPU backend present:
+
+| Mode | Soft declines | Effect |
+|---|---|---|
+| `ComputeBackend::Auto`, no forced backend, CPU present | on | GL and G2D leave soft-declined conversions to the CPU |
+| `ComputeBackend::OpenGl`, or `EDGEFIRST_FORCE_BACKEND=opengl` | off | GL renders soft-declined conversions |
+| `ComputeBackend::G2d`, or `EDGEFIRST_FORCE_BACKEND=g2d` | off | G2D runs soft-declined conversions |
+| Any other forced backend, or no CPU backend | off | GL and G2D run soft-declined conversions |
+
+When the GL worker takes no message to set this, the processor drops its GL backend with a warning, or returns the error when GL is forced.
+
+Each time the auto chain moves past a backend (a GL decline in `convert` or `convert_with_fence`, a G2D decline, or G2D skipped for its colorimetry), `FallbackLog::note` (`fallback_log.rs`) logs `convert: {backend} declined {src format} {WxH} -> {dst format} {WxH}: {reason}`, at info the first time for that backend and those formats and sizes and at debug afterwards. It holds at most 1024 shapes and clears them when full.
+
 ### TensorDyn as the image type
 
 The image-side type system reuses [`edgefirst_tensor::TensorDyn`](https://docs.rs/edgefirst-tensor/latest/edgefirst_tensor/struct.TensorDyn.html)
@@ -259,6 +278,7 @@ path, no type parameters leaking into the engine):
 | `Import` / `ImportHandle` | `EglImage` / `egl::Image` (DMA-BUF) | `IoSurfacePbuffer` / `egl::Surface` | `AndroidEglImage` / `egl::Image` (AHardwareBuffer) | `D3d11EglImage` / `egl::Image` (`EGL_ANGLE_image_d3d11_texture`) |
 | `import_buffer` / `import_buffer_nv_r8` / `import_buffer_packed` | `eglCreateImageKHR` attribute assembly (`dma_import.rs`, 64-byte stride invariant, multi-plane NV12) | `eglCreatePbufferFromClientBuffer` (`iosurface_import.rs` layouts) | `eglGetNativeClientBufferANDROID` → `eglCreateImageKHR` (`ahardwarebuffer_import.rs`; self-describing buffer, no attribute assembly; NV R8 needs the API-29 `R8_UNORM` format and errors today) | EGLImage over the tensor's `ID3D11Texture2D` (`d3d11_import.rs` attributes) |
 | `attach_tex_image_2d` (+`_external`, `_renderbuffer`) | `glEGLImageTargetTexture2DOES` (persistent — binding-skip cache applies) | `eglBindTexImage`, recorded and released by `end_gpu_pass` after the engine's sync point | `glEGLImageTargetTexture2DOES` (persistent — binding-skip cache applies, like Linux) | `glEGLImageTargetTexture2DOES`, re-issued per use (`end_gpu_pass` has nothing to release) |
+| `NV12_DST` / `import_nv12_dst` | `true`: a single-plane destination imports `NvDstPlanes::Combined` (one R8 EGLImage, pitch × `h + h/2`), a multiplane one `Split` (R8 luma, R8 chroma) (`dma_import.rs`) | `true`: an IOSurface destination imports `Combined` (one R8 pbuffer over the surface's physical dimensions); one that starts at a buffer offset is refused | `false` / `NotSupported` | `false` / `NotSupported` |
 | `PERSISTENT_TEX_BINDINGS` / `EXTERNAL_OES` | `true` / `true` | `false` / `false` (no `samplerExternalOES` on ANGLE — those four programs are not even built) | `true` / `false` (the driver exposes external-OES, but the YUV sampling flip awaits on-device camera validation) | `false` / `false` (ANGLE has no `samplerExternalOES`; persistent bindings are off because ANGLE does not observe writes made to the texture outside GL and a kept binding samples stale content) |
 | `load_gl_once` | once-per-process via this display's `eglGetProcAddress` | no-op (loaded at shared-display init) | no-op (loaded at shared-display init) | no-op (loaded at shared-display init) |
 | Transfer backend | `DmaBuf` → `Pbo` on the NVIDIA verify-failure downgrade | `IOSurface` | `AHardwareBuffer` | `D3d11Texture` |
@@ -518,6 +538,36 @@ A limited-range bilinear luma resize (NV or YUYV) filters in the shader, never t
 
 The letterbox colour of a `Grey` destination becomes its luma (`CPUProcessor::rgba_to_grey`) in every channel before the output mapping is resolved, so the pad matches the CPU's whichever pass clears it, quantized destinations included; an output-domain pad (`pad_output`) recovers channel 0's sample into all three. Integer mapping uses channel 0's parameters, the only channel a `Grey` destination has.
 
+### NV12 destinations
+
+A u8 `Nv12` destination renders on GL only as a zero-copy import on a platform with `GlPlatform::NV12_DST` (Linux DMA-BUF, macOS IOSurface; a destination is single-plane on both and two-plane on Linux); `dst_format_renderable` declines it in host or PBO memory, and `convert_via_engine` declines an i8 one and a `view()`/`batch()` one. `convert_to_nv12` declines, in `nv12_admit`, an odd width or height, a conversion `nv12_dst_decline` declines under the GPU's `Nv12DstPolicy` (the GPU named by its `GL_RENDERER`), a placement without a fill colour whose edges are odd, and one the platform cannot place or import or whose import does not hold the image. NV12 destination imports are cached in `dst_egl_cache`, one entry for a `Combined` destination and one per plane for a `Split` one; `egl_cache_stats().dst` counts them. The NV12 programs build on the first NV12 destination that reaches them; a failed build is logged once and declines that and every later NV12 destination, leaving other conversions on GL. The CPU then converts. `GlPlatform::import_nv12_dst` returns the render targets as `NvDstPlanes`:
+
+| Variant | Surfaces | Luma pass | Chroma pass |
+|---|---|---|---|
+| `Combined { plane, width, height }` | one R8 surface, `width` = pitch, `height` = `h + h/2` | viewport rows `0..h` | viewport rows `h..h + h/2`, `chroma_row = h` |
+| `Split { luma, chroma, chroma_rows }` | R8 luma `w × h`, R8 chroma `w × chroma_rows` (`h/2`) | the luma surface | the chroma surface, `chroma_row = 0` |
+
+`Nv12DstPolicy::for_renderer` sets each GPU's policy from its `RendererTraits`, checked in the order of the rows below. A same-size conversion has no resize, crop, placement, flip or rotation; an exact YUV copy is a same-size one from an NV12, YUYV or VYUY source that resolves to the destination's matrix and range. Hard declines apply always; soft declines apply while soft declines are on (see *Backend selection*).
+
+| GPU | Same-size | Resized | Exact YUV copies | Reason |
+|---|---|---|---|---|
+| Adreno | GL from 1920x1080 up, CPU below | GL | CPU | GL's fixed cost loses to the CPU on small frames |
+| Mali | GL | GL | GL | GL is faster at every size |
+| ANGLE (macOS) | GL from 1600x900 up, CPU below | GL | CPU | GL's fixed cost loses to the CPU on small frames |
+| Vivante | CPU | GL, except from YUYV or VYUY | CPU | GL is slower than the CPU for same-size frames; a YUYV or VYUY source renders wrong, so it is a hard decline |
+| Software rasterizer | hard decline | hard decline | hard decline | no accelerated NV12 destination |
+| Any other GPU | CPU (soft) | CPU (soft) | CPU (soft) | not measured |
+
+`ConvertPlan::ThreePassNv12` (`convert_to_nv12`):
+
+1. The source renders into the RGBA intermediate through the ordinary packed convert, with every resize, crop, letterbox, flip and rotation.
+2. `NV12_LUMA_FRAGMENT` writes Y 1:1 from the intermediate through the fullscreen quad.
+3. `NV12_CHROMA_R8_FRAGMENT` writes U at even and V at odd columns from the mean of each 2x2 block, addressed by `texelFetch` on `gl_FragCoord` less `chroma_row`.
+
+Framebuffer row 0 is memory row 0 on the destination import and on the intermediate, so both passes read intermediate row `y` for destination row `y`. The destination's width and height are even (an odd one is declined), so every 2x2 block lies inside the intermediate.
+
+The coefficients are `colorimetry::rgb_to_yuv_coeffs` of `effective_colorimetry` of the destination, as on the CPU. A placement with a fill colour first clears the luma rows to the colour's encoded Y and draws its encoded U and V with `NV12_CHROMA_FILL_FRAGMENT`, both from `CPUProcessor::rgba_to_yuyv`; any placement then scissors the luma pass to its band and the chroma pass to the band rounded outward to whole chroma samples, as the CPU fills it. A placement with no fill colour must have even edges. A refused destination import declines as `NotSupported` and counts in `ConvertStats::dst_import_fallbacks`. `GLProcessorThreaded::dst_cpu_access` reports NV12 destinations as declined, so `create_image` keeps the CPU write access the fallback needs.
+
 ### macOS GL backend (unified engine over ANGLE)
 
 macOS runs the same `GLProcessorThreaded` engine as Linux: each
@@ -556,7 +606,8 @@ macOS thereby has the engine's full conversion matrix (resize/letterbox everywhe
 ### Colorimetry
 
 YUV→RGB on every backend is driven by the source tensor's per-tensor
-[`Colorimetry`](#colorimetry-1) (matrix + range), resolved at use-time:
+[`Colorimetry`](#colorimetry-1) (matrix + range), resolved at use-time; RGB→YUV
+and YUV→YUV encode with the destination's own resolved colorimetry:
 
 - **Path B** (Linux R8 `texelFetch`, NV12/NV16/NV24) and the **macOS** NV
   shader compute the matrix *in the fragment shader* from six colorimetry
@@ -711,12 +762,14 @@ that tells the engine what completes the convert.
 | `TextureMem` | Mem/Shm (or DMA without import, or a PBO another processor allocated) | offscreen texture seeded from the mapped tensor | `glReadPixels` into the mapped tensor |
 
 One `convert_via_engine` executes every u8/i8 convert: the pure plan table
-`render::plan_convert(src_fmt, dst_fmt, lowering)` picks one of three plans.
+`render::plan_convert(src_fmt, src_host, dst_fmt, lowering)` picks one of the five plans.
 
 | Plan | Selected when | Why |
 |------|---------------|-----|
 | `TwoPassPackedRgb` | `dst_fmt == Rgb` on a `ZeroCopy` lowering | GL has no 3-byte render format, so pass 2 packs into the destination reinterpreted as RGBA8 at `W*3/4 × H`. Texture lowerings render genuine RGB in one pass and stay `SinglePass`. |
 | `TwoPassNvPlanar` | any planar `dst_fmt` on a texture lowering (`TextureMem`/`TexturePbo`), **or** a source with no import (Mem/Shm/PBO) or an NV12/NV16/NV24 source into a planar destination on any lowering | Pass 1 is the ordinary `convert_to` packed path (which handles every source format, including a heap source, on every platform); pass 2 deinterleaves RGBA into the planes and reads back through the same `DstTarget` `SinglePass` uses. |
+| `TwoPassGrey` | a `Grey` destination from an `Rgb`, `Rgba` or `Bgra` source | See *Grey destinations*. |
+| `ThreePassNv12` | an `Nv12` destination on a `ZeroCopy` lowering | See *NV12 destinations*. An `Nv12` destination on a texture lowering is declined to the CPU. |
 | `SinglePass` | everything else | One render pass into the bound target, then the lowering's readback. |
 
 The `TwoPassNvPlanar` gate is a *capability* fact, not a Vivante carve-out:
@@ -918,14 +971,7 @@ EGLImage cache key. Per backend:
 | G2D     | the tile is the destination crop rectangle of the blit | the tile's byte offset/stride must meet G2D's dst alignment, else this tile falls back to CPU |
 | CPU     | a base `offset` + the **parent's** `row_stride` into the parent buffer | the writer strides by the parent pitch, not a tile-local tight stride |
 
-**Every accelerated `convert()` outputs an RGB-family colour (`Grey` / `Rgb` /
-`Rgba` / `Bgra`), packed `HWC` or planar `CHW`** — chroma is a *source* concern
-on the GL and G2D paths, which decline a YUV destination outright. NPUs require
-packed/aligned inputs and models are trained to match. (The CPU backend does
-accept four YUV pairs — `Yuyv`→`Yuyv`, `Yuyv`→`Nv16`, and the two `Vyuy`
-equivalents — so such a convert is correct but always lands on the CPU.) The `Rgb` output
-uses the "4-into-3" packing trick (four RGB pixels written as three RGBA texels);
-`Grey` renders to `GL_RED` (see *Grey destinations*).
+**Accelerated `convert()` outputs an RGB-family colour (`Grey` / `Rgb` / `Rgba` / `Bgra`), packed `HWC` or planar `CHW`, plus `Nv12` on GL** (see *NV12 destinations*) — chroma is otherwise a *source* concern, and the G2D path renders `Yuyv` destinations and declines `Nv12`/`Nv16` ones, plus a YUV-to-YUV pair with a different matrix or range (see *Backend selection*). NPUs require packed/aligned inputs and models are trained to match. (The CPU backend also renders `Yuyv` from `Yuyv`, `Nv12`, `Rgb`, `Rgba` and `Grey`, `Vyuy` from `Vyuy`, and `Nv16` and `Nv12` from `Yuyv`, `Vyuy`, `Nv12`, `Rgb`, `Rgba` and `Grey` (`Nv12` also from `Nv16` and `Nv24`), so such a convert is correct but lands on the CPU unless the GL backend takes it.) The `Rgb` output uses the "4-into-3" packing trick (four RGB pixels written as three RGBA texels); `Grey` renders to `GL_RED` (see *Grey destinations*).
 
 **Packed vs planar tiles.** Both are contiguous (`N` is outermost), so a tile is
 a row-band in the *physical render target* either way:
@@ -1570,6 +1616,9 @@ image.convert                                           [user-facing fn, orchest
 │   ├── image.convert.gl.nv_to_planar.pass2_deinterleave ← 2-pass: RGBA → PlanarRgb planes
 │   ├── image.convert.gl.grey.pass1_rgba                ← 2-pass: Rgb/Rgba → intermediate RGBA
 │   ├── image.convert.gl.grey.pass2_luma                ← 2-pass: RGBA → Grey (BT.601 luma)
+│   ├── image.convert.gl.nv12.pass1_rgba                ← 3-pass: any source → intermediate RGBA
+│   ├── image.convert.gl.nv12.pass2_luma                ← 3-pass: RGBA → NV12 luma
+│   ├── image.convert.gl.nv12.pass3_chroma              ← 3-pass: RGBA → NV12 interleaved chroma
 │   └── image.convert.gl.nv_to_planar_float             ← fused two-pass: NV12/NV16/NV24 → PlanarRgb F16 (macOS IOSurface + Linux DMA-BUF f16)
 │
 ├── image.convert.g2d                                   [NXP i.MX G2D backend, picked second]
@@ -1631,14 +1680,17 @@ image.tile_one                                          [user-facing fn — rend
 | `image.gl_init`                                        | One-time shared-display bring-up: ANGLE dylib discovery + Metal display on macOS/iOS, system EGL default display on Android. An `info_span`, not a trace span. | Fires once per process, not per processor. A second occurrence means the `OnceLock` was re-entered — worth investigating. Linux brings its display up through `context.rs` and emits no span here. |
 | `image.convert`                                        | Orchestration: probe backends, pick OpenGL → G2D → CPU, dispatch. | The `src_memory` and `dst_memory` fields reveal whether you're on a zero-copy DMA-buf path, the PBO path, or the heap fallback. Cache-miss EGLImage imports show up as outliers here when callers reuse fds without reusing tensors. |
 | `image.convert.gl`                                     | The chosen GL backend's full shader pipeline: bind/import source, set up FBO/renderbuffer, run conversion shader, `glFinish`. | First call at a new (src_fmt, dst_fmt, dims) tuple includes shader compile/link cost. Steady-state cost is dominated by the GPU draw and the `glFinish` at the end. Both feed fields land on `image.convert.gl` itself for **u8 and float converts**, and both are recorded on every one — including the single-pass planar route, whose source import is unconditional: `src_feed` (`import` / `pbo` / `upload`) says how the source was fed, `dst_feed` (`zero_copy` / `mapped_texture` / `pbo`) how the output reached the destination. The float route enters this span before dispatch (`convert_float_to_*`, `convert_nv_to_float_two_pass`) with `is_int8 = false`. `dst_feed` is recorded where the route is committed, not where the destination is bound, so a bind the engine then re-plans away from does not put a stale value on the span. On the float route that commit is the zero-copy FBO draw (`zero_copy`) or the PBO pack readback (`pbo`). `dst_feed` is deliberately not an import-refusal marker — it is recorded in `bind_dst`, the one place a `DstTarget` is decided, plus the packed-RGB plan's pre-flight, which is the only destination import that does not go through it. A field that appeared only on the refused route would read as "zero-copy" whenever it was absent, which is how an ordinary texture-lowered convert, or a DMA destination that `dst_import_places` pre-lowered without attempting an import, could pass for a zero-copy one in a trace. `ConvertStats::dst_import_fallbacks` is the refusal count. Anything but `import` on a DMA source means the frame paid a copy. The recording sites take the span's handle rather than `Span::current()`, which inside the engine names `image.convert.gl.engine` (and on the two-pass plans a pass span); `tracing` drops a record against a field the span does not declare, so a record through `Span::current()` there is silently lost. Use `ConvertStats` (`src_imports` / `src_pbo_uploads` / `src_uploads` / `zero_copy_declines` / `dst_import_fallbacks`) for counts on any route. |
-| `image.convert.gl.engine`                              | The convert engine's decision record: which `ConvertPlan` (`SinglePass` / `TwoPassPackedRgb` / `TwoPassNvPlanar` / `TwoPassGrey`) and which destination lowering (`ZeroCopy` / `TextureMem` / `TexturePbo`) this convert took, plus whether the source is PBO-backed. | The plan/lowering pair maps 1:1 onto the GL work performed — filter traces by these fields to isolate one lowering's latency. Both decisions are pure host-tested tables in `render.rs` (`plan_convert`, `lower_dst`). |
-| `image.convert.gl.egl_import`                          | One actual `eglCreateImageKHR` — every EGLImage creation (DMA-BUF, NV R8, RGB renderbuffer paths) funnels through this single choke point. | The cache-behaviour observable: a steady-state frame loop over a fixed buffer pool must emit zero of these after warmup. Any per-frame occurrence means the EGLImage cache stopped hitting (key drift, geometry churn, or pool misuse). The `GLProcessorThreaded::egl_cache_stats()` counters (`src`/`dst`/`nv_r8` hits/misses) are the assertable form, pinned by the `dma_pool_steady_state_zero_imports` test. |
+| `image.convert.gl.engine`                              | The convert engine's decision record: which `ConvertPlan` (`SinglePass` / `TwoPassPackedRgb` / `TwoPassNvPlanar` / `TwoPassGrey` / `ThreePassNv12`) and which destination lowering (`ZeroCopy` / `TextureMem` / `TexturePbo`) this convert took, plus whether the source is PBO-backed. | The plan/lowering pair maps 1:1 onto the GL work performed — filter traces by these fields to isolate one lowering's latency. Both decisions are pure host-tested tables in `render.rs` (`plan_convert`, `lower_dst`). |
+| `image.convert.gl.egl_import`                          | One actual `eglCreateImageKHR` — every EGLImage creation (DMA-BUF, NV R8, RGB renderbuffer, NV12 destination paths) funnels through this single choke point. | The cache-behaviour observable: a steady-state frame loop over a fixed buffer pool must emit zero of these after warmup. Any per-frame occurrence means the EGLImage cache stopped hitting (key drift, geometry churn, or pool misuse). The `GLProcessorThreaded::egl_cache_stats()` counters (`src`/`dst`/`nv_r8` hits/misses; `dst` includes NV12 destination imports) are the assertable form, pinned by the `dma_pool_steady_state_zero_imports` test. |
 | `image.convert.gl.pack_rgb.pass1_rgba`                 | NV12 → intermediate RGBA texture (full geometry: resize, crop, rotation, flip, letterbox). | Reused for the "packed RGB" output path (DMA destination with 3-byte-per-pixel width × 3 / 4 render geometry). |
 | `image.convert.gl.pack_rgb.pass2_pack`                 | Intermediate RGBA → RGB DMA destination via the packed shader. | Only the second pass touches the DMA buffer; the first pass renders into the cached intermediate texture. |
 | `image.convert.gl.nv_to_planar.pass1_rgba`             | NV12/NV16/NV24 → intermediate RGBA — pass 1 of the `TwoPassNvPlanar` plan. | Selected by `render::plan_convert` for every NV\* → planar convert on every GPU, and for any source → planar on a texture lowering. |
 | `image.convert.gl.nv_to_planar.pass2_deinterleave`     | RGBA → PlanarRgb / PlanarRgba via `sampler2D` deinterleave shader. | Includes the optional `XOR 0x80` int8-bias step when the destination is `DType::I8`. |
 | `image.convert.gl.grey.pass1_rgba`                     | Rgb/Rgba → intermediate RGBA — pass 1 of the `TwoPassGrey` plan (full geometry, through whatever route the source takes). | Selected by `render::plan_convert` for every RGB-family source into a `Grey` destination; see *Grey destinations*. |
 | `image.convert.gl.grey.pass2_luma`                     | Intermediate RGBA → Grey destination, BT.601 luma 1:1. | Applies the int8 mapping with channel 0's parameters. |
+| `image.convert.gl.nv12.pass1_rgba`                     | Any source → intermediate RGBA — pass 1 of the `ThreePassNv12` plan (full geometry). | See *NV12 destinations*. |
+| `image.convert.gl.nv12.pass2_luma`                     | Intermediate RGBA → NV12 luma rows (fill colour first when letterboxed). | |
+| `image.convert.gl.nv12.pass3_chroma`                   | Intermediate RGBA → NV12 chroma rows, 2x2 mean. | |
 | `image.convert.gl.nv_to_planar_float`                  | Fused NV12/NV16/NV24 → PlanarRgb F16 with a GPU-resident intermediate: pass 1 renders NV→RGBA with the caller's full geometry into the shared intermediate texture (`packed_rgb_intermediate_tex`), pass 2 packs it 1:1 through the RGBA16F float shader into the zero-copy destination. The pixels never visit the host between the zero-copy source and the zero-copy destination. Portable (macOS IOSurface + Linux DMA-BUF f16 targets). | Emitted by `convert_nv_to_planar_float_two_pass`. |
 | `image.convert.g2d`                                    | NXP 2D hardware engine doing format conversion + resize + rotation + flip + letterbox in one DMA-DMA blit. | Only available on i.MX 8M Plus / 8M Mini. Synchronous on the G2D driver; the span includes the driver's blocking wait. |
 | `image.convert.cpu.format_convert`                     | Per-pixel format conversion (e.g. NV12 → RGB, RGBA → BGRA). The `pass` field tells you whether this ran before, after, or instead of resize. | `pre_resize` indicates the source needed conversion to RGB/RGBA/GREY before `fast_image_resize` could run; `direct` indicates no resize was needed; `post_resize` indicates the destination format differed from the intermediate. |
@@ -1708,8 +1760,7 @@ Cross-cutting truths:
 encoding, range }` — where every axis is `Option<_>` (`None` = unknown/unset).
 The enums (`ColorSpace`, `ColorTransfer`, `ColorEncoding`, `ColorRange`) are
 videostream-aligned and `#[non_exhaustive]`. Tensors and `TensorDyn` carry an
-`Option<Colorimetry>`. `None` means undefined; it is **never auto-filled** by the
-tensor layer — that invariant is strict.
+`Option<Colorimetry>`. `None` means undefined; the tensor layer never fills it. `ImageProcessor::convert` tags an untagged YUV destination (see below).
 
 Helper constructors:
 - `Colorimetry::jfif()` — sRGB primaries + sRGB transfer + BT.601 encoding +
@@ -1739,7 +1790,7 @@ The HAL has no native Mac/Windows capture; all camera/stream sources go through 
 
 #### `convert()` and the `effective_colorimetry` resolver
 
-`convert()` never mutates the source tensor. Instead it calls a pure
+`convert()` never mutates the source tensor. It calls a pure
 `effective_colorimetry()` function at use-time that fills only the axes that are
 `None` on the tensor, using a height heuristic:
 
@@ -1747,17 +1798,26 @@ The HAL has no native Mac/Windows capture; all camera/stream sources go through 
 - **Height < 720 → BT.601, limited range** (SD convention)
 
 Per-axis: a tensor's explicitly set axes win; only the missing axes get the
-heuristic value. The resolved colorimetry is consumed by the backend for that
-single call and discarded.
+heuristic value.
+
+Every YUV destination (`Nv12`, `Nv16`, `Yuyv`, `Vyuy`) is encoded with its own
+resolved colorimetry; the source's colorimetry is never inherited. After a
+successful convert, an untagged YUV destination is tagged with the colorimetry
+it was encoded with (`tag_yuv_destination`), in Python too; a failed convert
+leaves the tag unchanged. A same-size YUV→YUV conversion copies bytes only when
+source and destination resolve to the same matrix and range (`same_yuv_coding`),
+and otherwise re-encodes through RGBA. A `Vyuy` destination that would need
+re-encoding returns `NotSupported`.
 
 #### Backend colorimetry support
 
 | Backend | Matrix | Range | Notes |
 |---------|--------|-------|-------|
-| CPU (`cpu/convert.rs`) | BT.601 / BT.709 / BT.2020 | Full / Limited | Fully correct — passes resolved matrix + range to the `yuv` crate |
+| CPU (`cpu/convert.rs`) | BT.601 / BT.709 / BT.2020 | Full / Limited | Fully correct — YUV→RGB and the NV12/NV16 encoders pass the resolved matrix + range to the `yuv` crate; the YUYV encoder uses `YuyvEncodeCoeffs`, which is built from `rgb_to_yuv_coeffs` |
 | GL NV12/NV16/NV24 (Path B, Linux R8 + macOS) | BT.601 / BT.709 / BT.2020 | Full / Limited | Fully correct — YUV→RGB is computed **in the fragment shader** from six per-tensor colorimetry uniforms (`yuv_to_rgb_coeffs`); the combined semi-planar buffer is imported as one R8 `texelFetch` texture. Verified on Vivante GC7000UL, Mali-G310, and V3D. |
 | GL Path A / YUYV (driver `samplerExternalOES`) | driver-selected via EGL hints | Full / Limited (driver-honored) | The import sets `YUV_COLOR_SPACE_HINT` / `SAMPLE_RANGE_HINT` from the resolved colorimetry. Hint-honoring drivers (e.g. Tegra) are correct; on hint-ignoring drivers (Vivante) single-plane NV12 with non-default colorimetry is force-routed to Path B, and packed YUYV/VYUY falls back to the colorimetry-correct CPU path. |
-| G2D (`g2d.rs`) | BT.601 / BT.709 | — | **Limitation:** `g2d-sys` exposes only `set_bt601_colorspace()` / `set_bt709_colorspace()` (matrix only). Full-range and BT.2020 YUV cannot be expressed. G2D **declines** full-range or BT.2020 YUV conversions; the dispatch falls through to GL or CPU. |
+| GL RGB→NV12 destination (`ThreePassNv12`) | BT.601 / BT.709 / BT.2020 | Full / Limited | RGB→YUV in the fragment shader from `rgb_to_yuv_coeffs` of the destination's effective colorimetry. |
+| G2D (`g2d.rs`) | BT.601 / BT.709 | — | **Limitation:** `g2d-sys` exposes only `set_bt601_colorspace()` / `set_bt709_colorspace()` (matrix only). Full-range and BT.2020 YUV cannot be expressed. G2D **declines** full-range or BT.2020 YUV conversions, and a YUV→YUV pair whose matrix or range differ, unless soft declines are off and the destination is untagged (see *Backend selection*); the dispatch falls through to GL or CPU. |
 
 #### C and Python surfaces
 
@@ -1816,12 +1876,13 @@ in the project README for the user-facing rules and validation patterns.
 
 | Platform | Backends available | Float preprocessing | Notes |
 |----------|--------------------|---------------------|-------|
-| Linux NXP i.MX 8M Plus (Vivante GC7000UL) | OpenGL, G2D, CPU | CPU only (float disabled) | NV12/NV16/NV24 → PlanarRgb requires the two-pass workaround; NV16/NV24 use the Path B R8 shader (NV12 uses Path A); packed RGB sources use the R8 view (libg2d rejects 24-bit sources); GPU float disabled (170–320 ms readback) |
-| Linux NXP i.MX 95 (Mali-G310 / Panfrost) | OpenGL, CPU | F16 PBO + DMA-BUF; F32 PBO | Concurrent GL works; `EDGEFIRST_OPENGL_RENDERSURFACE=1` required for Neutron NPU DMA-BUF destinations |
+| Linux NXP i.MX 8M Plus (Vivante GC7000UL) | OpenGL, G2D, CPU | CPU only (float disabled) | NV12/NV16/NV24 → PlanarRgb requires the two-pass workaround; NV16/NV24 use the Path B R8 shader (NV12 uses Path A); packed RGB sources use the R8 view (libg2d rejects 24-bit sources); GPU float disabled (170–320 ms readback); NV12 destinations: a resized conversion renders on GL unless its source is YUYV or VYUY; every other conversion runs on the CPU |
+| Linux NXP i.MX 95 (Mali-G310 / Panfrost) | OpenGL, CPU | F16 PBO + DMA-BUF; F32 PBO | Concurrent GL works; `EDGEFIRST_OPENGL_RENDERSURFACE=1` required for Neutron NPU DMA-BUF destinations; NV12 destinations render on GL at every size, including exact YUV copies |
+| Linux Qualcomm (Adreno) | OpenGL, CPU | — | NV12 destinations render on GL from 1920x1080 up and when resized; smaller same-size conversions and exact YUV copies run on the CPU |
 | Linux RPi 5 (V3D / Broadcom) | OpenGL, CPU | F16 PBO + DMA-BUF; F32 PBO | |
 | Linux Tegra Orin / NVIDIA (orin-nano) | OpenGL (PBO path), CPU | F16 PBO; F32 PBO — **PBO → CUDA zero-copy implemented** (`cuda_map()` maps the PBO to a device pointer on the GL worker thread; TensorRT reads directly from device memory) | DMA-buf import unsupported; PBO path provides zero-copy to CUDA |
 | Linux desktop / Mesa x86_64 | OpenGL, CPU | GPU-dependent | DMA-heap permission required for DMA path |
-| macOS (Apple Silicon, ANGLE installed) | OpenGL (ANGLE → Metal), CPU | F16 `PlanarRgb` IOSurface zero-copy; F32 not supported | YUYV → RGBA, GREY → RGBA, NV12/NV16/NV24 → RGBA, NV12/NV16/NV24 → PlanarRgb F16 (two-pass), and RGBA → PlanarRgb F16 all run on the GPU. IOSurface `width == 64-aligned pitch` (`semi_planar_surface_dims`) is required so ANGLE does not address texels beyond the declared width — NV24's chroma row is 2W bytes and would otherwise spill into padding columns. Other convert pairs fall back to CPU. |
+| macOS (Apple Silicon, ANGLE installed) | OpenGL (ANGLE → Metal), CPU | F16 `PlanarRgb` IOSurface zero-copy; F32 not supported | YUYV → RGBA, GREY → RGBA, NV12/NV16/NV24 → RGBA, NV12/NV16/NV24 → PlanarRgb F16 (two-pass), and RGBA → PlanarRgb F16 all run on the GPU. IOSurface `width == 64-aligned pitch` (`semi_planar_surface_dims`) is required so ANGLE does not address texels beyond the declared width — NV24's chroma row is 2W bytes and would otherwise spill into padding columns. Any imported source → NV12 IOSurface destination (`ThreePassNv12`; a same-size conversion of fewer than 1600x900 pixels, or an exact YUV copy, stays on the CPU). Other convert pairs fall back to CPU. |
 | macOS (no ANGLE) | CPU | CPU only | `GLProcessorThreaded::new()` fails at `ImageProcessor::new()` time (ANGLE dylib not found); the GPU dispatch is never attempted. |
 | Android (API 26+, Adreno/Mali) | OpenGL (native EGL), CPU | F16 `PlanarRgb` AHardwareBuffer zero-copy (RGBA16F packing, same layout as macOS); F32 gated on `GL_EXT_color_buffer_float` | Zero-copy formats: RGBA8, packed RGB u8/i8 (RGB-in-RGBA8888 texel packing via `packed_rgb888_layout`, the INT8 NPU input layout), and RGBA16F/planar-F16. Sources import zero-copy on the same formats; the float family imports its RGBA source per-frame (see `feed_float_src`). NPU handoff is direct: `hardware_buffer_ptr()` + `convert_with_fence()` (`EGL_ANDROID_native_fence_sync`); gralloc pitch padding is recorded on the tensor (`recorded_row_stride`/`copy_to_flat` for flat consumers). Grey/NV single-plane import needs the API-29 `R8_UNORM` format, BGRA has no AHardwareBuffer format, and YUV camera buffers await the external-OES sampling flip — those fall back to CPU conversion; explicit `Some(Dma)` requests for unmapped formats error (`InvalidArgument`) instead of degrading. Generic (non-image) tensors allocate as BLOB buffers. Hardware-only destinations (`CpuAccess::None`) are eligible for gralloc vendor tile compression (UBWC/AFBC/PVRIC/DCC — request via `create_image_desc` + `Compression::Any`, outcome on `Tensor::compression()`); only Qualcomm's QNN consumes compressed input natively (UBWC data formats declared at context-binary preparation) — every other NPU stack takes the linear zero-copy dma-buf that the default produces. Validated on-device via the hal-mobile Device Farm harness (Galaxy S26 Ultra). |
 | Other Unix | CPU | CPU only | No GPU/G2D |

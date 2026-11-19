@@ -65,17 +65,28 @@ pub(super) enum ConvertPlan {
     /// writes its BT.601 luma into the destination. YUV sources stay
     /// single-pass, drawing their own luma plane.
     TwoPassGrey,
+    /// Zero-copy NV12 destination: pass 1 renders the source into an RGBA
+    /// intermediate through the ordinary packed convert, pass 2 writes its
+    /// luma and pass 3 its 2x2-averaged chroma into the destination's
+    /// imported planes.
+    ThreePassNv12,
 }
 
 /// Decide the render plan from the source format, source residence,
 /// destination format and destination lowering. `src_host` is a source in host
 /// memory (`Mem`, `Shm`).
+///
+/// An NV12 destination plans [`ConvertPlan::ThreePassNv12`] on the zero-copy
+/// lowering only.
 pub(super) fn plan_convert(
     src_fmt: PixelFormat,
     src_host: bool,
     dst_fmt: PixelFormat,
     lowering: DstLowering,
 ) -> ConvertPlan {
+    if lowering == DstLowering::ZeroCopy && dst_fmt == PixelFormat::Nv12 {
+        return ConvertPlan::ThreePassNv12;
+    }
     // A zero-copy packed RGB destination takes the two-pass W*3/4 reinterpretation.
     if lowering == DstLowering::ZeroCopy && dst_fmt == PixelFormat::Rgb {
         return ConvertPlan::TwoPassPackedRgb;
@@ -581,6 +592,24 @@ mod tests {
                         plan_convert(src, host, Grey, lowering),
                         ConvertPlan::SinglePass,
                         "{src:?}->Grey via {lowering:?}"
+                    );
+                }
+            }
+        }
+        // NV12 destination: three-pass on the zero-copy lowering for every
+        // source and residence; never three-pass on a texture lowering.
+        for src in nv.iter().chain(&non_nv).chain(&[Vyuy]) {
+            for host in [false, true] {
+                assert_eq!(
+                    plan_convert(*src, host, Nv12, ZeroCopy),
+                    ConvertPlan::ThreePassNv12,
+                    "{src:?}->Nv12 zero-copy, host {host}"
+                );
+                for lowering in [TextureMem, TexturePbo] {
+                    assert_ne!(
+                        plan_convert(*src, host, Nv12, lowering),
+                        ConvertPlan::ThreePassNv12,
+                        "{src:?}->Nv12 via {lowering:?}, host {host}"
                     );
                 }
             }

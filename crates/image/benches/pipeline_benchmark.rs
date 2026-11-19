@@ -657,6 +657,9 @@ fn main() {
         BenchConfig::new(1920, 1080, 1920, 1080, PixelFormat::Nv16, PixelFormat::Rgba),
         // PixelFormat::Grey destination
         BenchConfig::new(1920, 1080, 1920, 1080, PixelFormat::Rgba, PixelFormat::Grey),
+        // PixelFormat::Nv12 destination
+        BenchConfig::new(1920, 1080, 1920, 1080, PixelFormat::Yuyv, PixelFormat::Nv12),
+        BenchConfig::new(640, 480, 640, 480, PixelFormat::Yuyv, PixelFormat::Nv12),
     ];
     let convert_configs: Vec<_> = convert_configs
         .into_iter()

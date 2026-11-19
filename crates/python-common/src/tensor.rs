@@ -2283,7 +2283,8 @@ impl PyTensor {
 
     /// Colorimetry metadata, or ``None`` when undefined.
     ///
-    /// Never auto-filled. Set to ``None`` to clear.
+    /// ``ImageProcessor.convert`` tags an untagged YUV destination with the
+    /// colorimetry it encoded. Set to ``None`` to clear.
     #[getter]
     fn colorimetry(&self) -> Option<crate::colorimetry::PyColorimetry> {
         self.0.colorimetry().map(Into::into)

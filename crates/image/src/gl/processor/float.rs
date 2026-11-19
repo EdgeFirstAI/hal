@@ -16,7 +16,6 @@ use std::ffi::{c_void, CStr};
 
 use super::super::cache::{BufferImportKey, CacheKind};
 use super::super::core::float_crop_uniforms;
-use super::super::platform::GlPlatform;
 use super::{
     check_gl_error, dyn_to_u8_src, plan_pbo_readback, spread_rows, with_mapped_pbo, GLProcessorST,
     PboReadbackLayout,
@@ -1045,40 +1044,21 @@ impl GLProcessorST {
                         edgefirst_gl::gl::RENDERBUFFER,
                         rbo,
                     );
+                    if let Err(fbo_status) = super::super::core::check_framebuffer_complete() {
+                        edgefirst_gl::gl::BindFramebuffer(edgefirst_gl::gl::FRAMEBUFFER, 0);
+                        return Err(crate::Error::NotSupported(format!(
+                            "GL float render-to-DMA: FBO incomplete (0x{fbo_status:x}) for the \
+                             {packed:?} import; using CPU fallback"
+                        )));
+                    }
                 }
                 None => {
-                    edgefirst_gl::gl::ActiveTexture(edgefirst_gl::gl::TEXTURE0);
-                    edgefirst_gl::gl::BindTexture(
-                        edgefirst_gl::gl::TEXTURE_2D,
-                        self.render_texture.id,
-                    );
-                    super::super::core::set_tex_filter(
-                        edgefirst_gl::gl::TEXTURE_2D,
-                        edgefirst_gl::gl::NEAREST,
-                    );
-                    // Platform attach of the import to the texture.
-                    super::super::platform::Platform::attach_tex_image_2d(
+                    Self::attach_import_target(
                         &self.gl_context,
+                        &mut self.render_texture,
                         dest_egl,
                     )?;
-                    edgefirst_gl::gl::FramebufferTexture2D(
-                        edgefirst_gl::gl::FRAMEBUFFER,
-                        edgefirst_gl::gl::COLOR_ATTACHMENT0,
-                        edgefirst_gl::gl::TEXTURE_2D,
-                        self.render_texture.id,
-                        0,
-                    );
-                    // Drops render_texture's cached EGLImage binding.
-                    self.render_texture.invalidate_egl_binding();
                 }
-            }
-
-            if let Err(fbo_status) = super::super::core::check_framebuffer_complete() {
-                edgefirst_gl::gl::BindFramebuffer(edgefirst_gl::gl::FRAMEBUFFER, 0);
-                return Err(crate::Error::NotSupported(format!(
-                    "GL float render-to-DMA: FBO incomplete (0x{fbo_status:x}) for the \
-                     {packed:?} import; using CPU fallback"
-                )));
             }
             check_gl_error(function!(), line!())?;
         }

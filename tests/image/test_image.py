@@ -1215,6 +1215,44 @@ def test_convert_honors_tagged_colorimetry(monkeypatch):
     assert mean_diff > 1.0, f"mean pixel delta {mean_diff:.3f} too small to be real"
 
 
+@pytest.mark.parametrize(
+    "method", ["convert", "convert_deferred", "convert_with_fence"]
+)
+def test_convert_tags_an_untagged_yuv_destination(method):
+    """Every convert entry point tags an untagged YUV destination with the
+    colorimetry its height implies, and keeps a tagged destination's tag."""
+    p = ImageProcessor()
+    src = Tensor.image(640, 360, PixelFormat.Rgba, None, "readwrite")
+    bt709_full = Colorimetry(encoding=ColorEncoding.Bt709, range=ColorRange.Full)
+
+    def run(dst):
+        fence = getattr(p, method)(src, dst)
+        if method == "convert_with_fence" and fence is not None:
+            if sys.platform == "win32":
+                import ctypes
+
+                ctypes.windll.kernel32.CloseHandle(ctypes.c_void_p(fence))
+            else:
+                os.close(fence)
+        if method == "convert_deferred":
+            p.flush()
+
+    for fmt in (PixelFormat.Nv12, PixelFormat.Nv16, PixelFormat.Yuyv):
+        dst = Tensor.image(640, 360, fmt, None, "readwrite")
+        assert dst.colorimetry is None
+        run(dst)
+        tag = dst.colorimetry
+        assert tag is not None, f"{fmt}: the destination was left untagged"
+        assert tag.encoding == ColorEncoding.Bt601, f"{fmt}: {tag}"
+        assert tag.range == ColorRange.Limited, f"{fmt}: {tag}"
+
+        tagged = Tensor.image(640, 360, fmt, None, "readwrite")
+        tagged.colorimetry = bt709_full
+        run(tagged)
+        assert tagged.colorimetry.encoding == ColorEncoding.Bt709, f"{fmt}"
+        assert tagged.colorimetry.range == ColorRange.Full, f"{fmt}"
+
+
 @pytest.mark.gpu
 def test_convert_with_fence_returns_a_waitable_or_none():
     """convert_with_fence() returns a waitable completion handle, or None."""

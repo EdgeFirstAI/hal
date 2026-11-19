@@ -2583,7 +2583,7 @@ where
     plane_offset: Option<usize>,
     /// Quantization metadata for integer-typed tensors.
     pub(crate) quantization: Option<Quantization>,
-    /// Optional colorimetry metadata. `None` = undefined; never auto-filled.
+    /// Optional colorimetry metadata. `None` = undefined; an image convert tags an untagged YUV destination.
     colorimetry: Option<crate::Colorimetry>,
     /// Declared CPU access (see [`CpuAccess`]). Image constructors set it
     /// from their `access` parameter; non-image tensors (`new`, imports,

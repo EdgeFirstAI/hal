@@ -108,28 +108,22 @@ impl YuyvEncodeCoeffs {
     /// are full-range (255/255) or limited-range (219/224) per `cp.range_kind`;
     /// the `KR`/`KB` luma weights come from `cp.encoding` (BT.601 / 709 / 2020).
     fn from_params(cp: ColorParams) -> Self {
-        let w = cp.encoding.luma_weights();
-        let (kr, kb) = (w.kr, w.kb);
-        let kg = w.kg();
-        let s = cp.range_kind.scaling();
-        // Chroma is centred on 128; the luma black level (`y_off`) and the
-        // swings come from the resolved range.
-        let (y_swing, c_swing, y_off, c_off) = (s.y_swing, s.c_swing, s.y_offset as i32, 128);
-        let b = Self::BIAS;
-        let yscale = (1_i64 << b) as f64 * y_swing / 255.0;
-        let cscale = (1_i64 << b) as f64 * c_swing / 255.0;
+        let c = crate::colorimetry::rgb_to_yuv_coeffs(cp.encoding, cp.range_kind);
+        let q = |v: f64| (v * (1_i64 << Self::BIAS) as f64).round() as i32;
+        // The two 0.5 terms round up.
+        let q_up = |v: f64| (v * (1_i64 << Self::BIAS) as f64).ceil() as i32;
         Self {
-            y_r: (kr * yscale).round() as i32,
-            y_g: (kg * yscale).round() as i32,
-            y_b: (kb * yscale).round() as i32,
-            u_r: (-kr / (kr + kg) / 2.0 * cscale).round() as i32,
-            u_g: (-kg / (kr + kg) / 2.0 * cscale).round() as i32,
-            u_b: (0.5 * cscale).ceil() as i32,
-            v_r: (0.5 * cscale).ceil() as i32,
-            v_g: (-kg / (kg + kb) / 2.0 * cscale).round() as i32,
-            v_b: (-kb / (kg + kb) / 2.0 * cscale).round() as i32,
-            y_off,
-            c_off,
+            y_r: q(c.y[0]),
+            y_g: q(c.y[1]),
+            y_b: q(c.y[2]),
+            u_r: q(c.u[0]),
+            u_g: q(c.u[1]),
+            u_b: q_up(c.u[2]),
+            v_r: q_up(c.v[0]),
+            v_g: q(c.v[1]),
+            v_b: q(c.v[2]),
+            y_off: cp.range_kind.scaling().y_offset as i32,
+            c_off: 128,
         }
     }
 
@@ -140,28 +134,34 @@ impl YuyvEncodeCoeffs {
         let [r0, g0, b0] = p0;
         let [r1, g1, b1] = p1;
         let b = Self::BIAS;
-        let y0 = ((self.y_r * r0 + self.y_g * g0 + self.y_b * b0 + Self::ROUND).shr(b) + self.y_off)
-            as u8;
-        let y1 = ((self.y_r * r1 + self.y_g * g1 + self.y_b * b1 + Self::ROUND).shr(b) + self.y_off)
-            as u8;
-        let u = ((self.u_r * r0
-            + self.u_g * g0
-            + self.u_b * b0
-            + self.u_r * r1
-            + self.u_g * g1
-            + self.u_b * b1
-            + Self::ROUND2)
-            .shr(b + 1)
-            + self.c_off) as u8;
-        let v = ((self.v_r * r0
-            + self.v_g * g0
-            + self.v_b * b0
-            + self.v_r * r1
-            + self.v_g * g1
-            + self.v_b * b1
-            + Self::ROUND2)
-            .shr(b + 1)
-            + self.c_off) as u8;
+        let y0 = Self::saturate(
+            (self.y_r * r0 + self.y_g * g0 + self.y_b * b0 + Self::ROUND).shr(b) + self.y_off,
+        );
+        let y1 = Self::saturate(
+            (self.y_r * r1 + self.y_g * g1 + self.y_b * b1 + Self::ROUND).shr(b) + self.y_off,
+        );
+        let u = Self::saturate(
+            (self.u_r * r0
+                + self.u_g * g0
+                + self.u_b * b0
+                + self.u_r * r1
+                + self.u_g * g1
+                + self.u_b * b1
+                + Self::ROUND2)
+                .shr(b + 1)
+                + self.c_off,
+        );
+        let v = Self::saturate(
+            (self.v_r * r0
+                + self.v_g * g0
+                + self.v_b * b0
+                + self.v_r * r1
+                + self.v_g * g1
+                + self.v_b * b1
+                + Self::ROUND2)
+                .shr(b + 1)
+                + self.c_off,
+        );
         [y0, u, y1, v]
     }
 
@@ -171,13 +171,22 @@ impl YuyvEncodeCoeffs {
     fn encode_single(&self, rgb: [i32; 3]) -> [u8; 4] {
         let [r, g, b] = rgb;
         let bias = Self::BIAS;
-        let y = (((self.y_r * r + self.y_g * g + self.y_b * b + Self::ROUND) >> bias) + self.y_off)
-            as u8;
-        let u = (((self.u_r * r + self.u_g * g + self.u_b * b + Self::ROUND) >> bias) + self.c_off)
-            as u8;
-        let v = (((self.v_r * r + self.v_g * g + self.v_b * b + Self::ROUND) >> bias) + self.c_off)
-            as u8;
+        let y = Self::saturate(
+            ((self.y_r * r + self.y_g * g + self.y_b * b + Self::ROUND) >> bias) + self.y_off,
+        );
+        let u = Self::saturate(
+            ((self.u_r * r + self.u_g * g + self.u_b * b + Self::ROUND) >> bias) + self.c_off,
+        );
+        let v = Self::saturate(
+            ((self.v_r * r + self.v_g * g + self.v_b * b + Self::ROUND) >> bias) + self.c_off,
+        );
         [y, u, y, v]
+    }
+
+    /// Clamp to `0..=255` and narrow.
+    #[inline(always)]
+    fn saturate(v: i32) -> u8 {
+        v.clamp(0, 255) as u8
     }
 }
 
@@ -318,6 +327,16 @@ fn pack_to_planar(
     Ok(())
 }
 
+/// A `yuv` crate packed-RGB(A) to NV12 encoder.
+type Nv12Encoder = fn(
+    &mut yuv::YuvBiPlanarImageMut<u8>,
+    &[u8],
+    u32,
+    yuv::YuvRange,
+    yuv::YuvStandardMatrix,
+    yuv::YuvConversionMode,
+) -> std::result::Result<(), yuv::YuvError>;
+
 impl CPUProcessor {
     /// Shared decode for every semi-planar (NV12/NV16/NV24) → packed
     /// conversion: wraps the resolved planes/strides in a `YuvBiPlanarImage`
@@ -373,27 +392,26 @@ impl CPUProcessor {
     {
         let src_w = src.width().unwrap();
         let src_h = src.height().unwrap();
-        let stride = src
-            .effective_row_stride()
-            .unwrap_or(src_w.next_multiple_of(2));
+        Self::with_nv12_src(src, |y_plane, y_stride, uv_plane, uv_stride| {
+            Self::semi_planar_decode(
+                y_plane, uv_plane, src_w, src_h, y_stride, uv_stride, dst, decode,
+            )
+        })
+    }
+
+    /// Run `f(luma, luma_stride, chroma, chroma_stride)` over the mapped planes of an NV12
+    /// source; a contiguous source's two planes share one stride.
+    fn with_nv12_src<R>(
+        src: &Tensor<u8>,
+        f: impl FnOnce(&[u8], usize, &[u8], usize) -> Result<R>,
+    ) -> Result<R> {
+        let src_h = src.height().unwrap();
+        let (stride, uv_stride) = super::semi_planar_strides(src);
         if src.is_multiplane() {
             let y_map = src.map_read()?;
-            let uv_map = src.chroma().unwrap().map_read()?;
-            let uv_stride = src
-                .chroma()
-                .unwrap()
-                .effective_row_stride()
-                .unwrap_or(src_w.next_multiple_of(2));
-            Self::semi_planar_decode(
-                y_map.as_slice(),
-                uv_map.as_slice(),
-                src_w,
-                src_h,
-                stride,
-                uv_stride,
-                dst,
-                decode,
-            )
+            let chroma = src.chroma().unwrap();
+            let uv_map = chroma.map_read()?;
+            f(y_map.as_slice(), stride, uv_map.as_slice(), uv_stride)
         } else {
             let map = src.map_read()?;
             let (y_plane, uv_plane) = super::split_semi_planar(
@@ -402,8 +420,57 @@ impl CPUProcessor {
                 src_h,
                 src.format().expect("semi-planar source has a pixel format"),
             )?;
-            Self::semi_planar_decode(y_plane, uv_plane, src_w, src_h, stride, stride, dst, decode)
+            f(y_plane, stride, uv_plane, stride)
         }
+    }
+
+    /// Run `f(luma, luma_stride, chroma, chroma_stride)` over the mapped planes of an NV12
+    /// destination, single-plane or multiplane.
+    pub(super) fn with_nv12_dst<R>(
+        dst: &Tensor<u8>,
+        f: impl FnOnce(&mut [u8], usize, &mut [u8], usize) -> Result<R>,
+    ) -> Result<R> {
+        Self::with_nv12_dst_mapped(dst, false, f)
+    }
+
+    /// As [`Self::with_nv12_dst`], mapping the planes for a partial write
+    /// (read-write) when `partial` is set.
+    pub(super) fn with_nv12_dst_mapped<R>(
+        dst: &Tensor<u8>,
+        partial: bool,
+        f: impl FnOnce(&mut [u8], usize, &mut [u8], usize) -> Result<R>,
+    ) -> Result<R> {
+        let w = dst.width().unwrap();
+        let h = dst.height().unwrap();
+        let chroma_rows = h.div_ceil(2);
+        let (luma_stride, chroma_stride) = super::semi_planar_strides(dst);
+        let mut luma_map = if partial {
+            dst.map_for_partial_write()?
+        } else {
+            dst.map_for_write()?
+        };
+        let mut chroma_map = dst
+            .chroma()
+            .map(|c| {
+                if partial {
+                    c.map_for_partial_write()
+                } else {
+                    c.map_for_write()
+                }
+            })
+            .transpose()?;
+        let (luma, chroma) = match chroma_map.as_mut() {
+            Some(chroma_map) => (luma_map.as_mut_slice(), chroma_map.as_mut_slice()),
+            None => super::split_semi_planar_mut(
+                luma_map.as_mut_slice(),
+                luma_stride,
+                h,
+                edgefirst_tensor::PixelFormat::Nv12,
+            )?,
+        };
+        super::guard_plane(luma.len(), luma_stride, h, w, "NV12 luma")?;
+        super::guard_plane(chroma.len(), chroma_stride, chroma_rows, w, "NV12 chroma")?;
+        f(luma, luma_stride, chroma, chroma_stride)
     }
 
     pub(super) fn convert_nv12_to_rgb(
@@ -636,6 +703,43 @@ impl CPUProcessor {
             }
         }
         Ok(())
+    }
+
+    pub(super) fn convert_yuyv_to_nv12(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
+        Self::packed422_to_nv12(src, dst, super::simd::Packed422::Yuyv)
+    }
+
+    pub(super) fn convert_vyuy_to_nv12(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
+        Self::packed422_to_nv12(src, dst, super::simd::Packed422::Vyuy)
+    }
+
+    /// Packed 4:2:2 → NV12 by row pairs; chroma is the mean of each row pair.
+    fn packed422_to_nv12(
+        src: &Tensor<u8>,
+        dst: &mut Tensor<u8>,
+        order: super::simd::Packed422,
+    ) -> Result<()> {
+        let w = src.width().unwrap();
+        let h = src.height().unwrap();
+        debug_assert!(h.is_multiple_of(2));
+        let src_stride = super::tensor_row_stride(src);
+
+        let src_map = src.map_read()?;
+        let src_bytes = src_map.as_slice();
+        super::guard_plane(src_bytes.len(), src_stride, h, w * 2, "packed 4:2:2 src")?;
+
+        Self::with_nv12_dst(dst, |luma, luma_stride, chroma, chroma_stride| {
+            for r in 0..h / 2 {
+                let top = &src_bytes[2 * r * src_stride..][..w * 2];
+                let bottom = &src_bytes[(2 * r + 1) * src_stride..][..w * 2];
+                let (upper, lower) = luma.split_at_mut((2 * r + 1) * luma_stride);
+                let y_top = &mut upper[2 * r * luma_stride..][..w];
+                let y_bottom = &mut lower[..w];
+                let uv = &mut chroma[r * chroma_stride..][..w];
+                super::simd::packed422_rows_to_nv12(top, bottom, y_top, y_bottom, uv, w, order);
+            }
+            Ok(())
+        })
     }
 
     pub(super) fn convert_vyuy_to_rgb(
@@ -1176,6 +1280,104 @@ impl CPUProcessor {
             cp.matrix,
             yuv_mode(),
         )?)
+    }
+
+    pub(super) fn convert_rgba_to_nv12(
+        src: &Tensor<u8>,
+        dst: &mut Tensor<u8>,
+        cp: ColorParams,
+    ) -> Result<()> {
+        Self::encode_nv12(src, dst, cp, yuv::rgba_to_yuv_nv12)
+    }
+
+    pub(super) fn convert_rgb_to_nv12(
+        src: &Tensor<u8>,
+        dst: &mut Tensor<u8>,
+        cp: ColorParams,
+    ) -> Result<()> {
+        Self::encode_nv12(src, dst, cp, yuv::rgb_to_yuv_nv12)
+    }
+
+    /// Runs the `yuv` crate's packed-RGB(A) to NV12 `encode` into `dst`.
+    fn encode_nv12(
+        src: &Tensor<u8>,
+        dst: &mut Tensor<u8>,
+        cp: ColorParams,
+        encode: Nv12Encoder,
+    ) -> Result<()> {
+        let w = dst.width().unwrap() as u32;
+        let h = dst.height().unwrap() as u32;
+        let src_stride = super::tensor_row_stride(src) as u32;
+        let src_map = src.map_read()?;
+        Self::with_nv12_dst(dst, |luma, luma_stride, chroma, chroma_stride| {
+            let mut image = yuv::YuvBiPlanarImageMut::<u8> {
+                y_plane: yuv::BufferStoreMut::Borrowed(luma),
+                y_stride: luma_stride as u32,
+                uv_plane: yuv::BufferStoreMut::Borrowed(chroma),
+                uv_stride: chroma_stride as u32,
+                width: w,
+                height: h,
+            };
+            Ok(encode(
+                &mut image,
+                src_map.as_slice(),
+                src_stride,
+                cp.range,
+                cp.matrix,
+                yuv_mode(),
+            )?)
+        })
+    }
+
+    pub(super) fn convert_grey_to_nv12(
+        src: &Tensor<u8>,
+        dst: &mut Tensor<u8>,
+        cp: ColorParams,
+    ) -> Result<()> {
+        let w = dst.width().unwrap();
+        let h = dst.height().unwrap();
+        let src_stride = super::tensor_row_stride(src);
+        let src_map = src.map_read()?;
+        let src_bytes = src_map.as_slice();
+        super::guard_plane(src_bytes.len(), src_stride, h, w, "grey src")?;
+        Self::with_nv12_dst(dst, |luma, luma_stride, chroma, chroma_stride| {
+            for row in 0..h {
+                let s = &src_bytes[row * src_stride..][..w];
+                let d = &mut luma[row * luma_stride..][..w];
+                if cp.dst_full_range {
+                    d.copy_from_slice(s);
+                } else {
+                    for (s, d) in s.iter().zip(d.iter_mut()) {
+                        *d = full_to_limit(*s);
+                    }
+                }
+            }
+            for row in 0..h.div_ceil(2) {
+                chroma[row * chroma_stride..][..w].fill(128);
+            }
+            Ok(())
+        })
+    }
+
+    pub(super) fn convert_nv12_to_nv12(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
+        let w = src.width().unwrap();
+        let h = src.height().unwrap();
+        Self::with_nv12_src(
+            src,
+            |src_luma, src_luma_stride, src_chroma, src_chroma_stride| {
+                Self::with_nv12_dst(dst, |luma, luma_stride, chroma, chroma_stride| {
+                    for row in 0..h {
+                        luma[row * luma_stride..][..w]
+                            .copy_from_slice(&src_luma[row * src_luma_stride..][..w]);
+                    }
+                    for row in 0..h.div_ceil(2) {
+                        chroma[row * chroma_stride..][..w]
+                            .copy_from_slice(&src_chroma[row * src_chroma_stride..][..w]);
+                    }
+                    Ok(())
+                })
+            },
+        )
     }
 
     /// Run `f(src_row, dst_row)` over the logical rows of a source/destination
@@ -1913,7 +2115,7 @@ impl CPUProcessor {
         [y]
     }
 
-    pub(super) fn rgba_to_yuyv(rgba: [u8; 4], cp: ColorParams) -> [u8; 4] {
+    pub(crate) fn rgba_to_yuyv(rgba: [u8; 4], cp: ColorParams) -> [u8; 4] {
         let [r, g, b, _] = rgba;
         YuyvEncodeCoeffs::from_params(cp).encode_single([r as i32, g as i32, b as i32])
     }

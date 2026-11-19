@@ -23,7 +23,7 @@ neighbours:
 ## Features
 
 - **Multiple backends** — Automatic selection: OpenGL (GPU) → G2D (NXP i.MX) → CPU (fallback)
-- **Format conversion** — RGB/RGBA/BGRA/GREY, planar RGB(A), semi-planar NV12/NV16/NV24, packed YUYV/VYUY
+- **Format conversion** — RGB/RGBA/BGRA/GREY, planar RGB(A), semi-planar NV12/NV16/NV24, packed YUYV/VYUY; NV12, NV16, YUYV and VYUY as destinations
 - **Geometric transforms** — Source crop, resize, letterbox, rotate (90° increments), flip
 - **Zero-copy integration** — Works with `edgefirst-tensor` DMA-BUF, IOSurface, AHardwareBuffer, PBO, and SHM buffers
 - **Tiled preprocessing** — SAHI grids for small-object detection in 4K frames
@@ -123,6 +123,8 @@ The CPU path (NEON on aarch64) and the GL path apply the mapping; G2D does not, 
 | `PixelFormat::Vyuy` | YUV 4:2:2 packed (VYUY order) | 2 |
 | `PixelFormat::Bgra` | 32-bit BGRA | 4 |
 | `PixelFormat::PlanarRgba` | Planar RGBA | 4 |
+
+`Yuyv`, `Vyuy`, `Nv16` and `Nv12` are also conversion destinations; an `Nv12` destination must have even width and height. A YUV destination is encoded with its own colorimetry, and an untagged one is tagged with it after the conversion. The OpenGL backend renders `Nv12` into DMA-BUF (Linux) and IOSurface (macOS) destinations; which conversions it takes is described in [ARCHITECTURE.md § Backend selection](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/ARCHITECTURE.md#backend-selection).
 
 Note: Int8 variants (e.g. packed RGB int8, planar RGB int8) use `DType::I8` with the corresponding `PixelFormat` rather than separate format constants.
 

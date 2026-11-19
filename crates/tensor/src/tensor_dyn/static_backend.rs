@@ -451,7 +451,7 @@ impl TensorDyn {
         Ok(self)
     }
 
-    /// Colorimetry metadata (`None` = undefined; never auto-filled).
+    /// Colorimetry metadata. `None` = undefined; an image convert tags an untagged YUV destination.
     pub fn colorimetry(&self) -> Option<crate::Colorimetry> {
         dispatch!(self, colorimetry)
     }

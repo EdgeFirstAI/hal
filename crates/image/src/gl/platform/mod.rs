@@ -84,6 +84,24 @@ impl PackedImportFormat {
     }
 }
 
+/// The render targets of an NV12 destination import.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum NvDstPlanes<I> {
+    /// One R8 surface `width` texels wide and `height` rows tall holding the
+    /// whole NV12 image: luma at rows `0..h`, interleaved chroma at rows
+    /// `h..h + h / 2`, where `h` is the image height and
+    /// `height == h + h / 2`.
+    Combined { plane: I, width: u32, height: u32 },
+    /// Luma and chroma as separate R8 surfaces, each as wide as its plane's
+    /// pitch: `luma` the image's height in rows, `chroma` `chroma_rows` rows
+    /// (U at even columns, V at odd ones).
+    Split {
+        luma: I,
+        chroma: I,
+        chroma_rows: u32,
+    },
+}
+
 /// The plane offset of a destination that carries a nonzero `plane_offset`
 /// and no `view_origin`; `None` otherwise.
 #[cfg(any(target_os = "windows", target_os = "macos", target_os = "ios"))]
@@ -256,6 +274,21 @@ pub(super) trait GlPlatform {
         Err(crate::Error::NotSupported(format!(
             "no {fmt:?} chroma-plane import on this platform"
         )))
+    }
+
+    /// Whether [`Self::import_nv12_dst`] is implemented.
+    const NV12_DST: bool = false;
+
+    /// Import an NV12 destination tensor as render targets for its luma and
+    /// chroma (see [`NvDstPlanes`]). Platforms without it return
+    /// `NotSupported`.
+    fn import_nv12_dst(
+        _display: &Self::Display,
+        _img: &Tensor<u8>,
+    ) -> crate::Result<NvDstPlanes<Self::Import>> {
+        Err(crate::Error::NotSupported(
+            "no NV12 destination import on this platform".into(),
+        ))
     }
 
     /// Import a tensor's zero-copy buffer as a packed RGBA-shaped render

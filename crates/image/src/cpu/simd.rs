@@ -88,6 +88,135 @@ fn deinterleave_row_scalar(
     }
 }
 
+/// Byte order of a packed 4:2:2 macropixel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Packed422 {
+    /// `[Y0, U, Y1, V]`
+    Yuyv,
+    /// `[V, Y0, U, Y1]`
+    Vyuy,
+}
+
+impl Packed422 {
+    /// Byte positions of `(Y0, U, Y1, V)` within a macropixel.
+    const fn offsets(self) -> (usize, usize, usize, usize) {
+        match self {
+            Packed422::Yuyv => (0, 1, 2, 3),
+            Packed422::Vyuy => (1, 2, 3, 0),
+        }
+    }
+}
+
+/// Convert two packed 4:2:2 rows into two NV12 luma rows and one interleaved
+/// UV row.
+///
+/// `width` is even. Each chroma byte is `(top + bottom + 1) >> 1` of the two
+/// rows' samples.
+///
+/// Only the first `width * 2` bytes of `top` and `bottom` and the first `width`
+/// bytes of each output are touched.
+#[inline]
+pub(super) fn packed422_rows_to_nv12(
+    top: &[u8],
+    bottom: &[u8],
+    y_top: &mut [u8],
+    y_bottom: &mut [u8],
+    uv: &mut [u8],
+    width: usize,
+    order: Packed422,
+) {
+    assert!(width.is_multiple_of(2));
+    assert!(top.len() >= width * 2 && bottom.len() >= width * 2);
+    assert!(y_top.len() >= width && y_bottom.len() >= width && uv.len() >= width);
+
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: NEON is baseline on aarch64; the lengths are asserted above.
+    unsafe {
+        packed422_rows_to_nv12_neon(top, bottom, y_top, y_bottom, uv, width, order);
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    packed422_macropixels_to_nv12(top, bottom, y_top, y_bottom, uv, 0, width / 2, order);
+}
+
+/// Scalar conversion of macropixels `first..end`.
+#[allow(clippy::too_many_arguments)]
+fn packed422_macropixels_to_nv12(
+    top: &[u8],
+    bottom: &[u8],
+    y_top: &mut [u8],
+    y_bottom: &mut [u8],
+    uv: &mut [u8],
+    first: usize,
+    end: usize,
+    order: Packed422,
+) {
+    let (y0, u, y1, v) = order.offsets();
+    let mean = |a: u8, b: u8| ((a as u16 + b as u16 + 1) >> 1) as u8;
+    for m in first..end {
+        let b = m * 4;
+        y_top[m * 2] = top[b + y0];
+        y_top[m * 2 + 1] = top[b + y1];
+        y_bottom[m * 2] = bottom[b + y0];
+        y_bottom[m * 2 + 1] = bottom[b + y1];
+        uv[m * 2] = mean(top[b + u], bottom[b + u]);
+        uv[m * 2 + 1] = mean(top[b + v], bottom[b + v]);
+    }
+}
+
+/// NEON [`packed422_rows_to_nv12`], 32 pixels per iteration.
+///
+/// # Safety
+/// The lengths documented on [`packed422_rows_to_nv12`] must hold.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn packed422_rows_to_nv12_neon(
+    top: &[u8],
+    bottom: &[u8],
+    y_top: &mut [u8],
+    y_bottom: &mut [u8],
+    uv: &mut [u8],
+    width: usize,
+    order: Packed422,
+) {
+    use std::arch::aarch64::*; // NOSONAR
+
+    let (y0, u, y1, v) = order.offsets();
+    let macropixels = width / 2;
+    let mut m = 0usize;
+    // SAFETY: each iteration reads 64 source bytes and writes 32 bytes per
+    // output at macropixel `m`, and `m + 16 <= macropixels` keeps all within
+    // the lengths the caller guarantees.
+    unsafe {
+        while m + 16 <= macropixels {
+            let t = vld4q_u8(top.as_ptr().add(m * 4));
+            let b = vld4q_u8(bottom.as_ptr().add(m * 4));
+            let pick = |x: &uint8x16x4_t, i: usize| match i {
+                0 => x.0,
+                1 => x.1,
+                2 => x.2,
+                _ => x.3,
+            };
+            vst2q_u8(
+                y_top.as_mut_ptr().add(m * 2),
+                uint8x16x2_t(pick(&t, y0), pick(&t, y1)),
+            );
+            vst2q_u8(
+                y_bottom.as_mut_ptr().add(m * 2),
+                uint8x16x2_t(pick(&b, y0), pick(&b, y1)),
+            );
+            vst2q_u8(
+                uv.as_mut_ptr().add(m * 2),
+                uint8x16x2_t(
+                    vrhaddq_u8(pick(&t, u), pick(&b, u)),
+                    vrhaddq_u8(pick(&t, v), pick(&b, v)),
+                ),
+            );
+            m += 16;
+        }
+    }
+    packed422_macropixels_to_nv12(top, bottom, y_top, y_bottom, uv, m, macropixels, order);
+}
+
 /// Widen a `u8` buffer into an `f32` buffer, dividing each value by 255.0.
 ///
 /// The NEON path converts 16 lanes per iteration with a true division
@@ -379,6 +508,44 @@ mod tests {
                 "byte {i}: got {} expected {expected}",
                 v.to_f32()
             );
+        }
+    }
+
+    /// The packed-4:2:2 → NV12 row kernel matches a scalar reference at widths that straddle the vector boundary.
+    #[test]
+    fn packed422_rows_match_the_reference_at_every_width() {
+        let mut seed = 0x1234_5678u32;
+        let mut next = move || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            (seed >> 24) as u8
+        };
+        for w in [2usize, 14, 16, 18, 30, 32, 34, 64, 100] {
+            for order in [Packed422::Yuyv, Packed422::Vyuy] {
+                let top: Vec<u8> = (0..w * 2).map(|_| next()).collect();
+                let bottom: Vec<u8> = (0..w * 2).map(|_| next()).collect();
+                let (y0, u, y1, v) = match order {
+                    Packed422::Yuyv => (0, 1, 2, 3),
+                    Packed422::Vyuy => (1, 2, 3, 0),
+                };
+                let mut y_top = vec![0u8; w];
+                let mut y_bottom = vec![0u8; w];
+                let mut uv = vec![0u8; w];
+                packed422_rows_to_nv12(&top, &bottom, &mut y_top, &mut y_bottom, &mut uv, w, order);
+                for m in 0..w / 2 {
+                    let b = m * 4;
+                    assert_eq!(y_top[m * 2], top[b + y0], "Y0 top w={w} m={m}");
+                    assert_eq!(y_top[m * 2 + 1], top[b + y1], "Y1 top w={w} m={m}");
+                    assert_eq!(y_bottom[m * 2], bottom[b + y0], "Y0 bottom w={w} m={m}");
+                    assert_eq!(y_bottom[m * 2 + 1], bottom[b + y1], "Y1 bottom w={w} m={m}");
+                    let mean = |a: u8, b: u8| ((a as u16 + b as u16 + 1) >> 1) as u8;
+                    assert_eq!(uv[m * 2], mean(top[b + u], bottom[b + u]), "U w={w} m={m}");
+                    assert_eq!(
+                        uv[m * 2 + 1],
+                        mean(top[b + v], bottom[b + v]),
+                        "V w={w} m={m}"
+                    );
+                }
+            }
         }
     }
 }

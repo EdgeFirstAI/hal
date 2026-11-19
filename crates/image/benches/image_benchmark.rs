@@ -313,6 +313,30 @@ fn bench_convert(proc: &mut ImageProcessor, suite: &mut BenchSuite) {
             CAMERA_1080P_RGBA.as_slice(),
             4,
         ),
+        (
+            PixelFormat::Yuyv,
+            PixelFormat::Nv12,
+            get_test_data(w, h, PixelFormat::Yuyv),
+            2,
+        ),
+        (
+            PixelFormat::Vyuy,
+            PixelFormat::Nv12,
+            get_test_data(w, h, PixelFormat::Vyuy),
+            2,
+        ),
+        (
+            PixelFormat::Rgba,
+            PixelFormat::Nv12,
+            CAMERA_1080P_RGBA.as_slice(),
+            4,
+        ),
+        (
+            PixelFormat::Nv12,
+            PixelFormat::Nv12,
+            get_test_data(w, h, PixelFormat::Nv12),
+            1,
+        ),
     ];
 
     for &(in_fmt, out_fmt, data, bpp) in configs {
@@ -449,6 +473,9 @@ fn bench_hires(proc: &mut ImageProcessor, suite: &mut BenchSuite) {
         BenchConfig::new(1920, 1080, 640, 360, PixelFormat::Rgba, PixelFormat::Rgb),
         BenchConfig::new(1920, 1080, 1280, 720, PixelFormat::Rgba, PixelFormat::Rgb),
         BenchConfig::new(1920, 1080, 1920, 1080, PixelFormat::Rgba, PixelFormat::Rgb),
+        BenchConfig::new(1920, 1080, 640, 360, PixelFormat::Yuyv, PixelFormat::Nv12),
+        BenchConfig::new(1920, 1080, 1280, 720, PixelFormat::Yuyv, PixelFormat::Nv12),
+        BenchConfig::new(1920, 1080, 640, 360, PixelFormat::Rgba, PixelFormat::Nv12),
         BenchConfig::new(1920, 1080, 640, 360, PixelFormat::Rgb, PixelFormat::Rgb),
         BenchConfig::new(1920, 1080, 1280, 720, PixelFormat::Rgb, PixelFormat::Rgb),
         BenchConfig::new(1920, 1080, 1920, 1080, PixelFormat::Rgb, PixelFormat::Rgb),

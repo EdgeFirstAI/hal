@@ -189,7 +189,7 @@ impl<T: Element> Tensor<T> {
         self.inner.restrict_cpu_access(access)
     }
 
-    /// Colorimetry metadata (`None` = undefined; never auto-filled).
+    /// Colorimetry metadata. `None` = undefined; an image convert tags an untagged YUV destination.
     pub fn colorimetry(&self) -> Option<Colorimetry> {
         self.inner.colorimetry()
     }

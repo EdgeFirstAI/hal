@@ -606,7 +606,7 @@ class ImageProcessor:
                 CPU is added, so ``Tensor.declared_cpu_access`` may be wider
                 than ``access``: ``"write"`` when it may fill the whole image
                 (CPU backend, host memory, a format or float dtype the GPU
-                does not render), ``"readwrite"`` when a pass reads back what
+                does not render, or an ``Nv12`` image), ``"readwrite"`` when a pass reads back what
                 it wrote or writes only part of it (an ``"int8"`` image through
                 the CPU or G2D, a ``Bgra`` image through the CPU, a G2D ``Rgb``
                 letterbox border). Nothing is added for use as a convert

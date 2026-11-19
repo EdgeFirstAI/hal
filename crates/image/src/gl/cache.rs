@@ -40,7 +40,8 @@ pub struct ConvertStats {
     pub zero_copy_declines: u64,
     /// Times a zero-copy destination import was attempted and declined into
     /// the mapped-texture readback (render to a texture, read back through
-    /// `map()` at the destination's offset and pitch).
+    /// `map()` at the destination's offset and pitch), or, for an NV12
+    /// destination, to the CPU.
     pub dst_import_fallbacks: u64,
 }
 
@@ -200,6 +201,23 @@ impl<I> ImportCache<I> {
             },
         );
         self.peak_entries = self.peak_entries.max(self.entries.len());
+    }
+
+    /// Look up `key`, counting a hit or a miss and refreshing the entry's LRU
+    /// position on a hit.
+    pub(super) fn lookup(&mut self, key: &BufferImportKey) -> Option<&I> {
+        let ts = self.next_timestamp();
+        match self.entries.get_mut(key) {
+            Some(cached) => {
+                self.hits += 1;
+                cached.last_used = ts;
+                Some(&cached.import)
+            }
+            None => {
+                self.misses += 1;
+                None
+            }
+        }
     }
 
     /// Allocate a new LRU timestamp.

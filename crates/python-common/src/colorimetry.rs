@@ -4,7 +4,7 @@
 //! Python bindings for `edgefirst_tensor::Colorimetry` and its four axis
 //! enums (`ColorSpace`, `ColorTransfer`, `ColorEncoding`, `ColorRange`).
 //!
-//! Each axis is optional; `None` means "undefined" and is never auto-filled.
+//! Each axis is optional; `None` means "undefined".
 
 use edgefirst_tensor::{
     ColorEncoding, ColorRange, ColorSpace, ColorTransfer, Colorimetry as RsColorimetry,

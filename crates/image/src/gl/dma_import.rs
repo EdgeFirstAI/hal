@@ -167,6 +167,27 @@ pub(super) fn resolved_source_plane0_offset(src: &Tensor<u8>, src_fmt: PixelForm
     resolve_source_plane0(src_fmt, width, pitch, src.plane_offset().unwrap_or(0)).0
 }
 
+/// `NotSupported` unless an R8 render target's row `pitch` is a multiple of 4.
+fn require_r8_pitch(pitch: usize, what: &str) -> Result<(), Error> {
+    if pitch.is_multiple_of(4) {
+        Ok(())
+    } else {
+        Err(Error::NotSupported(format!(
+            "{what}: an R8 render target needs a row pitch divisible by 4, got {pitch}"
+        )))
+    }
+}
+
+/// The raw DMA-BUF fd of `img`; `NotImplemented` when it has none, naming `what`.
+fn dma_fd(img: &Tensor<u8>, what: &str) -> Result<RawFd, Error> {
+    img.dmabuf().map(|fd| fd.as_raw_fd()).map_err(|e| {
+        Error::NotImplemented(format!(
+            "{what} requires a DMA tensor, got {:?} ({e})",
+            img.memory()
+        ))
+    })
+}
+
 impl DmaImportAttrs {
     /// Resolves the fd, pitch and offset values `eglCreateImage` needs from a
     /// tensor and its pixel format, without calling EGL. With `for_dst` a view
@@ -246,23 +267,12 @@ impl DmaImportAttrs {
             "{src_fmt:?}: the import's plane-0 channel count and the gate's must agree"
         );
 
-        let fd = src
-            .dmabuf()
-            .map_err(|e| {
-                Error::NotImplemented(format!(
-                    "OpenGL EGLImage requires DMA tensor, got {:?} ({e})",
-                    src.memory()
-                ))
-            })?
-            .as_raw_fd();
+        let fd = dma_fd(src, "OpenGL EGLImage")?;
 
         // Multiplane NV12: the UV plane's fd comes from the chroma tensor.
         let uv_fd = if src.is_multiplane() {
             let chroma = src.chroma().unwrap();
-            let chroma_fd = chroma.dmabuf().map_err(|e| {
-                Error::NotImplemented(format!("Multiplane chroma tensor must be DMA-backed ({e})"))
-            })?;
-            Some(chroma_fd.as_raw_fd())
+            Some(dma_fd(chroma, "OpenGL EGLImage chroma plane")?)
         } else {
             None
         };
@@ -416,15 +426,7 @@ impl DmaImportAttrs {
             })?
         };
 
-        let fd = src
-            .dmabuf()
-            .map_err(|e| {
-                Error::NotImplemented(format!(
-                    "OpenGL R8 import requires DMA tensor, got {:?} ({e})",
-                    src.memory()
-                ))
-            })?
-            .as_raw_fd();
+        let fd = dma_fd(src, "OpenGL R8 import")?;
         let plane0_offset = src.plane_offset().unwrap_or(0);
 
         Ok(DmaImportAttrs {
@@ -464,15 +466,7 @@ impl DmaImportAttrs {
             ));
         }
         let tex_width = src.effective_row_stride().unwrap_or(src_w);
-        let fd = src
-            .dmabuf()
-            .map_err(|e| {
-                Error::NotImplemented(format!(
-                    "NV chroma import requires a DMA tensor, got {:?} ({e})",
-                    src.memory()
-                ))
-            })?
-            .as_raw_fd();
+        let fd = dma_fd(src, "NV chroma import")?;
         let (sx, sy) = (layout.shift_x, layout.shift_y);
         Ok(DmaImportAttrs {
             width: src_w.div_ceil(1 << sx),
@@ -488,6 +482,71 @@ impl DmaImportAttrs {
             yuv_encoding: ColorEncoding::Bt709,
             yuv_range: ColorRange::Limited,
         })
+    }
+
+    /// Import attributes for a single-plane NV12 destination as one R8 render
+    /// target: `width` = the row pitch, `height` = `h + h / 2` (luma rows,
+    /// then chroma rows), at the tensor's plane offset.
+    ///
+    /// # Errors
+    ///
+    /// `NotSupported` for a multiplane tensor or a pitch that is not a
+    /// multiple of 4; `NotImplemented` for a tensor without a DMA-BUF.
+    pub fn from_tensor_nv12_dst_r8(img: &Tensor<u8>) -> Result<Self, Error> {
+        let attrs = Self::from_tensor_nv_r8(img, PixelFormat::Nv12)?;
+        require_r8_pitch(attrs.plane0_pitch, "NV12 destination")?;
+        Ok(attrs)
+    }
+
+    /// Import attributes for a multiplane NV12 destination as two R8 render
+    /// targets, each at its own buffer, pitch and offset and as wide as its
+    /// pitch: the luma plane (`luma_pitch` × `h`) and the interleaved chroma
+    /// plane (`chroma_pitch` × `h / 2`).
+    ///
+    /// # Errors
+    ///
+    /// `NotSupported` for a single-plane tensor or a plane pitch that is not
+    /// a multiple of 4; `NotImplemented` for a plane without a DMA-BUF.
+    pub fn from_tensor_nv12_dst_split(img: &Tensor<u8>) -> Result<(Self, Self), Error> {
+        let h = img.height().ok_or(Error::NotAnImage)?;
+        let chroma = img.chroma().ok_or_else(|| {
+            Error::NotSupported(
+                "NV12 destination split import: the chroma plane follows the luma plane".into(),
+            )
+        })?;
+        let (luma_pitch, chroma_pitch) = crate::cpu::semi_planar_strides(img);
+        require_r8_pitch(luma_pitch, "NV12 destination luma plane")?;
+        require_r8_pitch(chroma_pitch, "NV12 destination chroma plane")?;
+        let luma = Self::r8_render_target(
+            dma_fd(img, "NV12 destination luma plane")?,
+            h,
+            luma_pitch,
+            img.plane_offset().unwrap_or(0),
+        );
+        let chroma = Self::r8_render_target(
+            dma_fd(chroma, "NV12 destination chroma plane")?,
+            h / 2,
+            chroma_pitch,
+            chroma.plane_offset().unwrap_or(0),
+        );
+        Ok((luma, chroma))
+    }
+
+    /// Single-plane R8 attributes over `fd`, `pitch` texels wide.
+    fn r8_render_target(fd: RawFd, height: usize, pitch: usize, offset: usize) -> Self {
+        DmaImportAttrs {
+            width: pitch,
+            height,
+            drm_fourcc: DrmFourcc::R8,
+            plane0_fd: fd,
+            plane0_pitch: pitch,
+            plane0_offset: offset,
+            x_shift_px: 0,
+            plane1: None,
+            is_yuv: false,
+            yuv_encoding: ColorEncoding::Bt709,
+            yuv_range: ColorRange::Limited,
+        }
     }
 
     /// Build the EGL attribute list for `eglCreateImage`.
@@ -1787,6 +1846,162 @@ mod tests {
                 "{fmt:?} keeps its own (unaligned) offset"
             );
             assert_eq!(s.width, 64, "{fmt:?} must not be widened");
+        }
+    }
+
+    // ─── NV12 destination import tests ───────────────────────────────
+
+    /// A `w`x`h` multiplane NV12 tensor over two tensors of `memory`, or
+    /// `None` (warned) when a DMA plane cannot be allocated.
+    fn nv12_planes(w: usize, h: usize, memory: TensorMemory) -> Option<Tensor<u8>> {
+        let plane = |rows: usize, name: &str| {
+            let t = Tensor::<u8>::new(&[rows, w], Some(memory), Some(name));
+            if memory == TensorMemory::DmaBuf {
+                crate::test_support::dma_allocated(dma_only(t), name)
+            } else {
+                Some(t.expect("heap plane"))
+            }
+        };
+        let luma = plane(h, "nv12 luma")?;
+        let chroma = plane(h / 2, "nv12 chroma")?;
+        Some(Tensor::<u8>::from_planes(luma, chroma, PixelFormat::Nv12).expect("multiplane NV12"))
+    }
+
+    /// A single-plane NV12 destination imports as one R8 surface, pitch wide
+    /// and `h + h / 2` rows tall, at its plane offset.
+    #[test]
+    fn nv12_dst_r8_covers_luma_and_chroma_rows_at_the_pitch() {
+        let Some(t) = dma_parent(320, 240, PixelFormat::Nv12) else {
+            return;
+        };
+        let pitch = t.effective_row_stride().unwrap_or(320);
+        let a = DmaImportAttrs::from_tensor_nv12_dst_r8(&t).expect("single-plane NV12 imports");
+        assert_eq!(a.drm_fourcc, DrmFourcc::R8);
+        assert_eq!(a.width, pitch);
+        assert_eq!(a.height, 360);
+        assert_eq!(a.plane0_pitch, pitch);
+        assert_eq!(a.plane0_offset, 0);
+        assert_eq!(a.plane0_fd, t.dmabuf().unwrap().as_raw_fd());
+        assert!(a.plane1.is_none());
+        assert!(!a.is_yuv);
+    }
+
+    /// A multiplane NV12 destination imports its luma and chroma as separate
+    /// R8 surfaces, each at its own buffer.
+    #[test]
+    fn nv12_dst_split_imports_each_plane_at_its_own_buffer() {
+        if !dma_heap_or_skip("multiplane NV12 destination") {
+            return;
+        }
+        let Some(t) = nv12_planes(320, 240, TensorMemory::DmaBuf) else {
+            return;
+        };
+        let (luma, chroma) =
+            DmaImportAttrs::from_tensor_nv12_dst_split(&t).expect("multiplane NV12 imports");
+        assert_eq!(
+            (luma.drm_fourcc, chroma.drm_fourcc),
+            (DrmFourcc::R8, DrmFourcc::R8)
+        );
+        assert_eq!((luma.width, luma.height), (320, 240));
+        assert_eq!((chroma.width, chroma.height), (320, 120));
+        assert_eq!((luma.plane0_pitch, chroma.plane0_pitch), (320, 320));
+        assert_eq!(luma.plane0_fd, t.dmabuf().unwrap().as_raw_fd());
+        assert_eq!(
+            chroma.plane0_fd,
+            t.chroma().unwrap().dmabuf().unwrap().as_raw_fd()
+        );
+        assert_ne!(luma.plane0_fd, chroma.plane0_fd);
+        assert!(luma.plane1.is_none() && chroma.plane1.is_none());
+    }
+
+    /// A multiplane NV12 destination with padded pitches imports each plane
+    /// as wide as its own pitch.
+    #[test]
+    fn nv12_dst_split_imports_each_plane_as_wide_as_its_pitch() {
+        if !dma_heap_or_skip("padded multiplane NV12 destination") {
+            return;
+        }
+        let (w, h, luma_pitch, chroma_pitch) = (48, 64, 112, 80);
+        let plane = |rows: usize, pitch: usize, name: &str| {
+            let mut t = crate::test_support::dma_allocated(
+                dma_only(Tensor::<u8>::new(
+                    &[rows, pitch],
+                    Some(TensorMemory::DmaBuf),
+                    Some(name),
+                )),
+                name,
+            )?;
+            t.set_logical_shape(&[rows, w]).expect("logical width");
+            Some(t)
+        };
+        let Some(luma) = plane(h, luma_pitch, "padded nv12 luma") else {
+            return;
+        };
+        let Some(mut chroma) = plane(h / 2, chroma_pitch, "padded nv12 chroma") else {
+            return;
+        };
+        chroma.set_row_stride_unchecked(chroma_pitch);
+        let mut t =
+            Tensor::<u8>::from_planes(luma, chroma, PixelFormat::Nv12).expect("multiplane NV12");
+        t.set_row_stride(luma_pitch).expect("luma pitch");
+        let (luma, chroma) =
+            DmaImportAttrs::from_tensor_nv12_dst_split(&t).expect("multiplane NV12 imports");
+        assert_eq!(
+            (luma.width, luma.height, luma.plane0_pitch),
+            (luma_pitch, h, luma_pitch)
+        );
+        assert_eq!(
+            (chroma.width, chroma.height, chroma.plane0_pitch),
+            (chroma_pitch, h / 2, chroma_pitch)
+        );
+    }
+
+    /// Each builder refuses the other layout, and a plane pitch that is not a
+    /// multiple of 4.
+    #[test]
+    fn nv12_dst_builders_refuse_the_other_layout_and_an_odd_pitch() {
+        let Some(single) = dma_parent(320, 240, PixelFormat::Nv12) else {
+            return;
+        };
+        let Some(split) = nv12_planes(320, 240, TensorMemory::DmaBuf) else {
+            return;
+        };
+        let Some(mut narrow) = dma_parent(62, 240, PixelFormat::Nv12) else {
+            return;
+        };
+        narrow.set_row_stride(62).expect("pitch 62 at width 62");
+        let Some(narrow_split) = nv12_planes(62, 240, TensorMemory::DmaBuf) else {
+            return;
+        };
+        const LAYOUT_SPLIT: &str = "the chroma plane follows the luma plane";
+        const LAYOUT_R8: &str = "multiplane tensor not supported";
+        const PITCH: &str = "needs a row pitch divisible by 4, got 62";
+        for (what, err, expected) in [
+            (
+                "split of a single-plane tensor",
+                DmaImportAttrs::from_tensor_nv12_dst_split(&single).map(|_| ()),
+                LAYOUT_SPLIT,
+            ),
+            (
+                "R8 of a multiplane tensor",
+                DmaImportAttrs::from_tensor_nv12_dst_r8(&split).map(|_| ()),
+                LAYOUT_R8,
+            ),
+            (
+                "R8 at pitch 62",
+                DmaImportAttrs::from_tensor_nv12_dst_r8(&narrow).map(|_| ()),
+                PITCH,
+            ),
+            (
+                "split at pitch 62",
+                DmaImportAttrs::from_tensor_nv12_dst_split(&narrow_split).map(|_| ()),
+                PITCH,
+            ),
+        ] {
+            assert!(
+                matches!(&err, Err(crate::Error::NotSupported(m)) if m.contains(expected)),
+                "{what}: expected NotSupported containing {expected:?}, got {err:?}"
+            );
         }
     }
 }

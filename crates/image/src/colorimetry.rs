@@ -4,7 +4,7 @@
 //! Resolve a tensor's colorimetry to concrete conversion parameters.
 //!
 //! `convert()` calls [`effective_colorimetry`] at use-time to fill only the
-//! axes it needs, without mutating the tensor.
+//! axes it needs, and [`tag_yuv_destination`] after a successful convert.
 
 use edgefirst_tensor::{
     ColorEncoding, ColorRange, ColorSpace, ColorTransfer, Colorimetry, TensorDyn,
@@ -42,6 +42,18 @@ pub(crate) fn resolve_colorimetry(
             ColorEncoding::Bt601
         })),
         range: src.range.or(Some(ColorRange::Limited)),
+    }
+}
+
+/// Whether `a` and `b` share the same YUV matrix and range.
+pub(crate) fn same_yuv_coding(a: &Colorimetry, b: &Colorimetry) -> bool {
+    a.encoding == b.encoding && a.range == b.range
+}
+
+/// Tags an untagged YUV `dst` with its [`effective_colorimetry`].
+pub(crate) fn tag_yuv_destination(dst: &mut TensorDyn) {
+    if dst.format().is_some_and(|f| f.is_yuv()) && dst.colorimetry().is_none() {
+        dst.set_colorimetry(Some(effective_colorimetry(dst)));
     }
 }
 
@@ -137,6 +149,36 @@ pub(crate) fn yuv_to_rgb_coeffs(encoding: ColorEncoding, range: ColorRange) -> Y
     }
 }
 
+/// Normalised-[0, 1] RGB -> YUV coefficients: `y = dot(y, rgb) + y_offset`,
+/// `u = dot(u, rgb) + c_offset`, `v = dot(v, rgb) + c_offset`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct RgbToYuvCoeffs {
+    pub y: [f64; 3],
+    pub u: [f64; 3],
+    pub v: [f64; 3],
+    pub y_offset: f64,
+    pub c_offset: f64,
+}
+
+/// Compute the RGB->YUV coefficients for a resolved
+/// `(ColorEncoding, ColorRange)`.
+pub(crate) fn rgb_to_yuv_coeffs(encoding: ColorEncoding, range: ColorRange) -> RgbToYuvCoeffs {
+    let w = encoding.luma_weights();
+    let (kr, kg, kb) = (w.kr, w.kg(), w.kb);
+    let s = range.scaling();
+    let y_scale = s.y_swing / 255.0;
+    let c_scale = s.c_swing / 255.0;
+    let row = |v: [f64; 3], scale: f64| v.map(|c| c * scale);
+
+    RgbToYuvCoeffs {
+        y: row([kr, kg, kb], y_scale),
+        u: row([-kr / (kr + kg) / 2.0, -kg / (kr + kg) / 2.0, 0.5], c_scale),
+        v: row([0.5, -kg / (kg + kb) / 2.0, -kb / (kg + kb) / 2.0], c_scale),
+        y_offset: s.y_offset / 255.0,
+        c_offset: 128.0 / 255.0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -203,6 +245,55 @@ mod tests {
     }
 
     #[test]
+    fn same_yuv_coding_compares_encoding_and_range_only() {
+        let a = resolve_colorimetry(None, Some(480));
+        let mut b = a;
+        b.space = Some(ColorSpace::Bt709);
+        b.transfer = None;
+        assert!(same_yuv_coding(&a, &b));
+        assert!(!same_yuv_coding(&a, &resolve_colorimetry(None, Some(720))));
+        let full = Colorimetry::default().with_range(ColorRange::Full);
+        assert!(!same_yuv_coding(
+            &a,
+            &resolve_colorimetry(Some(full), Some(480))
+        ));
+    }
+
+    #[test]
+    fn tag_yuv_destination_tags_only_untagged_yuv_images() {
+        let image = |fmt| {
+            TensorDyn::image(
+                640,
+                360,
+                fmt,
+                DType::U8,
+                None,
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .unwrap()
+        };
+        for fmt in [
+            PixelFormat::Nv12,
+            PixelFormat::Nv16,
+            PixelFormat::Nv24,
+            PixelFormat::Yuyv,
+            PixelFormat::Vyuy,
+        ] {
+            let mut t = image(fmt);
+            tag_yuv_destination(&mut t);
+            assert_eq!(t.colorimetry(), Some(resolve_colorimetry(None, Some(360))));
+        }
+        let mut rgba = image(PixelFormat::Rgba);
+        tag_yuv_destination(&mut rgba);
+        assert_eq!(rgba.colorimetry(), None);
+        let partial = Colorimetry::default().with_range(ColorRange::Full);
+        let mut tagged = image(PixelFormat::Nv12);
+        tagged.set_colorimetry(Some(partial));
+        tag_yuv_destination(&mut tagged);
+        assert_eq!(tagged.colorimetry(), Some(partial));
+    }
+
+    #[test]
     fn yuv_to_rgb_coeffs_match_reference_values() {
         // Reference YCbCr→RGB cross-terms.
         fn close(a: f32, b: f32, what: &str) {
@@ -249,5 +340,40 @@ mod tests {
             yuv_range(ColorRange::Limited),
             yuv::YuvRange::Limited
         ));
+    }
+
+    #[test]
+    fn rgb_to_yuv_coeffs_match_the_cpu_encoder() {
+        let dot = |c: [f64; 3], rgb: [f64; 3]| c[0] * rgb[0] + c[1] * rgb[1] + c[2] * rgb[2];
+        let colours: [[u8; 3]; 5] = [
+            [255, 255, 255],
+            [0, 0, 0],
+            [255, 0, 0],
+            [0, 255, 0],
+            [0, 0, 255],
+        ];
+        for encoding in [ColorEncoding::Bt601, ColorEncoding::Bt709] {
+            for range in [ColorRange::Limited, ColorRange::Full] {
+                let cp = crate::cpu::ColorParams::uniform(encoding, range);
+                let c = rgb_to_yuv_coeffs(encoding, range);
+                for rgb in colours {
+                    let n = rgb.map(|v| v as f64 / 255.0);
+                    let got = [
+                        dot(c.y, n) + c.y_offset,
+                        dot(c.u, n) + c.c_offset,
+                        dot(c.v, n) + c.c_offset,
+                    ]
+                    .map(|v| ((v * 255.0).round() as i32).clamp(0, 255));
+                    let want =
+                        crate::cpu::CPUProcessor::rgba_to_yuyv([rgb[0], rgb[1], rgb[2], 255], cp);
+                    for (g, w) in got.iter().zip([want[0], want[1], want[3]]) {
+                        assert!(
+                            (g - w as i32).abs() <= 1,
+                            "{encoding:?} {range:?} {rgb:?}: got {got:?}, want {want:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

@@ -112,6 +112,7 @@ pub fn format_name(f: PixelFormat) -> &'static str {
         PixelFormat::PlanarRgb => "8BPS",
         PixelFormat::Bgra => "BGRA",
         PixelFormat::Nv16 => "NV16",
+        PixelFormat::Nv24 => "NV24",
         PixelFormat::Grey => "GREY",
         _ => "???",
     }
@@ -235,6 +236,11 @@ pub static CAMERA_720P_NV12: LazyLock<Vec<u8>> =
     LazyLock::new(|| edgefirst_bench::testdata::read("camera720p.nv12"));
 pub static CAMERA_720P_RGB: LazyLock<Vec<u8>> =
     LazyLock::new(|| edgefirst_bench::testdata::read("camera720p.rgb"));
+pub static CAMERA_VGA_YUYV: LazyLock<Vec<u8>> = LazyLock::new(|| {
+    (0..640u32 * 480 * 2)
+        .map(|i| (i.wrapping_mul(31) >> 3) as u8)
+        .collect()
+});
 pub static CAMERA_1080P_YUYV: LazyLock<Vec<u8>> =
     LazyLock::new(|| edgefirst_bench::testdata::read("camera1080p.yuyv"));
 pub static CAMERA_1080P_NV12: LazyLock<Vec<u8>> =
@@ -267,6 +273,7 @@ pub fn get_test_data(width: usize, height: usize, format: PixelFormat) -> &'stat
         (1280, 720, PixelFormat::Vyuy) => &CAMERA_720P_VYUY,
         (1280, 720, PixelFormat::Nv12) => &CAMERA_720P_NV12,
         (1280, 720, PixelFormat::Rgb) => &CAMERA_720P_RGB,
+        (640, 480, PixelFormat::Yuyv) => &CAMERA_VGA_YUYV,
         (1920, 1080, PixelFormat::Yuyv) => &CAMERA_1080P_YUYV,
         (1920, 1080, PixelFormat::Vyuy) => &CAMERA_1080P_VYUY,
         (1920, 1080, PixelFormat::Nv12) => &CAMERA_1080P_NV12,
