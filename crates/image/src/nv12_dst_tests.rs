@@ -462,12 +462,21 @@ fn two_plane_nv12_destination_with_padded_pitches() -> Res {
             ConvertOptions::new().letterbox([200, 30, 90, 255]),
         ),
     ];
+    let mut mems = vec![TensorMemory::Mem];
+    if cfg!(not(target_os = "windows")) && crate::test_support::is_gpu_buffer_available() {
+        mems.push(TensorMemory::DmaBuf);
+    } else {
+        crate::test_support::report_skip(
+            "two_plane_nv12_destination_with_padded_pitches: DmaBuf planes — no plain GPU buffer \
+             tensors on this host",
+        );
+    }
     let mut chain = ImageProcessor::new()?;
     let mut cpu = CPUProcessor::new();
     let mut fails = Vec::new();
     for fmt in [PixelFormat::Yuyv, PixelFormat::Rgba, PixelFormat::Nv12] {
         let src = make_src(&rgba, fmt, None);
-        for mem in [TensorMemory::Mem, TensorMemory::DmaBuf] {
+        for &mem in &mems {
             for (lp_pad, cp_pad) in [(0usize, 0usize), (64, 64), (0, 192), (128, 32)] {
                 for (gname, (dw, dh), opts) in &geoms {
                     let label = format!("{fmt:?} {mem:?} pad=({lp_pad},{cp_pad}) {gname}");
@@ -539,7 +548,9 @@ fn odd_nv12_destination_sizes_are_refused() -> Res {
         let src = make_src(&gradient_rgba(96, 64), fmt, None);
         for (dw, dh) in [(63usize, 64usize), (64, 63), (63, 63), (1, 1)] {
             for mem in [TensorMemory::Mem, TensorMemory::DmaBuf] {
-                let mut dst = img(dw, dh, PixelFormat::Nv12, mem).unwrap();
+                let Some(mut dst) = img(dw, dh, PixelFormat::Nv12, mem) else {
+                    continue;
+                };
                 for (engine, r) in [
                     ("cpu", cpu.convert(&src, &mut dst, None)),
                     ("chain", chain.convert(&src, &mut dst, None)),
@@ -577,7 +588,19 @@ fn odd_letterbox_edge_chroma_agrees_between_engines() -> Res {
         let src = make_src(&rgba, fmt, None);
         let mut want = img(100, 60, PixelFormat::Nv12, TensorMemory::Mem).unwrap();
         cpu.convert(&src, &mut want, Some(opts))?;
-        let mut got = img(100, 60, PixelFormat::Nv12, TensorMemory::DmaBuf).unwrap();
+        let Some(mut got) = crate::test_support::gpu_buffer_allocated(
+            TensorDyn::image(
+                100,
+                60,
+                PixelFormat::Nv12,
+                DType::U8,
+                Some(TensorMemory::DmaBuf),
+                CpuAccess::ReadWrite,
+            ),
+            "100x60 NV12 GPU buffer destination",
+        ) else {
+            return Ok(());
+        };
         chain.convert(&src, &mut got, Some(opts))?;
         let (um, _) = plane_diff(&nv12_planes(&got).1, &nv12_planes(&want).1);
         if um > 4 {
