@@ -1347,7 +1347,7 @@ mod cpu_tests {
 
     /// A letterbox at odd edges, through a processor whose intermediate holds another colour,
     /// encodes each chroma pair straddling an edge from the fill and image colours, with the
-    /// destination's colorimetry.
+    /// destination's colorimetry, and keeps every image pixel next to the edge.
     #[test]
     fn a_letterbox_at_odd_edges_encodes_straddling_chroma_from_the_fill() -> Result<()> {
         use edgefirst_tensor::{ColorEncoding, ColorRange};
@@ -1358,7 +1358,7 @@ mod cpu_tests {
         };
         // Source size, and the destination columns and rows the image covers.
         let shapes = [((50usize, 32usize), 7..57, 0..32), ((64, 25), 0..64, 3..28)];
-        for fmt in [PixelFormat::Nv12, PixelFormat::Nv16] {
+        for fmt in [PixelFormat::Nv12, PixelFormat::Nv16, PixelFormat::Yuyv] {
             let chroma_rows = if fmt == PixelFormat::Nv12 { h / 2 } else { h };
             let dst = || {
                 let t = TensorDyn::image(
@@ -1399,6 +1399,36 @@ mod cpu_tests {
 
                 let got_map = got.as_u8().unwrap().map_read()?;
                 let want_map = want.as_u8().unwrap().map_read()?;
+                if fmt == PixelFormat::Yuyv {
+                    let (got_b, want_b) = (got_map.as_slice(), want_map.as_slice());
+                    for (i, (g, e)) in got_b[..w * h * 2]
+                        .iter()
+                        .zip(&want_b[..w * h * 2])
+                        .enumerate()
+                    {
+                        assert!(
+                            g.abs_diff(*e) <= 1,
+                            "{label}: row {} column {} byte {}: {g} vs {e}",
+                            i / (w * 2),
+                            (i % (w * 2)) / 2,
+                            i % 4
+                        );
+                    }
+                    let chroma = |r: usize, m: usize| {
+                        let o = r * w * 2 + m * 4;
+                        [want_b[o + 1], want_b[o + 3]]
+                    };
+                    if sw < w {
+                        for m in [3, 28] {
+                            let mixed = chroma(0, m);
+                            assert!(
+                                mixed != chroma(0, 0) && mixed != chroma(10, 10),
+                                "{label}: straddling macropixel {m} chroma {mixed:?}"
+                            );
+                        }
+                    }
+                    continue;
+                }
                 let (got_y, got_uv) = got_map.as_slice().split_at(w * h);
                 let (want_y, want_uv) = want_map.as_slice().split_at(w * h);
                 for (i, (g, e)) in got_y.iter().zip(want_y).enumerate() {

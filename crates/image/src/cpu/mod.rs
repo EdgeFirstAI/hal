@@ -728,13 +728,26 @@ impl CPUProcessor {
             Yuyv => {
                 let (bytes, w, h, stride) = dst;
                 let yuyv = Self::rgba_to_yuyv(rgba, cp);
-                // Bulk fill in 4-byte [Y0,U,Y1,V] macropixels; crop bounds in
-                // macropixel units.
+                // Fills the 4-byte [Y0,U,Y1,V] macropixels that cover no part
+                // of the crop.
+                let left = crop.left / 2;
+                let right = crop.left + crop.width;
                 Self::fill_image_outside_crop_(
                     (&mut *bytes, w / 2, h, stride),
                     yuyv,
-                    Rect::new(crop.left / 2, crop.top, crop.width.div_ceil(2), crop.height),
+                    Rect::new(left, crop.top, right.div_ceil(2) - left, crop.height),
                 )?;
+                // A macropixel straddling the crop's left or right edge keeps
+                // its chroma, and its pixel outside the crop takes the fill luma.
+                let edges = [
+                    (crop.left % 2 == 1).then(|| crop.left - 1),
+                    (right % 2 == 1 && right < w).then_some(right),
+                ];
+                for y in crop.top..(crop.top + crop.height).min(h) {
+                    for x in edges.iter().flatten() {
+                        bytes[y * stride + x * 2] = yuyv[0];
+                    }
+                }
                 // An odd width leaves a trailing unpaired pixel whose 2 bytes are
                 // [Y, U]. It is filled on every row where the last column lies
                 // outside the crop.

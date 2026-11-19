@@ -26,7 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **YUV encoder rounding (`edgefirst-image`).** RGB to YUYV and NV16 conversions, and YUV letterbox fills, no longer wrap a Y, U or V value that rounds to 256 to 0.
-- **Letterbox chroma at odd edges (`edgefirst-image`).** In a letterbox from an RGB, RGBA or YUV source into NV16 or YUYV, the chroma pair that straddles an odd edge of the placed image is encoded from its two pixels instead of being overwritten by the fill colour.
+- **Letterbox at odd edges (`edgefirst-image`).** In a letterbox from an RGB, RGBA or YUV source into NV16 or YUYV, the chroma pair that straddles an odd edge of the placed image is encoded from its two pixels instead of being overwritten by the fill colour. In YUYV, the image's last column is no longer replaced by the fill colour when the placed image starts on an odd column.
 - **Semi-planar images at an odd width one short of the row alignment (`edgefirst-tensor`).** An NV12, NV16 or NV24 image tensor on an IOSurface, AHardwareBuffer or D3D11 texture now always records its row stride, so `map()` spans the whole buffer. A 639-wide JPEG decoded into such a tensor failed with `destination buffer … < required`.
 
 ## [0.41.0] - 2026-11-16
