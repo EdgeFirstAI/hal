@@ -241,3 +241,178 @@ pub(crate) fn box_expected_span(width: usize) -> Vec<usize> {
         .chain(hi..(hi + width).min(BOX_DIM))
         .collect()
 }
+
+#[cfg(all(target_os = "macos", feature = "opengl"))]
+pub(crate) use corevideo::{corevideo_buffer, CoreVideoBuffer};
+
+#[cfg(all(target_os = "macos", feature = "opengl"))]
+mod corevideo {
+    use std::ffi::c_void;
+
+    type CFTypeRef = *const c_void;
+
+    #[repr(C)]
+    struct CFDictionaryKeyCallBacks {
+        _opaque: [usize; 6],
+    }
+
+    #[repr(C)]
+    struct CFDictionaryValueCallBacks {
+        _opaque: [usize; 5],
+    }
+
+    #[allow(clippy::duplicated_attributes)]
+    #[link(name = "CoreVideo", kind = "framework")]
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        static kCVPixelBufferIOSurfacePropertiesKey: CFTypeRef;
+        static kCFTypeDictionaryKeyCallBacks: CFDictionaryKeyCallBacks;
+        static kCFTypeDictionaryValueCallBacks: CFDictionaryValueCallBacks;
+
+        fn CFDictionaryCreate(
+            allocator: CFTypeRef,
+            keys: *const CFTypeRef,
+            values: *const CFTypeRef,
+            count: isize,
+            key_callbacks: *const CFDictionaryKeyCallBacks,
+            value_callbacks: *const CFDictionaryValueCallBacks,
+        ) -> CFTypeRef;
+        fn CFRelease(object: CFTypeRef);
+
+        fn CVPixelBufferCreate(
+            allocator: CFTypeRef,
+            width: usize,
+            height: usize,
+            pixel_format: u32,
+            attributes: CFTypeRef,
+            out: *mut *mut c_void,
+        ) -> i32;
+        fn CVPixelBufferGetIOSurface(buffer: *mut c_void) -> *mut c_void;
+        fn CVPixelBufferLockBaseAddress(buffer: *mut c_void, flags: u64) -> i32;
+        fn CVPixelBufferUnlockBaseAddress(buffer: *mut c_void, flags: u64) -> i32;
+        fn CVPixelBufferGetPlaneCount(buffer: *mut c_void) -> usize;
+        fn CVPixelBufferGetBaseAddress(buffer: *mut c_void) -> *mut c_void;
+        fn CVPixelBufferGetBytesPerRow(buffer: *mut c_void) -> usize;
+        fn CVPixelBufferGetHeight(buffer: *mut c_void) -> usize;
+        fn CVPixelBufferGetBaseAddressOfPlane(buffer: *mut c_void, plane: usize) -> *mut c_void;
+        fn CVPixelBufferGetBytesPerRowOfPlane(buffer: *mut c_void, plane: usize) -> usize;
+        fn CVPixelBufferGetHeightOfPlane(buffer: *mut c_void, plane: usize) -> usize;
+        fn CVPixelBufferRelease(buffer: *mut c_void);
+    }
+
+    /// An IOSurface-backed CoreVideo pixel buffer, released on drop.
+    pub(crate) struct CoreVideoBuffer {
+        buffer: *mut c_void,
+    }
+
+    /// Creates an IOSurface-backed CoreVideo buffer of the four-character
+    /// pixel format `fourcc`.
+    pub(crate) fn corevideo_buffer(
+        width: usize,
+        height: usize,
+        fourcc: &[u8; 4],
+    ) -> CoreVideoBuffer {
+        let mut buffer: *mut c_void = std::ptr::null_mut();
+        let rc = unsafe {
+            let empty = CFDictionaryCreate(
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                &kCFTypeDictionaryKeyCallBacks,
+                &kCFTypeDictionaryValueCallBacks,
+            );
+            let key = kCVPixelBufferIOSurfacePropertiesKey;
+            let attributes = CFDictionaryCreate(
+                std::ptr::null(),
+                &key,
+                &empty,
+                1,
+                &kCFTypeDictionaryKeyCallBacks,
+                &kCFTypeDictionaryValueCallBacks,
+            );
+            let rc = CVPixelBufferCreate(
+                std::ptr::null(),
+                width,
+                height,
+                u32::from_be_bytes(*fourcc),
+                attributes,
+                &mut buffer,
+            );
+            CFRelease(attributes);
+            CFRelease(empty);
+            rc
+        };
+        assert_eq!(rc, 0, "CVPixelBufferCreate failed (rc={rc})");
+        assert!(!buffer.is_null());
+        CoreVideoBuffer { buffer }
+    }
+
+    impl CoreVideoBuffer {
+        /// The backing `IOSurfaceRef`, valid while this buffer lives.
+        pub(crate) fn surface(&self) -> *mut c_void {
+            let surface = unsafe { CVPixelBufferGetIOSurface(self.buffer) };
+            assert!(!surface.is_null(), "pixel buffer has no IOSurface");
+            surface
+        }
+
+        /// Calls `f(plane, row, bytes)` for every row of every plane, where
+        /// `bytes` is the whole row at the plane's pitch. A non-planar buffer
+        /// is plane 0.
+        pub(crate) fn fill_rows(&self, mut f: impl FnMut(usize, usize, &mut [u8])) {
+            unsafe {
+                assert_eq!(CVPixelBufferLockBaseAddress(self.buffer, 0), 0);
+                let planes = CVPixelBufferGetPlaneCount(self.buffer);
+                let layout: Vec<(*mut u8, usize, usize)> = if planes == 0 {
+                    vec![(
+                        CVPixelBufferGetBaseAddress(self.buffer) as *mut u8,
+                        CVPixelBufferGetBytesPerRow(self.buffer),
+                        CVPixelBufferGetHeight(self.buffer),
+                    )]
+                } else {
+                    (0..planes)
+                        .map(|p| {
+                            (
+                                CVPixelBufferGetBaseAddressOfPlane(self.buffer, p) as *mut u8,
+                                CVPixelBufferGetBytesPerRowOfPlane(self.buffer, p),
+                                CVPixelBufferGetHeightOfPlane(self.buffer, p),
+                            )
+                        })
+                        .collect()
+                };
+                for (plane, &(base, pitch, rows)) in layout.iter().enumerate() {
+                    for row in 0..rows {
+                        let bytes = std::slice::from_raw_parts_mut(base.add(row * pitch), pitch);
+                        f(plane, row, bytes);
+                    }
+                }
+                assert_eq!(CVPixelBufferUnlockBaseAddress(self.buffer, 0), 0);
+            }
+        }
+
+        /// Calls `f` with the bytes from the end of plane 0's last row to the
+        /// start of plane 1. Panics on a buffer with fewer than two planes.
+        pub(crate) fn between_planes(&self, f: impl FnOnce(&mut [u8])) {
+            unsafe {
+                assert_eq!(CVPixelBufferLockBaseAddress(self.buffer, 0), 0);
+                assert!(CVPixelBufferGetPlaneCount(self.buffer) >= 2);
+                let end = (CVPixelBufferGetBaseAddressOfPlane(self.buffer, 0) as *mut u8).add(
+                    CVPixelBufferGetBytesPerRowOfPlane(self.buffer, 0)
+                        * CVPixelBufferGetHeightOfPlane(self.buffer, 0),
+                );
+                let next = CVPixelBufferGetBaseAddressOfPlane(self.buffer, 1) as *mut u8;
+                let len = (next as usize)
+                    .checked_sub(end as usize)
+                    .expect("plane 1 starts before plane 0 ends");
+                f(std::slice::from_raw_parts_mut(end, len));
+                assert_eq!(CVPixelBufferUnlockBaseAddress(self.buffer, 0), 0);
+            }
+        }
+    }
+
+    impl Drop for CoreVideoBuffer {
+        fn drop(&mut self) {
+            unsafe { CVPixelBufferRelease(self.buffer) };
+        }
+    }
+}

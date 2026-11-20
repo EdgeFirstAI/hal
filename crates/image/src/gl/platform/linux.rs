@@ -11,7 +11,7 @@
 use super::super::context::{egl_ext, Egl, GlContext};
 use super::super::dma_import::DmaImportAttrs;
 use super::super::EglDisplayKind;
-use super::{GlPlatform, NvDstPlanes};
+use super::{GlPlatform, NvChromaFormat, NvDstPlanes};
 use edgefirst_egl as egl;
 use edgefirst_tensor::{PixelFormat, Tensor, TensorDyn};
 use std::rc::Rc;
@@ -271,6 +271,7 @@ impl GlPlatform for LinuxEgl {
                 luma: import(&luma)?,
                 chroma: import(&chroma)?,
                 chroma_rows: chroma.height as u32,
+                chroma_format: NvChromaFormat::R8Interleaved,
             })
         } else {
             let attrs = DmaImportAttrs::from_tensor_nv12_dst_r8(img)?;

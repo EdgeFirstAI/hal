@@ -94,14 +94,25 @@ pub(crate) enum NvDstPlanes<I> {
     /// `h..h + h / 2`, where `h` is the image height and
     /// `height == h + h / 2`.
     Combined { plane: I, width: u32, height: u32 },
-    /// Luma and chroma as separate R8 surfaces, each as wide as its plane's
-    /// pitch: `luma` the image's height in rows, `chroma` `chroma_rows` rows
-    /// (U at even columns, V at odd ones).
+    /// Luma and chroma as separate surfaces: `luma` an R8 surface of the
+    /// image's height in rows, `chroma` one of `chroma_rows` rows laid out as
+    /// `chroma_format`.
     Split {
         luma: I,
         chroma: I,
         chroma_rows: u32,
+        chroma_format: NvChromaFormat,
     },
+}
+
+/// The layout of a [`NvDstPlanes::Split`] chroma surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NvChromaFormat {
+    /// R8, as wide as the plane's pitch: U at even columns, V at odd ones.
+    R8Interleaved,
+    /// RG8, half the image's width: one (U, V) texel per 2x2 block.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    Rg8,
 }
 
 /// The plane offset of a destination that carries a nonzero `plane_offset`
@@ -265,9 +276,10 @@ pub(super) trait GlPlatform {
         None
     }
 
-    /// Import the chroma plane of a single-plane NV12/NV16/NV24 tensor as a
-    /// two-channel (U, V) texture of one texel per chroma sample. Platforms
-    /// without it return `NotSupported`.
+    /// Import the chroma plane of a single-plane NV12/NV16/NV24 tensor, or of
+    /// a buffer [`Self::nv_native_planes`] accepts, as a two-channel (U, V)
+    /// texture of one texel per chroma sample. Platforms without it return
+    /// `NotSupported`.
     fn import_buffer_nv_chroma(
         _display: &Self::Display,
         _img: &Tensor<u8>,
@@ -280,6 +292,10 @@ pub(super) trait GlPlatform {
 
     /// Whether [`Self::import_nv12_dst`] is implemented.
     const NV12_DST: bool = false;
+
+    /// The chroma layout of every [`NvDstPlanes::Split`] that
+    /// [`Self::import_nv12_dst`] returns.
+    const NV12_SPLIT_CHROMA: NvChromaFormat = NvChromaFormat::R8Interleaved;
 
     /// Import an NV12 destination tensor as render targets for its luma and
     /// chroma (see [`NvDstPlanes`]). Platforms without it return

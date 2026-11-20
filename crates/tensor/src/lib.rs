@@ -68,6 +68,9 @@ pub mod d3d11_layout;
 // IOSurface layout table.
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 mod iosurface_layout;
+// IOSurface plane geometry.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+mod iosurface_planes;
 // IOSurface backing.
 #[cfg(all(
     any(target_os = "macos", target_os = "ios"),
