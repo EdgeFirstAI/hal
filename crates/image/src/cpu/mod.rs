@@ -111,6 +111,9 @@ pub struct CPUProcessor {
     /// halo-grown crop rectangle extracted by [`Self::extract_nv_region`].
     /// Allocated only for a cropped convert that takes that path.
     convert_src_sub: Option<Tensor<u8>>,
+    /// Reusable tight RGBA copy of a BGRA source, holding the source with its
+    /// red and blue channels swapped.
+    bgra_src_scratch: Option<Tensor<u8>>,
 }
 
 // A clone starts with empty scratch buffers.
@@ -134,6 +137,7 @@ impl Clone for CPUProcessor {
             convert_tmp: None,
             convert_tmp2: None,
             convert_src_sub: None,
+            bgra_src_scratch: None,
         }
     }
 }
@@ -439,6 +443,7 @@ impl CPUProcessor {
             convert_tmp: None,
             convert_tmp2: None,
             convert_src_sub: None,
+            bgra_src_scratch: None,
         }
     }
 
@@ -528,6 +533,14 @@ impl CPUProcessor {
                 | (Rgb, Bgra)
                 | (Grey, Bgra)
                 | (Bgra, Bgra)
+                | (Bgra, Rgb)
+                | (Bgra, Rgba)
+                | (Bgra, Grey)
+                | (Bgra, Yuyv)
+                | (Bgra, PlanarRgb)
+                | (Bgra, PlanarRgba)
+                | (Bgra, Nv16)
+                | (Bgra, Nv12)
                 | (PlanarRgb, Rgb)
                 | (PlanarRgb, Rgba)
                 | (PlanarRgba, Rgb)
@@ -609,6 +622,17 @@ impl CPUProcessor {
 
             // BGRA destination: convert to RGBA layout, then swap R and B
             (Bgra, Bgra) => Self::copy_image(src, dst),
+            (Bgra, d) if Self::support_conversion_pf(Bgra, d) => {
+                let mut rgba = Tensor::<u8>::image(
+                    src.width().ok_or(Error::NotAnImage)?,
+                    src.height().ok_or(Error::NotAnImage)?,
+                    Rgba,
+                    Some(TensorMemory::Mem),
+                    edgefirst_tensor::CpuAccess::ReadWrite,
+                )?;
+                Self::swizzle_bgra_to_rgba(src, &mut rgba)?;
+                Self::convert_format_pf(&rgba, dst, Rgba, d, cp)
+            }
             (Nv12, Bgra) => {
                 Self::convert_nv12_to_rgba(src, dst, cp)?;
                 Self::swizzle_rb_4chan(dst)
@@ -1262,6 +1286,43 @@ impl CPUProcessor {
             )));
         }
 
+        let need_resize_flip_rotation = rotation != Rotation::None
+            || flip != Flip::None
+            || src_w != dst_w
+            || src_h != dst_h
+            || crop.src_rect.is_some_and(|c| {
+                c != Rect {
+                    left: 0,
+                    top: 0,
+                    width: src_w,
+                    height: src_h,
+                }
+            })
+            || crop.dst_rect.is_some_and(|c| {
+                c != Rect {
+                    left: 0,
+                    top: 0,
+                    width: dst_w,
+                    height: dst_h,
+                }
+            });
+
+        if src_fmt == Bgra && dst_fmt != Bgra && Self::support_conversion_pf(Bgra, dst_fmt) {
+            let mut rgba = Self::reuse_or_alloc_image(
+                self.bgra_src_scratch.take(),
+                src_w,
+                src_h,
+                PixelFormat::Rgba,
+            )?;
+            let result = Self::swizzle_bgra_to_rgba(src, &mut rgba).and_then(|()| {
+                self.convert_u8(
+                    &rgba, dst, Rgba, dst_fmt, rotation, flip, crop, src_params, dst_params,
+                )
+            });
+            self.bgra_src_scratch = Some(rgba);
+            return result;
+        }
+
         // Determine intermediate format for the resize step
         let intermediate = match (src_fmt, dst_fmt) {
             (Nv12, Rgb) => Rgb,
@@ -1341,27 +1402,6 @@ impl CPUProcessor {
                 return Err(Error::NotSupported(format!("Conversion from {s} to {d}",)));
             }
         };
-
-        let need_resize_flip_rotation = rotation != Rotation::None
-            || flip != Flip::None
-            || src_w != dst_w
-            || src_h != dst_h
-            || crop.src_rect.is_some_and(|c| {
-                c != Rect {
-                    left: 0,
-                    top: 0,
-                    width: src_w,
-                    height: src_h,
-                }
-            })
-            || crop.dst_rect.is_some_and(|c| {
-                c != Rect {
-                    left: 0,
-                    top: 0,
-                    width: dst_w,
-                    height: dst_h,
-                }
-            });
 
         // The colorimetry of a single conversion comes from its YUV side: the
         // source for YUV→RGB, the destination for RGB→YUV.
@@ -1517,7 +1557,7 @@ impl CPUProcessor {
             None => (src, src_fmt),
         };
 
-        debug_assert!(matches!(tmp_fmt, Rgb | Rgba | Grey));
+        debug_assert!(matches!(tmp_fmt, Rgb | Rgba | Grey | Bgra));
         if tmp_fmt == dst_fmt {
             let _s = tracing::trace_span!("image.convert.cpu.resize_flip_rotate").entered();
             self.resize_flip_rotate_pf(tmp, dst, dst_fmt, rotation, flip, crop)?;

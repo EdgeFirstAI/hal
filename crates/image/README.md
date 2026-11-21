@@ -23,7 +23,7 @@ neighbours:
 ## Features
 
 - **Multiple backends** — Automatic selection: OpenGL (GPU) → G2D (NXP i.MX) → CPU (fallback)
-- **Format conversion** — RGB/RGBA/BGRA/GREY, planar RGB(A), semi-planar NV12/NV16/NV24, packed YUYV/VYUY; NV12, NV16, YUYV and VYUY as destinations
+- **Format conversion** — RGB/RGBA/BGRA/GREY, planar RGB(A), semi-planar NV12/NV16/NV24, packed YUYV/VYUY; NV12, NV16, YUYV and VYUY as destinations; `Bgra` sources convert on the CPU
 - **Geometric transforms** — Source crop, resize, letterbox, rotate (90° increments), flip
 - **Zero-copy integration** — Works with `edgefirst-tensor` DMA-BUF, IOSurface, AHardwareBuffer, PBO, and SHM buffers
 - **Tiled preprocessing** — SAHI grids for small-object detection in 4K frames
