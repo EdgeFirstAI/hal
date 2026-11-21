@@ -6394,4 +6394,277 @@ mod cpu_tests {
         }
         Ok(())
     }
+
+    fn bgra_test_pixel(x: usize, y: usize) -> [u8; 4] {
+        [
+            ((x * 5 + y) % 256) as u8,
+            ((y * 7 + x * 3) % 256) as u8,
+            ((x * 11 + y * 13) % 256) as u8,
+            (255 - (x + y) % 200) as u8,
+        ]
+    }
+
+    /// A tight RGBA tensor and a BGRA tensor (optionally padded to `stride`
+    /// bytes per row) holding the same pixels.
+    fn rgba_and_bgra_sources(
+        w: usize,
+        h: usize,
+        stride: Option<usize>,
+        pixel: impl Fn(usize, usize) -> [u8; 4],
+    ) -> Result<(TensorDyn, TensorDyn)> {
+        let rgba = Tensor::<u8>::image(
+            w,
+            h,
+            PixelFormat::Rgba,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )?;
+        let stride = stride.unwrap_or(w * 4);
+        let mut bgra = Tensor::<u8>::image(
+            stride / 4,
+            h,
+            PixelFormat::Bgra,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )?;
+        bgra.configure_image(w, h, PixelFormat::Bgra)?;
+        bgra.set_row_stride(stride)?;
+        {
+            let mut rmap = rgba.map_mut()?;
+            let mut bmap = bgra.map_mut()?;
+            bmap.as_mut_slice().fill(0xEE);
+            for y in 0..h {
+                for x in 0..w {
+                    let [r, g, b, a] = pixel(x, y);
+                    rmap.as_mut_slice()[(y * w + x) * 4..][..4].copy_from_slice(&[r, g, b, a]);
+                    bmap.as_mut_slice()[y * stride + x * 4..][..4].copy_from_slice(&[b, g, r, a]);
+                }
+            }
+        }
+        Ok((TensorDyn::from(rgba), TensorDyn::from(bgra)))
+    }
+
+    /// The destination bytes of a tensor of any element type.
+    fn dyn_dst_bytes(t: &TensorDyn) -> Vec<u8> {
+        match t.dtype() {
+            DType::U8 => t.as_u8().unwrap().map_read().unwrap().as_slice().to_vec(),
+            DType::I8 => t
+                .as_typed::<i8>()
+                .unwrap()
+                .map_read()
+                .unwrap()
+                .as_slice()
+                .iter()
+                .map(|&v| v as u8)
+                .collect(),
+            DType::F16 => t
+                .as_typed::<half::f16>()
+                .unwrap()
+                .map_read()
+                .unwrap()
+                .as_slice()
+                .iter()
+                .flat_map(|v| v.to_bits().to_le_bytes())
+                .collect(),
+            DType::F32 => t
+                .as_typed::<f32>()
+                .unwrap()
+                .map_read()
+                .unwrap()
+                .as_slice()
+                .iter()
+                .flat_map(|v| v.to_bits().to_le_bytes())
+                .collect(),
+            other => panic!("unexpected dtype {other:?}"),
+        }
+    }
+
+    /// Converts `src` into a fresh `dst_w`x`dst_h` destination, returning its
+    /// bytes, or `None` when the conversion is not supported.
+    fn convert_to_bytes(
+        cpu: &mut CPUProcessor,
+        src: &TensorDyn,
+        dst_w: usize,
+        dst_h: usize,
+        fmt: PixelFormat,
+        dtype: DType,
+        options: Option<crate::ConvertOptions>,
+    ) -> Option<Vec<u8>> {
+        let mut dst = TensorDyn::image(
+            dst_w,
+            dst_h,
+            fmt,
+            dtype,
+            mem(),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .ok()?;
+        dyn_fill_zero(&mut dst);
+        cpu.convert(src, &mut dst, options).ok()?;
+        Some(dyn_dst_bytes(&dst))
+    }
+
+    fn dyn_fill_zero(t: &mut TensorDyn) {
+        if let Some(u) = t.as_u8() {
+            u.map_mut().unwrap().as_mut_slice().fill(0);
+        } else if let Some(i) = t.as_typed::<i8>() {
+            i.map_mut().unwrap().as_mut_slice().fill(0);
+        } else if let Some(h) = t.as_typed::<half::f16>() {
+            h.map_mut()
+                .unwrap()
+                .as_mut_slice()
+                .fill(half::f16::from_f32(0.0));
+        } else if let Some(f) = t.as_typed::<f32>() {
+            f.map_mut().unwrap().as_mut_slice().fill(0.0);
+        }
+    }
+
+    const BGRA_TEST_DTYPES: [DType; 4] = [DType::U8, DType::I8, DType::F16, DType::F32];
+
+    #[test]
+    fn bgra_source_matches_rgba_for_every_destination() -> Result<()> {
+        let (rgba, bgra) = rgba_and_bgra_sources(64, 48, None, bgra_test_pixel)?;
+        let mut cpu = CPUProcessor::new();
+        let mut compared = 0;
+        for fmt in [
+            PixelFormat::Rgb,
+            PixelFormat::Rgba,
+            PixelFormat::Grey,
+            PixelFormat::Yuyv,
+            PixelFormat::PlanarRgb,
+            PixelFormat::PlanarRgba,
+            PixelFormat::Nv16,
+            PixelFormat::Nv12,
+            PixelFormat::Bgra,
+        ] {
+            for dtype in BGRA_TEST_DTYPES {
+                let want = convert_to_bytes(&mut cpu, &rgba, 64, 48, fmt, dtype, None);
+                let got = convert_to_bytes(&mut cpu, &bgra, 64, 48, fmt, dtype, None);
+                assert_eq!(got, want, "BGRA to {fmt} {dtype:?}");
+                compared += 1;
+            }
+        }
+        assert_eq!(compared, 36);
+        Ok(())
+    }
+
+    #[test]
+    fn bgra_source_matches_rgba_with_crop_letterbox_flip_rotation() -> Result<()> {
+        let (rgba, bgra) = rgba_and_bgra_sources(640, 480, None, bgra_test_pixel)?;
+        let cases: [(&str, crate::ConvertOptions); 4] = [
+            (
+                "source crop",
+                crate::ConvertOptions::new()
+                    .crop(Crop::new().with_source(Some(Region::new(100, 50, 320, 240)))),
+            ),
+            (
+                "letterbox",
+                crate::ConvertOptions::new().crop(Crop::letterbox([114, 114, 114, 255])),
+            ),
+            (
+                "horizontal flip",
+                crate::ConvertOptions::new().flip(Flip::Horizontal),
+            ),
+            (
+                "rotation",
+                crate::ConvertOptions::new().rotation(Rotation::Clockwise90),
+            ),
+        ];
+        let mut cpu = CPUProcessor::new();
+        for (name, options) in cases {
+            for (fmt, dtype) in [
+                (PixelFormat::Rgba, DType::U8),
+                (PixelFormat::Nv12, DType::U8),
+                (PixelFormat::PlanarRgb, DType::U8),
+                (PixelFormat::PlanarRgb, DType::F16),
+            ] {
+                let want = convert_to_bytes(&mut cpu, &rgba, 320, 320, fmt, dtype, Some(options))
+                    .unwrap_or_else(|| panic!("RGBA to {fmt} {dtype:?} ({name})"));
+                let got = convert_to_bytes(&mut cpu, &bgra, 320, 320, fmt, dtype, Some(options))
+                    .unwrap_or_else(|| panic!("BGRA to {fmt} {dtype:?} ({name})"));
+                assert_eq!(got, want, "BGRA to {fmt} {dtype:?} ({name})");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn bgra_source_with_padded_stride_matches_rgba() -> Result<()> {
+        let (rgba, bgra) = rgba_and_bgra_sources(100, 40, Some(448), bgra_test_pixel)?;
+        let mut cpu = CPUProcessor::new();
+        for fmt in [PixelFormat::Rgba, PixelFormat::Nv12] {
+            let want = convert_to_bytes(&mut cpu, &rgba, 100, 40, fmt, DType::U8, None).unwrap();
+            let got = convert_to_bytes(&mut cpu, &bgra, 100, 40, fmt, DType::U8, None).unwrap();
+            assert_eq!(got, want, "padded BGRA to {fmt}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn bgra_scratch_follows_size_changes() -> Result<()> {
+        let mut cpu = CPUProcessor::new();
+        for (w, h, seed) in [(64, 48, 0), (32, 16, 0), (64, 48, 9)] {
+            let pixel = move |x: usize, y: usize| bgra_test_pixel(x + seed, y + seed);
+            let (rgba, bgra) = rgba_and_bgra_sources(w, h, None, pixel)?;
+            let want = convert_to_bytes(&mut cpu, &rgba, w, h, PixelFormat::Rgba, DType::U8, None)
+                .unwrap();
+            let got = convert_to_bytes(&mut cpu, &bgra, w, h, PixelFormat::Rgba, DType::U8, None)
+                .unwrap();
+            assert_eq!(got, want, "{w}x{h} seed {seed}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn bgra_to_bgra_resize_keeps_channel_order() -> Result<()> {
+        let (_, bgra) = rgba_and_bgra_sources(64, 48, None, bgra_test_pixel)?;
+        let mut cpu = CPUProcessor::new();
+        let got =
+            convert_to_bytes(&mut cpu, &bgra, 32, 24, PixelFormat::Bgra, DType::U8, None).unwrap();
+        let mut want =
+            convert_to_bytes(&mut cpu, &bgra, 32, 24, PixelFormat::Rgba, DType::U8, None).unwrap();
+        for px in want.as_chunks_mut::<4>().0 {
+            px.swap(0, 2);
+        }
+        assert_eq!(got, want);
+        Ok(())
+    }
+
+    #[test]
+    fn bgra_to_bgra_resize_into_write_only_destination() -> Result<()> {
+        let (_, bgra) = rgba_and_bgra_sources(64, 48, None, bgra_test_pixel)?;
+        let mut cpu = CPUProcessor::new();
+        let want =
+            convert_to_bytes(&mut cpu, &bgra, 32, 24, PixelFormat::Bgra, DType::U8, None).unwrap();
+        let mut dst = TensorDyn::image(
+            32,
+            24,
+            PixelFormat::Bgra,
+            DType::U8,
+            mem(),
+            edgefirst_tensor::CpuAccess::Write,
+        )?;
+        cpu.convert(&bgra, &mut dst, None)?;
+        let map = dst.as_u8().unwrap().map_write()?;
+        assert_eq!(map.as_slice(), want.as_slice());
+        Ok(())
+    }
+
+    #[test]
+    fn bgra_to_unsupported_destination_names_bgra() -> Result<()> {
+        let (_, bgra) = rgba_and_bgra_sources(64, 48, None, bgra_test_pixel)?;
+        let mut cpu = CPUProcessor::new();
+        let mut dst = TensorDyn::image(
+            64,
+            48,
+            PixelFormat::Vyuy,
+            DType::U8,
+            mem(),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )?;
+        let err = cpu.convert(&bgra, &mut dst, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("BGRA") && !msg.contains("RGBA"), "{msg}");
+        Ok(())
+    }
 }
