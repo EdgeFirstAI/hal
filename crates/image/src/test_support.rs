@@ -242,10 +242,10 @@ pub(crate) fn box_expected_span(width: usize) -> Vec<usize> {
         .collect()
 }
 
-#[cfg(all(target_os = "macos", feature = "opengl"))]
+#[cfg(target_os = "macos")]
 pub(crate) use corevideo::{corevideo_buffer, CoreVideoBuffer};
 
-#[cfg(all(target_os = "macos", feature = "opengl"))]
+#[cfg(target_os = "macos")]
 mod corevideo {
     use std::ffi::c_void;
 
