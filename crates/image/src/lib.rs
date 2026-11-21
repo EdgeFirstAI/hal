@@ -9233,6 +9233,435 @@ mod image_tests {
         }
     }
 
+    /// YUYV and RGBA IOSurface sources convert on GL into a `420v` CoreVideo
+    /// destination wrapped by `from_planar_iosurface`: both planes, read
+    /// through the CoreVideo buffer, are within 2 of the CPU converting into
+    /// memory, and the bytes between the planes keep their sentinel.
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[cfg(feature = "opengl")]
+    fn test_nv12_into_a_planar_surface_opengl_macos() {
+        use crate::test_support::corevideo_buffer;
+        const SENTINEL: u8 = 0x5A;
+        let mut gl = match GLProcessorThreaded::new(None) {
+            Ok(p) => p,
+            Err(e) => {
+                crate::test_support::report_skip(&format!(
+                    "{} — GL engine init failed ({e:?})",
+                    function!()
+                ));
+                return;
+            }
+        };
+        gl.set_soft_declines(false).unwrap();
+        let image = |w: usize, h: usize, fmt: PixelFormat, mem: TensorMemory| {
+            TensorDyn::image(
+                w,
+                h,
+                fmt,
+                DType::U8,
+                Some(mem),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .unwrap()
+        };
+        let max_diff = |a: &[u8], b: &[u8]| {
+            assert_eq!(a.len(), b.len());
+            a.iter().zip(b).map(|(x, y)| x.abs_diff(*y)).max().unwrap()
+        };
+
+        for (w, h) in [(1920usize, 1080usize), (1000, 562)] {
+            let gradient = image(w, h, PixelFormat::Rgba, TensorMemory::Mem);
+            {
+                let t = gradient.as_u8().unwrap();
+                let stride = t.effective_row_stride().unwrap();
+                let mut map = t.map().unwrap();
+                for y in 0..h {
+                    for x in 0..w {
+                        map.as_mut_slice()[y * stride + x * 4..][..4].copy_from_slice(&[
+                            (40 + x * 170 / w) as u8,
+                            (40 + y * 170 / h) as u8,
+                            (200 - (x + y) * 150 / (w + h)) as u8,
+                            255,
+                        ]);
+                    }
+                }
+            }
+            for fmt in [PixelFormat::Yuyv, PixelFormat::Rgba] {
+                let what = format!("{fmt:?} {w}x{h}");
+                let mut src = image(w, h, fmt, TensorMemory::DmaBuf);
+                CPUProcessor::new()
+                    .convert(&gradient, &mut src, None)
+                    .unwrap();
+
+                let buf = corevideo_buffer(w, h, b"420v");
+                buf.fill_rows(|_, _, bytes| bytes.fill(0));
+                let mut gap = 0;
+                buf.between_planes(|bytes| {
+                    bytes.fill(SENTINEL);
+                    gap = bytes.len();
+                });
+                let expected_gap = if (w, h) == (1000, 562) { 6144 } else { 0 };
+                assert_eq!(gap, expected_gap, "{what}: bytes between the planes");
+                let mut dst = unsafe { TensorDyn::from_planar_iosurface(buf.surface(), None) }
+                    .expect("from_planar_iosurface");
+                let mut want = image(w, h, PixelFormat::Nv12, TensorMemory::Mem);
+                want.set_colorimetry(dst.colorimetry());
+
+                gl.convert(&src, &mut dst, None)
+                    .unwrap_or_else(|e| panic!("{what}: GL convert: {e}"));
+                CPUProcessor::new()
+                    .convert(&src, &mut want, None)
+                    .unwrap_or_else(|e| panic!("{what}: CPU convert: {e}"));
+
+                let (mut got_y, mut got_uv) = (Vec::new(), Vec::new());
+                buf.fill_rows(|plane, _, bytes| match plane {
+                    0 => got_y.extend_from_slice(&bytes[..w]),
+                    _ => got_uv.extend_from_slice(&bytes[..w]),
+                });
+                let t = want.as_u8().unwrap();
+                let stride = t.effective_row_stride().unwrap();
+                let map = t.map().unwrap();
+                let rows = |first: usize, n: usize| -> Vec<u8> {
+                    (first..first + n)
+                        .flat_map(|r| map.as_slice()[r * stride..][..w].to_vec())
+                        .collect()
+                };
+                let (want_y, want_uv) = (rows(0, h), rows(h, h / 2));
+
+                let y = max_diff(&got_y, &want_y);
+                assert!(y <= 2, "{what}: luma max diff {y} > 2");
+                let uv = max_diff(&got_uv, &want_uv);
+                assert!(uv <= 2, "{what}: chroma max diff {uv} > 2");
+                buf.between_planes(|bytes| {
+                    assert!(
+                        bytes.iter().all(|&b| b == SENTINEL),
+                        "{what}: the bytes between the planes were written"
+                    );
+                });
+            }
+        }
+    }
+
+    /// The CPU writes a `420v` CoreVideo destination wrapped by `from_planar_iosurface`, from a
+    /// `420v` source and from RGBA, byte-for-byte as it writes a memory NV12, and leaves the
+    /// bytes between the planes untouched.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_cpu_into_a_planar_surface_macos() {
+        use crate::test_support::corevideo_buffer;
+        const SENTINEL: u8 = 0x5A;
+        let image = |w: usize, h: usize, fmt: PixelFormat| {
+            TensorDyn::image(
+                w,
+                h,
+                fmt,
+                DType::U8,
+                Some(TensorMemory::Mem),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .unwrap()
+        };
+
+        for (w, h) in [(1920usize, 1080usize), (1000, 562)] {
+            let wrap = |buf: &crate::test_support::CoreVideoBuffer| {
+                unsafe { TensorDyn::from_planar_iosurface(buf.surface(), None) }
+                    .expect("from_planar_iosurface")
+            };
+            let read = |buf: &crate::test_support::CoreVideoBuffer| {
+                let (mut y, mut uv) = (Vec::new(), Vec::new());
+                buf.fill_rows(|plane, _, bytes| match plane {
+                    0 => y.extend_from_slice(&bytes[..w]),
+                    _ => uv.extend_from_slice(&bytes[..w]),
+                });
+                (y, uv)
+            };
+            let tight = |t: &TensorDyn| {
+                let t = t.as_u8().unwrap();
+                let stride = t.effective_row_stride().unwrap();
+                let map = t.map().unwrap();
+                let rows = |first: usize, n: usize| -> Vec<u8> {
+                    (first..first + n)
+                        .flat_map(|r| map.as_slice()[r * stride..][..w].to_vec())
+                        .collect()
+                };
+                (rows(0, h), rows(h, h / 2))
+            };
+            let check_padding = |buf: &crate::test_support::CoreVideoBuffer, what: &str| {
+                buf.between_planes(|bytes| {
+                    assert!(
+                        bytes.iter().all(|&b| b == SENTINEL),
+                        "{what}: the bytes between the planes were written"
+                    );
+                });
+            };
+            let prepare = |buf: &crate::test_support::CoreVideoBuffer| {
+                buf.fill_rows(|_, _, bytes| bytes.fill(0));
+                buf.between_planes(|bytes| bytes.fill(SENTINEL));
+            };
+
+            // A 420v source copied into a 420v destination.
+            let what = format!("420v -> 420v {w}x{h}");
+            let src_buf = corevideo_buffer(w, h, b"420v");
+            src_buf.fill_rows(|plane, row, bytes| {
+                for (x, b) in bytes[..w].iter_mut().enumerate() {
+                    *b = if plane == 0 {
+                        (x * 9 + row * 5) & 0xff
+                    } else {
+                        (x * 11 + row * 7 + 30) & 0xff
+                    } as u8;
+                }
+            });
+            let dst_buf = corevideo_buffer(w, h, b"420v");
+            prepare(&dst_buf);
+            let mut src = wrap(&src_buf);
+            let mut dst = wrap(&dst_buf);
+            src.set_colorimetry(dst.colorimetry());
+            let mut want = image(w, h, PixelFormat::Nv12);
+            want.set_colorimetry(dst.colorimetry());
+            CPUProcessor::new()
+                .convert(&src, &mut dst, None)
+                .unwrap_or_else(|e| panic!("{what}: CPU convert: {e}"));
+            CPUProcessor::new()
+                .convert(&src, &mut want, None)
+                .unwrap_or_else(|e| panic!("{what}: CPU convert to memory: {e}"));
+            assert!(
+                read(&dst_buf) == tight(&want),
+                "{what}: the planes differ from the CPU writing into memory"
+            );
+            check_padding(&dst_buf, &what);
+
+            // An RGBA source converted into a 420v destination.
+            let what = format!("RGBA -> 420v {w}x{h}");
+            let rgba = image(w, h, PixelFormat::Rgba);
+            {
+                let t = rgba.as_u8().unwrap();
+                let stride = t.effective_row_stride().unwrap();
+                let mut map = t.map().unwrap();
+                for y in 0..h {
+                    for x in 0..w {
+                        map.as_mut_slice()[y * stride + x * 4..][..4].copy_from_slice(&[
+                            (40 + x * 170 / w) as u8,
+                            (40 + y * 170 / h) as u8,
+                            (200 - (x + y) * 150 / (w + h)) as u8,
+                            255,
+                        ]);
+                    }
+                }
+            }
+            let dst_buf = corevideo_buffer(w, h, b"420v");
+            prepare(&dst_buf);
+            let mut dst = wrap(&dst_buf);
+            let mut want = image(w, h, PixelFormat::Nv12);
+            want.set_colorimetry(dst.colorimetry());
+            CPUProcessor::new()
+                .convert(&rgba, &mut dst, None)
+                .unwrap_or_else(|e| panic!("{what}: CPU convert: {e}"));
+            CPUProcessor::new()
+                .convert(&rgba, &mut want, None)
+                .unwrap_or_else(|e| panic!("{what}: CPU convert to memory: {e}"));
+            assert!(
+                read(&dst_buf) == tight(&want),
+                "{what}: the planes differ from the CPU writing into memory"
+            );
+            check_padding(&dst_buf, &what);
+        }
+    }
+
+    /// A `420v` CoreVideo source wrapped by `from_planar_iosurface` converts on GL to a
+    /// letterboxed `PlanarRgb` F16 model input within the float-path tolerance of the CPU.
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[cfg(feature = "opengl")]
+    fn test_planar_nv12_to_planar_f16_letterbox_opengl_macos() {
+        use crate::test_support::corevideo_buffer;
+        let mut gl = match GLProcessorThreaded::new(None) {
+            Ok(p) => p,
+            Err(e) => {
+                crate::test_support::report_skip(&format!(
+                    "{} — GL engine init failed ({e:?})",
+                    function!()
+                ));
+                return;
+            }
+        };
+        gl.set_soft_declines(false).unwrap();
+        let (w, h) = (1000usize, 562usize);
+        let buf = corevideo_buffer(w, h, b"420v");
+        buf.fill_rows(|plane, row, bytes| {
+            if plane == 0 {
+                for (x, b) in bytes[..w].iter_mut().enumerate() {
+                    *b = (16 + x * 200 / w + row * 20 / h) as u8;
+                }
+            } else {
+                for (cx, pair) in bytes[..w].chunks_exact_mut(2).enumerate() {
+                    pair[0] = (40 + cx * 300 / w) as u8;
+                    pair[1] = (200 - row * 300 / h) as u8;
+                }
+            }
+        });
+        let src = unsafe { TensorDyn::from_planar_iosurface(buf.surface(), None) }
+            .expect("from_planar_iosurface");
+        let Some(mut gl_dst) = crate::test_support::gpu_buffer_allocated(
+            TensorDyn::image(
+                640,
+                640,
+                PixelFormat::PlanarRgb,
+                DType::F16,
+                Some(TensorMemory::DmaBuf),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            ),
+            "F16 PlanarRgb IOSurface",
+        ) else {
+            return;
+        };
+        let options = crate::ConvertOptions::new().letterbox([114, 114, 114, 255]);
+        gl.convert(&src, &mut gl_dst, Some(options))
+            .unwrap_or_else(|e| panic!("GL convert: {e}"));
+
+        let mut cpu_dst = TensorDyn::image(
+            640,
+            640,
+            PixelFormat::PlanarRgb,
+            DType::F16,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        CPUProcessor::new()
+            .convert(&src, &mut cpu_dst, Some(options))
+            .expect("CPU reference convert");
+
+        let values = |t: &TensorDyn| -> Vec<f32> {
+            let typed = t.as_typed::<half::f16>().unwrap();
+            let mut out = vec![0u8; typed.shape().iter().product::<usize>() * 2];
+            typed.copy_to_flat(&mut out).unwrap();
+            out.chunks_exact(2)
+                .map(|b| half::f16::from_le_bytes([b[0], b[1]]).to_f32())
+                .collect()
+        };
+        let (g, c) = (values(&gl_dst), values(&cpu_dst));
+        assert_eq!(g.len(), c.len());
+        let max_diff = g
+            .iter()
+            .zip(&c)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff <= 4.0 / 255.0 + 1e-3,
+            "planar NV12 to PlanarRgb F16 diverges from the CPU: max_diff={max_diff}"
+        );
+    }
+
+    /// An RGBA IOSurface source letterboxed at an odd offset, and flipped,
+    /// converts on GL into a `420v` CoreVideo destination wrapped by
+    /// `from_planar_iosurface`: both planes are within 2 of the CPU, and the
+    /// bytes between the planes keep their sentinel.
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[cfg(feature = "opengl")]
+    fn test_nv12_letterbox_into_a_planar_surface_opengl_macos() {
+        use crate::test_support::corevideo_buffer;
+        const SENTINEL: u8 = 0x5A;
+        let mut gl = match GLProcessorThreaded::new(None) {
+            Ok(p) => p,
+            Err(e) => {
+                crate::test_support::report_skip(&format!(
+                    "{} — GL engine init failed ({e:?})",
+                    function!()
+                ));
+                return;
+            }
+        };
+        gl.set_soft_declines(false).unwrap();
+        let image = |w: usize, h: usize, fmt: PixelFormat, mem: TensorMemory| {
+            TensorDyn::image(
+                w,
+                h,
+                fmt,
+                DType::U8,
+                Some(mem),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .unwrap()
+        };
+        let max_diff = |a: &[u8], b: &[u8]| {
+            assert_eq!(a.len(), b.len());
+            a.iter().zip(b).map(|(x, y)| x.abs_diff(*y)).max().unwrap()
+        };
+
+        // Each source letterboxes into its destination with an odd left edge.
+        for ((w, h), (sw, sh)) in [
+            ((1920usize, 1080usize), (600usize, 480usize)),
+            ((1000, 562), (640, 480)),
+        ] {
+            let src = image(sw, sh, PixelFormat::Rgba, TensorMemory::DmaBuf);
+            {
+                let t = src.as_u8().unwrap();
+                let stride = t.effective_row_stride().unwrap();
+                let mut map = t.map().unwrap();
+                for y in 0..sh {
+                    for x in 0..sw {
+                        map.as_mut_slice()[y * stride + x * 4..][..4].copy_from_slice(&[
+                            (40 + x * 170 / sw) as u8,
+                            (40 + y * 170 / sh) as u8,
+                            (200 - (x + y) * 150 / (sw + sh)) as u8,
+                            255,
+                        ]);
+                    }
+                }
+            }
+            for (geometry, options) in [
+                (
+                    "letterbox",
+                    ConvertOptions::new().letterbox([200, 30, 90, 255]),
+                ),
+                ("flip", ConvertOptions::new().flip(Flip::Horizontal)),
+            ] {
+                let what = format!("{sw}x{sh} -> {w}x{h} {geometry}");
+                let buf = corevideo_buffer(w, h, b"420v");
+                buf.fill_rows(|_, _, bytes| bytes.fill(0));
+                buf.between_planes(|bytes| bytes.fill(SENTINEL));
+                let mut dst = unsafe { TensorDyn::from_planar_iosurface(buf.surface(), None) }
+                    .expect("from_planar_iosurface");
+                let mut want = image(w, h, PixelFormat::Nv12, TensorMemory::Mem);
+                want.set_colorimetry(dst.colorimetry());
+
+                gl.convert(&src, &mut dst, Some(options))
+                    .unwrap_or_else(|e| panic!("{what}: GL convert: {e}"));
+                CPUProcessor::new()
+                    .convert(&src, &mut want, Some(options))
+                    .unwrap_or_else(|e| panic!("{what}: CPU convert: {e}"));
+
+                let (mut got_y, mut got_uv) = (Vec::new(), Vec::new());
+                buf.fill_rows(|plane, _, bytes| match plane {
+                    0 => got_y.extend_from_slice(&bytes[..w]),
+                    _ => got_uv.extend_from_slice(&bytes[..w]),
+                });
+                let t = want.as_u8().unwrap();
+                let stride = t.effective_row_stride().unwrap();
+                let map = t.map().unwrap();
+                let rows = |first: usize, n: usize| -> Vec<u8> {
+                    (first..first + n)
+                        .flat_map(|r| map.as_slice()[r * stride..][..w].to_vec())
+                        .collect()
+                };
+                let (want_y, want_uv) = (rows(0, h), rows(h, h / 2));
+
+                let y = max_diff(&got_y, &want_y);
+                assert!(y <= 2, "{what}: luma max diff {y} > 2");
+                let uv = max_diff(&got_uv, &want_uv);
+                assert!(uv <= 2, "{what}: chroma max diff {uv} > 2");
+                buf.between_planes(|bytes| {
+                    assert!(
+                        bytes.iter().all(|&b| b == SENTINEL),
+                        "{what}: the bytes between the planes were written"
+                    );
+                });
+            }
+        }
+    }
+
     /// Two consecutive converts of one source tensor succeed and produce identical output.
     #[test]
     #[cfg(target_os = "macos")]

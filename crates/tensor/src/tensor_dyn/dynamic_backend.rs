@@ -1596,6 +1596,79 @@ impl TensorDyn {
         Self::from_iosurface_id(id, shape, dtype, name)
     }
 
+    /// Wraps an image IOSurface, reading its pixel format and planes.
+    ///
+    /// `420v` and `420f` give NV12 as a multiplane tensor: luma and chroma
+    /// each wrap `surface` at their plane's offset and row stride. `yuvs` gives
+    /// YUYV and `BGRA` gives BGRA, as one tensor at the surface's row stride.
+    /// The surface is retained for the tensor's lifetime. Colorimetry is not
+    /// set.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidArgument` for a null surface or any other pixel format;
+    /// `InvalidShape` when a plane does not hold its image, or an NV12 surface
+    /// has an odd width or height.
+    ///
+    /// # Safety
+    ///
+    /// `surface` must be a live `IOSurfaceRef`.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    pub unsafe fn from_planar_iosurface(
+        surface: *mut std::ffi::c_void,
+        name: Option<&str>,
+    ) -> Result<Self> {
+        use crate::tensor_dyn::derived::{planar_iosurface_parts, PlanarParts};
+
+        // SAFETY: the caller guarantees `surface` is a live IOSurfaceRef.
+        let parts = unsafe { planar_iosurface_parts(surface)? };
+        match parts {
+            PlanarParts::Nv12 { luma, chroma } => {
+                // SAFETY: as above; each wrap takes its own retain.
+                let (mut y, mut uv) = unsafe {
+                    (
+                        Self::from_iosurface(surface, &[luma.height, luma.width], DType::U8, name)?,
+                        Self::from_iosurface(
+                            surface,
+                            &[chroma.height, luma.width],
+                            DType::U8,
+                            name,
+                        )?,
+                    )
+                };
+                y.set_plane_offset(luma.offset);
+                y.set_row_stride_unchecked(luma.bytes_per_row);
+                uv.set_plane_offset(chroma.offset);
+                uv.set_row_stride_unchecked(chroma.bytes_per_row);
+                let typed = |t: Self| {
+                    t.into_u8()
+                        .map_err(|_| Error::InvalidArgument("plane is not a u8 tensor".into()))
+                };
+                crate::Tensor::<u8>::from_planes(typed(y)?, typed(uv)?, PixelFormat::Nv12)
+                    .map(Self::from)
+            }
+            PlanarParts::Packed {
+                format,
+                width,
+                height,
+                bytes_per_row,
+            } => {
+                // SAFETY: as above.
+                let mut t = unsafe {
+                    Self::from_iosurface(
+                        surface,
+                        &[height, width, format.channels()],
+                        DType::U8,
+                        name,
+                    )?
+                };
+                t.set_format(format)?;
+                t.set_row_stride_unchecked(bytes_per_row);
+                Ok(t)
+            }
+        }
+    }
+
     /// IOSurfaceID for cross-process sharing. `None` when this handle has
     /// no IOSurface (wrong backing, or `IOSurfaceGetID` returned 0).
     #[cfg(any(target_os = "macos", target_os = "ios"))]

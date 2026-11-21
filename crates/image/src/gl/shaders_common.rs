@@ -899,6 +899,31 @@ void main() {
 "
 );
 
+/// RGBA->NV12 chroma fragment shader for an RG chroma plane; writes U to red
+/// and V to green, from the average of the 2x2 block of the RGBA intermediate
+/// whose first texel is at twice the fragment's coordinates.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub(crate) const NV12_CHROMA_RG_FRAGMENT: &str = "\
+#version 300 es
+precision highp float;
+precision highp int;
+uniform highp sampler2D tex;
+uniform vec3 u_coeffs;
+uniform vec3 v_coeffs;
+uniform float c_offset;
+out vec4 color;
+
+void main() {
+    ivec2 base = ivec2(gl_FragCoord.xy) << 1;
+    vec3 rgb = (texelFetch(tex, base, 0).rgb
+        + texelFetch(tex, base + ivec2(1, 0), 0).rgb
+        + texelFetch(tex, base + ivec2(0, 1), 0).rgb
+        + texelFetch(tex, base + ivec2(1, 1), 0).rgb) * 0.25;
+    vec2 uv = vec2(dot(u_coeffs, rgb), dot(v_coeffs, rgb)) + c_offset;
+    color = vec4(clamp(uv, 0.0, 1.0), 0.0, 1.0);
+}
+";
+
 /// NV12 chroma fill fragment shader; writes `uv.x` at even output columns and
 /// `uv.y` at odd ones.
 pub(crate) const NV12_CHROMA_FILL_FRAGMENT: &str = "\
@@ -1007,6 +1032,17 @@ mod nv_shader_golden {
             super::NV12_CHROMA_R8_FRAGMENT,
             golden(include_str!("golden/nv12_chroma_r8_linux.glsl")).as_str(),
             "NV12 chroma shader bytes drifted from the golden"
+        );
+    }
+
+    /// The RGBA->NV12 RG chroma shader matches its golden byte for byte.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[test]
+    fn nv12_chroma_rg_matches_its_golden() {
+        assert_eq!(
+            super::NV12_CHROMA_RG_FRAGMENT,
+            golden(include_str!("golden/nv12_chroma_rg_macos.glsl")).as_str(),
+            "NV12 RG chroma shader bytes drifted from the golden"
         );
     }
 

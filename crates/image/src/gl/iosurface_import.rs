@@ -33,8 +33,8 @@ const EGL_TEXTURE_2D: i32 = 0x305F;
 
 // GL constants used in attribute lists (OpenGL ES 3.0 and
 // GL_EXT_texture_format_BGRA8888).
-const GL_RED: i32 = 0x1903;
-const GL_RG: i32 = 0x8227;
+pub(super) const GL_RED: i32 = 0x1903;
+pub(super) const GL_RG: i32 = 0x8227;
 const GL_RGBA: i32 = 0x1908;
 const GL_BGRA_EXT: i32 = 0x80E1;
 const GL_UNSIGNED_BYTE: i32 = 0x1401;
@@ -56,6 +56,13 @@ const FOURCC_RGHA: u32 = u32::from_be_bytes(*b"RGhA"); // kCVPixelFormatType_64R
 #[link(name = "CoreFoundation", kind = "framework")]
 extern "C" {
     fn IOSurfaceCreate(properties: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+    fn IOSurfaceGetID(surface: *mut std::ffi::c_void) -> u32;
+    fn IOSurfaceGetPlaneCount(surface: *mut std::ffi::c_void) -> usize;
+    fn IOSurfaceGetBaseAddress(surface: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+    fn IOSurfaceGetBaseAddressOfPlane(
+        surface: *mut std::ffi::c_void,
+        plane: usize,
+    ) -> *mut std::ffi::c_void;
     fn CFRelease(cf: *const std::ffi::c_void);
 
     fn CFDictionaryCreateMutable(
@@ -333,6 +340,51 @@ type FnCreatePbufferFromClientBuffer = unsafe extern "C" fn(
     attrib_list: *const i32,
 ) -> egl::EGLSurface;
 
+/// Looks up `eglCreatePbufferFromClientBuffer` in ANGLE's libEGL.
+fn create_pbuffer_fn(egl: &super::Egl) -> Result<FnCreatePbufferFromClientBuffer, Error> {
+    let ptr = egl
+        .get_proc_address("eglCreatePbufferFromClientBuffer")
+        .ok_or_else(|| {
+            Error::Io(std::io::Error::other(
+                "eglCreatePbufferFromClientBuffer not exported by ANGLE libEGL",
+            ))
+        })?;
+    // SAFETY: the symbol has the `eglCreatePbufferFromClientBuffer` signature.
+    Ok(
+        unsafe {
+            std::mem::transmute::<extern "system" fn(), FnCreatePbufferFromClientBuffer>(ptr)
+        },
+    )
+}
+
+/// The `EGL_ANGLE_iosurface_client_buffer` attribute list for a
+/// `width`x`height` binding of IOSurface plane `plane`.
+fn pbuffer_attribs(
+    width: usize,
+    height: usize,
+    plane: i32,
+    internal_format: i32,
+    gl_type: i32,
+) -> [i32; 15] {
+    [
+        egl::WIDTH,
+        width as i32,
+        egl::HEIGHT,
+        height as i32,
+        EGL_IOSURFACE_PLANE_ANGLE,
+        plane,
+        EGL_TEXTURE_TARGET,
+        EGL_TEXTURE_2D,
+        EGL_TEXTURE_INTERNAL_FORMAT_ANGLE,
+        internal_format,
+        EGL_TEXTURE_FORMAT,
+        EGL_TEXTURE_RGBA,
+        EGL_TEXTURE_TYPE_ANGLE,
+        gl_type,
+        egl::NONE,
+    ]
+}
+
 /// Bind an IOSurface to an EGL pbuffer via
 /// `EGL_ANGLE_iosurface_client_buffer`. The pbuffer can then be bound
 /// as a texture via `eglBindTexImage` for sampling or as a renderbuffer
@@ -355,36 +407,17 @@ pub(super) unsafe fn create_iosurface_pbuffer(
     height: usize,
 ) -> Result<egl::Surface, Error> {
     let layout = ImageLayout::for_format(fmt, dtype, width, height)?;
-
-    let create_pbuffer_ptr = egl
-        .get_proc_address("eglCreatePbufferFromClientBuffer")
-        .ok_or_else(|| {
-            Error::Io(std::io::Error::other(
-                "eglCreatePbufferFromClientBuffer not exported by ANGLE libEGL",
-            ))
-        })?;
-    let create_pbuffer: FnCreatePbufferFromClientBuffer =
-        unsafe { std::mem::transmute(create_pbuffer_ptr) };
+    let create_pbuffer = create_pbuffer_fn(egl)?;
 
     let gl_internal_format = layout.gl_internal_format()?;
     let gl_type = layout.gl_type()?;
-    let attribs = [
-        egl::WIDTH,
-        layout.surface_width as i32,
-        egl::HEIGHT,
-        layout.surface_height as i32,
-        EGL_IOSURFACE_PLANE_ANGLE,
+    let attribs = pbuffer_attribs(
+        layout.surface_width,
+        layout.surface_height,
         0,
-        EGL_TEXTURE_TARGET,
-        EGL_TEXTURE_2D,
-        EGL_TEXTURE_INTERNAL_FORMAT_ANGLE,
         gl_internal_format,
-        EGL_TEXTURE_FORMAT,
-        EGL_TEXTURE_RGBA,
-        EGL_TEXTURE_TYPE_ANGLE,
         gl_type,
-        egl::NONE,
-    ];
+    );
 
     let raw = unsafe {
         create_pbuffer(
@@ -411,6 +444,83 @@ pub(super) unsafe fn create_iosurface_pbuffer(
         ))));
     }
     Ok(unsafe { egl::Surface::from_ptr(raw) })
+}
+
+/// Bind plane `plane` of a planar IOSurface to an EGL pbuffer as a
+/// `width`x`height` texture of `internal_format` (`GL_RED` or `GL_RG`) with
+/// `GL_UNSIGNED_BYTE` components.
+///
+/// # Errors
+///
+/// `Error::Io` when ANGLE does not export `eglCreatePbufferFromClientBuffer`
+/// or refuses the binding.
+///
+/// # Safety
+///
+/// As [`create_iosurface_pbuffer`]. `width` and `height` must not exceed the
+/// plane's own extent.
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe fn create_iosurface_plane_pbuffer(
+    egl: &super::Egl,
+    display: egl::Display,
+    config: egl::Config,
+    surface_ref: *mut std::ffi::c_void,
+    plane: i32,
+    internal_format: i32,
+    width: usize,
+    height: usize,
+) -> Result<egl::Surface, Error> {
+    let create_pbuffer = create_pbuffer_fn(egl)?;
+    let attribs = pbuffer_attribs(width, height, plane, internal_format, GL_UNSIGNED_BYTE);
+    let raw = unsafe {
+        create_pbuffer(
+            display.as_ptr(),
+            EGL_IOSURFACE_ANGLE,
+            surface_ref as egl::EGLClientBuffer,
+            config.as_ptr(),
+            attribs.as_ptr(),
+        )
+    };
+    if raw.is_null() {
+        let egl_err = egl.get_error();
+        return Err(Error::Io(std::io::Error::other(format!(
+            "eglCreatePbufferFromClientBuffer(EGL_IOSURFACE_ANGLE) failed: \
+             {egl_err:?} (surface_ref={surface_ref:?}, plane={plane}, \
+             {width}x{height}, internal_format=0x{internal_format:04x})"
+        ))));
+    }
+    Ok(unsafe { egl::Surface::from_ptr(raw) })
+}
+
+/// The index of the plane of `surface` that starts `offset` bytes from the
+/// surface's base address; `None` when no plane does or the surface is not
+/// planar, or the tensor is not IOSurface-backed.
+pub(super) fn plane_index<T>(tensor: &Tensor<T>, offset: usize) -> Option<i32>
+where
+    T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync + edgefirst_tensor::Element,
+{
+    let surface = tensor.iosurface_ref()?;
+    // SAFETY: `surface` is borrowed from `tensor`, which keeps it alive; these
+    // calls only read its plane layout.
+    unsafe {
+        let base = IOSurfaceGetBaseAddress(surface) as usize;
+        (0..IOSurfaceGetPlaneCount(surface))
+            .find(|&p| {
+                (IOSurfaceGetBaseAddressOfPlane(surface, p) as usize).wrapping_sub(base) == offset
+            })
+            .and_then(|p| i32::try_from(p).ok())
+    }
+}
+
+/// The `IOSurfaceID` of the tensor's surface; `None` when it is 0 or the
+/// tensor is not IOSurface-backed.
+pub(super) fn surface_id<T>(tensor: &Tensor<T>) -> Option<u32>
+where
+    T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync + edgefirst_tensor::Element,
+{
+    let surface = tensor.iosurface_ref()?;
+    // SAFETY: `surface` is borrowed from `tensor`, which keeps it alive.
+    Some(unsafe { IOSurfaceGetID(surface) }).filter(|&id| id != 0)
 }
 
 /// Extract the IOSurface backing a tensor (macOS only).

@@ -15,6 +15,14 @@
 //! A map holds an `IOSurfaceLock` for its lifetime and exposes the base address
 //! as a slice; dropping it calls the matching unlock.
 //!
+//! ## Planar surfaces
+//!
+//! A CoreVideo `420v` or `420f` surface has two planes at their own offsets
+//! and row pitches. `TensorDyn::from_planar_iosurface` wraps it as a multiplane
+//! NV12 tensor whose luma and chroma each wrap the surface at their plane's
+//! offset and row stride, whether or not the planes are contiguous. A planar
+//! surface records no single backing pitch.
+//!
 //! ## Cross-process sharing
 //!
 //! IOSurfaces are identified by `IOSurfaceID` (u32) within a host. The GL
@@ -193,7 +201,8 @@ where
     /// this up to 64-byte alignment, so for image-formatted surfaces it can
     /// exceed the natural `width × bytes_per_pixel`. Image-formatted tensors
     /// carry this as their row stride; raw byte surfaces (`new_with_byte_size`,
-    /// a single padded row) leave the tensor stride natural.
+    /// a single padded row) leave the tensor stride natural. Zero for a planar
+    /// surface, which has no single row pitch.
     pub(crate) bytes_per_row: usize,
     /// Whether this tensor was constructed from an externally-provided
     /// IOSurface via `from_surface`.
@@ -251,12 +260,15 @@ where
                 "IOSurfaceGetBaseAddress returned null; surface is not host-addressable",
             ))
         })?;
-        // The whole surface; `Tensor::pin_host` narrows to the logical extent.
-        let len = self.buf_size;
+        // The surface from the view offset on; `Tensor::pin_host` narrows to
+        // the logical extent.
+        let offset = self.view_offset.min(self.buf_size);
+        // SAFETY: `offset` is at most `buf_size`, the surface's allocation.
+        let data = unsafe { (base_ptr.as_ptr() as *mut u8).add(offset) };
         Ok(crate::pin::HostPin::new(
             std::sync::Arc::new(self.surface.clone()),
-            base_ptr.as_ptr() as *mut u8,
-            len,
+            data,
+            self.buf_size - offset,
         ))
     }
 }
@@ -665,7 +677,12 @@ where
             let surface = OwnedIoSurface::from_external(surface_ref)?;
             let identity = identity_from_surface(surface.as_ptr());
             let alloc = IOSurfaceGetAllocSize(surface.as_ptr());
-            let bytes_per_row = IOSurfaceGetBytesPerRow(surface.as_ptr());
+            let planar = !crate::iosurface_planes::plane_geometry(surface.as_ptr()).is_empty();
+            let bytes_per_row = if planar {
+                0
+            } else {
+                IOSurfaceGetBytesPerRow(surface.as_ptr())
+            };
 
             let elem_size = std::mem::size_of::<T>();
             let elems: usize = shape.iter().product();
@@ -720,7 +737,7 @@ where
     /// surface (`new_with_byte_size`).
     pub(crate) fn image_backing_row_stride(&self) -> Option<usize> {
         let (_w, h) = self.physical_surface_dims();
-        (h > 1).then_some(self.bytes_per_row)
+        (h > 1 && self.bytes_per_row != 0).then_some(self.bytes_per_row)
     }
 
     /// Lock and map exposing `byte_size` bytes via `as_slice()` for strided row
@@ -1584,5 +1601,71 @@ mod tests {
              window over a {pitch}-byte-pitched surface would be read at 64-byte \
              rows"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn plane_geometry_reads_a_corevideo_nv12_surface() {
+        use crate::iosurface_planes::{plane_geometry, PlaneGeometry};
+
+        let buf = crate::test_support::corevideo_nv12(1920, 1080, false);
+        let planes = unsafe { plane_geometry(buf.surface()) };
+        assert_eq!(
+            planes,
+            vec![
+                PlaneGeometry {
+                    offset: 512,
+                    bytes_per_row: 1920,
+                    width: 1920,
+                    height: 1080,
+                    bytes_per_element: 1,
+                },
+                PlaneGeometry {
+                    offset: 2_074_112,
+                    bytes_per_row: 1920,
+                    width: 960,
+                    height: 540,
+                    bytes_per_element: 2,
+                },
+            ]
+        );
+
+        let buf = crate::test_support::corevideo_nv12(1000, 562, false);
+        let planes = unsafe { plane_geometry(buf.surface()) };
+        assert_eq!(planes.len(), 2);
+        assert_eq!(
+            planes[0],
+            PlaneGeometry {
+                offset: 512,
+                bytes_per_row: 1024,
+                width: 1000,
+                height: 562,
+                bytes_per_element: 1,
+            }
+        );
+        assert_eq!(planes[1].offset, 582_144);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_planar_wrap_records_no_backing_pitch() {
+        let buf = crate::test_support::corevideo_nv12(1920, 1080, false);
+        let t = unsafe { IoSurfaceTensor::<u8>::from_surface(buf.surface(), &[1080, 1920], None) }
+            .expect("wrap planar surface");
+        assert_eq!(t.image_backing_row_stride(), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn host_pin_starts_at_the_plane_offset() {
+        let buf = crate::test_support::corevideo_nv12(1920, 1080, false);
+        buf.fill(0x10, 0x80);
+        let mut t =
+            unsafe { IoSurfaceTensor::<u8>::from_surface(buf.surface(), &[1080, 1920], None) }
+                .expect("wrap planar surface");
+        t.view_offset = 2_074_112;
+        let pin = t.host_pin().expect("pin");
+        assert_eq!(unsafe { *pin.as_ptr() }, 0x80);
+        assert_eq!(pin.len(), t.buf_size - 2_074_112);
     }
 }

@@ -9,6 +9,8 @@
 //! `import_storage`; the validation before it and the metadata restore after it
 //! live here.
 
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+use crate::{iosurface_planes::PlaneGeometry, Error, PixelFormat};
 use crate::{DType, Result, TensorDesc, TensorDyn};
 
 impl TensorDyn {
@@ -227,5 +229,143 @@ fn apply_imported_row_stride(
                      a malformed descriptor"
             );
         }
+    }
+}
+
+/// How a CoreVideo IOSurface maps onto image tensors.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub(crate) enum PlanarParts {
+    /// Two planes: luma, then interleaved chroma at half width and height.
+    Nv12 {
+        luma: PlaneGeometry,
+        chroma: PlaneGeometry,
+    },
+    /// One packed plane at the surface's row pitch.
+    Packed {
+        format: PixelFormat,
+        width: usize,
+        height: usize,
+        bytes_per_row: usize,
+    },
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+const FOURCC_420V: u32 = u32::from_be_bytes(*b"420v");
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+const FOURCC_420F: u32 = u32::from_be_bytes(*b"420f");
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+const FOURCC_YUVS: u32 = u32::from_be_bytes(*b"yuvs");
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+const FOURCC_BGRA: u32 = u32::from_be_bytes(*b"BGRA");
+
+/// Reads the pixel format and plane layout of `surface` and checks that each
+/// plane holds its image.
+///
+/// # Errors
+///
+/// `InvalidArgument` for a null surface or an unsupported pixel format;
+/// `InvalidShape` when a plane does not hold its image, or an NV12 surface
+/// has an odd width or height.
+///
+/// # Safety
+///
+/// `surface` must be a live `IOSurfaceRef`.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub(crate) unsafe fn planar_iosurface_parts(surface: *mut std::ffi::c_void) -> Result<PlanarParts> {
+    use crate::iosurface_planes::{pixel_format, plane_geometry, surface_extent};
+
+    if surface.is_null() {
+        return Err(Error::InvalidArgument(
+            "from_planar_iosurface: surface is null".into(),
+        ));
+    }
+    // SAFETY: the caller guarantees `surface` is a live IOSurfaceRef.
+    let (fourcc, planes, extent) = unsafe {
+        (
+            pixel_format(surface),
+            plane_geometry(surface),
+            surface_extent(surface),
+        )
+    };
+    let fits = |offset: usize, bytes_per_row: usize, row_bytes: usize, rows: usize| {
+        bytes_per_row >= row_bytes
+            && rows
+                .checked_sub(1)
+                .and_then(|r| r.checked_mul(bytes_per_row))
+                .and_then(|b| b.checked_add(offset))
+                .and_then(|b| b.checked_add(row_bytes))
+                .is_some_and(|end| end <= extent.alloc_size)
+    };
+
+    match fourcc {
+        FOURCC_420V | FOURCC_420F => {
+            let [luma, chroma] = planes[..] else {
+                return Err(Error::InvalidShape(format!(
+                    "NV12 surface has {} planes, expected 2",
+                    planes.len()
+                )));
+            };
+            let chroma_row_bytes = chroma.width * chroma.bytes_per_element;
+            if luma.bytes_per_element != 1
+                || luma.width % 2 != 0
+                || luma.height % 2 != 0
+                || chroma.height != luma.height / 2
+                || chroma_row_bytes != luma.width
+                || !fits(luma.offset, luma.bytes_per_row, luma.width, luma.height)
+                || !fits(
+                    chroma.offset,
+                    chroma.bytes_per_row,
+                    chroma_row_bytes,
+                    chroma.height,
+                )
+            {
+                return Err(Error::InvalidShape(format!(
+                    "NV12 planes do not hold a {}x{} image: luma {luma:?}, chroma {chroma:?}",
+                    luma.width, luma.height
+                )));
+            }
+            Ok(PlanarParts::Nv12 { luma, chroma })
+        }
+        FOURCC_YUVS | FOURCC_BGRA => {
+            let (format, bytes_per_pixel) = if fourcc == FOURCC_YUVS {
+                (PixelFormat::Yuyv, 2)
+            } else {
+                (PixelFormat::Bgra, 4)
+            };
+            if !planes.is_empty()
+                || !fits(
+                    0,
+                    extent.bytes_per_row,
+                    extent.width * bytes_per_pixel,
+                    extent.height,
+                )
+            {
+                return Err(Error::InvalidShape(format!(
+                    "{format:?} surface does not hold a {}x{} image at {} bytes per row",
+                    extent.width, extent.height, extent.bytes_per_row
+                )));
+            }
+            Ok(PlanarParts::Packed {
+                format,
+                width: extent.width,
+                height: extent.height,
+                bytes_per_row: extent.bytes_per_row,
+            })
+        }
+        other => Err(Error::InvalidArgument(format!(
+            "unsupported IOSurface pixel format {}",
+            fourcc_text(other)
+        ))),
+    }
+}
+
+/// The four-character code as text, or its hex value when it is not printable.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn fourcc_text(fourcc: u32) -> String {
+    let bytes = fourcc.to_be_bytes();
+    if bytes.iter().all(|b| b.is_ascii_graphic() || *b == b' ') {
+        String::from_utf8_lossy(&bytes).into_owned()
+    } else {
+        format!("{fourcc:#010x}")
     }
 }

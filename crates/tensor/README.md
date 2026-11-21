@@ -207,6 +207,18 @@ For buffers where image data does not start at byte 0 of the fd:
 - `set_plane_offset(offset: usize)` — Set byte offset.
 - `with_plane_offset(offset: usize) -> Self` — Builder-style consuming variant.
 
+## Planar IOSurfaces
+
+On macOS and iOS, `unsafe TensorDyn::from_planar_iosurface(surface, name)` wraps a CoreVideo IOSurface as image tensors, reading its pixel format and planes:
+
+| Surface pixel format | Result |
+|---|---|
+| `420v`, `420f` | Multiplane NV12: luma and chroma each wrap the surface at their plane's offset and row stride, whether or not the planes are contiguous |
+| `yuvs` | One YUYV tensor at the surface's row pitch |
+| `BGRA` | One BGRA tensor at the surface's row pitch |
+
+Any other pixel format returns `InvalidArgument` naming its FourCC, and a plane that does not hold its image, or a `420v` or `420f` surface with an odd width or height, returns `InvalidShape`. The surface is retained for the tensor's lifetime. The wrap does not set colorimetry; set it on the result.
+
 ## BufferIdentity
 
 `BufferIdentity` provides a stable cache key for a tensor's underlying buffer.

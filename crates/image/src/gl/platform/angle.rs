@@ -19,7 +19,7 @@
 use super::super::iosurface_import;
 use super::super::Egl;
 use super::macos::ApplePlatform;
-use super::{GlPlatform, NvDstPlanes};
+use super::{GlPlatform, NvChromaFormat, NvDstPlanes};
 use crate::{Error, Result};
 use edgefirst_egl as egl;
 use edgefirst_tensor::{DType, PixelFormat, Tensor, TensorDyn};
@@ -306,12 +306,13 @@ impl GlPlatform for AngleClientBuffer {
     type ImportHandle = egl::Surface;
 
     /// A destination that carries a plane offset and no `view_origin` is
-    /// not placed by a zero-copy import.
+    /// not placed by a zero-copy import, unless its planes are a planar
+    /// surface's own (see [`Self::nv_native_planes`]).
     fn dst_import_places<T>(img: &Tensor<T>) -> bool
     where
         T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync + edgefirst_tensor::Element,
     {
-        super::unplaced_destination(img).is_none()
+        super::unplaced_destination(img).is_none() || planar_nv12_extent(img).is_some()
     }
 
     // eglBindTexImage attachments are released at end_gpu_pass.
@@ -322,6 +323,7 @@ impl GlPlatform for AngleClientBuffer {
         super::super::float_dispatch::ZeroCopyFloatSet::PlanarF16;
     const EXTERNAL_OES: bool = false;
     const NV12_DST: bool = true;
+    const NV12_SPLIT_CHROMA: NvChromaFormat = NvChromaFormat::Rg8;
 
     fn load_gl_once(_display: &AngleDisplay) {
         // Loaded once at shared-display init.
@@ -551,52 +553,150 @@ impl GlPlatform for AngleClientBuffer {
         Ok(IoSurfacePbuffer { shared, surface })
     }
 
+    /// Imports plane 0 of a planar NV12 surface (see [`Self::nv_native_planes`])
+    /// as `GL_RED`; any other NV source as its whole surface in one R8 binding.
     fn import_buffer_nv_r8(
         display: &AngleDisplay,
         img: &Tensor<u8>,
         _fmt: PixelFormat,
     ) -> Result<IoSurfacePbuffer> {
-        super::refuse_offset_source(img, "NV source", "EGL_ANGLE_iosurface_client_buffer")?;
-        let surface_ref = img.iosurface_ref().ok_or_else(|| {
-            Error::NotSupported("GL convert: NV source is not IOSurface-backed".into())
-        })?;
-        // Bind the whole physical IOSurface as one R8 (`L008`) texture; the
-        // shader addresses Y/UV texels within it.
-        let (pw, ph) = img.iosurface_physical_dims().ok_or_else(|| {
-            Error::NotSupported("GL convert: NV source has no IOSurface physical dims".into())
-        })?;
-        let shared = display.shared;
-        // SAFETY: as in `import_buffer`.
-        let surface = unsafe {
-            iosurface_import::create_iosurface_pbuffer(
-                &shared.egl,
-                shared.display,
-                shared.config,
-                surface_ref,
-                PixelFormat::Grey,
-                DType::U8,
-                pw,
-                ph,
-            )?
-        };
-        Ok(IoSurfacePbuffer { shared, surface })
+        match Self::nv_native_planes(img) {
+            Some((w, h)) => import_plane(display, img, 0, iosurface_import::GL_RED, w, h),
+            None => import_nv_combined(display, img),
+        }
     }
 
+    /// Imports plane 1 of a planar NV12 surface, from the chroma tensor's
+    /// surface, as `GL_RG` at half the luma extent.
+    fn import_buffer_nv_chroma(
+        display: &AngleDisplay,
+        img: &Tensor<u8>,
+        fmt: PixelFormat,
+    ) -> Result<IoSurfacePbuffer> {
+        let ((w, h), chroma) = Self::nv_native_planes(img)
+            .zip(img.chroma())
+            .ok_or_else(|| {
+                Error::NotSupported(format!(
+                    "{fmt:?} source is not a planar IOSurface and has no chroma plane of its own"
+                ))
+            })?;
+        import_plane(display, chroma, 1, iosurface_import::GL_RG, w / 2, h / 2)
+    }
+
+    /// The luma extent of a multiplane NV12 tensor whose luma and chroma wrap
+    /// one planar IOSurface at its plane 0 and plane 1.
+    fn nv_native_planes(img: &Tensor<u8>) -> Option<(usize, usize)> {
+        planar_nv12_extent(img)
+    }
+
+    /// A destination [`Self::nv_native_planes`] accepts imports `Split`:
+    /// plane 0 as `GL_RED` and plane 1 as `GL_RG` at half the luma extent.
+    /// Any other imports its whole surface as `Combined`.
     fn import_nv12_dst(
         display: &AngleDisplay,
         img: &Tensor<u8>,
     ) -> Result<NvDstPlanes<IoSurfacePbuffer>> {
+        if let (Some((w, h)), Some(chroma)) = (Self::nv_native_planes(img), img.chroma()) {
+            return Ok(NvDstPlanes::Split {
+                luma: import_plane(display, img, 0, iosurface_import::GL_RED, w, h)?,
+                chroma: import_plane(display, chroma, 1, iosurface_import::GL_RG, w / 2, h / 2)?,
+                chroma_rows: (h / 2) as u32,
+                chroma_format: Self::NV12_SPLIT_CHROMA,
+            });
+        }
         let (width, height) = img.iosurface_physical_dims().ok_or_else(|| {
             Error::NotSupported(
                 "GL convert: NV12 destination has no IOSurface physical dims".into(),
             )
         })?;
         Ok(NvDstPlanes::Combined {
-            plane: Self::import_buffer_nv_r8(display, img, PixelFormat::Nv12)?,
+            plane: import_nv_combined(display, img)?,
             width: width as u32,
             height: height as u32,
         })
     }
+}
+
+/// The luma extent of a multiplane NV12 tensor whose luma and chroma wrap
+/// one planar IOSurface at its plane 0 and plane 1.
+fn planar_nv12_extent<T>(img: &Tensor<T>) -> Option<(usize, usize)>
+where
+    T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync + edgefirst_tensor::Element,
+{
+    if img.format() != Some(PixelFormat::Nv12) {
+        return None;
+    }
+    let chroma = img.chroma()?;
+    let id = iosurface_import::surface_id(img)?;
+    if iosurface_import::surface_id(chroma) != Some(id) {
+        return None;
+    }
+    let at_plane = |t: &Tensor<T>, plane: i32| {
+        let offset = t.plane_offset().unwrap_or(0);
+        (iosurface_import::plane_index(t, offset) == Some(plane)).then_some(())
+    };
+    at_plane(img, 0)?;
+    at_plane(chroma, 1)?;
+    Some((img.width()?, img.height()?))
+}
+
+/// Binds a tensor's whole IOSurface as one R8 (`L008`) texture at the
+/// surface's physical extent, for a shader that addresses Y and UV texels
+/// within it.
+fn import_nv_combined(display: &AngleDisplay, img: &Tensor<u8>) -> Result<IoSurfacePbuffer> {
+    super::refuse_offset_source(img, "NV source", "EGL_ANGLE_iosurface_client_buffer")?;
+    let surface_ref = img.iosurface_ref().ok_or_else(|| {
+        Error::NotSupported("GL convert: NV source is not IOSurface-backed".into())
+    })?;
+    let (pw, ph) = img.iosurface_physical_dims().ok_or_else(|| {
+        Error::NotSupported("GL convert: NV source has no IOSurface physical dims".into())
+    })?;
+    let shared = display.shared;
+    // SAFETY: `surface_ref` is borrowed from a live tensor.
+    let surface = unsafe {
+        iosurface_import::create_iosurface_pbuffer(
+            &shared.egl,
+            shared.display,
+            shared.config,
+            surface_ref,
+            PixelFormat::Grey,
+            DType::U8,
+            pw,
+            ph,
+        )?
+    };
+    Ok(IoSurfacePbuffer { shared, surface })
+}
+
+/// Binds plane `plane` of `img`'s IOSurface as a `width`x`height` texture of
+/// `internal_format`.
+fn import_plane(
+    display: &AngleDisplay,
+    img: &Tensor<u8>,
+    plane: i32,
+    internal_format: i32,
+    width: usize,
+    height: usize,
+) -> Result<IoSurfacePbuffer> {
+    let surface_ref = img.iosurface_ref().ok_or_else(|| {
+        Error::NotSupported("GL convert: NV plane is not IOSurface-backed".into())
+    })?;
+    let shared = display.shared;
+    // SAFETY: `surface_ref` is borrowed from a live tensor whose surface has
+    // plane `plane` of at least `width`x`height`.
+    let surface = unsafe {
+        iosurface_import::create_iosurface_plane_pbuffer(
+            &shared.egl,
+            shared.display,
+            shared.config,
+            surface_ref,
+            plane,
+            internal_format,
+            width,
+            height,
+        )?
+    };
+    Ok(IoSurfacePbuffer { shared, surface })
 }
 
 #[cfg(test)]

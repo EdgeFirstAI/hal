@@ -511,7 +511,7 @@ test-capi-modular: capi-libs
 
 # Runs the named edgefirst-tensor test targets against the dynamic backend.
 DYNAMIC_TEST_TARGETS := dynamic_primitives protocol_roundtrip map_access \
-	identity scenarios no_global_state vocabulary logical_shape
+	identity scenarios no_global_state vocabulary logical_shape planar_iosurface
 
 .PHONY: test-tensor-dynamic
 test-tensor-dynamic: capi-libs

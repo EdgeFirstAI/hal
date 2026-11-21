@@ -8837,6 +8837,308 @@ mod gl_tests {
         );
     }
 
+    /// CoreVideo IOSurface sources wrapped by `TensorDyn::from_planar_iosurface`.
+    #[cfg(target_os = "macos")]
+    mod planar_iosurface {
+        use super::*;
+        use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath, NvSampling};
+        use crate::test_support::{corevideo_buffer, report_skip, CoreVideoBuffer};
+        use crate::{CPUProcessor, ConvertOptions, Flip};
+
+        /// A GL processor, or `None` after reporting why the test skips.
+        fn gl_processor(test: &str) -> Option<GLProcessorST> {
+            if !is_gpu_image_buffer_available() {
+                report_skip(&format!("{test} - no zero-copy GPU buffers"));
+                return None;
+            }
+            match GLProcessorST::new(None, None) {
+                Ok(gl) => Some(gl),
+                Err(e) => {
+                    report_skip(&format!("{test} - GL not available: {e}"));
+                    None
+                }
+            }
+        }
+
+        fn wrap(buf: &CoreVideoBuffer) -> TensorDyn {
+            unsafe { TensorDyn::from_planar_iosurface(buf.surface(), None) }
+                .expect("from_planar_iosurface")
+        }
+
+        /// Fills a `w`-wide NV12 buffer with a gradient offset by `seed`.
+        fn fill_nv12(buf: &CoreVideoBuffer, w: usize, seed: usize) {
+            buf.fill_rows(|plane, row, bytes| {
+                if plane == 0 {
+                    for (x, b) in bytes[..w].iter_mut().enumerate() {
+                        *b = ((x * 9 + row * 5 + seed) & 0xff) as u8;
+                    }
+                } else {
+                    for (cx, pair) in bytes[..w].chunks_exact_mut(2).enumerate() {
+                        pair[0] = ((cx * 11 + 30 + seed) & 0xff) as u8;
+                        pair[1] = ((row * 7 + 200 + seed) & 0xff) as u8;
+                    }
+                }
+            });
+        }
+
+        /// Fills a `w`x`h` NV12 buffer with ramps that do not wrap.
+        fn fill_smooth_nv12(buf: &CoreVideoBuffer, w: usize, h: usize) {
+            buf.fill_rows(|plane, row, bytes| {
+                if plane == 0 {
+                    for (x, b) in bytes[..w].iter_mut().enumerate() {
+                        *b = (16 + x * 200 / w + row * 20 / h) as u8;
+                    }
+                } else {
+                    for (cx, pair) in bytes[..w].chunks_exact_mut(2).enumerate() {
+                        pair[0] = (40 + cx * 300 / w) as u8;
+                        pair[1] = (200 - row * 300 / h) as u8;
+                    }
+                }
+            });
+        }
+
+        fn rgba(w: usize, h: usize, memory: TensorMemory) -> TensorDyn {
+            TensorDyn::image(
+                w,
+                h,
+                PixelFormat::Rgba,
+                DType::U8,
+                Some(memory),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .unwrap()
+        }
+
+        /// The RGBA pixels of `t` without row padding.
+        fn tight_rgba(t: &TensorDyn) -> Vec<u8> {
+            let (w, h) = (t.width().unwrap(), t.height().unwrap());
+            let t = t.as_u8().unwrap();
+            let stride = t.effective_row_stride().unwrap();
+            let map = t.map().unwrap();
+            let bytes = map.as_slice();
+            (0..h)
+                .flat_map(|y| bytes[y * stride..y * stride + w * 4].iter().copied())
+                .collect()
+        }
+
+        /// Converts `src` into a `w`x`h` RGBA IOSurface on GL and into memory
+        /// on the CPU, and returns both results' pixels.
+        fn convert_both(
+            gl: &mut GLProcessorST,
+            src: &TensorDyn,
+            w: usize,
+            h: usize,
+            options: ConvertOptions,
+        ) -> (Vec<u8>, Vec<u8>) {
+            let mut gpu = rgba(w, h, TensorMemory::DmaBuf);
+            gl.begin_gpu_pass();
+            let result = gl.convert(src, &mut gpu, Some(options));
+            gl.end_gpu_pass_if_synced();
+            result.unwrap_or_else(|e| panic!("GL convert to {w}x{h} RGBA: {e}"));
+            let mut cpu = rgba(w, h, TensorMemory::Mem);
+            CPUProcessor::new()
+                .convert(src, &mut cpu, Some(options))
+                .unwrap_or_else(|e| panic!("CPU convert to {w}x{h} RGBA: {e}"));
+            (tight_rgba(&gpu), tight_rgba(&cpu))
+        }
+
+        /// The largest and the mean absolute difference over the RGB channels.
+        fn rgb_diff(a: &[u8], b: &[u8]) -> (u8, f64) {
+            assert_eq!(a.len(), b.len());
+            let (mut max, mut sum, mut n) = (0u8, 0u64, 0u64);
+            for (pa, pb) in a.chunks_exact(4).zip(b.chunks_exact(4)) {
+                for c in 0..3 {
+                    let d = pa[c].abs_diff(pb[c]);
+                    max = max.max(d);
+                    sum += d as u64;
+                    n += 1;
+                }
+            }
+            (max, sum as f64 / n as f64)
+        }
+
+        fn assert_sampled_by_plane(gl: &GLProcessorST, what: &str) {
+            assert_eq!(
+                gl.last_nv_convert_path,
+                NvConvertPath::ShaderR8,
+                "{what}: NV path"
+            );
+            assert_eq!(
+                gl.last_nv_sampling,
+                Some(NvSampling::Hardware),
+                "{what}: NV sampling"
+            );
+        }
+
+        /// `420v` and `420f` CoreVideo sources convert to RGBA on GL by plane, within 3 of the CPU.
+        #[test]
+        fn test_planar_nv12_to_rgba_opengl_macos() {
+            let Some(mut gl) = gl_processor(function!()) else {
+                return;
+            };
+            for (w, h, fourcc) in [
+                (1920usize, 1080usize, b"420v"),
+                (1000, 562, b"420v"),
+                (640, 480, b"420f"),
+            ] {
+                let what = format!("{} {w}x{h}", String::from_utf8_lossy(fourcc));
+                let buf = corevideo_buffer(w, h, fourcc);
+                fill_nv12(&buf, w, 0);
+                let src = wrap(&buf);
+                assert!(src.is_multiplane(), "{what}: wrap is multiplane");
+                let (gpu, cpu) = convert_both(&mut gl, &src, w, h, ConvertOptions::default());
+                let (max, _) = rgb_diff(&gpu, &cpu);
+                assert!(max <= 3, "{what}: GL vs CPU max channel diff {max} > 3");
+                assert_sampled_by_plane(&gl, &what);
+            }
+        }
+
+        /// A planar NV12 source resized to 640x360 and flipped horizontally matches the CPU within a mean of 2.
+        #[test]
+        fn test_planar_nv12_resized_and_flipped_opengl_macos() {
+            let Some(mut gl) = gl_processor(function!()) else {
+                return;
+            };
+            for (w, h) in [(1920usize, 1080usize), (1000, 562)] {
+                let what = format!("420v {w}x{h} -> 640x360");
+                let buf = corevideo_buffer(w, h, b"420v");
+                fill_smooth_nv12(&buf, w, h);
+                let src = wrap(&buf);
+                let options = ConvertOptions::default().flip(Flip::Horizontal);
+                let (gpu, cpu) = convert_both(&mut gl, &src, 640, 360, options);
+                let (_, mean) = rgb_diff(&gpu, &cpu);
+                assert!(
+                    mean <= 2.0,
+                    "{what}: GL vs CPU mean channel diff {mean:.3} > 2"
+                );
+                assert_sampled_by_plane(&gl, &what);
+            }
+        }
+
+        /// A planar surface refilled and wrapped again between two conversions is read again by the second.
+        #[test]
+        fn test_a_recycled_planar_surface_is_read_again_opengl_macos() {
+            let Some(mut gl) = gl_processor(function!()) else {
+                return;
+            };
+            let (w, h) = (1000usize, 562usize);
+            let buf = corevideo_buffer(w, h, b"420v");
+            fill_nv12(&buf, w, 0);
+            let src = wrap(&buf);
+            let (first, _) = convert_both(&mut gl, &src, w, h, ConvertOptions::default());
+            let before = gl.egl_cache_stats();
+            drop(src);
+
+            fill_nv12(&buf, w, 97);
+            let src = wrap(&buf);
+            let (second, expected) = convert_both(&mut gl, &src, w, h, ConvertOptions::default());
+            assert_sampled_by_plane(&gl, "refilled surface");
+            let after = gl.egl_cache_stats();
+            assert_eq!(
+                after.nv_r8.misses, before.nv_r8.misses,
+                "luma plane re-imported"
+            );
+            assert_eq!(
+                after.nv_uv.misses, before.nv_uv.misses,
+                "chroma plane re-imported"
+            );
+            assert!(
+                after.nv_r8.hits > before.nv_r8.hits,
+                "luma import not reused"
+            );
+            assert!(
+                after.nv_uv.hits > before.nv_uv.hits,
+                "chroma import not reused"
+            );
+            let (max, _) = rgb_diff(&second, &expected);
+            assert!(
+                max <= 3,
+                "refilled surface: GL vs CPU max channel diff {max} > 3"
+            );
+            assert_ne!(
+                first, second,
+                "the second conversion read the first pattern"
+            );
+        }
+
+        /// A `yuvs` CoreVideo source converts to RGBA on GL within 3 of the CPU, and a `BGRA` one
+        /// converts to BGRA through the image processor unchanged.
+        #[test]
+        fn test_yuvs_on_gl_and_bgra_through_the_processor_macos() {
+            let Some(mut gl) = gl_processor(function!()) else {
+                return;
+            };
+            let (w, h) = (640usize, 480usize);
+
+            let yuvs = corevideo_buffer(w, h, b"yuvs");
+            let luma = |x: usize, row: usize| (16 + x * 200 / w + row * 20 / h) as u8;
+            yuvs.fill_rows(|_, row, bytes| {
+                for (cx, quad) in bytes[..w * 2].chunks_exact_mut(4).enumerate() {
+                    quad[0] = luma(cx * 2, row);
+                    quad[1] = (40 + cx * 300 / w) as u8;
+                    quad[2] = luma(cx * 2 + 1, row);
+                    quad[3] = (200 - row * 150 / h) as u8;
+                }
+            });
+
+            let src = wrap(&yuvs);
+            assert_eq!(
+                src.format(),
+                Some(PixelFormat::Yuyv),
+                "yuvs: wrapped format"
+            );
+            let imports = gl.convert_stats().src_imports;
+            let (gpu, cpu) = convert_both(&mut gl, &src, w, h, ConvertOptions::default());
+            assert!(
+                gl.convert_stats().src_imports > imports,
+                "yuvs: GL did not import the surface"
+            );
+            let (max, _) = rgb_diff(&gpu, &cpu);
+            assert!(max <= 3, "yuvs: GL vs CPU max channel diff {max} > 3");
+
+            let bgra = corevideo_buffer(w, h, b"BGRA");
+            let pixel = |x: usize, row: usize| {
+                [
+                    ((x * 3) & 0xff) as u8,
+                    ((row * 5) & 0xff) as u8,
+                    ((x + row) & 0xff) as u8,
+                    255,
+                ]
+            };
+            bgra.fill_rows(|_, row, bytes| {
+                for (x, px) in bytes[..w * 4].chunks_exact_mut(4).enumerate() {
+                    px.copy_from_slice(&pixel(x, row));
+                }
+            });
+            let src = wrap(&bgra);
+            assert_eq!(
+                src.format(),
+                Some(PixelFormat::Bgra),
+                "BGRA: wrapped format"
+            );
+            let mut dst = TensorDyn::image(
+                w,
+                h,
+                PixelFormat::Bgra,
+                DType::U8,
+                Some(TensorMemory::Mem),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .unwrap();
+            crate::ImageProcessor::new()
+                .expect("image processor")
+                .convert(&src, &mut dst, None)
+                .expect("BGRA to BGRA");
+            let expected: Vec<u8> = (0..h)
+                .flat_map(|row| (0..w).flat_map(move |x| pixel(x, row)))
+                .collect();
+            assert!(
+                tight_rgba(&dst) == expected,
+                "BGRA: the converted pixels differ from the source"
+            );
+        }
+    }
+
     /// A DMA NV12 source converts on the GPU, through `ExternalSampler` or `ShaderR8`.
     #[test]
     #[cfg(target_os = "linux")]

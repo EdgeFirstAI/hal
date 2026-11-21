@@ -12,7 +12,7 @@ use std::time::Instant;
 use super::EglDisplayKind;
 
 use super::cache::{BufferImportKey, CacheKind, GlCacheStats, ImportCache};
-use super::platform::{GlPlatform, NvDstPlanes, Platform};
+use super::platform::{GlPlatform, NvChromaFormat, NvDstPlanes, Platform};
 
 /// The platform display/context owned by this processor — `GlContext` on
 /// Linux, `AngleDisplay` (per-processor ANGLE context) on macOS.
@@ -596,10 +596,16 @@ struct Nv12Programs {
     chroma: GlProgram,
     /// `NV12_CHROMA_FILL_FRAGMENT`.
     fill: GlProgram,
+    /// `NV12_CHROMA_RG_FRAGMENT`.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    chroma_rg: GlProgram,
     /// `y_coeffs`, `y_offset` of `luma`.
     luma_locs: [i32; 2],
     /// `u_coeffs`, `v_coeffs`, `c_offset`, `chroma_row` of `chroma`.
     chroma_locs: [i32; 4],
+    /// `u_coeffs`, `v_coeffs`, `c_offset` of `chroma_rg`.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    chroma_rg_locs: [i32; 3],
     /// `uv` of `fill`.
     fill_uv: i32,
 }
@@ -610,8 +616,12 @@ impl Nv12Programs {
         let luma = build(super::shaders_common::NV12_LUMA_FRAGMENT)?;
         let chroma = build(super::shaders_common::NV12_CHROMA_R8_FRAGMENT)?;
         let fill = build(super::shaders_common::NV12_CHROMA_FILL_FRAGMENT)?;
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let chroma_rg = build(super::shaders_common::NV12_CHROMA_RG_FRAGMENT)?;
         luma.load_uniform_1i(c"tex", 0)?;
         chroma.load_uniform_1i(c"tex", 0)?;
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        chroma_rg.load_uniform_1i(c"tex", 0)?;
         let loc = |program: &GlProgram, name: &CStr| {
             // SAFETY: `program` is linked on this thread's current context.
             unsafe { edgefirst_gl::gl::GetUniformLocation(program.id, name.as_ptr()) }
@@ -624,10 +634,18 @@ impl Nv12Programs {
                 loc(&chroma, c"c_offset"),
                 loc(&chroma, c"chroma_row"),
             ],
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            chroma_rg_locs: [
+                loc(&chroma_rg, c"u_coeffs"),
+                loc(&chroma_rg, c"v_coeffs"),
+                loc(&chroma_rg, c"c_offset"),
+            ],
             fill_uv: loc(&fill, c"uv"),
             luma,
             chroma,
             fill,
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            chroma_rg,
         })
     }
 }
@@ -4957,8 +4975,10 @@ impl GLProcessorST {
     /// Forcing an unavailable path logs a warning and returns the viable one.
     ///
     /// Capability:
-    /// - [`NvConvertPath::ShaderR8`] needs a single combined-plane buffer: it
-    ///   covers single-plane NV12/NV16/NV24 but not true-multiplane NV12.
+    /// - [`NvConvertPath::ShaderR8`] needs a single combined-plane buffer, or
+    ///   planes the platform imports on their own
+    ///   ([`GlPlatform::nv_native_planes`]): it covers single-plane
+    ///   NV12/NV16/NV24 and such a multiplane NV12.
     /// - [`NvConvertPath::ExternalSampler`] (samplerExternalOES) covers NV12
     ///   only (incl. multiplane).
     ///
@@ -4970,12 +4990,14 @@ impl GLProcessorST {
         src_fmt: PixelFormat,
         render_fmt: PixelFormat,
     ) -> NvConvertPath {
-        // `ShaderR8` applies to single-plane NV12/NV16/NV24; every other source
-        // takes `ExternalSampler`.
+        // `ShaderR8` applies to single-plane NV12/NV16/NV24 and to a multiplane
+        // source whose planes import natively; every other source takes
+        // `ExternalSampler`.
         let shader_capable = matches!(
             src_fmt,
             PixelFormat::Nv12 | PixelFormat::Nv16 | PixelFormat::Nv24
-        ) && !src.is_multiplane();
+        ) && (!src.is_multiplane()
+            || Platform::nv_native_planes(src).is_some());
         if !shader_capable {
             return NvConvertPath::ExternalSampler;
         }
@@ -6156,13 +6178,16 @@ impl GLProcessorST {
         coeffs: &crate::colorimetry::RgbToYuvCoeffs,
     ) -> crate::Result<()> {
         let (w, h) = (w as i32, h as i32);
-        let (luma, chroma, chroma_row, chroma_h) = match planes {
-            NvDstPlanes::Combined { plane, .. } => (plane, None, h, h / 2),
+        let (luma, chroma, chroma_row, chroma_h, chroma_format) = match planes {
+            NvDstPlanes::Combined { plane, .. } => {
+                (plane, None, h, h / 2, NvChromaFormat::R8Interleaved)
+            }
             NvDstPlanes::Split {
                 luma,
                 chroma,
                 chroma_rows,
-            } => (luma, Some(chroma), 0, chroma_rows as i32),
+                chroma_format,
+            } => (luma, Some(chroma), 0, chroma_rows as i32, chroma_format),
         };
         let scissor = |x: i32, y: i32, sw: i32, sh: i32| unsafe {
             edgefirst_gl::gl::Scissor(x, y, sw, sh);
@@ -6208,6 +6233,13 @@ impl GLProcessorST {
                 Self::attach_import_target(&self.gl_context, &mut self.nv12_chroma_texture, chroma)?
             };
         }
+        match chroma_format {
+            NvChromaFormat::R8Interleaved => {}
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            NvChromaFormat::Rg8 => {
+                return self.draw_nv12_chroma_rg((w / 2, chroma_h), band, fill, coeffs);
+            }
+        }
         unsafe { edgefirst_gl::gl::Viewport(0, chroma_row, w, chroma_h) };
         let p = self.nv12_programs()?;
         if let Some([_, u, v]) = fill {
@@ -6246,6 +6278,53 @@ impl GLProcessorST {
             );
             edgefirst_gl::gl::Uniform1f(c_offset, coeffs.c_offset as f32);
             edgefirst_gl::gl::Uniform1i(row, chroma_row);
+        }
+        self.bind_intermediate();
+        self.draw_fullscreen_quad()
+    }
+
+    /// Pass 3 of [`Self::convert_to_nv12`] into the attached RG8 chroma
+    /// target of `cw`x`ch` texels: fill, then one (U, V) texel per 2x2 block
+    /// of `packed_rgb_intermediate_tex`. Leaves `SCISSOR_TEST` enabled when
+    /// `band` is set.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    fn draw_nv12_chroma_rg(
+        &mut self,
+        (cw, ch): (i32, i32),
+        band: Option<crate::Rect>,
+        fill: Option<[u8; 3]>,
+        coeffs: &crate::colorimetry::RgbToYuvCoeffs,
+    ) -> crate::Result<()> {
+        // SAFETY: on the GL thread with the chroma target attached to `convert_fbo`.
+        unsafe {
+            edgefirst_gl::gl::Viewport(0, 0, cw, ch);
+            if let Some([_, u, v]) = fill {
+                edgefirst_gl::gl::Disable(edgefirst_gl::gl::SCISSOR_TEST);
+                edgefirst_gl::gl::ClearColor(u as f32 / 255.0, v as f32 / 255.0, 0.0, 1.0);
+                edgefirst_gl::gl::Clear(edgefirst_gl::gl::COLOR_BUFFER_BIT);
+            }
+            if let Some(r) = band {
+                let (x0, x1) = (r.left / 2, (r.left + r.width).div_ceil(2));
+                let (y0, y1) = (r.top / 2, (r.top + r.height).div_ceil(2));
+                edgefirst_gl::gl::Scissor(x0 as i32, y0 as i32, (x1 - x0) as i32, (y1 - y0) as i32);
+                edgefirst_gl::gl::Enable(edgefirst_gl::gl::SCISSOR_TEST);
+            }
+            let p = self.nv12_programs()?;
+            edgefirst_gl::gl::UseProgram(p.chroma_rg.id);
+            let [u_coeffs, v_coeffs, c_offset] = p.chroma_rg_locs;
+            edgefirst_gl::gl::Uniform3f(
+                u_coeffs,
+                coeffs.u[0] as f32,
+                coeffs.u[1] as f32,
+                coeffs.u[2] as f32,
+            );
+            edgefirst_gl::gl::Uniform3f(
+                v_coeffs,
+                coeffs.v[0] as f32,
+                coeffs.v[1] as f32,
+                coeffs.v[2] as f32,
+            );
+            edgefirst_gl::gl::Uniform1f(c_offset, coeffs.c_offset as f32);
         }
         self.bind_intermediate();
         self.draw_fullscreen_quad()
@@ -7291,8 +7370,13 @@ impl GLProcessorST {
         let mut r8_src = r8_src;
         let mut native_extent = r8_src.and_then(|_| Platform::nv_native_planes(src));
         // A bilinear draw that filters in the shader uploads the combined plane
-        // from the CPU map when the source can be read.
-        if native_extent.is_some() && bilinear && !hw_filter && src.cpu_access().reads() {
+        // from the CPU map when the source has one and can be read.
+        if native_extent.is_some()
+            && bilinear
+            && !hw_filter
+            && !src.is_multiplane()
+            && src.cpu_access().reads()
+        {
             native_extent = None;
             r8_src = None;
         }
@@ -7314,6 +7398,12 @@ impl GLProcessorST {
         } else {
             None
         };
+        if r8_src.is_none() && src.is_multiplane() {
+            return Err(Error::NotSupported(format!(
+                "a multiplane {src_fmt:?} source has no combined plane to upload; \
+                 converting on the CPU"
+            )));
+        }
         // Y2Y is offered for NV12 colour draws only.
         let mut sampling = if native_planes {
             NvSampling::Hardware
@@ -7924,7 +8014,8 @@ impl GLProcessorST {
     }
 
     /// Look up or create the chroma-plane (U, V) EGLImage of a single-plane
-    /// NV* source for [`NvSampling::Hardware`], cached in `nv_uv_egl_cache`.
+    /// NV* source, or of a source whose planes import natively, for
+    /// [`NvSampling::Hardware`], cached in `nv_uv_egl_cache`.
     /// Declines an unaligned chroma plane offset on GPUs that misplace it.
     fn get_or_create_nv_uv_egl_image(
         &mut self,
@@ -7944,7 +8035,10 @@ impl GLProcessorST {
         let stride = img
             .effective_row_stride()
             .unwrap_or(img.width().ok_or(Error::NotAnImage)?);
-        let offset = img.plane_offset().unwrap_or(0) + stride * height;
+        let offset = match img.chroma().filter(|_| native) {
+            Some(chroma) => chroma.plane_offset().unwrap_or(0),
+            None => img.plane_offset().unwrap_or(0) + stride * height,
+        };
         if rejects_unaligned_import_offset(self.misplaces_unaligned_offsets(), offset) {
             return Err(crate::Error::NotSupported(format!(
                 "chroma plane offset {offset} is not {DMA_IMPORT_OFFSET_ALIGN}-byte aligned"
@@ -8331,6 +8425,7 @@ impl GLProcessorST {
                 luma,
                 chroma: handle(&self.dst_egl_cache, &key)?,
                 chroma_rows: (dst_h / 2) as u32,
+                chroma_format: Platform::NV12_SPLIT_CHROMA,
             },
             None => NvDstPlanes::Combined {
                 plane: luma,
