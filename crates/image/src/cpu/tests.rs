@@ -6479,8 +6479,8 @@ mod cpu_tests {
         }
     }
 
-    /// Converts `src` into a fresh `dst_w`x`dst_h` destination, returning its
-    /// bytes, or `None` when the conversion is not supported.
+    /// Converts `src` into a fresh `dst_w`x`dst_h` destination and returns its
+    /// bytes. Panics, naming the destination, when allocation or conversion fails.
     fn convert_to_bytes(
         cpu: &mut CPUProcessor,
         src: &TensorDyn,
@@ -6489,7 +6489,7 @@ mod cpu_tests {
         fmt: PixelFormat,
         dtype: DType,
         options: Option<crate::ConvertOptions>,
-    ) -> Option<Vec<u8>> {
+    ) -> Vec<u8> {
         let mut dst = TensorDyn::image(
             dst_w,
             dst_h,
@@ -6498,10 +6498,11 @@ mod cpu_tests {
             mem(),
             edgefirst_tensor::CpuAccess::ReadWrite,
         )
-        .ok()?;
+        .unwrap_or_else(|e| panic!("allocating {fmt} {dtype:?}: {e}"));
         dyn_fill_zero(&mut dst);
-        cpu.convert(src, &mut dst, options).ok()?;
-        Some(dyn_dst_bytes(&dst))
+        cpu.convert(src, &mut dst, options)
+            .unwrap_or_else(|e| panic!("converting to {fmt} {dtype:?}: {e}"));
+        dyn_dst_bytes(&dst)
     }
 
     fn dyn_fill_zero(t: &mut TensorDyn) {
@@ -6578,10 +6579,8 @@ mod cpu_tests {
                 (PixelFormat::PlanarRgb, DType::U8),
                 (PixelFormat::PlanarRgb, DType::F16),
             ] {
-                let want = convert_to_bytes(&mut cpu, &rgba, 320, 320, fmt, dtype, Some(options))
-                    .unwrap_or_else(|| panic!("RGBA to {fmt} {dtype:?} ({name})"));
-                let got = convert_to_bytes(&mut cpu, &bgra, 320, 320, fmt, dtype, Some(options))
-                    .unwrap_or_else(|| panic!("BGRA to {fmt} {dtype:?} ({name})"));
+                let want = convert_to_bytes(&mut cpu, &rgba, 320, 320, fmt, dtype, Some(options));
+                let got = convert_to_bytes(&mut cpu, &bgra, 320, 320, fmt, dtype, Some(options));
                 assert_eq!(got, want, "BGRA to {fmt} {dtype:?} ({name})");
             }
         }
@@ -6592,7 +6591,7 @@ mod cpu_tests {
         let (rgba, _) = rgba_and_bgra_sources(64, 32, None, |_, _| [10, 20, 30, 255]).unwrap();
         let options = crate::ConvertOptions::new().crop(Crop::letterbox(pad));
         let mut cpu = CPUProcessor::new();
-        let out = convert_to_bytes(&mut cpu, &rgba, 64, 64, fmt, dtype, Some(options)).unwrap();
+        let out = convert_to_bytes(&mut cpu, &rgba, 64, 64, fmt, dtype, Some(options));
         let px = dtype.size() * 4;
         out[..px].to_vec()
     }
@@ -6646,8 +6645,8 @@ mod cpu_tests {
         let (rgba, bgra) = rgba_and_bgra_sources(100, 40, Some(448), bgra_test_pixel)?;
         let mut cpu = CPUProcessor::new();
         for fmt in [PixelFormat::Rgba, PixelFormat::Nv12] {
-            let want = convert_to_bytes(&mut cpu, &rgba, 100, 40, fmt, DType::U8, None).unwrap();
-            let got = convert_to_bytes(&mut cpu, &bgra, 100, 40, fmt, DType::U8, None).unwrap();
+            let want = convert_to_bytes(&mut cpu, &rgba, 100, 40, fmt, DType::U8, None);
+            let got = convert_to_bytes(&mut cpu, &bgra, 100, 40, fmt, DType::U8, None);
             assert_eq!(got, want, "padded BGRA to {fmt}");
         }
         Ok(())
@@ -6659,10 +6658,8 @@ mod cpu_tests {
         for (w, h, seed) in [(64, 48, 0), (32, 16, 0), (64, 48, 9)] {
             let pixel = move |x: usize, y: usize| bgra_test_pixel(x + seed, y + seed);
             let (rgba, bgra) = rgba_and_bgra_sources(w, h, None, pixel)?;
-            let want = convert_to_bytes(&mut cpu, &rgba, w, h, PixelFormat::Rgba, DType::U8, None)
-                .unwrap();
-            let got = convert_to_bytes(&mut cpu, &bgra, w, h, PixelFormat::Rgba, DType::U8, None)
-                .unwrap();
+            let want = convert_to_bytes(&mut cpu, &rgba, w, h, PixelFormat::Rgba, DType::U8, None);
+            let got = convert_to_bytes(&mut cpu, &bgra, w, h, PixelFormat::Rgba, DType::U8, None);
             assert_eq!(got, want, "{w}x{h} seed {seed}");
         }
         Ok(())
@@ -6672,10 +6669,9 @@ mod cpu_tests {
     fn bgra_to_bgra_resize_keeps_channel_order() -> Result<()> {
         let (_, bgra) = rgba_and_bgra_sources(64, 48, None, bgra_test_pixel)?;
         let mut cpu = CPUProcessor::new();
-        let got =
-            convert_to_bytes(&mut cpu, &bgra, 32, 24, PixelFormat::Bgra, DType::U8, None).unwrap();
+        let got = convert_to_bytes(&mut cpu, &bgra, 32, 24, PixelFormat::Bgra, DType::U8, None);
         let mut want =
-            convert_to_bytes(&mut cpu, &bgra, 32, 24, PixelFormat::Rgba, DType::U8, None).unwrap();
+            convert_to_bytes(&mut cpu, &bgra, 32, 24, PixelFormat::Rgba, DType::U8, None);
         for px in want.as_chunks_mut::<4>().0 {
             px.swap(0, 2);
         }
@@ -6687,8 +6683,7 @@ mod cpu_tests {
     fn bgra_to_bgra_resize_into_write_only_destination() -> Result<()> {
         let (_, bgra) = rgba_and_bgra_sources(64, 48, None, bgra_test_pixel)?;
         let mut cpu = CPUProcessor::new();
-        let want =
-            convert_to_bytes(&mut cpu, &bgra, 32, 24, PixelFormat::Bgra, DType::U8, None).unwrap();
+        let want = convert_to_bytes(&mut cpu, &bgra, 32, 24, PixelFormat::Bgra, DType::U8, None);
         let mut dst = TensorDyn::image(
             32,
             24,
