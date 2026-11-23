@@ -6588,6 +6588,59 @@ mod cpu_tests {
         Ok(())
     }
 
+    fn letterbox_pad_bytes(fmt: PixelFormat, dtype: DType, pad: [u8; 4]) -> Vec<u8> {
+        let (rgba, _) = rgba_and_bgra_sources(64, 32, None, |_, _| [10, 20, 30, 255]).unwrap();
+        let options = crate::ConvertOptions::new().crop(Crop::letterbox(pad));
+        let mut cpu = CPUProcessor::new();
+        let out = convert_to_bytes(&mut cpu, &rgba, 64, 64, fmt, dtype, Some(options)).unwrap();
+        let px = dtype.size() * 4;
+        out[..px].to_vec()
+    }
+
+    #[test]
+    fn letterbox_pad_into_bgra_is_written_in_bgra_order() {
+        let pad = letterbox_pad_bytes(PixelFormat::Bgra, DType::U8, [200, 100, 30, 255]);
+        assert_eq!(pad, [30, 100, 200, 255]);
+    }
+
+    #[test]
+    fn letterbox_pad_into_rgba_is_written_in_rgba_order() {
+        let pad = letterbox_pad_bytes(PixelFormat::Rgba, DType::U8, [200, 100, 30, 255]);
+        assert_eq!(pad, [200, 100, 30, 255]);
+    }
+
+    #[test]
+    fn letterbox_pad_into_bgra_f32_is_written_in_bgra_order() {
+        let pad = letterbox_pad_bytes(PixelFormat::Bgra, DType::F32, [200, 100, 30, 255]);
+        let values: Vec<f32> = pad
+            .chunks(4)
+            .map(|b| (f32::from_le_bytes(b.try_into().unwrap()) * 255.0).round())
+            .collect();
+        assert_eq!(values, [30.0, 100.0, 200.0, 255.0]);
+    }
+
+    #[test]
+    fn fill_outside_crop_into_bgra_reorders_the_rgba_fill() {
+        let mut dst = TensorDyn::image(
+            4,
+            4,
+            PixelFormat::Bgra,
+            DType::U8,
+            mem(),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        CPUProcessor::fill_image_outside_crop_u8(
+            dst.as_u8_mut().unwrap(),
+            [200, 100, 30, 255],
+            Rect::new(1, 1, 2, 2),
+            false,
+        )
+        .unwrap();
+        let map = dst.as_u8().unwrap().map().unwrap();
+        assert_eq!(&map.as_slice()[0..4], &[30, 100, 200, 255]);
+    }
+
     #[test]
     fn bgra_source_with_padded_stride_matches_rgba() -> Result<()> {
         let (rgba, bgra) = rgba_and_bgra_sources(100, 40, Some(448), bgra_test_pixel)?;

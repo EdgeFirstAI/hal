@@ -746,7 +746,8 @@ impl CPUProcessor {
     ) -> Result<()> {
         use PixelFormat::*;
         match fmt {
-            Rgba | Bgra => Self::fill_image_outside_crop_(dst, rgba, crop),
+            Rgba => Self::fill_image_outside_crop_(dst, rgba, crop),
+            Bgra => Self::fill_image_outside_crop_(dst, [rgba[2], rgba[1], rgba[0], rgba[3]], crop),
             Rgb => Self::fill_image_outside_crop_(dst, Self::rgba_to_rgb(rgba), crop),
             Grey => Self::fill_image_outside_crop_(dst, Self::rgba_to_grey(rgba), crop),
             Yuyv => {
