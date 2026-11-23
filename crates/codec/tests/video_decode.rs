@@ -12,8 +12,8 @@
 use std::collections::{BTreeSet, VecDeque};
 
 use edgefirst_codec::video::{
-    access_units, DecodeEvent, DecodedFrame, DecoderConfig, EncoderConfig, FrameOptions,
-    OutputMemory, OutputPool, StreamInfo, VideoDecoder, VideoEncoder,
+    access_units, DecodeEvent, DecodedFrame, DecoderConfig, EncodedFrame, EncoderConfig,
+    FrameOptions, OutputMemory, OutputPool, StreamInfo, VideoDecoder, VideoEncoder,
 };
 use edgefirst_codec::{CodecError, Engine, Transfer};
 use edgefirst_tensor::{CpuAccess, DType, PixelFormat, TensorDyn, TensorMemory};
@@ -82,6 +82,23 @@ const RESOLUTION_CHANGE: [u64; 20] = [
     0x50131b5fbe969272,
     0xf07d7d444f1f9dd6,
 ];
+
+/// Encodes `src`. On VideoToolbox, submits it again while the encoder
+/// refuses it with [`CodecError::Timeout`].
+fn encode(
+    enc: &mut VideoEncoder,
+    src: &TensorDyn,
+    opts: &FrameOptions,
+) -> Result<Option<EncodedFrame>, CodecError> {
+    let vt = enc.info().engine == Engine::VideoToolbox;
+    encode_retry::retry(
+        || enc.encode(src, opts),
+        |e| vt && matches!(e, CodecError::Timeout(_)),
+    )
+}
+
+#[path = "support/encode_retry.rs"]
+mod encode_retry;
 
 fn skip(test: &str, why: &str) {
     use std::io::Write;
@@ -156,14 +173,20 @@ fn picture_hash(t: &TensorDyn) -> u64 {
     h
 }
 
+/// Whether the decoder copies pictures into a provided pool, which then holds
+/// NV12 images of the stream's size.
+fn copies_into_provided_pools() -> bool {
+    cfg!(any(windows, target_os = "macos", target_os = "ios"))
+}
+
 /// `n` buffers for a provided pool that holds `w`x`h` pictures. A device
 /// that decodes in place takes plain DMA-BUFs larger than its NV12 buffer
-/// (1.5 bytes per pixel of a padded picture). On Windows, where pictures
+/// (1.5 bytes per pixel of a padded picture). Where pictures
 /// are copied into the pool, each is an NV12 image of exactly that size.
 fn provided_pool(n: usize, (w, h): (usize, usize)) -> Vec<TensorDyn> {
     (0..n)
         .map(|_| {
-            if cfg!(windows) {
+            if copies_into_provided_pools() {
                 TensorDyn::image(
                     w,
                     h,
@@ -320,10 +343,11 @@ fn decodes_into_a_provided_pool() {
     let engine = decoder.engine();
     assert_eq!(run.infos[0].engine, engine);
     // V4L2 decodes into the pool; Media Foundation copies each picture out
-    // of its decoder, on the GPU when it decodes there (DXVA).
+    // of its decoder, on the GPU when it decodes there (DXVA); VideoToolbox
+    // copies each on the CPU.
     let transfer = match engine {
         Engine::MediaFoundation if decoder.device().contains("DXVA") => Transfer::GpuCopy,
-        Engine::MediaFoundation => Transfer::CpuCopy,
+        Engine::MediaFoundation | Engine::VideoToolbox => Transfer::CpuCopy,
         _ => Transfer::ZeroCopy,
     };
     assert_eq!(run.infos[0].transfer, transfer);
@@ -336,10 +360,10 @@ fn frames_held_across_a_resolution_change_keep_their_provided_buffers() {
     if !dma_require::available_or_skip(edgefirst_tensor::is_gpu_buffer_available(), test) {
         return;
     }
-    if cfg!(windows) {
+    if copies_into_provided_pools() {
         return skip(
             test,
-            "a provided pool holds pictures of one size on Windows",
+            "a provided pool holds pictures of one size where the decoder copies into it",
         );
     }
     let pool = provided_pool(14, (1920, 1080));
@@ -393,7 +417,7 @@ fn rejects_a_provided_pool_too_small_for_the_stream() {
     ) {
         return;
     }
-    let pool: Vec<TensorDyn> = if cfg!(windows) {
+    let pool: Vec<TensorDyn> = if copies_into_provided_pools() {
         provided_pool(8, (640, 480))
     } else {
         (0..8)
@@ -569,6 +593,8 @@ fn decodes_what_the_hardware_encoder_produces() {
         Err(CodecError::NoDevice(why)) => return skip(test, &why),
         Err(e) => panic!("encoder open failed: {e}"),
     };
+    let info = encoder.info();
+    eprintln!("{test}: {} hardware {}", info.device, info.hardware);
     let Some(mut decoder) = open(test, DecoderConfig::h264()) else {
         return;
     };
@@ -594,7 +620,7 @@ fn decodes_what_the_hardware_encoder_produces() {
             pts: n,
             ..FrameOptions::default()
         };
-        units.extend(encoder.encode(&src, &opts).unwrap());
+        units.extend(encode(&mut encoder, &src, &opts).unwrap());
     }
     units.extend(encoder.flush().unwrap());
     assert_eq!(units.len(), 30);

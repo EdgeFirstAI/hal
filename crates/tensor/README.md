@@ -214,10 +214,12 @@ On macOS and iOS, `unsafe TensorDyn::from_planar_iosurface(surface, name)` wraps
 | Surface pixel format | Result |
 |---|---|
 | `420v`, `420f` | Multiplane NV12: luma and chroma each wrap the surface at their plane's offset and row stride, whether or not the planes are contiguous |
-| `yuvs` | One YUYV tensor at the surface's row pitch |
+| `yuvs`, `yuvf` | One YUYV tensor at the surface's row pitch |
 | `BGRA` | One BGRA tensor at the surface's row pitch |
 
 Any other pixel format returns `InvalidArgument` naming its FourCC, and a plane that does not hold its image, or a `420v` or `420f` surface with an odd width or height, returns `InvalidShape`. The surface is retained for the tensor's lifetime. The wrap does not set colorimetry; set it on the result.
+
+A wrapped surface passed to `edgefirst_codec::video::VideoEncoder::encode` follows that function's rule. On macOS and iOS, a source whose IOSurface is a CoreVideo `420v`, `420f`, `yuvs` or `yuvf` surface of the configured size, encoded without a crop, may be read in place; `EncoderInfo::transfer` reports the route. Its IOSurface may stay in use (`IOSurfaceIsInUse` is true) after `encode()` returns, until its frame leaves the encoder (its access unit is returned, it is dropped, or `flush()` returns). CoreVideo pixel buffer pools do not hand out a surface while it is in use. Any other pool or writer must not reuse or write a surface while `IOSurfaceIsInUse` is true. Other sources are copied, and the caller may reuse them once `encode()` returns.
 
 ## BufferIdentity
 

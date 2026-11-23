@@ -371,6 +371,30 @@ impl Colorimetry {
         self
     }
 
+    /// Fill each unset axis from the frame height; set axes are kept.
+    ///
+    /// `height` is in lines. Primaries are BT.709 when `height` is at least
+    /// 720 or `None`, SMPTE 170M below. Transfer is BT.709. The matrix is
+    /// BT.709 when `height` is at least 720 or `None`, BT.601 below. Range is
+    /// limited.
+    pub fn with_height_defaults(self, height: Option<usize>) -> Self {
+        let hd = height.is_none_or(|h| h >= 720);
+        Colorimetry {
+            space: self.space.or(Some(if hd {
+                ColorSpace::Bt709
+            } else {
+                ColorSpace::Smpte170m
+            })),
+            transfer: self.transfer.or(Some(ColorTransfer::Bt709)),
+            encoding: self.encoding.or(Some(if hd {
+                ColorEncoding::Bt709
+            } else {
+                ColorEncoding::Bt601
+            })),
+            range: self.range.or(Some(ColorRange::Limited)),
+        }
+    }
+
     /// Pack all four axes into one `u32` for
     /// [`crate::protocol::TensorDesc::colorimetry`].
     ///
@@ -406,6 +430,40 @@ impl Colorimetry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn height_defaults_fill_only_missing_axes() {
+        let hd = Colorimetry::default().with_height_defaults(Some(720));
+        assert_eq!(
+            hd,
+            Colorimetry {
+                space: Some(ColorSpace::Bt709),
+                transfer: Some(ColorTransfer::Bt709),
+                encoding: Some(ColorEncoding::Bt709),
+                range: Some(ColorRange::Limited),
+            }
+        );
+        let sd = Colorimetry::default().with_height_defaults(Some(719));
+        assert_eq!(
+            (sd.space, sd.transfer, sd.encoding, sd.range),
+            (
+                Some(ColorSpace::Smpte170m),
+                Some(ColorTransfer::Bt709),
+                Some(ColorEncoding::Bt601),
+                Some(ColorRange::Limited)
+            )
+        );
+        assert_eq!(Colorimetry::default().with_height_defaults(None), hd);
+        let full = Colorimetry {
+            range: Some(ColorRange::Full),
+            ..Default::default()
+        }
+        .with_height_defaults(Some(480));
+        assert_eq!(
+            (full.encoding, full.range),
+            (Some(ColorEncoding::Bt601), Some(ColorRange::Full))
+        );
+    }
 
     #[test]
     fn from_v4l2_known_and_default() {

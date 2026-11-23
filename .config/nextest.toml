@@ -1,6 +1,9 @@
 # cargo-nextest configuration
 # Reference: https://nexte.st/book/configuration.html
 
+[test-groups]
+videotoolbox = { max-threads = 1 }
+
 [profile.default]
 # JUnit XML output for CI test reporting. junit.path is relative to the
 # profile's store directory (target/nextest/default, or under cargo-llvm-cov
@@ -11,6 +14,18 @@ junit.store-failure-output = true
 
 # Fail fast on first test failure (can be overridden with --no-fail-fast)
 fail-fast = true
+
+# On macOS, tests that drive VideoToolbox run one at a time.
+[[profile.default.overrides]]
+platform = 'cfg(target_os = "macos")'
+filter = """
+    (binary_id(edgefirst-codec) & test(/^video::vt::tests::/))
+    | binary_id(edgefirst-codec::video_encode)
+    | binary_id(edgefirst-codec::video_decode)
+    | binary_id(edgefirst-codec::engines)
+    | binary_id(edgefirst-image::decoded_video_macos)
+"""
+test-group = "videotoolbox"
 
 [profile.ci]
 # CI profile without fail-fast

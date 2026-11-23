@@ -6,13 +6,7 @@
 //! `convert()` calls [`effective_colorimetry`] at use-time to fill only the
 //! axes it needs, and [`tag_yuv_destination`] after a successful convert.
 
-use edgefirst_tensor::{
-    ColorEncoding, ColorRange, ColorSpace, ColorTransfer, Colorimetry, TensorDyn,
-};
-
-/// Height (in lines) at/above which HD conventions (BT.709) apply; below it,
-/// SD conventions (BT.601).
-const HD_THRESHOLD: usize = 720;
+use edgefirst_tensor::{ColorEncoding, ColorRange, Colorimetry, TensorDyn};
 
 /// Return a fully-resolved `Colorimetry` (every axis `Some`): the tensor's
 /// specified axes, with only the missing ones filled by the height heuristic.
@@ -27,22 +21,7 @@ pub(crate) fn resolve_colorimetry(
     colorimetry: Option<Colorimetry>,
     height: Option<usize>,
 ) -> Colorimetry {
-    let hd = height.map(|h| h >= HD_THRESHOLD).unwrap_or(true);
-    let src = colorimetry.unwrap_or_default();
-    Colorimetry {
-        space: src.space.or(Some(if hd {
-            ColorSpace::Bt709
-        } else {
-            ColorSpace::Smpte170m
-        })),
-        transfer: src.transfer.or(Some(ColorTransfer::Bt709)),
-        encoding: src.encoding.or(Some(if hd {
-            ColorEncoding::Bt709
-        } else {
-            ColorEncoding::Bt601
-        })),
-        range: src.range.or(Some(ColorRange::Limited)),
-    }
+    colorimetry.unwrap_or_default().with_height_defaults(height)
 }
 
 /// Whether `a` and `b` share the same YUV matrix and range.
@@ -182,7 +161,9 @@ pub(crate) fn rgb_to_yuv_coeffs(encoding: ColorEncoding, range: ColorRange) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
-    use edgefirst_tensor::{ColorEncoding, ColorRange, Colorimetry, DType, PixelFormat, TensorDyn};
+    use edgefirst_tensor::{
+        ColorEncoding, ColorRange, ColorSpace, Colorimetry, DType, PixelFormat, TensorDyn,
+    };
 
     #[test]
     fn heuristic_hd_is_709_limited_sd_is_601_limited() {

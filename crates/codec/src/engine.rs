@@ -99,8 +99,9 @@ impl fmt::Display for Direction {
 pub enum Engine {
     /// The first engine that can do the request, in the platform's order:
     /// on Linux V4L2 for video and nvJPEG (when enabled), V4L2, then the CPU
-    /// for JPEG; on Windows Media Foundation for video. The environment
-    /// variable [`ENGINE_ENV`] narrows and orders this choice.
+    /// for JPEG; on Windows Media Foundation for video; on macOS and iOS
+    /// VideoToolbox for video. The environment variable [`ENGINE_ENV`] narrows
+    /// and orders this choice.
     #[default]
     Auto,
     /// Linux V4L2 memory-to-memory devices.
@@ -229,7 +230,10 @@ pub(crate) fn compiled(engine: Engine) -> bool {
         Engine::Auto | Engine::Cpu => true,
         Engine::V4l2 => cfg!(all(target_os = "linux", feature = "v4l2")),
         Engine::MediaFoundation => cfg!(all(windows, feature = "media-foundation")),
-        Engine::VideoToolbox => false,
+        Engine::VideoToolbox => cfg!(all(
+            any(target_os = "macos", target_os = "ios"),
+            feature = "videotoolbox"
+        )),
         Engine::NvJpeg => cfg!(all(target_os = "linux", feature = "nvjpeg")),
     }
 }
@@ -293,13 +297,17 @@ pub struct Capability {
 
 /// What the codec engines on this machine can do, engine by engine, in the
 /// order [`Engine::Auto`] tries them. Probing opens no stream; it opens
-/// device nodes and enumerates (on Windows, activates) transforms.
+/// device nodes, enumerates (on Windows, activates) transforms, and on macOS
+/// and iOS lists VideoToolbox's H.264 encoders and asks whether it decodes
+/// H.264 in hardware.
 pub fn capabilities() -> Vec<Capability> {
     let mut found = Vec::new();
     #[cfg(all(target_os = "linux", feature = "v4l2"))]
     crate::video::v4l2::capabilities(&mut found);
     #[cfg(all(windows, feature = "media-foundation"))]
     crate::video::mf::capabilities(&mut found);
+    #[cfg(all(any(target_os = "macos", target_os = "ios"), feature = "videotoolbox"))]
+    crate::video::vt::capabilities(&mut found);
     crate::jpeg::capabilities(&mut found);
     // The V4L2 MJPEG encoders also encode still JPEG.
     let still: Vec<Capability> = found
@@ -403,7 +411,13 @@ mod tests {
     #[test]
     fn the_cpu_engine_is_always_compiled() {
         assert!(compiled(Engine::Cpu) && compiled(Engine::Auto));
-        assert!(!compiled(Engine::VideoToolbox));
+        assert_eq!(
+            compiled(Engine::VideoToolbox),
+            cfg!(all(
+                any(target_os = "macos", target_os = "ios"),
+                feature = "videotoolbox"
+            ))
+        );
         assert_eq!(
             compiled(Engine::MediaFoundation),
             cfg!(all(windows, feature = "media-foundation"))

@@ -55,7 +55,7 @@ use super::{
     Platform, Transform,
 };
 use crate::engine::unsupported;
-use crate::video::copy::{self, Plane};
+use crate::video::copy::{self, mapped_planes, write_map, Plane};
 use crate::video::{
     DecodeEvent, DecodedFrame, DecoderBackend, DecoderConfig, OutputMemory, OutputPool, Returns,
     StreamInfo,
@@ -883,32 +883,6 @@ fn fits(t: &TensorDyn, w: usize, h: usize) -> bool {
         && t.width() == Some(w)
         && t.height() == Some(h)
         && !t.is_multiplane()
-}
-
-/// Where the planes of a `size` NV12 image are in a CPU map of `t`.
-fn mapped_planes(t: &TensorDyn, size: (usize, usize)) -> Result<Vec<Plane>> {
-    let stride = t
-        .effective_row_stride()
-        .ok_or_else(|| CodecError::InvalidConfig("an NV12 tensor has no row stride".into()))?;
-    Ok(PixelFormat::Nv12
-        .plane_table(size.0, size.1, stride)
-        .ok_or(CodecError::UnsupportedFormat(PixelFormat::Nv12))?
-        .iter()
-        .map(|p| Plane {
-            offset: p.offset as usize,
-            pitch: p.stride as usize,
-        })
-        .collect())
-}
-
-/// A CPU map of `t` for writing a whole picture.
-fn write_map(t: &TensorDyn) -> Result<edgefirst_tensor::HostView<'static, u8>> {
-    Ok(match t.map_bytes(CpuAccess::Write) {
-        Err(edgefirst_tensor::Error::PartialWriteRequiresReadWrite(_)) => {
-            t.map_bytes(CpuAccess::ReadWrite)
-        }
-        other => other,
-    }?)
 }
 
 /// Copies a parked picture into a pool tensor the GPU cannot copy it into,

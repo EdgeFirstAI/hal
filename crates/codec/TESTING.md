@@ -338,6 +338,23 @@ cargo test -p edgefirst-codec --test video_encode --test video_decode
 
 `EDGEFIRST_CODEC_MF_ENCODER=nvidia|dx12|software` runs the suite against each; the decoder suite runs on DXVA on a GPU and in system memory on WARP.
 
+## macOS and iOS (VideoToolbox)
+
+`tests/video_encode.rs`, `tests/video_decode.rs` and `tests/engines.rs` run against VideoToolbox on macOS, and the backend's own tests are the `video::vt::tests` filter. `scripts/test-macos.sh` builds, signs and runs them under nextest:
+
+```bash
+scripts/test-macos.sh -p edgefirst-codec
+scripts/test-macos.sh -p edgefirst-codec -E 'test(video::vt::tests)'
+```
+
+`.config/nextest.toml` puts the tests that drive VideoToolbox in a `videotoolbox` test group with `max-threads = 1`, so on macOS they run one at a time. The timing tests depend on it, because two hardware sessions on one machine slow each other down.
+
+Each encoder test logs the encoder it opened and whether it is hardware (`Apple H.264 (HW) hardware true`). The `test-macos` lane of `hal-full.yml` may have only Apple's software encoder. That encoder does not bound its frame delay, so it copies every source:
+
+- The zero-copy tests (`video::vt::tests::zero_copy`, except the routing and copy-route ones) skip, with a reason that names the encoder. `sustains_4k_at_30_fps_zero_copy` also skips on any software encoder, since it can't keep up.
+- `corevideo_sources_take_the_route_the_session_allows` checks the copy route instead: `EncoderInfo::transfer` is `CpuCopy`, and the source isn't in use after `encode()` returns.
+- A hardware encoder session that doesn't bound its frame delay fails these tests rather than skipping them.
+
 ## Benchmarks
 
 See `crates/codec/benches/codec_benchmark.rs` for performance benchmarks.

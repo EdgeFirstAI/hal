@@ -44,12 +44,12 @@ and either falls back to the CPU decoder transparently. PNG decoding uses
 |---|---|---|
 | `v4l2` | on | Linux V4L2 mem2mem hardware JPEG decode. Opt-out at runtime with `EDGEFIRST_DISABLE_V4L2=1` |
 | `nvjpeg` | on | Linux CUDA nvJPEG GPU decode. Opt-**in** at runtime with `EDGEFIRST_ENABLE_NVJPEG=1` |
+| `media-foundation` | on | Windows Media Foundation H.264 encode and decode |
+| `videotoolbox` | on | macOS and iOS VideoToolbox H.264 encode and decode |
 | `opencv` | off | OpenCV-backed decode, for comparison and parity testing |
 | `turbojpeg` | off | libjpeg-turbo, for benchmark comparison |
 
-Both default features are fully `#[cfg]`-gated to Linux, so off Linux they
-compile to nothing. `nvjpeg` is pure `dlopen` and adds no link-time CUDA
-dependency, so enabling it does not constrain where the binary runs.
+`v4l2` and `nvjpeg` are gated to Linux, `media-foundation` to Windows and `videotoolbox` to macOS and iOS, so elsewhere they compile to nothing. `nvjpeg` is pure `dlopen` and adds no link-time CUDA dependency, so enabling it does not constrain where the binary runs.
 
 ## Quick Start
 
@@ -146,14 +146,14 @@ image has no EXIF orientation both fields are `0` / `false`.
 
 Every codec runs on an `Engine`: `V4l2` (Linux), `MediaFoundation` (Windows), `VideoToolbox` (Apple), `NvJpeg` (Linux with CUDA) or `Cpu` (still images only). `Codec` names the formats: `Jpeg`, `Png`, `H264`, `Mjpeg`, and `Hevc`, `Vp8`, `Vp9`, `Av1`, which no engine runs yet.
 
-| Codec | Linux (V4L2) | Windows (Media Foundation) | CPU |
-|---|---|---|---|
-| H.264 encode / decode | yes / yes | yes / yes | no |
-| MJPEG encode / decode | JPEG encoder / JPEG decoder (i.MX 95 and others with `mxc-jpeg`) | no / yes (GPU vendor's decoder, else Microsoft's) | no |
-| JPEG still encode (`ImageEncoder`) | JPEG encoder | no | yes |
-| JPEG / PNG still decode (`ImageDecoder`) | JPEG decoder | no | yes / yes |
+| Codec | Linux (V4L2) | Windows (Media Foundation) | macOS and iOS (VideoToolbox) | CPU |
+|---|---|---|---|---|
+| H.264 encode / decode | yes / yes | yes / yes | yes / yes | no |
+| MJPEG encode / decode | JPEG encoder / JPEG decoder (i.MX 95 and others with `mxc-jpeg`) | no / yes (GPU vendor's decoder, else Microsoft's) | no / no | no |
+| JPEG still encode (`ImageEncoder`) | JPEG encoder | no | no | yes |
+| JPEG / PNG still decode (`ImageDecoder`) | JPEG decoder | no | no | yes / yes |
 
-`Engine::Auto`, the default everywhere, picks the first engine that can do the request: the platform's own for video, and nvJPEG (when enabled), V4L2, then the CPU for JPEG. Naming an engine (`EncoderConfig::with_engine`, `DecoderConfig::with_engine`, `ImageDecoder::set_engine`) uses that engine alone, with no fallback. There is no CPU video codec in HAL: a video codec the platform cannot run fails with `CodecError::Unsupported(UnsupportedFeature::Codec { .. })`, and an engine this platform or build does not have with `CodecError::NoDevice`. A platform engine may itself use software, such as Microsoft's H.264 encoder on a GPU without one; `EncoderInfo::hardware` and `Capability::hardware` say which.
+`Engine::Auto`, the default everywhere, picks the first engine that can do the request: the platform's own for video, and nvJPEG (when enabled), V4L2, then the CPU for JPEG. Naming an engine (`EncoderConfig::with_engine`, `DecoderConfig::with_engine`, `ImageDecoder::set_engine`) uses that engine alone, with no fallback. There is no CPU video codec in HAL: a video codec the platform cannot run fails with `CodecError::Unsupported(UnsupportedFeature::Codec { .. })`, and an engine this platform or build does not have with `CodecError::NoDevice`. A platform engine may itself use software, such as Microsoft's H.264 encoder on a GPU without one, or Apple's where the system has no hardware encoder; `EncoderInfo::hardware` and `Capability::hardware` say which.
 
 `capabilities()` lists what the engines on this machine can do, without opening a stream: engine, device, codec, direction, whether it is hardware, the pixel formats, and how frames move at best (`Transfer::ZeroCopy`, `GpuCopy` or `CpuCopy`). An open stream reports what it actually does: `VideoEncoder::info()` returns an `EncoderInfo`, and `StreamInfo` carries the decoder's `engine` and `transfer`.
 
@@ -171,7 +171,7 @@ let h264 = capabilities()
 
 | Environment variable     | Effect                                     |
 |--------------------------|--------------------------------------------|
-| `EDGEFIRST_CODEC_ENGINE` | The engines `Engine::Auto` may use, in order, separated by commas: for example `cpu` decodes JPEG on the CPU only, and `media-foundation` keeps video on Media Foundation. Codec objects that name an engine ignore it |
+| `EDGEFIRST_CODEC_ENGINE` | The engines `Engine::Auto` may use, in order, separated by commas: for example `cpu` decodes JPEG on the CPU only, `media-foundation` keeps video on Media Foundation, and `videotoolbox` keeps it on VideoToolbox. Codec objects that name an engine ignore it |
 
 ## Encoding Still Images (JPEG)
 
@@ -226,7 +226,7 @@ Otherwise the driver buffers are mapped and the decoded planes are copied
 `edgefirst_codec::video::VideoEncoder` encodes image tensors to an H.264 Annex B
 stream with the platform's hardware encoder. On Linux that is any V4L2 stateful
 memory-to-memory encoder, found by capability: i.MX 8M Plus `vsi_v4l2`, i.MX 95
-Wave6, and others. It needs the `v4l2` feature (on by default). On Windows it is a Media Foundation encoder transform: the GPU's (NVIDIA, Intel, AMD) where the driver registers one, otherwise Microsoft's software encoder. It needs the `media-foundation` feature (on by default).
+Wave6, and others. It needs the `v4l2` feature (on by default). On Windows it is a Media Foundation encoder transform: the GPU's (NVIDIA, Intel, AMD) where the driver registers one, otherwise Microsoft's software encoder. It needs the `media-foundation` feature (on by default). On macOS and iOS it is VideoToolbox: the hardware encoder where the system has one, otherwise Apple's software encoder. It needs the `videotoolbox` feature (on by default).
 
 ```rust,no_run
 use edgefirst_codec::video::{Bitrate, EncoderConfig, FrameOptions, VideoEncoder};
@@ -250,19 +250,36 @@ let rest = encoder.flush()?; // every access unit still in the encoder
 - **PTS:** `FrameOptions::pts` comes back unchanged on the matching `EncodedFrame`, in any unit.
 - **Input formats** are whatever the device lists for HAL's V4L2 code of the format (`PixelFormat::to_fourcc`); NV12 and YUYV on both i.MX encoders.
 - **Windows:** sources are NV12 or YUYV tensors in any memory. On a hardware encoder a native NV12 texture of the configured size is read in place, without a copy; crops, host tensors, and sources for an encoder that holds frames are copied into a texture of the encoder's own, on the GPU where the source is a texture. Either way the caller can reuse the source as soon as `encode()` returns. B-frames are off and the transform runs in low-latency mode, so `encode()` normally returns the access unit of the frame it was given. Microsoft's software encoder, used where there is no hardware encoder, reads system memory.
+- **macOS and iOS:** sources are NV12 or YUYV tensors. A source that is a whole CoreVideo `420v`, `420f`, `yuvs` or `yuvf` surface of the configured size may be read in place. Every other source, a crop included, is copied into a pixel buffer of the encoder's own, and the caller can reuse it as soon as `encode()` returns. `encode()` never waits for the encoder. When the encoder holds too many frames (eight read in place, or eight copied and not yet submitted), `encode()` returns `CodecError::Timeout` and doesn't take the frame; submit it again later. B-frames are off. The encoder writes the source's colour description into the stream: the source's colorimetry, with the range of a CoreVideo surface (`420v` and `yuvs` limited, `420f` and `yuvf` full), then the surface's colour attachments, then the height rule for anything still untagged.
 - **MJPEG:** `EncoderConfig::new(Codec::Mjpeg, ..)` encodes each frame as a JPEG picture, every one a key frame, at `EncoderConfig::quality` (85 by default). Only V4L2 JPEG encoders run it; elsewhere it is `CodecError::Unsupported`.
-- **`info()`** names the engine and device and says how sources reach the encoder (`EncoderInfo::transfer`): on V4L2 zero-copy, or a CPU copy while sources are copied into the device's layout; on Media Foundation zero-copy for an encoder that reads textures in place, a GPU copy for one that holds frames (decided on the first frame), and a CPU copy for the software encoder.
+- **`info()`** names the engine and device and says how sources reach the encoder (`EncoderInfo::transfer`): on V4L2 zero-copy, or a CPU copy while sources are copied into the device's layout; on Media Foundation zero-copy for an encoder that reads textures in place, a GPU copy for one that holds frames (decided on the first frame), and a CPU copy for the software encoder; on VideoToolbox zero-copy when the last frame was read in place and a CPU copy otherwise (see [VideoToolbox sources](#videotoolbox-sources)).
 
 | Environment variable           | Effect                                     |
 |--------------------------------|--------------------------------------------|
 | `EDGEFIRST_CODEC_V4L2_ENCODER` | Use only this encoder node (e.g. `/dev/video0`) instead of searching `/dev/video*` |
 | `EDGEFIRST_CODEC_MF_ENCODER`   | Windows: use only the encoder transforms whose name contains this text (e.g. `NVIDIA`), or only the `hardware` or `software` ones |
 
+### VideoToolbox sources
+
+On macOS and iOS, a source whose IOSurface is a CoreVideo `420v`, `420f`, `yuvs` or `yuvf` surface of the configured size, encoded without a crop, may be read in place; `EncoderInfo::transfer` reports the route. Its IOSurface may stay in use (`IOSurfaceIsInUse` is true) after `encode()` returns, until its frame leaves the encoder (its access unit is returned, it is dropped, or `flush()` returns). CoreVideo pixel buffer pools do not hand out a surface while it is in use. Any other pool or writer must not reuse or write a surface while `IOSurfaceIsInUse` is true. Other sources are copied, and the caller may reuse them once `encode()` returns.
+
+The rule covers a surface wrapped with `TensorDyn::from_planar_iosurface`. A pool of such sources can skip the ones still in use:
+
+```rust,ignore
+// `frames` is the caller's own set of IOSurface-backed tensors.
+let free = frames
+    .iter()
+    .find(|frame| !unsafe { IOSurfaceIsInUse(frame.iosurface_ref().unwrap()) })
+    .ok_or("every frame is still being encoded")?;
+```
+
+Apple's software encoder (in virtual machines and the iOS simulator) doesn't read sources in place. There every source is copied and `EncoderInfo::transfer` reports `Transfer::CpuCopy`.
+
 Run `cargo run --release -p edgefirst-codec --example video-encode -- out.h264 --frames 300` to encode a test pattern (or `--input frames.nv12`) and print the per-frame encode time.
 
 ## Video Decoding (H.264, MJPEG)
 
-`edgefirst_codec::video::VideoDecoder` decodes an H.264 Annex B stream into NV12 image tensors with the platform's hardware decoder: on Linux any V4L2 stateful memory-to-memory decoder, found by capability (i.MX 8M Plus `vsi_v4l2`, i.MX 95 Wave6). It needs the `v4l2` feature (on by default). On Windows it is Microsoft's Media Foundation H.264 decoder, with the `media-foundation` feature (on by default).
+`edgefirst_codec::video::VideoDecoder` decodes an H.264 Annex B stream into NV12 image tensors with the platform's hardware decoder: on Linux any V4L2 stateful memory-to-memory decoder, found by capability (i.MX 8M Plus `vsi_v4l2`, i.MX 95 Wave6). It needs the `v4l2` feature (on by default). On Windows it is Microsoft's Media Foundation H.264 decoder, with the `media-foundation` feature (on by default). On macOS and iOS it is VideoToolbox's H.264 decoder, with the `videotoolbox` feature (on by default).
 
 ```rust,no_run
 use edgefirst_codec::video::{access_units, DecodeEvent, DecoderConfig, OutputPool, VideoDecoder};
@@ -286,6 +303,7 @@ let rest = decoder.flush()?; // every event still in the decoder
 - **Frames are lent, not copied.** Each `DecodedFrame` is an NV12 DMA-BUF tensor of the visible picture over the device's buffer (whose coded height may be larger: 1088 rows for 1080p). The buffer goes back to the device when the frame is dropped, so the tensor is only reachable through the frame; share a picture by sharing the frame (`Arc<DecodedFrame>`). Frames import into the image crate's GPU paths without a copy.
 - **The pool:** `OutputPool::Allocate { count }` lets the caller hold `count` frames at once; the decoder adds the device's minimum and one buffer for it to decode into. `OutputPool::Provided(tensors)` decodes into the caller's DMA-BUFs. When the caller holds every buffer, `decode()` fails with `CodecError::PoolExhausted` without taking the access unit: drop frames and pass it again. `StreamInfo::memory` says whether the device imports the pool or, where it will not, writes its own buffers exported as DMA-BUFs, and `StreamInfo::transfer` how each picture reaches the pool (zero-copy on V4L2, a GPU copy on Media Foundation with DXVA, a CPU copy without).
 - **MJPEG:** `DecoderConfig::new(Codec::Mjpeg)` takes one JPEG picture per `decode()` call and returns its frame at once. Pictures may change size from one to the next; each change is a `DecodeEvent::Reconfigured`. On Windows the decoder is the GPU vendor's MJPEG transform where there is one (NVIDIA's decodes on the GPU), otherwise Microsoft's software one; 4:2:2 pictures, as cameras send, come back as NV12. On Linux it is the V4L2 JPEG decoder, which writes NV12 or Grey; a picture it cannot decode is an error, since HAL has no CPU video decoder.
+- **macOS and iOS:** with `OutputPool::Allocate`, each frame is one of VideoToolbox's own pixel buffers, lent as a multiplane NV12 tensor over its IOSurface without a copy (`StreamInfo::memory` is `Exported`, `transfer` is `ZeroCopy`). A lent `DecodedFrame` keeps its pixel buffer out of VideoToolbox's pool until it drops. With `OutputPool::Provided`, each picture is copied into one of the caller's tensors (`Imported`, `CpuCopy`). Each tensor must be an NV12 image of exactly the stream's visible size, as one buffer or as separate luma and chroma planes, and the pool can't follow a change of size. `flush()` lends such a pool every waiting picture or none: it returns `CodecError::PoolExhausted` while the caller holds the tensors it needs (drop frames and flush again), and `CodecError::InvalidConfig` when the pool holds fewer tensors than the pictures waiting.
 - **Size changes** mid-stream (a new SPS) drain the old pictures and rebuild the pool; `DecodeEvent::Reconfigured` carries the new `StreamInfo`. Frames already returned keep their memory.
 - **`flush()`** returns the remaining pictures. The decoder then starts a new sequence, so the next access unit must be an IDR with its SPS and PPS, as after a seek.
 - **Windows:** the decoder runs on the GPU (DXVA), and each picture is copied on the GPU into a pool tensor of the visible size, a native NV12 D3D11 texture whose recorded fence value orders consumers behind the copy; without DXVA (no D3D11 device, or an adapter without video decoding) it decodes into system memory, copied into the pool on the CPU. A provided pool must hold NV12 images of exactly the stream's visible size, so it cannot follow a size change. The decoder runs in low-latency mode: a picture comes back as soon as the stream's reordering allows.

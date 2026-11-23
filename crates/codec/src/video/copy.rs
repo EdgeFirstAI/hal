@@ -36,7 +36,13 @@ pub(crate) fn plane_shapes(
 
 /// The planes of a picture whose planes follow one another in one buffer,
 /// each `pitch` bytes per row, the chroma after `rows` luma rows.
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(
+    not(any(
+        windows,
+        all(any(target_os = "macos", target_os = "ios"), feature = "videotoolbox")
+    )),
+    allow(dead_code)
+)]
 pub(crate) fn contiguous(format: PixelFormat, pitch: usize, rows: usize) -> Vec<Plane> {
     let luma = Plane { offset: 0, pitch };
     match format {
@@ -248,9 +254,121 @@ pub(crate) fn copy_source(
     copied.map_err(CodecError::InvalidInput)
 }
 
+/// Where the planes of a `size` NV12 image are in a CPU map of `t`.
+#[cfg_attr(
+    not(any(
+        all(windows, feature = "media-foundation"),
+        all(any(target_os = "macos", target_os = "ios"), feature = "videotoolbox")
+    )),
+    allow(dead_code)
+)]
+pub(crate) fn mapped_planes(t: &TensorDyn, size: (usize, usize)) -> crate::Result<Vec<Plane>> {
+    let stride = t
+        .effective_row_stride()
+        .ok_or_else(|| CodecError::InvalidConfig("an NV12 tensor has no row stride".into()))?;
+    Ok(PixelFormat::Nv12
+        .plane_table(size.0, size.1, stride)
+        .ok_or(CodecError::UnsupportedFormat(PixelFormat::Nv12))?
+        .iter()
+        .map(|p| Plane {
+            offset: p.offset as usize,
+            pitch: p.stride as usize,
+        })
+        .collect())
+}
+
+/// A CPU map of `t` for writing a whole picture.
+#[cfg_attr(
+    not(any(
+        all(windows, feature = "media-foundation"),
+        all(any(target_os = "macos", target_os = "ios"), feature = "videotoolbox")
+    )),
+    allow(dead_code)
+)]
+pub(crate) fn write_map(t: &TensorDyn) -> crate::Result<edgefirst_tensor::HostView<'static, u8>> {
+    Ok(match t.map_bytes(CpuAccess::Write) {
+        Err(edgefirst_tensor::Error::PartialWriteRequiresReadWrite(_)) => {
+            t.map_bytes(CpuAccess::ReadWrite)
+        }
+        other => other,
+    }?)
+}
+
+/// Writes a `size` picture from the planes `from` of `src` into the NV12 or
+/// YUYV image `dst`, whether it is one buffer or separate luma and chroma
+/// planes.
+#[cfg_attr(
+    not(all(any(target_os = "macos", target_os = "ios"), feature = "videotoolbox")),
+    allow(dead_code)
+)]
+pub(crate) fn copy_into_image(
+    format: PixelFormat,
+    size: (usize, usize),
+    src: &[u8],
+    from: &[Plane],
+    dst: &TensorDyn,
+) -> crate::Result<()> {
+    let write_error =
+        |e: String| CodecError::InvalidInput(format!("the image cannot be written: {e}"));
+    if dst.format() != Some(format) {
+        return Err(CodecError::InvalidInput(format!(
+            "image format {:?} is not {format}",
+            dst.format()
+        )));
+    }
+    let shapes =
+        plane_shapes(format, size.0, size.1).ok_or(CodecError::UnsupportedFormat(format))?;
+    let stride = dst
+        .effective_row_stride()
+        .ok_or_else(|| CodecError::InvalidInput("the image has no row stride".into()))?;
+    if dst.is_multiplane() {
+        let chroma = dst.chroma_dyn().ok_or_else(|| {
+            CodecError::InvalidInput("multi-plane image has no chroma plane".into())
+        })?;
+        let cstride = chroma.effective_row_stride().unwrap_or(stride);
+        if from.len() < shapes.len() {
+            return Err(write_error(format!("{format} has {} planes", shapes.len())));
+        }
+        let mut luma = write_map(dst)?;
+        let mut cmap = write_map(&chroma)?;
+        return copy_plane(
+            src,
+            from[0],
+            &mut luma,
+            Plane {
+                offset: 0,
+                pitch: stride,
+            },
+            shapes[0],
+        )
+        .and_then(|()| {
+            copy_plane(
+                src,
+                from[1],
+                &mut cmap,
+                Plane {
+                    offset: 0,
+                    pitch: cstride,
+                },
+                shapes[1],
+            )
+        })
+        .map_err(write_error);
+    }
+    let to = if format == PixelFormat::Nv12 {
+        mapped_planes(dst, size)?
+    } else {
+        contiguous(format, stride, size.1)
+    };
+    let mut map = write_map(dst)?;
+    copy(format, size, src, from, &mut map, &to).map_err(write_error)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::video::{check_source, EncoderConfig, FrameOptions};
+    use edgefirst_tensor::{DType, Region, Tensor, TensorMemory};
 
     #[test]
     fn nv12_planes_move_to_the_destination_pitch() {
@@ -394,7 +512,6 @@ mod tests {
 
     #[test]
     fn a_source_declared_without_reads_is_refused_as_denied_access() {
-        use edgefirst_tensor::{DType, TensorMemory};
         for declared in [CpuAccess::None, CpuAccess::Write] {
             let src = TensorDyn::image(
                 8,
@@ -419,5 +536,176 @@ mod tests {
             plane_shapes(PixelFormat::Nv12, 5, 3),
             Some(vec![(5, 3), (6, 2)])
         );
+    }
+
+    fn multiplane_nv12(
+        luma: (usize, usize),
+        chroma: (usize, usize),
+        strides: (usize, usize),
+    ) -> TensorDyn {
+        let l = Tensor::<u8>::new(&[luma.1, luma.0], Some(TensorMemory::Mem), None).unwrap();
+        let mut c =
+            Tensor::<u8>::new(&[chroma.1, chroma.0], Some(TensorMemory::Mem), None).unwrap();
+        c.set_row_stride_unchecked(strides.1);
+        let mut t = Tensor::from_planes(l, c, PixelFormat::Nv12).unwrap();
+        t.set_row_stride(strides.0).unwrap();
+        TensorDyn::from(t)
+    }
+
+    fn fill(t: &TensorDyn, pitch: usize, rows: usize, base: u8) {
+        let mut map = t.map_bytes(CpuAccess::ReadWrite).unwrap();
+        for r in 0..rows {
+            for x in 0..4 {
+                map[r * pitch + x] = base + (r * 4 + x) as u8;
+            }
+        }
+    }
+
+    #[test]
+    fn copy_source_reads_a_multiplane_source_at_each_planes_stride() {
+        // 4x4 NV12: luma rows 8 bytes apart, chroma rows 6 bytes apart.
+        let src = multiplane_nv12((8, 4), (8, 2), (8, 6));
+        fill(&src, 8, 4, 0);
+        fill(&src.chroma_dyn().unwrap(), 6, 2, 100);
+        let mut dst = vec![0xff; 24];
+        let to = contiguous(PixelFormat::Nv12, 4, 4);
+        copy_source(PixelFormat::Nv12, (4, 4), &src, (0, 0), 8, &mut dst, &to).unwrap();
+        let luma: Vec<u8> = (0..16).collect();
+        assert_eq!(&dst[..16], luma.as_slice());
+        assert_eq!(&dst[16..], &[100, 101, 102, 103, 104, 105, 106, 107]);
+    }
+
+    #[test]
+    fn copy_into_image_writes_single_buffer_and_multiplane_nv12() {
+        let tight: Vec<u8> = (0..24).collect();
+        let from = contiguous(PixelFormat::Nv12, 4, 4);
+
+        let single = TensorDyn::image(
+            4,
+            4,
+            PixelFormat::Nv12,
+            DType::U8,
+            Some(TensorMemory::Mem),
+            CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        copy_into_image(PixelFormat::Nv12, (4, 4), &tight, &from, &single).unwrap();
+        let planes = mapped_planes(&single, (4, 4)).unwrap();
+        let map = single.map_bytes(CpuAccess::Read).unwrap();
+        let mut back = vec![0; 24];
+        copy(PixelFormat::Nv12, (4, 4), &map, &planes, &mut back, &from).unwrap();
+        assert_eq!(back, tight);
+
+        let multi = multiplane_nv12((8, 4), (8, 2), (8, 6));
+        copy_into_image(PixelFormat::Nv12, (4, 4), &tight, &from, &multi).unwrap();
+        let (luma, chroma) = (
+            multi.map_bytes(CpuAccess::Read).unwrap(),
+            multi
+                .chroma_dyn()
+                .unwrap()
+                .map_bytes(CpuAccess::Read)
+                .unwrap(),
+        );
+        let mut back = vec![0; 24];
+        copy_plane(
+            &luma,
+            Plane {
+                offset: 0,
+                pitch: 8,
+            },
+            &mut back,
+            from[0],
+            (4, 4),
+        )
+        .unwrap();
+        copy_plane(
+            &chroma,
+            Plane {
+                offset: 0,
+                pitch: 6,
+            },
+            &mut back,
+            from[1],
+            (4, 2),
+        )
+        .unwrap();
+        assert_eq!(back, tight);
+    }
+
+    #[test]
+    fn copy_into_image_writes_yuyv() {
+        let tight: Vec<u8> = (0..16).collect();
+        let dst = TensorDyn::image(
+            4,
+            2,
+            PixelFormat::Yuyv,
+            DType::U8,
+            Some(TensorMemory::Mem),
+            CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        copy_into_image(
+            PixelFormat::Yuyv,
+            (4, 2),
+            &tight,
+            &contiguous(PixelFormat::Yuyv, 8, 2),
+            &dst,
+        )
+        .unwrap();
+        assert_eq!(
+            &dst.map_bytes(CpuAccess::Read).unwrap()[..16],
+            tight.as_slice()
+        );
+    }
+
+    #[test]
+    fn check_source_refuses_wrong_format_dtype_size_and_crop() {
+        let config = EncoderConfig::h264(640, 480, PixelFormat::Nv12, 30.0);
+        let image = |w, h, format, dtype| {
+            TensorDyn::image(
+                w,
+                h,
+                format,
+                dtype,
+                Some(TensorMemory::Mem),
+                CpuAccess::ReadWrite,
+            )
+            .unwrap()
+        };
+        let crop = |region| FrameOptions {
+            crop: Some(region),
+            ..FrameOptions::default()
+        };
+        let none = FrameOptions::default();
+        let big = image(1920, 1080, PixelFormat::Nv12, DType::U8);
+        let refused = [
+            check_source(
+                &config,
+                &image(320, 240, PixelFormat::Nv12, DType::U8),
+                &none,
+            ),
+            check_source(
+                &config,
+                &image(640, 480, PixelFormat::Nv12, DType::U16),
+                &none,
+            ),
+            check_source(
+                &config,
+                &image(640, 480, PixelFormat::Yuyv, DType::U8),
+                &none,
+            ),
+            check_source(&config, &big, &crop(Region::new(0, 0, 1280, 720))),
+            check_source(&config, &big, &crop(Region::new(1, 1, 640, 480))),
+        ];
+        for result in refused {
+            assert!(
+                matches!(result, Err(CodecError::InvalidInput(_))),
+                "{result:?}"
+            );
+        }
+        let ok = check_source(&config, &big, &crop(Region::new(320, 180, 640, 480)));
+        assert_eq!(ok.unwrap(), (320, 180));
+        let whole = image(640, 480, PixelFormat::Nv12, DType::U8);
+        assert_eq!(check_source(&config, &whole, &none).unwrap(), (0, 0));
     }
 }

@@ -15,7 +15,7 @@ pub(crate) const NAL_SPS: u8 = 7;
 /// `nal_unit_type` of a picture parameter set.
 pub(crate) const NAL_PPS: u8 = 8;
 /// `nal_unit_type` of an access unit delimiter.
-const NAL_AUD: u8 = 9;
+pub(crate) const NAL_AUD: u8 = 9;
 /// `nal_unit_type` of an end of sequence.
 const NAL_END_OF_SEQUENCE: u8 = 10;
 /// `nal_unit_type` of an end of stream.
@@ -39,6 +39,10 @@ pub(crate) fn nal_types(data: &[u8]) -> Vec<u8> {
 
 /// The SPS and PPS NAL units of an Annex B buffer, each with a 4-byte
 /// start code, in stream order.
+#[cfg_attr(
+    all(any(target_os = "macos", target_os = "ios"), feature = "videotoolbox"),
+    allow(dead_code)
+)]
 pub(crate) fn parameter_sets(data: &[u8]) -> Vec<u8> {
     let mut starts = Vec::new();
     let mut i = 0;
@@ -82,7 +86,13 @@ fn nal_end(data: &[u8], from: usize) -> usize {
 /// `au` with `parameter_sets` inserted before its first NAL unit, or after
 /// it when that is an access unit delimiter, which must come first
 /// (§7.4.1.2.3).
-#[cfg_attr(not(all(windows, feature = "media-foundation")), allow(dead_code))]
+#[cfg_attr(
+    not(any(
+        all(windows, feature = "media-foundation"),
+        all(any(target_os = "macos", target_os = "ios"), feature = "videotoolbox")
+    )),
+    allow(dead_code)
+)]
 pub(crate) fn with_parameter_sets(au: &[u8], parameter_sets: &[u8]) -> Vec<u8> {
     let at = if nal_types(au).first() == Some(&NAL_AUD) {
         nal_end(au, 0)
@@ -94,6 +104,75 @@ pub(crate) fn with_parameter_sets(au: &[u8], parameter_sets: &[u8]) -> Vec<u8> {
     out.extend_from_slice(parameter_sets);
     out.extend_from_slice(&au[at..]);
     out
+}
+
+/// Converts an Annex B buffer to AVCC: every NAL unit whose `nal_unit_type`
+/// is not in `drop`, each preceded by its length as a 4-byte big-endian
+/// integer. Bytes before the first start code are ignored.
+#[cfg_attr(
+    not(all(any(target_os = "macos", target_os = "ios"), feature = "videotoolbox")),
+    allow(dead_code)
+)]
+pub(crate) fn annex_b_to_avcc(au: &[u8], drop: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(au.len() + 16);
+    for nal in nal_units(au) {
+        if let Some(&header) = nal.first() {
+            if !drop.contains(&(header & 0x1f)) {
+                out.extend_from_slice(&(nal.len() as u32).to_be_bytes());
+                out.extend_from_slice(nal);
+            }
+        }
+    }
+    out
+}
+
+/// The NAL units of an Annex B buffer, each from its header byte to the
+/// next start code, in order. Bytes before the first start code are ignored.
+pub(crate) fn nal_units(data: &[u8]) -> impl Iterator<Item = &[u8]> {
+    let mut next = next_start_code(data, 0);
+    std::iter::from_fn(move || {
+        let first = next?;
+        next = next_start_code(data, first);
+        let end = next.map_or(data.len(), |n| start_code_begin(data, n));
+        Some(&data[first..end])
+    })
+}
+
+/// Converts an AVCC sample to Annex B, each NAL unit preceded by a
+/// `00 00 00 01` start code. `length_size` is the width in bytes of each
+/// length prefix: 1, 2 or 4.
+///
+/// # Errors
+///
+/// `length_size` is not 1, 2 or 4, a length prefix is cut short, or a length
+/// runs past the end of the sample. The message names the byte offset.
+#[cfg_attr(
+    not(all(any(target_os = "macos", target_os = "ios"), feature = "videotoolbox")),
+    allow(dead_code)
+)]
+pub(crate) fn avcc_to_annex_b(sample: &[u8], length_size: usize) -> Result<Vec<u8>, String> {
+    if !matches!(length_size, 1 | 2 | 4) {
+        return Err(format!("unsupported NAL length size {length_size}"));
+    }
+    let mut out = Vec::with_capacity(sample.len() + 16);
+    let mut at = 0;
+    while at < sample.len() {
+        let Some(prefix) = sample.get(at..at + length_size) else {
+            return Err(format!("truncated NAL length at byte {at}"));
+        };
+        let len = prefix.iter().fold(0usize, |n, &b| (n << 8) | b as usize);
+        let start = at + length_size;
+        let Some(nal) = start
+            .checked_add(len)
+            .and_then(|end| sample.get(start..end))
+        else {
+            return Err(format!("NAL length {len} at byte {at} runs past the end"));
+        };
+        out.extend_from_slice(&[0, 0, 0, 1]);
+        out.extend_from_slice(nal);
+        at = start + len;
+    }
+    Ok(out)
 }
 
 /// Index of the first byte after the next `00 00 01` start code at or
@@ -206,6 +285,10 @@ impl AccessUnit {
 
     /// Belongs to the access unit before it: no picture, only NAL units that
     /// end one (an encoder's end of sequence after a drain).
+    #[cfg_attr(
+        all(any(target_os = "macos", target_os = "ios"), feature = "videotoolbox"),
+        allow(dead_code)
+    )]
     pub(crate) fn ends_previous(&self) -> bool {
         !self.has_picture && self.trailing_only
     }
@@ -223,6 +306,112 @@ mod tests {
 
     fn cat(parts: &[&[u8]]) -> Vec<u8> {
         parts.concat()
+    }
+
+    #[test]
+    fn nal_units_are_split_at_3_and_4_byte_start_codes() {
+        let au = cat(&[&[0xff], SPS, PPS, SEI, P_SLICE]);
+        let nals: Vec<&[u8]> = nal_units(&au).collect();
+        assert_eq!(nals, vec![&SPS[4..], &PPS[4..], &SEI[3..], &P_SLICE[4..]]);
+        assert_eq!(nal_units(&[]).count(), 0);
+        assert_eq!(nal_units(&[0, 0, 2, 0x65]).count(), 0);
+    }
+
+    #[test]
+    fn annex_b_with_3_and_4_byte_start_codes_becomes_length_prefixed() {
+        let au = cat(&[
+            &[0, 0, 0, 1, 0x67, 1, 2],
+            &[0, 0, 1, 0x68, 3],
+            &[0, 0, 0, 1, 0x65, 4, 5, 6],
+        ]);
+        assert_eq!(
+            annex_b_to_avcc(&au, &[]),
+            cat(&[
+                &[0, 0, 0, 3, 0x67, 1, 2],
+                &[0, 0, 0, 2, 0x68, 3],
+                &[0, 0, 0, 4, 0x65, 4, 5, 6]
+            ])
+        );
+    }
+
+    #[test]
+    fn annex_b_to_avcc_drops_the_named_nal_types() {
+        let au = cat(&[
+            &[0, 0, 0, 1, 0x09, 0xf0],
+            &[0, 0, 0, 1, 0x67, 1],
+            &[0, 0, 1, 0x68, 2],
+            &[0, 0, 1, 0x65, 3],
+        ]);
+        assert_eq!(annex_b_to_avcc(&au, &[9, 7, 8]), vec![0, 0, 0, 2, 0x65, 3]);
+    }
+
+    #[test]
+    fn empty_input_converts_to_empty_output() {
+        assert!(annex_b_to_avcc(&[], &[]).is_empty());
+        assert_eq!(avcc_to_annex_b(&[], 4), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn emulation_prevention_bytes_are_kept() {
+        let au = [0, 0, 1, 0x65, 0, 0, 3, 1];
+        assert_eq!(
+            annex_b_to_avcc(&au, &[]),
+            vec![0, 0, 0, 5, 0x65, 0, 0, 3, 1]
+        );
+    }
+
+    #[test]
+    fn avcc_converts_to_annex_b_at_each_length_size() {
+        assert_eq!(
+            avcc_to_annex_b(&[0, 0, 0, 2, 0x65, 9], 4).unwrap(),
+            vec![0, 0, 0, 1, 0x65, 9]
+        );
+        assert_eq!(
+            avcc_to_annex_b(&[0, 2, 0x41, 9, 0, 1, 0x06], 2).unwrap(),
+            vec![0, 0, 0, 1, 0x41, 9, 0, 0, 0, 1, 0x06]
+        );
+        assert_eq!(
+            avcc_to_annex_b(&[1, 0x09], 1).unwrap(),
+            vec![0, 0, 0, 1, 0x09]
+        );
+    }
+
+    #[test]
+    fn a_truncated_or_overlong_avcc_sample_is_an_error() {
+        assert!(avcc_to_annex_b(&[0, 0, 0], 4).is_err());
+        assert!(avcc_to_annex_b(&[0, 0, 0, 9, 0x65], 4).is_err());
+        assert!(avcc_to_annex_b(&[0, 1, 0x65], 3).is_err());
+    }
+
+    #[test]
+    fn access_unit_inputs_round_trip_through_avcc_with_4_byte_start_codes() {
+        let p_slice2: &[u8] = &[0, 0, 1, 0x41, 0x40, 0x11];
+        let aud: &[u8] = &[0, 0, 0, 1, 0x09, 0xf0];
+        let eos: &[u8] = &[0, 0, 0, 1, 0x0a];
+        let streams: [Vec<&[u8]>; 2] = [
+            vec![SPS, PPS, IDR, P_SLICE, p_slice2, aud, SEI, P_SLICE],
+            vec![IDR, eos, SPS, PPS, IDR],
+        ];
+        for pieces in streams {
+            let expected: Vec<u8> = pieces
+                .iter()
+                .flat_map(|nal| {
+                    let body = nal
+                        .strip_prefix(&[0, 0, 0, 1])
+                        .or_else(|| nal.strip_prefix(&[0, 0, 1]))
+                        .unwrap();
+                    [&[0, 0, 0, 1][..], body].concat()
+                })
+                .collect();
+            let stream = pieces.concat();
+            let mut back = Vec::new();
+            for au in access_units(&stream) {
+                let converted = avcc_to_annex_b(&annex_b_to_avcc(au, &[]), 4).unwrap();
+                assert_eq!(nal_types(&converted), nal_types(au));
+                back.extend_from_slice(&converted);
+            }
+            assert_eq!(back, expected);
+        }
     }
 
     #[test]
