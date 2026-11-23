@@ -918,6 +918,38 @@ fn a_source_whose_row_stride_is_not_the_surface_pitch_is_copied() {
 }
 
 #[test]
+fn a_refused_first_frame_leaves_the_stream_unset() {
+    let test = "a_refused_first_frame_leaves_the_stream_unset";
+    let (w, h) = (600, 480);
+    let Some(mut enc) = open_encoder(test, config(w, h, PixelFormat::Yuyv)) else {
+        return;
+    };
+    let refused = wrap(&aligned_buffer(w, h, FOURCC_YUVS, 256)).with_colorimetry(Colorimetry {
+        range: Some(ColorRange::Full),
+        ..Colorimetry::default()
+    });
+    paint(&refused, level(0));
+    let e = enc.encode(&refused, &at(0)).unwrap_err();
+    assert!(matches!(e, CodecError::InvalidInput(_)), "{e}");
+    let src = wrap_tight_yuyv(&aligned_buffer(w, h, FOURCC_YUVS, 256));
+    let strides = (refused.effective_row_stride(), src.effective_row_stride());
+    eprintln!(
+        "{test}: refused at row stride {:?}, then {:?}",
+        strides.0, strides.1
+    );
+    assert_ne!(strides.0, strides.1);
+    let mut units = Vec::new();
+    for i in 0..5 {
+        paint(&src, level(i));
+        units.extend(encode_retrying(&mut enc, &src, &at(i as u64)));
+    }
+    units.extend(enc.flush().expect("flush"));
+    assert_eq!(units.len(), 5);
+    assert_eq!(vui_colour(&units[0].data).1, Some(false));
+    check_levels(test, &units, |pts| level(pts as usize));
+}
+
+#[test]
 fn a_cropped_planar_source_is_copied() {
     let test = "a_cropped_planar_source_is_copied";
     let Some(mut enc) = open_encoder(test, config(1280, 720, PixelFormat::Nv12)) else {

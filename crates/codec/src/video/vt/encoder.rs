@@ -275,9 +275,9 @@ pub(crate) struct VtEncoder {
     hardware: bool,
     /// One frame period in ticks of [`TIMESCALE`].
     duration: i64,
-    /// The row stride of the stream's sources.
+    /// The row stride of the stream's sources, from its first accepted frame.
     stride: Option<usize>,
-    /// The stream's colorimetry, from its first source.
+    /// The stream's colorimetry, from its first accepted frame.
     colour: Option<Colorimetry>,
     /// The next frame starts a new sequence: an IDR picture.
     restart: bool,
@@ -401,11 +401,11 @@ impl VtEncoder {
     }
 
     /// Replaces the session with a new one whose pool holds `fourcc`
-    /// buffers, describing the stream's colour.
-    fn start_session(&mut self, fourcc: u32) -> Result<()> {
+    /// buffers, describing `colour`.
+    fn start_session(&mut self, fourcc: u32, colour: Option<&Colorimetry>) -> Result<()> {
         self.submitter.drain()?;
         self.session = None;
-        let session = Session::new(&self.config, fourcc, self.colour.as_ref(), &self.shared)?;
+        let session = Session::new(&self.config, fourcc, colour, &self.shared)?;
         self.hardware = session.hardware;
         self.in_place = session.bounded_delay;
         self.device = device_name(&session, &self.encoders);
@@ -413,18 +413,17 @@ impl VtEncoder {
         Ok(())
     }
 
-    /// Fixes the stream's colorimetry to `colour`. The session is kept when
-    /// it already describes `colour`, or has encoded nothing and has the
-    /// pool format `colour` needs; otherwise it is recreated.
+    /// Makes the session describe `colour`. The session is kept when it
+    /// already describes `colour`, or has encoded nothing and has the pool
+    /// format `colour` needs; otherwise it is recreated.
     fn describe(&mut self, colour: Colorimetry) -> Result<()> {
         let fourcc = pool_format(self.config.input_format, colour.range)?;
-        self.colour = Some(colour);
         match &mut self.session {
             Some(s) if s.fourcc == fourcc && s.colour == Some(colour) => {}
             Some(s) if s.fourcc == fourcc && s.fresh => s.describe(&colour)?,
             _ => {
                 let started = std::time::Instant::now();
-                self.start_session(fourcc)?;
+                self.start_session(fourcc, Some(&colour))?;
                 log::debug!(
                     "{DEVICE}: new session for {colour:?} in {:?}",
                     started.elapsed()
@@ -463,19 +462,20 @@ impl VtEncoder {
         self.restart = true;
     }
 
-    /// Submits `src`: read in place through `in_place`, a pixel buffer over
-    /// its surface, or else copied into a pool buffer.
+    /// Submits `src`, whose rows are `stride` bytes apart and whose
+    /// colorimetry is `colour`: read in place through `in_place`, a pixel
+    /// buffer over its surface, or else copied into a pool buffer.
     fn submit(
         &mut self,
         src: &TensorDyn,
         opts: &FrameOptions,
         origin: (usize, usize),
+        (stride, colour): (usize, Colorimetry),
         in_place: Option<CfOwned>,
     ) -> Result<()> {
-        let stride = self.stride.expect("the stride is known");
         if self.session.is_none() {
-            let fourcc = pool_format(self.config.input_format, self.colour.and_then(|c| c.range))?;
-            self.start_session(fourcc)?;
+            let fourcc = pool_format(self.config.input_format, colour.range)?;
+            self.start_session(fourcc, Some(&colour))?;
         }
         let session = self.session.as_ref().expect("a session");
         let (buffer, held, transfer) = match in_place {
@@ -550,14 +550,10 @@ impl EncoderBackend for VtEncoder {
         let stride = src
             .effective_row_stride()
             .ok_or_else(|| CodecError::InvalidInput("source has no row stride".into()))?;
-        match self.stride {
-            Some(s) if s != stride => {
-                return Err(CodecError::InvalidInput(format!(
-                    "source row stride {stride} is not the stream's {s}"
-                )))
-            }
-            Some(_) => {}
-            None => self.stride = Some(stride),
+        if let Some(s) = self.stride.filter(|&s| s != stride) {
+            return Err(CodecError::InvalidInput(format!(
+                "source row stride {stride} is not the stream's {s}"
+            )));
         }
         let in_place = self.in_place && in_place_format(&self.config, src, opts).is_some();
         if in_place {
@@ -581,20 +577,17 @@ impl EncoderBackend for VtEncoder {
                 )))
             }
             Some(_) => {}
-            None => {
-                if let Err(e) = self.describe(colour) {
-                    self.colour = None;
-                    return Err(e);
-                }
-            }
+            None => self.describe(colour)?,
         }
         let in_place = surface.filter(|_| in_place);
-        if let Err(e) = self.submit(src, opts, origin, in_place) {
+        if let Err(e) = self.submit(src, opts, origin, (stride, colour), in_place) {
             if matches!(e, CodecError::Device { .. }) {
                 self.reset();
             }
             return Err(e);
         }
+        self.stride = Some(stride);
+        self.colour = Some(colour);
         Ok(self.shared.lock().ready.pop_front())
     }
 
