@@ -1430,6 +1430,17 @@ impl CPUProcessor {
         Self::for_each_row(src, dst, "copy_image", |s, d| d.copy_from_slice(s))
     }
 
+    /// Copy a BGRA image into an RGBA image of the same size, swapping the red
+    /// and blue channels of every pixel; each side is read and written at its
+    /// own row stride.
+    pub(super) fn swizzle_bgra_to_rgba(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
+        Self::for_each_row(src, dst, "swizzle bgra to rgba", |s, d| {
+            for (s, d) in s.as_chunks::<4>().0.iter().zip(d.as_chunks_mut::<4>().0) {
+                *d = [s[2], s[1], s[0], s[3]];
+            }
+        })
+    }
+
     /// Swap R and B channels in-place for an interleaved 4-channel image,
     /// confined to each row's logical bytes.
     pub(super) fn swizzle_rb_4chan(dst: &mut Tensor<u8>) -> Result<()> {

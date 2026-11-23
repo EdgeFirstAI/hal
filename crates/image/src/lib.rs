@@ -870,7 +870,8 @@ pub trait ImageProcessorTrait {
     /// `Rgba`/`Bgra`, packed `HWC` or planar `CHW`. The CPU backend also
     /// renders YUV destinations: `Yuyv` (from `Yuyv`, `Nv12`, `Rgb`, `Rgba`,
     /// `Grey`), `Vyuy` (from `Vyuy`), `Nv16` and `Nv12` (each from `Yuyv`,
-    /// `Vyuy`, `Nv12`, `Rgb`, `Rgba` and `Grey`; `Nv12` also from `Nv16` and `Nv24`). An `Nv12` destination's
+    /// `Vyuy`, `Nv12`, `Rgb`, `Rgba` and `Grey`; `Nv12` also from `Nv16` and `Nv24`). The CPU backend
+    /// converts a `Bgra` source to every destination it converts an `Rgba` source to. An `Nv12` destination's
     /// width and height must be even. An accelerator may render an `Nv12`
     /// destination; a destination whose [`CpuAccess`](edgefirst_tensor::CpuAccess)
     /// denies the CPU can be refused when the accelerator declines it.
@@ -14525,6 +14526,203 @@ mod image_tests {
             tensor.colorimetry(),
             Some(expected),
             "import_image must store the supplied colorimetry on the returned TensorDyn"
+        );
+    }
+
+    fn bgra_gradient_source(w: usize, h: usize, memory: Option<TensorMemory>) -> TensorDyn {
+        let src = TensorDyn::image(
+            w,
+            h,
+            PixelFormat::Bgra,
+            DType::U8,
+            memory,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        {
+            let t = src.as_u8().unwrap();
+            let stride = t.effective_row_stride().unwrap();
+            let mut map = t.map().unwrap();
+            for y in 0..h {
+                for x in 0..w {
+                    map.as_mut_slice()[y * stride + x * 4..][..4].copy_from_slice(&[
+                        (200 - (x + y) * 150 / (w + h)) as u8,
+                        (40 + y * 170 / h) as u8,
+                        (40 + x * 170 / w) as u8,
+                        255,
+                    ]);
+                }
+            }
+        }
+        src
+    }
+
+    fn bgra_test_bytes(t: &TensorDyn) -> Vec<u8> {
+        let typed = t.as_u8().unwrap();
+        let mut out = vec![0u8; typed.shape().iter().product::<usize>()];
+        typed.copy_to_flat(&mut out).unwrap();
+        out
+    }
+
+    #[test]
+    fn test_bgra_source_through_the_image_processor() {
+        let _lock = acquire_env_lock();
+        let _guard = EnvGuard::snapshot(&[
+            "EDGEFIRST_FORCE_BACKEND",
+            "EDGEFIRST_DISABLE_GL",
+            "EDGEFIRST_DISABLE_G2D",
+            "EDGEFIRST_DISABLE_CPU",
+        ]);
+        for name in [
+            "EDGEFIRST_FORCE_BACKEND",
+            "EDGEFIRST_DISABLE_GL",
+            "EDGEFIRST_DISABLE_G2D",
+            "EDGEFIRST_DISABLE_CPU",
+        ] {
+            unsafe { std::env::remove_var(name) };
+        }
+        let mut processor = ImageProcessor::new().unwrap();
+        let src = bgra_gradient_source(640, 480, Some(TensorMemory::Mem));
+        for format in [PixelFormat::Rgba, PixelFormat::Nv12] {
+            let new_dst = || {
+                TensorDyn::image(
+                    320,
+                    240,
+                    format,
+                    DType::U8,
+                    Some(TensorMemory::Mem),
+                    edgefirst_tensor::CpuAccess::ReadWrite,
+                )
+                .unwrap()
+            };
+            let mut got = new_dst();
+            let mut want = new_dst();
+            processor
+                .convert(&src, &mut got, None)
+                .unwrap_or_else(|e| panic!("{format:?}: ImageProcessor convert: {e}"));
+            CPUProcessor::new()
+                .convert(&src, &mut want, None)
+                .unwrap_or_else(|e| panic!("{format:?}: CPU convert: {e}"));
+            assert_eq!(
+                bgra_test_bytes(&got),
+                bgra_test_bytes(&want),
+                "{format:?}: ImageProcessor differs from the CPU"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_bgra_iosurface_through_the_image_processor_macos() {
+        use crate::test_support::corevideo_buffer;
+        let _lock = acquire_env_lock();
+        let _guard = EnvGuard::snapshot(&[
+            "EDGEFIRST_FORCE_BACKEND",
+            "EDGEFIRST_DISABLE_GL",
+            "EDGEFIRST_DISABLE_G2D",
+            "EDGEFIRST_DISABLE_CPU",
+        ]);
+        for name in [
+            "EDGEFIRST_FORCE_BACKEND",
+            "EDGEFIRST_DISABLE_GL",
+            "EDGEFIRST_DISABLE_G2D",
+            "EDGEFIRST_DISABLE_CPU",
+        ] {
+            unsafe { std::env::remove_var(name) };
+        }
+        let (w, h) = (1000usize, 562usize);
+        let buf = corevideo_buffer(w, h, b"BGRA");
+        buf.fill_rows(|_, row, bytes| {
+            for (x, px) in bytes[..w * 4].chunks_exact_mut(4).enumerate() {
+                px.copy_from_slice(&[
+                    (200 - (x + row) * 150 / (w + h)) as u8,
+                    (40 + row * 170 / h) as u8,
+                    (40 + x * 170 / w) as u8,
+                    255,
+                ]);
+            }
+        });
+        let src = unsafe { TensorDyn::from_planar_iosurface(buf.surface(), None) }
+            .expect("from_planar_iosurface");
+        assert_eq!(src.format(), Some(PixelFormat::Bgra));
+        let mut processor = ImageProcessor::new().unwrap();
+
+        let new_dst = |w: usize, h: usize, format: PixelFormat, dtype: DType| {
+            TensorDyn::image(
+                w,
+                h,
+                format,
+                dtype,
+                Some(TensorMemory::Mem),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .unwrap()
+        };
+
+        let mut got = new_dst(w, h, PixelFormat::Rgba, DType::U8);
+        let mut want = new_dst(w, h, PixelFormat::Rgba, DType::U8);
+        processor
+            .convert(&src, &mut got, None)
+            .expect("ImageProcessor convert to Rgba");
+        CPUProcessor::new()
+            .convert(&src, &mut want, None)
+            .expect("CPU convert to Rgba");
+        assert_eq!(
+            bgra_test_bytes(&got),
+            bgra_test_bytes(&want),
+            "Rgba: ImageProcessor differs from the CPU"
+        );
+
+        let options = ConvertOptions::new().letterbox([114, 114, 114, 255]);
+        let mut got = new_dst(640, 640, PixelFormat::PlanarRgb, DType::F16);
+        let mut want = new_dst(640, 640, PixelFormat::PlanarRgb, DType::F16);
+        processor
+            .convert(&src, &mut got, Some(options))
+            .expect("ImageProcessor convert to PlanarRgb F16");
+        CPUProcessor::new()
+            .convert(&src, &mut want, Some(options))
+            .expect("CPU convert to PlanarRgb F16");
+        let values = |t: &TensorDyn| -> Vec<u8> {
+            let typed = t.as_typed::<half::f16>().unwrap();
+            let mut out = vec![0u8; typed.shape().iter().product::<usize>() * 2];
+            typed.copy_to_flat(&mut out).unwrap();
+            out
+        };
+        assert_eq!(
+            values(&got),
+            values(&want),
+            "PlanarRgb F16: ImageProcessor differs from the CPU"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "opengl")]
+    fn test_gl_declines_bgra_sources() {
+        let mut gl = match GLProcessorThreaded::new(None) {
+            Ok(p) => p,
+            Err(e) => {
+                crate::test_support::report_skip(&format!(
+                    "{} - GL engine init failed ({e:?})",
+                    function!()
+                ));
+                return;
+            }
+        };
+        gl.set_soft_declines(false).unwrap();
+        let src = bgra_gradient_source(64, 64, Some(TensorMemory::Mem));
+        let mut dst = TensorDyn::image(
+            32,
+            32,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        let result = gl.convert(&src, &mut dst, None);
+        assert!(
+            matches!(result, Err(Error::NotSupported(_))),
+            "GL must refuse a Bgra source, got {result:?}"
         );
     }
 }

@@ -22,7 +22,8 @@ use edgefirst_bench::BenchSuite;
 use edgefirst_codec::{peek_info, ImageDecoder, ImageLoad};
 
 use edgefirst_image::{
-    ComputeBackend, ImageProcessor, ImageProcessorConfig, ImageProcessorTrait, Rotation,
+    CPUProcessor, ComputeBackend, ImageProcessor, ImageProcessorConfig, ImageProcessorTrait,
+    Rotation,
 };
 use edgefirst_tensor::{
     DType, PixelFormat, Tensor, TensorDyn, TensorMapTrait, TensorMemory, TensorTrait,
@@ -703,12 +704,76 @@ fn bench_import(proc: &ImageProcessor, suite: &mut BenchSuite) {
 }
 
 // =============================================================================
+// CPU convert benchmarks — RGBA and BGRA sources on the CPU backend only
+// =============================================================================
+
+fn bench_cpu_convert(suite: &mut BenchSuite) {
+    println!("\n== CPU Convert: RGBA and BGRA sources at 1080p ==\n");
+
+    let (w, h) = (1920usize, 1080usize);
+    let mut cpu = CPUProcessor::new();
+    let rgba = CAMERA_1080P_RGBA.as_slice();
+    let bgra: Vec<u8> = rgba
+        .chunks_exact(4)
+        .flat_map(|p| [p[2], p[1], p[0], p[3]])
+        .collect();
+
+    for (in_fmt, data) in [(PixelFormat::Rgba, rgba), (PixelFormat::Bgra, &bgra[..])] {
+        for (out_fmt, dtype) in [
+            (PixelFormat::Rgb, DType::U8),
+            (PixelFormat::Nv12, DType::U8),
+            (PixelFormat::PlanarRgb, DType::F16),
+        ] {
+            let name = format!(
+                "cpu_convert/1080p/{}->{}/{:?}",
+                format_name(in_fmt),
+                format_name(out_fmt),
+                dtype
+            );
+            let src = TensorDyn::image(
+                w,
+                h,
+                in_fmt,
+                DType::U8,
+                Some(TensorMemory::Mem),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .unwrap();
+            src.as_u8().unwrap().map().unwrap().as_mut_slice()[..data.len()].copy_from_slice(data);
+            let mut dst = TensorDyn::image(
+                w,
+                h,
+                out_fmt,
+                dtype,
+                Some(TensorMemory::Mem),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .unwrap();
+            if let Err(e) = cpu.convert(&src, &mut dst, None) {
+                println!("  {:50} [unsupported: {}]", name, e);
+                continue;
+            }
+            let result = run_bench(&name, WARMUP, ITERATIONS, || {
+                cpu.convert(&src, &mut dst, None).unwrap();
+            });
+            result.print_summary_with_throughput(w as u64 * h as u64 * 4);
+            suite.record(&result);
+        }
+    }
+}
+
+// =============================================================================
 // Main
 // =============================================================================
 
 fn main() {
     env_logger::init();
     let mut suite = BenchSuite::from_args();
+    if std::env::args().any(|a| a == "cpu_convert") {
+        bench_cpu_convert(&mut suite);
+        suite.finish();
+        return;
+    }
     let mut proc = ImageProcessor::new().expect("Failed to create ImageProcessor");
 
     println!("Image Benchmark — edgefirst-bench harness");
@@ -720,6 +785,7 @@ fn main() {
     bench_rotate(&mut proc, &mut suite);
     bench_hires(&mut proc, &mut suite);
     bench_import(&proc, &mut suite);
+    bench_cpu_convert(&mut suite);
 
     suite.finish();
     println!("\nDone.");
