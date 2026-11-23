@@ -199,6 +199,8 @@ extern "C" {
     pub(crate) static kCVPixelBufferWidthKey: CFStringRef;
     pub(crate) static kCVPixelBufferHeightKey: CFStringRef;
     pub(crate) static kCVPixelBufferIOSurfacePropertiesKey: CFStringRef;
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) static kCVPixelBufferBytesPerRowAlignmentKey: CFStringRef;
 
     pub(crate) static kCVImageBufferColorPrimariesKey: CFStringRef;
     pub(crate) static kCVImageBufferTransferFunctionKey: CFStringRef;
@@ -294,6 +296,8 @@ extern "C" {
     pub(crate) fn IOSurfaceGetHeight(surface: IOSurfaceRef) -> usize;
     pub(crate) fn IOSurfaceGetBaseAddress(surface: IOSurfaceRef) -> *mut c_void;
     pub(crate) fn IOSurfaceGetPlaneCount(surface: IOSurfaceRef) -> usize;
+    pub(crate) fn IOSurfaceGetBytesPerRow(surface: IOSurfaceRef) -> usize;
+    pub(crate) fn IOSurfaceGetBytesPerRowOfPlane(surface: IOSurfaceRef, plane: usize) -> usize;
     pub(crate) fn IOSurfaceGetBaseAddressOfPlane(
         surface: IOSurfaceRef,
         plane: usize,

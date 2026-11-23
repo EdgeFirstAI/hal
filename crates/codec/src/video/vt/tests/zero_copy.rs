@@ -837,6 +837,86 @@ fn a_yuvf_surface_tagged_limited_range_is_refused() {
     assert!(!in_use(&src));
 }
 
+/// A `w`x`h` IOSurface-backed `fourcc` pixel buffer whose rows are aligned
+/// to `align` bytes.
+fn aligned_buffer(w: usize, h: usize, fourcc: u32, align: usize) -> CfOwned {
+    let align = cf_number_i32(align as i32).unwrap();
+    // SAFETY: the dictionaries hold live CF objects, `buffer` is a valid
+    // out-pointer, and `CVPixelBufferCreate` returns +1.
+    unsafe {
+        let surface = cf_dictionary(&[]).unwrap();
+        let attributes = cf_dictionary(&[
+            (kCVPixelBufferIOSurfacePropertiesKey, surface.as_ptr()),
+            (kCVPixelBufferBytesPerRowAlignmentKey, align.as_ptr()),
+        ])
+        .unwrap();
+        let mut buffer = std::ptr::null_mut();
+        let status = CVPixelBufferCreate(
+            std::ptr::null(),
+            w,
+            h,
+            fourcc,
+            attributes.as_ptr(),
+            &mut buffer,
+        );
+        assert_eq!(status, kCVReturnSuccess);
+        CfOwned::from_create(buffer).unwrap()
+    }
+}
+
+/// The surface of the YUYV pixel buffer `buffer` wrapped as a YUYV tensor
+/// with tightly packed rows.
+fn wrap_tight_yuyv(buffer: &CfOwned) -> TensorDyn {
+    // SAFETY: the pixel buffer is live, and the tensor retains the surface.
+    unsafe {
+        let surface = CVPixelBufferGetIOSurface(buffer.as_ptr());
+        let (w, h) = (IOSurfaceGetWidth(surface), IOSurfaceGetHeight(surface));
+        let mut t = TensorDyn::from_iosurface(surface, &[h, w, 2], DType::U8, None).unwrap();
+        t.set_format(PixelFormat::Yuyv).unwrap();
+        t
+    }
+}
+
+#[test]
+fn a_source_whose_row_stride_is_not_the_surface_pitch_is_copied() {
+    let test = "a_source_whose_row_stride_is_not_the_surface_pitch_is_copied";
+    let (w, h) = (600, 480);
+    let buffer = aligned_buffer(w, h, FOURCC_YUVS, 256);
+    // SAFETY: a live pixel buffer.
+    let pitch = unsafe { CVPixelBufferGetBytesPerRow(buffer.as_ptr()) };
+    let tight = wrap_tight_yuyv(&buffer);
+    let pitched = wrap(&buffer);
+    drop(buffer);
+    let stride = tight.effective_row_stride().unwrap();
+    eprintln!("{test}: surface pitch {pitch}, tensor row stride {stride}");
+    assert_ne!(stride, pitch);
+    let Some(mut enc) = open_encoder(test, config(w, h, PixelFormat::Yuyv)) else {
+        return;
+    };
+    let mut units = Vec::new();
+    for i in 0..10 {
+        paint(&tight, level(i));
+        units.extend(encode_retrying(&mut enc, &tight, &at(i as u64)));
+        assert_eq!(enc.info().transfer, Transfer::CpuCopy, "frame {i}");
+        assert!(!in_use(&tight), "frame {i}");
+    }
+    units.extend(enc.flush().expect("flush"));
+    assert_eq!(units.len(), 10);
+    check_levels(test, &units, |pts| level(pts as usize));
+    let Some(mut enc) = open_encoder(test, config(w, h, PixelFormat::Yuyv)) else {
+        return;
+    };
+    assert_eq!(pitched.effective_row_stride(), Some(pitch));
+    let route = corevideo_route(&enc);
+    paint(&pitched, level(0));
+    let mut units: Vec<EncodedFrame> = encode_retrying(&mut enc, &pitched, &at(0))
+        .into_iter()
+        .collect();
+    assert_eq!(enc.info().transfer, route);
+    units.extend(enc.flush().expect("flush"));
+    check_levels(test, &units, |pts| level(pts as usize));
+}
+
 #[test]
 fn a_cropped_planar_source_is_copied() {
     let test = "a_cropped_planar_source_is_copied";

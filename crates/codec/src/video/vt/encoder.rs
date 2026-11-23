@@ -50,8 +50,9 @@ pub(crate) const MAX_QUEUED_COPIES: usize = 8;
 
 /// The pixel format of the CoreVideo surface `src` wraps, when the frame
 /// is the whole surface and the surface has the configured size: `420v` or
-/// `420f`, with the luma and chroma at its planes 0 and 1, for NV12, and
-/// `yuvs` or `yuvf` for YUYV.
+/// `420f`, with the luma and chroma at its planes 0 and 1 and the row
+/// strides of those planes, for NV12, and `yuvs` or `yuvf` at the surface's
+/// row stride for YUYV.
 fn in_place_format(config: &EncoderConfig, src: &TensorDyn, opts: &FrameOptions) -> Option<u32> {
     if opts.crop.is_some() || src.view_origin().is_some() {
         return None;
@@ -73,25 +74,31 @@ fn in_place_format(config: &EncoderConfig, src: &TensorDyn, opts: &FrameOptions)
             let chroma_surface = chroma.iosurface_ref()?;
             // SAFETY: the tensors keep their surfaces live, and the plane
             // addresses are only compared.
-            let (same, planes, at) = unsafe {
+            let (same, planes, at, pitches) = unsafe {
                 let base = IOSurfaceGetBaseAddress(surface) as usize;
                 let at = |plane| {
                     (IOSurfaceGetBaseAddressOfPlane(surface, plane) as usize).wrapping_sub(base)
                 };
+                let pitch = |plane| IOSurfaceGetBytesPerRowOfPlane(surface, plane);
                 (
                     IOSurfaceGetID(chroma_surface) == IOSurfaceGetID(surface),
                     IOSurfaceGetPlaneCount(surface),
                     [at(0), at(1)],
+                    [pitch(0), pitch(1)],
                 )
             };
             let offsets = [
                 src.plane_offset().unwrap_or(0),
                 chroma.plane_offset().unwrap_or(0),
             ];
-            (same && planes == 2 && offsets == at).then_some(format)
+            let strides = [src.effective_row_stride(), chroma.effective_row_stride()];
+            (same && planes == 2 && offsets == at && strides == pitches.map(Some)).then_some(format)
         }
-        (PixelFormat::Yuyv, FOURCC_YUVS | FOURCC_YUVF) if src.plane_offset().unwrap_or(0) == 0 => {
-            Some(format)
+        (PixelFormat::Yuyv, FOURCC_YUVS | FOURCC_YUVF) => {
+            // SAFETY: the tensor keeps its surface live.
+            let pitch = unsafe { IOSurfaceGetBytesPerRow(surface) };
+            (src.plane_offset().unwrap_or(0) == 0 && src.effective_row_stride() == Some(pitch))
+                .then_some(format)
         }
         _ => None,
     }

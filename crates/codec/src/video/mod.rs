@@ -684,15 +684,15 @@ impl VideoEncoder {
     ///
     /// On macOS and iOS, every source of one stream must have the same row
     /// stride. A source whose IOSurface is a CoreVideo `420v`, `420f`,
-    /// `yuvs` or `yuvf` surface of the configured size, encoded without a crop,
-    /// may be read in place; [`EncoderInfo::transfer`] reports the route. Its
-    /// IOSurface may stay in use (`IOSurfaceIsInUse` is true) after `encode()`
-    /// returns, until its frame leaves the encoder (its access unit is
-    /// returned, it is dropped, or `flush()` returns). CoreVideo pixel buffer
-    /// pools do not hand out a surface while it is in use. Any other pool or
-    /// writer must not reuse or write a surface while `IOSurfaceIsInUse` is
-    /// true. Other sources are copied, and the caller may reuse them once
-    /// `encode()` returns.
+    /// `yuvs` or `yuvf` surface of the configured size, with the row stride of
+    /// each surface plane and encoded without a crop, may be read in place;
+    /// [`EncoderInfo::transfer`] reports the route. Its IOSurface may stay in use
+    /// (`IOSurfaceIsInUse` is true) after `encode()` returns, until its frame
+    /// leaves the encoder (its access unit is returned, it is dropped, or
+    /// `flush()` returns). CoreVideo pixel buffer pools do not hand out a
+    /// surface while it is in use. Any other pool or writer must not reuse or
+    /// write a surface while `IOSurfaceIsInUse` is true. Other sources are
+    /// copied, and the caller may reuse them once `encode()` returns.
     ///
     /// Returns the next finished access unit, which may belong to an earlier
     /// frame, or `None` when none is ready yet.
