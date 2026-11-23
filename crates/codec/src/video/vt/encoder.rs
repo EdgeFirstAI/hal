@@ -23,7 +23,7 @@ use edgefirst_tensor::{ColorRange, Colorimetry, PixelFormat, TensorDyn};
 
 use self::session::{HeldSource, Session, Shared, State, TIMESCALE};
 use self::submit::{Job, Submitter};
-use super::color::{from_attachments, surface_range};
+use super::color::{from_attachments, surface_range, to_corevideo};
 use super::ffi::*;
 use super::{
     chroma_offset, h264_encoders, status, ListedEncoder, FOURCC_420F, FOURCC_420V, FOURCC_YUVF,
@@ -421,7 +421,7 @@ impl VtEncoder {
         self.colour = Some(colour);
         match &mut self.session {
             Some(s) if s.fourcc == fourcc && s.colour == Some(colour) => {}
-            Some(s) if s.fourcc == fourcc && s.fresh => s.describe(&colour),
+            Some(s) if s.fourcc == fourcc && s.fresh => s.describe(&colour)?,
             _ => {
                 let started = std::time::Instant::now();
                 self.start_session(fourcc)?;
@@ -573,6 +573,7 @@ impl EncoderBackend for VtEncoder {
             None => None,
         };
         let colour = source_colour(src, surface.as_ref())?;
+        to_corevideo(&colour)?;
         match self.colour {
             Some(c) if c != colour => {
                 return Err(CodecError::InvalidInput(format!(

@@ -548,7 +548,7 @@ impl Session {
         session.configure(config)?;
         let delay_set = session.set_frame_delay();
         if let Some(colour) = colour {
-            session.describe(colour);
+            session.describe(colour)?;
         }
         // SAFETY: a live session.
         let s = unsafe { VTCompressionSessionPrepareToEncodeFrames(session.session.as_ptr()) };
@@ -724,9 +724,14 @@ impl Session {
 
     /// Sets the stream's colour primaries, transfer function and matrix to
     /// those of `colour`.
-    pub(super) fn describe(&mut self, colour: &Colorimetry) {
+    ///
+    /// # Errors
+    ///
+    /// [`CodecError::InvalidInput`] when a set axis of `colour` has no
+    /// CoreVideo value on this platform.
+    pub(super) fn describe(&mut self, colour: &Colorimetry) -> Result<()> {
+        let cv = to_corevideo(colour)?;
         self.colour = Some(*colour);
-        let cv = to_corevideo(colour);
         // SAFETY: reads VideoToolbox's key constants.
         let keys = unsafe {
             [
@@ -742,6 +747,7 @@ impl Session {
                 }
             }
         }
+        Ok(())
     }
 
     #[cfg(target_os = "macos")]

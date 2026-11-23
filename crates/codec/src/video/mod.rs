@@ -707,6 +707,9 @@ impl VideoEncoder {
     ///
     /// On macOS and iOS, at most 8 sources read in place are in use at once;
     /// another fails at once with [`CodecError::Timeout`] and is not encoded.
+    /// A source tagged with a colour value that has no CoreVideo equivalent
+    /// on the running platform (on iOS, `ColorTransfer::Linear`) fails
+    /// with [`CodecError::InvalidInput`] naming the axis and value.
     ///
     /// On macOS and iOS, [`CodecError::Timeout`] means the frame was not
     /// taken because the encoder has too many frames waiting; the caller may

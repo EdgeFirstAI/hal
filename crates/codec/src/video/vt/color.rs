@@ -7,9 +7,10 @@ use edgefirst_tensor::{ColorEncoding, ColorRange, ColorSpace, ColorTransfer, Col
 
 use super::ffi::*;
 use super::{FOURCC_420F, FOURCC_420V, FOURCC_YUVF, FOURCC_YUVS};
+use crate::{CodecError, Result};
 
-/// The CoreVideo attachment values for a colorimetry; an axis that is unset,
-/// or has no CoreVideo value, is `None`.
+/// The CoreVideo attachment values for a colorimetry; an unset axis is
+/// `None`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CoreVideoColour {
     pub(crate) primaries: Option<CFStringRef>,
@@ -18,12 +19,40 @@ pub(crate) struct CoreVideoColour {
 }
 
 /// The CoreVideo primaries, transfer function and matrix of `c`.
-pub(crate) fn to_corevideo(c: &Colorimetry) -> CoreVideoColour {
-    CoreVideoColour {
-        primaries: c.space.and_then(cv_primaries),
-        transfer: c.transfer.and_then(cv_transfer),
-        matrix: c.encoding.and_then(cv_matrix),
-    }
+///
+/// # Errors
+///
+/// [`CodecError::InvalidInput`] naming the axis and value when a set axis
+/// has no CoreVideo value on this platform.
+pub(crate) fn to_corevideo(c: &Colorimetry) -> Result<CoreVideoColour> {
+    Ok(CoreVideoColour {
+        primaries: corevideo_value("colour primaries", c.space, cv_primaries)?,
+        transfer: corevideo_value("transfer function", c.transfer, cv_transfer)?,
+        matrix: corevideo_value("YCbCr matrix", c.encoding, cv_matrix)?,
+    })
+}
+
+/// The CoreVideo value `map` gives the `axis` value `value`, or `None` when
+/// `value` is unset.
+///
+/// # Errors
+///
+/// [`CodecError::InvalidInput`] naming `axis` and `value` when `map` gives
+/// none.
+fn corevideo_value<T: Copy + std::fmt::Debug>(
+    axis: &str,
+    value: Option<T>,
+    map: impl Fn(T) -> Option<CFStringRef>,
+) -> Result<Option<CFStringRef>> {
+    value
+        .map(|v| {
+            map(v).ok_or_else(|| {
+                CodecError::InvalidInput(format!(
+                    "the source's {axis} {v:?} has no CoreVideo value on this platform"
+                ))
+            })
+        })
+        .transpose()
 }
 
 /// The range of CoreVideo pixel format `fourcc`: `420v` and `yuvs` limited,
@@ -209,7 +238,7 @@ mod tests {
         ];
         for (c, fourcc) in cases {
             let buffer = surface_buffer(fourcc);
-            attach(&buffer, &to_corevideo(&c));
+            attach(&buffer, &to_corevideo(&c).unwrap());
             assert_eq!(read(&buffer, fourcc), c);
         }
     }
@@ -238,7 +267,7 @@ mod tests {
                 range: Some(ColorRange::Limited),
             };
             let buffer = surface_buffer(FOURCC_420V);
-            attach(&buffer, &to_corevideo(&c));
+            attach(&buffer, &to_corevideo(&c).unwrap());
             assert_eq!(read(&buffer, FOURCC_420V), c);
         }
         let srgb = Colorimetry {
@@ -246,13 +275,68 @@ mod tests {
             ..Colorimetry::default()
         };
         assert_eq!(
-            to_corevideo(&srgb).primaries,
+            to_corevideo(&srgb).unwrap().primaries,
             to_corevideo(&Colorimetry {
                 space: Some(ColorSpace::Bt709),
                 ..Colorimetry::default()
             })
+            .unwrap()
             .primaries
         );
+    }
+
+    #[test]
+    fn a_set_axis_without_a_corevideo_value_is_refused() {
+        let unmapped = |_: ColorTransfer| None;
+        let e = corevideo_value("transfer function", Some(ColorTransfer::Linear), unmapped)
+            .unwrap_err();
+        assert!(
+            matches!(&e, CodecError::InvalidInput(why)
+                if why.contains("transfer function") && why.contains("Linear")),
+            "{e}"
+        );
+        assert_eq!(
+            corevideo_value("transfer function", None, unmapped).unwrap(),
+            None
+        );
+        assert!(
+            corevideo_value("transfer function", Some(ColorTransfer::Pq), cv_transfer)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn every_colour_tag_has_a_corevideo_value_on_macos() {
+        for space in [
+            ColorSpace::Bt709,
+            ColorSpace::Bt2020,
+            ColorSpace::Srgb,
+            ColorSpace::Smpte170m,
+        ] {
+            for transfer in [
+                ColorTransfer::Bt709,
+                ColorTransfer::Srgb,
+                ColorTransfer::Pq,
+                ColorTransfer::Hlg,
+                ColorTransfer::Linear,
+            ] {
+                for encoding in [
+                    ColorEncoding::Bt601,
+                    ColorEncoding::Bt709,
+                    ColorEncoding::Bt2020,
+                ] {
+                    let c = Colorimetry {
+                        space: Some(space),
+                        transfer: Some(transfer),
+                        encoding: Some(encoding),
+                        range: None,
+                    };
+                    let cv = to_corevideo(&c).unwrap_or_else(|e| panic!("{c:?}: {e}"));
+                    assert!(cv.primaries.is_some() && cv.transfer.is_some() && cv.matrix.is_some());
+                }
+            }
+        }
     }
 
     #[test]
