@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Planar IOSurface wrapping (`edgefirst-tensor`, macOS and iOS).** `TensorDyn::from_planar_iosurface` wraps a CoreVideo IOSurface as image tensors. A `420v` or `420f` surface becomes a multiplane NV12 tensor whose luma and chroma each wrap the surface at their plane's offset and row stride, whether or not the planes are contiguous. A `yuvs` surface becomes one YUYV tensor and a `BGRA` surface one BGRA tensor, at the surface's row pitch. Any other pixel format returns `InvalidArgument` naming its FourCC, and a plane that does not hold its image or an NV12 surface with an odd width or height returns `InvalidShape`. The wrap does not set colorimetry; the caller sets it.
 - **Planar IOSurface NV12 on ANGLE (`edgefirst-image`, macOS and iOS).** A multiplane NV12 source over a planar IOSurface is sampled plane by plane, luma as `GL_RED` and chroma as `GL_RG`, with hardware chroma sampling. NV12 conversions render into a multiplane NV12 destination over a planar IOSurface: luma into plane 0 and chroma into plane 1 at half width and height, leaving any padding between the planes untouched.
+- **BGRA sources (`edgefirst-image`).** `ImageProcessor` and `CPUProcessor` convert `Bgra` sources (including BGRA IOSurfaces on macOS) to every destination they take from `Rgba`; GL declines BGRA sources so they run on the CPU.
 
 ### Changed
 
@@ -33,6 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Letterbox at odd edges (`edgefirst-image`).** In a letterbox from an RGB, RGBA or YUV source into NV16 or YUYV, the chroma pair that straddles an odd edge of the placed image is encoded from its two pixels instead of being overwritten by the fill colour. In YUYV, the image's last column is no longer replaced by the fill colour when the placed image starts on an odd column.
 - **Semi-planar images at an odd width one short of the row alignment (`edgefirst-tensor`).** An NV12, NV16 or NV24 image tensor on an IOSurface, AHardwareBuffer or D3D11 texture now always records its row stride, so `map()` spans the whole buffer. A 639-wide JPEG decoded into such a tensor failed with `destination buffer … < required`.
 - **IOSurface pins and backing pitch at a plane offset (`edgefirst-tensor`, macOS and iOS).** A host pin of an IOSurface tensor that starts at a plane offset begins at that offset instead of at the surface base. A planar IOSurface wrapped as a tensor no longer takes the surface's meaningless whole-surface bytes per row as its backing pitch.
+- **Letterbox pad on BGRA destinations (`edgefirst-image`).** The CPU letterbox pad on `Bgra` destinations now comes out in the requested colour; red and blue were swapped.
 
 ## [0.41.0] - 2026-11-16
 
