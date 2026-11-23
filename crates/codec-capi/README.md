@@ -5,7 +5,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # edgefirst-codec (C API)
 
-Image and video encode and decode with tensors as the pictures: JPEG and PNG decode, JPEG encode, and H.264 and MJPEG streams, on the platform's hardware (V4L2 on Linux, Media Foundation on Windows, nvJPEG on Linux with CUDA) or the CPU for still images. Ships as `libedgefirst_codec` with `edgefirst/codec.h`.
+Image and video encode and decode with tensors as the pictures: JPEG and PNG decode, JPEG encode, and H.264 and MJPEG streams, on the platform's hardware (V4L2 on Linux, Media Foundation on Windows, VideoToolbox on macOS and iOS, nvJPEG on Linux with CUDA) or the CPU for still images. Ships as `libedgefirst_codec` with `edgefirst/codec.h`.
 
 ```sh
 cc my_app.c $(pkg-config --cflags --libs edgefirst-codec) -o my_app
@@ -77,7 +77,7 @@ ef_video_encoder_flush(enc);
 ef_video_encoder_free(enc);
 ```
 
-Sources are read in place where the engine can (DMA-BUF on Linux, D3D11 textures on Windows); `ef_video_encoder_get_info` says which engine and device encode and how sources reach them. A V4L2 device reads only the layout it asks for, so other sources are copied into that layout first; `ef_video_encoder_create_source` allocates an image in it, which the encoder reads without a copy, and the caller frees it with `ef_tensor_free`. A packet stays valid until the next `ef_video_encoder_next_packet` call.
+Sources are read in place where the engine can (DMA-BUF on Linux, D3D11 textures on Windows, CoreVideo surfaces on macOS and iOS); `ef_video_encoder_get_info` says which engine and device encode and how sources reach them. A V4L2 device reads only the layout it asks for, so other sources are copied into that layout first; `ef_video_encoder_create_source` allocates an image in it, which the encoder reads without a copy, and the caller frees it with `ef_tensor_free`. A packet stays valid until the next `ef_video_encoder_next_packet` call.
 
 ## Decoding video
 
@@ -106,14 +106,14 @@ Frames come from a pool: the caller may hold up to the pool count at once, and a
 
 Every codec runs on an engine (`ef_codec_engine`). `EF_CODEC_ENGINE_AUTO` takes the first engine that can do the request; the environment variable `EDGEFIRST_CODEC_ENGINE` (for example `v4l2,cpu`) narrows and orders that choice. An engine named explicitly is used alone.
 
-| Codec | Linux | Windows | CPU |
-|---|---|---|---|
-| H.264 encode / decode | V4L2 | Media Foundation | no |
-| MJPEG encode / decode | V4L2 JPEG encoder / decoder | no / Media Foundation | no |
-| JPEG encode | V4L2 JPEG encoder | no | yes |
-| JPEG / PNG decode | nvJPEG, V4L2 | no | yes |
+| Codec | Linux | Windows | macOS and iOS | CPU |
+|---|---|---|---|---|
+| H.264 encode / decode | V4L2 | Media Foundation | VideoToolbox | no |
+| MJPEG encode / decode | V4L2 JPEG encoder / decoder | no / Media Foundation | no | no |
+| JPEG encode | V4L2 JPEG encoder | no | no | yes |
+| JPEG / PNG decode | nvJPEG, V4L2 | no | no | yes |
 
-There is no software video codec: where no engine runs a codec, opening it fails with `ENOTSUP` or `ENODEV`. `ef_codec_capabilities_new` lists what this machine's engines do, with each one's device, pixel formats and how frames move (`EF_CODEC_TRANSFER_ZERO_COPY`, `_GPU_COPY`, `_CPU_COPY`). Probing opens devices, so do it once.
+The CPU engine runs no video codec: where no engine runs a codec, opening it fails with `ENOTSUP` or `ENODEV`. `ef_codec_capabilities_new` lists what this machine's engines do, with each one's device, pixel formats and how frames move (`EF_CODEC_TRANSFER_ZERO_COPY`, `_GPU_COPY`, `_CPU_COPY`). Probing opens devices, so do it once.
 
 `ef_codec_v4l2_available` and `ef_codec_nvjpeg_available` are quick probes for the JPEG decoders.
 

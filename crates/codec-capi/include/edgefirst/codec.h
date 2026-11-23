@@ -446,6 +446,8 @@ typedef struct ef_video_encoder_info {
    * layout, `EF_CODEC_TRANSFER_ZERO_COPY` before the first frame and when
    * the device read it in place, as it reads a source from
    * [`ef_video_encoder_create_source`].
+   * A VideoToolbox encoder reports the route of the last frame,
+   * `EF_CODEC_TRANSFER_CPU_COPY` before the first.
    */
   uint32_t transfer;
   /**
@@ -889,15 +891,16 @@ int ef_video_encoder_config_set_quality(struct ef_video_encoder_config *c, uint3
  * runs the codec.
  *
  * Platforms: Linux (V4L2 memory-to-memory encoders), Windows (Media
- * Foundation hardware encoder transforms). Elsewhere there is no engine
- * and this fails with `ENODEV`.
+ * Foundation hardware encoder transforms), macOS and iOS (VideoToolbox, H.264
+ * only). Elsewhere there is no engine and this fails with `ENODEV`.
  *
  * On Linux the first V4L2 device that produces the codec and accepts the
  * input format is used (`EDGEFIRST_CODEC_V4L2_ENCODER` names one device
  * node). On Windows the first hardware encoder transform that takes the
  * input format is used (`EDGEFIRST_CODEC_MF_ENCODER` keeps only the
- * transforms whose name contains its value). There is no software video
- * encoder.
+ * transforms whose name contains its value). Linux and Windows have no
+ * software video encoder. On macOS and iOS VideoToolbox uses the hardware
+ * encoder where there is one and Apple's software encoder otherwise.
  *
  * @return the encoder, freed with [`ef_video_encoder_free`]; `NULL` with
  *         `errno` `EINVAL` for an invalid configuration or one the device
@@ -923,19 +926,35 @@ void ef_video_encoder_free(struct ef_video_encoder *e);
  *
  * `src` must have the configured pixel format and, without `crop`, the
  * configured size. `crop`, when not `NULL`, is the part of `src` to
- * encode, exactly the configured size. A source the device can read in
- * place is read there; [`ef_video_encoder_create_source`] allocates one.
- * Any other source, of any row stride and in any memory the CPU can read,
- * is copied into a buffer the device can read first. Either way the call
- * returns once `src` has been read, so the caller may reuse it
- * afterwards. `pts` is returned unchanged on the access unit; `flags` is 0
- * or `EF_VIDEO_ENCODE_KEYFRAME`.
+ * encode, exactly the configured size. `pts` is returned unchanged on the
+ * access unit; `flags` is 0 or `EF_VIDEO_ENCODE_KEYFRAME`.
  *
- * Platforms: Linux, Windows.
+ * On Linux and Windows, a source the device can read in place is read
+ * there; [`ef_video_encoder_create_source`] allocates one. Any other
+ * source, of any row stride and in any memory the CPU can read, is copied
+ * into a buffer the device can read first. Either way the call returns
+ * once `src` has been read, so the caller may reuse it afterwards.
+ *
+ * On macOS and iOS, every source of one stream must have the same row
+ * stride. A source whose IOSurface is a CoreVideo `420v`, `420f`,
+ * `yuvs` or `yuvf` surface of the configured size, with the row stride of
+ * each surface plane and encoded without a crop, may be read in place;
+ * [`ef_video_encoder_get_info`] reports the route. Its IOSurface may stay in
+ * use (`IOSurfaceIsInUse` is true) after the call returns, until its frame
+ * leaves the encoder (its access unit is queued, it is dropped, or
+ * [`ef_video_encoder_flush`] returns). The caller must not reuse or
+ * overwrite such a source while `IOSurfaceIsInUse` is true. CoreVideo
+ * pixel buffer pools do not hand out a surface while it is in use. Other
+ * sources are copied, and the caller may reuse them once the call returns.
+ *
+ * Platforms: Linux, Windows, macOS and iOS.
  *
  * @return 0; `EINVAL` for a source that does not match the configuration;
- *         `ETIMEDOUT` when the device does not finish in time; otherwise an
- *         errno, with the reason in `ef_codec_last_error`.
+ *         `ETIMEDOUT` when the device does not finish in time, and on
+ *         VideoToolbox when the frame was not accepted because the encoder
+ *         holds too many frames (8 read in place, or 8 copied and not yet
+ *         submitted): submit it again later; otherwise an errno, with the
+ *         reason in `ef_codec_last_error`.
  *
  * # Safety
  * `e` must be a live encoder, `src` a live tensor handle, and `crop`
@@ -957,9 +976,12 @@ int ef_video_encoder_encode(struct ef_video_encoder *e,
  * the picture needs, and the chroma plane can be a buffer of its own. On
  * Windows it is a GPU image of the configured size for an encoder that
  * reads D3D11 textures, and a host-memory image, which the encoder copies
- * into its input sample, for one that does not.
+ * into its input sample, for one that does not. On macOS and iOS it is a
+ * CoreVideo IOSurface: `420v` for NV12 and `yuvs` for YUYV, or `420f` and
+ * `yuvf` once the stream's first source was full range. The encoder reads
+ * it in place under the rule [`ef_video_encoder_encode`] states.
  *
- * Platforms: Linux, Windows.
+ * Platforms: Linux, Windows, macOS and iOS.
  *
  * @return a tensor the caller owns, freed with `ef_tensor_free`; `NULL`
  *         with `errno` `EINVAL` for a `NULL` encoder, `ENODEV` when there
@@ -1006,7 +1028,9 @@ const struct ef_video_encoder_info *ef_video_encoder_get_info(struct ef_video_en
  * Opens a decoder for `codec` (an `ef_codec`) on `engine` (an
  * `ef_codec_engine`), which allocates its own frames: DMA-BUF tensors on
  * Linux, D3D11 textures on Windows (host memory where the process has no
- * D3D11 device), allocated again when the stream changes size.
+ * D3D11 device), allocated again when the stream changes size. On macOS
+ * and iOS each frame is one of VideoToolbox's own pixel buffers, lent as a
+ * multiplane NV12 tensor over its IOSurface until the frame is freed.
  *
  * `pool_count` is the frames the caller may hold at once, 4 if 0; the
  * device's own reference pictures and one buffer to decode into are added
@@ -1015,8 +1039,9 @@ const struct ef_video_encoder_info *ef_video_encoder_get_info(struct ef_video_en
  * stream's format is known.
  *
  * Platforms: Linux (V4L2 memory-to-memory decoders), Windows (Media
- * Foundation: Microsoft's H.264 decoder with DXVA, and MJPEG decoders).
- * Elsewhere there is no engine and this fails with `ENODEV`.
+ * Foundation: Microsoft's H.264 decoder with DXVA, and MJPEG decoders),
+ * macOS and iOS (VideoToolbox, H.264 only). Elsewhere there is no engine
+ * and this fails with `ENODEV`.
  *
  * @return the decoder, freed with [`ef_video_decoder_free`]; `NULL` with
  *         `errno` `ENOTSUP` when no engine here decodes the codec, `ENODEV`
@@ -1037,15 +1062,16 @@ struct ef_video_decoder *ef_video_decoder_new(uint32_t codec,
  * held, the decoder's CPU writes into the tensor (software decoders) are
  * refused. On failure the caller keeps its references.
  *
- * On Windows pictures are copied into the pool, and each tensor must be an
- * NV12 image of exactly the stream's visible size; such a pool cannot
- * follow a change of size. On Linux the device imports the tensors'
- * DMA-BUFs: there must be at least one more than the device keeps for
- * reference pictures, each large enough for the coded picture at the row
- * stride the device asks for, or decoding fails with `EINVAL` once the
+ * On Windows, macOS and iOS pictures are copied into the pool, and each
+ * tensor must be an NV12 image of exactly the stream's visible size (on
+ * macOS and iOS one buffer or separate luma and chroma planes); such a
+ * pool cannot follow a change of size. On Linux the device imports the
+ * tensors' DMA-BUFs: there must be at least one more than the device keeps
+ * for reference pictures, each large enough for the coded picture at the
+ * row stride the device asks for, or decoding fails with `EINVAL` once the
  * stream's size is known.
  *
- * Platforms: Linux, Windows.
+ * Platforms: Linux, Windows, macOS and iOS.
  *
  * @return as [`ef_video_decoder_new`].
  *
@@ -1075,7 +1101,7 @@ void ef_video_decoder_free(struct ef_video_decoder *d);
  * `edgefirst_codec::video::access_units` for splitting a byte stream), for
  * MJPEG one JPEG picture. `pts` is returned unchanged on the frame.
  *
- * Platforms: Linux, Windows.
+ * Platforms: Linux, Windows, macOS and iOS.
  *
  * @return 0; `EAGAIN` when the caller holds every frame of the pool (free
  *         some, then decode the same access unit again); `EBADMSG` for data
@@ -1096,7 +1122,15 @@ int ef_video_decoder_decode(struct ef_video_decoder *d,
  * Drains the decoder at the end of the stream, queueing every frame not yet
  * queued.
  *
- * @return 0, or an errno.
+ * On macOS and iOS a drain into a pool from
+ * [`ef_video_decoder_new_with_pool`] queues every waiting frame or none.
+ *
+ * @return 0; `EAGAIN` when the caller holds frames the drain needs (free
+ *         some, then flush again); `EINVAL` on Windows, macOS and iOS when a
+ *         pool from [`ef_video_decoder_new_with_pool`] holds fewer tensors
+ *         than the frames the drain releases; `ETIMEDOUT` when the device
+ *         does not finish draining; otherwise an errno, with the reason in
+ *         `ef_codec_last_error`.
  *
  * # Safety
  * `d` must be a live decoder.
