@@ -1469,6 +1469,8 @@ calling `dlclose` on either one can trigger heap corruption (`corrupted
 double-linked list`) during process exit — the atexit handlers from the
 shared `galcore` driver become inconsistent.
 
+The first `G2DProcessor::new` in a process loads `libg2d.so.2` once more with `RTLD_NODELETE` and leaks that handle, so the `dlclose` each `G2DProcessor` drop makes never unmaps the library or the driver libraries it pulls in. Their code, including per-thread destructors that run when a thread exits, stays mapped for the life of the process.
+
 For production code, `G2DProcessor` is dropped normally; the EGL
 `Box::leak` (Layer 1) keeps shared `galcore` state intact. For benchmark
 code (where many G2D processors are created/destroyed in one process), the

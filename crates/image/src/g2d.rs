@@ -130,6 +130,25 @@ unsafe impl Sync for G2DProcessor {}
 /// Serializes `g2d_open` and `g2d_close` across the process.
 static G2D_LIFECYCLE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Loads [`G2D_LIBRARY`] once per process with `RTLD_NODELETE` and leaks the
+/// handle, so no later `dlclose` unmaps it. Does nothing if the library is
+/// absent.
+fn keep_g2d_library_loaded() {
+    static LOADED: std::sync::Once = std::sync::Once::new();
+    LOADED.call_once(|| {
+        // SAFETY: loading runs the library's initializers, as `G2D::new` does.
+        let lib = unsafe {
+            libloading::os::unix::Library::open(
+                Some(G2D_LIBRARY),
+                libc::RTLD_LAZY | libc::RTLD_NODELETE,
+            )
+        };
+        if let Ok(lib) = lib {
+            std::mem::forget(lib);
+        }
+    });
+}
+
 impl Drop for G2DProcessor {
     fn drop(&mut self) {
         let _lifecycle = G2D_LIFECYCLE.lock().unwrap_or_else(|e| e.into_inner());
@@ -147,6 +166,7 @@ impl G2DProcessor {
     pub fn new() -> Result<Self> {
         let g2d = {
             let _lifecycle = G2D_LIFECYCLE.lock().unwrap_or_else(|e| e.into_inner());
+            keep_g2d_library_loaded();
             G2D::new(G2D_LIBRARY)?
         };
         let mut processor = Self {
