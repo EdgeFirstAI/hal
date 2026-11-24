@@ -21,8 +21,10 @@
 #   HAL_ONTARGET_TEST_THREADS   test threads per binary; unset uses libtest's
 #                               default, one per CPU
 #   HAL_ONTARGET_GDB            1 to run each test binary under `gdb -batch`,
-#                               which prints every thread's backtrace into the
-#                               binary's log if the binary is killed by a signal
+#                               which prints every thread's backtrace and the
+#                               loaded shared libraries with their addresses
+#                               into the binary's log if the binary is killed
+#                               by a signal
 #
 # Sets the test gates from what the board has: HAL_TEST_REQUIRE_GL with a
 # render node, HAL_TEST_REQUIRE_G2D with libg2d.so.2 (HAL_TEST_SKIP_G2D
@@ -75,7 +77,8 @@ echo "    ${diag}"
 DEBUGGER=()
 if [[ "${HAL_ONTARGET_GDB:-0}" == "1" ]]; then
   if [[ "${have_gdb}" == yes ]]; then
-    DEBUGGER=(gdb -q -batch -return-child-result -ex run -ex "thread apply all bt" --args)
+    DEBUGGER=(gdb -q -batch -return-child-result -ex run -ex "thread apply all bt" \
+      -ex "info sharedlibrary" --args)
   else
     echo "    HAL_ONTARGET_GDB=1 but the board has no gdb"
   fi
@@ -101,7 +104,8 @@ collect_crash() {
   for core in "core.${pid}" core; do
     [[ -f "${core}" ]] || continue
     if [[ "${have_gdb}" == yes ]]; then
-      gdb -q -batch -ex "thread apply all bt" "${bin}" "${core}" >> "${out}" 2>&1
+      gdb -q -batch -ex "thread apply all bt" -ex "info sharedlibrary" "${bin}" "${core}" \
+        >> "${out}" 2>&1
     else
       echo "core file ${core} left on the board; no gdb to read it" >> "${out}"
     fi
