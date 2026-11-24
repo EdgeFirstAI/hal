@@ -24,7 +24,12 @@
 #                               which prints every thread's backtrace and the
 #                               loaded shared libraries with their addresses
 #                               into the binary's log if the binary is killed
-#                               by a signal
+#                               by a signal or hangs
+#   HAL_ONTARGET_GDB_TIMEOUT    seconds a binary may run under gdb before it
+#                               counts as hung (default: 900). A hung binary
+#                               gets SIGINT, which stops it in gdb for the
+#                               backtraces, and SIGKILL 120 s later if gdb is
+#                               still running
 #
 # Sets the test gates from what the board has: HAL_TEST_REQUIRE_GL with a
 # render node, HAL_TEST_REQUIRE_G2D with libg2d.so.2 (HAL_TEST_SKIP_G2D
@@ -38,7 +43,9 @@
 # coredumpctl), summary.txt (`RESULT|detail`, one line) and summary.json into
 # <results-dir>. A test binary killed by a signal also gets
 # <binary>.crash.txt, with the signal and whatever backtrace coredumpctl or a
-# core file and gdb can give. Exits 0 on PASS, 1 on FAIL, NO-TESTS or NO-GPU.
+# core file and gdb can give. A binary that hangs under gdb gets
+# <binary>.crash.txt with each thread's name, wait channel and kernel stack and
+# the last kernel messages. Exits 0 on PASS, 1 on FAIL, NO-TESTS or NO-GPU.
 #
 # Needs bash and the POSIX tools (awk, grep, sed, sort). python3 is used for
 # the Python codec tests only.
@@ -111,6 +118,42 @@ collect_crash() {
     fi
     rm -f "${core}"
     break
+  done
+}
+
+GDB_TIMEOUT="${HAL_ONTARGET_GDB_TIMEOUT:-900}"
+
+# Prints the pids of the processes whose parent is `parent`.
+children_of() {
+  local parent="$1" stat ppid
+  for stat in /proc/[0-9]*/stat; do
+    read -r _ ppid _ < <(sed 's/.*) //' "${stat}" 2>/dev/null) || continue
+    [[ "${ppid}" == "${parent}" ]] && basename "$(dirname "${stat}")"
+  done
+  return 0
+}
+
+# Handles test binary `name` still running under gdb (pid `gdb_pid`) after
+# GDB_TIMEOUT seconds: writes <results>/<name>.crash.txt, sends the binary
+# SIGINT, and sends SIGKILL if it is still running 120 s later.
+on_hang() {
+  local name="$1" gdb_pid="$2" out="${RESULTS}/$1.crash.txt" child task
+  for child in $(children_of "${gdb_pid}"); do
+    {
+      echo "${name} (pid ${child}) hung: still running after ${GDB_TIMEOUT} s"
+      for task in /proc/"${child}"/task/*; do
+        echo "--- thread ${task##*/} $(cat "${task}/comm" 2>/dev/null) wchan=$(cat "${task}/wchan" 2>/dev/null)"
+        cat "${task}/stack" 2>/dev/null
+      done
+      echo "--- dmesg"
+      dmesg 2>/dev/null | tail -n 100
+    } > "${out}"
+    kill -INT "${child}" 2>/dev/null
+  done
+  sleep 120 & nap=$!
+  wait "${nap}"
+  for child in $(children_of "${gdb_pid}"); do
+    kill -KILL "${child}" 2>/dev/null
   done
 }
 
@@ -215,9 +258,26 @@ for bin in "${bins[@]}"; do
     ${DEBUGGER[@]+"${DEBUGGER[@]}"} "./${bin}" ${THREADS_ARG[@]+"${THREADS_ARG[@]}"} ${FILTER} \
     > "${log}" 2>&1 &
   pid=$!
+  watchdog=""
+  if [[ ${#DEBUGGER[@]} -gt 0 ]]; then
+    (
+      nap=""
+      trap 'kill "${nap}" 2>/dev/null; exit 0' TERM
+      sleep "${GDB_TIMEOUT}" & nap=$!
+      wait "${nap}"
+      on_hang "${name}" "${pid}"
+    ) &
+    watchdog=$!
+  fi
   wait "${pid}"
   rc=$?
-  if [[ ${rc} -eq 0 ]]; then
+  if [[ -n "${watchdog}" ]]; then
+    kill "${watchdog}" 2>/dev/null
+    wait "${watchdog}" 2>/dev/null
+  fi
+  hung=no
+  [[ -n "${watchdog}" && -f "${RESULTS}/${name}.crash.txt" ]] && hung=yes
+  if [[ ${rc} -eq 0 && "${hung}" == no ]]; then
     pass=$((pass + 1))
     # Reports the skips of a binary that passed.
     if grep -q "SKIPPED" "${log}"; then
@@ -229,10 +289,13 @@ for bin in "${bins[@]}"; do
       echo "     ok, but ran 0 tests${FILTER:+ (FILTER=\"${FILTER}\" matched no test name)}"
     fi
   else
-    fail=$((fail + 1)); failed_bins+=("${name}")
+    fail=$((fail + 1))
+    if [[ "${hung}" == yes ]]; then failed_bins+=("${name} (hung)"); else failed_bins+=("${name}"); fi
     echo "     FAILED (see ${log})"
     grep -E "^(test .* FAILED|failures:|error)" "${log}" | head -8 | sed 's/^/     /'
-    if [[ ${rc} -gt 128 ]]; then
+    if [[ "${hung}" == yes ]]; then
+      echo "     hung after ${GDB_TIMEOUT} s; see ${RESULTS}/${name}.crash.txt"
+    elif [[ ${rc} -gt 128 ]]; then
       collect_crash "${bin}" "${pid}" "${rc}"
       echo "     killed by signal $((rc - 128)); see ${RESULTS}/${name}.crash.txt"
     fi
