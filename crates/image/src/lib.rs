@@ -1173,22 +1173,19 @@ pub struct ImageProcessorConfig {
     pub egl_cache_capacity: Option<usize>,
 }
 
-/// How `convert()` trades colorimetric exactness against speed on platforms
-/// where the exact path is expensive.
+/// How `convert()` trades colorimetric exactness against speed.
 ///
-/// This affects NV12 sources on Vivante GC7000UL (i.MX 8M Plus), where the
-/// hardware external sampler applies the driver's fixed BT.601-limited
-/// matrix regardless of the source's tagged colorimetry. Other platforms
-/// (Mali, V3D, Tegra, ANGLE) behave identically in both modes.
+/// Both modes select the same conversion paths on every backend: NV12
+/// sources take the in-shader matrix wherever the GL backend can read them
+/// with it.
 ///
 /// Override at runtime with `EDGEFIRST_COLORIMETRY=fast|exact` (takes
-/// precedence over the config field), or per-source by forcing a path with
-/// `EDGEFIRST_NV_CONVERT_PATH`.
+/// precedence over the config field). `EDGEFIRST_NV_CONVERT_PATH` forces the
+/// NV12 path.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ColorimetryMode {
     /// Prefer the fastest path whose output is correct-enough video RGB
-    /// (default). On Vivante, NV12 takes the hardware sampler even when the
-    /// source is not BT.601-limited.
+    /// (default).
     #[default]
     Fast,
     /// Prefer bit-exact colorimetry everywhere: the fast path is used only

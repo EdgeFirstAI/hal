@@ -578,7 +578,7 @@ Use environment variables to isolate tests to specific backends:
 | `EDGEFIRST_GL_SERIALIZE=full` / `=lifecycle` | Pin the GL serialization policy instead of letting the driver probe choose |
 | `EDGEFIRST_NV_CONVERT_PATH=sampler` / `=shader` / `=auto` | Force the NV12/16/24 GPU conversion path |
 | `EDGEFIRST_GL_NO_NV_HW_FILTER=1` | Resize NV12/16/24 with the shader-filtered program instead of the hardware-filtered one (diagnostic; tests reach it per processor) |
-| `EDGEFIRST_COLORIMETRY=exact` | Opt into colorimetry-exact conversion where the default trades exactness for speed |
+| `EDGEFIRST_COLORIMETRY=exact` | Select `ColorimetryMode::Exact`; it selects the same conversion paths as the default |
 
 Example — run tests without any GPU backend:
 

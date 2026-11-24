@@ -3210,6 +3210,140 @@ mod gl_tests {
             .expect("multiplane PixelFormat::Nv12")
     }
 
+    /// Multiplane NV12 (two buffers, one buffer with the chroma at an offset, and padded
+    /// plane pitches) takes `ShaderR8` and matches the CPU into Rgba, Rgb and PlanarRgb.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn multiplane_nv12_shader_r8_matches_cpu() {
+        use crate::opengl_headless::processor::NvConvertPath;
+        use crate::ImageProcessorTrait;
+        use edgefirst_tensor::PlaneDescriptor;
+        if !is_opengl_available() || !is_dma_available() {
+            crate::test_support::report_skip(&format!("{} - GL or DMA not available", function!()));
+            return;
+        }
+        let gl = GLProcessorThreaded::new(None).unwrap();
+        let importer = crate::ImageProcessor::with_config(crate::ImageProcessorConfig {
+            backend: crate::ComputeBackend::Cpu,
+            ..Default::default()
+        })
+        .unwrap();
+        let fill = |w: usize, h: usize, pitch: usize| {
+            let mut y = vec![0u8; pitch * h];
+            let mut uv = vec![0u8; pitch * (h / 2)];
+            for r in 0..h {
+                for c in 0..w {
+                    y[r * pitch + c] = (16 + (r * 3 + c * 5) % 220) as u8;
+                }
+            }
+            for r in 0..h / 2 {
+                for c in 0..w / 2 {
+                    uv[r * pitch + 2 * c] = if c < w / 4 { 90 } else { 200 };
+                    uv[r * pitch + 2 * c + 1] = (40 + (r * 7) % 180) as u8;
+                }
+            }
+            (y, uv)
+        };
+        let dma = |len: usize, bytes: &[u8]| {
+            let t = Tensor::<u8>::new(&[len], Some(TensorMemory::DmaBuf), None).unwrap();
+            t.map().unwrap().as_mut_slice()[..bytes.len()].copy_from_slice(bytes);
+            t
+        };
+        let mut failures = Vec::new();
+        for (w, h) in [(640usize, 640usize), (1920, 1080)] {
+            let mut sources = Vec::new();
+            for (name, pitch, same_fd) in [
+                ("two buffers", w, false),
+                ("one buffer, chroma at an offset", w, true),
+                ("two buffers, padded pitch", w + 64, false),
+            ] {
+                let (y, uv) = fill(w, h, pitch);
+                let src = if same_fd {
+                    let mut all = y.clone();
+                    all.extend_from_slice(&uv);
+                    let buf = dma(all.len(), &all);
+                    let fd = buf.dmabuf().unwrap();
+                    let luma = PlaneDescriptor::new(fd).unwrap().with_stride(pitch);
+                    let chroma = PlaneDescriptor::new(fd)
+                        .unwrap()
+                        .with_stride(pitch)
+                        .with_offset(y.len());
+                    importer
+                        .import_image(luma, Some(chroma), w, h, PixelFormat::Nv12, DType::U8, None)
+                        .unwrap()
+                } else {
+                    let yb = dma(y.len(), &y);
+                    let cb = dma(uv.len(), &uv);
+                    let luma = PlaneDescriptor::new(yb.dmabuf().unwrap())
+                        .unwrap()
+                        .with_stride(pitch);
+                    let chroma = PlaneDescriptor::new(cb.dmabuf().unwrap())
+                        .unwrap()
+                        .with_stride(pitch);
+                    importer
+                        .import_image(luma, Some(chroma), w, h, PixelFormat::Nv12, DType::U8, None)
+                        .unwrap()
+                };
+                assert!(src.as_u8().unwrap().is_multiplane(), "{name}");
+                sources.push((name, src));
+            }
+            for (name, src) in &sources {
+                for fmt in [PixelFormat::Rgba, PixelFormat::Rgb, PixelFormat::PlanarRgb] {
+                    let mut got = TensorDyn::image(
+                        640,
+                        640,
+                        fmt,
+                        DType::U8,
+                        Some(TensorMemory::DmaBuf),
+                        edgefirst_tensor::CpuAccess::ReadWrite,
+                    )
+                    .unwrap();
+                    let fresh;
+                    let g = if std::env::var("MP_FRESH").is_ok() {
+                        fresh = GLProcessorThreaded::new(None).unwrap();
+                        &fresh
+                    } else {
+                        &gl
+                    };
+                    let path = g.with_st(|st| {
+                        st.convert(src, &mut got, None).unwrap();
+                        st.last_nv_convert_path
+                    });
+                    let mut want = TensorDyn::image(
+                        640,
+                        640,
+                        fmt,
+                        DType::U8,
+                        Some(TensorMemory::Mem),
+                        edgefirst_tensor::CpuAccess::ReadWrite,
+                    )
+                    .unwrap();
+                    crate::CPUProcessor::new()
+                        .convert(src, &mut want, None)
+                        .unwrap();
+                    let g = got.as_u8().unwrap().map().unwrap().to_vec();
+                    let c = want.as_u8().unwrap().map().unwrap().to_vec();
+                    let n = g.len().min(c.len());
+                    let diffs: Vec<u32> = (0..n)
+                        .map(|i| (g[i] as i32 - c[i] as i32).unsigned_abs())
+                        .collect();
+                    let max = diffs.iter().copied().max().unwrap_or(0);
+                    let mean = diffs.iter().map(|&d| d as f64).sum::<f64>() / n.max(1) as f64;
+                    eprintln!(
+                        "MP {w}x{h} {name} -> {fmt:?}: path={path:?} max={max} mean={mean:.3}"
+                    );
+                    let limit = if (w, h) == (640, 640) { 3 } else { 255 };
+                    if path != NvConvertPath::ShaderR8 || max > limit || mean > 2.0 {
+                        failures.push(format!(
+                            "{w}x{h} {name} -> {fmt:?}: path={path:?} max={max} mean={mean:.3}"
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
     /// Multiplane NV12 (two separate fds) → Rgba through GL equals contiguous NV12 → Rgba.
     #[test]
     #[cfg(target_os = "linux")]
@@ -7344,7 +7478,8 @@ mod gl_tests {
         });
     }
 
-    /// Colorimetry mode, source colorimetry and `EDGEFIRST_COLORIMETRY` pick the `auto` NV12 path.
+    /// `auto` takes `ShaderR8` for single-plane NV12 in both colorimetry modes, for BT.709 and
+    /// BT.601 sources, into RGBA and Grey, and with `EDGEFIRST_COLORIMETRY` pinned.
     #[test]
     #[cfg(target_os = "linux")]
     fn colorimetry_mode_policy_nv12_auto() {
@@ -7397,31 +7532,16 @@ mod gl_tests {
             gl.last_nv_convert_path
         };
         worker.with_st(|gl| {
-            // Fast (default): the sampler on Vivante, the in-shader matrix everywhere else.
-            let expect_fast = if gl.is_vivante {
-                NvConvertPath::ExternalSampler
-            } else {
-                NvConvertPath::ShaderR8
-            };
-            assert_eq!(
-                path_for(gl, &src_709, &mut dst),
-                expect_fast,
-                "Fast mode, BT.709-full NV12"
-            );
-
-            // Exact: the in-shader matrix everywhere for a BT.709 source.
-            gl.set_colorimetry_mode(ColorimetryMode::Exact);
-            assert_eq!(
-                path_for(gl, &src_709, &mut dst),
-                NvConvertPath::ShaderR8,
-                "Exact mode, BT.709-full NV12"
-            );
-            // Exact with a BT.601-limited source: the sampler on Vivante.
-            assert_eq!(
-                path_for(gl, &src_601, &mut dst),
-                expect_fast,
-                "Exact mode, BT.601-limited NV12"
-            );
+            for mode in [ColorimetryMode::Fast, ColorimetryMode::Exact] {
+                gl.set_colorimetry_mode(mode);
+                for (name, src) in [("BT.709-full", &src_709), ("BT.601-limited", &src_601)] {
+                    assert_eq!(
+                        path_for(gl, src, &mut dst),
+                        NvConvertPath::ShaderR8,
+                        "{mode:?} mode, {name} NV12"
+                    );
+                }
+            }
 
             // A Grey destination takes `ShaderR8` in either mode.
             let mut grey_dst = TensorDyn::image(
@@ -7485,7 +7605,7 @@ mod gl_tests {
             bytes.push(80); // Cr
         }
 
-        let run = |env: Option<&str>| -> Option<(NvConvertPath, bool)> {
+        let run = |env: Option<&str>| -> Option<NvConvertPath> {
             let worker = GLProcessorThreaded::with_env(
                 None,
                 None,
@@ -7520,29 +7640,25 @@ mod gl_tests {
             .unwrap();
             Some(worker.with_st(|gl| {
                 gl.convert(&src, &mut dst, None).unwrap();
-                (gl.last_nv_convert_path, gl.is_vivante)
+                gl.last_nv_convert_path
             }))
         };
 
-        if let Some((p, is_vivante)) = run(None) {
-            let expect = if is_vivante {
-                NvConvertPath::ExternalSampler
-            } else {
-                NvConvertPath::ShaderR8
-            };
+        if let Some(p) = run(None) {
             assert_eq!(
-                p, expect,
-                "auto default: single-plane full-range NV12 policy pick"
+                p,
+                NvConvertPath::ShaderR8,
+                "auto default: single-plane full-range NV12 takes ShaderR8"
             );
         }
-        if let Some((p, _)) = run(Some("shader")) {
+        if let Some(p) = run(Some("shader")) {
             assert_eq!(
                 p,
                 NvConvertPath::ShaderR8,
                 "forced shader must use ShaderR8"
             );
         }
-        if let Some((p, _)) = run(Some("sampler")) {
+        if let Some(p) = run(Some("sampler")) {
             assert_ne!(
                 p,
                 NvConvertPath::ShaderR8,

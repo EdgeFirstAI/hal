@@ -478,7 +478,8 @@ DMA-BUF import paths, selected by format (`processor/mod.rs::convert_to`):
 - **Path A — driver hardware-YUV (`samplerExternalOES`).** The two-plane
   DMA-BUF is imported as an `EGL_LINUX_DMA_BUF_EXT` EGLImage with a YUV DRM
   FourCC and sampled through `samplerExternalOES`; the driver does the
-  YUV→RGB. This is the path **NV12** uses on every GPU. It is *not* used for
+  YUV→RGB. `auto` takes it for multiplane NV12, which Path B cannot import;
+  `EDGEFIRST_NV_CONVERT_PATH=sampler` forces it for single-plane NV12. It is *not* used for
   NV16/NV24 on the embedded drivers: `samplerExternalOES` either rejects the
   4:2:2/4:4:4 FourCC (Vivante: `EGL(BadMatch)`) or samples it incorrectly
   (Mali/V3D produce wrong pixels). `pixel_format_to_drm` therefore maps only
@@ -624,15 +625,10 @@ and YUV→YUV encode with the destination's own resolved colorimetry:
 - **Path A** (`samplerExternalOES`, driver YUV) sets the matching EGL
   `YUV_COLOR_SPACE_HINT` / `SAMPLE_RANGE_HINT` from the resolved colorimetry.
   Hint-ignoring drivers (Vivante) apply a fixed BT.601-limited matrix
-  regardless. How `auto` weighs that against Vivante's ~12× Path-B cost is
-  the **`ColorimetryMode`** knob (`ImageProcessorConfig::colorimetry`, env
-  `EDGEFIRST_COLORIMETRY`): the default **`Fast`** keeps
-  single-plane 4-aligned NV12 on Path A for every colorimetry (approximate
-  matrix for non-BT.601-limited sources), while the **`Exact`** opt-in
-  forces non-matching colorimetries to Path B so the exact matrix always
-  applies. Multiplane NV12 (which Path B cannot import) stays on Path A in
-  both modes, as does every non-Vivante GPU's Path-B preference (exact is
-  already the fast path there).
+  regardless. `auto` takes Path B for single-plane NV12 on every GPU, in
+  both **`ColorimetryMode`**s (`ImageProcessorConfig::colorimetry`, env
+  `EDGEFIRST_COLORIMETRY`). Multiplane NV12, which Path B cannot import,
+  takes Path A.
 - Packed **YUYV/VYUY**: the **macOS** YUYV shader threads the same six
   colorimetry uniforms as the NV path (`yuv_to_rgb_coeffs`), so an untagged
   720p source resolves to BT.709 limited and matches the camera fixture (~0.997

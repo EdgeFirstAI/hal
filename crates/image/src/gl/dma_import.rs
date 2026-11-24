@@ -532,6 +532,54 @@ impl DmaImportAttrs {
         Ok((luma, chroma))
     }
 
+    /// Import attributes for the planes of a multiplane NV12 source: the luma
+    /// plane as an R8 image of `w` x `h` texels and the chroma plane as a
+    /// `GR88` image of `w / 2` x `h / 2` texels (U in R, V in G), each at its
+    /// own buffer, pitch and offset.
+    ///
+    /// # Errors
+    ///
+    /// `NotSupported` for a single-plane tensor; `NotImplemented` for a plane
+    /// without a DMA-BUF.
+    pub fn from_tensor_nv12_planes(img: &Tensor<u8>) -> Result<(Self, Self), Error> {
+        let w = img.width().ok_or(Error::NotAnImage)?;
+        let h = img.height().ok_or(Error::NotAnImage)?;
+        let chroma = img.chroma().ok_or_else(|| {
+            Error::NotSupported("NV12 plane import: the source has no chroma plane".into())
+        })?;
+        let (luma_pitch, chroma_pitch) = crate::cpu::semi_planar_strides(img);
+        let plane = |fd, width, height, fourcc, pitch, offset| DmaImportAttrs {
+            width,
+            height,
+            drm_fourcc: fourcc,
+            plane0_fd: fd,
+            plane0_pitch: pitch,
+            plane0_offset: offset,
+            x_shift_px: 0,
+            plane1: None,
+            is_yuv: false,
+            yuv_encoding: ColorEncoding::Bt709,
+            yuv_range: ColorRange::Limited,
+        };
+        let luma = plane(
+            dma_fd(img, "NV12 luma plane")?,
+            w,
+            h,
+            DrmFourcc::R8,
+            luma_pitch,
+            img.plane_offset().unwrap_or(0),
+        );
+        let chroma = plane(
+            dma_fd(chroma, "NV12 chroma plane")?,
+            w.div_ceil(2),
+            h.div_ceil(2),
+            DrmFourcc::Gr88,
+            chroma_pitch,
+            chroma.plane_offset().unwrap_or(0),
+        );
+        Ok((luma, chroma))
+    }
+
     /// Single-plane R8 attributes over `fd`, `pitch` texels wide.
     fn r8_render_target(fd: RawFd, height: usize, pitch: usize, offset: usize) -> Self {
         DmaImportAttrs {

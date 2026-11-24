@@ -85,6 +85,31 @@ pub(super) enum NvPathPref {
     ForceShader,
 }
 
+/// The NV* path for a `src_fmt` source that `ShaderR8` can read, under
+/// `pref`, drawing into a `render_fmt` target. `Auto` and `ForceShader` take
+/// `ShaderR8`. `ForceSampler` takes `ExternalSampler` for NV12 into a
+/// non-Grey target, and otherwise logs a warning and takes `ShaderR8`.
+fn nv_path_for(pref: NvPathPref, src_fmt: PixelFormat, render_fmt: PixelFormat) -> NvConvertPath {
+    if pref != NvPathPref::ForceSampler {
+        return NvConvertPath::ShaderR8;
+    }
+    if render_fmt == PixelFormat::Grey {
+        log::warn!(
+            "EDGEFIRST_NV_CONVERT_PATH=sampler refused for {src_fmt:?}→Grey \
+             (the sampler returns RGB, not the source's luma); using shader"
+        );
+        return NvConvertPath::ShaderR8;
+    }
+    if src_fmt != PixelFormat::Nv12 {
+        log::warn!(
+            "EDGEFIRST_NV_CONVERT_PATH=sampler unavailable for {src_fmt:?} \
+             (no external-sampler path); using shader"
+        );
+        return NvConvertPath::ShaderR8;
+    }
+    NvConvertPath::ExternalSampler
+}
+
 /// Bound destination render target for one convert, produced by
 /// [`GLProcessorST::bind_dst`]. The GL counterpart of
 /// [`super::render::DstLowering`].
@@ -5024,6 +5049,7 @@ impl GLProcessorST {
     /// - [`NvConvertPath::ExternalSampler`] (samplerExternalOES) covers NV12
     ///   only (incl. multiplane).
     ///
+    /// `Auto` takes `ShaderR8` wherever it can read the source.
     /// `render_fmt` is the format of the render target this draw writes. A
     /// Grey render target always takes `ShaderR8`.
     fn select_nv_path(
@@ -5043,60 +5069,7 @@ impl GLProcessorST {
         if !shader_capable {
             return NvConvertPath::ExternalSampler;
         }
-        // A Grey target takes `ShaderR8`; a forced sampler is refused.
-        if render_fmt == PixelFormat::Grey {
-            if self.nv_path_pref == NvPathPref::ForceSampler {
-                log::warn!(
-                    "EDGEFIRST_NV_CONVERT_PATH=sampler refused for {src_fmt:?}→Grey \
-                     (the sampler returns RGB, not the source's luma); using shader"
-                );
-            }
-            return NvConvertPath::ShaderR8;
-        }
-        // Single-plane NV12/NV16/NV24 from here; only NV12 also has an
-        // ExternalSampler path.
-        match self.nv_path_pref {
-            NvPathPref::ForceShader => NvConvertPath::ShaderR8,
-            NvPathPref::ForceSampler => {
-                if src_fmt == PixelFormat::Nv12 {
-                    NvConvertPath::ExternalSampler
-                } else {
-                    log::warn!(
-                        "EDGEFIRST_NV_CONVERT_PATH=sampler unavailable for {src_fmt:?} \
-                         (no external-sampler path); using shader"
-                    );
-                    NvConvertPath::ShaderR8
-                }
-            }
-            // Auto: `ShaderR8`, except on Vivante for single-plane 4-aligned NV12,
-            // where the pick follows the colorimetry mode:
-            //
-            // * `ColorimetryMode::Fast`: the sampler for every colorimetry.
-            // * `ColorimetryMode::Exact`: the sampler only when the source resolves
-            //   to BT.601 limited range.
-            NvPathPref::Auto => {
-                let vivante_sampler_usable = src_fmt == PixelFormat::Nv12
-                    && self.is_vivante
-                    && src.width().is_some_and(|w| w.is_multiple_of(4));
-                let take_sampler = vivante_sampler_usable
-                    && match self.colorimetry_mode {
-                        crate::ColorimetryMode::Fast => true,
-                        crate::ColorimetryMode::Exact => {
-                            let cm = crate::colorimetry::resolve_colorimetry(
-                                src.colorimetry(),
-                                src.height(),
-                            );
-                            cm.encoding == Some(edgefirst_tensor::ColorEncoding::Bt601)
-                                && cm.range == Some(edgefirst_tensor::ColorRange::Limited)
-                        }
-                    };
-                if take_sampler {
-                    NvConvertPath::ExternalSampler
-                } else {
-                    NvConvertPath::ShaderR8
-                }
-            }
-        }
+        nv_path_for(self.nv_path_pref, src_fmt, render_fmt)
     }
 
     /// Render `src` to the currently-bound FBO at `dst`'s dimensions; see
@@ -9949,6 +9922,79 @@ impl GLProcessorST {
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
+    /// `Auto` takes `ShaderR8` for every source `ShaderR8` reads, into every target format.
+    #[test]
+    fn auto_nv_path_is_shader_r8() {
+        use super::{nv_path_for, NvConvertPath, NvPathPref};
+        use edgefirst_tensor::PixelFormat;
+        for src in [PixelFormat::Nv12, PixelFormat::Nv16, PixelFormat::Nv24] {
+            for render in [
+                PixelFormat::Rgba,
+                PixelFormat::Rgb,
+                PixelFormat::PlanarRgb,
+                PixelFormat::Grey,
+            ] {
+                assert_eq!(
+                    nv_path_for(NvPathPref::Auto, src, render),
+                    NvConvertPath::ShaderR8,
+                    "{src:?} -> {render:?}"
+                );
+            }
+        }
+    }
+
+    /// A forced path is taken where it exists, and `ShaderR8` otherwise.
+    #[test]
+    fn forced_nv_path() {
+        use super::{nv_path_for, NvConvertPath, NvPathPref};
+        use edgefirst_tensor::PixelFormat;
+        let cases = [
+            (
+                NvPathPref::ForceShader,
+                PixelFormat::Nv12,
+                PixelFormat::Rgba,
+                NvConvertPath::ShaderR8,
+            ),
+            (
+                NvPathPref::ForceSampler,
+                PixelFormat::Nv12,
+                PixelFormat::Rgba,
+                NvConvertPath::ExternalSampler,
+            ),
+            (
+                NvPathPref::ForceSampler,
+                PixelFormat::Nv12,
+                PixelFormat::PlanarRgb,
+                NvConvertPath::ExternalSampler,
+            ),
+            (
+                NvPathPref::ForceSampler,
+                PixelFormat::Nv12,
+                PixelFormat::Grey,
+                NvConvertPath::ShaderR8,
+            ),
+            (
+                NvPathPref::ForceSampler,
+                PixelFormat::Nv16,
+                PixelFormat::Rgba,
+                NvConvertPath::ShaderR8,
+            ),
+            (
+                NvPathPref::ForceSampler,
+                PixelFormat::Nv24,
+                PixelFormat::Rgba,
+                NvConvertPath::ShaderR8,
+            ),
+        ];
+        for (pref, src, render, want) in cases {
+            assert_eq!(
+                nv_path_for(pref, src, render),
+                want,
+                "{pref:?} {src:?} -> {render:?}"
+            );
+        }
+    }
+
     /// `GlEnv` reads each documented name; the flags need exactly `1`.
     #[test]
     fn gl_env_reads_the_documented_names() {

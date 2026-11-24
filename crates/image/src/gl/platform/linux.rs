@@ -236,22 +236,45 @@ impl GlPlatform for LinuxEgl {
         dma_buf_import_formats(display).contains(&(drm_fourcc::DrmFourcc::Bgr888 as u32))
     }
 
+    /// Imports the luma plane alone of a source [`Self::nv_native_planes`]
+    /// accepts, and the combined plane of any other.
     fn import_buffer_nv_r8(
         display: &GlContext,
         img: &Tensor<u8>,
         fmt: PixelFormat,
     ) -> crate::Result<EglImage> {
-        let attrs = DmaImportAttrs::from_tensor_nv_r8(img, fmt)?;
+        let attrs = if Self::nv_native_planes(img).is_some() {
+            DmaImportAttrs::from_tensor_nv12_planes(img)?.0
+        } else {
+            DmaImportAttrs::from_tensor_nv_r8(img, fmt)?
+        };
         new_egl_image_owned(display, egl_ext::LINUX_DMA_BUF, &attrs.to_egl_attribs())
     }
 
+    /// Imports the chroma plane of a source [`Self::nv_native_planes`]
+    /// accepts from its own buffer, and of any other from the combined plane.
     fn import_buffer_nv_chroma(
         display: &GlContext,
         img: &Tensor<u8>,
         fmt: PixelFormat,
     ) -> crate::Result<EglImage> {
-        let attrs = DmaImportAttrs::from_tensor_nv_chroma_gr88(img, fmt)?;
+        let attrs = if Self::nv_native_planes(img).is_some() {
+            DmaImportAttrs::from_tensor_nv12_planes(img)?.1
+        } else {
+            DmaImportAttrs::from_tensor_nv_chroma_gr88(img, fmt)?
+        };
         new_egl_image_owned(display, egl_ext::LINUX_DMA_BUF, &attrs.to_egl_attribs())
+    }
+
+    /// The luma extent of a multiplane NV12 source whose luma and chroma
+    /// planes are DMA-BUFs.
+    fn nv_native_planes(img: &Tensor<u8>) -> Option<(usize, usize)> {
+        use edgefirst_tensor::{TensorMemory, TensorTrait};
+        let chroma = img.chroma()?;
+        (img.format() == Some(PixelFormat::Nv12)
+            && img.memory() == TensorMemory::DmaBuf
+            && chroma.memory() == TensorMemory::DmaBuf)
+            .then_some((img.width()?, img.height()?))
     }
 
     const NV12_DST: bool = true;
