@@ -7,7 +7,7 @@ use std::ptr::NonNull;
 use std::thread::JoinHandle;
 use tokio::sync::mpsc::{Sender, WeakSender};
 
-use super::processor::GLProcessorST;
+use super::processor::{GLProcessorST, GlEnv};
 use super::shaders::check_gl_error;
 use super::{EglDisplayKind, Int8InterpolationMode, TransferBackend};
 use crate::{ConvertOptions, Error, ImageProcessorTrait};
@@ -33,6 +33,15 @@ enum GLProcessorMessage {
     ),
     /// Complete any deferred batch render with a single GPU sync.
     Flush(tokio::sync::oneshot::Sender<Result<(), Error>>),
+    /// Deferred converts of one source into each destination, then one GPU
+    /// sync, as a single message. Replies with each convert's result, or the
+    /// sync's error.
+    #[allow(clippy::type_complexity)]
+    ImageConvertBatch(
+        SendablePtr<TensorDyn>,
+        SendablePtr<(TensorDyn, ConvertOptions)>,
+        tokio::sync::oneshot::Sender<Result<Vec<Result<(), Error>>, Error>>,
+    ),
     SetColors(
         Vec<[u8; 4]>,
         tokio::sync::oneshot::Sender<Result<(), Error>>,
@@ -77,6 +86,9 @@ enum GLProcessorMessage {
     /// Test hook: make every zero-copy destination import fail.
     #[cfg(test)]
     SetFailDstImport(bool, tokio::sync::oneshot::Sender<Result<(), Error>>),
+    /// Test hook: run a closure against the worker's `GLProcessorST`.
+    #[cfg(test)]
+    WithSt(WorkerJob, tokio::sync::oneshot::Sender<()>),
     /// Test hook: the NV12 destination policy and whether soft declines apply.
     #[cfg(test)]
     Nv12DeclineState(
@@ -105,6 +117,10 @@ enum GLProcessorMessage {
     CudaUnmap(usize),      // fire-and-forget
     CudaUnregister(usize), // fire-and-forget
 }
+
+/// A closure run on the GL worker thread by [`GLProcessorThreaded::with_st`].
+#[cfg(test)]
+type WorkerJob = Box<dyn FnOnce(&mut GLProcessorST) + Send>;
 
 /// Compute the flat element count for a PBO image buffer of the given format:
 /// the product of the format's `allocation_shape`.
@@ -441,6 +457,9 @@ fn reject_poisoned_message(msg: GLProcessorMessage) {
         GLProcessorMessage::Flush(resp) => {
             let _ = resp.send(Err(poison_err));
         }
+        GLProcessorMessage::ImageConvertBatch(.., resp) => {
+            let _ = resp.send(Err(poison_err));
+        }
         GLProcessorMessage::DrawDecodedMasks(.., resp) => {
             let _ = resp.send(Err(poison_err));
         }
@@ -468,6 +487,11 @@ fn reject_poisoned_message(msg: GLProcessorMessage) {
         #[cfg(test)]
         GLProcessorMessage::SetFailDstImport(_, resp) => {
             let _ = resp.send(Err(poison_err));
+        }
+        #[cfg(test)]
+        GLProcessorMessage::WithSt(job, resp) => {
+            drop(job);
+            let _ = resp.send(());
         }
         #[cfg(test)]
         GLProcessorMessage::Nv12DeclineState(resp) => {
@@ -506,6 +530,7 @@ fn run_gl_worker(
     owned_pbos: std::sync::Arc<super::processor::OwnedPbos>,
     kind: Option<EglDisplayKind>,
     capacity: Option<usize>,
+    env: GlEnv,
     mut recv: tokio::sync::mpsc::Receiver<GLProcessorMessage>,
     create_ctx_send: tokio::sync::oneshot::Sender<Result<super::platform::PlatformCaps, Error>>,
 ) {
@@ -515,16 +540,16 @@ fn run_gl_worker(
         let _guard = super::context::GL_MUTEX
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        GLProcessorST::new(kind, capacity)
+        GLProcessorST::new(kind, capacity, &env)
     };
     // macOS, iOS and Android: creation takes no lock.
     #[cfg(any(target_os = "macos", target_os = "ios", target_os = "android"))]
-    let init_result = GLProcessorST::new(kind, capacity);
+    let init_result = GLProcessorST::new(kind, capacity, &env);
     // Windows: creation runs under `NON_LINUX_GL_MUTEX`.
     #[cfg(target_os = "windows")]
     let init_result = {
         let _guard = NON_LINUX_GL_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        GLProcessorST::new(kind, capacity)
+        GLProcessorST::new(kind, capacity, &env)
     };
     let mut gl_converter = match init_result {
         Ok(gl) => gl,
@@ -559,9 +584,9 @@ fn run_gl_worker(
     let _gl_worker_slot = GlWorkerSlot;
     // Per-message serialization policy: `caps.serialize_gl`, overridden by
     // `EDGEFIRST_GL_SERIALIZE` (`full` or `lifecycle`).
-    let serialize_per_msg = match std::env::var("EDGEFIRST_GL_SERIALIZE").as_deref() {
-        Ok("full") => true,
-        Ok("lifecycle") => {
+    let serialize_per_msg = match env.serialize.as_deref() {
+        Some("full") => true,
+        Some("lifecycle") => {
             #[cfg(target_os = "windows")]
             log::warn!(
                 "EDGEFIRST_GL_SERIALIZE=lifecycle drops the per-message lock the ANGLE/D3D11 context re-sync relies on; concurrent GL across processors is not supported on this backend"
@@ -611,6 +636,12 @@ fn run_gl_worker(
         handle_gl_message(msg, &mut gl_converter, &mut poisoned);
         // Fold in a panic from a re-entrant inline PBO op.
         poisoned |= GL_WORKER_POISON.with(|p| p.replace(false));
+        // Full policy: no deferred draw is left pending once the lock is
+        // released. A panic here poisons the worker.
+        if serialize_per_msg && !poisoned {
+            poisoned |= std::panic::catch_unwind(AssertUnwindSafe(|| gl_converter.flush_pending()))
+                .is_err();
+        }
         // Per-pass platform texture attachments are released once the
         // message's GPU work has synced; deferred batches keep theirs until
         // Flush.
@@ -654,6 +685,22 @@ fn handle_gl_message(
         GLProcessorMessage::Flush(resp) => {
             let result = std::panic::catch_unwind(AssertUnwindSafe(|| gl_converter.flush()));
             reply_caught(result, resp, poisoned, "Flush");
+        }
+        GLProcessorMessage::ImageConvertBatch(src, mut items, resp) => {
+            // SAFETY: `convert_batch()` waits for the reply before dropping its
+            // borrows of `src` and the destinations.
+            let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                let src = unsafe { src.ptr.as_ref() };
+                let items =
+                    unsafe { std::slice::from_raw_parts_mut(items.ptr.as_mut(), items.len) };
+                let results = items
+                    .iter_mut()
+                    .map(|(dst, options)| gl_converter.convert_deferred(src, dst, Some(*options)))
+                    .collect::<Vec<_>>();
+                gl_converter.flush()?;
+                Ok(results)
+            }));
+            reply_caught(result, resp, poisoned, "ImageConvertBatch");
         }
         GLProcessorMessage::DrawDecodedMasks(
             dst,
@@ -739,6 +786,11 @@ fn handle_gl_message(
                 Ok(())
             }));
             reply_caught(result, resp, poisoned, "SetFailDstImport");
+        }
+        #[cfg(test)]
+        GLProcessorMessage::WithSt(job, resp) => {
+            job(gl_converter);
+            let _ = resp.send(());
         }
         #[cfg(test)]
         GLProcessorMessage::Nv12DeclineState(resp) => {
@@ -1036,6 +1088,16 @@ impl GLProcessorThreaded {
         kind: Option<EglDisplayKind>,
         capacity: Option<usize>,
     ) -> Result<Self, Error> {
+        Self::with_env(kind, capacity, GlEnv::from_process())
+    }
+
+    /// Creates a processor whose worker takes its environment settings from
+    /// `env` instead of the process environment.
+    pub(crate) fn with_env(
+        kind: Option<EglDisplayKind>,
+        capacity: Option<usize>,
+        env: GlEnv,
+    ) -> Result<Self, Error> {
         let worker_id = NEXT_GL_WORKER_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (send, recv) = tokio::sync::mpsc::channel::<GLProcessorMessage>(1);
 
@@ -1049,6 +1111,7 @@ impl GLProcessorThreaded {
                 worker_owned,
                 kind,
                 capacity,
+                env,
                 recv,
                 create_ctx_send,
             );
@@ -1324,6 +1387,78 @@ impl GLProcessorThreaded {
     pub(crate) fn stop_worker(&mut self) {
         drop(self.sender.take());
         let _ = self.handle.take().and_then(|h| h.join().ok());
+    }
+
+    /// Converts `src` into each destination of `items` with its options as
+    /// deferred converts, then completes them with one GPU sync, all in one
+    /// worker message. Returns each convert's result in order; a convert
+    /// that fails leaves its destination unwritten and the others unaffected.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the worker has exited or the final sync fails.
+    pub(crate) fn convert_batch(
+        &mut self,
+        src: &TensorDyn,
+        items: &mut [(TensorDyn, ConvertOptions)],
+    ) -> Result<Vec<Result<(), Error>>, Error> {
+        let _cpu_latency = self.hold_cpu_latency();
+        let (send, recv) = tokio::sync::oneshot::channel();
+        let len = items.len();
+        self.sender
+            .as_ref()
+            .ok_or_else(|| Error::Internal("GL processor is shutting down".to_string()))?
+            .blocking_send(GLProcessorMessage::ImageConvertBatch(
+                SendablePtr {
+                    ptr: NonNull::from(src),
+                    len: 1,
+                },
+                SendablePtr {
+                    ptr: NonNull::new(items.as_mut_ptr()).expect("slice pointer is non-null"),
+                    len,
+                },
+                send,
+            ))
+            .map_err(|_| Error::Internal("GL converter thread exited".to_string()))?;
+        recv.blocking_recv().map_err(|_| {
+            Error::Internal("GL converter error messaging closed without update".to_string())
+        })?
+    }
+
+    /// Test hook: runs `f` against the worker's `GLProcessorST` on the GL
+    /// worker thread, as one message under the processor's serialization
+    /// policy, and returns its result. A panic in `f` resumes on the calling
+    /// thread with its original payload. The worker is not marked poisoned
+    /// after such a panic, unlike after a panic inside a regular message.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the worker thread has exited, or if `f` panics.
+    #[cfg(test)]
+    pub(crate) fn with_st<R, F>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut GLProcessorST) -> R + Send,
+        R: Send,
+    {
+        let mut out: Option<std::thread::Result<R>> = None;
+        let slot = &mut out;
+        let job: Box<dyn FnOnce(&mut GLProcessorST) + Send + '_> = Box::new(move |gl| {
+            *slot = Some(std::panic::catch_unwind(AssertUnwindSafe(|| f(gl))));
+        });
+        // SAFETY: the worker runs or drops `job` before it replies, and this
+        // function waits for that reply, so `job`'s borrows outlive its use.
+        let job: WorkerJob = unsafe { std::mem::transmute(job) };
+        let (send, recv) = tokio::sync::oneshot::channel();
+        self.sender
+            .as_ref()
+            .expect("GL processor is shutting down")
+            .blocking_send(GLProcessorMessage::WithSt(job, send))
+            .unwrap_or_else(|_| panic!("GL converter thread exited"));
+        let _ = recv.blocking_recv();
+        match out.expect("GL worker dropped the closure without running it") {
+            Ok(r) => r,
+            Err(e) => std::panic::resume_unwind(e),
+        }
     }
 
     /// Test hook: the NV12 destination policy and whether soft declines apply.

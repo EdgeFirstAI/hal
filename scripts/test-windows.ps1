@@ -8,7 +8,7 @@
   Points EDGEFIRST_ANGLE_PATH at the ANGLE DLLs fetched by
   `bash scripts/fetch-angle.sh` (target\angle\windows-x64\bin) unless it is
   already set, optionally selects the WARP software adapter, and runs
-  `cargo nextest run --workspace -j 1` with the crate exclusions of the macOS
+  `cargo nextest run --workspace` with the crate exclusions of the macOS
   lane.
 
   Run from a "Developer PowerShell for VS", or any shell where cargo finds
@@ -136,8 +136,8 @@ Set-Location $root
 if ($Coverage) {
     # --no-report leaves the profraw under target\llvm-cov-target. Everything
     # after --no-report is forwarded to nextest.
-    & cargo llvm-cov nextest --no-report @scope @profile -j 1 @NextestArgs
+    & cargo llvm-cov nextest --no-report @scope @profile @NextestArgs
 } else {
-    & cargo nextest run @scope @profile -j 1 @NextestArgs
+    & cargo nextest run @scope @profile @NextestArgs
 }
 exit $LASTEXITCODE

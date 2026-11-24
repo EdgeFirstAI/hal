@@ -1220,11 +1220,51 @@ fn warn_first_fallback(mode: Interpolation) -> bool {
     INTERPOLATION_FALLBACKS_WARNED.fetch_or(bit, std::sync::atomic::Ordering::Relaxed) & bit == 0
 }
 
-/// The interpolation selected by `EDGEFIRST_INTERPOLATION`, if it is set to
-/// a recognised value. An unrecognised value is logged and ignored.
-pub(crate) fn interpolation_from_env() -> Option<Interpolation> {
-    let value = std::env::var("EDGEFIRST_INTERPOLATION").ok()?;
-    let value = value.trim().to_ascii_lowercase();
+/// The environment variables an [`ImageProcessor`] reads when it is built.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ProcessorEnv {
+    /// `EDGEFIRST_FORCE_BACKEND`.
+    pub(crate) force_backend: Option<String>,
+    /// `EDGEFIRST_DISABLE_GL` is set to a value other than `0` or `false`.
+    #[cfg_attr(not(feature = "opengl"), allow(dead_code))]
+    pub(crate) disable_gl: bool,
+    /// `EDGEFIRST_DISABLE_G2D` is set to a value other than `0` or `false`.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) disable_g2d: bool,
+    /// `EDGEFIRST_DISABLE_CPU` is set to a value other than `0` or `false`.
+    pub(crate) disable_cpu: bool,
+    /// `EDGEFIRST_INTERPOLATION`.
+    pub(crate) interpolation: Option<String>,
+}
+
+impl ProcessorEnv {
+    /// Reads the variables from the process environment.
+    pub(crate) fn from_process() -> Self {
+        Self::from_lookup(|name| std::env::var(name).ok())
+    }
+
+    /// Reads the variables through `lookup`, which returns a variable's value
+    /// or `None` when it is unset.
+    pub(crate) fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Self {
+        let disabled = |name: &str| {
+            lookup(name)
+                .map(|x| x != "0" && x.to_lowercase() != "false")
+                .unwrap_or(false)
+        };
+        Self {
+            force_backend: lookup("EDGEFIRST_FORCE_BACKEND"),
+            disable_gl: disabled("EDGEFIRST_DISABLE_GL"),
+            disable_g2d: disabled("EDGEFIRST_DISABLE_G2D"),
+            disable_cpu: disabled("EDGEFIRST_DISABLE_CPU"),
+            interpolation: lookup("EDGEFIRST_INTERPOLATION"),
+        }
+    }
+}
+
+/// The interpolation selected by an `EDGEFIRST_INTERPOLATION` value, if it
+/// is a recognised one. An unrecognised value is logged and ignored.
+pub(crate) fn interpolation_from_env(value: Option<&str>) -> Option<Interpolation> {
+    let value = value?.trim().to_ascii_lowercase();
     if value.is_empty() {
         return None;
     }
@@ -1582,9 +1622,18 @@ impl ImageProcessor {
     /// When `Auto`, the `EDGEFIRST_FORCE_BACKEND` and `EDGEFIRST_DISABLE_*`
     /// environment variables apply.
     pub fn with_config(config: ImageProcessorConfig) -> Result<Self> {
+        Self::with_config_env(config, &ProcessorEnv::from_process())
+    }
+
+    /// [`ImageProcessor::with_config`] with the environment settings taken
+    /// from `env` instead of the process environment.
+    pub(crate) fn with_config_env(
+        config: ImageProcessorConfig,
+        env: &ProcessorEnv,
+    ) -> Result<Self> {
         let interpolation = config.interpolation;
         let auto = config.backend == ComputeBackend::Auto;
-        let mut processor = Self::with_config_backends(config)?;
+        let mut processor = Self::with_config_backends(config, env)?;
         let soft_declines = processor.soft_declines_apply(auto);
         #[cfg(all(
             any(
@@ -1612,7 +1661,8 @@ impl ImageProcessor {
             )
         )))]
         let _ = soft_declines;
-        processor.env_interpolation = interpolation_from_env().map(runnable_interpolation);
+        processor.env_interpolation =
+            interpolation_from_env(env.interpolation.as_deref()).map(runnable_interpolation);
         processor.set_interpolation(interpolation)?;
         Ok(processor)
     }
@@ -1660,7 +1710,7 @@ impl ImageProcessor {
 
     /// The backend selection half of [`Self::with_config`].
     #[allow(unused_variables)]
-    fn with_config_backends(config: ImageProcessorConfig) -> Result<Self> {
+    fn with_config_backends(config: ImageProcessorConfig, env: &ProcessorEnv) -> Result<Self> {
         // ── Config-driven backend selection ──────────────────────────
         // An explicit backend in the config skips the environment variables.
         match config.backend {
@@ -1875,7 +1925,7 @@ impl ImageProcessor {
         // When set, only the requested backend is initialised and no
         // fallback chain is used. Accepted values (case-insensitive):
         //   "cpu", "g2d", "opengl"
-        if let Ok(val) = std::env::var("EDGEFIRST_FORCE_BACKEND") {
+        if let Some(val) = env.force_backend.as_deref() {
             let val_lower = val.to_lowercase();
             let forced = match val_lower.as_str() {
                 "cpu" => ForcedBackend::Cpu,
@@ -2056,10 +2106,7 @@ impl ImageProcessor {
 
         // ── EDGEFIRST_DISABLE_* ─────────────────────────────────────
         #[cfg(target_os = "linux")]
-        let g2d = if std::env::var("EDGEFIRST_DISABLE_G2D")
-            .map(|x| x != "0" && x.to_lowercase() != "false")
-            .unwrap_or(false)
-        {
+        let g2d = if env.disable_g2d {
             log::debug!("EDGEFIRST_DISABLE_G2D is set");
             None
         } else {
@@ -2078,10 +2125,7 @@ impl ImageProcessor {
 
         #[cfg(target_os = "linux")]
         #[cfg(feature = "opengl")]
-        let opengl = if std::env::var("EDGEFIRST_DISABLE_GL")
-            .map(|x| x != "0" && x.to_lowercase() != "false")
-            .unwrap_or(false)
-        {
+        let opengl = if env.disable_gl {
             log::debug!("EDGEFIRST_DISABLE_GL is set");
             None
         } else {
@@ -2104,10 +2148,7 @@ impl ImageProcessor {
             target_os = "windows"
         ))]
         #[cfg(feature = "opengl")]
-        let opengl = if std::env::var("EDGEFIRST_DISABLE_GL")
-            .map(|x| x != "0" && x.to_lowercase() != "false")
-            .unwrap_or(false)
-        {
+        let opengl = if env.disable_gl {
             log::debug!("EDGEFIRST_DISABLE_GL is set");
             None
         } else {
@@ -2126,10 +2167,7 @@ impl ImageProcessor {
             }
         };
 
-        let cpu = if std::env::var("EDGEFIRST_DISABLE_CPU")
-            .map(|x| x != "0" && x.to_lowercase() != "false")
-            .unwrap_or(false)
-        {
+        let cpu = if env.disable_cpu {
             log::debug!("EDGEFIRST_DISABLE_CPU is set");
             None
         } else {
@@ -3057,6 +3095,64 @@ impl ImageProcessor {
                 height,
             ),
         }
+    }
+}
+
+impl ImageProcessor {
+    /// Converts `src` into each destination of `items` with its options and
+    /// completes them all. On the OpenGL backend the converts and the GPU
+    /// sync run as one worker message; a destination GL declines, or every
+    /// destination when the batch itself fails, converts eagerly on the next
+    /// backend, unless GL is forced.
+    pub(crate) fn convert_batch(
+        &mut self,
+        src: &TensorDyn,
+        items: &mut [(TensorDyn, ConvertOptions)],
+    ) -> Result<()> {
+        for (_, options) in items.iter_mut() {
+            *options = self.resolve_interpolation(*options);
+        }
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android",
+            target_os = "windows"
+        ))]
+        #[cfg(feature = "opengl")]
+        {
+            let gl_forced = matches!(self.forced_backend, Some(ForcedBackend::OpenGl));
+            if gl_forced || self.forced_backend.is_none() {
+                if let Some(opengl) = self.opengl.as_mut() {
+                    match opengl.convert_batch(src, items) {
+                        Ok(results) => {
+                            for ((dst, options), result) in items.iter_mut().zip(results) {
+                                if let Err(e) = result {
+                                    log::trace!("convert_batch: gl declined: {e}; eager fallback");
+                                    if gl_forced {
+                                        return Err(e);
+                                    }
+                                    self.convert(src, dst, Some(*options))?;
+                                }
+                            }
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            if gl_forced {
+                                return Err(e);
+                            }
+                            if let Some((dst, _)) = items.first() {
+                                self.fallback_log.note("opengl", src, dst, &e);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for (dst, options) in items.iter_mut() {
+            self.convert(src, dst, Some(*options))?;
+        }
+        Ok(())
     }
 }
 
@@ -4419,6 +4515,171 @@ mod image_tests {
         }
     }
 
+    /// `tile_into` matches the CPU tile by tile while a second processor converts on another thread.
+    #[test]
+    #[cfg(all(
+        any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android",
+            target_os = "windows"
+        ),
+        feature = "opengl"
+    ))]
+    fn tile_into_matches_the_cpu_beside_a_converting_processor() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc;
+        const ROUNDS: usize = 20;
+        const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+        let mut proc = match ImageProcessor::new() {
+            Ok(p) if p.opengl.is_some() => p,
+            Ok(_) => {
+                crate::test_support::report_skip(&format!("{} — no OpenGL backend", function!()));
+                return;
+            }
+            Err(e) => {
+                crate::test_support::report_skip(&format!(
+                    "{} — ImageProcessor init failed ({e:?})",
+                    function!()
+                ));
+                return;
+            }
+        };
+        let (fw, fh) = (96usize, 64usize);
+        let cfg = TilingConfig::new(32, 32).with_overlap(0.0);
+        let n = tile_grid(fh, fw, 32, 32, 0.0).len();
+        let alloc = move |proc: &ImageProcessor| {
+            crate::test_support::dma_allocated(
+                proc.alloc_tile_batch(
+                    n,
+                    &cfg,
+                    PixelFormat::Rgba,
+                    DType::U8,
+                    Some(TensorMemory::DmaBuf),
+                    edgefirst_tensor::CpuAccess::ReadWrite,
+                ),
+                "tall DMA parent",
+            )
+        };
+        if alloc(&proc).is_none() {
+            return;
+        }
+
+        /// Sets the flag when dropped.
+        struct StopOnDrop<'a>(&'a AtomicBool);
+        impl Drop for StopOnDrop<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let src = gradient_frame(fw, fh);
+                let stop = AtomicBool::new(false);
+                std::thread::scope(|scope| {
+                    let (ready_tx, ready_rx) = mpsc::channel();
+                    scope.spawn(|| {
+                        let mut p = ImageProcessor::new().unwrap();
+                        let other_src = gradient_frame(640, 480);
+                        let crop = Crop::default()
+                            .with_source(Some(Region::new(13, 7, 400, 300)))
+                            .with_fit(Fit::Stretch);
+                        let mut ready = Some(ready_tx);
+                        while !stop.load(Ordering::Relaxed) {
+                            let mut dst = TensorDyn::image(
+                                320,
+                                240,
+                                PixelFormat::Rgba,
+                                DType::U8,
+                                Some(TensorMemory::DmaBuf),
+                                edgefirst_tensor::CpuAccess::ReadWrite,
+                            )
+                            .unwrap();
+                            p.convert(&other_src, &mut dst, Some(ConvertOptions::new().crop(crop)))
+                                .unwrap();
+                            if let Some(tx) = ready.take() {
+                                let _ = tx.send(());
+                            }
+                        }
+                    });
+                    let _stop = StopOnDrop(&stop);
+                    ready_rx
+                        .recv()
+                        .expect("the contending processor converts once before the rounds");
+
+                    let mut failures = Vec::new();
+                    for round in 0..ROUNDS {
+                        let mut parent = alloc(&proc).unwrap();
+                        let placements = proc.tile_into(&src, &mut parent, &cfg).unwrap();
+                        for p in &placements {
+                            let source = Region::new(
+                                p.origin.0 as usize,
+                                p.origin.1 as usize,
+                                p.crop_size.0 as usize,
+                                p.crop_size.1 as usize,
+                            );
+                            let mut want = TensorDyn::image(
+                                32,
+                                32,
+                                PixelFormat::Rgba,
+                                DType::U8,
+                                Some(TensorMemory::Mem),
+                                edgefirst_tensor::CpuAccess::ReadWrite,
+                            )
+                            .unwrap();
+                            CPUProcessor::new()
+                                .convert(
+                                    &src,
+                                    &mut want,
+                                    Some(
+                                        ConvertOptions::new().crop(
+                                            Crop::default()
+                                                .with_source(Some(source))
+                                                .with_fit(Fit::Stretch),
+                                        ),
+                                    ),
+                                )
+                                .unwrap();
+                            let band = parent.view(Region::new(0, p.index * 32, 32, 32)).unwrap();
+                            let got = {
+                                let t = band.as_u8().unwrap();
+                                let stride = t.effective_row_stride().unwrap_or(32 * 4);
+                                let map = t.map().unwrap();
+                                (0..32)
+                                    .flat_map(|r| map.as_slice()[r * stride..][..32 * 4].to_vec())
+                                    .collect::<Vec<u8>>()
+                            };
+                            let want = want.as_u8().unwrap().map().unwrap().as_slice().to_vec();
+                            let mean = got
+                                .iter()
+                                .zip(&want)
+                                .map(|(a, b)| a.abs_diff(*b) as f64)
+                                .sum::<f64>()
+                                / got.len() as f64;
+                            if mean > 4.0 {
+                                failures.push(format!(
+                                    "round {round} tile {}: mean diff {mean:.2}",
+                                    p.index
+                                ));
+                            }
+                        }
+                    }
+                    failures
+                })
+            }));
+            let _ = done_tx.send(result);
+        });
+        match done_rx.recv_timeout(TIMEOUT) {
+            Ok(Ok(failures)) => assert!(failures.is_empty(), "{}", failures.join("\n")),
+            Ok(Err(panic)) => std::panic::resume_unwind(panic),
+            Err(_) => panic!("{} timed out after {TIMEOUT:?}", function!()),
+        }
+    }
+
     /// `tile_into` rejects a destination too small to hold all tile bands.
     #[test]
     fn tile_into_undersized_dst_errors() {
@@ -4685,44 +4946,50 @@ mod image_tests {
 
     #[test]
     fn test_disable_env_var() -> Result<(), Error> {
-        let _lock = acquire_env_lock();
-
-        let _guard = EnvGuard::snapshot(&[
-            "EDGEFIRST_FORCE_BACKEND",
-            "EDGEFIRST_DISABLE_GL",
-            "EDGEFIRST_DISABLE_G2D",
-            "EDGEFIRST_DISABLE_CPU",
-        ]);
-
-        unsafe { std::env::remove_var("EDGEFIRST_FORCE_BACKEND") };
-
         #[cfg(target_os = "linux")]
         {
-            unsafe { std::env::set_var("EDGEFIRST_DISABLE_G2D", "1") };
-            let converter = ImageProcessor::new()?;
+            let converter = ImageProcessor::with_config_env(
+                ImageProcessorConfig::default(),
+                &ProcessorEnv {
+                    disable_g2d: true,
+                    ..Default::default()
+                },
+            )?;
             assert!(converter.g2d.is_none());
-            unsafe { std::env::remove_var("EDGEFIRST_DISABLE_G2D") };
         }
 
         #[cfg(any(target_os = "linux", target_os = "windows"))]
         #[cfg(feature = "opengl")]
         {
-            unsafe { std::env::set_var("EDGEFIRST_DISABLE_GL", "1") };
-            let converter = ImageProcessor::new()?;
+            let converter = ImageProcessor::with_config_env(
+                ImageProcessorConfig::default(),
+                &ProcessorEnv {
+                    disable_gl: true,
+                    ..Default::default()
+                },
+            )?;
             assert!(converter.opengl.is_none());
-            unsafe { std::env::remove_var("EDGEFIRST_DISABLE_GL") };
         }
 
-        unsafe { std::env::set_var("EDGEFIRST_DISABLE_CPU", "1") };
-        let converter = ImageProcessor::new()?;
+        let converter = ImageProcessor::with_config_env(
+            ImageProcessorConfig::default(),
+            &ProcessorEnv {
+                disable_cpu: true,
+                ..Default::default()
+            },
+        )?;
         assert!(converter.cpu.is_none());
-        unsafe { std::env::remove_var("EDGEFIRST_DISABLE_CPU") };
 
         // With every backend disabled, convert returns `NoConverter`.
-        unsafe { std::env::set_var("EDGEFIRST_DISABLE_CPU", "1") };
-        unsafe { std::env::set_var("EDGEFIRST_DISABLE_GL", "1") };
-        unsafe { std::env::set_var("EDGEFIRST_DISABLE_G2D", "1") };
-        let mut converter = ImageProcessor::new()?;
+        let mut converter = ImageProcessor::with_config_env(
+            ImageProcessorConfig::default(),
+            &ProcessorEnv {
+                disable_gl: true,
+                disable_g2d: true,
+                disable_cpu: true,
+                ..Default::default()
+            },
+        )?;
 
         let src = TensorDyn::image(
             1280,
@@ -7106,7 +7373,7 @@ mod image_tests {
             ));
             return;
         }
-        let mut p = match with_force_backend(Some("opengl"), ImageProcessor::new) {
+        let mut p = match with_force_backend(Some("opengl")) {
             Ok(p) => p,
             Err(e) if !std::env::var("HAL_TEST_REQUIRE_GL").is_ok_and(|v| v == "1") => {
                 crate::test_support::report_skip(&format!(
@@ -7274,7 +7541,7 @@ mod image_tests {
         }
 
         // With GL forced, the draw into the view is refused.
-        let mut forced = with_force_backend(Some("opengl"), ImageProcessor::new).unwrap();
+        let mut forced = with_force_backend(Some("opengl")).unwrap();
         let mut band = parent
             .view(edgefirst_tensor::Region::new(0, h / 2, w, h / 2))
             .unwrap();
@@ -12008,20 +12275,27 @@ mod image_tests {
 
     #[test]
     fn test_force_backend_cpu() {
-        let _lock = acquire_env_lock();
-        let _guard = EnvGuard::snapshot(&["EDGEFIRST_FORCE_BACKEND"]);
-        unsafe { std::env::set_var("EDGEFIRST_FORCE_BACKEND", "cpu") };
-        let converter = ImageProcessor::new().unwrap();
+        let converter = ImageProcessor::with_config_env(
+            ImageProcessorConfig::default(),
+            &ProcessorEnv {
+                force_backend: Some("cpu".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert!(converter.cpu.is_some());
         assert_eq!(converter.forced_backend, Some(ForcedBackend::Cpu));
     }
 
     #[test]
     fn test_force_backend_invalid() {
-        let _lock = acquire_env_lock();
-        let _guard = EnvGuard::snapshot(&["EDGEFIRST_FORCE_BACKEND"]);
-        unsafe { std::env::set_var("EDGEFIRST_FORCE_BACKEND", "invalid") };
-        let result = ImageProcessor::new();
+        let result = ImageProcessor::with_config_env(
+            ImageProcessorConfig::default(),
+            &ProcessorEnv {
+                force_backend: Some("invalid".into()),
+                ..Default::default()
+            },
+        );
         assert!(
             matches!(&result, Err(Error::ForcedBackendUnavailable(s)) if s.contains("unknown")),
             "invalid backend value should return ForcedBackendUnavailable error: {result:?}"
@@ -12030,10 +12304,11 @@ mod image_tests {
 
     #[test]
     fn test_force_backend_unset() {
-        let _lock = acquire_env_lock();
-        let _guard = EnvGuard::snapshot(&["EDGEFIRST_FORCE_BACKEND"]);
-        unsafe { std::env::remove_var("EDGEFIRST_FORCE_BACKEND") };
-        let converter = ImageProcessor::new().unwrap();
+        let converter = ImageProcessor::with_config_env(
+            ImageProcessorConfig::default(),
+            &ProcessorEnv::default(),
+        )
+        .unwrap();
         assert!(converter.forced_backend.is_none());
     }
 
@@ -12043,19 +12318,16 @@ mod image_tests {
 
     #[test]
     fn test_draw_proto_masks_no_cpu_returns_error() {
-        let _lock = acquire_env_lock();
-        let _guard = EnvGuard::snapshot(&[
-            "EDGEFIRST_FORCE_BACKEND",
-            "EDGEFIRST_DISABLE_GL",
-            "EDGEFIRST_DISABLE_G2D",
-            "EDGEFIRST_DISABLE_CPU",
-        ]);
-
-        unsafe { std::env::set_var("EDGEFIRST_DISABLE_CPU", "1") };
-        unsafe { std::env::set_var("EDGEFIRST_DISABLE_GL", "1") };
-        unsafe { std::env::set_var("EDGEFIRST_DISABLE_G2D", "1") };
-
-        let mut converter = ImageProcessor::new().unwrap();
+        let mut converter = ImageProcessor::with_config_env(
+            ImageProcessorConfig::default(),
+            &ProcessorEnv {
+                disable_gl: true,
+                disable_g2d: true,
+                disable_cpu: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert!(converter.cpu.is_none(), "CPU should be disabled");
 
         let dst = TensorDyn::image(
@@ -12099,10 +12371,14 @@ mod image_tests {
 
     #[test]
     fn test_draw_proto_masks_cpu_fallback_works() {
-        let _lock = acquire_env_lock();
-        let _guard = EnvGuard::snapshot(&["EDGEFIRST_FORCE_BACKEND"]);
-        unsafe { std::env::set_var("EDGEFIRST_FORCE_BACKEND", "cpu") };
-        let mut converter = ImageProcessor::new().unwrap();
+        let mut converter = ImageProcessor::with_config_env(
+            ImageProcessorConfig::default(),
+            &ProcessorEnv {
+                force_backend: Some("cpu".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert!(converter.cpu.is_some());
 
         let dst = TensorDyn::image(
@@ -12156,45 +12432,6 @@ mod image_tests {
     // Every test pre-fills dst with a non-zero pattern.
     // ============================================================
 
-    // =========================================================================
-    // Env-var serialisation helpers
-    // =========================================================================
-
-    /// Acquires the process-wide env-var mutex.
-    fn acquire_env_lock() -> std::sync::MutexGuard<'static, ()> {
-        use std::sync::{Mutex, OnceLock};
-        static ENV_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
-        ENV_MUTEX
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-    }
-
-    /// Snapshots a set of env vars on construction and restores them on drop.
-    struct EnvGuard {
-        vars: Vec<(&'static str, Option<String>)>,
-    }
-
-    impl EnvGuard {
-        /// Snapshots the current values of `names`. The caller holds the env lock.
-        fn snapshot(names: &[&'static str]) -> Self {
-            Self {
-                vars: names.iter().map(|&k| (k, std::env::var(k).ok())).collect(),
-            }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            for (k, v) in &self.vars {
-                match v {
-                    Some(s) => unsafe { std::env::set_var(k, s) },
-                    None => unsafe { std::env::remove_var(k) },
-                }
-            }
-        }
-    }
-
     /// The GL backend's soft declines are off when the processor has no CPU backend.
     #[test]
     #[cfg(all(
@@ -12208,16 +12445,14 @@ mod image_tests {
         feature = "opengl"
     ))]
     fn soft_declines_are_off_without_a_cpu_fallback() {
-        let _lock = acquire_env_lock();
-        let _guard = EnvGuard::snapshot(&[
-            "EDGEFIRST_FORCE_BACKEND",
-            "EDGEFIRST_DISABLE_GL",
-            "EDGEFIRST_DISABLE_CPU",
-        ]);
-        unsafe { std::env::remove_var("EDGEFIRST_FORCE_BACKEND") };
-        unsafe { std::env::remove_var("EDGEFIRST_DISABLE_GL") };
-        unsafe { std::env::set_var("EDGEFIRST_DISABLE_CPU", "1") };
-        let processor = ImageProcessor::new().unwrap();
+        let processor = ImageProcessor::with_config_env(
+            ImageProcessorConfig::default(),
+            &ProcessorEnv {
+                disable_cpu: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert!(processor.cpu.is_none());
         let Some(gl) = processor.opengl.as_ref() else {
             crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
@@ -12253,29 +12488,25 @@ mod image_tests {
             crate::test_support::report_skip(&format!("{} - {why}", function!()));
             return;
         }
-        let _lock = acquire_env_lock();
-        let _guard = EnvGuard::snapshot(&[
-            "EDGEFIRST_FORCE_BACKEND",
-            "EDGEFIRST_DISABLE_G2D",
-            "EDGEFIRST_DISABLE_CPU",
-        ]);
-        unsafe { std::env::remove_var("EDGEFIRST_FORCE_BACKEND") };
-        unsafe { std::env::remove_var("EDGEFIRST_DISABLE_G2D") };
-        unsafe { std::env::remove_var("EDGEFIRST_DISABLE_CPU") };
-        let soft = |backend| {
-            ImageProcessor::with_config(ImageProcessorConfig {
-                backend,
-                ..Default::default()
-            })
+        let soft = |backend, force: Option<&str>| {
+            ImageProcessor::with_config_env(
+                ImageProcessorConfig {
+                    backend,
+                    ..Default::default()
+                },
+                &ProcessorEnv {
+                    force_backend: force.map(str::to_string),
+                    ..Default::default()
+                },
+            )
             .unwrap()
             .g2d
             .as_ref()
             .map(G2DProcessor::soft_declines)
         };
-        assert_eq!(soft(ComputeBackend::Auto), Some(true));
-        assert_eq!(soft(ComputeBackend::G2d), Some(false));
-        unsafe { std::env::set_var("EDGEFIRST_FORCE_BACKEND", "g2d") };
-        assert_eq!(soft(ComputeBackend::Auto), Some(false));
+        assert_eq!(soft(ComputeBackend::Auto, None), Some(true));
+        assert_eq!(soft(ComputeBackend::G2d, None), Some(false));
+        assert_eq!(soft(ComputeBackend::Auto, Some("g2d")), Some(false));
     }
 
     /// A GL backend whose worker takes no message when its soft declines are set is dropped
@@ -12292,16 +12523,11 @@ mod image_tests {
         feature = "opengl"
     ))]
     fn a_gl_backend_that_takes_no_message_is_dropped_outside_forced_gl() {
-        let _lock = acquire_env_lock();
-        let _guard = EnvGuard::snapshot(&[
-            "EDGEFIRST_FORCE_BACKEND",
-            "EDGEFIRST_DISABLE_GL",
-            "EDGEFIRST_DISABLE_CPU",
-        ]);
-        unsafe { std::env::remove_var("EDGEFIRST_FORCE_BACKEND") };
-        unsafe { std::env::remove_var("EDGEFIRST_DISABLE_GL") };
-        unsafe { std::env::remove_var("EDGEFIRST_DISABLE_CPU") };
-        let mut processor = ImageProcessor::new().unwrap();
+        let mut processor = ImageProcessor::with_config_env(
+            ImageProcessorConfig::default(),
+            &ProcessorEnv::default(),
+        )
+        .unwrap();
         let Some(gl) = processor.opengl.as_mut() else {
             crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
             return;
@@ -12329,10 +12555,13 @@ mod image_tests {
         .unwrap();
         processor.convert(&src, &mut dst, None).unwrap();
 
-        let mut processor = ImageProcessor::with_config(ImageProcessorConfig {
-            backend: ComputeBackend::OpenGl,
-            ..Default::default()
-        })
+        let mut processor = ImageProcessor::with_config_env(
+            ImageProcessorConfig {
+                backend: ComputeBackend::OpenGl,
+                ..Default::default()
+            },
+            &ProcessorEnv::default(),
+        )
         .unwrap();
         processor.forced_backend = Some(ForcedBackend::OpenGl);
         processor.opengl.as_mut().unwrap().stop_worker();
@@ -12342,9 +12571,41 @@ mod image_tests {
 
     /// `EDGEFIRST_INTERPOLATION` accepts `nearest` and `bilinear` in any case and ignores anything else.
     #[test]
+    fn processor_env_reads_the_documented_names() {
+        let lookup = |vars: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                vars.iter()
+                    .find(|(k, _)| *k == name)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        let env = ProcessorEnv::from_lookup(lookup(&[
+            ("EDGEFIRST_FORCE_BACKEND", "cpu"),
+            ("EDGEFIRST_DISABLE_GL", "1"),
+            ("EDGEFIRST_DISABLE_G2D", "FALSE"),
+            ("EDGEFIRST_DISABLE_CPU", "0"),
+            ("EDGEFIRST_INTERPOLATION", "nearest"),
+        ]));
+        assert_eq!(env.force_backend.as_deref(), Some("cpu"));
+        assert!(env.disable_gl);
+        assert!(!env.disable_g2d, "\"FALSE\" leaves G2D enabled");
+        assert!(!env.disable_cpu, "\"0\" leaves the CPU enabled");
+        assert_eq!(env.interpolation.as_deref(), Some("nearest"));
+
+        let env = ProcessorEnv::from_lookup(lookup(&[
+            ("EDGEFIRST_DISABLE_G2D", "yes"),
+            ("EDGEFIRST_DISABLE_CPU", ""),
+            ("EDGEFIRST_DISABLE_OPENGL", "1"),
+        ]));
+        assert!(env.disable_g2d, "any other value disables");
+        assert!(env.disable_cpu, "an empty value disables");
+        assert!(!env.disable_gl, "only EDGEFIRST_DISABLE_GL disables GL");
+        assert_eq!(env.force_backend, None);
+        assert_eq!(env.interpolation, None);
+    }
+
+    #[test]
     fn test_interpolation_env_parse() {
-        let _lock = acquire_env_lock();
-        let _guard = EnvGuard::snapshot(&["EDGEFIRST_INTERPOLATION"]);
         for (value, want) in [
             (Some("nearest"), Some(Interpolation::Nearest)),
             (Some(" BILINEAR "), Some(Interpolation::Bilinear)),
@@ -12352,12 +12613,8 @@ mod image_tests {
             (Some(""), None),
             (None, None),
         ] {
-            match value {
-                Some(v) => unsafe { std::env::set_var("EDGEFIRST_INTERPOLATION", v) },
-                None => unsafe { std::env::remove_var("EDGEFIRST_INTERPOLATION") },
-            }
             assert_eq!(
-                interpolation_from_env(),
+                interpolation_from_env(value),
                 want,
                 "EDGEFIRST_INTERPOLATION={value:?}"
             );
@@ -12367,8 +12624,6 @@ mod image_tests {
     /// `ImageProcessorConfig::interpolation` reaches the CPU backend and `EDGEFIRST_INTERPOLATION` overrides it.
     #[test]
     fn test_interpolation_config_and_env_reach_cpu() {
-        let _lock = acquire_env_lock();
-        let _guard = EnvGuard::snapshot(&["EDGEFIRST_INTERPOLATION"]);
         let mut checker = Vec::with_capacity(8 * 8 * 4);
         for y in 0..8 {
             for x in 0..8 {
@@ -12413,14 +12668,23 @@ mod image_tests {
             ..Default::default()
         };
 
-        unsafe { std::env::remove_var("EDGEFIRST_INTERPOLATION") };
-        let mut p = ImageProcessor::with_config(config(Interpolation::Nearest)).unwrap();
+        let mut p = ImageProcessor::with_config_env(
+            config(Interpolation::Nearest),
+            &ProcessorEnv::default(),
+        )
+        .unwrap();
         assert_eq!(resize(&mut p), nearest, "config Nearest");
         p.set_interpolation(Interpolation::Bilinear).unwrap();
         assert_eq!(resize(&mut p), bilinear, "set_interpolation(Bilinear)");
 
-        unsafe { std::env::set_var("EDGEFIRST_INTERPOLATION", "nearest") };
-        let mut p = ImageProcessor::with_config(config(Interpolation::Bilinear)).unwrap();
+        let mut p = ImageProcessor::with_config_env(
+            config(Interpolation::Bilinear),
+            &ProcessorEnv {
+                interpolation: Some("nearest".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert_eq!(
             resize(&mut p),
             nearest,
@@ -12437,8 +12701,6 @@ mod image_tests {
     /// A per-convert interpolation overrides the processor's for that convert only; `EDGEFIRST_INTERPOLATION` pins both.
     #[test]
     fn test_per_convert_interpolation_overrides_processor() {
-        let _lock = acquire_env_lock();
-        let _guard = EnvGuard::snapshot(&["EDGEFIRST_INTERPOLATION"]);
         let mut checker = Vec::with_capacity(8 * 8 * 4);
         for y in 0..8 {
             for x in 0..8 {
@@ -12477,18 +12739,23 @@ mod image_tests {
         let nearest = resize(&mut CPUProcessor::new_nearest(), None);
         let bilinear = resize(&mut CPUProcessor::new(), None);
         assert_ne!(nearest, bilinear, "the checker must tell the filters apart");
-        let cpu_only = || {
-            ImageProcessor::with_config(ImageProcessorConfig {
-                backend: ComputeBackend::Cpu,
-                ..Default::default()
-            })
+        let cpu_only = |interpolation: Option<&str>| {
+            ImageProcessor::with_config_env(
+                ImageProcessorConfig {
+                    backend: ComputeBackend::Cpu,
+                    ..Default::default()
+                },
+                &ProcessorEnv {
+                    interpolation: interpolation.map(str::to_string),
+                    ..Default::default()
+                },
+            )
             .unwrap()
         };
         let model_a = ConvertOptions::new().interpolation(Interpolation::Nearest);
         let model_b = ConvertOptions::new().interpolation(Interpolation::Bicubic);
 
-        unsafe { std::env::remove_var("EDGEFIRST_INTERPOLATION") };
-        let mut p = cpu_only();
+        let mut p = cpu_only(None);
         assert_eq!(p.interpolation(), Interpolation::Bilinear);
         for _ in 0..2 {
             assert_eq!(resize(&mut p, Some(model_a)), nearest, "model A: nearest");
@@ -12503,7 +12770,7 @@ mod image_tests {
         spec.interpolation = Interpolation::Nearest;
         let from_spec = ConvertOptions::from_spec(&spec).unwrap();
         assert_eq!(from_spec.get_interpolation(), Some(Interpolation::Nearest));
-        let mut p = cpu_only();
+        let mut p = cpu_only(None);
         let stretch = from_spec.crop(Crop::default());
         assert_eq!(
             resize(&mut p, Some(stretch)),
@@ -12520,8 +12787,7 @@ mod image_tests {
             "an unchanged mode does not reach the backends"
         );
 
-        unsafe { std::env::set_var("EDGEFIRST_INTERPOLATION", "bilinear") };
-        let mut p = cpu_only();
+        let mut p = cpu_only(Some("bilinear"));
         assert_eq!(resize(&mut p, Some(model_a)), bilinear, "the env pin wins");
     }
 
@@ -12529,13 +12795,13 @@ mod image_tests {
     #[test]
     #[cfg(feature = "opengl")]
     fn test_per_convert_interpolation_reaches_gl_worker() {
-        let _lock = acquire_env_lock();
-        let _guard = EnvGuard::snapshot(&["EDGEFIRST_INTERPOLATION"]);
-        unsafe { std::env::remove_var("EDGEFIRST_INTERPOLATION") };
-        let mut p = match ImageProcessor::with_config(ImageProcessorConfig {
-            backend: ComputeBackend::OpenGl,
-            ..Default::default()
-        }) {
+        let mut p = match ImageProcessor::with_config_env(
+            ImageProcessorConfig {
+                backend: ComputeBackend::OpenGl,
+                ..Default::default()
+            },
+            &ProcessorEnv::default(),
+        ) {
             Ok(p) if p.opengl.is_some() => p,
             _ => {
                 crate::test_support::report_skip(&format!(
@@ -12609,15 +12875,15 @@ mod image_tests {
         assert!(!warn_first_fallback(Interpolation::Area));
     }
 
-    /// Runs `body` with `EDGEFIRST_FORCE_BACKEND` set or removed under the env lock, then restores it.
-    fn with_force_backend<R>(value: Option<&str>, body: impl FnOnce() -> R) -> R {
-        let _lock = acquire_env_lock();
-        let _guard = EnvGuard::snapshot(&["EDGEFIRST_FORCE_BACKEND"]);
-        match value {
-            Some(v) => unsafe { std::env::set_var("EDGEFIRST_FORCE_BACKEND", v) },
-            None => unsafe { std::env::remove_var("EDGEFIRST_FORCE_BACKEND") },
-        }
-        body()
+    /// An `ImageProcessor` built with `EDGEFIRST_FORCE_BACKEND` taken as `value`.
+    fn with_force_backend(value: Option<&str>) -> Result<ImageProcessor> {
+        ImageProcessor::with_config_env(
+            ImageProcessorConfig::default(),
+            &ProcessorEnv {
+                force_backend: value.map(str::to_string),
+                ..ProcessorEnv::from_process()
+            },
+        )
     }
 
     /// Allocates an RGBA image tensor filled with a non-zero pattern.
@@ -12840,7 +13106,7 @@ mod image_tests {
             crate::test_support::report_skip(&format!("{case} — DMA not available on this host"));
             return;
         }
-        let processor_result = with_force_backend(force_backend, ImageProcessor::new);
+        let processor_result = with_force_backend(force_backend);
         let mut processor = match processor_result {
             Ok(p) => p,
             Err(e) => {
@@ -12885,7 +13151,7 @@ mod image_tests {
             crate::test_support::report_skip("g2d forced — DMA not available on this host");
             return;
         }
-        let processor_result = with_force_backend(Some("g2d"), ImageProcessor::new);
+        let processor_result = with_force_backend(Some("g2d"));
         let mut processor = match processor_result {
             Ok(p) => p,
             Err(e) => {
@@ -12983,10 +13249,14 @@ mod image_tests {
 
     #[test]
     fn test_set_format_then_cpu_convert() {
-        let _lock = acquire_env_lock();
-        let _guard = EnvGuard::snapshot(&["EDGEFIRST_FORCE_BACKEND"]);
-        unsafe { std::env::set_var("EDGEFIRST_FORCE_BACKEND", "cpu") };
-        let mut processor = ImageProcessor::new().unwrap();
+        let mut processor = ImageProcessor::with_config_env(
+            ImageProcessorConfig::default(),
+            &ProcessorEnv {
+                force_backend: Some("cpu".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
         let image = edgefirst_bench::testdata::read("zidane.jpg");
         let src = load_image_test_helper(&image, Some(PixelFormat::Rgba), None).unwrap();
@@ -13005,7 +13275,6 @@ mod image_tests {
     /// Several `ImageProcessor`s on one thread each resize without deadlock or error.
     #[test]
     fn test_multiple_image_processors_same_thread() {
-        let _lock = acquire_env_lock();
         let mut processors: Vec<ImageProcessor> = (0..4)
             .map(|_| ImageProcessor::new().expect("ImageProcessor::new() failed"))
             .collect();
@@ -13053,8 +13322,6 @@ mod image_tests {
         }
 
         const TIMEOUT: Duration = Duration::from_secs(60);
-
-        let _lock = acquire_env_lock();
 
         let (tx, rx) = mpsc::channel::<()>();
 
@@ -13115,8 +13382,6 @@ mod image_tests {
         const N: usize = 4;
         const ROUNDS: usize = 10;
         const TIMEOUT: Duration = Duration::from_secs(60);
-
-        let _lock = acquire_env_lock();
 
         let (tx, rx) = mpsc::channel::<()>();
 
@@ -13200,7 +13465,6 @@ mod image_tests {
             return;
         }
 
-        let _lock = acquire_env_lock();
         let use_dma = crate::test_support::is_dma_available();
         if !use_dma {
             crate::test_support::report_skip(&format!(
@@ -13309,7 +13573,6 @@ mod image_tests {
         const ROUNDS: usize = 200;
         const TIMEOUT: Duration = Duration::from_secs(600);
 
-        let _lock = acquire_env_lock();
         let use_dma = crate::test_support::is_dma_available();
         if !use_dma {
             crate::test_support::report_skip(&format!(
@@ -13645,7 +13908,7 @@ mod image_tests {
         feature = "opengl"
     ))]
     fn convert_f16_gl_cpu_parity_identity() {
-        // Skips on the first pass of the macOS coverage lane.
+        // Skips when GL is required and the ANGLE dlopen gate is closed.
         #[cfg(target_os = "macos")]
         if std::env::var("HAL_TEST_REQUIRE_GL").is_ok_and(|v| v == "1")
             && std::env::var_os("HAL_TEST_ALLOW_DLOPEN_ANGLE").is_none()
@@ -14063,20 +14326,15 @@ mod image_tests {
     #[test]
     fn create_image_adds_readwrite_for_read_modify_write_passes() {
         use edgefirst_tensor::CpuAccess;
-        let _lock = acquire_env_lock();
-        let _guard = EnvGuard::snapshot(&[
-            "EDGEFIRST_FORCE_BACKEND",
-            "EDGEFIRST_DISABLE_GL",
-            "EDGEFIRST_DISABLE_G2D",
-            "EDGEFIRST_DISABLE_CPU",
-        ]);
-        unsafe {
-            std::env::remove_var("EDGEFIRST_FORCE_BACKEND");
-            std::env::remove_var("EDGEFIRST_DISABLE_CPU");
-            std::env::set_var("EDGEFIRST_DISABLE_GL", "1");
-            std::env::set_var("EDGEFIRST_DISABLE_G2D", "1");
-        }
-        let mut proc = ImageProcessor::new().unwrap();
+        let mut proc = ImageProcessor::with_config_env(
+            ImageProcessorConfig::default(),
+            &ProcessorEnv {
+                disable_gl: true,
+                disable_g2d: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let src = access_test_src(128, 96);
         for (format, dtype) in [
             (PixelFormat::Rgb, DType::I8),
@@ -14271,20 +14529,15 @@ mod image_tests {
     #[test]
     fn create_image_adds_write_when_the_cpu_backend_fills_it() {
         use edgefirst_tensor::CpuAccess;
-        let _lock = acquire_env_lock();
-        let _guard = EnvGuard::snapshot(&[
-            "EDGEFIRST_FORCE_BACKEND",
-            "EDGEFIRST_DISABLE_GL",
-            "EDGEFIRST_DISABLE_G2D",
-            "EDGEFIRST_DISABLE_CPU",
-        ]);
-        unsafe {
-            std::env::remove_var("EDGEFIRST_FORCE_BACKEND");
-            std::env::remove_var("EDGEFIRST_DISABLE_CPU");
-            std::env::set_var("EDGEFIRST_DISABLE_GL", "1");
-            std::env::set_var("EDGEFIRST_DISABLE_G2D", "1");
-        }
-        let mut proc = ImageProcessor::new().unwrap();
+        let mut proc = ImageProcessor::with_config_env(
+            ImageProcessorConfig::default(),
+            &ProcessorEnv {
+                disable_gl: true,
+                disable_g2d: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let src = access_test_src(128, 96);
         for (requested, declared) in [
             (CpuAccess::Read, CpuAccess::ReadWrite),
@@ -14566,22 +14819,11 @@ mod image_tests {
 
     #[test]
     fn test_bgra_source_through_the_image_processor() {
-        let _lock = acquire_env_lock();
-        let _guard = EnvGuard::snapshot(&[
-            "EDGEFIRST_FORCE_BACKEND",
-            "EDGEFIRST_DISABLE_GL",
-            "EDGEFIRST_DISABLE_G2D",
-            "EDGEFIRST_DISABLE_CPU",
-        ]);
-        for name in [
-            "EDGEFIRST_FORCE_BACKEND",
-            "EDGEFIRST_DISABLE_GL",
-            "EDGEFIRST_DISABLE_G2D",
-            "EDGEFIRST_DISABLE_CPU",
-        ] {
-            unsafe { std::env::remove_var(name) };
-        }
-        let mut processor = ImageProcessor::new().unwrap();
+        let mut processor = ImageProcessor::with_config_env(
+            ImageProcessorConfig::default(),
+            &ProcessorEnv::default(),
+        )
+        .unwrap();
         let src = bgra_gradient_source(640, 480, Some(TensorMemory::Mem));
         for format in [PixelFormat::Rgba, PixelFormat::Nv12] {
             let new_dst = || {
@@ -14615,21 +14857,6 @@ mod image_tests {
     #[cfg(target_os = "macos")]
     fn test_bgra_iosurface_through_the_image_processor_macos() {
         use crate::test_support::corevideo_buffer;
-        let _lock = acquire_env_lock();
-        let _guard = EnvGuard::snapshot(&[
-            "EDGEFIRST_FORCE_BACKEND",
-            "EDGEFIRST_DISABLE_GL",
-            "EDGEFIRST_DISABLE_G2D",
-            "EDGEFIRST_DISABLE_CPU",
-        ]);
-        for name in [
-            "EDGEFIRST_FORCE_BACKEND",
-            "EDGEFIRST_DISABLE_GL",
-            "EDGEFIRST_DISABLE_G2D",
-            "EDGEFIRST_DISABLE_CPU",
-        ] {
-            unsafe { std::env::remove_var(name) };
-        }
         let (w, h) = (1000usize, 562usize);
         let buf = corevideo_buffer(w, h, b"BGRA");
         buf.fill_rows(|_, row, bytes| {
@@ -14645,7 +14872,11 @@ mod image_tests {
         let src = unsafe { TensorDyn::from_planar_iosurface(buf.surface(), None) }
             .expect("from_planar_iosurface");
         assert_eq!(src.format(), Some(PixelFormat::Bgra));
-        let mut processor = ImageProcessor::new().unwrap();
+        let mut processor = ImageProcessor::with_config_env(
+            ImageProcessorConfig::default(),
+            &ProcessorEnv::default(),
+        )
+        .unwrap();
 
         let new_dst = |w: usize, h: usize, format: PixelFormat, dtype: DType| {
             TensorDyn::image(

@@ -1462,7 +1462,7 @@ Per-crate variables and additional detail live in each crate's README.
 ## Testing
 
 See [TESTING.md](https://github.com/EdgeFirstAI/hal/blob/main/TESTING.md)
-for the cross-cutting testing guide (single-threaded rule, on-target
+for the cross-cutting testing guide (parallel execution, on-target
 gating, cross-compilation, CI matrix, optimization validation). Per-crate
 testing detail lives in each crate's `TESTING.md` — links in the
 [Core Components](#core-components) table.

@@ -159,13 +159,20 @@ impl WindowsPlatform {
     /// `libEGL.dll` on the default DLL search path. `libGLESv2.dll` must be
     /// a flat sibling of `libEGL.dll`.
     fn load_egl_lib_inner() -> Result<libloading::Library> {
+        Self::load_egl_from(&Self::candidate_dirs(), "libEGL.dll")
+    }
+
+    /// Loads `libEGL.dll` from the first of `dirs` that holds one, else
+    /// `fallback` by name from the default DLL search path. The error lists
+    /// every candidate and why it was rejected.
+    fn load_egl_from(dirs: &[PathBuf], fallback: &str) -> Result<libloading::Library> {
         use libloading::os::windows::{
             Library as WinLibrary, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
             LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR,
         };
         // One line per candidate: "<path>: <why it was rejected>".
         let mut tried: Vec<String> = Vec::new();
-        for dir in Self::candidate_dirs() {
+        for dir in dirs {
             let path = dir.join("libEGL.dll");
             if !path.is_file() {
                 tried.push(format!("{}: not found", path.display()));
@@ -193,12 +200,12 @@ impl WindowsPlatform {
             }
         }
         // SAFETY: as above.
-        match unsafe { libloading::Library::new("libEGL.dll") } {
+        match unsafe { libloading::Library::new(fallback) } {
             Ok(lib) => {
                 debug!("WindowsPlatform: loaded ANGLE libEGL from the default DLL search path");
                 return Ok(lib);
             }
-            Err(e) => tried.push(format!("libEGL.dll (default DLL search path): {e}")),
+            Err(e) => tried.push(format!("{fallback} (default DLL search path): {e}")),
         }
         warn!(
             "WindowsPlatform: ANGLE libEGL.dll not found. Fetch the Windows ANGLE \
@@ -1189,6 +1196,32 @@ mod tests {
         }
         WindowsPlatform::load_egl_lib()
             .expect("ANGLE libEGL.dll should load from EDGEFIRST_ANGLE_PATH");
+    }
+
+    /// With no `libEGL.dll` in any candidate directory and no fallback on the
+    /// DLL search path, the load fails and names every candidate it tried.
+    #[test]
+    fn load_egl_lib_reports_every_missing_candidate() {
+        let missing = std::env::temp_dir().join("edgefirst-no-angle-here");
+        let fallback = "edgefirst-no-such-libegl.dll";
+        let err = WindowsPlatform::load_egl_from(std::slice::from_ref(&missing), fallback)
+            .expect_err("nothing to load");
+        let msg = match &err {
+            Error::Io(e) => e.to_string(),
+            other => panic!("expected an I/O error, got {other:?}"),
+        };
+        assert!(msg.contains("ANGLE libEGL.dll not found"), "{msg}");
+        assert!(
+            msg.contains(&format!(
+                "{}: not found",
+                missing.join("libEGL.dll").display()
+            )),
+            "{msg}"
+        );
+        assert!(
+            msg.contains(&format!("{fallback} (default DLL search path)")),
+            "{msg}"
+        );
     }
 
     /// Destroying a context clears the last-active context another processor recorded.

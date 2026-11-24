@@ -307,10 +307,20 @@ impl ImageProcessor {
             )));
         }
 
-        for p in &placements {
-            self.render_tile(src, dst_batched, p, cfg)?;
-        }
-        self.flush()?;
+        let mut items = placements
+            .iter()
+            .map(|p| {
+                let options = cfg.options.source(Some(placement_to_source_region(p)?));
+                let band = dst_batched.view(Region::new(
+                    0,
+                    p.index * cfg.tile_h,
+                    cfg.tile_w,
+                    cfg.tile_h,
+                ))?;
+                Ok((band, options))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.convert_batch(src, &mut items)?;
         Ok(placements)
     }
 

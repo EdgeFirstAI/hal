@@ -18,6 +18,11 @@
 #                               summary.json for the fleet roll-up
 #   HAL_ONTARGET_REQUIRE_GPU    1 to fail, as NO-GPU, on a board without a
 #                               DRM render node
+#   HAL_ONTARGET_TEST_THREADS   test threads per binary; unset uses libtest's
+#                               default, one per CPU
+#   HAL_ONTARGET_GDB            1 to run each test binary under `gdb -batch`,
+#                               which prints every thread's backtrace into the
+#                               binary's log if the binary is killed by a signal
 #
 # Sets the test gates from what the board has: HAL_TEST_REQUIRE_GL with a
 # render node, HAL_TEST_REQUIRE_G2D with libg2d.so.2 (HAL_TEST_SKIP_G2D
@@ -27,8 +32,11 @@
 #
 # Writes one log per binary, check-single-home.log,
 # test_two_library_user.log, test_codec_api.log, python-codec.log,
-# capabilities.txt, summary.txt (`RESULT|detail`, one line) and summary.json
-# into <results-dir>. Exits 0 on PASS, 1 on FAIL, NO-TESTS or NO-GPU.
+# capabilities.txt, diagnostics.txt (core pattern, core size limit, gdb,
+# coredumpctl), summary.txt (`RESULT|detail`, one line) and summary.json into
+# <results-dir>. A test binary killed by a signal also gets
+# <binary>.crash.txt, with the signal and whatever backtrace coredumpctl or a
+# core file and gdb can give. Exits 0 on PASS, 1 on FAIL, NO-TESTS or NO-GPU.
 #
 # Needs bash and the POSIX tools (awk, grep, sed, sort). python3 is used for
 # the Python codec tests only.
@@ -39,6 +47,8 @@ BUNDLE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RESULTS="${1:?usage: $0 <results-dir>}"
 FILTER="${FILTER:-}"
 REQUIRE_GPU="${HAL_ONTARGET_REQUIRE_GPU:-0}"
+THREADS_ARG=()
+[[ -n "${HAL_ONTARGET_TEST_THREADS:-}" ]] && THREADS_ARG=(--test-threads="${HAL_ONTARGET_TEST_THREADS}")
 
 rm -rf "${RESULTS}"
 mkdir -p "${RESULTS}"
@@ -53,6 +63,52 @@ neutron="$([[ -e /dev/neutron0 ]] && echo yes || echo no)"
 caps="dma_heap=${heaps:-none} render=${render} galcore=${galcore} neutron=${neutron}"
 echo "${caps}" > "${RESULTS}/capabilities.txt"
 echo "    ${caps}"
+
+# Lets test binaries dump core, and records what the board offers for crash
+# backtraces.
+ulimit -c unlimited 2>/dev/null || true
+have_gdb="$(command -v gdb >/dev/null 2>&1 && echo yes || echo no)"
+have_coredumpctl="$(command -v coredumpctl >/dev/null 2>&1 && echo yes || echo no)"
+diag="core_pattern=$(cat /proc/sys/kernel/core_pattern 2>/dev/null || echo unknown) core_limit=$(ulimit -c) gdb=${have_gdb} coredumpctl=${have_coredumpctl}"
+echo "${diag}" > "${RESULTS}/diagnostics.txt"
+echo "    ${diag}"
+DEBUGGER=()
+if [[ "${HAL_ONTARGET_GDB:-0}" == "1" ]]; then
+  if [[ "${have_gdb}" == yes ]]; then
+    DEBUGGER=(gdb -q -batch -return-child-result -ex run -ex "thread apply all bt" --args)
+  else
+    echo "    HAL_ONTARGET_GDB=1 but the board has no gdb"
+  fi
+fi
+
+# Writes <results>/<name>.crash.txt for a test binary `bin` (pid `pid`) that
+# exited with status `rc` > 128.
+collect_crash() {
+  local bin="$1" pid="$2" rc="$3"
+  local name out core
+  name="$(basename "${bin}")"
+  out="${RESULTS}/${name}.crash.txt"
+  echo "${name} (pid ${pid}) was killed by signal $((rc - 128))" > "${out}"
+  if [[ "${have_coredumpctl}" == yes ]]; then
+    # Retries for up to 10 s while systemd-coredump records the dump.
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+      if coredumpctl --no-pager info "${pid}" >> "${out}" 2>&1; then
+        break
+      fi
+      sleep 1
+    done
+  fi
+  for core in "core.${pid}" core; do
+    [[ -f "${core}" ]] || continue
+    if [[ "${have_gdb}" == yes ]]; then
+      gdb -q -batch -ex "thread apply all bt" "${bin}" "${core}" >> "${out}" 2>&1
+    else
+      echo "core file ${core} left on the board; no gdb to read it" >> "${out}"
+    fi
+    rm -f "${core}"
+    break
+  done
+}
 
 extra_env=()
 [[ "${galcore}" == yes ]] && extra_env+=(EDGEFIRST_SKIP_VIVANTE_KNOWN_BUGS=1)
@@ -151,8 +207,13 @@ for bin in "${bins[@]}"; do
   echo "  -- ${name}"
   log="${RESULTS}/${name}.log"
   # shellcheck disable=SC2086
-  if env EDGEFIRST_TESTDATA_DIR="${BUNDLE}/testdata" ${extra_env[@]+"${extra_env[@]}"} \
-      "./${bin}" --test-threads=1 ${FILTER} > "${log}" 2>&1; then
+  env EDGEFIRST_TESTDATA_DIR="${BUNDLE}/testdata" ${extra_env[@]+"${extra_env[@]}"} \
+    ${DEBUGGER[@]+"${DEBUGGER[@]}"} "./${bin}" ${THREADS_ARG[@]+"${THREADS_ARG[@]}"} ${FILTER} \
+    > "${log}" 2>&1 &
+  pid=$!
+  wait "${pid}"
+  rc=$?
+  if [[ ${rc} -eq 0 ]]; then
     pass=$((pass + 1))
     # Reports the skips of a binary that passed.
     if grep -q "SKIPPED" "${log}"; then
@@ -167,6 +228,10 @@ for bin in "${bins[@]}"; do
     fail=$((fail + 1)); failed_bins+=("${name}")
     echo "     FAILED (see ${log})"
     grep -E "^(test .* FAILED|failures:|error)" "${log}" | head -8 | sed 's/^/     /'
+    if [[ ${rc} -gt 128 ]]; then
+      collect_crash "${bin}" "${pid}" "${rc}"
+      echo "     killed by signal $((rc - 128)); see ${RESULTS}/${name}.crash.txt"
+    fi
   fi
 done
 

@@ -1242,9 +1242,49 @@ fn should_reject_software_gl(is_software_renderer: bool, override_enabled: bool)
     is_software_renderer && !override_enabled
 }
 
-fn parse_nv_path_pref() -> NvPathPref {
-    match std::env::var("EDGEFIRST_NV_CONVERT_PATH") {
-        Ok(v) => match v.to_ascii_lowercase().as_str() {
+/// The environment variables a GL processor reads when it is built.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct GlEnv {
+    /// `EDGEFIRST_GL_SERIALIZE`.
+    pub(crate) serialize: Option<String>,
+    /// `EDGEFIRST_PROTO_COMPUTE` is `1`.
+    pub(crate) proto_compute: bool,
+    /// `EDGEFIRST_GL_NO_FLOAT_LINEAR` is `1`.
+    pub(crate) no_float_linear: bool,
+    /// `EDGEFIRST_NV_CONVERT_PATH`.
+    pub(crate) nv_convert_path: Option<String>,
+    /// `EDGEFIRST_COLORIMETRY`.
+    pub(crate) colorimetry: Option<String>,
+    /// Test hook: processor construction fails before it opens a display.
+    #[cfg(test)]
+    pub(crate) fail_setup: bool,
+}
+
+impl GlEnv {
+    /// Reads the variables from the process environment.
+    pub(crate) fn from_process() -> Self {
+        Self::from_lookup(|name| std::env::var(name).ok())
+    }
+
+    /// Reads the variables through `lookup`, which returns a variable's value
+    /// or `None` when it is unset.
+    pub(crate) fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Self {
+        let flag = |name: &str| lookup(name).is_some_and(|v| v == "1");
+        Self {
+            serialize: lookup("EDGEFIRST_GL_SERIALIZE"),
+            proto_compute: flag("EDGEFIRST_PROTO_COMPUTE"),
+            no_float_linear: flag("EDGEFIRST_GL_NO_FLOAT_LINEAR"),
+            nv_convert_path: lookup("EDGEFIRST_NV_CONVERT_PATH"),
+            colorimetry: lookup("EDGEFIRST_COLORIMETRY"),
+            #[cfg(test)]
+            fail_setup: false,
+        }
+    }
+}
+
+fn parse_nv_path_pref(value: Option<&str>) -> NvPathPref {
+    match value {
+        Some(v) => match v.to_ascii_lowercase().as_str() {
             "sampler" | "external" | "a" => NvPathPref::ForceSampler,
             "shader" | "r8" | "b" => NvPathPref::ForceShader,
             "auto" | "" => NvPathPref::Auto,
@@ -1256,13 +1296,13 @@ fn parse_nv_path_pref() -> NvPathPref {
                 NvPathPref::Auto
             }
         },
-        Err(_) => NvPathPref::Auto,
+        None => NvPathPref::Auto,
     }
 }
 
-fn parse_colorimetry_env() -> Option<crate::ColorimetryMode> {
-    match std::env::var("EDGEFIRST_COLORIMETRY") {
-        Ok(v) => match v.to_ascii_lowercase().as_str() {
+fn parse_colorimetry_env(value: Option<&str>) -> Option<crate::ColorimetryMode> {
+    match value {
+        Some(v) => match v.to_ascii_lowercase().as_str() {
             "exact" => Some(crate::ColorimetryMode::Exact),
             "fast" => Some(crate::ColorimetryMode::Fast),
             "" => None,
@@ -1274,7 +1314,7 @@ fn parse_colorimetry_env() -> Option<crate::ColorimetryMode> {
                 None
             }
         },
-        Err(_) => None,
+        None => None,
     }
 }
 
@@ -2025,13 +2065,21 @@ impl GLProcessorST {
     /// `capacity` is the per-cache import-cache bound
     /// ([`ImageProcessorConfig::egl_cache_capacity`]); `None` (or `Some(0)`)
     /// defers to `EDGEFIRST_EGL_CACHE_CAPACITY` and then to the default —
-    /// see [`resolve_egl_cache_capacity`].
+    /// see [`resolve_egl_cache_capacity`]. `env` holds the environment
+    /// settings the processor applies.
     ///
     /// [`ImageProcessorConfig::egl_cache_capacity`]: crate::ImageProcessorConfig::egl_cache_capacity
     pub fn new(
         kind: Option<EglDisplayKind>,
         capacity: Option<usize>,
+        env: &GlEnv,
     ) -> Result<GLProcessorST, crate::Error> {
+        #[cfg(test)]
+        if env.fail_setup {
+            return Err(crate::Error::NotSupported(
+                "GL processor setup refused by the test hook".into(),
+            ));
+        }
         let gl_context = Platform::init_display(kind)?;
         // Loads the GL function pointers once per process.
         Platform::load_gl_once(&gl_context);
@@ -2044,7 +2092,7 @@ impl GLProcessorST {
             renderer_name,
             supports_f32_color,
             supports_f16_color,
-        } = Self::gl_check_support()?;
+        } = Self::gl_check_support(env.no_float_linear)?;
         let RendererTraits {
             vivante: is_vivante,
             mali: is_mali,
@@ -2359,14 +2407,14 @@ impl GLProcessorST {
 
         // NV* conversion-path preference: `auto` (default), or `sampler`/`shader`
         // to force a path.
-        let nv_path_pref = parse_nv_path_pref();
+        let nv_path_pref = parse_nv_path_pref(env.nv_convert_path.as_deref());
         if nv_path_pref != NvPathPref::Auto {
             log::info!("EDGEFIRST_NV_CONVERT_PATH override: {nv_path_pref:?}");
         }
 
         // Colorimetry mode: the env var pins it for the processor's lifetime;
         // otherwise it starts as Fast.
-        let colorimetry_env = parse_colorimetry_env();
+        let colorimetry_env = parse_colorimetry_env(env.colorimetry.as_deref());
         if let Some(mode) = colorimetry_env {
             log::info!("EDGEFIRST_COLORIMETRY override: {mode:?}");
         }
@@ -2498,11 +2546,8 @@ impl GLProcessorST {
         check_gl_error(function!(), line!())?;
 
         // Compile the proto repack compute shader when GLES 3.1 is available
-        // and EDGEFIRST_PROTO_COMPUTE=1.
-        let compute_enabled = converter.gl_context.has_compute
-            && std::env::var("EDGEFIRST_PROTO_COMPUTE")
-                .map(|v| v == "1")
-                .unwrap_or(false);
+        // and `env.proto_compute` is set.
+        let compute_enabled = converter.gl_context.has_compute && env.proto_compute;
         if compute_enabled {
             match Self::compile_compute_program(generate_proto_repack_compute_shader()) {
                 Ok(program) => {
@@ -3705,7 +3750,7 @@ impl GLProcessorST {
 
     /// Query GL capabilities and detect GPU vendor/renderer type; see
     /// [`GlSupport`].
-    fn gl_check_support() -> Result<GlSupport, crate::Error> {
+    fn gl_check_support(force_no_float_linear: bool) -> Result<GlSupport, crate::Error> {
         if let Ok(version) = edgefirst_gl::get_string(edgefirst_gl::gl::SHADING_LANGUAGE_VERSION) {
             log::debug!("GL Shading Language Version: {version:?}");
         } else {
@@ -3809,10 +3854,7 @@ impl GLProcessorST {
             }
         }
 
-        // EDGEFIRST_GL_NO_FLOAT_LINEAR=1 forces the float-linear capability off.
-        let force_no_float_linear = std::env::var("EDGEFIRST_GL_NO_FLOAT_LINEAR")
-            .map(|v| v == "1")
-            .unwrap_or(false);
+        // `force_no_float_linear` forces the float-linear capability off.
         let has_float_linear =
             extensions.contains("GL_OES_texture_float_linear") && !force_no_float_linear;
         if force_no_float_linear {
@@ -9907,6 +9949,72 @@ impl GLProcessorST {
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
+    /// `GlEnv` reads each documented name; the flags need exactly `1`.
+    #[test]
+    fn gl_env_reads_the_documented_names() {
+        use super::GlEnv;
+        let lookup = |vars: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                vars.iter()
+                    .find(|(k, _)| *k == name)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        let env = GlEnv::from_lookup(lookup(&[
+            ("EDGEFIRST_GL_SERIALIZE", "full"),
+            ("EDGEFIRST_PROTO_COMPUTE", "1"),
+            ("EDGEFIRST_GL_NO_FLOAT_LINEAR", "1"),
+            ("EDGEFIRST_NV_CONVERT_PATH", "shader"),
+            ("EDGEFIRST_COLORIMETRY", "exact"),
+        ]));
+        assert_eq!(env.serialize.as_deref(), Some("full"));
+        assert!(env.proto_compute);
+        assert!(env.no_float_linear);
+        assert_eq!(env.nv_convert_path.as_deref(), Some("shader"));
+        assert_eq!(env.colorimetry.as_deref(), Some("exact"));
+
+        let env = GlEnv::from_lookup(lookup(&[
+            ("EDGEFIRST_PROTO_COMPUTE", "true"),
+            ("EDGEFIRST_GL_NO_FLOAT_LINEAR", "0"),
+        ]));
+        assert!(!env.proto_compute, "only `1` turns the flag on");
+        assert!(!env.no_float_linear);
+        assert_eq!(env.serialize, None);
+        assert_eq!(env.nv_convert_path, None);
+        assert_eq!(env.colorimetry, None);
+    }
+
+    /// The NV path and colorimetry values match case-insensitively, and an
+    /// unrecognised value falls back to the default.
+    #[test]
+    fn nv_path_and_colorimetry_values_parse() {
+        use super::{parse_colorimetry_env, parse_nv_path_pref, NvPathPref};
+        use crate::ColorimetryMode;
+        for (value, want) in [
+            (Some("SAMPLER"), NvPathPref::ForceSampler),
+            (Some("external"), NvPathPref::ForceSampler),
+            (Some("a"), NvPathPref::ForceSampler),
+            (Some("Shader"), NvPathPref::ForceShader),
+            (Some("r8"), NvPathPref::ForceShader),
+            (Some("b"), NvPathPref::ForceShader),
+            (Some("auto"), NvPathPref::Auto),
+            (Some(""), NvPathPref::Auto),
+            (Some("bogus"), NvPathPref::Auto),
+            (None, NvPathPref::Auto),
+        ] {
+            assert_eq!(parse_nv_path_pref(value), want, "{value:?}");
+        }
+        for (value, want) in [
+            (Some("EXACT"), Some(ColorimetryMode::Exact)),
+            (Some("fast"), Some(ColorimetryMode::Fast)),
+            (Some(""), None),
+            (Some("bogus"), None),
+            (None, None),
+        ] {
+            assert_eq!(parse_colorimetry_env(value), want, "{value:?}");
+        }
+    }
+
     #[test]
     fn nv12_dst_policy_per_renderer() {
         use super::{
@@ -10103,7 +10211,7 @@ mod tests {
         use super::super::shaders_common::{
             NV12_CHROMA_FILL_FRAGMENT, NV12_CHROMA_R8_FRAGMENT, NV12_LUMA_FRAGMENT,
         };
-        let _gl = match super::GLProcessorST::new(None, None) {
+        let worker = match super::super::GLProcessorThreaded::new(None) {
             Ok(g) => g,
             Err(e) => {
                 crate::test_support::report_skip(&format!(
@@ -10112,13 +10220,15 @@ mod tests {
                 return;
             }
         };
-        for fragment in [
-            NV12_LUMA_FRAGMENT,
-            NV12_CHROMA_R8_FRAGMENT,
-            NV12_CHROMA_FILL_FRAGMENT,
-        ] {
-            GlProgram::new(generate_vertex_shader(), fragment).unwrap();
-        }
+        worker.with_st(|_| {
+            for fragment in [
+                NV12_LUMA_FRAGMENT,
+                NV12_CHROMA_R8_FRAGMENT,
+                NV12_CHROMA_FILL_FRAGMENT,
+            ] {
+                GlProgram::new(generate_vertex_shader(), fragment).unwrap();
+            }
+        });
     }
 
     /// An NV12 destination is renderable only as a zero-copy DMA buffer on a

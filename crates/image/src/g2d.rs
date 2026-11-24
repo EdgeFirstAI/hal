@@ -118,13 +118,25 @@ fn pixelfmt_to_fourcc(fmt: PixelFormat) -> FourCharCode {
 /// library for hardware-accelerated image processing on i.MX platforms.
 #[derive(Debug)]
 pub struct G2DProcessor {
-    g2d: G2D,
+    /// Opened and closed under [`G2D_LIFECYCLE`].
+    g2d: std::mem::ManuallyDrop<G2D>,
     interpolation: crate::Interpolation,
     soft_declines: bool,
 }
 
 unsafe impl Send for G2DProcessor {}
 unsafe impl Sync for G2DProcessor {}
+
+/// Serializes `g2d_open` and `g2d_close` across the process.
+static G2D_LIFECYCLE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+impl Drop for G2DProcessor {
+    fn drop(&mut self) {
+        let _lifecycle = G2D_LIFECYCLE.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: `g2d` is dropped once, here, and not used afterwards.
+        unsafe { std::mem::ManuallyDrop::drop(&mut self.g2d) };
+    }
+}
 
 impl G2DProcessor {
     /// Creates a new G2DConverter instance.
@@ -133,16 +145,23 @@ impl G2DProcessor {
     /// colorimetry of the YUV side of that conversion. Full-range YUV and
     /// BT.2020 conversions are declined.
     pub fn new() -> Result<Self> {
-        let mut g2d = G2D::new(G2D_LIBRARY)?;
-        // Initial matrix; every `convert()` programs its own.
-        g2d.set_bt601_colorspace()?;
-
-        log::debug!("G2DConverter created with version {:?}", g2d.version());
-        Ok(Self {
-            g2d,
+        let g2d = {
+            let _lifecycle = G2D_LIFECYCLE.lock().unwrap_or_else(|e| e.into_inner());
+            G2D::new(G2D_LIBRARY)?
+        };
+        let mut processor = Self {
+            g2d: std::mem::ManuallyDrop::new(g2d),
             interpolation: crate::Interpolation::default(),
             soft_declines: true,
-        })
+        };
+        // Initial matrix; every `convert()` programs its own.
+        processor.g2d.set_bt601_colorspace()?;
+
+        log::debug!(
+            "G2DConverter created with version {:?}",
+            processor.g2d.version()
+        );
+        Ok(processor)
     }
 
     /// Whether G2D returns `NotSupported` for conversions the CPU runs exactly,

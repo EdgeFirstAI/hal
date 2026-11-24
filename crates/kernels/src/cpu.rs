@@ -42,11 +42,13 @@ impl CpuFeatures {
     /// `neon_baseline`), `neon_fp16`, `neon_dotprod`. Anything else
     /// returns `ForcedTierUnavailable`.
     pub fn from_env_or_probe() -> Result<Self> {
-        Self::from_forced_tier(
-            std::env::var("EDGEFIRST_KERNELS_FORCE_TIER")
-                .ok()
-                .as_deref(),
-        )
+        Self::from_lookup(|name| std::env::var(name).ok())
+    }
+
+    /// [`CpuFeatures::from_env_or_probe`] with `EDGEFIRST_KERNELS_FORCE_TIER`
+    /// read through `lookup`.
+    fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Self> {
+        Self::from_forced_tier(lookup("EDGEFIRST_KERNELS_FORCE_TIER").as_deref())
     }
 
     /// The features of the forced tier `forced`, or the probed features for `None`.
@@ -164,7 +166,6 @@ impl Tier {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, MutexGuard};
 
     /// The usable predicates need the requested feature, NEON and the CPU's own support.
     #[test]
@@ -191,39 +192,6 @@ mod tests {
         assert!(!no_neon.fp16_usable() && !no_neon.dotprod_usable());
         assert!(!CpuFeatures::default().fp16_usable());
         assert!(!CpuFeatures::default().dotprod_usable());
-    }
-
-    /// Serializes every test that overrides an env var; poisoning is ignored.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    /// Overrides an env var while it lives, holding [`ENV_LOCK`], and restores the prior
-    /// value, or its absence, on drop.
-    struct EnvGuard {
-        key: &'static str,
-        prev: Option<String>,
-        _lock: MutexGuard<'static, ()>,
-    }
-
-    impl EnvGuard {
-        fn set(key: &'static str, value: &str) -> Self {
-            let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            let prev = std::env::var(key).ok();
-            std::env::set_var(key, value);
-            Self {
-                key,
-                prev,
-                _lock: lock,
-            }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            match self.prev.take() {
-                Some(v) => std::env::set_var(self.key, v),
-                None => std::env::remove_var(self.key),
-            }
-        }
     }
 
     #[test]
@@ -309,13 +277,19 @@ mod tests {
         }
     }
 
-    /// `from_env_or_probe` reads `EDGEFIRST_KERNELS_FORCE_TIER`.
+    /// `from_env_or_probe` reads `EDGEFIRST_KERNELS_FORCE_TIER`; other names are ignored.
     #[test]
     fn from_env_or_probe_reads_the_documented_variable() {
-        let _g = EnvGuard::set("EDGEFIRST_KERNELS_FORCE_TIER", "scalar");
+        let forced = |name: &str| (name == "EDGEFIRST_KERNELS_FORCE_TIER").then(|| "scalar".into());
         assert_eq!(
-            CpuFeatures::from_env_or_probe().unwrap(),
+            CpuFeatures::from_lookup(forced).unwrap(),
             CpuFeatures::default()
+        );
+        let other =
+            |name: &str| (name == "EDGEFIRST_DECODER_FORCE_KERNEL").then(|| "scalar".into());
+        assert_eq!(
+            CpuFeatures::from_lookup(other).unwrap(),
+            CpuFeatures::probe()
         );
     }
 }

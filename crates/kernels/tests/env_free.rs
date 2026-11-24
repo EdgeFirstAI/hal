@@ -3,42 +3,12 @@
 
 //! The `*_with_features` constructors read no environment.
 //!
-//! These tests set `EDGEFIRST_KERNELS_FORCE_TIER` to an unknown tier, which makes every
+//! The test sets `EDGEFIRST_KERNELS_FORCE_TIER` to an unknown tier, which makes every
 //! env-reading constructor fail.
-
-use std::sync::{Mutex, MutexGuard};
 
 use edgefirst_kernels::{
     CpuFeatures, DType, KernelError, LutI8Plan, Quant, SigmoidParams, SigmoidPlan, Tier,
 };
-
-const VAR: &str = "EDGEFIRST_KERNELS_FORCE_TIER";
-
-static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-/// Sets `VAR` for the guard's lifetime and restores the previous value on drop.
-struct EnvGuard {
-    prev: Option<String>,
-    _lock: MutexGuard<'static, ()>,
-}
-
-impl EnvGuard {
-    fn set(value: &str) -> Self {
-        let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let prev = std::env::var(VAR).ok();
-        std::env::set_var(VAR, value);
-        Self { prev, _lock: lock }
-    }
-}
-
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        match self.prev.take() {
-            Some(v) => std::env::set_var(VAR, v),
-            None => std::env::remove_var(VAR),
-        }
-    }
-}
 
 fn i8_params() -> SigmoidParams {
     SigmoidParams {
@@ -51,7 +21,7 @@ fn i8_params() -> SigmoidParams {
 
 #[test]
 fn with_features_constructors_ignore_the_environment() {
-    let _g = EnvGuard::set("wibble");
+    std::env::set_var("EDGEFIRST_KERNELS_FORCE_TIER", "wibble");
     let f = CpuFeatures::default();
     // The env-reading constructors see the unknown tier.
     assert!(matches!(

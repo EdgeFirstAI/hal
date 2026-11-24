@@ -45,6 +45,10 @@ on:
         description: Fail a board without a DRM render node instead of skipping its GPU tests
         type: boolean
         default: true
+      gdb:
+        description: Run each test binary under gdb, which logs every thread's backtrace if it crashes
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -220,6 +224,7 @@ jobs:
         env:
           FILTER: ${{ inputs.filter }}
           HAL_ONTARGET_REQUIRE_GPU: ${{ inputs.require-gpu && '1' || '0' }}
+          HAL_ONTARGET_GDB: ${{ inputs.gdb && '1' || '0' }}
           HAL_BOARD_ENTRY: ${{ matrix.runner }}
         run: hal-bundle/scripts/on-target-run.sh "$GITHUB_WORKSPACE/hal-results"
 

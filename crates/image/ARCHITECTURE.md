@@ -1489,7 +1489,7 @@ resources.
   `EGL_KHR_no_config_context`) and renders exclusively through FBOs
   backed by EGLImages.
 - **DMA buffers** — fd `close()` in `Drop`.
-- **G2D contexts** — `g2d_close` in `G2DProcessor::drop`.
+- **G2D contexts** — `g2d_close` in `G2DProcessor::drop`. `g2d_open` and `g2d_close` run under one process-wide lock, so processors on different threads never open or close a context at the same time.
 
 Intentional leaks: the EGL library handle (`Box::leak`), the `Rc<Egl>`
 wrapper (`ManuallyDrop`), and the shared EGL display
@@ -1517,6 +1517,8 @@ Override with `EDGEFIRST_GL_SERIALIZE=full|lifecycle` — `full` is the
 escape hatch for unknown-bad drivers (or tiny-convert-heavy
 multi-processor workloads on Tegra, below); `lifecycle` forces
 parallelism for experiments.
+
+Under `Full`, a worker completes any deferred draw it still has pending before it releases the lock at the end of a message, so no other context runs while a batch is half drawn. A `convert_deferred` on a `Full` worker is therefore finished when it returns, and `flush` has nothing left to sync. `tile_into` sends all its tiles and the sync as one message, so it keeps one import and one sync per batch under every policy.
 
 ### Why Vivante serializes
 
