@@ -245,6 +245,29 @@ thread_local! {
     /// Set when a re-entrant inline PBO op panicked; the worker loop folds it
     /// into `poisoned` after the message that raised it.
     static GL_WORKER_POISON: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
+    /// Replies a serializing worker holds until the message's GL work has
+    /// completed.
+    static HELD_REPLIES: std::cell::RefCell<Vec<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Run `reply` now, or, on a worker holding the process-wide per-message
+/// lock, from [`send_held_replies`] once the message's GL work has completed.
+fn send_reply(reply: impl FnOnce() + 'static) {
+    if on_serializing_gl_worker() {
+        HELD_REPLIES.with(|held| held.borrow_mut().push(Box::new(reply)));
+    } else {
+        reply();
+    }
+}
+
+/// Run every reply [`send_reply`] held on this thread, in order.
+fn send_held_replies() {
+    let held = HELD_REPLIES.with(|held| std::mem::take(&mut *held.borrow_mut()));
+    for reply in held {
+        reply();
+    }
 }
 
 /// Run a re-entrant PBO op inline on the owning worker, turning a panic into
@@ -427,13 +450,13 @@ fn panic_message(info: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
-fn reply_caught<T>(
+fn reply_caught<T: 'static>(
     result: std::thread::Result<crate::Result<T>>,
     resp: tokio::sync::oneshot::Sender<crate::Result<T>>,
     poisoned: &mut bool,
     what: &str,
 ) {
-    let _ = resp.send(match result {
+    let reply = match result {
         Ok(res) => res,
         Err(e) => {
             *poisoned = true;
@@ -442,6 +465,9 @@ fn reply_caught<T>(
                 panic_message(e.as_ref()),
             )))
         }
+    };
+    send_reply(move || {
+        let _ = resp.send(reply);
     });
 }
 
@@ -634,9 +660,9 @@ fn run_gl_worker(
         handle_gl_message(msg, &mut gl_converter, &mut poisoned);
         // Fold in a panic from a re-entrant inline PBO op.
         poisoned |= GL_WORKER_POISON.with(|p| p.replace(false));
-        // Full policy: no GL work is left pending once the lock is released,
-        // including after a panic in this message. A panic here poisons the
-        // worker.
+        // Full policy: no GL work is left pending once the lock is released or
+        // the message is answered, including after a panic in this message. A
+        // panic here poisons the worker.
         if serialize_per_msg {
             let synced = std::panic::catch_unwind(AssertUnwindSafe(|| {
                 if poisoned {
@@ -651,6 +677,7 @@ fn run_gl_worker(
         // message's GPU work has synced; deferred batches keep theirs until
         // Flush.
         gl_converter.end_gpu_pass_if_synced();
+        send_held_replies();
     }
     // Drop under the mutex on Linux and Windows.
     #[cfg(target_os = "linux")]
@@ -795,7 +822,9 @@ fn handle_gl_message(
         #[cfg(test)]
         GLProcessorMessage::WithSt(job, resp) => {
             job(gl_converter);
-            let _ = resp.send(());
+            send_reply(move || {
+                let _ = resp.send(());
+            });
         }
         #[cfg(test)]
         GLProcessorMessage::Nv12DeclineState(resp) => {

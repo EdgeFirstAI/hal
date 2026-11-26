@@ -1326,6 +1326,75 @@ mod gl_tests {
         );
     }
 
+    /// On a worker that serializes every message, a deferred convert into a zero-copy GPU buffer
+    /// has written its destination when the call returns, without a flush.
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    fn a_deferred_convert_on_a_serializing_worker_is_complete_when_it_returns() {
+        if !is_opengl_available() || !is_gpu_image_buffer_available() {
+            crate::test_support::report_skip(&format!(
+                "{} - no zero-copy GPU buffers or GL",
+                function!()
+            ));
+            return;
+        }
+        let mut worker = match GLProcessorThreaded::new(None) {
+            Ok(w) => w,
+            Err(e) => {
+                crate::test_support::report_skip(&format!(
+                    "{} - GL not available: {e}",
+                    function!()
+                ));
+                return;
+            }
+        };
+        if !worker.with_st(|gl| gl.platform_caps().serialize_gl) {
+            crate::test_support::report_skip(&format!(
+                "{} - this driver runs messages in parallel, so a deferred convert stays deferred",
+                function!()
+            ));
+            return;
+        }
+        const ROUNDS: usize = 8;
+        let (sw, sh, dw, dh) = (1920usize, 1080usize, 1280usize, 720usize);
+        let bytes = rgba_gradient(sw, sh, 19);
+        let src = load_raw_image(sw, sh, PixelFormat::Rgba, Some(TensorMemory::Mem), &bytes)
+            .expect("source");
+        let image = || {
+            crate::test_support::gpu_buffer_allocated(
+                TensorDyn::image(
+                    dw,
+                    dh,
+                    PixelFormat::Rgba,
+                    DType::U8,
+                    Some(TensorMemory::DmaBuf),
+                    edgefirst_tensor::CpuAccess::ReadWrite,
+                ),
+                "GPU buffer destination",
+            )
+        };
+        let (Some(mut want), Some(mut dst)) = (image(), image()) else {
+            return;
+        };
+        worker
+            .convert(&src, &mut want, None)
+            .expect("blocking convert");
+        let want = want.as_u8().unwrap().map().unwrap().as_slice().to_vec();
+        for round in 0..ROUNDS {
+            dst.as_u8().unwrap().map().unwrap().as_mut_slice().fill(0);
+            worker
+                .convert_deferred(&src, &mut dst, None)
+                .expect("deferred convert");
+            let got = dst.as_u8().unwrap().map().unwrap().as_slice().to_vec();
+            assert!(
+                got == want,
+                "round {round}: the deferred convert had not finished writing its destination \
+                 when it returned"
+            );
+        }
+        worker.flush().expect("flush");
+    }
+
     /// A convert that fails after a draw that skipped its GPU wait leaves that draw owed, deferred
     /// or fenced, and a worker that syncs every message leaves nothing pending after it.
     #[test]
