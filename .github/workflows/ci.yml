@@ -189,6 +189,7 @@ jobs:
         edgefirst_tensor=dma
         edgefirst_codec=v4l2
         v4l2_jpeg
+        v4l2_jpeg_reconfigure
         dst_view_stride
         offset_nv_source_upload
         offset_source_view_alignment

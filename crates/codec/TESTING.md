@@ -36,7 +36,8 @@ Located in `crates/codec/tests/`:
 | `decode_png.rs`         | PNG → Tensor<u8/u16/i8/i16/f32>, native colorspace |
 | `decode_tensordyn.rs`   | TensorDyn decode for all dtypes, file path API     |
 | `exif_orientations.rs`  | End-to-end EXIF orientation reporting (JPEG + PNG): native dims preserved, `(rotation_degrees, flip_horizontal)` per tag |
-| `v4l2_jpeg.rs`          | Device-gated hardware decode: NV12 parity vs CPU, persistent streaming loop, geometry change, DMA-BUF zero-copy (skips cleanly when no V4L2 JPEG device / dma_heap) |
+| `v4l2_jpeg.rs`          | Device-gated hardware decode: NV12 parity vs CPU, persistent streaming loop, DMA-BUF zero-copy (skips cleanly when no V4L2 JPEG device / dma_heap) |
+| `v4l2_jpeg_reconfigure.rs` | One decoder reconfigured for each image's geometry and subsampling keeps its file descriptor count steady. It is the binary's only test, as it counts the whole process's `/proc/self/fd` |
 | `video_encode.rs`       | Device-gated H.264 encoding (see [Video Encoder Verification](#video-encoder-verification)) |
 | `video_decode.rs`       | Device-gated H.264 decoding (see [Video Decoder Verification](#video-decoder-verification)) |
 | `video_concurrency.rs`  | Device-gated sessions at once: two encoders on two threads, each stream decoded and compared with its own source; an encoder and a decoder on two threads; two processes encoding at once (the test runs itself again as the two children, told apart by `EDGEFIRST_CODEC_TEST_CHILD`) |
