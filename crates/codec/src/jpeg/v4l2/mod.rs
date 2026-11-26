@@ -1874,7 +1874,9 @@ mod tests {
     #[test]
     #[ignore = "on-target hardware probe; run with --ignored --nocapture on a JPEG M2M device"]
     fn probe_decode_throughput() {
-        let _sessions = crate::test_support::sessions::take(1);
+        // Decoders the parallel arm keeps open at once.
+        const CONTEXTS: [usize; 2] = [2, 4];
+        let _sessions = crate::test_support::sessions::take(CONTEXTS[1]);
         let Some(jpeg) = testdata_file("zidane.jpg") else {
             crate::test_support::report_skip(
                 "probe_decode_throughput - testdata not found (set EDGEFIRST_TESTDATA_DIR)",
@@ -1897,7 +1899,7 @@ mod tests {
         }
 
         // Parallel contexts: one fd per thread, depth 1 each.
-        for contexts in [2usize, 4] {
+        for contexts in CONTEXTS {
             let mut devs = Vec::new();
             for _ in 0..contexts {
                 match device::probe() {
