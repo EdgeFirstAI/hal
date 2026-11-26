@@ -13,16 +13,10 @@ use super::{dma_require, outcome};
 use edgefirst_tensor::{CpuAccess, DType, PixelFormat, TensorDyn, TensorMemory};
 
 /// Whether a missing zero-copy buffer fails the test even without a probe:
-/// under `HAL_TEST_REQUIRE_GL=1` on macOS and Windows, where the buffer needs
-/// no device node, and on Linux under `HAL_TEST_REQUIRE_GL=1` on a host that
-/// has a DMA heap node.
+/// under `HAL_TEST_REQUIRE_GL=1` everywhere but Linux, where the buffer needs
+/// no device node. On Linux the heap probe and `HAL_TEST_REQUIRE_DMA` decide.
 fn required_with_gl() -> bool {
-    let set = |k: &str| std::env::var(k).is_ok_and(|v| v == "1");
-    if cfg!(target_os = "linux") {
-        set("HAL_TEST_REQUIRE_GL") && std::path::Path::new("/dev/dma_heap").exists()
-    } else {
-        set("HAL_TEST_REQUIRE_GL")
-    }
+    !cfg!(target_os = "linux") && std::env::var("HAL_TEST_REQUIRE_GL").is_ok_and(|v| v == "1")
 }
 
 /// Whether a zero-copy allocation may fail on this host.
