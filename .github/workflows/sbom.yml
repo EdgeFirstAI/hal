@@ -19,7 +19,7 @@ concurrency:
 
 jobs:
   sbom:
-    uses: EdgeFirstAI/.github/.github/workflows/sbom.yml@c7876194b9fe9f7f72daf0efadaf32d7dff1b257
+    uses: EdgeFirstAI/.github/.github/workflows/sbom.yml@966df5c40680f6946896cb5e51542d5dde1bfa1a
     with:
       mode: full
       # The targets reaching a distributed artifact.
