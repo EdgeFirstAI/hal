@@ -918,6 +918,37 @@ fn a_source_whose_row_stride_is_not_the_surface_pitch_is_copied() {
 }
 
 #[test]
+fn one_stream_takes_sources_at_different_row_strides() {
+    let test = "one_stream_takes_sources_at_different_row_strides";
+    let (w, h) = (600, 480);
+    let tight = wrap_tight_yuyv(&aligned_buffer(w, h, FOURCC_YUVS, 256));
+    let Some(mut enc) = open_encoder(test, config(w, h, PixelFormat::Yuyv)) else {
+        return;
+    };
+    let route = corevideo_route(&enc);
+    let mut units = Vec::new();
+    let mut strides = Vec::new();
+    for i in 0..10 {
+        let pitched;
+        let (src, want) = if i % 2 == 0 {
+            (&tight, Transfer::CpuCopy)
+        } else {
+            pitched = wrap(&aligned_buffer(w, h, FOURCC_YUVS, 256));
+            (&pitched, route)
+        };
+        strides.push(src.effective_row_stride().unwrap());
+        paint(src, level(i));
+        units.extend(encode_retrying(&mut enc, src, &at(i as u64)));
+        assert_eq!(enc.info().transfer, want, "frame {i}");
+    }
+    eprintln!("{test}: row strides {strides:?}");
+    assert_ne!(strides[0], strides[1]);
+    units.extend(enc.flush().expect("flush"));
+    assert_eq!(units.len(), 10);
+    check_levels(test, &units, |pts| level(pts as usize));
+}
+
+#[test]
 fn a_refused_first_frame_leaves_the_stream_unset() {
     let test = "a_refused_first_frame_leaves_the_stream_unset";
     let (w, h) = (600, 480);

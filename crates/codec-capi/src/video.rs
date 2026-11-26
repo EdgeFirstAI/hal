@@ -483,8 +483,7 @@ pub unsafe extern "C" fn ef_video_encoder_free(e: *mut EfVideoEncoder) {
 /// into a buffer the device can read first. Either way the call returns
 /// once `src` has been read, so the caller may reuse it afterwards.
 ///
-/// On macOS and iOS, every source of one stream must have the same row
-/// stride. A source whose IOSurface is a CoreVideo `420v`, `420f`,
+/// On macOS and iOS, a source whose IOSurface is a CoreVideo `420v`, `420f`,
 /// `yuvs` or `yuvf` surface of the configured size, with the row stride of
 /// each surface plane and encoded without a crop, may be read in place;
 /// [`ef_video_encoder_get_info`] reports the route. Its IOSurface may stay in

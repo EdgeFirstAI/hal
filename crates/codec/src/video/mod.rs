@@ -682,8 +682,7 @@ impl VideoEncoder {
     /// call returns once `src` has been read, so the caller may reuse it
     /// afterwards.
     ///
-    /// On macOS and iOS, every source of one stream must have the same row
-    /// stride. A source whose IOSurface is a CoreVideo `420v`, `420f`,
+    /// On macOS and iOS, a source whose IOSurface is a CoreVideo `420v`, `420f`,
     /// `yuvs` or `yuvf` surface of the configured size, with the row stride of
     /// each surface plane and encoded without a crop, may be read in place;
     /// [`EncoderInfo::transfer`] reports the route. Its IOSurface may stay in use

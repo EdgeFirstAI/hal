@@ -275,8 +275,6 @@ pub(crate) struct VtEncoder {
     hardware: bool,
     /// One frame period in ticks of [`TIMESCALE`].
     duration: i64,
-    /// The row stride of the stream's sources, from its first accepted frame.
-    stride: Option<usize>,
     /// The stream's colorimetry, from its first accepted frame.
     colour: Option<Colorimetry>,
     /// The next frame starts a new sequence: an IDR picture.
@@ -338,7 +336,6 @@ impl VtEncoder {
             session: Some(session),
             encoders,
             device,
-            stride: None,
             colour: None,
             restart: true,
             transfer: Transfer::CpuCopy,
@@ -550,11 +547,6 @@ impl EncoderBackend for VtEncoder {
         let stride = src
             .effective_row_stride()
             .ok_or_else(|| CodecError::InvalidInput("source has no row stride".into()))?;
-        if let Some(s) = self.stride.filter(|&s| s != stride) {
-            return Err(CodecError::InvalidInput(format!(
-                "source row stride {stride} is not the stream's {s}"
-            )));
-        }
         let in_place = self.in_place && in_place_format(&self.config, src, opts).is_some();
         if in_place {
             let held = self.shared.lock().in_flight.held();
@@ -586,7 +578,6 @@ impl EncoderBackend for VtEncoder {
             }
             return Err(e);
         }
-        self.stride = Some(stride);
         self.colour = Some(colour);
         Ok(self.shared.lock().ready.pop_front())
     }
@@ -619,7 +610,6 @@ impl EncoderBackend for VtEncoder {
         let out = state.ready.drain(..).collect();
         drop(state);
         self.restart = true;
-        self.stride = None;
         self.colour = None;
         Ok(out)
     }
