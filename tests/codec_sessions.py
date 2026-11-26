@@ -42,7 +42,11 @@ def _slot_path(index: int) -> str:
 def _try_lock(path: str):
     """The open slot file at ``path``, locked, or ``None`` when another holder
     has it. Any other locking failure raises."""
-    f = open(path, "a+b")  # noqa: SIM115
+    try:
+        f = open(path, "rb")  # noqa: SIM115
+    except FileNotFoundError:
+        os.close(os.open(path, os.O_WRONLY | os.O_CREAT, 0o666))
+        f = open(path, "rb")  # noqa: SIM115
     try:
         if sys.platform == "win32":
             import msvcrt
