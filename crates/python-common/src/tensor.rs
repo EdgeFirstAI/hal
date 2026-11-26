@@ -2113,6 +2113,7 @@ impl PyTensor {
             // A PBO-backed tensor is decoded in place with the GIL held.
             return decode_image_into(&mut self_.0, &data);
         }
+        crate::interop::refuse_two_plane_decode(&self_.0).map_err(Error::Py)?;
         // Decode into a `TensorDyn` reconstructed over the same backing memory,
         // with the GIL released.
         let (mut tensor, _pin) =
@@ -2148,6 +2149,7 @@ impl PyTensor {
             let data = std::fs::read(&filename).map_err(Error::Io)?;
             return decode_image_into(&mut self_.0, &data);
         }
+        crate::interop::refuse_two_plane_decode(&self_.0).map_err(Error::Py)?;
         // Decode into a `TensorDyn` reconstructed over the same backing memory,
         // with the GIL released.
         let (mut tensor, _pin) =

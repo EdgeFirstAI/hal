@@ -924,8 +924,8 @@ type Returned = Mutex<Vec<DecodedFrame>>;
 pub struct PyFrame {
     frame: Option<DecodedFrame>,
     returned: Weak<Returned>,
-    /// Keeps a reconstructed base tensor's host mapping alive.
-    _pin: Option<edgefirst_tensor::HostPin<'static>>,
+    /// Keeps a reconstructed base tensor's host mappings alive.
+    _pins: crate::interop::HostPins,
 }
 
 impl Drop for PyFrame {
@@ -940,26 +940,28 @@ impl Drop for PyFrame {
     }
 }
 
+/// The base tensor of a frame over `picture`: a second owner of its handle,
+/// or, where tensors are not shared handles, a tensor reconstructed from its
+/// descriptors with the host pins it needs.
+fn frame_base(picture: &TensorDyn) -> PyResult<(TensorDyn, crate::interop::HostPins)> {
+    // SAFETY: neither owner changes the metadata while both are alive.
+    match unsafe { picture.share() } {
+        Ok(shared) => Ok((shared, Vec::new())),
+        Err(_) => crate::interop::reconstruct(picture, edgefirst_tensor::CpuAccess::Read),
+    }
+}
+
 impl PyFrame {
     fn into_py(
         py: Python<'_>,
         frame: DecodedFrame,
         returned: &Arc<Returned>,
     ) -> PyResult<Py<PyAny>> {
-        // The base tensor shares the frame's handle; where tensors are not
-        // shared handles, the memory is reconstructed from its descriptor.
-        //
-        // SAFETY: neither owner changes the metadata while both are alive.
-        let (base, pin) = match unsafe { frame.tensor().share() } {
-            Ok(shared) => (shared, None),
-            Err(_) => {
-                crate::interop::reconstruct(frame.tensor(), edgefirst_tensor::CpuAccess::Read)?
-            }
-        };
+        let (base, pins) = frame_base(frame.tensor())?;
         let init = PyClassInitializer::from(PyTensor(base)).add_subclass(PyFrame {
             frame: Some(frame),
             returned: Arc::downgrade(returned),
-            _pin: pin,
+            _pins: pins,
         });
         Ok(Py::new(py, init)?.into_any())
     }
@@ -1305,4 +1307,66 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("InvalidInputError", py.get_type::<InvalidInputError>())?;
     m.add("InvalidDataError", py.get_type::<InvalidDataError>())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use edgefirst_tensor::{
+        PixelFormat, Tensor, TensorDyn, TensorMapTrait, TensorMemory, TensorTrait,
+    };
+
+    /// A host-memory plane of `rows` x `width` bytes, each `fill(row, col)`.
+    fn plane(rows: usize, width: usize, fill: impl Fn(usize, usize) -> u8) -> Tensor<u8> {
+        let t = Tensor::<u8>::new(&[rows, width], Some(TensorMemory::Mem), None).unwrap();
+        {
+            let mut map = t.map().unwrap();
+            for (i, b) in map.as_mut_slice().iter_mut().enumerate() {
+                *b = fill(i / width, i % width);
+            }
+        }
+        t
+    }
+
+    /// The bytes of `t`'s chroma plane.
+    fn chroma_bytes(t: &TensorDyn) -> Vec<u8> {
+        let chroma = t.chroma_dyn().expect("a chroma plane");
+        let map = chroma.as_u8().unwrap().map().unwrap();
+        map.as_slice().to_vec()
+    }
+
+    /// A frame over a two-plane NV12 picture has a base tensor with both
+    /// planes, in NV12, aliasing the picture's memory.
+    #[test]
+    fn a_two_plane_frame_keeps_both_planes() {
+        let (w, h) = (64usize, 48usize);
+        let luma = plane(h, w, |r, c| (r * 3 + c) as u8);
+        let chroma = plane(h / 2, w, |r, c| (200 - r - c) as u8);
+        let picture: TensorDyn = Tensor::<u8>::from_planes(luma, chroma, PixelFormat::Nv12)
+            .unwrap()
+            .into();
+        let want_chroma = chroma_bytes(&picture);
+
+        let Ok((base, _pins)) = super::frame_base(&picture) else {
+            panic!("the frame's base tensor could not be built");
+        };
+
+        assert!(base.is_multiplane(), "the base tensor has both planes");
+        assert_eq!(base.format(), Some(PixelFormat::Nv12));
+        assert_eq!((base.width(), base.height()), (Some(w), Some(h)));
+        assert_eq!(chroma_bytes(&base), want_chroma, "chroma bytes");
+        let luma_of =
+            |t: &TensorDyn| t.as_u8().unwrap().map().unwrap().as_slice()[..w * h].to_vec();
+        assert_eq!(luma_of(&base), luma_of(&picture), "luma bytes");
+
+        {
+            let chroma = picture.chroma_dyn().unwrap();
+            let mut map = chroma.as_u8().unwrap().map().unwrap();
+            map.as_mut_slice()[0] = 7;
+        }
+        assert_eq!(
+            chroma_bytes(&base)[0],
+            7,
+            "the base aliases the picture's chroma"
+        );
+    }
 }

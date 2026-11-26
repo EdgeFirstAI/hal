@@ -336,13 +336,13 @@ enum RawTensorRepr {
     /// Read-only origin: `TensorArg::NativeRef`. `AsMut::as_mut` panics on it.
     Ref {
         tensor: TensorDyn,
-        _pin: Option<HostPin<'static>>,
+        _pins: HostPins,
         _keepalive: Option<Py<PyAny>>,
     },
     /// Exclusive origin: `TensorArg::NativeMut` or `TensorArg::Foreign`.
     Mut {
         tensor: TensorDyn,
-        _pin: Option<HostPin<'static>>,
+        _pins: HostPins,
         _keepalive: Option<Py<PyAny>>,
     },
 }
@@ -364,25 +364,25 @@ impl<'py> TensorArg<'py> {
 
         Ok(match self {
             Self::NativeRef(guard) => {
-                let (tensor, pin) = reconstruct(&guard.0, CpuAccess::Read)?;
+                let (tensor, pins) = reconstruct(&guard.0, CpuAccess::Read)?;
                 let py = guard.py();
                 let keepalive = guard.into_pyobject(py).unwrap().into_any().unbind();
                 RawTensorAccess {
                     repr: RawTensorRepr::Ref {
                         tensor,
-                        _pin: pin,
+                        _pins: pins,
                         _keepalive: Some(keepalive),
                     },
                 }
             }
             Self::NativeMut(guard) => {
-                let (tensor, pin) = reconstruct(&guard.0, write_pin_access(&guard.0))?;
+                let (tensor, pins) = reconstruct(&guard.0, write_pin_access(&guard.0))?;
                 let py = guard.py();
                 let keepalive = guard.into_pyobject(py).unwrap().into_any().unbind();
                 RawTensorAccess {
                     repr: RawTensorRepr::Mut {
                         tensor,
-                        _pin: pin,
+                        _pins: pins,
                         _keepalive: Some(keepalive),
                     },
                 }
@@ -390,7 +390,7 @@ impl<'py> TensorArg<'py> {
             Self::Foreign { tensor, _keepalive } => RawTensorAccess {
                 repr: RawTensorRepr::Mut {
                     tensor: *tensor,
-                    _pin: None,
+                    _pins: HostPins::new(),
                     _keepalive: Some(_keepalive),
                 },
             },
@@ -406,21 +406,82 @@ pub(crate) fn write_pin_access(tensor: &TensorDyn) -> edgefirst_tensor::CpuAcces
         .union(edgefirst_tensor::CpuAccess::Write)
 }
 
+/// The host pins a reconstructed tensor's planes hold, kept alive as long as
+/// the tensor is used.
+pub(crate) type HostPins = Vec<HostPin<'static>>;
+
 /// Build an independent `TensorDyn` aliasing the same backing memory as
-/// `tensor`. Requests no pin unless the descriptor comes back host-kind with a
-/// null `ptr`, in which case it pins with `access` and returns the pin.
+/// `tensor`. A plane is pinned with `access` only when its descriptor comes
+/// back host-kind with a null `ptr`; the pins are returned.
 ///
-/// Fails with `RuntimeError` for a tensor whose chroma plane is a tensor of
-/// its own, which a descriptor cannot describe.
+/// A tensor whose chroma plane is a tensor of its own is rebuilt plane by
+/// plane and combined with `from_planes` in the source's pixel format, so the
+/// result aliases both planes.
 pub(crate) fn reconstruct(
     tensor: &TensorDyn,
     access: edgefirst_tensor::CpuAccess,
-) -> PyResult<(TensorDyn, Option<HostPin<'static>>)> {
+) -> PyResult<(TensorDyn, HostPins)> {
+    if tensor.is_multiplane() {
+        return reconstruct_planes(tensor, access);
+    }
+    let (imported, pin) = reconstruct_plane(tensor, access, false)?;
+    Ok((imported, pin.into_iter().collect()))
+}
+
+/// Fails with `RuntimeError` for a tensor whose chroma plane is a tensor of
+/// its own, which a decode cannot write.
+#[cfg(feature = "codec")]
+pub(crate) fn refuse_two_plane_decode(tensor: &TensorDyn) -> PyResult<()> {
     if tensor.is_multiplane() {
         return Err(pyo3::exceptions::PyRuntimeError::new_err(
             "this call cannot take a tensor whose chroma plane is a separate tensor",
         ));
     }
+    Ok(())
+}
+
+/// Rebuild each plane of the two-plane `tensor` with [`reconstruct_plane`]
+/// and combine them in its pixel format.
+fn reconstruct_planes(
+    tensor: &TensorDyn,
+    access: edgefirst_tensor::CpuAccess,
+) -> PyResult<(TensorDyn, HostPins)> {
+    let failed = |reason: &dyn std::fmt::Display| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "failed to resolve a tensor whose chroma plane is a separate tensor: {reason}"
+        ))
+    };
+    let format = tensor
+        .format()
+        .ok_or_else(|| failed(&"it has no pixel format"))?;
+    let chroma = tensor
+        .chroma_dyn()
+        .ok_or_else(|| failed(&"its chroma plane cannot be resolved"))?;
+    let (luma, luma_pin) = reconstruct_plane(tensor, access, true)?;
+    let (chroma, chroma_pin) = reconstruct_plane(&chroma, access, true)?;
+    let luma = luma
+        .into_u8()
+        .map_err(|_| failed(&"its luma plane is not u8"))?;
+    let chroma = chroma
+        .into_u8()
+        .map_err(|_| failed(&"its chroma plane is not u8"))?;
+    let mut planes = edgefirst_tensor::Tensor::<u8>::from_planes(luma, chroma, format)
+        .map_err(|e| failed(&e))?;
+    planes.set_colorimetry(tensor.colorimetry());
+    let mut planes = TensorDyn::from(planes);
+    apply_quantization(&mut planes, tensor.quantization().cloned())?;
+    Ok((planes, luma_pin.into_iter().chain(chroma_pin).collect()))
+}
+
+/// Build an independent `TensorDyn` aliasing the backing memory of one plane,
+/// `tensor`, pinning it with `access` when its descriptor comes back host-kind
+/// with a null `ptr`. With `raw` the result carries no pixel format or
+/// colorimetry: a plane of a two-plane image.
+fn reconstruct_plane(
+    tensor: &TensorDyn,
+    access: edgefirst_tensor::CpuAccess,
+    raw: bool,
+) -> PyResult<(TensorDyn, Option<HostPin<'static>>)> {
     let desc = tensor.descriptor_pinned(None);
     let (desc, pin) = if desc.is_host() && desc.ptr.is_null() {
         let pin = tensor.pin_host(access).map_err(|e| {
@@ -433,6 +494,16 @@ pub(crate) fn reconstruct(
         (desc, Some(pin))
     } else {
         (desc, None)
+    };
+    let desc = if raw {
+        TensorDesc {
+            fourcc: 0,
+            format: 0,
+            colorimetry: 0,
+            ..desc
+        }
+    } else {
+        desc
     };
     let mut imported = TensorDyn::import_descriptor(&desc).map_err(|e| {
         pyo3::exceptions::PyRuntimeError::new_err(format!(
@@ -521,8 +592,9 @@ pub(crate) fn publish_colorimetry(
     }
 }
 
-/// Whether [`reconstruct`] can succeed for `tensor`: any tensor but a `Cuda`
-/// one and one whose chroma plane is a tensor of its own.
+/// Whether a call may take `tensor` through [`reconstruct`] with the GIL
+/// released: any tensor but a `Cuda` one and one whose chroma plane is a
+/// tensor of its own.
 pub(crate) fn reconstructible(tensor: &TensorDyn) -> bool {
     !matches!(tensor.memory(), edgefirst_tensor::TensorMemory::Cuda) && !tensor.is_multiplane()
 }
@@ -531,7 +603,7 @@ pub(crate) fn reconstructible(tensor: &TensorDyn) -> bool {
 /// pin and the Python object it was resolved from. Drop it after the tensor.
 #[cfg(feature = "codec")]
 pub struct RawKeepalive {
-    _pin: Option<HostPin<'static>>,
+    _pins: HostPins,
     _keepalive: Option<Py<PyAny>>,
 }
 
@@ -543,14 +615,14 @@ impl RawTensorAccess {
         match self.repr {
             RawTensorRepr::Ref {
                 tensor,
-                _pin,
+                _pins,
                 _keepalive,
             }
             | RawTensorRepr::Mut {
                 tensor,
-                _pin,
+                _pins,
                 _keepalive,
-            } => (tensor, RawKeepalive { _pin, _keepalive }),
+            } => (tensor, RawKeepalive { _pins, _keepalive }),
         }
     }
 }
@@ -727,9 +799,7 @@ mod decoder_interop {
 
 #[cfg(any(feature = "image", feature = "decoder"))]
 mod proto_interop {
-    use super::{
-        Bound, HostPin, Py, PyAny, PyAnyMethods, PyCapsule, PyResult, PyTypeMethods, TensorDyn,
-    };
+    use super::{Bound, Py, PyAny, PyAnyMethods, PyCapsule, PyResult, PyTypeMethods, TensorDyn};
     #[cfg(feature = "decoder")]
     use super::{IntoPyObject, PyRef};
     use edgefirst_tensor::ProtoData;
@@ -824,7 +894,7 @@ mod proto_interop {
     /// into independent values, as in [`super::TensorArg::into_raw_access`].
     pub struct RawProtoDataAccess {
         proto_data: ProtoData,
-        _pins: (Option<HostPin<'static>>, Option<HostPin<'static>>),
+        _pins: (super::HostPins, super::HostPins),
         _keepalive: RawProtoKeepalive,
     }
 
@@ -888,7 +958,7 @@ mod proto_interop {
                     ..
                 } => Ok(RawProtoDataAccess {
                     proto_data: *proto_data,
-                    _pins: (None, None),
+                    _pins: (Vec::new(), Vec::new()),
                     _keepalive: RawProtoKeepalive::Foreign {
                         _mask: mask_keepalive,
                         _protos: protos_keepalive,
