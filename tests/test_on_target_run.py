@@ -75,6 +75,25 @@ exit 97
 """
 
 
+# Stands in for dma-heap-setup.sh on a board whose heap probe cannot allocate.
+DMA_PROBE_FAILS = """\
+echo "HAL_CI_DMA_STATE=unavailable" >> "${GITHUB_ENV}"
+"""
+
+# Stands in for dma-heap-setup.sh on a board whose heap probe allocates.
+DMA_PROBE_ALLOCATES = """\
+echo "HAL_CI_DMA_STATE=required" >> "${GITHUB_ENV}"
+echo "HAL_TEST_REQUIRE_DMA=1" >> "${GITHUB_ENV}"
+"""
+
+# Stands in for a test binary that reports the DMA gate it was given.
+DMA_GATE_BINARY = """\
+echo "running 1 test"
+echo "gate HAL_TEST_REQUIRE_DMA=${HAL_TEST_REQUIRE_DMA:-unset}"
+echo "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out"
+"""
+
+
 def _stub(path, body):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("#!/usr/bin/env bash\n" + body, newline="\n")
@@ -82,14 +101,21 @@ def _stub(path, body):
 
 
 def _run(
-    tmp_path, python3, env=None, with_wheels=True, binary=LIBTEST_BINARY, tools=None
+    tmp_path,
+    python3,
+    env=None,
+    with_wheels=True,
+    binary=LIBTEST_BINARY,
+    tools=None,
+    dma_setup=DMA_PROBE_FAILS,
 ):
-    """Run the runner over a stand-in bundle, with `binary` as its test binary and
-    `tools` ({name: body}) as extra programs on PATH; return (process, results dir)."""
+    """Run the runner over a stand-in bundle, with `binary` as its test binary,
+    `tools` ({name: body}) as extra programs on PATH and `dma_setup` as the DMA
+    heap probe; return (process, results dir)."""
     bundle = tmp_path / "bundle"
     (bundle / "scripts").mkdir(parents=True)
     shutil.copy(RUNNER, bundle / "scripts" / "on-target-run.sh")
-    _stub(bundle / "scripts" / "dma-heap-setup.sh", "exit 0\n")
+    _stub(bundle / "scripts" / "dma-heap-setup.sh", dma_setup)
     _stub(
         bundle / "scripts" / "check-single-home.sh",
         "echo '  PASS  the libraries share one tensor implementation'\n",
@@ -270,3 +296,48 @@ def test_a_core_stays_on_a_board_without_gdb(tmp_path):
     assert len(cores) == 1 and cores[0].startswith("core."), cores
     report = _crash_report(results)
     assert f"{cores[0]} left on the board; no gdb to read it" in report, report
+
+
+def _dma_gate(results):
+    log = (results / "edgefirst_fake-0123456789abcdef.log").read_text()
+    return next(line for line in log.splitlines() if line.startswith("gate "))
+
+
+def test_a_required_dma_heap_that_cannot_allocate_fails_the_run(tmp_path):
+    proc, results = _run(
+        tmp_path,
+        NO_PYTHON,
+        env={"HAL_ONTARGET_REQUIRE_DMA": "1"},
+        binary=DMA_GATE_BINARY,
+    )
+
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    result, detail = _summary_txt(results)
+    assert result == "NO-DMA"
+    assert "dma unavailable" in detail
+    summary = json.loads((results / "summary.json").read_text())
+    assert summary["result"] == "NO-DMA"
+    assert not (results / "edgefirst_fake-0123456789abcdef.log").exists()
+
+
+def test_an_unrequired_dma_heap_that_cannot_allocate_lets_dma_tests_skip(tmp_path):
+    proc, results = _run(tmp_path, NO_PYTHON, binary=DMA_GATE_BINARY)
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert _summary_txt(results)[0] == "PASS"
+    assert _dma_gate(results) == "gate HAL_TEST_REQUIRE_DMA=unset"
+
+
+@pytest.mark.parametrize("required", ["0", "1"])
+def test_a_dma_heap_that_allocates_requires_the_dma_tests(tmp_path, required):
+    proc, results = _run(
+        tmp_path,
+        NO_PYTHON,
+        env={"HAL_ONTARGET_REQUIRE_DMA": required},
+        binary=DMA_GATE_BINARY,
+        dma_setup=DMA_PROBE_ALLOCATES,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert _summary_txt(results)[0] == "PASS"
+    assert _dma_gate(results) == "gate HAL_TEST_REQUIRE_DMA=1"

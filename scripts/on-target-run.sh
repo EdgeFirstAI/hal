@@ -18,6 +18,9 @@
 #                               summary.json for the fleet roll-up
 #   HAL_ONTARGET_REQUIRE_GPU    1 to fail, as NO-GPU, on a board without a
 #                               DRM render node
+#   HAL_ONTARGET_REQUIRE_DMA    1 to fail, as NO-DMA, on a board whose DMA
+#                               heap probe cannot allocate, and to set
+#                               HAL_TEST_REQUIRE_DMA=1 for every test
 #   HAL_ONTARGET_TEST_THREADS   test threads per binary; unset uses libtest's
 #                               default, one per CPU
 #   HAL_ONTARGET_GDB            1 to run each test binary under `gdb -batch`,
@@ -35,7 +38,7 @@
 # render node, HAL_TEST_REQUIRE_G2D with libg2d.so.2 (HAL_TEST_SKIP_G2D
 # instead on i.MX 95), EDGEFIRST_SKIP_VIVANTE_KNOWN_BUGS with /dev/galcore,
 # and HAL_TEST_REQUIRE_DMA when dma-heap-setup.sh's probe allocation
-# succeeds.
+# succeeds or HAL_ONTARGET_REQUIRE_DMA=1.
 #
 # Writes one log per binary, check-single-home.log,
 # test_two_library_user.log, test_codec_api.log, python-codec.log,
@@ -45,7 +48,8 @@
 # <binary>.crash.txt, with the signal and whatever backtrace coredumpctl or a
 # core file and gdb can give. A binary that hangs under gdb gets
 # <binary>.crash.txt with each thread's name, wait channel and kernel stack and
-# the last kernel messages. Exits 0 on PASS, 1 on FAIL, NO-TESTS or NO-GPU.
+# the last kernel messages. Exits 0 on PASS, 1 on FAIL, NO-TESTS, NO-GPU or
+# NO-DMA.
 #
 # Needs bash and the POSIX tools (awk, grep, sed, sort). python3 is used for
 # the Python codec tests only, and only its standard library.
@@ -56,6 +60,7 @@ BUNDLE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RESULTS="${1:?usage: $0 <results-dir>}"
 FILTER="${FILTER:-}"
 REQUIRE_GPU="${HAL_ONTARGET_REQUIRE_GPU:-0}"
+REQUIRE_DMA="${HAL_ONTARGET_REQUIRE_DMA:-0}"
 THREADS_ARG=()
 [[ -n "${HAL_ONTARGET_TEST_THREADS:-}" ]] && THREADS_ARG=(--test-threads="${HAL_ONTARGET_TEST_THREADS}")
 
@@ -172,7 +177,11 @@ dma_env="$(mktemp)"
 GITHUB_ENV="${dma_env}" GITHUB_STEP_SUMMARY="" bash scripts/dma-heap-setup.sh \
   > "${RESULTS}/dma-heap-setup.log" 2>&1
 dma_state="$(sed -n 's/^HAL_CI_DMA_STATE=//p' "${dma_env}" | tail -n 1)"
-grep -q '^HAL_TEST_REQUIRE_DMA=1$' "${dma_env}" && extra_env+=(HAL_TEST_REQUIRE_DMA=1)
+dma_allocated=no
+grep -q '^HAL_TEST_REQUIRE_DMA=1$' "${dma_env}" && dma_allocated=yes
+if [[ "${REQUIRE_DMA}" == "1" || "${dma_allocated}" == yes ]]; then
+  extra_env+=(HAL_TEST_REQUIRE_DMA=1)
+fi
 rm -f "${dma_env}"
 echo "    gates: ${extra_env[*]:-none} (dma ${dma_state:-unknown})"
 
@@ -236,6 +245,11 @@ write_summary() {
 if [[ "${REQUIRE_GPU}" == "1" && "${render}" -eq 0 ]]; then
   echo "     NO-GPU: no DRM render node, so every GPU test would skip"
   write_summary NO-GPU "no DRM render node (/dev/dri/renderD*); GPU tests cannot run"
+  exit 1
+fi
+if [[ "${REQUIRE_DMA}" == "1" && "${dma_allocated}" != yes ]]; then
+  echo "     NO-DMA: the DMA heap probe did not allocate (dma ${dma_state:-unknown}); see dma-heap-setup.log"
+  write_summary NO-DMA "the DMA heap probe did not allocate (dma ${dma_state:-unknown}); DMA tests cannot run"
   exit 1
 fi
 

@@ -11,7 +11,11 @@
 #   summary  one table naming the runner each entry ran on; red if any failed
 #
 # Board entries are runner labels, `+` joining labels one runner must all
-# carry (`imx95-frdm+ara240`). The default is one EVK per SoC.
+# carry (`imx95-frdm+ara240`). The default is one EVK per SoC. Every entry is
+# listed in BOARD_DMA below with whether its DMA heap must allocate: 1 fails
+# the entry as NO-DMA when the heap probe cannot allocate, and fails every DMA
+# test that would skip; 0 arms the DMA tests only when the probe allocates. An
+# entry missing from BOARD_DMA fails the plan job.
 #
 # The runner check reads FLEET_RUNNERS_TOKEN, an organisation secret with
 # "Self-hosted runners: read". Without it every entry is scheduled.
@@ -53,6 +57,15 @@ on:
 permissions:
   contents: read
 
+env:
+  # `<board entry>=<1|0>`: whether the entry's DMA heap must allocate.
+  BOARD_DMA: |
+    imx8mp-evk=1
+    imx95-evk=1
+    rpi5=1
+    iq9075-evk=1
+    orin-nano=0
+
 jobs:
   plan:
     name: Plan
@@ -68,6 +81,25 @@ jobs:
         with:
           boards: ${{ inputs.boards }}
           token: ${{ secrets.FLEET_RUNNERS_TOKEN }}
+
+      - name: Check each board entry's DMA expectation
+        env:
+          MATRIX: ${{ steps.boards.outputs.board_matrix }}
+        run: |
+          python3 - <<'PY'
+          import json, os, sys
+          listed = {
+              line.split("=", 1)[0].strip()
+              for line in os.environ["BOARD_DMA"].splitlines()
+              if "=" in line
+          }
+          entries = [e["runner"] for e in json.loads(os.environ["MATRIX"] or "[]")]
+          missing = [e for e in entries if e not in listed]
+          if missing:
+              print("::error::board entries with no DMA expectation in BOARD_DMA "
+                    f"(hardware-test.yml): {', '.join(missing)}")
+              sys.exit(1)
+          PY
 
   # Builds the edgefirst-tensor and edgefirst-codec wheels natively on aarch64
   # with abi3-py311, and downloads pytest with its pure-Python dependencies and
@@ -232,7 +264,11 @@ jobs:
           HAL_ONTARGET_REQUIRE_GPU: ${{ inputs.require-gpu && '1' || '0' }}
           HAL_ONTARGET_GDB: ${{ inputs.gdb && '1' || '0' }}
           HAL_BOARD_ENTRY: ${{ matrix.runner }}
-        run: hal-bundle/scripts/on-target-run.sh "$GITHUB_WORKSPACE/hal-results"
+        run: |
+          require_dma="$(awk -F= -v entry="${HAL_BOARD_ENTRY}" \
+            '{ gsub(/[[:space:]]/, "") } $1 == entry { print $2 }' <<< "${BOARD_DMA}")"
+          HAL_ONTARGET_REQUIRE_DMA="${require_dma}" \
+            hal-bundle/scripts/on-target-run.sh "$GITHUB_WORKSPACE/hal-results"
 
       - name: Upload results
         if: always()

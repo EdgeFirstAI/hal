@@ -399,6 +399,8 @@ A DMA test that finds no usable heap skips and reports `ok`, so a lane that lost
 
 CI sets it through `.github/scripts/dma-heap-setup.sh`, which opens `/dev/dma_heap/system` to the job user (`sudo chmod a+rw` where it can), allocates and maps one page through the heap ioctl, and exports `HAL_TEST_REQUIRE_DMA=1` only when that probe succeeds. The step summary says which: `DMA: required (system heap, host-coherent)` or `DMA: unavailable — DMA tests skipped (<reason>)`. It runs on the Linux mutation legs and, through `.github/scripts/ci-setup.sh`, on the hosted Linux Quick/Full lanes and the board pre-command.
 
+Arming the gate from the probe means a host whose heap stops allocating, for example after a BSP update, skips its DMA tests with a warning and stays green. On boards that must have a working heap, `scripts/on-target-run.sh` takes `HAL_ONTARGET_REQUIRE_DMA=1` (`REQUIRE_DMA=1` through `scripts/on-target-test.sh`). It then sets `HAL_TEST_REQUIRE_DMA=1` for every test whatever the probe found, and fails the run up front as `NO-DMA` when the probe cannot allocate. `hardware-test.yml` sets it per board entry from its `BOARD_DMA` table. The hosted lanes, the mutation legs and the CI board lane keep the probe-armed behaviour.
+
 The V4L2 capture-import tests (`crates/tensor/tests/vivid_capture_import.rs`) need the kernel's virtual capture driver, vivid. `.github/scripts/vivid-setup.sh`, also run from `ci-setup.sh`, installs `linux-modules-extra` for the hosted runner's kernel, loads vivid, opens its nodes and exports `HAL_TEST_REQUIRE_VIVID=1` only when they appear. When the archive has no modules package for the runner's kernel the tests skip and the step summary says why. It does nothing on boards and other self-hosted machines. Locally: `sudo modprobe vivid n_devs=2 node_types=0x1,0x1 multiplanar=1,2`.
 
 A hosted-runner pass is **not** hardware validation. That heap is cached, cache-coherent system memory with no `/dev/dri` behind it, so it proves the DMA code paths run but says nothing about coherency (a missing end-of-access sync), CMA contiguity or GPU import. Only the board lanes cover those.
@@ -568,7 +570,8 @@ Use environment variables to isolate tests to specific backends:
 | Variable | Effect |
 |----------|--------|
 | `EDGEFIRST_TENSOR_FORCE_MEM=1` | Force heap (`MemTensor`) allocation; skips DMA-heap and shared memory |
-| `HAL_TEST_REQUIRE_DMA=1` | Fail, rather than skip, any DMA test that finds no usable heap. See [CI guard against silent DMA skips](#ci-guard-against-silent-dma-skips) |
+| `HAL_TEST_REQUIRE_DMA=1` | Fail, rather than skip, any DMA test that finds no usable heap. Set by the DMA heap probe when it allocates, and on a board by `HAL_ONTARGET_REQUIRE_DMA=1`. See [CI guard against silent DMA skips](#ci-guard-against-silent-dma-skips) |
+| `HAL_ONTARGET_REQUIRE_DMA=1` | On a board, `scripts/on-target-run.sh` sets `HAL_TEST_REQUIRE_DMA=1` whatever the heap probe found, and fails the run as `NO-DMA` when the probe cannot allocate. See [CI guard against silent DMA skips](#ci-guard-against-silent-dma-skips) |
 | `HAL_TEST_REQUIRE_VIVID=1` | Fail, rather than skip, the vivid capture-import tests when no vivid node is found. See [CI guard against silent DMA skips](#ci-guard-against-silent-dma-skips) |
 | `EDGEFIRST_FORCE_BACKEND=cpu` | Force CPU-only image processing |
 | `EDGEFIRST_FORCE_BACKEND=opengl` | Force OpenGL backend |
@@ -723,11 +726,14 @@ A few details worth knowing:
   `.github/scripts/dma-heap-setup.sh` allocates from the DMA heap, so a GL
   stack or heap that should work and does not fails the run instead of
   skipping. `REQUIRE_GPU=1` also fails a host with no render node at all, as
-  `NO-GPU`, where every GPU test would otherwise skip.
+  `NO-GPU`, where every GPU test would otherwise skip. `REQUIRE_DMA=1` does the
+  same for the DMA heap: it arms `HAL_TEST_REQUIRE_DMA=1` whatever the probe
+  found and fails a host whose probe cannot allocate as `NO-DMA`. Without it,
+  a host whose heap does not allocate skips its DMA tests with a warning.
 - **The DMA-BUF and G2D suites always build.** They probe for the hardware at
   run time and report `SKIPPED` without it; on a board the require gates turn
   that skip into a failure: `HAL_TEST_REQUIRE_DMA=1` when the DMA heap
-  allocates, `HAL_TEST_REQUIRE_G2D=1` when `libg2d.so.2` is installed. Both are
+  allocates or `REQUIRE_DMA=1` is set, `HAL_TEST_REQUIRE_G2D=1` when `libg2d.so.2` is installed. Both are
   armed automatically by `scripts/on-target-run.sh` and the CI board lane. On
   i.MX 95 they arm `HAL_TEST_SKIP_G2D=1` instead: its `libg2d.so.2` loads, but
   G2D is not supported there, so the G2D suites skip.
@@ -741,7 +747,7 @@ A few details worth knowing:
 Two `workflow_dispatch` workflows run on the self-hosted board fleet, one
 job per board entry:
 
-- [`hardware-test.yml`](https://github.com/EdgeFirstAI/hal/blob/main/.github/workflows/hardware-test.yml) — the whole on-target suite plus the C-API gates, with the DMA/G2D require gates armed from what each board has and `require-gpu` failing a board that has no render node.
+- [`hardware-test.yml`](https://github.com/EdgeFirstAI/hal/blob/main/.github/workflows/hardware-test.yml) — the whole on-target suite plus the C-API gates, with the G2D require gate armed from what each board has, `require-gpu` failing a board that has no render node, and the DMA gate set per board entry by the workflow's `BOARD_DMA` table: an entry marked `1` must have a heap that allocates or fails as `NO-DMA`, an entry marked `0` (orin-nano, which has no DMA heap) arms the gate only when its probe allocates. An entry missing from the table fails the plan job, so a new board entry needs a line there.
 - [`hardware-bench.yml`](https://github.com/EdgeFirstAI/hal/blob/main/.github/workflows/hardware-bench.yml) — every benchmark case of [`scripts/on-target-bench.sh`](https://github.com/EdgeFirstAI/hal/blob/main/scripts/on-target-bench.sh); see [BENCHMARKS.md § Running Benchmarks](https://github.com/EdgeFirstAI/hal/blob/main/BENCHMARKS.md#running-benchmarks).
 
 A board entry is a runner label, or labels joined by `+` that one runner must
