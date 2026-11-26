@@ -430,6 +430,12 @@ pub(crate) fn wait_completion_fence(fence: crate::CompletionFence) {
         // SAFETY: `pfd` names a descriptor `fence` keeps open for the call.
         let ready = unsafe { libc::poll(&mut pfd, 1, 5000) };
         assert_eq!(ready, 1, "the fence did not signal within 5 seconds");
+        assert_eq!(
+            pfd.revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP | libc::POLLNVAL),
+            libc::POLLIN,
+            "the fence descriptor polled as {:#x}, not readable",
+            pfd.revents
+        );
     }
     #[cfg(windows)]
     {
