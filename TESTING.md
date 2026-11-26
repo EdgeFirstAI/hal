@@ -1312,7 +1312,7 @@ explicit probe, not a `#[ignore]` attribute.
 
 The `software-gl-coverage` lane exists because no hosted runner has a
 GPU. Mesa llvmpipe runs the same GL paths with
-`EDGEFIRST_ALLOW_SOFTWARE_GL=1`. On x86_64 Linux it is the one lane that runs `edgefirst-image`: the `ci` nextest profile leaves the crate out of the Full linux lane there.
+`EDGEFIRST_ALLOW_SOFTWARE_GL=1`, and sets `HAL_TEST_REQUIRE_GL=1`, so the lane fails when GL cannot initialise. On x86_64 Linux it is the one lane that runs `edgefirst-image`: the `ci` nextest profile leaves the crate out of the Full linux lane there.
 
 ## Android On-Device Validation (Device Farm)
 
