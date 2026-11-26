@@ -81,8 +81,11 @@ def _stub(path, body):
     path.chmod(0o755)
 
 
-def _run(tmp_path, python3, env=None, with_wheels=True):
-    """Run the runner over a stand-in bundle; return (process, results dir)."""
+def _run(
+    tmp_path, python3, env=None, with_wheels=True, binary=LIBTEST_BINARY, tools=None
+):
+    """Run the runner over a stand-in bundle, with `binary` as its test binary and
+    `tools` ({name: body}) as extra programs on PATH; return (process, results dir)."""
     bundle = tmp_path / "bundle"
     (bundle / "scripts").mkdir(parents=True)
     shutil.copy(RUNNER, bundle / "scripts" / "on-target-run.sh")
@@ -91,7 +94,7 @@ def _run(tmp_path, python3, env=None, with_wheels=True):
         bundle / "scripts" / "check-single-home.sh",
         "echo '  PASS  the libraries share one tensor implementation'\n",
     )
-    _stub(bundle / "bin" / "edgefirst_fake-0123456789abcdef", LIBTEST_BINARY)
+    _stub(bundle / "bin" / "edgefirst_fake-0123456789abcdef", binary)
     _stub(bundle / "target" / "debug" / "test_two_library_user", "exit 0\n")
     _stub(bundle / "target" / "debug" / "test_codec_api", CODEC_C_PROGRAM)
     if with_wheels:
@@ -100,13 +103,15 @@ def _run(tmp_path, python3, env=None, with_wheels=True):
     (bundle / "MANIFEST").write_text(
         "".join(f"{k}={v}\n" for k, v in MANIFEST.items()), newline="\n"
     )
-    tools = tmp_path / "tools"
-    _stub(tools / "python3", python3)
+    tools_dir = tmp_path / "tools"
+    _stub(tools_dir / "python3", python3)
+    for name, body in (tools or {}).items():
+        _stub(tools_dir / name, body)
 
     results = tmp_path / "results"
     run_env = {
         **os.environ,
-        "PATH": f"{tools}{os.pathsep}{os.environ['PATH']}",
+        "PATH": f"{tools_dir}{os.pathsep}{os.environ['PATH']}",
         "FILTER": "",
         "HAL_ONTARGET_REQUIRE_GPU": "0",
         "HAL_BOARD_ENTRY": "imx95-evk",
@@ -210,3 +215,58 @@ def test_summary_json_survives_quotes_and_backslashes(tmp_path):
     assert summary["entry"] == 'imx95-frdm+"ara240"'
     assert summary["runner"] == "lab\\imx95\tfrdm"
     assert summary["bundle"] == MANIFEST
+
+
+# Stands in for a test binary that leaves a core file in the bundle and is
+# killed by SIGSEGV.
+CRASHING_BINARY = """\
+echo 'running 1 test'
+: > "core.$$"
+kill -SEGV $$
+"""
+
+# Answers at once, as coredumpctl does for a dump it has recorded.
+COREDUMPCTL = "echo 'PID: stand-in dump'\n"
+
+
+def _bundle_cores(tmp_path):
+    return sorted(p.name for p in (tmp_path / "bundle").glob("core*"))
+
+
+def _crash_report(results):
+    reports = list(results.glob("*.crash.txt"))
+    assert len(reports) == 1, reports
+    return reports[0].read_text()
+
+
+def test_a_core_is_removed_once_gdb_has_read_it(tmp_path):
+    proc, results = _run(
+        tmp_path,
+        NO_PYTHON,
+        binary=CRASHING_BINARY,
+        tools={"gdb": 'echo "backtrace read from $8"\n', "coredumpctl": COREDUMPCTL},
+    )
+
+    assert _summary_txt(results)[0] == "FAIL", proc.stdout + proc.stderr
+    report = _crash_report(results)
+    assert "backtrace read from core." in report, report
+    assert _bundle_cores(tmp_path) == []
+
+
+@pytest.mark.skipif(
+    shutil.which("gdb") is not None,
+    reason="gdb is installed, so the runner reads the core",
+)
+def test_a_core_stays_on_a_board_without_gdb(tmp_path):
+    proc, results = _run(
+        tmp_path,
+        NO_PYTHON,
+        binary=CRASHING_BINARY,
+        tools={"coredumpctl": COREDUMPCTL},
+    )
+
+    assert _summary_txt(results)[0] == "FAIL", proc.stdout + proc.stderr
+    cores = _bundle_cores(tmp_path)
+    assert len(cores) == 1 and cores[0].startswith("core."), cores
+    report = _crash_report(results)
+    assert f"{cores[0]} left on the board; no gdb to read it" in report, report

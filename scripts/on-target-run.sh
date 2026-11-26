@@ -113,10 +113,10 @@ collect_crash() {
     if [[ "${have_gdb}" == yes ]]; then
       gdb -q -batch -ex "thread apply all bt" -ex "info sharedlibrary" "${bin}" "${core}" \
         >> "${out}" 2>&1
+      rm -f "${core}"
     else
-      echo "core file ${core} left on the board; no gdb to read it" >> "${out}"
+      echo "core file ${BUNDLE}/${core} left on the board; no gdb to read it" >> "${out}"
     fi
-    rm -f "${core}"
     break
   done
 }
