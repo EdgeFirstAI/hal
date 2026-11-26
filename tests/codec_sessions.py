@@ -13,6 +13,7 @@ opens them, and frees them when the ``with`` block ends.
 from __future__ import annotations
 
 import contextlib
+import errno
 import os
 import random
 import sys
@@ -20,6 +21,12 @@ import tempfile
 import time
 
 SLOTS = 4
+
+_HELD = (
+    {errno.EACCES, errno.EDEADLK}
+    if sys.platform == "win32"
+    else {errno.EWOULDBLOCK, errno.EAGAIN}
+)
 
 
 def _temp_dir() -> str:
@@ -34,7 +41,7 @@ def _slot_path(index: int) -> str:
 
 def _try_lock(path: str):
     """The open slot file at ``path``, locked, or ``None`` when another holder
-    has it."""
+    has it. Any other locking failure raises."""
     f = open(path, "a+b")  # noqa: SIM115
     try:
         if sys.platform == "win32":
@@ -46,9 +53,11 @@ def _try_lock(path: str):
             import fcntl
 
             fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
+    except OSError as e:
         f.close()
-        return None
+        if e.errno in _HELD:
+            return None
+        raise
     return f
 
 
