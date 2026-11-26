@@ -56,7 +56,7 @@ def test_another_package_refuses_a_two_plane_tensor(layout):
     images, _keep = two_plane_images()
     src = images[layout]
     with pytest.raises(NotImplementedError, match=REFUSED):
-        codec.ImageEncoder(codec.Codec.Jpeg).encode(src)
+        codec.ImageEncoder(codec.Codec.Jpeg, engine=codec.Engine.Cpu).encode(src)
     jpeg = (TESTDATA / "zidane.jpg").read_bytes()
     with pytest.raises(NotImplementedError, match=REFUSED):
         codec.decode_into(src, jpeg)
@@ -68,7 +68,10 @@ def test_a_one_plane_tensor_still_crosses():
 
     src = Tensor.image(W, H, PixelFormat.Nv12, None, "readwrite")
     assert src.__edgefirst_tensor__() is not None
-    assert len(codec.ImageEncoder(codec.Codec.Jpeg).encode(src)) > 0
+    assert (
+        len(codec.ImageEncoder(codec.Codec.Jpeg, engine=codec.Engine.Cpu).encode(src))
+        > 0
+    )
 
 
 @linux_only
