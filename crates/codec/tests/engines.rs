@@ -40,6 +40,11 @@ fn video_engine() -> Option<Engine> {
         Some(Engine::V4l2)
     } else if cfg!(all(windows, feature = "media-foundation")) {
         Some(Engine::MediaFoundation)
+    } else if cfg!(all(
+        any(target_os = "macos", target_os = "ios"),
+        feature = "videotoolbox"
+    )) {
+        Some(Engine::VideoToolbox)
     } else {
         None
     }
@@ -72,8 +77,12 @@ fn video_capabilities_are_the_platform_engine() {
     for c in video.iter().filter(|c| c.direction == Direction::Decode) {
         assert!(c.formats.contains(&PixelFormat::Nv12), "{c:?}");
     }
-    // Media Foundation has no MJPEG encoder, so it lists none and refuses.
-    if video_engine() == Some(Engine::MediaFoundation) {
+    // Media Foundation and VideoToolbox have no MJPEG encoder, so they list
+    // none and refuse.
+    if matches!(
+        video_engine(),
+        Some(Engine::MediaFoundation | Engine::VideoToolbox)
+    ) {
         assert!(!video
             .iter()
             .any(|c| c.codec == Codec::Mjpeg && c.direction == Direction::Encode));
@@ -115,8 +124,27 @@ fn engines_that_cannot_run_a_video_codec_are_refused() {
     };
     let e = encoder(Engine::Cpu, Codec::H264);
     assert!(is_codec_refusal(&e, Codec::H264, Engine::Cpu), "{e}");
-    let e = encoder(Engine::VideoToolbox, Codec::H264);
-    assert!(matches!(e, CodecError::NoDevice(_)), "{e}");
+    let vt = VideoEncoder::new(
+        EncoderConfig::h264(640, 480, PixelFormat::Nv12, 30.0).with_engine(Engine::VideoToolbox),
+    );
+    if video_engine() == Some(Engine::VideoToolbox) {
+        match vt {
+            Ok(e) => {
+                let info = e.info();
+                eprintln!(
+                    "engines_that_cannot_run_a_video_codec_are_refused: {} hardware {}",
+                    info.device, info.hardware
+                );
+            }
+            Err(CodecError::NoDevice(why)) if !edgefirst_tensor::is_gpu_buffer_available() => {
+                skip("engines_that_cannot_run_a_video_codec_are_refused", &why)
+            }
+            Err(e) => panic!("{e}"),
+        }
+    } else {
+        let e = vt.map(|_| ()).unwrap_err();
+        assert!(matches!(e, CodecError::NoDevice(_)), "{e}");
+    }
     let e = encoder(Engine::Auto, Codec::Jpeg);
     match video_engine() {
         Some(_) => assert!(is_codec_refusal(&e, Codec::Jpeg, Engine::Auto), "{e}"),
@@ -157,6 +185,7 @@ fn an_encoder_reports_its_engine_and_how_sources_reach_it() {
         Err(e) => panic!("{e}"),
     };
     let info = encoder.info();
+    eprintln!("{TEST}: {} hardware {}", info.device, info.hardware);
     assert_eq!(Some(info.engine), video_engine());
     assert!(!info.device.is_empty());
     let src = TensorDyn::image(
@@ -188,6 +217,7 @@ fn an_encoder_reports_its_engine_and_how_sources_reach_it() {
             assert_ne!(after.transfer, Transfer::CpuCopy, "{after:?}")
         }
         Engine::MediaFoundation => assert_eq!(after.transfer, Transfer::CpuCopy),
+        Engine::VideoToolbox => assert_eq!(after.transfer, Transfer::CpuCopy),
         other => panic!("unexpected engine {other}"),
     }
 }
@@ -223,5 +253,15 @@ fn an_image_decoder_on_an_explicit_engine_decodes_or_refuses() {
     }
     decoder.set_engine(Engine::VideoToolbox);
     let e = decoder.decode_into_dyn(&jpeg, &mut dst).unwrap_err();
-    assert!(matches!(e, CodecError::NoDevice(_)), "{e}");
+    if cfg!(all(
+        any(target_os = "macos", target_os = "ios"),
+        feature = "videotoolbox"
+    )) {
+        assert!(
+            is_codec_refusal(&e, Codec::Jpeg, Engine::VideoToolbox),
+            "{e}"
+        );
+    } else {
+        assert!(matches!(e, CodecError::NoDevice(_)), "{e}");
+    }
 }

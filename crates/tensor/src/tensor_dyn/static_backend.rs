@@ -1214,10 +1214,26 @@ impl TensorDyn {
     /// Wraps an image IOSurface, reading its pixel format and planes.
     ///
     /// `420v` and `420f` give NV12 as a multiplane tensor: luma and chroma
-    /// each wrap `surface` at their plane's offset and row stride. `yuvs` gives
-    /// YUYV and `BGRA` gives BGRA, as one tensor at the surface's row stride.
+    /// each wrap `surface` at their plane's offset and row stride. `yuvs` and
+    /// `yuvf` give YUYV and `BGRA` gives BGRA, as one tensor at the surface's
+    /// row stride.
     /// The surface is retained for the tensor's lifetime. Colorimetry is not
     /// set.
+    ///
+    /// A wrapped surface passed to
+    /// `edgefirst_codec::video::VideoEncoder::encode` follows that function's
+    /// rule.
+    ///
+    /// On macOS and iOS, a source whose IOSurface is a CoreVideo `420v`, `420f`,
+    /// `yuvs` or `yuvf` surface of the configured size, with the row stride of
+    /// each surface plane and encoded without a crop, may be read in place;
+    /// `EncoderInfo::transfer` reports the route. Its IOSurface may stay in use
+    /// (`IOSurfaceIsInUse` is true) after `encode()` returns, until its frame
+    /// leaves the encoder (its access unit is returned, it is dropped, or
+    /// `flush()` returns). CoreVideo pixel buffer pools do not hand out a
+    /// surface while it is in use. Any other pool or writer must not reuse or
+    /// write a surface while `IOSurfaceIsInUse` is true. Other sources are
+    /// copied, and the caller may reuse them once `encode()` returns.
     ///
     /// # Errors
     ///

@@ -42,13 +42,39 @@ fn open(test: &str, config: EncoderConfig) -> Option<VideoEncoder> {
         return None;
     }
     match VideoEncoder::new(config) {
-        Ok(e) => Some(e),
+        Ok(e) => {
+            log_hardware(test, &e);
+            Some(e)
+        }
         Err(CodecError::NoDevice(why)) => {
             skip(test, &why);
             None
         }
         Err(e) => panic!("encoder open failed: {e}"),
     }
+}
+
+/// Encodes `src`. On VideoToolbox, submits it again while the encoder
+/// refuses it with [`CodecError::Timeout`].
+fn encode(
+    enc: &mut VideoEncoder,
+    src: &TensorDyn,
+    opts: &FrameOptions,
+) -> Result<Option<EncodedFrame>, CodecError> {
+    let vt = enc.info().engine == Engine::VideoToolbox;
+    encode_retry::retry(
+        || enc.encode(src, opts),
+        |e| vt && matches!(e, CodecError::Timeout(_)),
+    )
+}
+
+#[path = "support/encode_retry.rs"]
+mod encode_retry;
+
+/// Prints which encoder runs `test`, and whether it is hardware.
+fn log_hardware(test: &str, e: &VideoEncoder) {
+    let info = e.info();
+    eprintln!("{test}: {} hardware {}", info.device, info.hardware);
 }
 
 /// Decodes `stream` and returns the dense NV12 bytes of its first picture,
@@ -118,7 +144,10 @@ fn the_stream_carries_the_requested_profile_and_level() {
         config.profile = Some(profile);
         config.level = Some(H264Level::L4_0);
         let mut enc = match VideoEncoder::new(config) {
-            Ok(e) => e,
+            Ok(e) => {
+                log_hardware(TEST, &e);
+                e
+            }
             Err(CodecError::NoDevice(why)) => return skip(TEST, &why),
             Err(CodecError::InvalidConfig(why)) => {
                 skip(TEST, &format!("{profile:?}: {why}"));
@@ -173,7 +202,7 @@ fn encodes_1080p_nv12_at_30_fps_with_forced_keyframe_and_drain() {
             ..FrameOptions::default()
         };
         let t = Instant::now();
-        let au = enc.encode(&src, &opts).unwrap();
+        let au = encode(&mut enc, &src, &opts).unwrap();
         busy += t.elapsed();
         out.extend(au);
     }
@@ -233,7 +262,7 @@ fn encodes_a_crop_of_a_larger_source() {
             crop: Some(crop),
             ..FrameOptions::default()
         };
-        out.extend(enc.encode(&src, &opts).unwrap());
+        out.extend(encode(&mut enc, &src, &opts).unwrap());
     }
     out.extend(enc.flush().unwrap());
     save("nv12_crop_720p", &out, &first);
@@ -268,7 +297,7 @@ fn a_copied_crop_decodes_to_the_source_region() {
             crop: Some(crop),
             ..FrameOptions::default()
         };
-        out.extend(enc.encode(&src, &opts).unwrap());
+        out.extend(encode(&mut enc, &src, &opts).unwrap());
     }
     out.extend(enc.flush().unwrap());
     assert_eq!(out.len(), 5);
@@ -304,7 +333,7 @@ fn a_source_from_create_source_is_read_in_place() {
             pts: i,
             ..FrameOptions::default()
         };
-        out.extend(enc.encode(&src, &opts).unwrap());
+        out.extend(encode(&mut enc, &src, &opts).unwrap());
         if enc.info().engine == Engine::V4l2 {
             assert_eq!(enc.info().transfer, Transfer::ZeroCopy, "frame {i}");
         }
@@ -347,7 +376,7 @@ fn encodes_a_host_memory_source_where_the_encoder_copies() {
             pts: i as u64,
             ..FrameOptions::default()
         };
-        out.extend(enc.encode(&src, &opts).unwrap());
+        out.extend(encode(&mut enc, &src, &opts).unwrap());
     }
     out.extend(enc.flush().unwrap());
     assert_eq!(out.len(), 10);

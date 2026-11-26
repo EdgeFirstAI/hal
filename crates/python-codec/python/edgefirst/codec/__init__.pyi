@@ -327,7 +327,7 @@ class Engine(enum.Enum):
     MediaFoundation: Engine
     """Windows Media Foundation transforms."""
     VideoToolbox: Engine
-    """Apple VideoToolbox. No backend runs it."""
+    """Apple VideoToolbox, on macOS and iOS."""
     NvJpeg: Engine
     """NVIDIA nvJPEG (JPEG decoding on Linux)."""
     Cpu: Engine

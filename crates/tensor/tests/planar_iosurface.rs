@@ -13,6 +13,7 @@ type CFTypeRef = *const c_void;
 const FMT_420V: u32 = u32::from_be_bytes(*b"420v");
 const FMT_420F: u32 = u32::from_be_bytes(*b"420f");
 const FMT_YUVS: u32 = u32::from_be_bytes(*b"yuvs");
+const FMT_YUVF: u32 = u32::from_be_bytes(*b"yuvf");
 const FMT_2VUY: u32 = u32::from_be_bytes(*b"2vuy");
 
 #[repr(C)]
@@ -255,6 +256,18 @@ fn a_yuvs_buffer_wraps_as_one_yuyv_tensor() {
     assert_eq!(t.width(), Some(640));
     assert_eq!(t.height(), Some(480));
     assert_eq!(t.effective_row_stride(), Some(1280));
+}
+
+#[test]
+fn a_yuvf_buffer_wraps_as_one_yuyv_tensor() {
+    let buf = CoreVideoBuffer::new(640, 480, FMT_YUVF);
+    let t = wrap(buf.surface()).expect("wrap");
+    assert_eq!(t.format(), Some(PixelFormat::Yuyv));
+    assert!(!t.is_multiplane());
+    assert_eq!(t.width(), Some(640));
+    assert_eq!(t.height(), Some(480));
+    assert_eq!(t.effective_row_stride(), Some(1280));
+    assert_eq!(t.colorimetry(), None);
 }
 
 #[test]

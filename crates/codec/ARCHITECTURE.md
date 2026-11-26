@@ -117,8 +117,9 @@ V4L2 access goes through the [`edgefirst-v4l2`](https://github.com/EdgeFirstAI/v
 | Module          | Purpose                                              |
 |-----------------|------------------------------------------------------|
 | `mod.rs`        | `VideoEncoder`, `EncoderConfig` and its H.264 profile, level and bitrate types, `FrameOptions`, `EncodedFrame`, the `EncoderBackend` seam; `VideoDecoder`, `DecoderConfig`, `OutputPool`, `StreamInfo`, `DecodeEvent`, `DecodedFrame` (returns its buffer on drop), the `DecoderBackend` seam |
-| `h264.rs`       | Annex B framing: NAL unit types, SPS/PPS extraction, `AccessUnit` classification (IDR, parameter sets, trailing NAL units that belong to the previous access unit), `access_units()` splitting |
-| `copy.rs`       | Plane geometry and strided copies of NV12 and packed pictures, shared by the V4L2 and Media Foundation encoders and the Media Foundation decoder |
+| `h264.rs`       | Annex B framing: NAL unit types, SPS/PPS extraction, `AccessUnit` classification (IDR, parameter sets, trailing NAL units that belong to the previous access unit), `access_units()` splitting; Annex B to and from AVCC |
+| `h264_syntax.rs` | SPS, PPS and slice header parsers, the reorder depth an SPS implies, and picture order count |
+| `copy.rs`       | Plane geometry and strided copies of NV12, YUYV and packed pictures, shared by the V4L2, Media Foundation and VideoToolbox backends |
 | `v4l2/mod.rs`   | Capability-based discovery of stateful M2M nodes (env override, then `/dev/video*`), `M2mDevice`, busy codec nodes reported as errors |
 | `v4l2/media.rs` | Whether a video node is a codec, from the media controller graph of its device (`MEDIA_IOC_G_TOPOLOGY`) |
 | `v4l2/encoder.rs` | `V4l2Encoder` (Linux + `v4l2` feature): format and control setup, DMA-BUF import of the source planes and crops, copy of other sources into a staging buffer of the device's layout, `create_source`, PTS mapping, header caching, `ENCODER_CMD` drain and stream reset |
@@ -127,6 +128,11 @@ V4L2 access goes through the [`edgefirst-v4l2`](https://github.com/EdgeFirstAI/v
 | `mf/transform.rs` | `Transform`: one synchronous or asynchronous MFT driven from the caller's thread (event polling, input credits, output sample allocation, stream-change renegotiation, drain and restart) |
 | `mf/encoder.rs` | `MfEncoder`: output and input types with the profile and level fallbacks, `ICodecAPI` rate control, tight copy of the source into a sample, forced key frames, PTS by sample time, header caching |
 | `mf/decoder.rs` | `MfDecoder`: NV12 output, layout from the output type (aperture, stride, colorimetry), pictures waiting in Media Foundation memory, copy into the D3D11 or host pool, pool growth for drain bursts |
+| `vt/mod.rs`     | VideoToolbox platform (macOS and iOS, `videotoolbox` feature): the encoder list, `capabilities()`, the CoreVideo pixel format codes, `OSStatus` errors |
+| `vt/ffi.rs`     | Declarations of the VideoToolbox, CoreMedia, CoreVideo, IOSurface and CoreFoundation calls and keys the backend uses; `CfOwned`, the owning CoreFoundation reference |
+| `vt/color.rs`   | `Colorimetry` to and from CoreVideo colour attachments |
+| `vt/encoder.rs` | `VtEncoder`: the two input routes, source colorimetry, session start and reset, `EncoderInfo`; `encoder/session.rs` has the compression session, its properties, the output callback and the in-flight frames, and `encoder/submit.rs` the submission thread |
+| `vt/decoder.rs` | `VtDecoder`: access units to length-prefixed samples, the decompression session, the reorder queue by picture order count, the two pools |
 
 ## Key Design Decisions
 
@@ -647,11 +653,7 @@ The UAPI structs must match the kernel's `sizeof`: a wrong size yields the wrong
 
 ## Video Encoder (`video`)
 
-`video::VideoEncoder` is a thin front over an internal `EncoderBackend` trait,
-with a V4L2 backend on Linux and a Media Foundation backend on Windows (see
-[Media Foundation backend](#media-foundation-backend-windows)). The Linux backend
-(`video/v4l2/encoder.rs`) drives a V4L2 stateful encoder
-(`dev-encoder.rst`) through `edgefirst-v4l2`.
+`video::VideoEncoder` is a thin front over an internal `EncoderBackend` trait, with a V4L2 backend on Linux, a Media Foundation backend on Windows (see [Media Foundation backend](#media-foundation-backend-windows)) and a VideoToolbox backend on macOS and iOS (see [VideoToolbox backend](#videotoolbox-backend-macos-and-ios)). The Linux backend (`video/v4l2/encoder.rs`) drives a V4L2 stateful encoder (`dev-encoder.rst`) through `edgefirst-v4l2`.
 
 - **Discovery is by capability.** Any streaming M2M node whose CAPTURE queue
   lists H.264 and whose OUTPUT queue lists the input format qualifies. Names are
@@ -787,6 +789,20 @@ MJPEG reuses the H.264 backends where the platform's model fits. On V4L2 the sta
 - **Provided pools** must be NV12 images of the visible size: a D3D11 texture
   cannot be described as a smaller image, so the pool cannot follow a size
   change.
+
+## VideoToolbox backend (macOS and iOS)
+
+`video/vt/` implements `EncoderBackend` and `DecoderBackend` with VideoToolbox's H.264 compression and decompression sessions. The frameworks are linked at build time. There is no MJPEG.
+
+- **Threads and callbacks.** In steady state `encode()` never waits for VideoToolbox. A frame goes to a submission thread (`vt-encode`), the only caller of `VTCompressionSessionEncodeFrame`, which submits frames in order with the frame's sequence number as its ref-con. The output callback runs on a VideoToolbox thread: it turns the sample into an Annex B access unit with the PTS recorded for that sequence number, releases the frame's held source, and queues the unit. `encode()` returns the oldest queued unit, and `flush()` drains the submission queue, then calls `VTCompressionSessionCompleteFrames`. A few waits stay inside `encode()`. After a session error it discards the submission queue, which waits for an `EncodeFrame` call in progress, and invalidates the session. It creates a session (`VTCompressionSessionCreate` and `PrepareToEncodeFrames`) on the frame after a reset, and on a stream's first frame when its colour needs another pool format, or differs from the colour of a session that has already encoded frames. `open()` builds a `420v` session, so the first frame of every full-range stream creates one. On the copy route `CVPixelBufferPoolCreatePixelBuffer` allocates a surface when the pool has none free. And it takes the state lock, which the output callback holds briefly while it parses an access unit. The decoder submits from the caller's thread. Its output callback only queues the decoded pixel buffer under the access unit's sequence number, and `flush()` and a format change wait for the session's asynchronous frames.
+- **Input routes.** A source whose IOSurface is a whole `420v`, `420f`, `yuvs` or `yuvf` surface of the configured size, with the luma and chroma planes where the pixel format puts them and the tensor's row strides equal to the surface's (`IOSurfaceGetBytesPerRowOfPlane`, or `IOSurfaceGetBytesPerRow` for a packed surface), is wrapped in a pixel buffer (`CVPixelBufferCreateWithIOSurface`) and submitted without a copy. Anything else, including every crop, is copied into a pixel buffer from the session's pool (`copy.rs`). The route is taken only when the session bounds its frame delay. The encoder asks for `MaxFrameDelayCount` 4 and treats the session as bounded if the set succeeds or the property reads back a value from 0 to 4. On Apple silicon Macs the hardware encoder does. Apple's software encoder (virtual machines, the iOS simulator) accepts no bound and holds many frames before its first output, so its sessions copy every source.
+- **Source lifetime and the bound.** A source read in place is held from submission until its frame leaves the session: the pixel buffer wrapper is retained and the surface's use count is raised (`IOSurfaceIncrementUseCount`), so `IOSurfaceIsInUse` is true and CoreVideo pools do not hand the surface out again. The output callback drops the hold when it emits or drops the frame; a reset, a flush and a drop of the encoder release what remains. At most `MAX_IN_FLIGHT` (8) sources are held; past that `encode()` returns `CodecError::Timeout` and takes nothing. The copy route returns `Timeout` once `MAX_QUEUED_COPIES` (8) copied frames wait for the submission thread. `EncoderInfo::transfer` is the route of the last frame, `CpuCopy` before the first.
+- **Session.** One session per colorimetry. Its properties are the average bitrate and data rate limits, the expected frame rate, the key frame interval, the profile and level, no frame reordering, the colour primaries, transfer function and matrix, and a frame delay of 4. A frame after a flush or an error is an IDR. A session error is recorded by the callback or the submission thread, and the next `encode()` or `flush()` returns it and starts a new session.
+- **Colorimetry.** The source's tag, then, for a CoreVideo surface, its range (`420v` and `yuvs` limited, `420f` and `yuvf` full) and, for the axes still unset, the colour attachments of a pixel buffer over the surface, on either route, then the height rule (`Colorimetry::with_height_defaults`). A tag that contradicts the surface's range is `InvalidInput`, and so is a tagged axis with no CoreVideo value on the running platform (`ColorTransfer::Linear` on iOS). The result must match for every frame of a stream. The session is recreated when the first frame needs another pool format (full range), and its colour properties make VideoToolbox write the colour description into the stream.
+- **Decoder input.** Each access unit's SPS and PPS update a `ParameterSets`; the pair the picture's slice refers to builds the format description, rebuilt only when their bytes change. The sample is the access unit in AVCC form (`annex_b_to_avcc`). `Reconfigured` follows a size or colorimetry change.
+- **Reorder queue.** VideoToolbox returns pictures in decode order. They wait in a queue keyed by output epoch and picture order count (`PocCounter`), and leave it in display order once more than the SPS's reorder depth (`Sps::reorder_depth`) are waiting. Pictures of an earlier epoch (before an IDR) leave first, and a flush releases them all.
+- **Pools.** With `OutputPool::Allocate`, each slot holds the decoder's own pixel buffer and lends it as a multiplane NV12 tensor over its IOSurface; the buffer stays in the slot until the `DecodedFrame` drops, so VideoToolbox's pool does not reuse it. `PoolExhausted` is returned, before the access unit is taken, when the caller holds every slot and a picture is waiting; a pool grows by one when the caller holds nothing and a drain releases more pictures than it has free. With `OutputPool::Provided`, each picture is copied into the next free tensor (`copy_into_image`) and its pixel buffer is released at once; the tensors must be NV12 images of the visible size, and the pool neither grows nor follows a size change. `decode()` lends what such a pool can take and keeps the rest waiting. `flush()` lends every waiting picture or none: `PoolExhausted` while the caller holds the tensors it needs, `InvalidConfig` when the pool holds fewer tensors than the pictures waiting.
+- **Decoder colorimetry.** The session asks for `420f` output when the SPS's VUI says full range and `420v` otherwise. A picture's colorimetry is its pixel buffer's colour attachments with the range of its pixel format.
 
 ## nvJPEG GPU Backend
 

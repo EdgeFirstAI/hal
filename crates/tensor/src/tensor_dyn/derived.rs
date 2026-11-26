@@ -256,6 +256,8 @@ const FOURCC_420F: u32 = u32::from_be_bytes(*b"420f");
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 const FOURCC_YUVS: u32 = u32::from_be_bytes(*b"yuvs");
 #[cfg(any(target_os = "macos", target_os = "ios"))]
+const FOURCC_YUVF: u32 = u32::from_be_bytes(*b"yuvf");
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 const FOURCC_BGRA: u32 = u32::from_be_bytes(*b"BGRA");
 
 /// Reads the pixel format and plane layout of `surface` and checks that each
@@ -326,8 +328,8 @@ pub(crate) unsafe fn planar_iosurface_parts(surface: *mut std::ffi::c_void) -> R
             }
             Ok(PlanarParts::Nv12 { luma, chroma })
         }
-        FOURCC_YUVS | FOURCC_BGRA => {
-            let (format, bytes_per_pixel) = if fourcc == FOURCC_YUVS {
+        FOURCC_YUVS | FOURCC_YUVF | FOURCC_BGRA => {
+            let (format, bytes_per_pixel) = if fourcc != FOURCC_BGRA {
                 (PixelFormat::Yuyv, 2)
             } else {
                 (PixelFormat::Bgra, 4)

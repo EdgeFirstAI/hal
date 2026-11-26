@@ -14,12 +14,13 @@ categories = ["multimedia::images", "embedded"]
 documentation = "https://docs.rs/edgefirst-codec"
 
 [features]
-# The v4l2 and nvjpeg backends are gated to Linux and media-foundation to
-# Windows. nvjpeg loads libnvjpeg.so.12 and media-foundation loads mfplat.dll
-# at runtime.
-default = ["v4l2", "nvjpeg", "png", "media-foundation"]
+# The v4l2 and nvjpeg backends are gated to Linux, media-foundation to
+# Windows, and videotoolbox to macOS and iOS. nvjpeg loads libnvjpeg.so.12
+# and media-foundation loads mfplat.dll at runtime.
+default = ["v4l2", "nvjpeg", "png", "media-foundation", "videotoolbox"]
 v4l2 = ["dep:edgefirst-v4l2", "dep:libc"]
 media-foundation = ["dep:windows", "dep:libloading"]
+videotoolbox = []
 png = ["dep:zune-png"]
 nvjpeg = ["dep:libloading"]
 opencv = ["dep:opencv"]

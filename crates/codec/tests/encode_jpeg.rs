@@ -4,7 +4,9 @@
 //! JPEG encoding with [`ImageEncoder`], checked by decoding each file with
 //! [`ImageDecoder`] and comparing the pixels.
 
-use edgefirst_codec::{Codec, CodecError, Engine, ImageDecoder, ImageEncoder};
+use edgefirst_codec::{
+    Codec, CodecError, Direction, Engine, ImageDecoder, ImageEncoder, UnsupportedFeature,
+};
 use edgefirst_tensor::{
     ColorRange, Colorimetry, CpuAccess, DType, PixelFormat, TensorDyn, TensorMemory,
 };
@@ -197,8 +199,25 @@ fn unsupported_sources_and_engines_are_refused() {
         Err(CodecError::UnsupportedFormat(PixelFormat::PlanarRgb))
     ));
     encoder.set_engine(Engine::VideoToolbox);
-    assert!(matches!(
-        encoder.encode(&image(64, 64, PixelFormat::Nv12)),
-        Err(CodecError::NoDevice(_))
-    ));
+    let e = encoder
+        .encode(&image(64, 64, PixelFormat::Nv12))
+        .unwrap_err();
+    if cfg!(all(
+        any(target_os = "macos", target_os = "ios"),
+        feature = "videotoolbox"
+    )) {
+        assert!(
+            matches!(
+                e,
+                CodecError::Unsupported(UnsupportedFeature::Codec {
+                    codec: Codec::Jpeg,
+                    direction: Direction::Encode,
+                    engine: Engine::VideoToolbox,
+                })
+            ),
+            "{e}"
+        );
+    } else {
+        assert!(matches!(e, CodecError::NoDevice(_)), "{e}");
+    }
 }

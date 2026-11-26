@@ -22,6 +22,13 @@
 //! in place, and the decoder (DXVA) copies each picture, GPU to GPU, into a
 //! pool of D3D11 tensors.
 //!
+//! On macOS and iOS both are VideoToolbox's (feature `videotoolbox`): a
+//! hardware encoder where the system has one, otherwise Apple's software
+//! encoder. A CoreVideo source of the configured size may be read in place;
+//! every other source is copied into a pixel buffer from the encoder's own
+//! pool. Decoded pictures are VideoToolbox's own IOSurface pixel buffers, lent
+//! without a copy as multiplane NV12 tensors.
+//!
 //! ```rust,no_run
 //! use edgefirst_codec::video::{EncoderConfig, FrameOptions, VideoEncoder};
 //! use edgefirst_tensor::{CpuAccess, PixelFormat, TensorDyn, TensorMemory};
@@ -63,25 +70,34 @@
 
 #[cfg(any(
     all(target_os = "linux", feature = "v4l2"),
-    all(windows, feature = "media-foundation")
+    all(windows, feature = "media-foundation"),
+    all(any(target_os = "macos", target_os = "ios"), feature = "videotoolbox")
 ))]
 pub(crate) mod copy;
 #[cfg_attr(
     not(any(
         all(target_os = "linux", feature = "v4l2"),
-        all(windows, feature = "media-foundation")
+        all(windows, feature = "media-foundation"),
+        all(any(target_os = "macos", target_os = "ios"), feature = "videotoolbox")
     )),
     allow(dead_code)
 )]
 pub(crate) mod h264;
+#[cfg_attr(
+    not(all(any(target_os = "macos", target_os = "ios"), feature = "videotoolbox")),
+    allow(dead_code)
+)]
+pub(crate) mod h264_syntax;
 #[cfg(all(windows, feature = "media-foundation"))]
 pub(crate) mod mf;
 #[cfg(all(target_os = "linux", feature = "v4l2"))]
 pub(crate) mod v4l2;
+#[cfg(all(any(target_os = "macos", target_os = "ios"), feature = "videotoolbox"))]
+pub(crate) mod vt;
 
 use std::sync::{Arc, Mutex};
 
-use edgefirst_tensor::{Colorimetry, PixelFormat, Region, TensorDyn};
+use edgefirst_tensor::{Colorimetry, DType, PixelFormat, Region, TensorDyn};
 
 pub use h264::{access_units, AccessUnits};
 
@@ -95,7 +111,7 @@ pub type VideoCodec = Codec;
 /// The engines this build has for video, in the order [`Engine::Auto`] tries
 /// them.
 fn video_engines() -> Vec<Engine> {
-    [Engine::V4l2, Engine::MediaFoundation]
+    [Engine::V4l2, Engine::MediaFoundation, Engine::VideoToolbox]
         .into_iter()
         .filter(|&e| compiled(e))
         .collect()
@@ -106,8 +122,11 @@ fn runs(engine: Engine, codec: Codec, direction: Direction) -> bool {
     compiled(engine)
         && matches!(
             (engine, codec, direction),
-            (Engine::V4l2 | Engine::MediaFoundation, Codec::H264, _)
-                | (Engine::V4l2, Codec::Mjpeg, _)
+            (
+                Engine::V4l2 | Engine::MediaFoundation | Engine::VideoToolbox,
+                Codec::H264,
+                _
+            ) | (Engine::V4l2, Codec::Mjpeg, _)
                 | (Engine::MediaFoundation, Codec::Mjpeg, Direction::Decode)
         )
 }
@@ -284,6 +303,8 @@ fn open_encoder(engine: Engine, config: EncoderConfig) -> Result<Box<dyn Encoder
         Engine::V4l2 => Ok(Box::new(v4l2::encoder::V4l2Encoder::open(config)?)),
         #[cfg(all(windows, feature = "media-foundation"))]
         Engine::MediaFoundation => Ok(Box::new(mf::encoder::MfEncoder::open(config)?)),
+        #[cfg(all(any(target_os = "macos", target_os = "ios"), feature = "videotoolbox"))]
+        Engine::VideoToolbox => Ok(Box::new(vt::encoder::VtEncoder::open(config)?)),
         other => Err(unsupported(config.codec, Direction::Encode, other)),
     }
 }
@@ -299,6 +320,8 @@ fn open_decoder(engine: Engine, config: DecoderConfig) -> Result<Box<dyn Decoder
         Engine::V4l2 => Ok(Box::new(v4l2::decoder::V4l2Decoder::open(config)?)),
         #[cfg(all(windows, feature = "media-foundation"))]
         Engine::MediaFoundation => Ok(Box::new(mf::decoder::MfDecoder::open(config)?)),
+        #[cfg(all(any(target_os = "macos", target_os = "ios"), feature = "videotoolbox"))]
+        Engine::VideoToolbox => Ok(Box::new(vt::decoder::VtDecoder::open(config)?)),
         other => Err(unsupported(config.codec, Direction::Decode, other)),
     }
 }
@@ -464,6 +487,74 @@ pub(crate) fn chroma_subsampling(format: PixelFormat) -> (u32, u32) {
     }
 }
 
+/// Checks that `src` can be encoded as configured and returns the origin of
+/// the region to encode.
+#[cfg_attr(
+    not(any(
+        all(windows, feature = "media-foundation"),
+        all(any(target_os = "macos", target_os = "ios"), feature = "videotoolbox")
+    )),
+    allow(dead_code)
+)]
+pub(crate) fn check_source(
+    config: &EncoderConfig,
+    src: &TensorDyn,
+    opts: &FrameOptions,
+) -> Result<(usize, usize)> {
+    let invalid = |what: String| Err(CodecError::InvalidInput(what));
+    if src.format() != Some(config.input_format) {
+        return invalid(format!(
+            "source format {:?} is not the configured {}",
+            src.format(),
+            config.input_format
+        ));
+    }
+    if src.dtype() != DType::U8 {
+        return invalid(format!(
+            "source elements are {:?}; {} is 8-bit",
+            src.dtype(),
+            config.input_format
+        ));
+    }
+    let (sw, sh) = match (src.width(), src.height()) {
+        (Some(w), Some(h)) => (w, h),
+        _ => return invalid("source is not an image".into()),
+    };
+    if src.view_origin().is_some() && config.input_format == PixelFormat::Nv12 {
+        return invalid(format!(
+            "a view of a {} image cannot be encoded; crop with FrameOptions::crop",
+            config.input_format
+        ));
+    }
+    let (w, h) = (config.width as usize, config.height as usize);
+    let Some(crop) = opts.crop else {
+        if (sw, sh) != (w, h) {
+            return invalid(format!("source is {sw}x{sh}, the encoder {w}x{h}"));
+        }
+        return Ok((0, 0));
+    };
+    if (crop.width, crop.height) != (w, h) {
+        return invalid(format!(
+            "crop is {}x{}, the encoder {w}x{h}",
+            crop.width, crop.height
+        ));
+    }
+    if crop.x + crop.width > sw || crop.y + crop.height > sh {
+        return invalid(format!(
+            "crop {}x{}+{}+{} is outside the {sw}x{sh} source",
+            crop.width, crop.height, crop.x, crop.y
+        ));
+    }
+    let (hsub, vsub) = chroma_subsampling(config.input_format);
+    if !crop.x.is_multiple_of(hsub as usize) || !crop.y.is_multiple_of(vsub as usize) {
+        return invalid(format!(
+            "crop origin {},{} is not on a {} chroma sample",
+            crop.x, crop.y, config.input_format
+        ));
+    }
+    Ok((crop.x, crop.y))
+}
+
 /// Per-frame options for [`VideoEncoder::encode`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct FrameOptions {
@@ -512,6 +603,10 @@ pub struct EncoderInfo {
     /// copied into the device's layout, [`Transfer::ZeroCopy`] before the
     /// first frame and when the device read it in place, as it reads a
     /// source from [`VideoEncoder::create_source`].
+    /// A VideoToolbox encoder reports how the last frame reached it,
+    /// [`Transfer::CpuCopy`] before the first; [`Transfer::ZeroCopy`] means
+    /// the last frame was read in place under the rule
+    /// [`VideoEncoder::encode`] states.
     pub transfer: Transfer,
 }
 
@@ -555,6 +650,9 @@ impl VideoEncoder {
     /// transforms whose name contains its value, or only the `hardware` or
     /// `software` ones.
     ///
+    /// On macOS and iOS a VideoToolbox H.264 encoder is used, hardware where
+    /// the system has one.
+    ///
     /// # Errors
     ///
     /// [`CodecError::InvalidConfig`] when `config` is invalid or the device
@@ -575,15 +673,46 @@ impl VideoEncoder {
     /// Encodes `src`.
     ///
     /// `src` must have the configured input format and, without a crop, the
-    /// configured size. A source the device can read in place is read
+    /// configured size.
+    ///
+    /// On Linux and Windows, a source the device can read in place is read
     /// there; [`create_source`](Self::create_source) allocates one. Any
     /// other source, of any row stride and in any memory the CPU can read,
     /// is copied into a buffer the device can read first. Either way the
     /// call returns once `src` has been read, so the caller may reuse it
     /// afterwards.
     ///
+    /// On macOS and iOS, a source whose IOSurface is a CoreVideo `420v`, `420f`,
+    /// `yuvs` or `yuvf` surface of the configured size, with the row stride of
+    /// each surface plane and encoded without a crop, may be read in place;
+    /// [`EncoderInfo::transfer`] reports the route. Its IOSurface may stay in use
+    /// (`IOSurfaceIsInUse` is true) after `encode()` returns, until its frame
+    /// leaves the encoder (its access unit is returned, it is dropped, or
+    /// `flush()` returns). CoreVideo pixel buffer pools do not hand out a
+    /// surface while it is in use. Any other pool or writer must not reuse or
+    /// write a surface while `IOSurfaceIsInUse` is true. Other sources are
+    /// copied, and the caller may reuse them once `encode()` returns.
+    ///
     /// Returns the next finished access unit, which may belong to an earlier
     /// frame, or `None` when none is ready yet.
+    ///
+    /// # Errors
+    ///
+    /// [`CodecError::InvalidInput`] when `src` does not match the
+    /// configuration or the stream's earlier sources,
+    /// [`CodecError::Device`] when the device fails, and
+    /// [`CodecError::Timeout`] when the device does not take the frame in
+    /// time.
+    ///
+    /// On macOS and iOS, at most 8 sources read in place are in use at once;
+    /// another fails at once with [`CodecError::Timeout`] and is not encoded.
+    /// A source tagged with a colour value that has no CoreVideo equivalent
+    /// on the running platform (on iOS, `ColorTransfer::Linear`) fails
+    /// with [`CodecError::InvalidInput`] naming the axis and value.
+    ///
+    /// On macOS and iOS, [`CodecError::Timeout`] means the frame was not
+    /// taken because the encoder has too many frames waiting; the caller may
+    /// submit it again later.
     pub fn encode(&mut self, src: &TensorDyn, opts: &FrameOptions) -> Result<Option<EncodedFrame>> {
         self.backend.encode(src, opts)
     }
@@ -613,13 +742,18 @@ impl VideoEncoder {
     /// picture needs, and the chroma plane can be a buffer of its own. On
     /// Windows it is a GPU image of the configured size for an encoder that
     /// reads D3D11 textures, and a host-memory image, which the encoder
-    /// copies into its input sample, for one that does not.
+    /// copies into its input sample, for one that does not. On macOS and
+    /// iOS it is a CoreVideo IOSurface: `420v` for NV12 and `yuvs` for
+    /// YUYV, or `420f` and `yuvf` once the stream's first source was full
+    /// range. The encoder reads it in place under the rule
+    /// [`encode`](Self::encode) states.
     ///
     /// # Errors
     ///
     /// [`CodecError::Tensor`] when the image cannot be allocated,
     /// [`CodecError::NoDevice`] when there is no GPU buffer allocator, and
-    /// [`CodecError::Device`] when the device does not report its layout.
+    /// [`CodecError::Device`] when the device does not report its layout or,
+    /// on macOS and iOS, CoreVideo cannot create the surface.
     pub fn create_source(&self) -> Result<TensorDyn> {
         self.backend.create_source()
     }
@@ -630,6 +764,10 @@ impl VideoEncoder {
 pub enum OutputPool {
     /// The decoder allocates DMA-BUF frames, and allocates them again when
     /// the stream changes size.
+    ///
+    /// On macOS and iOS the frames are VideoToolbox's own pixel buffers,
+    /// lent as multiplane NV12 tensors. A lent [`DecodedFrame`] keeps its
+    /// pixel buffer out of VideoToolbox's pool until it drops.
     Allocate {
         /// Frames the caller may hold at once. The device's own minimum
         /// (the reference pictures it keeps) and one buffer for it to
@@ -643,10 +781,13 @@ pub enum OutputPool {
     /// Pictures are decoded into these DMA-BUF tensors, one buffer each.
     /// Each tensor must be a different buffer.
     ///
-    /// On Windows pictures are copied into the pool (on the GPU), and each
+    /// On Windows, macOS and iOS pictures are copied into the pool (on the
+    /// GPU where the device decodes there, otherwise by the CPU), and each
     /// tensor must be an NV12 image of exactly the stream's visible size;
-    /// such a pool cannot follow a change of size. The rest of this
-    /// description is about devices that decode in place.
+    /// such a pool cannot follow a change of size. On macOS and iOS an image
+    /// is one buffer or separate luma and chroma planes, and
+    /// [`VideoDecoder::flush`] lends the pool every waiting picture or none.
+    /// The rest of this description is about devices that decode in place.
     ///
     /// There must be at least one more than the device keeps for reference
     /// pictures and no more than it takes in all, and each must be large
@@ -733,9 +874,10 @@ pub struct StreamInfo {
     /// The engine that decodes.
     pub engine: Engine,
     /// How each picture reaches its pool tensor: written in place
-    /// ([`Transfer::ZeroCopy`], V4L2), or copied out of the decoder's own
-    /// surfaces on the GPU ([`Transfer::GpuCopy`], Media Foundation with
-    /// D3D11) or through CPU memory ([`Transfer::CpuCopy`]).
+    /// ([`Transfer::ZeroCopy`], V4L2), lent in the decoder's own pixel
+    /// buffers ([`Transfer::ZeroCopy`], VideoToolbox), or copied out of the
+    /// decoder's own surfaces on the GPU ([`Transfer::GpuCopy`], Media
+    /// Foundation with D3D11) or through CPU memory ([`Transfer::CpuCopy`]).
     pub transfer: Transfer,
 }
 
@@ -748,7 +890,8 @@ pub enum OutputMemory {
     /// each picture out of the decoder, on the GPU where it decodes there.
     Imported,
     /// The device's own buffers, exported as DMA-BUFs, when it does not
-    /// import the pool's. CPU reads of these may be uncached and slow.
+    /// import the pool's. CPU reads of these may be uncached and slow. On
+    /// macOS and iOS, VideoToolbox's own IOSurface pixel buffers.
     Exported,
 }
 
@@ -775,7 +918,8 @@ impl Returns {
     #[cfg_attr(
         not(any(
             all(target_os = "linux", feature = "v4l2"),
-            all(windows, feature = "media-foundation")
+            all(windows, feature = "media-foundation"),
+            all(any(target_os = "macos", target_os = "ios"), feature = "videotoolbox")
         )),
         allow(dead_code)
     )]
@@ -811,7 +955,8 @@ impl DecodedFrame {
     #[cfg_attr(
         not(any(
             all(target_os = "linux", feature = "v4l2"),
-            all(windows, feature = "media-foundation")
+            all(windows, feature = "media-foundation"),
+            all(any(target_os = "macos", target_os = "ios"), feature = "videotoolbox")
         )),
         allow(dead_code)
     )]
@@ -833,7 +978,9 @@ impl DecodedFrame {
 
     /// The picture: an image tensor of the visible size in DMA-BUF memory
     /// (a D3D11 texture on Windows, or host memory where the process has no
-    /// D3D11 device).
+    /// D3D11 device). On macOS and iOS it is a multiplane NV12 tensor over
+    /// one of VideoToolbox's IOSurfaces with [`OutputPool::Allocate`], and
+    /// one of the pool's tensors with [`OutputPool::Provided`].
     pub fn tensor(&self) -> &TensorDyn {
         &self.tensor
     }
@@ -898,6 +1045,8 @@ impl VideoDecoder {
     /// On Windows Microsoft's Media Foundation H.264 decoder is used.
     /// Setting `EDGEFIRST_CODEC_MF_DECODER` keeps only the transforms whose
     /// name contains its value, or only the `hardware` or `software` ones.
+    ///
+    /// On macOS and iOS VideoToolbox's H.264 decoder is used.
     ///
     /// # Errors
     ///
@@ -970,8 +1119,21 @@ impl VideoDecoder {
     /// # Errors
     ///
     /// [`CodecError::PoolExhausted`] when the caller holds the frames in
-    /// every output buffer the drain needs; drop frames and flush again.
-    /// [`CodecError::Timeout`] when the device does not finish draining.
+    /// output buffers the drain needs; drop frames and flush again.
+    /// [`CodecError::InvalidConfig`] on Windows, macOS and iOS when an
+    /// [`OutputPool::Provided`] pool holds fewer tensors than the pictures
+    /// the drain releases. [`CodecError::Timeout`] when the device does not
+    /// finish draining.
+    ///
+    /// On macOS and iOS a flush into an [`OutputPool::Provided`] pool lends
+    /// every waiting picture or none. It returns them all when they fit the
+    /// free tensors. Otherwise it lends nothing and the pictures stay
+    /// queued: it returns [`CodecError::PoolExhausted`] while the caller
+    /// holds frames, and [`CodecError::InvalidConfig`] when the pool holds
+    /// fewer tensors than the pictures waiting. Frames an earlier call left
+    /// after an error come first; when they fill the tensors the pictures
+    /// need, the flush returns only those frames, and the next flush
+    /// continues the drain.
     pub fn flush(&mut self) -> Result<Vec<DecodeEvent>> {
         self.backend.flush()
     }
@@ -1182,10 +1344,23 @@ mod tests {
                 engine: Engine::Cpu,
             })
         ));
-        assert!(matches!(
-            refused(Engine::VideoToolbox, Codec::H264),
-            CodecError::NoDevice(_)
-        ));
+        if cfg!(all(
+            any(target_os = "macos", target_os = "ios"),
+            feature = "videotoolbox"
+        )) {
+            assert_eq!(
+                pick(Engine::VideoToolbox, Codec::H264, Direction::Encode).unwrap(),
+                Engine::VideoToolbox
+            );
+        } else {
+            assert!(matches!(
+                refused(Engine::VideoToolbox, Codec::H264),
+                CodecError::NoDevice(_)
+            ));
+        }
+        for direction in [Direction::Encode, Direction::Decode] {
+            assert!(!runs(Engine::VideoToolbox, Codec::Mjpeg, direction));
+        }
         if !video_engines().is_empty() {
             assert!(matches!(
                 refused(Engine::Auto, Codec::Hevc),

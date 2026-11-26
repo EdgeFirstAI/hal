@@ -35,7 +35,7 @@ abi3-py311 = ["pyo3/abi3-py311"]
 [dependencies]
 edgefirst-tensor = { workspace = true, default-features = false, optional = true }
 # Each extension states exactly the library features it ships.
-edgefirst-codec = { workspace = true, optional = true, default-features = false, features = ["v4l2", "nvjpeg", "png", "media-foundation"] }
+edgefirst-codec = { workspace = true, optional = true, default-features = false, features = ["v4l2", "nvjpeg", "png", "media-foundation", "videotoolbox"] }
 # `opengl` enables the GPU path; the workspace entry disables image's defaults.
 edgefirst-image = { workspace = true, optional = true, default-features = false, features = [
     "opengl",

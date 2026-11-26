@@ -181,7 +181,7 @@ pub enum PyEngine {
     V4l2 = 1,
     /// Windows Media Foundation transforms.
     MediaFoundation = 2,
-    /// Apple VideoToolbox. No backend runs it.
+    /// Apple VideoToolbox, on macOS and iOS.
     VideoToolbox = 3,
     /// NVIDIA nvJPEG (JPEG decoding on Linux).
     NvJpeg = 4,

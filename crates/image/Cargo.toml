@@ -71,6 +71,7 @@ gbm = { workspace = true, optional = true }
 [dev-dependencies]
 # Tests build decoders.
 edgefirst-decoder = { workspace = true }
+edgefirst-codec = { workspace = true, default-features = false, features = ["videotoolbox"] }
 ctor = { workspace = true }
 env_logger = { workspace = true }
 crc32fast = { workspace = true }

@@ -132,8 +132,8 @@ static int h264_round_trip(void) {
     ef_video_encoder_config_free(cfg);
     if (!enc) FAIL("ef_video_encoder_new");
     const ef_video_encoder_info *info = ef_video_encoder_get_info(enc);
-    printf("  encoder: %s on %s, transfer %u\n", info->device,
-           ef_codec_engine_name(info->engine), info->transfer);
+    printf("  encoder: %s on %s, hardware %d, transfer %u\n", info->device,
+           ef_codec_engine_name(info->engine), info->hardware, info->transfer);
 
     static uint8_t stream[1 << 20];
     size_t sizes[FRAMES * 2] = { 0 };

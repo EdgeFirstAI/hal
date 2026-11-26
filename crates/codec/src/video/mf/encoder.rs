@@ -47,7 +47,7 @@ use super::{
 use crate::video::copy::{self, Plane};
 use crate::video::h264::{self, AccessUnit};
 use crate::video::{
-    chroma_subsampling, EncodedFrame, EncoderBackend, EncoderConfig, EncoderInfo, FrameOptions,
+    check_source, EncodedFrame, EncoderBackend, EncoderConfig, EncoderInfo, FrameOptions,
     H264Level, H264Profile,
 };
 use crate::{CodecError, Engine, Result, Transfer};
@@ -402,62 +402,6 @@ impl MfEncoder {
         h264::parameter_sets(&blob)
     }
 
-    fn check_source(&self, src: &TensorDyn, opts: &FrameOptions) -> Result<(usize, usize)> {
-        let cfg = &self.config;
-        let invalid = |what: String| Err(CodecError::InvalidInput(what));
-        if src.format() != Some(cfg.input_format) {
-            return invalid(format!(
-                "source format {:?} is not the configured {}",
-                src.format(),
-                cfg.input_format
-            ));
-        }
-        if src.dtype() != DType::U8 {
-            return invalid(format!(
-                "source elements are {:?}; {} is 8-bit",
-                src.dtype(),
-                cfg.input_format
-            ));
-        }
-        let (sw, sh) = match (src.width(), src.height()) {
-            (Some(w), Some(h)) => (w, h),
-            _ => return invalid("source is not an image".into()),
-        };
-        if src.view_origin().is_some() && cfg.input_format == PixelFormat::Nv12 {
-            return invalid(format!(
-                "a view of a {} image cannot be encoded; crop with FrameOptions::crop",
-                cfg.input_format
-            ));
-        }
-        let (w, h) = (cfg.width as usize, cfg.height as usize);
-        let Some(crop) = opts.crop else {
-            if (sw, sh) != (w, h) {
-                return invalid(format!("source is {sw}x{sh}, the encoder {w}x{h}"));
-            }
-            return Ok((0, 0));
-        };
-        if (crop.width, crop.height) != (w, h) {
-            return invalid(format!(
-                "crop is {}x{}, the encoder {w}x{h}",
-                crop.width, crop.height
-            ));
-        }
-        if crop.x + crop.width > sw || crop.y + crop.height > sh {
-            return invalid(format!(
-                "crop {}x{}+{}+{} is outside the {sw}x{sh} source",
-                crop.width, crop.height, crop.x, crop.y
-            ));
-        }
-        let (hsub, vsub) = chroma_subsampling(cfg.input_format);
-        if !crop.x.is_multiple_of(hsub as usize) || !crop.y.is_multiple_of(vsub as usize) {
-            return invalid(format!(
-                "crop origin {},{} is not on a {} chroma sample",
-                crop.x, crop.y, cfg.input_format
-            ));
-        }
-        Ok((crop.x, crop.y))
-    }
-
     /// A sample holding the region of `src` at `origin`, tightly packed.
     fn fill(&self, src: &TensorDyn, origin: (usize, usize)) -> Result<IMFSample> {
         let format = self.config.input_format;
@@ -726,7 +670,7 @@ impl MfEncoder {
 impl EncoderBackend for MfEncoder {
     fn encode(&mut self, src: &TensorDyn, opts: &FrameOptions) -> Result<Option<EncodedFrame>> {
         com();
-        let origin = self.check_source(src, opts)?;
+        let origin = check_source(&self.config, src, opts)?;
         let time = self.next_seq * self.duration;
         let (sample, in_place) = if self.textures.is_some() {
             self.fill_texture(src, origin, time)?

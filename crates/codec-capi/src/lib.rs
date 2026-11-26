@@ -330,7 +330,15 @@ mod tests {
         .arg("-o")
         .arg(&exe);
         if cfg!(target_os = "macos") {
-            cmd.args(["-framework", "CoreFoundation", "-framework", "IOSurface"]);
+            for framework in [
+                "CoreFoundation",
+                "CoreMedia",
+                "CoreVideo",
+                "IOSurface",
+                "VideoToolbox",
+            ] {
+                cmd.args(["-framework", framework]);
+            }
         } else {
             cmd.args(["-lpthread", "-ldl", "-lm"]);
         }
