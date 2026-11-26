@@ -9,8 +9,15 @@
 //! enough capacity. `info.width`/`info.height` are the source's unrotated
 //! dims.
 
-use edgefirst_codec::{peek_info, CodecError, ImageDecoder, ImageLoad, UnsupportedFeature};
+use edgefirst_codec::{peek_info, CodecError, Engine, ImageDecoder, ImageLoad, UnsupportedFeature};
 use edgefirst_tensor::{PixelFormat, Tensor, TensorMemory, TensorTrait};
+
+/// An image decoder on the CPU engine.
+fn cpu_decoder() -> ImageDecoder {
+    let mut decoder = ImageDecoder::new();
+    decoder.set_engine(Engine::Cpu);
+    decoder
+}
 
 fn testdata(name: &str) -> Vec<u8> {
     let root = std::env::var("EDGEFIRST_TESTDATA_DIR")
@@ -38,7 +45,7 @@ fn decode_zidane_nv12() {
         edgefirst_tensor::CpuAccess::ReadWrite,
     )
     .unwrap();
-    let mut decoder = ImageDecoder::new();
+    let mut decoder = cpu_decoder();
     let info = tensor.load_image(&mut decoder, &jpeg).unwrap();
     assert_eq!(info.width, 1280);
     assert_eq!(info.height, 720);
@@ -68,7 +75,7 @@ fn decode_grey_jpeg() {
         edgefirst_tensor::CpuAccess::ReadWrite,
     )
     .unwrap();
-    let mut decoder = ImageDecoder::new();
+    let mut decoder = cpu_decoder();
     let info = tensor.load_image(&mut decoder, &jpeg).unwrap();
     assert!(info.width > 0 && info.height > 0);
     assert_eq!(info.format, PixelFormat::Grey);
@@ -97,7 +104,7 @@ fn decode_person_rejected() {
         edgefirst_tensor::CpuAccess::ReadWrite,
     )
     .unwrap();
-    let mut decoder = ImageDecoder::new();
+    let mut decoder = cpu_decoder();
     let result = tensor.load_image(&mut decoder, &jpeg);
     assert!(
         result.is_err(),
@@ -116,7 +123,7 @@ fn decode_f32_jpeg_unsupported_dtype() {
         edgefirst_tensor::CpuAccess::ReadWrite,
     )
     .unwrap();
-    let mut decoder = ImageDecoder::new();
+    let mut decoder = cpu_decoder();
     let result = tensor.load_image(&mut decoder, &jpeg);
     assert!(
         matches!(result, Err(CodecError::UnsupportedDtype(_))),
@@ -135,7 +142,7 @@ fn decode_capacity_error() {
         edgefirst_tensor::CpuAccess::ReadWrite,
     )
     .unwrap();
-    let mut decoder = ImageDecoder::new();
+    let mut decoder = cpu_decoder();
     let result = tensor.load_image(&mut decoder, &jpeg);
     assert!(result.is_err());
     match result.unwrap_err() {
@@ -159,7 +166,7 @@ fn decode_reuse_pattern() {
         edgefirst_tensor::CpuAccess::ReadWrite,
     )
     .unwrap();
-    let mut decoder = ImageDecoder::new();
+    let mut decoder = cpu_decoder();
 
     let images = ["zidane.jpg", "giraffe.jpg"];
     for name in &images {
@@ -187,7 +194,7 @@ fn pixel_accuracy_grey_vs_image_crate() {
         edgefirst_tensor::CpuAccess::ReadWrite,
     )
     .unwrap();
-    let mut decoder = ImageDecoder::new();
+    let mut decoder = cpu_decoder();
     let info = tensor.load_image(&mut decoder, &jpeg_data).unwrap();
     assert_eq!(info.format, PixelFormat::Grey);
 
@@ -250,7 +257,7 @@ fn decode_strided_oversized_tensor() {
         bytes.fill(0xAA);
     }
 
-    let mut decoder = ImageDecoder::new();
+    let mut decoder = cpu_decoder();
     let info = tensor.load_image(&mut decoder, &jpeg).unwrap();
 
     assert_eq!(info.width, 1280);
@@ -284,7 +291,7 @@ fn decode_truncated_jpeg() {
         edgefirst_tensor::CpuAccess::ReadWrite,
     )
     .unwrap();
-    let mut decoder = ImageDecoder::new();
+    let mut decoder = cpu_decoder();
     let result = tensor.load_image(&mut decoder, truncated);
     assert!(matches!(result, Err(CodecError::InvalidData(_))));
 }
@@ -302,7 +309,7 @@ fn decode_not_jpeg() {
         edgefirst_tensor::CpuAccess::ReadWrite,
     )
     .unwrap();
-    let mut decoder = ImageDecoder::new();
+    let mut decoder = cpu_decoder();
     let result = tensor.load_image(&mut decoder, &bogus);
     assert!(matches!(result, Err(CodecError::InvalidData(_))));
 }
@@ -317,7 +324,7 @@ fn decode_empty_data() {
         edgefirst_tensor::CpuAccess::ReadWrite,
     )
     .unwrap();
-    let mut decoder = ImageDecoder::new();
+    let mut decoder = cpu_decoder();
     let result = tensor.load_image(&mut decoder, &[]);
     assert!(matches!(result, Err(CodecError::InvalidData(_))));
 }
@@ -333,7 +340,7 @@ fn decode_corrupt_markers() {
         edgefirst_tensor::CpuAccess::ReadWrite,
     )
     .unwrap();
-    let mut decoder = ImageDecoder::new();
+    let mut decoder = cpu_decoder();
     let result = tensor.load_image(&mut decoder, &corrupt);
     assert!(matches!(result, Err(CodecError::InvalidData(_))));
 }
@@ -355,7 +362,7 @@ fn decode_exact_size_tensor() {
         edgefirst_tensor::CpuAccess::ReadWrite,
     )
     .unwrap();
-    let mut decoder = ImageDecoder::new();
+    let mut decoder = cpu_decoder();
     let info = tensor.load_image(&mut decoder, &jpeg).unwrap();
 
     assert_eq!(info.width, width as usize);
@@ -377,7 +384,7 @@ fn decode_nv12_output() {
         edgefirst_tensor::CpuAccess::ReadWrite,
     )
     .unwrap();
-    let mut decoder = ImageDecoder::new();
+    let mut decoder = cpu_decoder();
 
     let info = tensor.load_image(&mut decoder, &jpeg).unwrap();
     assert_eq!(info.width, width);
@@ -431,7 +438,7 @@ fn jpeg_decode_tags_jfif_colorimetry() {
         edgefirst_tensor::CpuAccess::ReadWrite,
     )
     .unwrap();
-    let mut d = ImageDecoder::new();
+    let mut d = cpu_decoder();
     t.load_image(&mut d, &testdata("zidane.jpg")).unwrap();
     assert_eq!(t.colorimetry(), Some(Colorimetry::jfif()));
 }
@@ -464,7 +471,7 @@ fn odd_width_nv12_jpeg_decodes_with_logical_width() {
     assert_eq!(s % 64, 0, "stride must be 64-byte aligned, got {s}");
     assert!(s >= 790, "stride must be >= even(width)=790, got {s}");
 
-    let mut decoder = ImageDecoder::new();
+    let mut decoder = cpu_decoder();
     let info = tensor
         .load_image(&mut decoder, &jpeg)
         .expect("odd-width NV12 JPEG should decode into the strided buffer");
@@ -512,7 +519,7 @@ fn check_native_decode_dims(
         edgefirst_tensor::CpuAccess::ReadWrite,
     )
     .unwrap();
-    let mut decoder = ImageDecoder::new();
+    let mut decoder = cpu_decoder();
     let info = tensor.load_image(&mut decoder, &jpeg).unwrap();
     assert_eq!(info.format, expect_fmt, "{fixture}: native format");
     assert_eq!(
@@ -626,7 +633,7 @@ fn rgb_request_errors_on_unsupported_subsampling() {
             edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
-        let mut decoder = ImageDecoder::new();
+        let mut decoder = cpu_decoder();
         decoder.set_output_format(Some(PixelFormat::Rgb));
         let err = tensor
             .load_image(&mut decoder, &jpeg)
@@ -655,7 +662,7 @@ fn decode_coco_grey_odd_width() {
         edgefirst_tensor::CpuAccess::ReadWrite,
     )
     .unwrap();
-    let mut decoder = ImageDecoder::new();
+    let mut decoder = cpu_decoder();
     let info = tensor.load_image(&mut decoder, &jpeg).unwrap();
     assert_eq!(info.format, PixelFormat::Grey, "native greyscale format");
     assert_eq!((info.width, info.height), (w, h), "odd dims preserved");
@@ -738,7 +745,7 @@ fn decode_logical_bytes(
         edgefirst_tensor::CpuAccess::ReadWrite,
     )
     .unwrap_or_else(|e| panic!("{what}: allocate: {e}"));
-    let mut decoder = ImageDecoder::new();
+    let mut decoder = cpu_decoder();
     let info = tensor
         .load_image(&mut decoder, jpeg)
         .unwrap_or_else(|e| panic!("{what}: decode: {e}"));
@@ -828,7 +835,7 @@ fn fast_dct_mode_close_to_accurate_and_off_by_default() {
         )
         .unwrap();
 
-        let mut dec = ImageDecoder::new();
+        let mut dec = cpu_decoder();
         dec.set_dct_method(DctMethod::Accurate);
         let info_a = t_acc.load_image(&mut dec, &jpeg).unwrap();
 
@@ -842,7 +849,7 @@ fn fast_dct_mode_close_to_accurate_and_off_by_default() {
                 edgefirst_tensor::CpuAccess::ReadWrite,
             )
             .unwrap();
-            let mut dec_default = ImageDecoder::new();
+            let mut dec_default = cpu_decoder();
             let info_d = t_def.load_image(&mut dec_default, &jpeg).unwrap();
             assert_eq!(info_a.format, info_d.format);
             let a = t_acc.map().unwrap();
@@ -913,7 +920,7 @@ fn decode_into_oversized_d3d11_pool_with(access: edgefirst_tensor::CpuAccess) {
     else {
         return;
     };
-    let mut decoder = ImageDecoder::new();
+    let mut decoder = cpu_decoder();
     let info = tensor
         .load_image(&mut decoder, &jpeg)
         .unwrap_or_else(|e| panic!("decode into a partial D3D11 window ({access:?}): {e}"));

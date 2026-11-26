@@ -3733,6 +3733,7 @@ pub(crate) fn load_image_test_helper(
     let h = info.height;
 
     let mut decoder = ImageDecoder::new();
+    decoder.set_engine(edgefirst_codec::Engine::Cpu);
 
     // Decodes into a tensor allocated for the native layout.
     #[cfg(target_os = "linux")]

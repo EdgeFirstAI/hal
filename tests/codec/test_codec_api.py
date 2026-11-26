@@ -80,7 +80,8 @@ def test_capabilities_list_the_cpu_jpeg_encoder():
     assert isinstance(cpu[0].transfer, codec.Transfer)
 
 
-def test_a_grey_image_encodes_to_a_jpeg_and_decodes_back():
+def test_a_grey_image_encodes_to_a_jpeg_and_decodes_back(monkeypatch):
+    monkeypatch.setenv("EDGEFIRST_CODEC_ENGINE", "cpu")
     enc = ImageEncoder(quality=90, engine=Engine.Cpu)
     assert enc.quality == 90
     assert enc.engine == Engine.Cpu
@@ -136,6 +137,7 @@ def decode_all(decoder, units):
     return events
 
 
+@pytest.mark.codec_sessions(1)
 def test_a_stream_decodes_into_tensor_frames():
     units = codec.access_units((TESTDATA / "h264_1080p_main_bframes.h264").read_bytes())
     decoder = open_or_skip(lambda: VideoDecoder(Codec.H264))
@@ -166,6 +168,7 @@ def test_a_stream_decodes_into_tensor_frames():
         assert np.asarray(m).size > 0
 
 
+@pytest.mark.codec_sessions(1)
 def test_frames_hold_the_pool_until_released():
     units = codec.access_units((TESTDATA / "h264_1080p_main_bframes.h264").read_bytes())
     decoder = open_or_skip(lambda: VideoDecoder(Codec.H264, pool=1))
@@ -187,6 +190,7 @@ def test_frames_hold_the_pool_until_released():
     decoder.decode(units[stuck], stuck)
 
 
+@pytest.mark.codec_sessions(1)
 def test_a_frame_is_read_only():
     units = codec.access_units((TESTDATA / "h264_1080p_main_bframes.h264").read_bytes())
     decoder = open_or_skip(lambda: VideoDecoder(Codec.H264))
@@ -220,6 +224,7 @@ def nv12(width, height, luma):
     return t
 
 
+@pytest.mark.codec_sessions(2)
 def test_a_source_from_the_encoder_is_read_in_place():
     w, h, count = 320, 240, 4
     encoder = open_or_skip(
@@ -254,6 +259,7 @@ def test_a_source_from_the_encoder_is_read_in_place():
         assert abs(mean - (16 + f.pts * 48)) < 4, f.pts
 
 
+@pytest.mark.codec_sessions(2)
 def test_a_decoded_frame_encodes_in_the_same_package():
     decoder = open_or_skip(lambda: VideoDecoder(Codec.H264))
     stream = (TESTDATA / "h264_resolution_change.h264").read_bytes()
@@ -275,6 +281,7 @@ def test_a_decoded_frame_encodes_in_the_same_package():
     assert packets[0].keyframe
 
 
+@pytest.mark.codec_sessions(4)
 def test_two_threads_encode_at_once():
     w, h, count = 320, 240, 6
     encoders = [
@@ -322,6 +329,7 @@ def test_two_threads_encode_at_once():
             assert abs(mean - (16 + i * 120 + f.pts * 8)) < 4, (i, f.pts)
 
 
+@pytest.mark.codec_sessions(2)
 def test_an_h264_stream_round_trips_through_the_hardware():
     w, h, count = 320, 240, 8
     encoder = open_or_skip(

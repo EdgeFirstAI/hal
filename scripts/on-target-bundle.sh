@@ -200,7 +200,7 @@ build_libs() {
 
 # Unpacks the wheels into python/, and the wheels tagged for one CPython
 # version (cp311-cp311) into python-cp311/, and copies the Python codec tests
-# into tests/.
+# and the helpers they import into tests/.
 bundle_python() {
   local wheels="$1" w dest tag
   echo "==> unpacking the Python wheels from ${wheels}"
@@ -217,7 +217,7 @@ bundle_python() {
     python3 -m zipfile -e "${w}" "${dest}"
     echo "    $(basename "${w}")"
   done
-  cp tests/__init__.py tests/conftest.py "${OUT}/tests/"
+  cp tests/__init__.py tests/conftest.py tests/codec_sessions.py "${OUT}/tests/"
   cp -a tests/codec "${OUT}/tests/"
   return 0
 }

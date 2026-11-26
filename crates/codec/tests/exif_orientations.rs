@@ -22,9 +22,16 @@
 //!   7 → (90,  true)    Transverse (90° CCW + mirror)
 //!   8 → (270, false)   Rotate 90° CCW
 
-use edgefirst_codec::{peek_info, ImageDecoder, ImageLoad};
+use edgefirst_codec::{peek_info, Engine, ImageDecoder, ImageLoad};
 use edgefirst_tensor::{PixelFormat, Tensor, TensorMemory};
 use std::path::PathBuf;
+
+/// An image decoder on the CPU engine.
+fn cpu_decoder() -> ImageDecoder {
+    let mut decoder = ImageDecoder::new();
+    decoder.set_engine(Engine::Cpu);
+    decoder
+}
 
 const W: usize = 1280;
 const H: usize = 720;
@@ -90,7 +97,7 @@ fn check_jpeg_orientation(o: u32) {
         edgefirst_tensor::CpuAccess::ReadWrite,
     )
     .unwrap();
-    let mut decoder = ImageDecoder::new();
+    let mut decoder = cpu_decoder();
     let info = tensor
         .load_image(&mut decoder, &data)
         .unwrap_or_else(|e| panic!("decode orientation {o}: {e}"));
@@ -177,7 +184,7 @@ fn check_png_orientation(o: u32) {
         edgefirst_tensor::CpuAccess::ReadWrite,
     )
     .unwrap();
-    let mut decoder = ImageDecoder::new();
+    let mut decoder = cpu_decoder();
     let info = tensor
         .load_image(&mut decoder, &data)
         .unwrap_or_else(|e| panic!("decode PNG orientation {o}: {e}"));

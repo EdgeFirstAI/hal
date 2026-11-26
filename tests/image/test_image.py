@@ -4,6 +4,7 @@
 import math
 import os
 import sys
+import threading
 
 import numpy as np
 import pytest
@@ -649,6 +650,7 @@ def test_decode_image_method_that_needs_a_cpu_write_raises_on_a_read_tensor():
         dma.decode_image(odd)
 
 
+@pytest.mark.codec_sessions(1)
 def test_a_hardware_jpeg_decoder_writes_a_read_dma_tensor_in_place():
     """Under ``Engine.Auto`` a V4L2 JPEG decoder writes a read-only DMA tensor
     by DMA: an aligned image decodes without a CPU access."""
@@ -663,7 +665,21 @@ def test_a_hardware_jpeg_decoder_writes_a_read_dma_tensor_in_place():
         data = fh.read()
     w, h = _image_size("testdata/zidane.jpg")
     dma = _dma_or_skip(CodecTensor, w, h, PixelFormat.Nv12, access="read")
-    info = dma.decode_image(data)
+    # A thread's decoder closes its device when the thread ends.
+    outcome = []
+
+    def decode():
+        try:
+            outcome.append(dma.decode_image(data))
+        except BaseException as e:  # noqa: BLE001
+            outcome.append(e)
+
+    worker = threading.Thread(target=decode)
+    worker.start()
+    worker.join()
+    if isinstance(outcome[0], BaseException):
+        raise outcome[0]
+    info = outcome[0]
     assert (info.width, info.height) == (w, h)
     with dma.map("read") as m:
         spread = float(np.asarray(m).reshape(-1)[: w * h].std())

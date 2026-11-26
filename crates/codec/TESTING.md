@@ -72,7 +72,7 @@ cargo test -p edgefirst-codec --lib
 cargo test -p edgefirst-codec decode_zidane_nv12
 ```
 
-Tests run in parallel; see the root [TESTING.md § Parallel Execution](../../TESTING.md#parallel-execution). A test that opens a hardware codec first takes a slot per session from `tests/common/sessions.rs` (`sessions::take(n)`), which keeps at most four hardware sessions open at once across every test thread and process.
+Tests run in parallel; see the root [TESTING.md § Parallel Execution](../../TESTING.md#parallel-execution). A test that opens a hardware codec first takes a slot per session from `tests/common/sessions.rs` (`sessions::take(n)`), which keeps at most four hardware sessions open at once across every test thread and process. A test that only needs a decoded picture decodes on `Engine::Cpu`: under `Engine::Auto` a V4L2 JPEG decoder takes even a host-memory destination.
 
 The `v4l2_jpeg.rs` tests are device-gated: they skip cleanly unless a V4L2 JPEG
 M2M device is present, so they pass on any host and exercise hardware only on a

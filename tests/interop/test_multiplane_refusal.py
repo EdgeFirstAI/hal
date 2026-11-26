@@ -72,6 +72,7 @@ def test_a_one_plane_tensor_still_crosses():
 
 
 @linux_only
+@pytest.mark.codec_sessions(1)
 def test_a_decoded_video_frame_is_refused_by_the_image_package():
     from edgefirst import codec
     from edgefirst.image import ImageProcessor

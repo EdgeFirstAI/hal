@@ -7909,6 +7909,7 @@ mod gl_tests {
         )
         .unwrap();
         let mut dec = ImageDecoder::new();
+        dec.set_engine(edgefirst_codec::Engine::Cpu);
         let info = src_t
             .load_image(&mut dec, &edgefirst_bench::testdata::read(fixture))
             .unwrap();
@@ -10793,6 +10794,7 @@ mod gl_tests {
         };
         let src_dma = {
             let mut dec = ImageDecoder::new();
+            dec.set_engine(edgefirst_codec::Engine::Cpu);
             src_grey.load_image(&mut dec, jpeg).unwrap();
             TensorDyn::from(src_grey)
         };
@@ -10808,6 +10810,7 @@ mod gl_tests {
             )
             .unwrap();
             let mut dec = ImageDecoder::new();
+            dec.set_engine(edgefirst_codec::Engine::Cpu);
             t.load_image(&mut dec, jpeg).unwrap();
             TensorDyn::from(t)
         };
