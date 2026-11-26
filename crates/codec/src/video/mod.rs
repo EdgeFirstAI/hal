@@ -604,13 +604,16 @@ impl VideoEncoder {
         self.backend.info()
     }
 
-    /// Allocates a source image of the configured size and input format
-    /// that the encoder reads in place, without a copy.
+    /// Allocates a source image of the configured size and input format in
+    /// the memory the encoder reads: one it reads in place, without a copy,
+    /// where it can.
     ///
     /// On V4L2 the image is laid out as the device reads it: its row stride
     /// and, for NV12, the offset of its chroma plane can be larger than the
     /// picture needs, and the chroma plane can be a buffer of its own. On
-    /// Windows it is a GPU image of the configured size.
+    /// Windows it is a GPU image of the configured size for an encoder that
+    /// reads D3D11 textures, and a host-memory image, which the encoder
+    /// copies into its input sample, for one that does not.
     ///
     /// # Errors
     ///

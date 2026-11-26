@@ -840,12 +840,19 @@ impl EncoderBackend for MfEncoder {
 
     fn create_source(&self) -> Result<TensorDyn> {
         let (w, h) = (self.config.width as usize, self.config.height as usize);
+        // A D3D11 texture for an encoder that reads textures, host memory for
+        // one that reads system-memory samples.
+        let memory = if self.textures.is_some() {
+            TensorMemory::DmaBuf
+        } else {
+            TensorMemory::Mem
+        };
         Ok(TensorDyn::image(
             w,
             h,
             self.config.input_format,
             DType::U8,
-            Some(TensorMemory::DmaBuf),
+            Some(memory),
             CpuAccess::ReadWrite,
         )?)
     }
