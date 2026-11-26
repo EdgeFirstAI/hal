@@ -355,3 +355,134 @@ impl Drop for GlProgram {
         }));
     }
 }
+
+/// The setup a [`LazyProgram`] runs once after its link, with the program
+/// bound: it loads constant uniforms and returns the link-time state `L`.
+type ProgramSetup<L> = Box<dyn Fn(&GlProgram) -> Result<L, crate::Error>>;
+
+/// A GL program over the shared vertex shader and `fragment`, compiled and
+/// linked the first time [`get`](Self::get) is called on the GL thread.
+///
+/// A failed build is logged once and kept: every later `get` returns
+/// [`crate::Error::NotSupported`] without building again.
+pub(super) struct LazyProgram<L = ()> {
+    fragment: std::borrow::Cow<'static, str>,
+    setup: ProgramSetup<L>,
+    linked: std::cell::OnceCell<Result<(GlProgram, L), String>>,
+}
+
+impl<L> LazyProgram<L> {
+    /// A program over `fragment` whose `setup` runs after the link.
+    pub(super) fn new(
+        fragment: impl Into<std::borrow::Cow<'static, str>>,
+        setup: impl Fn(&GlProgram) -> Result<L, crate::Error> + 'static,
+    ) -> Self {
+        Self {
+            fragment: fragment.into(),
+            setup: Box::new(setup),
+            linked: std::cell::OnceCell::new(),
+        }
+    }
+
+    /// The program, linked and set up now.
+    ///
+    /// # Errors
+    ///
+    /// The compile, link or setup error. Nothing is logged or kept.
+    pub(super) fn link_now(self) -> Result<Self, crate::Error> {
+        let built = self.build()?;
+        let _ = self.linked.set(Ok(built));
+        Ok(self)
+    }
+
+    /// Compiles, links and sets up the program, leaving the program bound
+    /// before the call bound.
+    fn build(&self) -> Result<(GlProgram, L), crate::Error> {
+        let mut bound = 0i32;
+        // SAFETY: on the GL thread with the processor's context current.
+        unsafe { edgefirst_gl::gl::GetIntegerv(edgefirst_gl::gl::CURRENT_PROGRAM, &mut bound) };
+        let built = GlProgram::new(super::shaders::generate_vertex_shader(), &self.fragment)
+            .and_then(|program| (self.setup)(&program).map(|state| (program, state)));
+        // SAFETY: as above; `bound` was the current program or 0.
+        unsafe { edgefirst_gl::gl::UseProgram(bound as u32) };
+        built
+    }
+
+    /// The program and its link-time state, linking it on the first call.
+    /// The program bound before the call stays bound.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::NotSupported`] when the program fails to compile, link
+    /// or set up, on this call and every later one.
+    pub(super) fn get(&self) -> Result<(&GlProgram, &L), crate::Error> {
+        let linked = self.linked.get_or_init(|| {
+            self.build().map_err(|e| {
+                log::warn!(
+                    "a GL program failed to build; conversions that need it decline on GL: {e}"
+                );
+                e.to_string()
+            })
+        });
+        match linked {
+            Ok((program, state)) => Ok((program, state)),
+            Err(e) => Err(crate::Error::NotSupported(format!(
+                "a GL program failed to build: {e}"
+            ))),
+        }
+    }
+
+    /// The program, linking it on the first call; see [`get`](Self::get).
+    pub(super) fn program(&self) -> Result<&GlProgram, crate::Error> {
+        self.get().map(|(program, _)| program)
+    }
+
+    /// The program's GL name, linking it on the first call; see
+    /// [`get`](Self::get).
+    pub(super) fn id(&self) -> Result<u32, crate::Error> {
+        self.get().map(|(program, _)| program.id)
+    }
+
+    /// The program's link-time state, linking it on the first call; see
+    /// [`get`](Self::get).
+    pub(super) fn state(&self) -> Result<&L, crate::Error> {
+        self.get().map(|(_, state)| state)
+    }
+
+    /// The program if it is linked, without building it.
+    pub(super) fn linked(&self) -> Option<&GlProgram> {
+        match self.linked.get() {
+            Some(Ok((program, _))) => Some(program),
+            _ => None,
+        }
+    }
+
+    /// Whether a build was attempted, successful or not.
+    #[cfg(test)]
+    pub(super) fn is_built(&self) -> bool {
+        self.linked.get().is_some()
+    }
+
+    /// Records a failed build with `message` in an unbuilt program.
+    #[cfg(test)]
+    pub(super) fn fail_build(&self, message: &str) {
+        let _ = self.linked.set(Err(message.to_owned()));
+    }
+}
+
+impl LazyProgram<()> {
+    /// A program over `fragment` with no setup.
+    pub(super) fn plain(fragment: impl Into<std::borrow::Cow<'static, str>>) -> Self {
+        Self::new(fragment, |_| Ok(()))
+    }
+
+    /// A program over `fragment` whose sampler `name` reads texture unit
+    /// `unit`.
+    pub(super) fn sampling(
+        fragment: impl Into<std::borrow::Cow<'static, str>>,
+        name: &'static CStr,
+        unit: i32,
+    ) -> Self {
+        Self::new(fragment, move |program| program.load_uniform_1i(name, unit))
+    }
+}
