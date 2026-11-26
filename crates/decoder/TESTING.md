@@ -70,24 +70,20 @@ crates/decoder/
 
 ## Running Tests
 
-All `cargo test` invocations below pass `-- --test-threads=1` per the
-workspace single-threaded rule
-([root TESTING.md § Single-threaded execution](https://github.com/EdgeFirstAI/hal/blob/main/TESTING.md#single-threaded-execution)).
-Decoder tests are CPU-only, but the rule applies workspace-wide so commands
-stay consistent and copy-pasteable across crates.
+Tests run in parallel, at the default thread count ([root TESTING.md § Parallel Execution](https://github.com/EdgeFirstAI/hal/blob/main/TESTING.md#parallel-execution)).
 
 ```bash
 # Full suite (unit + integration + doc-tests)
-cargo test -p edgefirst-decoder -- --test-threads=1
+cargo test -p edgefirst-decoder
 
 # Just the integration tests
-cargo test -p edgefirst-decoder --tests -- --test-threads=1
+cargo test -p edgefirst-decoder --tests
 
 # Single integration test
-cargo test -p edgefirst-decoder --test per_scale_parity -- --test-threads=1
+cargo test -p edgefirst-decoder --test per_scale_parity
 
 # Doc-tests only
-cargo test -p edgefirst-decoder --doc -- --test-threads=1
+cargo test -p edgefirst-decoder --doc
 ```
 
 ## Special Requirements
@@ -100,7 +96,7 @@ cargo test -p edgefirst-decoder --doc -- --test-threads=1
 - **No hardware gates.** All decoder tests run on any host; there is no GPU
   or NPU dependency.
 - **`tracker` feature** — gates the `decode_tracked` test paths. Run
-  `cargo test -p edgefirst-decoder --features tracker -- --test-threads=1` to exercise them.
+  `cargo test -p edgefirst-decoder --features tracker` to exercise them.
 - **Per-scale fixtures** — synthetic schemas under
   [`testdata/per_scale/`](https://github.com/EdgeFirstAI/hal/tree/main/testdata/per_scale)
   validate the per-scale planner against multiple split-tensor topologies

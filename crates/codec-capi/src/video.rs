@@ -21,7 +21,7 @@ use edgefirst_tensor::{PixelFormat, Region, TensorDyn};
 use edgefirst_tensor_ffi::EfTensor;
 
 use crate::engine::{codec_arg, engine_arg, engine_code, transfer_code};
-use crate::error::{fail, guard, guard_new, invalid};
+use crate::error::{fail, guard, guard_new, guard_ptr, invalid};
 
 /// Encode the frame as a key frame (an IDR picture); a flag of
 /// [`ef_video_encoder_encode`].
@@ -381,7 +381,12 @@ pub struct EfVideoEncoderInfo {
     /// an `ef_codec_transfer`. Crops and host-memory sources may take a
     /// copy where this says none. A Media Foundation hardware encoder
     /// decides on its first frame whether it reads sources in place, and
-    /// reports `EF_CODEC_TRANSFER_GPU_COPY` until then.
+    /// reports `EF_CODEC_TRANSFER_GPU_COPY` until then. A V4L2 encoder
+    /// reports how the latest source reached the device:
+    /// `EF_CODEC_TRANSFER_CPU_COPY` when it was copied into the device's
+    /// layout, `EF_CODEC_TRANSFER_ZERO_COPY` before the first frame and when
+    /// the device read it in place, as it reads a source from
+    /// [`ef_video_encoder_create_source`].
     pub transfer: u32,
     /// The encoder is dedicated hardware rather than software the platform
     /// provides.
@@ -466,11 +471,13 @@ pub unsafe extern "C" fn ef_video_encoder_free(e: *mut EfVideoEncoder) {
 ///
 /// `src` must have the configured pixel format and, without `crop`, the
 /// configured size. `crop`, when not `NULL`, is the part of `src` to
-/// encode, exactly the configured size. DMA-BUF and D3D11 sources are read
-/// in place: the call returns once the device has finished reading `src`,
-/// so the caller may reuse it afterwards. Every source of one stream must
-/// have the same row stride. `pts` is returned unchanged on the access
-/// unit; `flags` is 0 or `EF_VIDEO_ENCODE_KEYFRAME`.
+/// encode, exactly the configured size. A source the device can read in
+/// place is read there; [`ef_video_encoder_create_source`] allocates one.
+/// Any other source, of any row stride and in any memory the CPU can read,
+/// is copied into a buffer the device can read first. Either way the call
+/// returns once `src` has been read, so the caller may reuse it
+/// afterwards. `pts` is returned unchanged on the access unit; `flags` is 0
+/// or `EF_VIDEO_ENCODE_KEYFRAME`.
 ///
 /// Platforms: Linux, Windows.
 ///
@@ -519,6 +526,37 @@ pub unsafe extern "C" fn ef_video_encoder_encode(
             }
             Err(err) => fail(&err),
         }
+    })
+}
+
+/// Allocates a source image of the configured size and pixel format in the
+/// memory the encoder reads: one it reads in place, without a copy, where it
+/// can.
+///
+/// On Linux the image is laid out as the V4L2 device reads it: its row
+/// stride and, for NV12, the offset of its chroma plane can be larger than
+/// the picture needs, and the chroma plane can be a buffer of its own. On
+/// Windows it is a GPU image of the configured size for an encoder that
+/// reads D3D11 textures, and a host-memory image, which the encoder copies
+/// into its input sample, for one that does not.
+///
+/// Platforms: Linux, Windows.
+///
+/// @return a tensor the caller owns, freed with `ef_tensor_free`; `NULL`
+///         with `errno` `EINVAL` for a `NULL` encoder, `ENODEV` when there
+///         is no GPU buffer allocator, or `EIO` when the image cannot be
+///         allocated or the device does not report its layout.
+///
+/// # Safety
+/// `e` must be `NULL` or a live encoder.
+#[no_mangle]
+pub unsafe extern "C" fn ef_video_encoder_create_source(e: *const EfVideoEncoder) -> *mut EfTensor {
+    guard_ptr(|| {
+        let e = unsafe { e.as_ref() }.ok_or_else(|| invalid("the encoder is NULL"))?;
+        e.inner
+            .create_source()
+            .map(TensorDyn::into_raw)
+            .map_err(|err| fail(&err))
     })
 }
 
@@ -969,6 +1007,14 @@ mod tests {
     fn a_region_is_four_u32() {
         assert_eq!(std::mem::size_of::<EfCodecRegion>(), 16);
         assert_eq!(std::mem::align_of::<EfCodecRegion>(), 4);
+    }
+
+    #[test]
+    fn a_null_encoder_makes_no_source() {
+        assert!(unsafe { ef_video_encoder_create_source(std::ptr::null()) }.is_null());
+        assert_eq!(errno::errno().0, libc::EINVAL);
+        let why = unsafe { std::ffi::CStr::from_ptr(crate::error::ef_codec_last_error()) };
+        assert!(why.to_string_lossy().contains("NULL"), "{why:?}");
     }
 
     #[test]

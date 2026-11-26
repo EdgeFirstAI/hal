@@ -413,6 +413,7 @@ dependencies = [
  "edgefirst-v4l2",
  "jpeg-encoder",
  "kamadak-exif",
+ "libc",
  "libloading",
  "log",
  "num-traits",

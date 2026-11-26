@@ -490,7 +490,12 @@ class EncoderInfo:
     hardware: bool
     """Whether it encodes on dedicated hardware."""
     transfer: Transfer
-    """How sources reach it, for a source in the memory it prefers."""
+    """How sources reach it, for a source in the memory it prefers. A V4L2
+    encoder reports how the latest source reached the device:
+    ``Transfer.CpuCopy`` when it was copied into the device's layout,
+    ``Transfer.ZeroCopy`` before the first frame and when the device read
+    it in place, as it reads a source from
+    :meth:`VideoEncoder.create_source`."""
 
 class VideoEncoder:
     """Encodes image tensors into an H.264 or MJPEG stream on hardware.
@@ -499,8 +504,8 @@ class VideoEncoder:
     opening fails.
 
     Platforms:
-        Linux: V4L2 memory-to-memory encoders; DMA-BUF sources are read in
-        place.
+        Linux: V4L2 memory-to-memory encoders; DMA-BUF sources laid out as
+        the device reads them are read in place, others are copied first.
         Windows: Media Foundation; D3D11 sources are read in place.
         Elsewhere opening fails with ``NoDeviceError``.
     """
@@ -560,6 +565,11 @@ class VideoEncoder:
         Returns the next access unit, or ``None`` while the encoder holds
         pictures back; :meth:`flush` returns the rest at the end.
 
+        A source the device can read in place is read there;
+        :meth:`create_source` allocates one. Any other source, of any row
+        stride and in any memory the CPU can read, is copied into a buffer
+        the device can read first.
+
         Args:
             src: An image tensor from any ``edgefirst`` package, of the
                 configured format and size (or larger, with ``crop``).
@@ -575,6 +585,27 @@ class VideoEncoder:
 
     def flush(self) -> list[EncodedFrame]:
         """Ends the stream and returns the access units still held."""
+
+    def create_source(self) -> Tensor:
+        """Allocates a source image of the configured size and format in the
+        memory the encoder reads: one it reads in place, without a copy,
+        where it can.
+
+        On Linux the image is laid out as the V4L2 device reads it: its row
+        stride and, for NV12, the offset of its chroma plane can be larger
+        than the picture needs, and the chroma plane can be a buffer of its
+        own. On Windows it is a GPU image of the configured size for an
+        encoder that reads D3D11 textures, and a host-memory image, which
+        the encoder copies into its input sample, for one that does not.
+
+        Such an image is a ``edgefirst.codec`` tensor; one whose chroma plane
+        is a separate tensor cannot be passed to another edgefirst package.
+
+        Raises:
+            NoDeviceError: There is no GPU buffer allocator.
+            CodecError: The image cannot be allocated, or the device does not
+                report its layout.
+        """
 
     @property
     def info(self) -> EncoderInfo:
@@ -629,6 +660,11 @@ class Frame(Tensor):
     A frame is read-only. Changing its shape, format, quantization or
     colorimetry, or decoding or writing into it, raises ``TypeError``, and a
     writable CPU map raises ``RuntimeError``.
+
+    A V4L2 frame's chroma plane is a separate tensor, so it cannot be passed
+    to another edgefirst package: ``edgefirst.image.ImageProcessor.convert``
+    and every other call outside ``edgefirst.codec`` raise
+    ``NotImplementedError`` for it.
     """
 
     @property

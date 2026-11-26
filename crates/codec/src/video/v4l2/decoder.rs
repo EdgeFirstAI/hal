@@ -159,6 +159,9 @@ struct Stream {
     changing: bool,
     /// `V4L2_DEC_CMD_STOP` was issued and the drain has not finished.
     draining: bool,
+    /// The CAPTURE queue returned the buffer flagged last with neither a
+    /// source change nor a drain pending.
+    ended: bool,
 }
 
 pub(crate) struct V4l2Decoder {
@@ -186,9 +189,16 @@ pub(crate) struct V4l2Decoder {
 impl V4l2Decoder {
     /// Opens the first device that decodes H.264 to NV12.
     pub fn open(config: DecoderConfig) -> Result<Self> {
+        let mut busy = None;
         for path in candidates(ENV_DECODER) {
-            let Some(device) = M2mDevice::open(&path) else {
-                continue;
+            let device = match M2mDevice::try_open(&path) {
+                Ok(Some(device)) => device,
+                Ok(None) => continue,
+                Err(e) => {
+                    log::debug!("{e}");
+                    busy.get_or_insert(e);
+                    continue;
+                }
             };
             if !device.lists(device.output, uapi::V4L2_PIX_FMT_H264) {
                 continue;
@@ -231,7 +241,7 @@ impl V4l2Decoder {
                 needs_headers: false,
             });
         }
-        Err(CodecError::NoDevice("no V4L2 H.264 decoder found".into()))
+        Err(busy.unwrap_or_else(|| CodecError::NoDevice("no V4L2 H.264 decoder found".into())))
     }
 
     /// Sets the coded format, subscribes to events and starts the bitstream
@@ -288,6 +298,7 @@ impl V4l2Decoder {
             capture: None,
             changing: false,
             draining: false,
+            ended: false,
         });
         Ok(())
     }
@@ -761,11 +772,11 @@ impl V4l2Decoder {
             if ready.output {
                 self.reclaim_bitstream()?;
             }
-            if ready.capture {
-                self.collect()?;
-            }
             if ready.event {
                 self.handle_events()?;
+            }
+            if ready.capture {
+                self.collect()?;
             }
             // Stop at the deadline.
             if left.is_zero() {
@@ -778,6 +789,7 @@ impl V4l2Decoder {
     /// holds are queued again.
     fn restart(&mut self) -> Result<()> {
         let stream = self.stream.as_mut().expect("streaming");
+        stream.ended = false;
         stream.m2m.output().stream_off().map_err(device_error)?;
         stream.free = (0..stream.bitstream.len() as u32).collect();
         stream.m2m.output().stream_on().map_err(device_error)?;
@@ -827,10 +839,14 @@ impl V4l2Decoder {
             match ev.source_change() {
                 Some(changes) if changes & uapi::V4L2_EVENT_SRC_CH_RESOLUTION != 0 => {
                     let stream = self.stream.as_mut().expect("streaming");
-                    if stream.capture.is_some() {
-                        stream.changing = true;
-                    } else {
+                    if stream.capture.is_none() {
                         self.setup_capture()?;
+                    } else if stream.ended {
+                        // The old format's pictures are all dequeued.
+                        stream.changing = true;
+                        self.after_last()?;
+                    } else {
+                        stream.changing = true;
                     }
                 }
                 Some(changes) => log::debug!("{}: source change {changes:#x}", self.path),
@@ -841,8 +857,8 @@ impl V4l2Decoder {
     }
 
     /// Dequeues every decoded picture. Returns whether a buffer flagged last
-    /// (or the end of the queue) was reached; a pending source change is
-    /// then applied.
+    /// (or the end of the queue) was reached that ended no source change; a
+    /// pending source change is applied instead.
     fn collect(&mut self) -> Result<bool> {
         loop {
             let stream = self.stream.as_ref().expect("streaming");
@@ -878,25 +894,31 @@ impl V4l2Decoder {
             }
             if last {
                 log::debug!("{}: last buffer {} ({used} bytes)", self.path, done.index);
+                // Takes a source change reported with the last buffer.
+                self.handle_events()?;
                 return self.after_last();
             }
         }
     }
 
-    /// The CAPTURE queue ended a sequence: applies a pending source change,
-    /// or reports the end of a drain.
+    /// The CAPTURE queue ended a sequence: applies a pending source change.
+    /// Returns whether no source change was pending, so the sequence ended
+    /// a drain or the stream.
     fn after_last(&mut self) -> Result<bool> {
         let stream = self.stream.as_mut().expect("streaming");
-        if stream.changing {
-            stream.changing = false;
-            let old = stream.capture.take();
-            stream.m2m.capture_mut().free().map_err(device_error)?;
-            if let Some(old) = old {
-                self.retire(old);
-            }
-            self.setup_capture()?;
+        if !stream.changing {
+            stream.ended = !stream.draining;
+            return Ok(true);
         }
-        Ok(true)
+        stream.changing = false;
+        stream.ended = false;
+        let old = stream.capture.take();
+        stream.m2m.capture_mut().free().map_err(device_error)?;
+        if let Some(old) = old {
+            self.retire(old);
+        }
+        self.setup_capture()?;
+        Ok(false)
     }
 
     /// The caller's PTS for sequence number `seq`.
@@ -1179,11 +1201,8 @@ impl V4l2Decoder {
         if ready.event {
             self.handle_events()?;
         }
-        if ready.capture {
-            let changing = self.stream.as_ref().is_some_and(|s| s.changing);
-            if self.collect()? && !changing {
-                return Ok(true);
-            }
+        if ready.capture && self.collect()? {
+            return Ok(true);
         }
         Ok(false)
     }

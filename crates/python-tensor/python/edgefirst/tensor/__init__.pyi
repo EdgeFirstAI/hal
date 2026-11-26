@@ -192,6 +192,10 @@ class EdgeFirstTensorExportable(Protocol):
     protocol. Each ``edgefirst.*`` package registers its own ``Tensor`` type
     object, so consumers duck type
     (``hasattr(obj, "__edgefirst_tensor__")``) and do not use ``isinstance``.
+
+    A tensor whose chroma plane is a separate tensor (two-buffer NV12, chroma
+    at an offset, a decoded video frame) cannot cross a package boundary: its
+    ``__edgefirst_tensor__`` raises ``NotImplementedError``.
     """
 
     def __edgefirst_tensor__(self, access: str | None = None) -> object: ...
@@ -812,6 +816,9 @@ class Tensor:
             ValueError: if ``access`` is not one of the values above.
             PermissionError: if ``access`` pins outside the tensor's
                 declared CPU access (see :attr:`declared_cpu_access`).
+            NotImplementedError: if the tensor's chroma plane is a separate
+                tensor (two-buffer NV12, chroma at an offset, a decoded video
+                frame), which cannot be passed to another edgefirst package.
         """
 
     def pin_host(self, access: Literal["read", "write", "readwrite"]) -> HostPin:

@@ -55,25 +55,25 @@ crates/image/
 ## Running Tests
 
 ```bash
-# Full image suite — single-threaded is mandatory
-cargo test -p edgefirst-image -- --test-threads=1
+# Full image suite
+cargo test -p edgefirst-image
 
 # Single backend (skips others)
 EDGEFIRST_DISABLE_GL=1 EDGEFIRST_DISABLE_G2D=1 \
-  cargo test -p edgefirst-image -- --test-threads=1
+  cargo test -p edgefirst-image
 
 # Just the GL tests (skipped automatically without GPU)
-cargo test -p edgefirst-image --lib gl::tests -- --test-threads=1
+cargo test -p edgefirst-image --lib gl::tests
 
 # Doc-tests
-cargo test -p edgefirst-image --doc -- --test-threads=1
+cargo test -p edgefirst-image --doc
 ```
 
 ## Special Requirements
 
-### Single-threaded execution is mandatory
+### Parallel execution
 
-All `edgefirst-image` tests must run with `--test-threads=1`. The image crate is the reason for the [project-wide single-threaded rule](https://github.com/EdgeFirstAI/hal/blob/main/TESTING.md#single-threaded-execution) — concurrent EGL, G2D, and DMA-heap operations crash on Vivante hardware and risk CMA pool exhaustion on memory-constrained targets. The [`Makefile`](https://github.com/EdgeFirstAI/hal/blob/main/Makefile) enforces `-j 1` automatically. See [`ARCHITECTURE.md`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/ARCHITECTURE.md#gl-concurrency-model-serialization-policy) for the `GL_MUTEX` implementation.
+`edgefirst-image` tests run in parallel like the rest of the workspace ([root TESTING.md § Parallel Execution](https://github.com/EdgeFirstAI/hal/blob/main/TESTING.md#parallel-execution)), under nextest and under `cargo test`. Tests that need a GL environment setting (`EDGEFIRST_PROTO_COMPUTE`, `EDGEFIRST_GL_NO_FLOAT_LINEAR`, `EDGEFIRST_NV_CONVERT_PATH`, `EDGEFIRST_GL_SERIALIZE`) build their processor with `GLProcessorThreaded::with_env` instead of setting the variable, and the `ImageProcessor` tests do the same for `EDGEFIRST_FORCE_BACKEND`, `EDGEFIRST_DISABLE_*` and `EDGEFIRST_INTERPOLATION` with `ImageProcessor::with_config_env`. A test that needs `GLProcessorST` itself runs it through `GLProcessorThreaded::with_st`, on the worker thread and under the driver's serialization policy. Don't construct a `GLProcessorThreaded` or an `ImageProcessor` inside a `with_st` closure: under the `Full` policy the closure holds the lock the new worker waits for. See [`ARCHITECTURE.md`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/ARCHITECTURE.md#gl-concurrency-model-serialization-policy) for the `GL_MUTEX` implementation.
 
 ### GL hardware-gated tests
 
@@ -147,8 +147,7 @@ for the cell catalog and device matrix. The portable tiers above still
 cover the engine code Android shares with Linux/macOS. **Acceptance bar for newly ported tests:** green under
 `EDGEFIRST_GL_SERIALIZE=full` — GitHub's macOS runners expose a
 paravirtualized Metal GPU that takes the Full serialization policy.
-The macOS lane runs the first two tiers; `scripts/test-macos.sh`'s feature
-set must stay identical across its coverage passes (see the script comment).
+The macOS lane runs the first two tiers, built by `scripts/test-macos.sh` with the `edgefirst-image/opengl` feature.
 
 The Neutron-scenario tests gate on `/dev/neutron0` as a platform
 discriminator for i.MX 95 with Mali GPU. This device node indicates that
@@ -164,7 +163,7 @@ on i.MX 95, where `libg2d.so.2` loads but G2D is not supported) skips them
 even when G2D initializes. To exercise them locally on i.MX hardware:
 
 ```bash
-HAL_TEST_REQUIRE_DMA=1 HAL_TEST_REQUIRE_G2D=1 cargo test -p edgefirst-image g2d -- --test-threads=1
+HAL_TEST_REQUIRE_DMA=1 HAL_TEST_REQUIRE_G2D=1 cargo test -p edgefirst-image g2d
 ```
 
 ### Device-node gates
@@ -194,7 +193,7 @@ Example — run tests without any GPU backend:
 
 ```bash
 EDGEFIRST_DISABLE_GL=1 EDGEFIRST_DISABLE_G2D=1 \
-  cargo test -p edgefirst-image -- --test-threads=1
+  cargo test -p edgefirst-image
 ```
 
 ### Golden fixtures for cropped convert
@@ -342,11 +341,7 @@ code can actually execute:
 The **macOS coverage lane** ([`scripts/test-macos.sh`](https://github.com/EdgeFirstAI/hal/blob/main/scripts/test-macos.sh)
 `COVERAGE=1`) is what makes the IOSurface F16 render path count: macOS runs
 OpenGL ES on ANGLE-over-Metal, so `test_macos_gl_pbuffer_cache_reuses_surfaces`
-and the F16 IOSurface convert tests exercise the real GPU. Because the test
-binaries must be codesigned with the library-validation entitlement before
-they can `dlopen` ANGLE, the coverage build is **two-pass**: build+run
-instrumented (GL tests self-skip), codesign, then re-run with
-`HAL_TEST_ALLOW_DLOPEN_ANGLE=1` so the GL path executes under instrumentation.
+and the F16 IOSurface convert tests exercise the real GPU. The test binaries must be codesigned with the library-validation entitlement before they can `dlopen` ANGLE, so the script builds them instrumented, signs every one, and runs the suite once with `HAL_TEST_ALLOW_DLOPEN_ANGLE=1`, and the GL path executes under instrumentation.
 
 The **software-gl coverage lane** runs the Linux GL backend on **Mesa
 llvmpipe**. HAL normally *rejects* software renderers (they are slower than
@@ -357,13 +352,11 @@ llvmpipe EGL display. llvmpipe executes the *same* RGBA16F/R32F fragment
 shader the GPU would, so the `convert_f16_nchw_pbo_roundtrip` /
 `convert_f32_nhwc_pbo_roundtrip` value-checks are numerically valid — this
 lane genuinely covers the PBO render path (`upload_float_src`,
-`draw_float_quad`, `convert_float_to_pbo`) without any GPU. The lane is
-**bonus-coverage only** (best-effort steps); the x86/macOS/hardware lanes are
-the authoritative test gates. To reproduce locally on a Linux host with Mesa:
+`draw_float_quad`, `convert_float_to_pbo`) without any GPU. On x86_64 Linux it is the one lane that runs this crate's tests, CPU and GL, and a failure fails it. The lane has no DMA heap, so the DMA tests skip there and run on the aarch64 and board lanes. To reproduce locally on a Linux host with Mesa:
 
 ```bash
 LIBGL_ALWAYS_SOFTWARE=1 EGL_PLATFORM=surfaceless EDGEFIRST_ALLOW_SOFTWARE_GL=1 \
-  cargo test -p edgefirst-image --lib -- --test-threads=1
+  cargo test -p edgefirst-image --lib
 ```
 
 ### Known ceiling: Linux GL float DMA-BUF render path

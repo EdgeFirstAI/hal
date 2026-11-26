@@ -8,11 +8,18 @@
 //! cells for odd-W/H JPEG fixtures and analytically-constructed odd-both
 //! sources, and the resize strided-source path.
 
-use edgefirst_codec::{ImageDecoder, ImageLoad};
+use edgefirst_codec::{Engine, ImageDecoder, ImageLoad};
 use edgefirst_image::{CPUProcessor, Crop, ImageProcessorTrait};
 use edgefirst_tensor::{
     DType, PixelFormat, Tensor, TensorDyn, TensorMapTrait, TensorMemory, TensorTrait,
 };
+
+/// An image decoder on the CPU engine.
+fn cpu_decoder() -> ImageDecoder {
+    let mut decoder = ImageDecoder::new();
+    decoder.set_engine(Engine::Cpu);
+    decoder
+}
 
 #[path = "../../tensor/tests/support/dma_require.rs"]
 #[allow(dead_code)]
@@ -137,7 +144,7 @@ fn nv12_odd_w_allocation_geometry() {
         edgefirst_tensor::CpuAccess::ReadWrite,
     )
     .unwrap();
-    let mut dec = ImageDecoder::new();
+    let mut dec = cpu_decoder();
     t.load_image(&mut dec, &jpeg).unwrap();
     assert_allocation_geometry(&t, 789, 384, PixelFormat::Nv12);
 
@@ -164,7 +171,7 @@ fn nv16_odd_w_allocation_geometry() {
         edgefirst_tensor::CpuAccess::ReadWrite,
     )
     .unwrap();
-    let mut dec = ImageDecoder::new();
+    let mut dec = cpu_decoder();
     t.load_image(&mut dec, &jpeg).unwrap();
     assert_allocation_geometry(&t, 789, 384, PixelFormat::Nv16);
 }
@@ -180,7 +187,7 @@ fn nv24_odd_w_allocation_geometry() {
         edgefirst_tensor::CpuAccess::ReadWrite,
     )
     .unwrap();
-    let mut dec = ImageDecoder::new();
+    let mut dec = cpu_decoder();
     t.load_image(&mut dec, &jpeg).unwrap();
     assert_allocation_geometry(&t, 789, 384, PixelFormat::Nv24);
 }
@@ -196,7 +203,7 @@ fn grey_odd_h_allocation_geometry() {
         edgefirst_tensor::CpuAccess::ReadWrite,
     )
     .unwrap();
-    let mut dec = ImageDecoder::new();
+    let mut dec = cpu_decoder();
     t.load_image(&mut dec, &jpeg).unwrap();
     assert_allocation_geometry(&t, 1024, 681, PixelFormat::Grey);
 }
@@ -212,7 +219,7 @@ fn nv12_odd_h_allocation_geometry() {
         edgefirst_tensor::CpuAccess::ReadWrite,
     )
     .unwrap();
-    let mut dec = ImageDecoder::new();
+    let mut dec = cpu_decoder();
     t.load_image(&mut dec, &jpeg).unwrap();
     assert_allocation_geometry(&t, 1024, 681, PixelFormat::Nv12);
 }
@@ -236,7 +243,7 @@ fn max_alloc_tensor_is_reused_for_a_small_decode() {
     assert!(large_stride >= 1920);
 
     let jpeg = testdata("jaguar.jpg");
-    let mut dec = ImageDecoder::new();
+    let mut dec = cpu_decoder();
     pool.load_image(&mut dec, &jpeg).unwrap();
 
     assert_eq!(pool.width(), Some(789), "logical width must update to 789");
@@ -312,7 +319,7 @@ fn jpeg_nv_to_rgb_mae(fixture: &str, fmt: PixelFormat, w: usize, h: usize) -> (f
         edgefirst_tensor::CpuAccess::ReadWrite,
     )
     .unwrap();
-    let mut dec = ImageDecoder::new();
+    let mut dec = cpu_decoder();
     src.load_image(&mut dec, &jpeg).unwrap();
     assert_eq!(src.width(), Some(w));
     assert_eq!(src.height(), Some(h));
@@ -386,7 +393,7 @@ fn grey_odd_h_to_rgb() {
         edgefirst_tensor::CpuAccess::ReadWrite,
     )
     .unwrap();
-    let mut dec = ImageDecoder::new();
+    let mut dec = cpu_decoder();
     src.load_image(&mut dec, &jpeg).unwrap();
 
     let src_dyn = TensorDyn::from(src);
@@ -706,7 +713,7 @@ fn nv12_to_rgb_i8() {
     )
     .unwrap();
     {
-        let mut dec = ImageDecoder::new();
+        let mut dec = cpu_decoder();
         src_i8.load_image(&mut dec, &jpeg).unwrap();
     }
     let src_i8_dyn = TensorDyn::from(src_i8);
@@ -731,7 +738,7 @@ fn nv12_to_rgb_i8() {
     )
     .unwrap();
     {
-        let mut dec = ImageDecoder::new();
+        let mut dec = cpu_decoder();
         src_u8.load_image(&mut dec, &jpeg).unwrap();
     }
     let src_u8_dyn = TensorDyn::from(src_u8);
@@ -790,7 +797,7 @@ fn nv12_to_rgb_f16() {
     )
     .unwrap();
     {
-        let mut dec = ImageDecoder::new();
+        let mut dec = cpu_decoder();
         src_f16.load_image(&mut dec, &jpeg).unwrap();
     }
     let src_f16_dyn = TensorDyn::from(src_f16);
@@ -815,7 +822,7 @@ fn nv12_to_rgb_f16() {
     )
     .unwrap();
     {
-        let mut dec = ImageDecoder::new();
+        let mut dec = cpu_decoder();
         src_u8.load_image(&mut dec, &jpeg).unwrap();
     }
     let src_u8_dyn = TensorDyn::from(src_u8);
@@ -874,7 +881,7 @@ fn letterbox_resize_sanity_nv12_to_rgb_640() {
         edgefirst_tensor::CpuAccess::ReadWrite,
     )
     .unwrap();
-    let mut dec = ImageDecoder::new();
+    let mut dec = cpu_decoder();
     src.load_image(&mut dec, &jpeg).unwrap();
 
     // Letterbox 789×384 into 640×640.

@@ -12,6 +12,10 @@ pub(crate) fn report_skip(reason: &str) {
     let _ = writeln!(&mut std::io::stderr(), "WARNING: SKIPPED: {reason}");
 }
 
+#[cfg(test)]
+#[path = "../tests/common/sessions.rs"]
+pub(crate) mod sessions;
+
 #[cfg(all(target_os = "linux", feature = "v4l2"))]
 #[path = "../../tensor/tests/support/dma_require.rs"]
 #[allow(dead_code)]

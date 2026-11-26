@@ -412,6 +412,7 @@ mod tests {
 
     #[test]
     fn capabilities_list_the_cpu_jpeg_decoder() {
+        let _sessions = crate::test_support::sessions::take(1);
         let caps = capabilities();
         assert!(caps.iter().any(|c| c.engine == Engine::Cpu
             && c.codec == Codec::Jpeg

@@ -37,10 +37,12 @@ pub(super) struct Texture {
     pub(super) width: usize,
     pub(super) height: usize,
     pub(super) format: edgefirst_gl::gl::types::GLenum,
-    /// Which EGLImage (identified by buffer identity key) is currently bound
-    /// to this texture via `glEGLImageTargetTexture2DOES`. `None` means no
-    /// EGLImage is bound (or the binding has been invalidated).
-    bound_egl_key: Option<BufferImportKey>,
+    /// Which import (identified by buffer identity key) is bound to this
+    /// texture, and the platform's binding epoch when it was bound
+    /// (`GlPlatform::tex_binding_epoch`). `None` means no import is bound,
+    /// the binding has been invalidated, or the platform re-attaches on
+    /// every use.
+    bound_egl: Option<(BufferImportKey, u64)>,
 }
 
 impl Default for Texture {
@@ -59,7 +61,7 @@ impl Texture {
             width: 0,
             height: 0,
             format: 0,
-            bound_egl_key: None,
+            bound_egl: None,
         }
     }
 
@@ -129,7 +131,7 @@ impl Texture {
                 self.width = width;
                 self.height = height;
                 // TexImage2D reallocates the texture, invalidating any EGLImage binding.
-                self.bound_egl_key = None;
+                self.bound_egl = None;
             } else {
                 edgefirst_gl::gl::TexSubImage2D(
                     target,
@@ -156,11 +158,11 @@ impl Texture {
         self.target = 0;
     }
 
-    /// Attach a platform import to this GL_TEXTURE_2D texture if the key
-    /// differs from what's already bound. Returns `true` if the attach was
-    /// performed, `false` if skipped (already bound). The skip applies only
-    /// where attachments persist (`GlPlatform::PERSISTENT_TEX_BINDINGS`);
-    /// elsewhere every call attaches.
+    /// Attach a platform import to this GL_TEXTURE_2D texture unless the
+    /// same key is still bound in the platform's current binding epoch
+    /// (`GlPlatform::tex_binding_epoch`). Returns `true` if the attach was
+    /// performed, `false` if skipped (already bound). Where the platform has
+    /// no epoch, every call attaches.
     ///
     /// # Safety
     /// Caller must ensure the texture is bound to the active texture unit
@@ -171,13 +173,12 @@ impl Texture {
         key: BufferImportKey,
         handle: <Platform as GlPlatform>::ImportHandle,
     ) -> crate::Result<bool> {
-        if Platform::PERSISTENT_TEX_BINDINGS && self.bound_egl_key == Some(key) {
+        let bound = Platform::tex_binding_epoch(display).map(|epoch| (key, epoch));
+        if bound.is_some() && self.bound_egl == bound {
             return Ok(false);
         }
         unsafe { Platform::attach_tex_image_2d(display, handle)? };
-        if Platform::PERSISTENT_TEX_BINDINGS {
-            self.bound_egl_key = Some(key);
-        }
+        self.bound_egl = bound;
         Ok(true)
     }
 
@@ -194,13 +195,12 @@ impl Texture {
         key: BufferImportKey,
         handle: <Platform as GlPlatform>::ImportHandle,
     ) -> crate::Result<bool> {
-        if Platform::PERSISTENT_TEX_BINDINGS && self.bound_egl_key == Some(key) {
+        let bound = Platform::tex_binding_epoch(display).map(|epoch| (key, epoch));
+        if bound.is_some() && self.bound_egl == bound {
             return Ok(false);
         }
         unsafe { Platform::attach_tex_image_external(display, handle)? };
-        if Platform::PERSISTENT_TEX_BINDINGS {
-            self.bound_egl_key = Some(key);
-        }
+        self.bound_egl = bound;
         Ok(true)
     }
 
@@ -208,7 +208,7 @@ impl Texture {
     /// EGLImage cache evicts the entry this texture was using, or when
     /// `TexImage2D` overwrites the texture storage.
     pub(super) fn invalidate_egl_binding(&mut self) {
-        self.bound_egl_key = None;
+        self.bound_egl = None;
     }
 }
 

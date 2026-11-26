@@ -154,8 +154,7 @@ Memory and transfer:
 Conversion behaviour:
 
 - `EDGEFIRST_INTERPOLATION` — `bilinear` (default) or `nearest`: how `convert()` resamples when it resizes, overriding `ImageProcessorConfig::interpolation` and every per-convert `ConvertOptions::interpolation`. Read when the processor is created. See [ARCHITECTURE.md § Resampling and source crops](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/ARCHITECTURE.md#resampling-and-source-crops).
-- `EDGEFIRST_COLORIMETRY` — `fast` (default) or `exact`. `fast` keeps single-plane NV12 on the driver's YUV sampler even when its colorimetry does not match; `exact` forces the in-shader matrix. See [ARCHITECTURE.md § Colorimetry](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/ARCHITECTURE.md#colorimetry-1).
-- `EDGEFIRST_NV_CONVERT_PATH` — `auto` (default), `sampler`, or `shader`. Pins the NV12 GPU conversion path for A/B measurement.
+- `EDGEFIRST_NV_CONVERT_PATH` — `auto` (default), `sampler`, or `shader`. Pins the NV12 GPU conversion path for A/B measurement. Vivante refuses `sampler` and uses the shader. On Vivante the GL backend declines a multiplane NV12 or NV16 source (separate luma and chroma planes), whatever this is set to; the conversion falls through to the next backend.
 - `EDGEFIRST_GL_SERIALIZE` — `full` or `lifecycle`. Overrides the per-driver GL serialization policy.
 - `EDGEFIRST_GL_CPU_LATENCY` — `on` or `off`. Whether GL operations hold a CPU wake-latency request on `/dev/cpu_dma_latency` (Linux) while they run; on by default for Adreno. The device must be writable by the process. See [Qualcomm Adreno on Linux](https://github.com/EdgeFirstAI/hal/blob/main/README.md#qualcomm-adreno-on-linux) for granting access without root.
 - `EDGEFIRST_PROTO_COMPUTE` — Set to `1` to enable the experimental GLES 3.1 compute shader path for proto repack. Requires GLES 3.1 hardware.
@@ -316,6 +315,15 @@ let mut batch = processor.alloc_tile_batch(
 // Render all tiles (deferred convert per tile + single flush). Returns the same
 // placements mapping each tile band back to full-frame coordinates.
 let placements = processor.tile_into(&src, &mut batch, &cfg)?;
+```
+
+To hand the batch to its consumer without blocking on the GPU, use `tile_into_with_fence`. It renders the same tiles and returns the placements with an `Option<CompletionFence>`. On Linux and Android the fence is a sync-file fd, where the EGL display has `EGL_ANDROID_native_fence_sync`, and on Windows an event handle; it signals when every tile is complete and the GPU has finished reading `src`, and the caller owns it. Keep `src` unmodified until it signals. `None` means the tiles are already complete, as they are on macOS and iOS, on an EGL display without the extension, or when a backend other than OpenGL rendered them.
+
+```rust,ignore
+let (placements, fence) = processor.tile_into_with_fence(&src, &mut batch, &cfg)?;
+if let Some(fence) = fence {
+    // The consumer of `batch` waits on `fence` before reading it.
+}
 ```
 
 Each tile selects its source crop by **sampling** the whole-frame tensor (texture

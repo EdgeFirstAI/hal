@@ -7,8 +7,15 @@
 //! with [`CodecError::UnsupportedDtype`]. PNG supports the wide types, so the
 //! wide-dtype decode coverage uses a PNG fixture.
 
-use edgefirst_codec::{CodecError, ImageDecoder, ImageLoad};
+use edgefirst_codec::{CodecError, Engine, ImageDecoder, ImageLoad};
 use edgefirst_tensor::{DType, PixelFormat, TensorDyn, TensorMemory};
+
+/// An image decoder on the CPU engine.
+fn cpu_decoder() -> ImageDecoder {
+    let mut decoder = ImageDecoder::new();
+    decoder.set_engine(Engine::Cpu);
+    decoder
+}
 
 fn testdata(name: &str) -> Vec<u8> {
     let root = std::env::var("EDGEFIRST_TESTDATA_DIR")
@@ -37,7 +44,7 @@ fn decode_tensordyn_u8_nv12() {
         edgefirst_tensor::CpuAccess::ReadWrite,
     )
     .unwrap();
-    let mut decoder = ImageDecoder::new();
+    let mut decoder = cpu_decoder();
     let info = tensor.load_image(&mut decoder, &jpeg).unwrap();
     assert_eq!(info.width, 1280);
     assert_eq!(info.height, 720);
@@ -57,7 +64,7 @@ fn decode_tensordyn_jpeg_f32_unsupported() {
         edgefirst_tensor::CpuAccess::ReadWrite,
     )
     .unwrap();
-    let mut decoder = ImageDecoder::new();
+    let mut decoder = cpu_decoder();
     let result = tensor.load_image(&mut decoder, &jpeg);
     assert!(
         matches!(result, Err(CodecError::UnsupportedDtype(_))),
@@ -78,7 +85,7 @@ fn decode_tensordyn_unsupported_dtype() {
         edgefirst_tensor::CpuAccess::ReadWrite,
     )
     .unwrap();
-    let mut decoder = ImageDecoder::new();
+    let mut decoder = cpu_decoder();
     let result = tensor.load_image(&mut decoder, &jpeg);
     assert!(result.is_err());
 }
@@ -97,7 +104,7 @@ fn decode_tensordyn_png_f32() {
         edgefirst_tensor::CpuAccess::ReadWrite,
     )
     .unwrap();
-    let mut decoder = ImageDecoder::new();
+    let mut decoder = cpu_decoder();
     let info = tensor.load_image(&mut decoder, &png).unwrap();
     assert_eq!(info.width, 1280);
     assert_eq!(info.height, 720);
@@ -117,7 +124,7 @@ fn decode_tensordyn_png_i16() {
         edgefirst_tensor::CpuAccess::ReadWrite,
     )
     .unwrap();
-    let mut decoder = ImageDecoder::new();
+    let mut decoder = cpu_decoder();
     let info = tensor.load_image(&mut decoder, &png).unwrap();
     assert_eq!(info.width, 1280);
     assert_eq!(info.height, 720);
@@ -146,7 +153,7 @@ fn decode_file_path() {
         edgefirst_tensor::CpuAccess::ReadWrite,
     )
     .unwrap();
-    let mut decoder = ImageDecoder::new();
+    let mut decoder = cpu_decoder();
     let info = tensor.load_image_file(&mut decoder, &path).unwrap();
     assert_eq!(info.width, 1280);
     assert_eq!(info.height, 720);
@@ -171,7 +178,7 @@ fn decode_into_a_destination_declared_without_writes_is_refused() {
                 declared,
             )
             .unwrap();
-            let mut decoder = ImageDecoder::new();
+            let mut decoder = cpu_decoder();
             match decoder.decode_into_dyn(&testdata(name), &mut tensor) {
                 Err(CodecError::Tensor(edgefirst_tensor::Error::CpuAccessDenied {
                     declared: d,
@@ -189,7 +196,7 @@ fn decode_into_a_destination_declared_without_writes_is_refused() {
             CpuAccess::Write,
         )
         .unwrap();
-        ImageDecoder::new()
+        cpu_decoder()
             .decode_into_dyn(&testdata(name), &mut write_only)
             .unwrap_or_else(|e| panic!("{name} into a Write tensor: {e}"));
     }

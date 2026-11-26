@@ -30,6 +30,14 @@
 #                      testdata already on the host
 #   REQUIRE_GPU        1 to fail a host without a DRM render node as NO-GPU
 #                      (default: 0)
+#   REQUIRE_DMA        1 to fail a host whose DMA heap probe cannot allocate as
+#                      NO-DMA, and to fail every DMA test that would skip
+#                      (default: 0)
+#   GDB                1 to run each test binary under gdb on the host, which
+#                      logs every thread's backtrace if it crashes or hangs
+#                      (default: 0)
+#   GDB_TIMEOUT        seconds a binary may run under gdb before it counts as
+#                      hung (default: 900)
 #
 # Exits non-zero when any host reports a test failure or ran no tests
 # (NO-TESTS). An unreachable host and a host another run is using (BUSY) are
@@ -50,6 +58,9 @@ FILTER="${FILTER:-}"
 REMOTE_DIR="${REMOTE_DIR:-/tmp/hal-ontarget}"
 SYNC_TESTDATA="${SYNC_TESTDATA:-1}"
 REQUIRE_GPU="${REQUIRE_GPU:-0}"
+REQUIRE_DMA="${REQUIRE_DMA:-0}"
+GDB="${GDB:-0}"
+GDB_TIMEOUT="${GDB_TIMEOUT:-900}"
 RESULTS="${ROOT}/target/on-target-results"
 BUNDLES="${ROOT}/target/on-target-bundle"
 readonly RULE='============================================================'
@@ -211,7 +222,7 @@ for i in "${!OK_HOSTS[@]}"; do
     echo "SKIP: bundle sync failed"; SUMMARY+=("${target}|SYNCFAIL|${arch}|-"); continue
   fi
 
-  run_env="FILTER=$(printf '%q' "${FILTER}") HAL_ONTARGET_REQUIRE_GPU=$(printf '%q' "${REQUIRE_GPU}")"
+  run_env="FILTER=$(printf '%q' "${FILTER}") HAL_ONTARGET_REQUIRE_GPU=$(printf '%q' "${REQUIRE_GPU}") HAL_ONTARGET_REQUIRE_DMA=$(printf '%q' "${REQUIRE_DMA}") HAL_ONTARGET_GDB=$(printf '%q' "${GDB}") HAL_ONTARGET_GDB_TIMEOUT=$(printf '%q' "${GDB_TIMEOUT}")"
   ssh_q "${target}" "${run_env} '${REMOTE_DIR}/scripts/on-target-run.sh' '${REMOTE_DIR}/results'"
   rc=$?
 

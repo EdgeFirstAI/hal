@@ -15,7 +15,7 @@
 
 use edgefirst_image::{Flip, ImageProcessor, ImageProcessorTrait};
 use edgefirst_tensor::{
-    CpuAccess, DType, HostPin, PixelFormat, TensorDyn, TensorMapTrait, TensorMemory, TensorTrait,
+    CpuAccess, DType, HostPin, PixelFormat, TensorDyn, TensorMapTrait, TensorTrait,
 };
 
 const W: usize = 64;
@@ -45,16 +45,10 @@ fn want(x: usize, y: usize) -> [u8; 3] {
     [x as u8, y as u8, ((x + y) / 2) as u8]
 }
 
+/// A zero-copy image, on a host [`zero_copy::served_or_skip`] says serves one.
 fn image(fmt: PixelFormat) -> TensorDyn {
-    TensorDyn::image(
-        W,
-        H,
-        fmt,
-        DType::U8,
-        Some(TensorMemory::DmaBuf),
-        CpuAccess::ReadWrite,
-    )
-    .expect("allocate a zero-copy image")
+    zero_copy::image(W, H, fmt, DType::U8)
+        .expect("a host that serves zero-copy images allocated none")
 }
 
 /// An RGBA source carrying [`want`] with an opaque alpha.

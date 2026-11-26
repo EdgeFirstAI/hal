@@ -157,6 +157,15 @@ impl ImageEncoder {
         for engine in engines_to_try(self.engine, &encode_engines())? {
             match engine {
                 #[cfg(all(target_os = "linux", feature = "v4l2"))]
+                Engine::V4l2
+                    if !explicit && src.memory() != edgefirst_tensor::TensorMemory::DmaBuf =>
+                {
+                    log::debug!(
+                        "v4l2 jpeg encode passed on: the source is in {:?} memory",
+                        src.memory()
+                    );
+                }
+                #[cfg(all(target_os = "linux", feature = "v4l2"))]
                 Engine::V4l2 => match self.encode_v4l2(src, out) {
                     Ok(()) => return Ok(()),
                     Err(e) if explicit => return Err(e),

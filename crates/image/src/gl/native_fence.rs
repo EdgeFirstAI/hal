@@ -17,9 +17,9 @@
 //! The entry points are EGL extension functions (`EGL_KHR_fence_sync` +
 //! `EGL_ANDROID_native_fence_sync`), resolved once per process via
 //! `eglGetProcAddress`. Callers gate on the display's extension probe
-//! (`SharedAndroidDisplay::supports_native_fence`).
+//! ([`display_supports_native_fence`]) on Linux and Android.
 
-#![cfg(target_os = "android")]
+#![cfg(any(target_os = "linux", target_os = "android"))]
 
 use super::Egl;
 use crate::{Error, Result};
@@ -83,6 +83,13 @@ fn fns(egl: &Egl) -> Result<&'static FenceEglFns> {
         .map_err(|s| Error::NotSupported(s.clone()))
 }
 
+/// Whether an EGL display extension string names both
+/// `EGL_ANDROID_native_fence_sync` and `EGL_KHR_fence_sync`.
+pub(super) fn display_supports_native_fence(extensions: &str) -> bool {
+    let has = |name: &str| extensions.split_ascii_whitespace().any(|e| e == name);
+    has("EGL_ANDROID_native_fence_sync") && has("EGL_KHR_fence_sync")
+}
+
 /// Export a native sync-fence fd guarding every GL command submitted so
 /// far on the current context. Must be called on the GL worker thread
 /// with the convert's context current. The returned fd is owned by the
@@ -113,16 +120,37 @@ pub(super) fn export_native_fence_fd(egl: &Egl, display: egl::Display) -> Result
 
     // SAFETY: sync is the live object created above on this display.
     let fd = unsafe { (fns.dup_native_fence_fd)(display.as_ptr(), sync) };
+    let dup_error = (fd < 0).then(|| egl.get_error());
     let destroy_ok = unsafe { (fns.destroy_sync_khr)(display.as_ptr(), sync) } != 0;
     if !destroy_ok {
         log::warn!("eglDestroySyncKHR failed after fence dup (leaking the sync object)");
     }
-    if fd < 0 {
+    if let Some(error) = dup_error {
         return Err(Error::OpenGl(format!(
-            "eglDupNativeFenceFDANDROID returned {fd} (EGL error {:?})",
-            egl.get_error()
+            "eglDupNativeFenceFDANDROID returned {fd} (EGL error {error:?})"
         )));
     }
     // SAFETY: fd is a freshly dup'd, caller-owned kernel sync-fence fd.
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::display_supports_native_fence;
+
+    /// Both extensions are required, matched as whole tokens.
+    #[test]
+    fn a_native_fence_needs_both_extensions_as_whole_tokens() {
+        assert!(display_supports_native_fence(
+            "EGL_KHR_image EGL_KHR_fence_sync EGL_ANDROID_native_fence_sync"
+        ));
+        assert!(!display_supports_native_fence(
+            "EGL_ANDROID_native_fence_sync"
+        ));
+        assert!(!display_supports_native_fence("EGL_KHR_fence_sync"));
+        assert!(!display_supports_native_fence(
+            "EGL_KHR_fence_sync EGL_ANDROID_native_fence_sync_extra"
+        ));
+        assert!(!display_supports_native_fence(""));
+    }
 }

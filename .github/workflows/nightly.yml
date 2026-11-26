@@ -79,7 +79,7 @@ jobs:
         vocabulary
       # Minimum number of tests the board selection must match.
       board-min-tests: "100"
-      nextest-args: --workspace --locked --features default,edgefirst-decoder/model-files --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-kernels --exclude edgefirst-python-common -j 1
+      nextest-args: --workspace --locked --features default,edgefirst-decoder/model-files --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-kernels --exclude edgefirst-python-common
       archive-profile: profiling
       archive-args: --locked --package edgefirst-image --features opengl --package edgefirst-tensor
     secrets: inherit

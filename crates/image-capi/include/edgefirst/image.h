@@ -18,12 +18,15 @@
  * header, `edgefirst/tensor.h`. Detection primitives used when drawing
  * masks live in header-only `edgefirst/detect.h`.
  *
- * Platform-specific entry points. Both are declared on every platform and
+ * Platform-specific entry points. Each is declared on every platform and
  * refuse at run time off their platform. Each function states its
  * platforms on a "Platforms:" line:
- *   - Linux, macOS, iOS, Android: ef_image_processor_convert_fence
- *     (sync-fence fd)
- *   - Windows: ef_image_processor_convert_fence_handle (event handle)
+ *   - Linux, macOS, iOS, Android: ef_image_processor_convert_fence and
+ *     ef_image_processor_tile_into_fence (sync-fence fd; a fence is
+ *     returned on Linux and Android where the EGL display has
+ *     EGL_ANDROID_native_fence_sync)
+ *   - Windows: ef_image_processor_convert_fence_handle and
+ *     ef_image_processor_tile_into_fence_handle (event handle)
  */
 
 #include <stdarg.h>
@@ -741,7 +744,12 @@ int ef_image_processor_flush(ef_image_processor *p);
  *
  * `*fence_fd` receives a descriptor the caller owns and must close, or `-1`
  * when the platform has no native fence and the convert completed
- * synchronously.
+ * synchronously. Linux and Android return a descriptor where the EGL
+ * display has `EGL_ANDROID_native_fence_sync`; macOS and iOS return `-1`.
+ *
+ * The fence also covers the GPU's reads of `src`: keep the source
+ * unmodified, and do not hand its buffer back to its producer (a V4L2
+ * capture queue, for example), until the fence signals.
  *
  * `options` as for [`ef_image_processor_convert`].
  *
@@ -764,6 +772,10 @@ int ef_image_processor_convert_fence(ef_image_processor *p,
  * event is set when the destination is complete; the caller owns it and
  * closes it with `CloseHandle`. `*fence` is `NULL` when the convert
  * completed synchronously (no fence on this display).
+ *
+ * The fence also covers the GPU's reads of `src`: keep the source
+ * unmodified, and do not hand its buffer back to its producer (a V4L2
+ * capture queue, for example), until the fence signals.
  *
  * `options` as for [`ef_image_processor_convert`].
  *
@@ -899,6 +911,62 @@ ef_tile_placement_list *ef_image_processor_tile_into(ef_image_processor *p,
                                                      ef_tensor *dst,
                                                      const struct ef_tiling_config *config,
                                                      const ef_convert_options *options);
+
+/**
+ * Platforms: Linux, macOS, iOS, Android.
+ *
+ * Render every tile of `src` into `dst` as [`ef_image_processor_tile_into`]
+ * does, returning a sync-fence fd instead of blocking on the GPU.
+ *
+ * `*fence_fd` receives a descriptor the caller owns and must close, or `-1`
+ * when the tiles completed synchronously, as they do where the platform has
+ * no native fence. Linux and Android return a descriptor where the EGL
+ * display has `EGL_ANDROID_native_fence_sync`; macOS and iOS return `-1`.
+ *
+ * The fence also covers the GPU's reads of `src`: keep the source
+ * unmodified, and do not hand its buffer back to its producer (a V4L2
+ * capture queue, for example), until the fence signals.
+ *
+ * @return a placement list to free with [`ef_tile_placement_list_free`], or
+ * `NULL` with `errno` set: the codes [`ef_image_processor_tile_into`] sets,
+ * `EINVAL` for a `NULL` `fence_fd`, and `ENOTSUP` off Unix.
+ *
+ * # Safety
+ * Pointers must be live or NULL as documented; `fence_fd` must be writable.
+ */
+ef_tile_placement_list *ef_image_processor_tile_into_fence(ef_image_processor *p,
+                                                           const ef_tensor *src,
+                                                           ef_tensor *dst,
+                                                           const struct ef_tiling_config *config,
+                                                           const ef_convert_options *options,
+                                                           int *fence_fd);
+
+/**
+ * Platforms: Windows.
+ *
+ * Render every tile of `src` into `dst` as [`ef_image_processor_tile_into`]
+ * does, returning an event handle instead of blocking on the GPU. The event
+ * is set when every tile is complete; the caller owns it and closes it with
+ * `CloseHandle`. `*fence` is `NULL` when the tiles completed synchronously,
+ * as they do where this display has no fence.
+ *
+ * The fence also covers the GPU's reads of `src`: keep the source
+ * unmodified, and do not hand its buffer back to its producer (a V4L2
+ * capture queue, for example), until the fence signals.
+ *
+ * @return a placement list to free with [`ef_tile_placement_list_free`], or
+ * `NULL` with `errno` set: the codes [`ef_image_processor_tile_into`] sets,
+ * `EINVAL` for a `NULL` `fence`, and `ENOTSUP` off Windows.
+ *
+ * # Safety
+ * Pointers must be live or NULL as documented; `fence` must be writable.
+ */
+ef_tile_placement_list *ef_image_processor_tile_into_fence_handle(ef_image_processor *p,
+                                                                  const ef_tensor *src,
+                                                                  ef_tensor *dst,
+                                                                  const struct ef_tiling_config *config,
+                                                                  const ef_convert_options *options,
+                                                                  void **fence);
 
 /**
  * Render one planned tile of `src` into `dst`, converted with `options`

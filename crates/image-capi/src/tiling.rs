@@ -3,7 +3,7 @@
 
 //! SAHI-style input tiling: grid, plan, and GPU blit.
 
-use std::ffi::{c_char, c_int, CStr};
+use std::ffi::{c_char, c_int, c_void, CStr};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use edgefirst_decoder_abi::{EfTilePlacement, TilePlacement};
@@ -364,6 +364,144 @@ pub unsafe extern "C" fn ef_image_processor_tile_into(
     }
 }
 
+/// Platforms: Linux, macOS, iOS, Android.
+///
+/// Render every tile of `src` into `dst` as [`ef_image_processor_tile_into`]
+/// does, returning a sync-fence fd instead of blocking on the GPU.
+///
+/// `*fence_fd` receives a descriptor the caller owns and must close, or `-1`
+/// when the tiles completed synchronously, as they do where the platform has
+/// no native fence. Linux and Android return a descriptor where the EGL
+/// display has `EGL_ANDROID_native_fence_sync`; macOS and iOS return `-1`.
+///
+/// The fence also covers the GPU's reads of `src`: keep the source
+/// unmodified, and do not hand its buffer back to its producer (a V4L2
+/// capture queue, for example), until the fence signals.
+///
+/// @return a placement list to free with [`ef_tile_placement_list_free`], or
+/// `NULL` with `errno` set: the codes [`ef_image_processor_tile_into`] sets,
+/// `EINVAL` for a `NULL` `fence_fd`, and `ENOTSUP` off Unix.
+///
+/// # Safety
+/// Pointers must be live or NULL as documented; `fence_fd` must be writable.
+#[no_mangle]
+pub unsafe extern "C" fn ef_image_processor_tile_into_fence(
+    p: *mut EfImageProcessor,
+    src: *const EfTensor,
+    dst: *mut EfTensor,
+    config: *const EfTilingConfig,
+    options: *const EfConvertOptions,
+    fence_fd: *mut c_int,
+) -> *mut EfTilePlacementList {
+    let fail = |code: c_int| {
+        errno::set_errno(errno::Errno(code));
+        std::ptr::null_mut()
+    };
+    unsafe {
+        catch_unwind(AssertUnwindSafe(|| {
+            if p.is_null() || config.is_null() || fence_fd.is_null() {
+                return fail(libc::EINVAL);
+            }
+            *fence_fd = -1;
+            #[cfg(not(unix))]
+            {
+                let _ = (src, dst, options);
+                fail(libc::ENOTSUP)
+            }
+            #[cfg(unix)]
+            {
+                let cfg = match tiling_config_from(&*config, options) {
+                    Ok(cfg) => cfg,
+                    Err(code) => return fail(code),
+                };
+                let result = with_tensor(src, |s| {
+                    with_tensor_mut(dst, |d| (*p).inner.tile_into_with_fence(s, d, &cfg))
+                });
+                match result {
+                    Ok(Ok(Ok((placements, fence)))) => {
+                        if let Some(owned) = fence {
+                            use std::os::fd::IntoRawFd;
+                            *fence_fd = owned.into_raw_fd();
+                        }
+                        Box::into_raw(Box::new(EfTilePlacementList { placements }))
+                    }
+                    Ok(Ok(Err(e))) => fail(image_errno(&e)),
+                    Ok(Err(code)) | Err(code) => fail(code),
+                }
+            }
+        }))
+        .unwrap_or_else(|_| fail(libc::EINVAL))
+    }
+}
+
+/// Platforms: Windows.
+///
+/// Render every tile of `src` into `dst` as [`ef_image_processor_tile_into`]
+/// does, returning an event handle instead of blocking on the GPU. The event
+/// is set when every tile is complete; the caller owns it and closes it with
+/// `CloseHandle`. `*fence` is `NULL` when the tiles completed synchronously,
+/// as they do where this display has no fence.
+///
+/// The fence also covers the GPU's reads of `src`: keep the source
+/// unmodified, and do not hand its buffer back to its producer (a V4L2
+/// capture queue, for example), until the fence signals.
+///
+/// @return a placement list to free with [`ef_tile_placement_list_free`], or
+/// `NULL` with `errno` set: the codes [`ef_image_processor_tile_into`] sets,
+/// `EINVAL` for a `NULL` `fence`, and `ENOTSUP` off Windows.
+///
+/// # Safety
+/// Pointers must be live or NULL as documented; `fence` must be writable.
+#[no_mangle]
+pub unsafe extern "C" fn ef_image_processor_tile_into_fence_handle(
+    p: *mut EfImageProcessor,
+    src: *const EfTensor,
+    dst: *mut EfTensor,
+    config: *const EfTilingConfig,
+    options: *const EfConvertOptions,
+    fence: *mut *mut c_void,
+) -> *mut EfTilePlacementList {
+    let fail = |code: c_int| {
+        errno::set_errno(errno::Errno(code));
+        std::ptr::null_mut()
+    };
+    unsafe {
+        catch_unwind(AssertUnwindSafe(|| {
+            if p.is_null() || config.is_null() || fence.is_null() {
+                return fail(libc::EINVAL);
+            }
+            *fence = std::ptr::null_mut();
+            #[cfg(not(target_os = "windows"))]
+            {
+                let _ = (src, dst, options);
+                fail(libc::ENOTSUP)
+            }
+            #[cfg(target_os = "windows")]
+            {
+                let cfg = match tiling_config_from(&*config, options) {
+                    Ok(cfg) => cfg,
+                    Err(code) => return fail(code),
+                };
+                let result = with_tensor(src, |s| {
+                    with_tensor_mut(dst, |d| (*p).inner.tile_into_with_fence(s, d, &cfg))
+                });
+                match result {
+                    Ok(Ok(Ok((placements, event)))) => {
+                        if let Some(owned) = event {
+                            use std::os::windows::io::IntoRawHandle;
+                            *fence = owned.into_raw_handle();
+                        }
+                        Box::into_raw(Box::new(EfTilePlacementList { placements }))
+                    }
+                    Ok(Ok(Err(e))) => fail(image_errno(&e)),
+                    Ok(Err(code)) | Err(code) => fail(code),
+                }
+            }
+        }))
+        .unwrap_or_else(|_| fail(libc::EINVAL))
+    }
+}
+
 /// Render one planned tile of `src` into `dst`, converted with `options`
 /// (`NULL` for a plain stretch) sampling the tile's crop.
 ///
@@ -466,6 +604,135 @@ mod tests {
                 ..cfg
             };
             assert!(ef_image_processor_plan_tiles(p, 1500, 400, &bad, std::ptr::null()).is_null());
+            ef_image_processor_free(p);
+        }
+    }
+
+    /// The CPU-backed RGBA images the fenced tiling tests convert between.
+    fn rgba_image(width: usize, height: usize) -> *mut EfTensor {
+        use edgefirst_tensor::{CpuAccess, TensorDyn};
+        TensorDyn::image(
+            width,
+            height,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::Mem),
+            CpuAccess::ReadWrite,
+        )
+        .unwrap()
+        .into_raw()
+    }
+
+    #[test]
+    fn tile_into_fence_refuses_null_arguments_before_writing_the_fence() {
+        let cfg = ef_tiling_config_default(16, 16);
+        unsafe {
+            let mut fd: c_int = 7;
+            errno::set_errno(errno::Errno(0));
+            assert!(ef_image_processor_tile_into_fence(
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                &cfg,
+                std::ptr::null(),
+                &mut fd,
+            )
+            .is_null());
+            assert_eq!(errno::errno().0, libc::EINVAL);
+            assert_eq!(fd, 7, "a refused call leaves the fence untouched");
+
+            let p = ef_image_processor_new_with_backend(1);
+            assert!(!p.is_null(), "the CPU backend exists everywhere");
+            errno::set_errno(errno::Errno(0));
+            assert!(ef_image_processor_tile_into_fence(
+                p,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                &cfg,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+            )
+            .is_null());
+            assert_eq!(errno::errno().0, libc::EINVAL);
+
+            let mut fence: *mut c_void = std::ptr::dangling_mut();
+            errno::set_errno(errno::Errno(0));
+            assert!(ef_image_processor_tile_into_fence_handle(
+                p,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+                &mut fence,
+            )
+            .is_null());
+            assert_eq!(errno::errno().0, libc::EINVAL);
+            errno::set_errno(errno::Errno(0));
+            assert!(ef_image_processor_tile_into_fence_handle(
+                p,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                &cfg,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+            )
+            .is_null());
+            assert_eq!(errno::errno().0, libc::EINVAL);
+            ef_image_processor_free(p);
+        }
+    }
+
+    #[test]
+    fn tile_into_fence_on_the_cpu_returns_the_placements_and_no_fence() {
+        let p = ef_image_processor_new_with_backend(1);
+        assert!(!p.is_null(), "the CPU backend exists everywhere");
+        let cfg = EfTilingConfig {
+            overlap_ratio: 0.0,
+            ..ef_tiling_config_default(16, 16)
+        };
+        unsafe {
+            let src = rgba_image(32, 16);
+            let dst = rgba_image(16, 32);
+            let mut fd: c_int = 7;
+            errno::set_errno(errno::Errno(0));
+            let list =
+                ef_image_processor_tile_into_fence(p, src, dst, &cfg, std::ptr::null(), &mut fd);
+            if cfg!(unix) {
+                assert!(!list.is_null(), "errno {}", errno::errno().0);
+                assert_eq!(fd, -1, "the CPU backend completes the tiles synchronously");
+                assert_eq!(ef_tile_placement_list_len(list), 2);
+                ef_tile_placement_list_free(list);
+            } else {
+                assert!(list.is_null());
+                assert_eq!(errno::errno().0, libc::ENOTSUP);
+                assert_eq!(fd, -1);
+            }
+
+            let mut fence: *mut c_void = std::ptr::dangling_mut();
+            errno::set_errno(errno::Errno(0));
+            let list = ef_image_processor_tile_into_fence_handle(
+                p,
+                src,
+                dst,
+                &cfg,
+                std::ptr::null(),
+                &mut fence,
+            );
+            if cfg!(windows) {
+                assert!(!list.is_null(), "errno {}", errno::errno().0);
+                assert!(
+                    fence.is_null(),
+                    "the CPU backend completes the tiles synchronously"
+                );
+                assert_eq!(ef_tile_placement_list_len(list), 2);
+                ef_tile_placement_list_free(list);
+            } else {
+                assert!(list.is_null());
+                assert_eq!(errno::errno().0, libc::ENOTSUP);
+                assert!(fence.is_null());
+            }
+            edgefirst_tensor_ffi::ef_tensor_free(src);
+            edgefirst_tensor_ffi::ef_tensor_free(dst);
             ef_image_processor_free(p);
         }
     }

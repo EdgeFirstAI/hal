@@ -85,6 +85,50 @@ pub(super) enum NvPathPref {
     ForceShader,
 }
 
+/// The NV* path for a `src_fmt` source that `ShaderR8` can read, under
+/// `pref`, drawing into a `render_fmt` target on a Vivante GPU when `vivante`
+/// is set. `Auto` and `ForceShader` take `ShaderR8`. `ForceSampler` takes
+/// `ExternalSampler` for NV12 into a non-Grey target on a GPU other than
+/// Vivante, and otherwise logs a warning and takes `ShaderR8`.
+fn nv_path_for(
+    pref: NvPathPref,
+    src_fmt: PixelFormat,
+    render_fmt: PixelFormat,
+    vivante: bool,
+) -> NvConvertPath {
+    if pref != NvPathPref::ForceSampler {
+        return NvConvertPath::ShaderR8;
+    }
+    if render_fmt == PixelFormat::Grey {
+        log::warn!(
+            "EDGEFIRST_NV_CONVERT_PATH=sampler refused for {src_fmt:?}→Grey \
+             (the sampler returns RGB, not the source's luma); using shader"
+        );
+        return NvConvertPath::ShaderR8;
+    }
+    if vivante {
+        log::warn!(
+            "EDGEFIRST_NV_CONVERT_PATH=sampler refused for {src_fmt:?} on Vivante \
+             (the external sampler can lock up the GPU); using shader"
+        );
+        return NvConvertPath::ShaderR8;
+    }
+    if src_fmt != PixelFormat::Nv12 {
+        log::warn!(
+            "EDGEFIRST_NV_CONVERT_PATH=sampler unavailable for {src_fmt:?} \
+             (no external-sampler path); using shader"
+        );
+        return NvConvertPath::ShaderR8;
+    }
+    NvConvertPath::ExternalSampler
+}
+
+/// Whether the GL backend declines a `fmt` source with separate planes
+/// (`multiplane`) on a Vivante GPU (`vivante`): multiplane NV12 and NV16.
+fn declines_sampler_only_nv(vivante: bool, fmt: PixelFormat, multiplane: bool) -> bool {
+    vivante && multiplane && matches!(fmt, PixelFormat::Nv12 | PixelFormat::Nv16)
+}
+
 /// Bound destination render target for one convert, produced by
 /// [`GLProcessorST::bind_dst`]. The GL counterpart of
 /// [`super::render::DstLowering`].
@@ -747,6 +791,15 @@ pub struct GLProcessorST {
     /// Test hook: make the NV12 program build fail.
     #[cfg(test)]
     pub(super) fail_nv12_programs: bool,
+    /// Test hook: the terminal GPU waits converts have issued.
+    #[cfg(test)]
+    pub(super) terminal_waits: usize,
+    /// Test hook: make every texture readback fail before it reads.
+    #[cfg(test)]
+    pub(super) fail_readback: bool,
+    /// Test hook: the render plan of the latest u8/i8 convert.
+    #[cfg(test)]
+    pub(super) last_plan: Option<super::render::ConvertPlan>,
     /// While set, a failed zero-copy destination import propagates instead of
     /// falling back to the mapped-texture readback. Set by
     /// `verify_dma_buf_roundtrip`.
@@ -893,6 +946,9 @@ pub struct GLProcessorST {
     /// NV import failures already warned about (keyed by buffer identity):
     /// the first occurrence warns, repeats log at debug.
     nv_import_warned: std::collections::HashSet<u64>,
+    /// The (format, width, height) of the sources
+    /// [`Self::decline_sampler_only_nv`] has warned about.
+    sampler_only_warned: std::collections::HashSet<(PixelFormat, usize, usize)>,
     /// The PBOs this processor's context allocated; see [`OwnedPbos`].
     /// Shared with the `GLProcessorThreaded` front end, which records each
     /// PBO as it hands it out.
@@ -920,11 +976,6 @@ pub struct GLProcessorST {
     pub(super) float_quad_uv_vbo: u32,
     /// Client preference for NV* path selection (`EDGEFIRST_NV_CONVERT_PATH`).
     nv_path_pref: NvPathPref,
-    /// Colorimetry/performance trade-off (see [`crate::ColorimetryMode`]).
-    colorimetry_mode: crate::ColorimetryMode,
-    /// `true` when `EDGEFIRST_COLORIMETRY` pinned the mode for this
-    /// processor's lifetime — `set_colorimetry_mode` then logs and keeps it.
-    colorimetry_env_pinned: bool,
     /// How resizing converts resample (see [`crate::Interpolation`]): the
     /// source textures' filter and the NV program family.
     interpolation: crate::Interpolation,
@@ -935,14 +986,19 @@ pub struct GLProcessorST {
     /// duration of a single [`convert_deferred`](Self::convert_deferred) and
     /// reset on every exit; `false` between calls.
     pub(super) defer_finish: bool,
-    /// `true` when one or more `convert_deferred` calls have rendered without a
-    /// `glFinish` and a [`flush`](Self::flush) is owed. Cleared by the flush;
-    /// see [`flush_pending`](Self::flush_pending).
+    /// `true` when GL work was issued without its terminal GPU wait and a
+    /// [`flush`](Self::flush) is owed: a deferred convert, or a convert that
+    /// failed after a draw that skipped its wait. Cleared by the flush (see
+    /// [`flush_pending`](Self::flush_pending)) and by any terminal wait that
+    /// runs.
     pub(super) pending_flush: bool,
     /// `true` when a `record_completion` inside a batch queued a device fence
     /// signal without submitting the command buffer. Cleared by
     /// [`flush_pending`](Self::flush_pending).
     pub(super) pending_submit: bool,
+    /// The value the latest `record_completion` inside a batch queued.
+    /// Cleared with `pending_submit`.
+    pub(super) pending_recorded: Option<u64>,
     pub(super) gl_context: PlatformDisplay,
 }
 
@@ -1087,8 +1143,10 @@ impl ImageProcessorTrait for GLProcessorST {
         // Records completion after every convert; inside a batch the device
         // submission is left to `flush_pending`.
         let submit = !self.defer_finish;
-        if Platform::record_completion(&self.gl_context, dst, submit).is_some() && !submit {
+        let recorded = Platform::record_completion(&self.gl_context, dst, submit);
+        if recorded.is_some() && !submit {
             self.pending_submit = true;
+            self.pending_recorded = recorded;
         }
         Ok(())
     }
@@ -1110,6 +1168,7 @@ impl ImageProcessorTrait for GLProcessorST {
             // Submits the device signals earlier tiles of this batch left queued.
             Platform::submit_recorded(&self.gl_context);
             self.pending_submit = false;
+            self.pending_recorded = None;
         }
         result
     }
@@ -1242,9 +1301,46 @@ fn should_reject_software_gl(is_software_renderer: bool, override_enabled: bool)
     is_software_renderer && !override_enabled
 }
 
-fn parse_nv_path_pref() -> NvPathPref {
-    match std::env::var("EDGEFIRST_NV_CONVERT_PATH") {
-        Ok(v) => match v.to_ascii_lowercase().as_str() {
+/// The environment variables a GL processor reads when it is built.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct GlEnv {
+    /// `EDGEFIRST_GL_SERIALIZE`.
+    pub(crate) serialize: Option<String>,
+    /// `EDGEFIRST_PROTO_COMPUTE` is `1`.
+    pub(crate) proto_compute: bool,
+    /// `EDGEFIRST_GL_NO_FLOAT_LINEAR` is `1`.
+    pub(crate) no_float_linear: bool,
+    /// `EDGEFIRST_NV_CONVERT_PATH`.
+    pub(crate) nv_convert_path: Option<String>,
+    /// Test hook: processor construction fails before it opens a display.
+    #[cfg(test)]
+    pub(crate) fail_setup: bool,
+}
+
+impl GlEnv {
+    /// Reads the variables from the process environment.
+    pub(crate) fn from_process() -> Self {
+        Self::from_lookup(|name| std::env::var(name).ok())
+    }
+
+    /// Reads the variables through `lookup`, which returns a variable's value
+    /// or `None` when it is unset.
+    pub(crate) fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Self {
+        let flag = |name: &str| lookup(name).is_some_and(|v| v == "1");
+        Self {
+            serialize: lookup("EDGEFIRST_GL_SERIALIZE"),
+            proto_compute: flag("EDGEFIRST_PROTO_COMPUTE"),
+            no_float_linear: flag("EDGEFIRST_GL_NO_FLOAT_LINEAR"),
+            nv_convert_path: lookup("EDGEFIRST_NV_CONVERT_PATH"),
+            #[cfg(test)]
+            fail_setup: false,
+        }
+    }
+}
+
+fn parse_nv_path_pref(value: Option<&str>) -> NvPathPref {
+    match value {
+        Some(v) => match v.to_ascii_lowercase().as_str() {
             "sampler" | "external" | "a" => NvPathPref::ForceSampler,
             "shader" | "r8" | "b" => NvPathPref::ForceShader,
             "auto" | "" => NvPathPref::Auto,
@@ -1256,25 +1352,7 @@ fn parse_nv_path_pref() -> NvPathPref {
                 NvPathPref::Auto
             }
         },
-        Err(_) => NvPathPref::Auto,
-    }
-}
-
-fn parse_colorimetry_env() -> Option<crate::ColorimetryMode> {
-    match std::env::var("EDGEFIRST_COLORIMETRY") {
-        Ok(v) => match v.to_ascii_lowercase().as_str() {
-            "exact" => Some(crate::ColorimetryMode::Exact),
-            "fast" => Some(crate::ColorimetryMode::Fast),
-            "" => None,
-            other => {
-                log::warn!(
-                    "EDGEFIRST_COLORIMETRY={other:?} not recognised \
-                     (expected fast|exact), ignoring"
-                );
-                None
-            }
-        },
-        Err(_) => None,
+        None => NvPathPref::Auto,
     }
 }
 
@@ -2017,6 +2095,84 @@ impl GLProcessorST {
             // One device submission for the whole batch.
             Platform::submit_recorded(&self.gl_context);
             self.pending_submit = false;
+            self.pending_recorded = None;
+        }
+    }
+
+    /// Complete a deferred batch with one native fence in place of the CPU
+    /// wait: submits the device signals the batch queued and every GL command
+    /// issued so far, then exports a fence that signals when they complete.
+    /// Nothing is left pending.
+    ///
+    /// `owed` is whether a flush was owed before the batch's converts ran.
+    /// After an export that work stays owed, so a later
+    /// [`flush`](Self::flush) still waits for it.
+    ///
+    /// Returns `None` after the blocking [`flush_pending`](Self::flush_pending)
+    /// when no deferred convert is pending, the platform has no native fence
+    /// or the export fails.
+    ///
+    /// # Safety contract
+    /// Must run on the GL worker thread that owns the context.
+    pub(super) fn flush_pending_fenced(&mut self, owed: bool) -> Option<super::CompletionFence> {
+        if !self.pending_flush {
+            self.flush_pending();
+            return None;
+        }
+        let recorded = self.pending_recorded.take();
+        if self.pending_submit {
+            Platform::submit_recorded(&self.gl_context);
+            self.pending_submit = false;
+        }
+        // SAFETY: called on the context-owning GL worker thread.
+        unsafe { edgefirst_gl::gl::Flush() };
+        match Platform::export_completion_fence(&self.gl_context, recorded) {
+            Ok(Some(fence)) => {
+                self.pending_flush = owed;
+                Some(fence)
+            }
+            Ok(None) => {
+                self.flush_pending();
+                None
+            }
+            Err(e) => {
+                log::debug!("native fence export failed ({e:?}); falling back to a blocking sync");
+                self.flush_pending();
+                None
+            }
+        }
+    }
+
+    /// Complete every GL command issued so far and clear the deferral state,
+    /// after a panic left a convert part-way through.
+    ///
+    /// # Safety contract
+    /// Must run on the GL worker thread that owns the context.
+    pub(super) fn sync_after_panic(&mut self) {
+        self.defer_finish = false;
+        self.pending_flush = true;
+        self.flush_pending();
+    }
+
+    /// Run the terminal GPU wait `wait` unless a deferred convert holds it
+    /// for the batch's sync; `force` runs it regardless. A skipped wait sets
+    /// `pending_flush`; a wait that runs completes every command issued and
+    /// clears it.
+    ///
+    /// `wait` must be safe to call on the GL worker thread.
+    pub(super) fn wait_unless_deferred(&mut self, force: bool, wait: unsafe fn()) {
+        if self.defer_finish && !force {
+            self.pending_flush = true;
+            return;
+        }
+        let start = Instant::now();
+        // SAFETY: called on the context-owning GL worker thread.
+        unsafe { wait() };
+        self.pending_flush = false;
+        log::debug!("terminal GPU wait takes {:?}", start.elapsed());
+        #[cfg(test)]
+        {
+            self.terminal_waits += 1;
         }
     }
 
@@ -2025,13 +2181,21 @@ impl GLProcessorST {
     /// `capacity` is the per-cache import-cache bound
     /// ([`ImageProcessorConfig::egl_cache_capacity`]); `None` (or `Some(0)`)
     /// defers to `EDGEFIRST_EGL_CACHE_CAPACITY` and then to the default —
-    /// see [`resolve_egl_cache_capacity`].
+    /// see [`resolve_egl_cache_capacity`]. `env` holds the environment
+    /// settings the processor applies.
     ///
     /// [`ImageProcessorConfig::egl_cache_capacity`]: crate::ImageProcessorConfig::egl_cache_capacity
     pub fn new(
         kind: Option<EglDisplayKind>,
         capacity: Option<usize>,
+        env: &GlEnv,
     ) -> Result<GLProcessorST, crate::Error> {
+        #[cfg(test)]
+        if env.fail_setup {
+            return Err(crate::Error::NotSupported(
+                "GL processor setup refused by the test hook".into(),
+            ));
+        }
         let gl_context = Platform::init_display(kind)?;
         // Loads the GL function pointers once per process.
         Platform::load_gl_once(&gl_context);
@@ -2044,7 +2208,7 @@ impl GLProcessorST {
             renderer_name,
             supports_f32_color,
             supports_f16_color,
-        } = Self::gl_check_support()?;
+        } = Self::gl_check_support(env.no_float_linear)?;
         let RendererTraits {
             vivante: is_vivante,
             mali: is_mali,
@@ -2053,6 +2217,11 @@ impl GLProcessorST {
             angle: is_angle,
             adreno: is_adreno,
         } = renderer;
+        #[cfg(target_os = "linux")]
+        super::adreno_unmap::install(
+            &edgefirst_gl::get_string(edgefirst_gl::gl::VENDOR).unwrap_or_default(),
+            &renderer_name,
+        );
 
         // Rejects software renderers (llvmpipe, softpipe, swrast) unless
         // `EDGEFIRST_ALLOW_SOFTWARE_GL=1`.
@@ -2359,16 +2528,9 @@ impl GLProcessorST {
 
         // NV* conversion-path preference: `auto` (default), or `sampler`/`shader`
         // to force a path.
-        let nv_path_pref = parse_nv_path_pref();
+        let nv_path_pref = parse_nv_path_pref(env.nv_convert_path.as_deref());
         if nv_path_pref != NvPathPref::Auto {
             log::info!("EDGEFIRST_NV_CONVERT_PATH override: {nv_path_pref:?}");
-        }
-
-        // Colorimetry mode: the env var pins it for the processor's lifetime;
-        // otherwise it starts as Fast.
-        let colorimetry_env = parse_colorimetry_env();
-        if let Some(mode) = colorimetry_env {
-            log::info!("EDGEFIRST_COLORIMETRY override: {mode:?}");
         }
 
         let mut converter = GLProcessorST {
@@ -2424,6 +2586,12 @@ impl GLProcessorST {
             fail_dst_import: false,
             #[cfg(test)]
             fail_nv12_programs: false,
+            #[cfg(test)]
+            terminal_waits: 0,
+            #[cfg(test)]
+            fail_readback: false,
+            #[cfg(test)]
+            last_plan: None,
             probe_dst_import_only: false,
             dst_import_warned: std::collections::HashSet::new(),
             is_vivante,
@@ -2475,6 +2643,7 @@ impl GLProcessorST {
             last_nv_sampling: None,
             convert_stats: Default::default(),
             nv_import_warned: std::collections::HashSet::new(),
+            sampler_only_warned: std::collections::HashSet::new(),
             owned_pbos: Default::default(),
             float_quad_locs: std::collections::HashMap::new(),
             float_norm: FloatNorm::IDENTITY,
@@ -2487,22 +2656,18 @@ impl GLProcessorST {
             float_quad_pos_vbo: 0,
             float_quad_uv_vbo: 0,
             nv_path_pref,
-            colorimetry_mode: colorimetry_env.unwrap_or_default(),
-            colorimetry_env_pinned: colorimetry_env.is_some(),
             interpolation: crate::Interpolation::default(),
             nv_hw_filter: std::env::var("EDGEFIRST_GL_NO_NV_HW_FILTER").map_or(true, |v| v != "1"),
             defer_finish: false,
             pending_flush: false,
             pending_submit: false,
+            pending_recorded: None,
         };
         check_gl_error(function!(), line!())?;
 
         // Compile the proto repack compute shader when GLES 3.1 is available
-        // and EDGEFIRST_PROTO_COMPUTE=1.
-        let compute_enabled = converter.gl_context.has_compute
-            && std::env::var("EDGEFIRST_PROTO_COMPUTE")
-                .map(|v| v == "1")
-                .unwrap_or(false);
+        // and `env.proto_compute` is set.
+        let compute_enabled = converter.gl_context.has_compute && env.proto_compute;
         if compute_enabled {
             match Self::compile_compute_program(generate_proto_repack_compute_shader()) {
                 Ok(program) => {
@@ -2675,24 +2840,6 @@ impl GLProcessorST {
         log::debug!("Int8 interpolation mode set to {:?}", mode);
     }
 
-    /// Sets the colorimetry/performance trade-off (see
-    /// [`crate::ColorimetryMode`]). When `EDGEFIRST_COLORIMETRY` pinned the
-    /// mode at construction, the env value wins: this logs and keeps it.
-    pub fn set_colorimetry_mode(&mut self, mode: crate::ColorimetryMode) {
-        if self.colorimetry_env_pinned {
-            if mode != self.colorimetry_mode {
-                log::info!(
-                    "ColorimetryMode::{mode:?} requested but EDGEFIRST_COLORIMETRY pins \
-                     {:?} — keeping the env override",
-                    self.colorimetry_mode
-                );
-            }
-            return;
-        }
-        self.colorimetry_mode = mode;
-        log::debug!("Colorimetry mode set to {:?}", mode);
-    }
-
     /// Sets how resizing converts resample (see [`crate::Interpolation`]).
     pub fn set_interpolation(&mut self, mode: crate::Interpolation) {
         self.interpolation = mode;
@@ -2760,6 +2907,29 @@ impl GLProcessorST {
         self.convert_stats
     }
 
+    /// `NotSupported` for a source [`declines_sampler_only_nv`] declines on
+    /// this GPU, whether or not soft declines are on. Logs a warning the
+    /// first time for each format and size, and at debug after that.
+    fn decline_sampler_only_nv(&mut self, src: &TensorDyn) -> crate::Result<()> {
+        let Some(fmt) = src.format() else {
+            return Ok(());
+        };
+        if !declines_sampler_only_nv(self.is_vivante, fmt, src.is_multiplane()) {
+            return Ok(());
+        }
+        let (w, h) = (src.width().unwrap_or(0), src.height().unwrap_or(0));
+        let why = format!(
+            "the Vivante external sampler can lock up the GPU for a {fmt:?} source with \
+             separate planes ({w}x{h}); the GL backend declines it"
+        );
+        if self.sampler_only_warned.insert((fmt, w, h)) {
+            log::warn!("{why}");
+        } else {
+            log::debug!("{why}");
+        }
+        Err(Error::NotSupported(why))
+    }
+
     /// The body of [`ImageProcessorTrait::convert`]. A per-convert
     /// interpolation in `options` replaces the processor's for this call only.
     fn convert_inner(
@@ -2784,6 +2954,7 @@ impl GLProcessorST {
         dst: &mut TensorDyn,
         options: &crate::ConvertOptions,
     ) -> crate::Result<()> {
+        self.decline_sampler_only_nv(src)?;
         let (rotation, flip, crop) = (
             options.get_rotation(),
             options.get_flip(),
@@ -3038,6 +3209,7 @@ impl GLProcessorST {
         dst: &mut TensorDyn,
         options: crate::ConvertOptions,
     ) -> Result<Option<super::CompletionFence>, crate::Error> {
+        let owed = self.pending_flush;
         self.defer_finish = true;
         let result = self.convert_inner(src, dst, &options);
         self.defer_finish = false;
@@ -3046,9 +3218,13 @@ impl GLProcessorST {
         // same sync point.
         let recorded = Platform::record_completion(&self.gl_context, dst, true);
         match Platform::export_completion_fence(&self.gl_context, recorded) {
-            Ok(Some(fd)) => Ok(Some(fd)),
+            Ok(Some(fd)) => {
+                self.pending_flush = owed;
+                Ok(Some(fd))
+            }
             Ok(None) => {
                 unsafe { edgefirst_gl::gl::Finish() };
+                self.pending_flush = false;
                 check_gl_error(function!(), line!())?;
                 Ok(None)
             }
@@ -3056,6 +3232,7 @@ impl GLProcessorST {
                 // A failed export falls back to `glFinish`.
                 log::debug!("native fence export failed ({e:?}); falling back to glFinish");
                 unsafe { edgefirst_gl::gl::Finish() };
+                self.pending_flush = false;
                 check_gl_error(function!(), line!())?;
                 Ok(None)
             }
@@ -3240,6 +3417,10 @@ impl GLProcessorST {
             src_pbo = src.memory() == TensorMemory::Pbo,
         )
         .entered();
+        #[cfg(test)]
+        {
+            self.last_plan = Some(plan);
+        }
 
         match plan {
             super::render::ConvertPlan::TwoPassPackedRgb => {
@@ -3298,6 +3479,10 @@ impl GLProcessorST {
                 super::render::ConvertPlan::TwoPassNvPlanar,
                 "a texture lowering can only re-plan onto the planar two-pass route"
             );
+            #[cfg(test)]
+            {
+                self.last_plan = Some(replanned);
+            }
             return self.convert_nv_to_planar_two_pass(
                 src,
                 src_fmt,
@@ -3705,7 +3890,7 @@ impl GLProcessorST {
 
     /// Query GL capabilities and detect GPU vendor/renderer type; see
     /// [`GlSupport`].
-    fn gl_check_support() -> Result<GlSupport, crate::Error> {
+    fn gl_check_support(force_no_float_linear: bool) -> Result<GlSupport, crate::Error> {
         if let Ok(version) = edgefirst_gl::get_string(edgefirst_gl::gl::SHADING_LANGUAGE_VERSION) {
             log::debug!("GL Shading Language Version: {version:?}");
         } else {
@@ -3809,10 +3994,7 @@ impl GLProcessorST {
             }
         }
 
-        // EDGEFIRST_GL_NO_FLOAT_LINEAR=1 forces the float-linear capability off.
-        let force_no_float_linear = std::env::var("EDGEFIRST_GL_NO_FLOAT_LINEAR")
-            .map(|v| v == "1")
-            .unwrap_or(false);
+        // `force_no_float_linear` forces the float-linear capability off.
         let has_float_linear =
             extensions.contains("GL_OES_texture_float_linear") && !force_no_float_linear;
         if force_no_float_linear {
@@ -4507,8 +4689,10 @@ impl GLProcessorST {
                     edgefirst_gl::gl::PixelStorei(edgefirst_gl::gl::PACK_ROW_LENGTH, 0);
                 }
                 edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::PIXEL_PACK_BUFFER, 0);
-                edgefirst_gl::gl::Finish();
                 spread = stride > tight_row && row_length.is_none();
+                // A deferred readback completes at the batch's sync; one this
+                // call maps below completes here.
+                self.wait_unless_deferred(spread || swap_rb, edgefirst_gl::finish);
             } else {
                 // Reads RGBA into the scratch and repacks each row's leading channels
                 // into the mapped PBO at the pitch.
@@ -4579,6 +4763,10 @@ impl GLProcessorST {
         dst_fmt: PixelFormat,
         pbo_id: Option<u32>,
     ) -> crate::Result<()> {
+        #[cfg(test)]
+        if self.fail_readback {
+            return Err(Error::OpenGl("readback refused by the test hook".into()));
+        }
         let dst_w = dst.width().ok_or(Error::NotAnImage)?;
         let dst_h = dst.height().ok_or(Error::NotAnImage)?;
         let dest_format = match dst_fmt {
@@ -4982,6 +5170,8 @@ impl GLProcessorST {
     /// - [`NvConvertPath::ExternalSampler`] (samplerExternalOES) covers NV12
     ///   only (incl. multiplane).
     ///
+    /// `Auto` takes `ShaderR8` wherever it can read the source. A forced
+    /// `ExternalSampler` is refused on Vivante.
     /// `render_fmt` is the format of the render target this draw writes. A
     /// Grey render target always takes `ShaderR8`.
     fn select_nv_path(
@@ -5001,60 +5191,7 @@ impl GLProcessorST {
         if !shader_capable {
             return NvConvertPath::ExternalSampler;
         }
-        // A Grey target takes `ShaderR8`; a forced sampler is refused.
-        if render_fmt == PixelFormat::Grey {
-            if self.nv_path_pref == NvPathPref::ForceSampler {
-                log::warn!(
-                    "EDGEFIRST_NV_CONVERT_PATH=sampler refused for {src_fmt:?}→Grey \
-                     (the sampler returns RGB, not the source's luma); using shader"
-                );
-            }
-            return NvConvertPath::ShaderR8;
-        }
-        // Single-plane NV12/NV16/NV24 from here; only NV12 also has an
-        // ExternalSampler path.
-        match self.nv_path_pref {
-            NvPathPref::ForceShader => NvConvertPath::ShaderR8,
-            NvPathPref::ForceSampler => {
-                if src_fmt == PixelFormat::Nv12 {
-                    NvConvertPath::ExternalSampler
-                } else {
-                    log::warn!(
-                        "EDGEFIRST_NV_CONVERT_PATH=sampler unavailable for {src_fmt:?} \
-                         (no external-sampler path); using shader"
-                    );
-                    NvConvertPath::ShaderR8
-                }
-            }
-            // Auto: `ShaderR8`, except on Vivante for single-plane 4-aligned NV12,
-            // where the pick follows the colorimetry mode:
-            //
-            // * `ColorimetryMode::Fast`: the sampler for every colorimetry.
-            // * `ColorimetryMode::Exact`: the sampler only when the source resolves
-            //   to BT.601 limited range.
-            NvPathPref::Auto => {
-                let vivante_sampler_usable = src_fmt == PixelFormat::Nv12
-                    && self.is_vivante
-                    && src.width().is_some_and(|w| w.is_multiple_of(4));
-                let take_sampler = vivante_sampler_usable
-                    && match self.colorimetry_mode {
-                        crate::ColorimetryMode::Fast => true,
-                        crate::ColorimetryMode::Exact => {
-                            let cm = crate::colorimetry::resolve_colorimetry(
-                                src.colorimetry(),
-                                src.height(),
-                            );
-                            cm.encoding == Some(edgefirst_tensor::ColorEncoding::Bt601)
-                                && cm.range == Some(edgefirst_tensor::ColorRange::Limited)
-                        }
-                    };
-                if take_sampler {
-                    NvConvertPath::ExternalSampler
-                } else {
-                    NvConvertPath::ShaderR8
-                }
-            }
-        }
+        nv_path_for(self.nv_path_pref, src_fmt, render_fmt, self.is_vivante)
     }
 
     /// Render `src` to the currently-bound FBO at `dst`'s dimensions; see
@@ -5214,12 +5351,7 @@ impl GLProcessorST {
             convert_span,
         );
 
-        // Finishes unless the batch defers it; a failed draw always finishes.
-        if !self.defer_finish || drawn.is_err() {
-            let start = Instant::now();
-            unsafe { edgefirst_gl::gl::Finish() };
-            log::debug!("gl_Finish takes {:?}", start.elapsed());
-        }
+        self.wait_unless_deferred(drawn.is_err(), edgefirst_gl::finish);
         drawn?;
         check_gl_error(function!(), line!())?;
         Ok(())
@@ -5625,7 +5757,7 @@ impl GLProcessorST {
             super::render::sample_clamp_rect_within((src_w, src_h), src_map, src_roi.uv_bounds());
         let src_roi = super::render::scale_roi_to_import(src_roi, (src_w, src_h), src_map);
 
-        self.draw_camera_texture_to_rgb_planar(
+        let drawn = self.draw_camera_texture_to_rgb_planar(
             src_key,
             src_egl,
             src_roi,
@@ -5636,8 +5768,9 @@ impl GLProcessorST {
             alpha,
             is_int8,
             src_fmt == PixelFormat::Grey,
-        )?;
-        unsafe { edgefirst_gl::gl::Finish() };
+        );
+        self.wait_unless_deferred(drawn.is_err(), edgefirst_gl::finish);
+        drawn?;
         check_gl_error(function!(), line!())?;
 
         Ok(())
@@ -5755,7 +5888,7 @@ impl GLProcessorST {
         }
 
         // Draw full-viewport quad to pack RGBA→RGB
-        self.draw_fullscreen_quad()?;
+        let drawn = self.draw_fullscreen_quad();
 
         // Unbinds the intermediate from TEXTURE1 and restores unit 0 as the
         // active unit.
@@ -5764,7 +5897,8 @@ impl GLProcessorST {
             edgefirst_gl::gl::ActiveTexture(edgefirst_gl::gl::TEXTURE0);
         };
 
-        unsafe { edgefirst_gl::gl::Finish() };
+        self.wait_unless_deferred(drawn.is_err(), edgefirst_gl::finish);
+        drawn?;
         check_gl_error(function!(), line!())?;
         Ok(())
     }
@@ -5853,9 +5987,9 @@ impl GLProcessorST {
             bottom: -1.,
         };
 
-        self.draw_intermediate_to_rgb_planar(dst_roi, alpha, is_int8)?;
-
-        unsafe { edgefirst_gl::gl::Finish() };
+        let drawn = self.draw_intermediate_to_rgb_planar(dst_roi, alpha, is_int8);
+        self.wait_unless_deferred(drawn.is_err(), edgefirst_gl::finish);
+        drawn?;
         check_gl_error(function!(), line!())?;
 
         // Reads back a texture-lowered destination (Mem/Pbo).
@@ -5933,8 +6067,8 @@ impl GLProcessorST {
             // SAFETY: on the GL thread with `program` bound.
             unsafe { self.set_plane_quant(program, None) };
         }
+        self.wait_unless_deferred(drawn.is_err(), edgefirst_gl::finish);
         drawn?;
-        unsafe { edgefirst_gl::gl::Finish() };
         check_gl_error(function!(), line!())?;
 
         if let DstTarget::Texture { readback } = target {
@@ -5979,8 +6113,8 @@ impl GLProcessorST {
         let drawn = self.draw_nv12_planes(planes, (dst_w, dst_h), band, fill, &coeffs);
         // SAFETY: on the GL thread.
         unsafe { edgefirst_gl::gl::Disable(edgefirst_gl::gl::SCISSOR_TEST) };
+        self.wait_unless_deferred(drawn.is_err(), edgefirst_gl::finish);
         drawn?;
-        unsafe { edgefirst_gl::gl::Finish() };
         check_gl_error(function!(), line!())
     }
 
@@ -9907,6 +10041,139 @@ impl GLProcessorST {
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
+    /// `Auto` takes `ShaderR8` for every source `ShaderR8` reads, into every target format.
+    #[test]
+    fn auto_nv_path_is_shader_r8() {
+        use super::{nv_path_for, NvConvertPath, NvPathPref};
+        use edgefirst_tensor::PixelFormat;
+        for src in [PixelFormat::Nv12, PixelFormat::Nv16, PixelFormat::Nv24] {
+            for render in [
+                PixelFormat::Rgba,
+                PixelFormat::Rgb,
+                PixelFormat::PlanarRgb,
+                PixelFormat::Grey,
+            ] {
+                for vivante in [false, true] {
+                    assert_eq!(
+                        nv_path_for(NvPathPref::Auto, src, render, vivante),
+                        NvConvertPath::ShaderR8,
+                        "{src:?} -> {render:?}, vivante={vivante}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A forced path is taken where it exists, and `ShaderR8` otherwise. Vivante refuses a
+    /// forced sampler.
+    #[test]
+    fn forced_nv_path() {
+        use super::{nv_path_for, NvConvertPath, NvPathPref};
+        use edgefirst_tensor::PixelFormat::{Grey, Nv12, Nv16, Nv24, PlanarRgb, Rgba};
+        use NvConvertPath::{ExternalSampler, ShaderR8};
+        use NvPathPref::{ForceSampler, ForceShader};
+        let cases = [
+            (ForceShader, Nv12, Rgba, false, ShaderR8),
+            (ForceShader, Nv12, Rgba, true, ShaderR8),
+            (ForceSampler, Nv12, Rgba, false, ExternalSampler),
+            (ForceSampler, Nv12, PlanarRgb, false, ExternalSampler),
+            (ForceSampler, Nv12, Rgba, true, ShaderR8),
+            (ForceSampler, Nv12, PlanarRgb, true, ShaderR8),
+            (ForceSampler, Nv12, Grey, false, ShaderR8),
+            (ForceSampler, Nv12, Grey, true, ShaderR8),
+            (ForceSampler, Nv16, Rgba, false, ShaderR8),
+            (ForceSampler, Nv24, Rgba, false, ShaderR8),
+            (ForceSampler, Nv16, Rgba, true, ShaderR8),
+        ];
+        for (pref, src, render, vivante, want) in cases {
+            assert_eq!(
+                nv_path_for(pref, src, render, vivante),
+                want,
+                "{pref:?} {src:?} -> {render:?}, vivante={vivante}"
+            );
+        }
+    }
+
+    /// Vivante declines multiplane NV12 and NV16 sources; single-plane ones, other formats
+    /// and other GPUs are not declined.
+    #[test]
+    fn vivante_declines_multiplane_nv_sources() {
+        use super::declines_sampler_only_nv;
+        use edgefirst_tensor::PixelFormat;
+        for fmt in [PixelFormat::Nv12, PixelFormat::Nv16] {
+            assert!(declines_sampler_only_nv(true, fmt, true), "{fmt:?}");
+            assert!(
+                !declines_sampler_only_nv(true, fmt, false),
+                "{fmt:?} single plane"
+            );
+            assert!(
+                !declines_sampler_only_nv(false, fmt, true),
+                "{fmt:?} not Vivante"
+            );
+        }
+        for fmt in [
+            PixelFormat::Nv24,
+            PixelFormat::Yuyv,
+            PixelFormat::Rgba,
+            PixelFormat::Grey,
+        ] {
+            assert!(!declines_sampler_only_nv(true, fmt, false), "{fmt:?}");
+        }
+    }
+
+    /// `GlEnv` reads each documented name; the flags need exactly `1`.
+    #[test]
+    fn gl_env_reads_the_documented_names() {
+        use super::GlEnv;
+        let lookup = |vars: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                vars.iter()
+                    .find(|(k, _)| *k == name)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        let env = GlEnv::from_lookup(lookup(&[
+            ("EDGEFIRST_GL_SERIALIZE", "full"),
+            ("EDGEFIRST_PROTO_COMPUTE", "1"),
+            ("EDGEFIRST_GL_NO_FLOAT_LINEAR", "1"),
+            ("EDGEFIRST_NV_CONVERT_PATH", "shader"),
+        ]));
+        assert_eq!(env.serialize.as_deref(), Some("full"));
+        assert!(env.proto_compute);
+        assert!(env.no_float_linear);
+        assert_eq!(env.nv_convert_path.as_deref(), Some("shader"));
+
+        let env = GlEnv::from_lookup(lookup(&[
+            ("EDGEFIRST_PROTO_COMPUTE", "true"),
+            ("EDGEFIRST_GL_NO_FLOAT_LINEAR", "0"),
+        ]));
+        assert!(!env.proto_compute, "only `1` turns the flag on");
+        assert!(!env.no_float_linear);
+        assert_eq!(env.serialize, None);
+        assert_eq!(env.nv_convert_path, None);
+    }
+
+    /// The NV path values match case-insensitively, and an unrecognised
+    /// value falls back to the default.
+    #[test]
+    fn nv_path_values_parse() {
+        use super::{parse_nv_path_pref, NvPathPref};
+        for (value, want) in [
+            (Some("SAMPLER"), NvPathPref::ForceSampler),
+            (Some("external"), NvPathPref::ForceSampler),
+            (Some("a"), NvPathPref::ForceSampler),
+            (Some("Shader"), NvPathPref::ForceShader),
+            (Some("r8"), NvPathPref::ForceShader),
+            (Some("b"), NvPathPref::ForceShader),
+            (Some("auto"), NvPathPref::Auto),
+            (Some(""), NvPathPref::Auto),
+            (Some("bogus"), NvPathPref::Auto),
+            (None, NvPathPref::Auto),
+        ] {
+            assert_eq!(parse_nv_path_pref(value), want, "{value:?}");
+        }
+    }
+
     #[test]
     fn nv12_dst_policy_per_renderer() {
         use super::{
@@ -10103,7 +10370,7 @@ mod tests {
         use super::super::shaders_common::{
             NV12_CHROMA_FILL_FRAGMENT, NV12_CHROMA_R8_FRAGMENT, NV12_LUMA_FRAGMENT,
         };
-        let _gl = match super::GLProcessorST::new(None, None) {
+        let worker = match super::super::GLProcessorThreaded::new(None) {
             Ok(g) => g,
             Err(e) => {
                 crate::test_support::report_skip(&format!(
@@ -10112,13 +10379,15 @@ mod tests {
                 return;
             }
         };
-        for fragment in [
-            NV12_LUMA_FRAGMENT,
-            NV12_CHROMA_R8_FRAGMENT,
-            NV12_CHROMA_FILL_FRAGMENT,
-        ] {
-            GlProgram::new(generate_vertex_shader(), fragment).unwrap();
-        }
+        worker.with_st(|_| {
+            for fragment in [
+                NV12_LUMA_FRAGMENT,
+                NV12_CHROMA_R8_FRAGMENT,
+                NV12_CHROMA_FILL_FRAGMENT,
+            ] {
+                GlProgram::new(generate_vertex_shader(), fragment).unwrap();
+            }
+        });
     }
 
     /// An NV12 destination is renderable only as a zero-copy DMA buffer on a

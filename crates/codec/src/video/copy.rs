@@ -1,10 +1,12 @@
 // SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! Copies of NV12 and YUYV pictures between buffers whose planes start at
+//! Copies of NV12 and packed pictures between buffers whose planes start at
 //! different offsets and whose rows have different pitches.
 
-use edgefirst_tensor::PixelFormat;
+use edgefirst_tensor::{CpuAccess, PixelFormat, PixelLayout, TensorDyn};
+
+use crate::CodecError;
 
 /// Where one plane of a picture starts in a buffer, and the distance from
 /// one of its rows to the next.
@@ -26,13 +28,15 @@ pub(crate) fn plane_shapes(
             (width, height),
             (width.div_ceil(2) * 2, height.div_ceil(2)),
         ]),
-        PixelFormat::Yuyv => Some(vec![(width.div_ceil(2) * 4, height)]),
+        PixelFormat::Yuyv | PixelFormat::Vyuy => Some(vec![(width.div_ceil(2) * 4, height)]),
+        f if f.layout() == PixelLayout::Packed => Some(vec![(width * f.channels(), height)]),
         _ => None,
     }
 }
 
 /// The planes of a picture whose planes follow one another in one buffer,
 /// each `pitch` bytes per row, the chroma after `rows` luma rows.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn contiguous(format: PixelFormat, pitch: usize, rows: usize) -> Vec<Plane> {
     let luma = Plane { offset: 0, pitch };
     match format {
@@ -51,7 +55,10 @@ pub(crate) fn contiguous(format: PixelFormat, pitch: usize, rows: usize) -> Vec<
 /// of a `format` picture that starts there. `x` and `y` must be on a chroma
 /// sample.
 pub(crate) fn offset(format: PixelFormat, src: &[Plane], (x, y): (usize, usize)) -> Vec<Plane> {
-    let bytes_per_pixel = if format == PixelFormat::Yuyv { 2 } else { 1 };
+    let bytes_per_pixel = match format.layout() {
+        PixelLayout::Packed => format.channels(),
+        _ => 1,
+    };
     src.iter()
         .enumerate()
         .map(|(i, p)| {
@@ -137,6 +144,108 @@ pub(crate) fn copy_plane(
         dst[b..b + len].copy_from_slice(&src[a..a + len]);
     }
     Ok(())
+}
+
+/// Repeats the last of the `rows` rows of `len` bytes of plane `d` of `dst`
+/// down to row `total`.
+///
+/// # Errors
+///
+/// A message when a row falls outside `dst` or is longer than a pitch.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn repeat_last_row(
+    dst: &mut [u8],
+    d: Plane,
+    (len, rows): (usize, usize),
+    total: usize,
+) -> Result<(), String> {
+    if rows == 0 || total <= rows {
+        return Ok(());
+    }
+    if len > d.pitch {
+        return Err(format!(
+            "a {len}-byte row is longer than the pitch {}",
+            d.pitch
+        ));
+    }
+    let end = d.offset + (total - 1) * d.pitch + len;
+    if end > dst.len() {
+        return Err(format!(
+            "the destination plane ends at byte {end} of {}",
+            dst.len()
+        ));
+    }
+    let last = d.offset + (rows - 1) * d.pitch;
+    for r in rows..total {
+        dst.copy_within(last..last + len, d.offset + r * d.pitch);
+    }
+    Ok(())
+}
+
+/// Copies the `size` region of `src` at `origin`, whose rows are `stride`
+/// bytes apart, into the planes `to` of `dst`.
+pub(crate) fn copy_source(
+    format: PixelFormat,
+    size: (usize, usize),
+    src: &TensorDyn,
+    origin: (usize, usize),
+    stride: usize,
+    dst: &mut [u8],
+    to: &[Plane],
+) -> crate::Result<()> {
+    let read_error = |e: edgefirst_tensor::Error| {
+        if e.cpu_access_denied().is_some() {
+            CodecError::Tensor(e)
+        } else {
+            CodecError::InvalidInput(format!("the source cannot be read: {e}"))
+        }
+    };
+    let shapes =
+        plane_shapes(format, size.0, size.1).ok_or(CodecError::UnsupportedFormat(format))?;
+    let luma = src.map_bytes(CpuAccess::Read).map_err(read_error)?;
+    let copied = if src.is_multiplane() {
+        let chroma = src.chroma_dyn().ok_or_else(|| {
+            CodecError::InvalidInput("multi-plane source has no chroma plane".into())
+        })?;
+        let cstride = chroma.effective_row_stride().unwrap_or(stride);
+        let cmap = chroma.map_bytes(CpuAccess::Read).map_err(read_error)?;
+        let planes = offset(
+            format,
+            &[
+                Plane {
+                    offset: 0,
+                    pitch: stride,
+                },
+                Plane {
+                    offset: 0,
+                    pitch: cstride,
+                },
+            ],
+            origin,
+        );
+        copy_plane(&luma, planes[0], dst, to[0], shapes[0])
+            .and_then(|()| copy_plane(&cmap, planes[1], dst, to[1], shapes[1]))
+    } else {
+        let table = format
+            .plane_table(src.width().unwrap_or(0), src.height().unwrap_or(0), stride)
+            .ok_or(CodecError::UnsupportedFormat(format))?;
+        let planes: Vec<Plane> = table
+            .iter()
+            .map(|p| Plane {
+                offset: p.offset as usize,
+                pitch: p.stride as usize,
+            })
+            .collect();
+        copy(
+            format,
+            size,
+            &luma,
+            &offset(format, &planes, origin),
+            dst,
+            to,
+        )
+    };
+    copied.map_err(CodecError::InvalidInput)
 }
 
 #[cfg(test)]
@@ -250,7 +359,58 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("longer than a pitch"), "{err}");
-        assert!(copy(PixelFormat::Rgba, (1, 1), &[0; 4], &to, &mut dst, &to).is_err());
+        assert!(copy(PixelFormat::Nv16, (1, 1), &[0; 4], &to, &mut dst, &to).is_err());
+    }
+
+    #[test]
+    fn packed_rows_carry_every_channel() {
+        assert_eq!(plane_shapes(PixelFormat::Rgba, 5, 3), Some(vec![(20, 3)]));
+        assert_eq!(plane_shapes(PixelFormat::Grey, 5, 3), Some(vec![(5, 3)]));
+        let from = offset(
+            PixelFormat::Rgb,
+            &contiguous(PixelFormat::Rgb, 30, 2),
+            (2, 1),
+        );
+        assert_eq!(from[0].offset, 30 + 6);
+    }
+
+    #[test]
+    fn the_last_row_fills_the_rows_below() {
+        // Two 3-byte rows at pitch 4, padded to four rows.
+        let mut dst = vec![0; 16];
+        dst[..3].copy_from_slice(&[1, 2, 3]);
+        dst[4..7].copy_from_slice(&[4, 5, 6]);
+        let d = Plane {
+            offset: 0,
+            pitch: 4,
+        };
+        repeat_last_row(&mut dst, d, (3, 2), 4).unwrap();
+        assert_eq!(&dst[8..11], &[4, 5, 6]);
+        assert_eq!(&dst[12..15], &[4, 5, 6]);
+        assert_eq!(dst[11], 0, "padding is left alone");
+        assert!(repeat_last_row(&mut dst, d, (3, 2), 5).is_err());
+        repeat_last_row(&mut dst, d, (3, 2), 2).unwrap();
+    }
+
+    #[test]
+    fn a_source_declared_without_reads_is_refused_as_denied_access() {
+        use edgefirst_tensor::{DType, TensorMemory};
+        for declared in [CpuAccess::None, CpuAccess::Write] {
+            let src = TensorDyn::image(
+                8,
+                4,
+                PixelFormat::Nv12,
+                DType::U8,
+                Some(TensorMemory::Mem),
+                declared,
+            )
+            .unwrap();
+            let mut dst = vec![0; 48];
+            let to = contiguous(PixelFormat::Nv12, 8, 4);
+            let err =
+                copy_source(PixelFormat::Nv12, (8, 4), &src, (0, 0), 8, &mut dst, &to).unwrap_err();
+            assert!(err.cpu_access_denied().is_some(), "{declared:?}: {err}");
+        }
     }
 
     #[test]

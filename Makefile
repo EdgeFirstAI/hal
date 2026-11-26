@@ -444,7 +444,7 @@ test-rust:
 	fi
 	@cargo llvm-cov nextest $(LLVM_COV_PROFILE) $(RUST_FEATURES) --workspace \
 		$(foreach c,$(PYTHON_CRATE_NAMES),--exclude $(c)) \
-		--lcov --output-path target/rust-coverage.lcov -j 1
+		--lcov --output-path target/rust-coverage.lcov
 	@echo "✓ Rust tests passed"
 	@echo "Coverage report: target/rust-coverage.lcov"
 	@$(MAKE) --no-print-directory test-doc
@@ -505,7 +505,7 @@ test-python: install-python
 test-capi-modular: capi-libs
 	@echo "Running tests for the modular C-API crates..."
 	@for c in $(CAPI_MODULAR_CRATES); do \
-		(cd crates/$$c && EF_REQUIRE_FRESH_ARTIFACTS=1 cargo test --target-dir $(CURDIR)/target -- --test-threads=1) || exit 1; \
+		(cd crates/$$c && EF_REQUIRE_FRESH_ARTIFACTS=1 cargo test --target-dir $(CURDIR)/target) || exit 1; \
 	done
 	@echo "✓ Modular C-API tests passed"
 
@@ -674,7 +674,7 @@ test-cuda:
 		export HAL_TEST_REQUIRE_CUDA=1; \
 	fi; \
 	LD_LIBRARY_PATH="$$CUDART_LIB:$$LD_LIBRARY_PATH" \
-		cargo test --features opengl -p edgefirst-image --lib cuda -- --nocapture --test-threads=1
+		cargo test --features opengl -p edgefirst-image --lib cuda -- --nocapture
 	@echo "✓ CUDA device-pointer tests complete"
 
 .PHONY: bench

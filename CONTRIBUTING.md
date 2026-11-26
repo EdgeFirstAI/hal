@@ -74,8 +74,8 @@ cd hal
 # Build all Rust crates. The PyO3 crates build as wheels instead (below).
 cargo build --workspace --exclude 'edgefirst-python-*'
 
-# Run tests — single-threaded, always (see below)
-cargo test --workspace --exclude 'edgefirst-python-*' -- --test-threads=1
+# Run tests
+cargo test --workspace --exclude 'edgefirst-python-*'
 
 # The C-API leaves (tensor-capi, image-capi, codec-capi, decoder-capi,
 # tracker-capi, kernels-capi) are excluded from the workspace and untouched by the two
@@ -87,7 +87,7 @@ cargo test --workspace --exclude 'edgefirst-python-*' -- --test-threads=1
 cargo build --manifest-path crates/tensor-capi/Cargo.toml --target-dir target
 (cd crates/image-capi && cargo build --target-dir ../../target)
 EF_REQUIRE_FRESH_ARTIFACTS=1 cargo test --manifest-path crates/tensor-capi/Cargo.toml \
-  --target-dir target -- --test-threads=1
+  --target-dir target
 # ...or `make capi-libs` / `make test-capi-modular` to cover all of them, as CI does.
 
 # Build Python bindings (optional), from the crate directory so its
@@ -99,11 +99,7 @@ pip install maturin
 python -m pytest tests/
 ```
 
-**Tests must run single-threaded.** GPU driver concurrency bugs, G2D per-process
-state, and CMA pool exhaustion each independently require it, so pass
-`--test-threads=1` to `cargo test` and `-j 1` to `cargo nextest`. The Makefile
-targets do this for you. [TESTING.md § Single-Threaded
-Execution](TESTING.md#single-threaded-execution) has the full reasoning.
+**Tests run in parallel**, under nextest and under `cargo test`. A test that fails only in parallel is a bug to fix in the test or the code, not a reason to pass `-j 1` or `--test-threads=1`. [TESTING.md § Parallel Execution](TESTING.md#parallel-execution) has the details.
 
 ### Hardware Platform Testing
 
@@ -158,8 +154,8 @@ make test                # Rust + Python + C API, with coverage
 Or run the pieces directly:
 
 ```bash
-# Rust tests — single-threaded
-cargo test --workspace -- --test-threads=1
+# Rust tests
+cargo test --workspace
 
 # Linting, exactly as CI runs it (plain `cargo clippy` will let CI failures through)
 cargo clippy --workspace --all-targets --features default,opencv -- -D warnings
@@ -316,13 +312,13 @@ def test_image_tensor_honours_requested_memory(mem):
 
 ```bash
 # All Rust tests
-cargo test --workspace -- --test-threads=1
+cargo test --workspace
 
 # Specific crate
-cargo test -p edgefirst-image -- --test-threads=1
+cargo test -p edgefirst-image
 
 # Specific test
-cargo test test_name -- --test-threads=1
+cargo test test_name
 
 # Python tests (requires maturin develop first)
 python -m pytest tests/ -v
@@ -332,7 +328,7 @@ cargo install cargo-llvm-cov --locked
 cargo llvm-cov nextest --workspace --exclude edgefirst-python-tensor \
   --exclude edgefirst-python-codec --exclude edgefirst-python-image \
   --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-kernels \
-  --lcov --output-path target/rust-coverage.lcov -j 1
+  --lcov --output-path target/rust-coverage.lcov
 
 # With coverage (Python, after building with instrumentation)
 pip install slipcover
@@ -352,7 +348,7 @@ Workflows are in `.github/workflows/`. HAL uses three tiers — see
 [`.github/workflows/README.md`](.github/workflows/README.md).
 
 - **Quick** (`ci.yml`): every non-draft PR. `cargo fmt --check` is a hard gate,
-  plus clippy, nextest (`-j 1`), `ruff check`, and the dependency license policy.
+  plus clippy, nextest, `ruff check`, and the dependency license policy.
   Target under 20 minutes on `ubuntu-24.04`.
 - **Full**: add the `ci:full` label (it sticks on later pushes). Host matrix,
   HAL extras (iOS, Android, software-GL, C-API, Python), coverage, scancode,

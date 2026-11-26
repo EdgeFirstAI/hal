@@ -9,7 +9,7 @@ and are pinned by commit SHA in `uses:`.
 
 | Tier | When | What |
 |------|------|------|
-| **Quick** | every non-draft PR push, and push to `main` | fmt (hard gate), clippy, nextest `-j 1`, ruff, dependency license — one Linux job, ~20 min budget |
+| **Quick** | every non-draft PR push, and push to `main` | fmt (hard gate), clippy, nextest, ruff, dependency license — one Linux job, ~20 min budget |
 | **Full** | reviewer adds `ci:full` (sticky on later pushes), `workflow_dispatch`, or merge queue | host matrix, HAL extras (iOS/Android/software-GL/C-API/Python), coverage, scancode, Sonar |
 | **Hardware** | `ci:hardware` (or `ci:full`) on a same-repo PR | on-target i.MX 8M Plus via the shared three-phase pattern |
 | **Nightly** | 03:17 UTC if `main` moved since the last nightly that reached a verdict | Full + differential + Sonar `main` baseline |
@@ -51,6 +51,20 @@ The roll-up (`.github/scripts/mutants_summary.py`, tested by `tests/test_mutants
 
 Never tag by hand. Do not introduce `-xlarge` / `-8core` labels unless a Full lane measured over 20 minutes on a standard runner; record that exception.
 
+## Test runs
+
+Every lane runs each test once, in parallel: nextest at its default thread count, with no `-j 1`. When the Full tier runs, Quick builds the tests without running them, since Full runs the same suite on x86_64 Linux under coverage. A test that fails in parallel is fixed, not serialized; see [TESTING.md § Parallel Execution](../../TESTING.md#parallel-execution).
+
+- **macOS** (`hal-full.yml`) runs `scripts/test-macos.sh --profile ci` with `COVERAGE=1`. The script builds the instrumented test binaries once, signs every one with `entitlements.plist` so they can load ANGLE, runs nextest over that build without rebuilding, and writes the LCOV report. The `ci` profile does not stop at the first failure, so the report covers the whole run.
+- **Windows** (`hal-full.yml`) runs the whole workspace once under coverage and the `ci` profile, with ANGLE on the D3D11 WARP adapter.
+- **Linux x86_64** runs the workspace once, in the shared `rust-full` linux lane under coverage, except `edgefirst-image`: the `ci` nextest profile leaves that crate out on x86_64 Linux, and the software-GL lane (`hal-full.yml`) runs all of it on Mesa llvmpipe under coverage. The Linux extras lane runs the Python suite, the doctests and the C-API leaves, not the Rust workspace suite.
+- **Linux aarch64** runs the whole workspace once, in the shared linux-arm lane under coverage.
+- **GPU**: the shared `gpu` lane is off (`ci.yml` passes no `gpu-args`). If it is turned on, it runs `--profile ci` on x86_64 Linux and so inherits the filter that leaves out `edgefirst-image`.
+- **Mutation** runs each mutant's tests at libtest's default thread count.
+- **Boards** in the Full tier run each `board-binaries` entry as one process with one test thread; the shared `board-run` action in `EdgeFirstAI/.github` sets that. The on-demand `hardware-test.yml` runs `scripts/on-target-run.sh`, which runs each binary at libtest's default thread count (`HAL_ONTARGET_TEST_THREADS` sets another).
+
+Benchmarks are not part of any tier. `ci.yml` only type-checks them, and `hardware-bench.yml` runs them one case at a time, on demand.
+
 ## Shared pin
 
 Callers pin one commit of `EdgeFirstAI/.github`. The SHA appears only in `uses:` lines, which is what Dependabot bumps; neither the file headers nor this document repeat it, so a bump cannot leave a stale second copy behind. The shared workflows find their own composite actions through `job.workflow_repository` / `job.workflow_sha`, so there is no second value to keep in sync there either.
@@ -82,5 +96,6 @@ The on-target lane runs one job per board identity: `imx8mp-evk` (Vivante, G2D),
 
 - **Boards are runner labels.** Each comma-separated entry is one job; `+` joins labels one runner must all carry, so `imx95-frdm+ara240` selects an FRDM board fitted with an Ara240. The default, `imx8mp-evk, imx95-evk, rpi5, orin-nano, iq9075-evk`, is one board per SoC for general HAL work: the EVK where the family has other carriers, because FRDM boards are kept for Ara240 work and vendor carriers (Phytec, Ezurio, Verdin) for vendor tests. Which physical boards carry which labels is on the Confluence page "Self-Hosted Runner Fleet Inventory"; the label convention is `EdgeFirstAI/.github`'s `runner-groups.md`.
 - **Unavailable boards are reported, not queued.** The plan job uses the shared `resolve-boards` action. With the `FLEET_RUNNERS_TOKEN` organisation secret (a token with read access to organisation self-hosted runners) it drops entries no online runner carries and lists them in the summary, instead of scheduling a job that waits 24 hours and then fails. Without the secret every entry is scheduled and the plan warns.
+- **Crashes leave a trace.** A test binary killed by a signal gets `<binary>.crash.txt` in the results: the signal, plus a backtrace from `coredumpctl` or from a core file and gdb when the board has them. `diagnostics.txt` records which the board has. The `gdb` input runs every test binary under gdb instead, which logs each thread's backtrace when one crashes.
 - **One bundle, built once.** A free hosted runner cross-builds an aarch64 bundle at the glibc 2.35 floor with `scripts/on-target-bundle.sh`; each board unpacks it and runs its board-side script (`scripts/on-target-run.sh` or `scripts/on-target-bench.sh`), the same bundle and scripts `scripts/on-target-test.sh` uses over ssh.
 - **The summary names the runner.** Each board entry's row records which runner ran it. A board that failed or produced no result makes the run red; an unavailable one does not, and a run that scheduled no board at all is red. The roll-up is `.github/scripts/fleet_summary.py`, tested by `tests/test_fleet_summary.py`.

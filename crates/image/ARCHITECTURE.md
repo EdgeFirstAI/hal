@@ -24,7 +24,7 @@ shutdown quirks of each driver stack.
 |--------|--------|----------------|
 | [`lib.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/src/lib.rs) | local | Public surface: `ImageProcessor`, `ImageProcessorTrait`, `Rotation`, `Flip`, `Crop`, `MaskOverlay`, `save_jpeg`, and the re-exported `codec` decode API (`codec::{ImageDecoder, ImageLoad, peek_info}`) |
 | [`cpu/`](https://github.com/EdgeFirstAI/hal/tree/main/crates/image/src/cpu) | local | `CPUProcessor` — fast_image_resize + rayon, plus the f16 mask kernels |
-| [`tiling.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/src/tiling.rs) | local | SAHI input side: EvenDist `tile_grid` geometry, `TilingConfig`/`TileSpec`, and the `ImageProcessor` tiling methods (`alloc_tile_batch`, `plan_tiles`, `tile_into`, `tile_one`) that render zero-copy tile batches |
+| [`tiling.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/src/tiling.rs) | local | SAHI input side: EvenDist `tile_grid` geometry, `TilingConfig`/`TileSpec`, and the `ImageProcessor` tiling methods (`alloc_tile_batch`, `plan_tiles`, `tile_into`, `tile_into_with_fence`, `tile_one`) that render zero-copy tile batches |
 | [`g2d.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/src/g2d.rs) | local | `G2DProcessor` — NXP i.MX G2D 2D-engine bindings |
 | [`colorimetry.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/src/colorimetry.rs) | local | `yuv_to_rgb_coeffs` (the six shader uniforms) and `effective_colorimetry` — the use-time resolver every backend shares |
 | [`gl/`](https://github.com/EdgeFirstAI/hal/tree/main/crates/image/src/gl) | local | OpenGL backend: threaded wrapper, context, EGL+PBO caches, shaders, DMA-BUF import |
@@ -76,7 +76,7 @@ classDiagram
         opengl: Option~GLProcessorThreaded~ (every OS)
         +new() orchestrator with fallback chain
         +create_image(w, h, PixelFormat, DType, mem, access) GPU-optimal alloc
-        +plan_tiles / alloc_tile_batch / tile_into / tile_one  SAHI input tiling
+        +plan_tiles / alloc_tile_batch / tile_into[_with_fence] / tile_one  SAHI input tiling
     }
 
     class G2DProcessor { NXP i.MX G2D hardware (Linux) }
@@ -277,11 +277,12 @@ path, no type parameters leaking into the engine):
 | `Display` | `GlContext` (GBM/PlatformDevice/Default EGL + surfaceless context) | `AngleDisplay` (private per-processor context on the shared ANGLE/Metal display) | `AndroidGlContext` (private per-processor context on the shared native default display) | `D3d11Display` (private per-processor context on the shared ANGLE/Direct3D 11 display, built on the tensor crate's device with `eglCreateDeviceANGLE`; the adapter is that crate's choice) |
 | `Import` / `ImportHandle` | `EglImage` / `egl::Image` (DMA-BUF) | `IoSurfacePbuffer` / `egl::Surface` | `AndroidEglImage` / `egl::Image` (AHardwareBuffer) | `D3d11EglImage` / `egl::Image` (`EGL_ANGLE_image_d3d11_texture`) |
 | `import_buffer` / `import_buffer_nv_r8` / `import_buffer_packed` | `eglCreateImageKHR` attribute assembly (`dma_import.rs`, 64-byte stride invariant, multi-plane NV12) | `eglCreatePbufferFromClientBuffer` (`iosurface_import.rs` layouts) | `eglGetNativeClientBufferANDROID` → `eglCreateImageKHR` (`ahardwarebuffer_import.rs`; self-describing buffer, no attribute assembly; NV R8 needs the API-29 `R8_UNORM` format and errors today) | EGLImage over the tensor's `ID3D11Texture2D` (`d3d11_import.rs` attributes) |
-| `attach_tex_image_2d` (+`_external`, `_renderbuffer`) | `glEGLImageTargetTexture2DOES` (persistent — binding-skip cache applies) | `eglBindTexImage`, recorded and released by `end_gpu_pass` after the engine's sync point | `glEGLImageTargetTexture2DOES` (persistent — binding-skip cache applies, like Linux) | `glEGLImageTargetTexture2DOES`, re-issued per use (`end_gpu_pass` has nothing to release) |
+| `attach_tex_image_2d` (+`_external`, `_renderbuffer`) | `glEGLImageTargetTexture2DOES` (persistent — binding-skip cache applies) | `eglBindTexImage`, recorded and released by `end_gpu_pass` after the engine's sync point (binding-skip cache applies within a pass, so every tile of a batch renders into the parent's one binding) | `glEGLImageTargetTexture2DOES` (persistent — binding-skip cache applies, like Linux) | `glEGLImageTargetTexture2DOES`, re-issued per use (`end_gpu_pass` has nothing to release) |
 | `NV12_DST` / `import_nv12_dst` | `true`: a single-plane destination imports `NvDstPlanes::Combined` (one R8 EGLImage, pitch × `h + h/2`), a multiplane one `Split` (R8 luma, R8 chroma) (`dma_import.rs`) | `true`: an IOSurface destination imports `Combined` (one R8 pbuffer over the surface's physical dimensions); a multiplane one over a planar IOSurface imports `Split` (plane 0 as `GL_RED`, plane 1 as `GL_RG` at half width and height); one that starts at a buffer offset is refused | `false` / `NotSupported` | `false` / `NotSupported` |
-| `PERSISTENT_TEX_BINDINGS` / `EXTERNAL_OES` | `true` / `true` | `false` / `false` (no `samplerExternalOES` on ANGLE — those four programs are not even built) | `true` / `false` (the driver exposes external-OES, but the YUV sampling flip awaits on-device camera validation) | `false` / `false` (ANGLE has no `samplerExternalOES`; persistent bindings are off because ANGLE does not observe writes made to the texture outside GL and a kept binding samples stale content) |
+| `tex_binding_epoch` / `EXTERNAL_OES` | constant / `true` | the count of `end_gpu_pass` calls, so a binding is skipped within the pass that made it and re-made after the release / `false` (no `samplerExternalOES` on ANGLE — those four programs are not even built) | constant / `false` (the driver exposes external-OES, but the YUV sampling flip awaits on-device camera validation) | `None` / `false` (ANGLE has no `samplerExternalOES`; bindings are re-made on every use because ANGLE does not observe writes made to the texture outside GL and a kept binding samples stale content) |
 | `load_gl_once` | once-per-process via this display's `eglGetProcAddress` | no-op (loaded at shared-display init) | no-op (loaded at shared-display init) | no-op (loaded at shared-display init) |
 | Transfer backend | `DmaBuf` → `Pbo` on the NVIDIA verify-failure downgrade | `IOSurface` | `AHardwareBuffer` | `D3d11Texture` |
+| `native_fence_sync` / `export_completion_fence` | the display's extension string has `EGL_ANDROID_native_fence_sync` and `EGL_KHR_fence_sync` / a sync-file fd from `eglDupNativeFenceFDANDROID` (`native_fence.rs`) | `false` / none | as Linux | the device supports `ID3D11Fence` / an event handle for the signalled value |
 
 `PlatformCaps` (transfer backend, float render support, `serialize_gl`,
 `external_oes`, `native_fence_sync`) is captured once per processor at worker startup and
@@ -478,7 +479,11 @@ DMA-BUF import paths, selected by format (`processor/mod.rs::convert_to`):
 - **Path A — driver hardware-YUV (`samplerExternalOES`).** The two-plane
   DMA-BUF is imported as an `EGL_LINUX_DMA_BUF_EXT` EGLImage with a YUV DRM
   FourCC and sampled through `samplerExternalOES`; the driver does the
-  YUV→RGB. This is the path **NV12** uses on every GPU. It is *not* used for
+  YUV→RGB. `auto` takes it for multiplane NV12, which Path B cannot import;
+  `EDGEFIRST_NV_CONVERT_PATH=sampler` forces it for single-plane NV12. On
+  Vivante GC7000UL the GL backend samples no NV source through it: a forced
+  `sampler` takes Path B, and a multiplane NV12 or NV16 source is a hard
+  decline to the next backend, logged at warn once per format and size. It is *not* used for
   NV16/NV24 on the embedded drivers: `samplerExternalOES` either rejects the
   4:2:2/4:4:4 FourCC (Vivante: `EGL(BadMatch)`) or samples it incorrectly
   (Mali/V3D produce wrong pixels). `pixel_format_to_drm` therefore maps only
@@ -624,15 +629,9 @@ and YUV→YUV encode with the destination's own resolved colorimetry:
 - **Path A** (`samplerExternalOES`, driver YUV) sets the matching EGL
   `YUV_COLOR_SPACE_HINT` / `SAMPLE_RANGE_HINT` from the resolved colorimetry.
   Hint-ignoring drivers (Vivante) apply a fixed BT.601-limited matrix
-  regardless. How `auto` weighs that against Vivante's ~12× Path-B cost is
-  the **`ColorimetryMode`** knob (`ImageProcessorConfig::colorimetry`, env
-  `EDGEFIRST_COLORIMETRY`): the default **`Fast`** keeps
-  single-plane 4-aligned NV12 on Path A for every colorimetry (approximate
-  matrix for non-BT.601-limited sources), while the **`Exact`** opt-in
-  forces non-matching colorimetries to Path B so the exact matrix always
-  applies. Multiplane NV12 (which Path B cannot import) stays on Path A in
-  both modes, as does every non-Vivante GPU's Path-B preference (exact is
-  already the fast path there).
+  regardless. `auto` takes Path B for single-plane NV12 on every GPU.
+  Multiplane NV12, which Path B cannot import,
+  takes Path A, except on Vivante, where the GL backend declines it.
 - Packed **YUYV/VYUY**: the **macOS** YUYV shader threads the same six
   colorimetry uniforms as the NV path (`yuv_to_rgb_coeffs`), so an untagged
   720p source resolves to BT.709 limited and matches the camera fixture (~0.997
@@ -1004,10 +1003,7 @@ OpenGL destination-tile obligations:
   its top-left `region.y` (= `n·H`), **not** a bottom-left `parent_h − (y+H)`
   flip. (`gl/render.rs::region_to_viewport` encodes the bottom-left flip for a
   *bottom-up* surface and is not used by this top-down DMA path.)
-- **Sync once per batch.** A plain `convert()` ends with `glFinish()`, so a loop
-  of N converts incurs N pipeline syncs. `convert_deferred` defers that finish and
-  `flush()` issues a single `finish_via_fence` for the whole batch; the CUDA map
-  path auto-flushes a pending batch before handing the device the buffer.
+- **Sync once per batch.** A plain `convert()` ends with `glFinish()`, so a loop of N converts incurs N pipeline syncs. `convert_deferred` defers that finish on every render route (the single-pass route, the packed-RGB, planar, grey and NV12 multi-pass routes and the float routes) and `flush()` issues a single `finish_via_fence` for the whole batch; the CUDA map path auto-flushes a pending batch before handing the device the buffer. A readback into a `Mem` destination is synchronous, since `glReadPixels` into client memory waits for the render. A readback into a PBO is deferred too, unless its rows are then re-laid out in a CPU mapping of the PBO. `tile_into_with_fence` replaces the single sync with one native fence where the platform exports one.
   **Current limit:** the band lowering handles the single-pass geometry only. A
   `view`/`batch` destination on a zero-copy lowering whose format is packed
   `Rgb` or any planar layout reinterprets the render-target geometry
@@ -1060,6 +1056,7 @@ extent is no larger than the tile yields a single whole-frame crop.
 | `plan_tiles(src_w, src_h, &cfg)` | none — pure geometry | — | Size pools up front; drive a pipelined tile stream |
 | `alloc_tile_batch(n, &cfg, …)` | allocation only | one tall `tile_w × (n · tile_h)` parent via `create_image` | Reused per frame |
 | `tile_into(&src, &mut batch, &cfg)` | one deferred convert per tile, then a single `flush` | row-band `view` of the tall parent | Whole frame in one batch |
+| `tile_into_with_fence(&src, &mut batch, &cfg)` | as `tile_into`, with one native fence for the batch in place of the CPU wait | row-band `view` of the tall parent | Whole frame in one batch, handed to a consumer that waits on the fence |
 | `tile_one(&src, &mut slot, &placement, &cfg)` | one deferred convert, caller flushes | a caller-owned model-input slot | Overlap preprocessing with inference |
 
 **Preprocessing.** `TilingConfig::with_options` sets the `ConvertOptions`
@@ -1469,6 +1466,8 @@ calling `dlclose` on either one can trigger heap corruption (`corrupted
 double-linked list`) during process exit — the atexit handlers from the
 shared `galcore` driver become inconsistent.
 
+The first `G2DProcessor::new` in a process loads `libg2d.so.2` once more with `RTLD_NODELETE` and leaks that handle, so the `dlclose` each `G2DProcessor` drop makes never unmaps the library or the driver libraries it pulls in. Their code stays mapped for the life of the process. That covers the OpenCL helper threads libg2d starts in `g2d_open`, which keep running after `g2d_close`, and the per-thread destructors that run when a thread exits. Contexts are still closed with `g2d_close`; only the library handle is leaked.
+
 For production code, `G2DProcessor` is dropped normally; the EGL
 `Box::leak` (Layer 1) keeps shared `galcore` state intact. For benchmark
 code (where many G2D processors are created/destroyed in one process), the
@@ -1489,7 +1488,7 @@ resources.
   `EGL_KHR_no_config_context`) and renders exclusively through FBOs
   backed by EGLImages.
 - **DMA buffers** — fd `close()` in `Drop`.
-- **G2D contexts** — `g2d_close` in `G2DProcessor::drop`.
+- **G2D contexts** — `g2d_close` in `G2DProcessor::drop`. `g2d_open` and `g2d_close` run under one process-wide lock, so processors on different threads never open or close a context at the same time.
 
 Intentional leaks: the EGL library handle (`Box::leak`), the `Rc<Egl>`
 wrapper (`ManuallyDrop`), and the shared EGL display
@@ -1508,7 +1507,7 @@ when the worker starts:
 | Driver | Policy | Effect |
 |---|---|---|
 | Vivante `galcore` (i.MX 8M Plus) | `Full` | Every message acquires the global `GL_MUTEX` — all instances serialize. |
-| Adreno on Linux (proprietary KGSL driver, e.g. IQ-9075 / Adreno 663) | `Full` | Its `eglCreateImage` maps every imported DMA-BUF into the process (through `msm_gbm`), and one `eglDestroyImage` unmaps that range **twice**; any mapping created between the two `munmap`s is destroyed. `Full` keeps other GL threads out of that window; `edgefirst_tensor::pin::with_cpu_mappings_excluded`, run around every `eglDestroyImage` against a shared lock held across every tensor `mmap`, keeps CPU threads' tensor mappings out of it. In a `dynamic` build it reaches the lock inside `libedgefirst_tensor` through `ef_tensor_with_cpu_mappings_excluded`, the one copy that makes the mappings. |
+| Adreno on Linux (proprietary KGSL driver, e.g. IQ-9075 / Adreno 663) | `Full` | Its `eglCreateImage` maps 16 KiB of every imported buffer into the process through `msm_gbm.so`. When the driver releases the image (in `eglDestroyImage`, or when a texture is re-targeted away from it), `libeglSubDriverWayland.so` unmaps that range and `msm_gbm.so` then unmaps it **again**, destroying any mapping another thread created there in between: a thread stack, `/etc/ld.so.cache`, a kgsl buffer or a tensor mapping. When the first GL processor's `GL_VENDOR` is Qualcomm and its `GL_RENDERER` is Adreno, on aarch64 Linux with both the proprietary `msm_gbm.so` and a `libeglSubDriver*.so` loaded, `gl/adreno_unmap.rs` points the `mmap`/`mmap64`/`munmap` GOT slots of `msm_gbm.so` and the `munmap` slot of each `libeglSubDriver*.so` at hooks that record `msm_gbm.so`'s mappings and drop its second `munmap` of a range the subdriver already unmapped on the same thread. Any other driver, Mesa freedreno included, and a process with only one of the two libraries loaded, is patched nowhere. `egl_image_releases_leave_other_threads_mappings_mapped` checks it. `Full` and `edgefirst_tensor::pin::with_cpu_mappings_excluded`, run around every `eglDestroyImage` against a shared lock held across every tensor `mmap` (in a `dynamic` build through `ef_tensor_with_cpu_mappings_excluded`), still apply. |
 | Virtualized GPUs (`Paravirtual`/`virtio` in `GL_RENDERER`) | `Full` | Concurrent GL across contexts mis-renders on paravirtual Metal (observed on GitHub macOS runners: ~60–86% of output bytes diverge under parallel converts). Messages serialize on a process-global mutex (macOS has no lifecycle lock — ANGLE serializes display entry points internally). |
 | Mali/Panfrost, V3D, Tegra, llvmpipe, macOS (real Apple GPU) | `LifecycleOnly` | Messages run unlocked; instances execute GL concurrently on the same GPU. |
 | Android (Adreno/Mali system drivers) | `LifecycleOnly` | Messages run unlocked. Android's system EGL is specification-conformant thread-safe, so there is also no Linux-style lifecycle lock around context bring-up (same reasoning as ANGLE's internal serialization); this claim is device-validated by the Device Farm harness. |
@@ -1517,6 +1516,10 @@ Override with `EDGEFIRST_GL_SERIALIZE=full|lifecycle` — `full` is the
 escape hatch for unknown-bad drivers (or tiny-convert-heavy
 multi-processor workloads on Tegra, below); `lifecycle` forces
 parallelism for experiments.
+
+Under `Full`, a worker completes any deferred draw it still has pending before it answers a message and releases the lock, so no other context runs while a batch is half drawn and no caller sees a reply while its draw is still queued. The same holds for a convert that fails after its draw and for a message that panics: the worker completes every command they issued before it answers and releases the lock. A `convert_deferred` on a `Full` worker is therefore finished when it returns, and `flush` has nothing left to sync. `tile_into` sends all its tiles and the sync as one message, so it keeps one import and one sync per batch under every policy.
+
+`tile_into_with_fence` sends all its tiles and the fence export as one message. The fence takes the place of the sync: the worker submits the batch's device signals, flushes every GL command the batch issued and exports one native fence covering them, so nothing is pending when the lock is released and another processor's GL never runs between the batch's draws and their submission. Where the platform exports no fence, or the export fails, or a tile was declined, the worker runs the blocking sync instead and the call returns no fence. On Linux the fence is the `EGL_ANDROID_native_fence_sync` sync-file fd, exported where the display's extension string has it with `EGL_KHR_fence_sync` (Vivante, Adreno and the other `Full` drivers included), so the same rule applies there: the batch is submitted before the lock is released.
 
 ### Why Vivante serializes
 
@@ -1579,7 +1582,7 @@ ignored on-demand `stress_parallel_processors_oracle` board tool.
 
 On Adreno with the Linux KGSL driver, a GL operation's completion reaches the caller through several thread wake-ups: the caller hands the message to the GL worker, the GPU completion interrupt wakes the `kgsl_dispatcher` kernel thread, which wakes `kgsl-events`, which wakes the worker blocked in `glFinish`, which replies to the caller. While the GPU runs, the cpuidle governor puts those cores into idle states whose exit latency is 1.45–1.76 ms on the IQ-9075, and each wake-up then costs 300–500 µs.
 
-`GLProcessorThreaded` holds a process-wide CPU latency request on `/dev/cpu_dma_latency` (`gl/cpu_latency.rs`) from the moment it sends a GPU-bound message (`convert`, `convert_deferred`, `flush`, `convert_with_fence`, `draw_decoded_masks`, `draw_proto_masks`) until the reply arrives. The request is reference-counted across processors: the first holder writes 0 µs, the last one releases it. Between operations the cores reach their deep idle states as usual.
+`GLProcessorThreaded` holds a process-wide CPU latency request on `/dev/cpu_dma_latency` (`gl/cpu_latency.rs`) from the moment it sends a GPU-bound message (`convert`, `convert_deferred`, `flush`, `convert_with_fence`, `tile_into`, `tile_into_with_fence`, `draw_decoded_masks`, `draw_proto_masks`) until the reply arrives. The request is reference-counted across processors: the first holder writes 0 µs, the last one releases it. Between operations the cores reach their deep idle states as usual.
 
 | | Policy |
 |---|---|
@@ -1678,6 +1681,11 @@ image.tile_into                                         [user-facing fn — rend
 ├── image.plan_tiles                                    ← grid + placement geometry for this frame
 └── (per tile) render_tile → convert_deferred            ← enters the image.convert.* tree above (dst_tile = row-band index)
 
+image.tile_into_with_fence                              [user-facing fn — as image.tile_into, with one native fence for the batch]
+│ fields: tiles
+├── image.plan_tiles
+└── (per tile) render_tile → convert_deferred
+
 image.tile_one                                          [user-facing fn — renders exactly one tile into a caller-owned slot]
 │ fields: index, count
 └── render_tile → convert_deferred                       ← enters the image.convert.* tree above
@@ -1719,6 +1727,7 @@ image.tile_one                                          [user-facing fn — rend
 | `image.convert.cpu.resize_flip_rotate`                 | `fast_image_resize::Resizer` + rayon parallel slice, with composed flip/rotate/letterbox geometry. | The bulk of CPU `convert()` cost. The CPU backend is selected only when neither GL nor G2D accepts the (src, dst) format pair. |
 | `image.plan_tiles`                                     | `tile_grid` (EvenDist SAHI grid) + per-tile `TilePlacement` construction for a `src_w`×`src_h` frame. Pure host computation, no GPU/CPU pixel work. | The `tiles` field is the realized tile count for this frame/config pair (can exceed the naive `ceil(frame/tile)` estimate under heavy overlap); `overlap` is the requested minimum. Called once per frame by `tile_into`, or directly by a pipelined caller sizing its own tile stream. |
 | `image.tile_into`                                      | Renders every tile of one frame into a shared tall packed-parent batch, one deferred `render_tile` per tile, then a single `flush`. | `tiles` mirrors `plan_tiles`' count for the same call. Per-tile cost is attributed via the nested `image.convert.*` (or `image.convert.gl.*`) spans that `render_tile` opens, in tile-index order. |
+| `image.tile_into_with_fence`                           | As `image.tile_into`, with one native fence for the batch in place of the final sync. | `tiles` as for `image.tile_into`. |
 | `image.tile_one`                                       | Renders exactly one tile of a frame into a caller-owned slot (e.g. a ring buffer entry), deferred — the caller controls the flush cadence. | `index`/`count` identify which tile of the frame this is, letting a pipelined runtime attribute cost per tile without a `tile_into` batch. Holds no frame-wide state — all geometry rides in the `TilePlacement` argument. |
 | `image.draw_decoded_masks`                             | Per-detection alpha-blend of `Segmentation` mask onto the destination image (CPU or GL depending on backend). | When backend == GL, this dispatches to the shader-based mask blit. |
 | `image.draw.gl.proto`                                  | The fused GL proto-segmentation render: proto texture upload + per-detection quad draws. The `upload` / `program` fields record the `ProtoPlan` chosen by the pure `proto_dispatch::plan_proto` table (e.g. `I8CpuRepack`/`Int8Bilinear`, `F32R32f`/`F32`, `F16Rgba16f`/`F16`), alongside `dtype`, `num_protos`, and `detections`. | Filter by `upload` to isolate one upload strategy's latency. Steady-state at fixed proto dims re-uploads via `TexSubImage3D` into the immutable `TexStorage3D` allocation (the `ensure_proto_texture` gate); re-allocation happens only on dims/format churn. |
@@ -1836,7 +1845,7 @@ re-encoding returns `NotSupported`.
 |---------|--------|-------|-------|
 | CPU (`cpu/convert.rs`) | BT.601 / BT.709 / BT.2020 | Full / Limited | Fully correct — YUV→RGB and the NV12/NV16 encoders pass the resolved matrix + range to the `yuv` crate; the YUYV encoder uses `YuyvEncodeCoeffs`, which is built from `rgb_to_yuv_coeffs` |
 | GL NV12/NV16/NV24 (Path B, Linux R8 + macOS) | BT.601 / BT.709 / BT.2020 | Full / Limited | Fully correct — YUV→RGB is computed **in the fragment shader** from six per-tensor colorimetry uniforms (`yuv_to_rgb_coeffs`); the combined semi-planar buffer is imported as one R8 `texelFetch` texture. Verified on Vivante GC7000UL, Mali-G310, and V3D. |
-| GL Path A / YUYV (driver `samplerExternalOES`) | driver-selected via EGL hints | Full / Limited (driver-honored) | The import sets `YUV_COLOR_SPACE_HINT` / `SAMPLE_RANGE_HINT` from the resolved colorimetry. Hint-honoring drivers (e.g. Tegra) are correct; on hint-ignoring drivers (Vivante) single-plane NV12 with non-default colorimetry is force-routed to Path B, and packed YUYV/VYUY falls back to the colorimetry-correct CPU path. |
+| GL Path A / YUYV (driver `samplerExternalOES`) | driver-selected via EGL hints | Full / Limited (driver-honored) | The import sets `YUV_COLOR_SPACE_HINT` / `SAMPLE_RANGE_HINT` from the resolved colorimetry. Hint-honoring drivers (e.g. Tegra) are correct; on hint-ignoring drivers (Vivante) single-plane NV12 takes Path B, and packed YUYV/VYUY falls back to the colorimetry-correct CPU path. |
 | GL RGB→NV12 destination (`ThreePassNv12`) | BT.601 / BT.709 / BT.2020 | Full / Limited | RGB→YUV in the fragment shader from `rgb_to_yuv_coeffs` of the destination's effective colorimetry. |
 | G2D (`g2d.rs`) | BT.601 / BT.709 | — | **Limitation:** `g2d-sys` exposes only `set_bt601_colorspace()` / `set_bt709_colorspace()` (matrix only). Full-range and BT.2020 YUV cannot be expressed. G2D **declines** full-range or BT.2020 YUV conversions, and a YUV→YUV pair whose matrix or range differ, unless soft declines are off and the destination is untagged (see *Backend selection*); the dispatch falls through to GL or CPU. |
 
@@ -1897,7 +1906,7 @@ in the project README for the user-facing rules and validation patterns.
 
 | Platform | Backends available | Float preprocessing | Notes |
 |----------|--------------------|---------------------|-------|
-| Linux NXP i.MX 8M Plus (Vivante GC7000UL) | OpenGL, G2D, CPU | CPU only (float disabled) | NV12/NV16/NV24 → PlanarRgb requires the two-pass workaround; NV16/NV24 use the Path B R8 shader (NV12 uses Path A); packed RGB sources use the R8 view (libg2d rejects 24-bit sources); GPU float disabled (170–320 ms readback); NV12 destinations: a resized conversion renders on GL unless its source is YUYV or VYUY; every other conversion runs on the CPU |
+| Linux NXP i.MX 8M Plus (Vivante GC7000UL) | OpenGL, G2D, CPU | CPU only (float disabled) | NV12/NV16/NV24 → PlanarRgb requires the two-pass workaround; single-plane NV12/NV16/NV24 use the Path B R8 shader; the GL backend declines multiplane NV12 and NV16 sources; packed RGB sources use the R8 view (libg2d rejects 24-bit sources); GPU float disabled (170–320 ms readback); NV12 destinations: a resized conversion renders on GL unless its source is YUYV or VYUY; every other conversion runs on the CPU |
 | Linux NXP i.MX 95 (Mali-G310 / Panfrost) | OpenGL, CPU | F16 PBO + DMA-BUF; F32 PBO | Concurrent GL works; `EDGEFIRST_OPENGL_RENDERSURFACE=1` required for Neutron NPU DMA-BUF destinations; NV12 destinations render on GL at every size, including exact YUV copies |
 | Linux Qualcomm (Adreno) | OpenGL, CPU | — | NV12 destinations render on GL from 1920x1080 up and when resized; smaller same-size conversions and exact YUV copies run on the CPU |
 | Linux RPi 5 (V3D / Broadcom) | OpenGL, CPU | F16 PBO + DMA-BUF; F32 PBO | |

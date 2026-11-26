@@ -76,10 +76,7 @@ These gates are cheap and catch the failure modes of shipping the bindings as in
 - **`maturin develop` rebuilds the Rust shared object** when the Rust source
   changes. Re-run after any change under `crates/`.
 - **Per-module type identity is not shared.** Each extension module caches its own `#[pyclass]` type objects, so `edgefirst.tensor.Tensor is edgefirst.image.Tensor` is **False** by design. Never write an `isinstance`/`is` assertion across packages — cross-package handoff goes through the `__edgefirst_tensor__` capsule protocol and is duck-typed.
-- **Single-threaded execution** — the Python suite inherits the
-  [project-wide single-threaded rule](https://github.com/EdgeFirstAI/hal/blob/main/TESTING.md#single-threaded-execution)
-  whenever GL or G2D paths are exercised. `make test-python` invokes plain
-  `pytest`, so it is already serial; don't add `-n`.
+- **One interpreter.** `make test-python` invokes plain `pytest`, which runs the suite in one process.
 - **LFS testdata** — fixtures live under `testdata/`. Tests resolve paths
   relative to the workspace root; on-target runs export
   `EDGEFIRST_TESTDATA_DIR`.

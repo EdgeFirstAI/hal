@@ -104,7 +104,8 @@ jobs:
       cross-clippy-args: --workspace --all-targets --locked --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-kernels --exclude edgefirst-python-common -- -D warnings
       pre-command: bash .github/scripts/ci-setup.sh
       clippy-args: --workspace --all-targets --locked --features default,edgefirst-decoder/model-files --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-kernels --exclude edgefirst-python-common -- -D warnings
-      nextest-args: --workspace --locked --features default,edgefirst-decoder/model-files --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-kernels --exclude edgefirst-python-common -j 1
+      # Builds the tests without running them when the Full tier runs.
+      nextest-args: --workspace --locked --features default,edgefirst-decoder/model-files --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-kernels --exclude edgefirst-python-common ${{ needs.changes.outputs.full == 'true' && '--no-run' || '' }}
       cache-key: quick-x86_64
 
   # `make sbom` resolves the dependency graph for every target that reaches a
@@ -188,6 +189,7 @@ jobs:
         edgefirst_tensor=dma
         edgefirst_codec=v4l2
         v4l2_jpeg
+        v4l2_jpeg_reconfigure
         dst_view_stride
         offset_nv_source_upload
         offset_source_view_alignment
@@ -199,6 +201,7 @@ jobs:
         odd_dim_cpu
         video_encode
         video_decode
+        video_concurrency
         mjpeg_encode
         mjpeg_decode
         decoded_video_import
@@ -209,7 +212,7 @@ jobs:
         vocabulary
       # Minimum number of tests the board selection must match.
       board-min-tests: "100"
-      nextest-args: --workspace --locked --features default,edgefirst-decoder/model-files --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-kernels --exclude edgefirst-python-common -j 1
+      nextest-args: --workspace --locked --features default,edgefirst-decoder/model-files --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-kernels --exclude edgefirst-python-common
       archive-profile: profiling
       archive-args: --locked --package edgefirst-image --features opengl --package edgefirst-tensor --package edgefirst-codec
     secrets: inherit

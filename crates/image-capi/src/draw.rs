@@ -414,4 +414,50 @@ mod tests {
         };
         assert_eq!(rc, libc::EINVAL);
     }
+
+    #[test]
+    fn each_draw_composites_into_its_own_destination() {
+        use edgefirst_tensor::{PixelFormat, TensorMapTrait, TensorTrait};
+        let bg_px = [10u8, 20, 30, 200];
+        let mut proc = edgefirst_image::ImageProcessor::new().expect("processor");
+        let bg = TensorDyn::image(
+            32,
+            32,
+            PixelFormat::Rgba,
+            DType::U8,
+            None,
+            CpuAccess::ReadWrite,
+        )
+        .expect("background");
+        bg.as_u8()
+            .unwrap()
+            .map()
+            .unwrap()
+            .as_mut_slice()
+            .chunks_exact_mut(4)
+            .for_each(|px| px.copy_from_slice(&bg_px));
+        for draw in 0..8 {
+            let mut dst = proc
+                .create_image(
+                    32,
+                    32,
+                    PixelFormat::Rgba,
+                    DType::U8,
+                    None,
+                    CpuAccess::ReadWrite,
+                )
+                .expect("destination");
+            let overlay = MaskOverlay {
+                background: Some(&bg),
+                ..Default::default()
+            };
+            proc.draw_decoded_masks(&mut dst, &[], &[], overlay)
+                .expect("draw");
+            let map = dst.as_u8().unwrap().map().unwrap();
+            assert!(
+                map.as_slice().chunks_exact(4).all(|px| px == bg_px),
+                "draw {draw} left its destination without the background"
+            );
+        }
+    }
 }

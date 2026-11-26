@@ -149,71 +149,76 @@ pub(super) unsafe fn finish_via_fence() {
     }
 }
 
-/// `glReadPixels` the packed float render target into the destination PBO,
-/// placing each destination row at its own pitch.
-///
-/// A pitch that is a whole number of texels is handed to GL as
-/// `GL_PACK_ROW_LENGTH`; a pitch no texel size divides is read tight and
-/// spread inside the PBO's own mapping.
-///
-/// # Safety
-/// Must run on the GL thread with the float render target bound as a complete
-/// read framebuffer. `layout` must describe this destination: every write
-/// stays inside its `needed` bytes.
-unsafe fn read_float_pixels_into_pbo(
-    layout: &PboReadbackLayout,
-    buffer_id: u32,
-    packed_w: usize,
-    rows: usize,
-    client_fmt: u32,
-    gl_type: u32,
-) -> crate::Result<()> {
-    let &PboReadbackLayout {
-        stride,
-        tight_row,
-        needed,
-        row_length,
-    } = layout;
-    // SAFETY: the caller's contract; every span written lies within `needed`,
-    // which `plan_pbo_readback` checked against the PBO's allocation.
-    unsafe {
-        edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::PIXEL_PACK_BUFFER, buffer_id);
-        edgefirst_gl::gl::ReadBuffer(edgefirst_gl::gl::COLOR_ATTACHMENT0);
-        if let Some(pixels) = row_length {
-            edgefirst_gl::gl::PixelStorei(edgefirst_gl::gl::PACK_ROW_LENGTH, pixels);
-        }
-        edgefirst_gl::gl::ReadPixels(
-            0,
-            0,
-            packed_w as i32,
-            rows as i32,
-            client_fmt,
-            gl_type,
-            std::ptr::null_mut(),
-        );
-        if row_length.is_some() {
-            edgefirst_gl::gl::PixelStorei(edgefirst_gl::gl::PACK_ROW_LENGTH, 0);
-        }
-        edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::PIXEL_PACK_BUFFER, 0);
-        // Waits for the readback into the destination PBO to complete.
-        finish_via_fence();
-    }
-    check_gl_error(function!(), line!())?;
-    if stride > tight_row && row_length.is_none() {
-        // SAFETY: GL thread, the read above has completed, and `needed` lies
-        // within the allocation.
+impl GLProcessorST {
+    /// `glReadPixels` the packed float render target into the destination PBO,
+    /// placing each destination row at its own pitch.
+    ///
+    /// A pitch that is a whole number of texels is handed to GL as
+    /// `GL_PACK_ROW_LENGTH`; a pitch no texel size divides is read tight and
+    /// spread inside the PBO's own mapping.
+    ///
+    /// # Safety
+    /// Must run on the GL thread with the float render target bound as a complete
+    /// read framebuffer. `layout` must describe this destination: every write
+    /// stays inside its `needed` bytes.
+    unsafe fn read_float_pixels_into_pbo(
+        &mut self,
+        layout: &PboReadbackLayout,
+        buffer_id: u32,
+        packed_w: usize,
+        rows: usize,
+        client_fmt: u32,
+        gl_type: u32,
+    ) -> crate::Result<()> {
+        let &PboReadbackLayout {
+            stride,
+            tight_row,
+            needed,
+            row_length,
+        } = layout;
+        // SAFETY: the caller's contract; every span written lies within `needed`,
+        // which `plan_pbo_readback` checked against the PBO's allocation.
         unsafe {
-            with_mapped_pbo(
-                buffer_id,
-                needed,
-                edgefirst_gl::gl::MAP_READ_BIT | edgefirst_gl::gl::MAP_WRITE_BIT,
-                "float PBO readback row placement",
-                |buf| spread_rows(buf, rows, tight_row, stride),
-            )?;
+            edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::PIXEL_PACK_BUFFER, buffer_id);
+            edgefirst_gl::gl::ReadBuffer(edgefirst_gl::gl::COLOR_ATTACHMENT0);
+            if let Some(pixels) = row_length {
+                edgefirst_gl::gl::PixelStorei(edgefirst_gl::gl::PACK_ROW_LENGTH, pixels);
+            }
+            edgefirst_gl::gl::ReadPixels(
+                0,
+                0,
+                packed_w as i32,
+                rows as i32,
+                client_fmt,
+                gl_type,
+                std::ptr::null_mut(),
+            );
+            if row_length.is_some() {
+                edgefirst_gl::gl::PixelStorei(edgefirst_gl::gl::PACK_ROW_LENGTH, 0);
+            }
+            edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::PIXEL_PACK_BUFFER, 0);
         }
+        let spread = stride > tight_row && row_length.is_none();
+        // Waits for the readback into the destination PBO to complete, unless a
+        // deferred convert leaves it to the batch's sync and nothing maps it below.
+        self.wait_unless_deferred(spread, finish_via_fence);
         check_gl_error(function!(), line!())?;
+        if spread {
+            // SAFETY: GL thread, the read above has completed, and `needed` lies
+            // within the allocation.
+            unsafe {
+                with_mapped_pbo(
+                    buffer_id,
+                    needed,
+                    edgefirst_gl::gl::MAP_READ_BIT | edgefirst_gl::gl::MAP_WRITE_BIT,
+                    "float PBO readback row placement",
+                    |buf| spread_rows(buf, rows, tight_row, stride),
+                )?;
+            }
+            check_gl_error(function!(), line!())?;
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 impl GLProcessorST {
@@ -773,7 +778,7 @@ impl GLProcessorST {
         // SAFETY: on the GL thread, with the float render target complete and
         // bound as the read framebuffer by the block above.
         unsafe {
-            read_float_pixels_into_pbo(
+            self.read_float_pixels_into_pbo(
                 &layout,
                 dst_buffer_id,
                 packed_w,
@@ -1065,7 +1070,7 @@ impl GLProcessorST {
 
         // ── Float draw: viewport = the packed surface, program, uniforms,
         // quad ──
-        self.draw_float_quad(
+        let drawn = self.draw_float_quad(
             program_id,
             c"src",
             src_tex_id,
@@ -1076,15 +1081,12 @@ impl GLProcessorST {
             dst_rect_px,
             pad_color,
             dst_image_size,
-        )?;
+        );
 
-        // Waits for the render into the destination buffer to complete.
-        //
-        // SAFETY: called on the thread that owns the current GL context, per
-        // finish_via_fence's contract.
-        unsafe {
-            finish_via_fence();
-        }
+        // Waits for the render into the destination buffer to complete unless
+        // a deferred convert leaves it to the batch's sync.
+        self.wait_unless_deferred(drawn.is_err(), finish_via_fence);
+        drawn?;
         check_gl_error(function!(), line!())?;
         convert_span.record("dst_feed", "zero_copy");
         Ok(())

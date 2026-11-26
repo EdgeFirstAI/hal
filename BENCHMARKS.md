@@ -120,7 +120,8 @@ selectable via the **`EDGEFIRST_NV_CONVERT_PATH`** environment variable
 On a **non-DMA** backend (PBO/Sync, e.g. orin) `ShaderR8` uploads the combined
 buffer as an R8 texture (`glTexImage2D`) and runs the same shader — so the GPU
 NV path is available even without DMA-buf EGLImage import. True-multiplane NV12
-(separate Y/UV fds) has no single-buffer R8 view, so it always uses `Sampler`.
+(separate Y/UV fds) has no single-buffer R8 view, so it uses `Sampler`, except on
+Vivante, where the GL backend declines it to the next backend.
 
 **Correctness (per-pixel Δ vs CPU reference, on-target):** the matrix matches on
 every GPU (solid frames ≤1); the divergence is **chroma upsampling**. `Sampler`
@@ -134,21 +135,15 @@ nearest-like and also matches CPU.
 |----------|-----|---------|--------|--------------------|
 | rpi5-hailo | V3D | 2.1 ms | 2.4 ms | **Shader** (correct, ~equal speed) |
 | imx95-frdm | Mali-G310 | 1.5 ms | 2.3 ms | **Shader** (chroma correctness) |
-| imx8mp-frdm | Vivante GC7000UL | **2.5 ms** | **29.2 ms** | **Sampler** (shader ~12× slower; sampler also correct here) |
+| imx8mp-frdm | Vivante GC7000UL | **2.5 ms** | **29.2 ms** | **Shader** |
 | jetson-orin-nano | Tegra (NVIDIA) | 2.4 ms | 2.1 ms | **Shader** (R8 upload; no DMA-buf import) |
 
-**`auto` policy (HIGH-PERFORMANCE default, issue #106):** prefer `ShaderR8`
-(portable, colorimetry-exact) wherever it is also the fast path — every GPU
-above except Vivante. On **Vivante**, single-plane 4-aligned NV12 takes
-`ExternalSampler` for **every** colorimetry in the default
-`ColorimetryMode::Fast`: the driver applies its fixed BT.601-limited matrix,
-which is exact for BT.601-limited sources and approximate for the rest — the
-12× speed gap (2.5 ms vs 29 ms) is the trade. Opt in to exactness with
-`ImageProcessorConfig::colorimetry = ColorimetryMode::Exact` or
-`EDGEFIRST_COLORIMETRY=exact`: the sampler is then used only when the driver
-matrix matches the source's resolved (encoding, range) exactly.
-`EDGEFIRST_NV_CONVERT_PATH` still force-overrides the path for benchmarking
-and platform bring-up.
+**`auto` policy:** `ShaderR8` on every GPU wherever it can read the
+source; multiplane NV12 takes `ExternalSampler`
+except on Vivante, where the GL backend declines it.
+`EDGEFIRST_NV_CONVERT_PATH` force-overrides the path for benchmarking
+and platform bring-up; Vivante refuses `sampler` for NV sources and uses
+`ShaderR8`.
 
 Source-width constraint for the `Sampler` (NV12 EGLImage) path: **even width**
 (4:2:0 chroma is W/2). The import uses the 64-byte-aligned row pitch, so widths

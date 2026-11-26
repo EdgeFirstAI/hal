@@ -18,6 +18,9 @@ use edgefirst_codec::video::{
 use edgefirst_codec::{CodecError, Engine, Transfer};
 use edgefirst_tensor::{CpuAccess, DType, PixelFormat, TensorDyn, TensorMemory};
 
+#[path = "common/sessions.rs"]
+mod sessions;
+
 /// 30 frames of 1920x1080 Main profile with two B-frames between
 /// references, GOP 15 (x264).
 const MAIN_BFRAMES_FILE: &str = "h264_1080p_main_bframes.h264";
@@ -241,6 +244,7 @@ fn assert_each_pts_once(pts: &[u64], first: u64, n: usize) {
 
 #[test]
 fn decodes_main_profile_with_b_frames_exactly() {
+    let _sessions = sessions::take(1);
     let Some(mut decoder) = open(
         "decodes_main_profile_with_b_frames_exactly",
         DecoderConfig::h264(),
@@ -273,6 +277,7 @@ fn decodes_main_profile_with_b_frames_exactly() {
 
 #[test]
 fn follows_a_mid_stream_resolution_change() {
+    let _sessions = sessions::take(1);
     let Some(mut decoder) = open(
         "follows_a_mid_stream_resolution_change",
         DecoderConfig::h264(),
@@ -294,6 +299,7 @@ fn follows_a_mid_stream_resolution_change() {
 
 #[test]
 fn decodes_into_a_provided_pool() {
+    let _sessions = sessions::take(1);
     if !dma_require::available_or_skip(
         edgefirst_tensor::is_gpu_buffer_available(),
         "decodes_into_a_provided_pool",
@@ -325,6 +331,7 @@ fn decodes_into_a_provided_pool() {
 
 #[test]
 fn frames_held_across_a_resolution_change_keep_their_provided_buffers() {
+    let _sessions = sessions::take(1);
     let test = "frames_held_across_a_resolution_change_keep_their_provided_buffers";
     if !dma_require::available_or_skip(edgefirst_tensor::is_gpu_buffer_available(), test) {
         return;
@@ -379,6 +386,7 @@ fn frames_held_across_a_resolution_change_keep_their_provided_buffers() {
 
 #[test]
 fn rejects_a_provided_pool_too_small_for_the_stream() {
+    let _sessions = sessions::take(1);
     if !dma_require::available_or_skip(
         edgefirst_tensor::is_gpu_buffer_available(),
         "rejects_a_provided_pool_too_small_for_the_stream",
@@ -407,6 +415,7 @@ fn rejects_a_provided_pool_too_small_for_the_stream() {
 /// A pool of 40 held frames is either granted in full or refused.
 #[test]
 fn a_pool_the_device_cannot_cover_is_refused() {
+    let _sessions = sessions::take(1);
     let count = 40;
     let Some(mut decoder) = open(
         "a_pool_the_device_cannot_cover_is_refused",
@@ -441,6 +450,7 @@ fn a_pool_the_device_cannot_cover_is_refused() {
 
 #[test]
 fn a_small_pool_recycles_dropped_frames() {
+    let _sessions = sessions::take(1);
     let Some(mut decoder) = open(
         "a_small_pool_recycles_dropped_frames",
         DecoderConfig::h264().with_output(OutputPool::Allocate { count: 1 }),
@@ -469,6 +479,7 @@ fn a_small_pool_recycles_dropped_frames() {
 
 #[test]
 fn a_pool_with_nothing_to_spare_still_returns_every_picture() {
+    let _sessions = sessions::take(1);
     let Some(mut decoder) = open(
         "a_pool_with_nothing_to_spare_still_returns_every_picture",
         DecoderConfig::h264().with_output(OutputPool::Allocate { count: 0 }),
@@ -483,6 +494,7 @@ fn a_pool_with_nothing_to_spare_still_returns_every_picture() {
 
 #[test]
 fn holding_every_frame_exhausts_the_pool_until_frames_are_dropped() {
+    let _sessions = sessions::take(1);
     let Some(mut decoder) = open(
         "holding_every_frame_exhausts_the_pool_until_frames_are_dropped",
         DecoderConfig::h264().with_output(OutputPool::Allocate { count: 2 }),
@@ -522,6 +534,7 @@ fn holding_every_frame_exhausts_the_pool_until_frames_are_dropped() {
 
 #[test]
 fn decodes_again_after_a_flush() {
+    let _sessions = sessions::take(1);
     let Some(mut decoder) = open("decodes_again_after_a_flush", DecoderConfig::h264()) else {
         return;
     };
@@ -540,6 +553,7 @@ fn decodes_again_after_a_flush() {
 
 #[test]
 fn decodes_what_the_hardware_encoder_produces() {
+    let _sessions = sessions::take(2);
     let test = "decodes_what_the_hardware_encoder_produces";
     if !dma_require::available_or_skip(edgefirst_tensor::is_gpu_buffer_available(), test) {
         return;
@@ -600,8 +614,47 @@ fn decodes_what_the_hardware_encoder_produces() {
     assert_eq!(run.corrupted, 0);
 }
 
+/// More decoders than a device has sessions open one after another, each
+/// dropped after its first picture, half of them before their stream is
+/// drained.
+#[test]
+fn a_dropped_decoder_frees_its_session() {
+    let _sessions = sessions::take(1);
+    const ROUNDS: usize = 40;
+    let stream = testdata(RESOLUTION_CHANGE_FILE);
+    let units: Vec<&[u8]> = access_units(&stream).take(3).collect();
+    for round in 0..ROUNDS {
+        let Some(mut decoder) = open("a_dropped_decoder_frees_its_session", DecoderConfig::h264())
+        else {
+            assert_eq!(round, 0, "the decoder went away after {round} sessions");
+            return;
+        };
+        let mut frames = 0;
+        for (i, au) in units.iter().enumerate() {
+            let events = decoder
+                .decode(au, i as u64)
+                .unwrap_or_else(|e| panic!("session {round}: {e}"));
+            frames += events
+                .iter()
+                .filter(|e| matches!(e, DecodeEvent::Frame(_)))
+                .count();
+        }
+        if round % 2 == 0 {
+            let events = decoder
+                .flush()
+                .unwrap_or_else(|e| panic!("session {round}: {e}"));
+            frames += events
+                .iter()
+                .filter(|e| matches!(e, DecodeEvent::Frame(_)))
+                .count();
+            assert_eq!(frames, units.len(), "session {round}");
+        }
+    }
+}
+
 #[test]
 fn rejects_an_empty_access_unit() {
+    let _sessions = sessions::take(1);
     let Some(mut decoder) = open("rejects_an_empty_access_unit", DecoderConfig::h264()) else {
         return;
     };

@@ -11,6 +11,9 @@ use edgefirst_codec::{
 };
 use edgefirst_tensor::{CpuAccess, DType, PixelFormat, TensorDyn, TensorMemory};
 
+#[path = "common/sessions.rs"]
+mod sessions;
+
 fn skip(test: &str, why: &str) {
     use std::io::Write;
     let _ = writeln!(&mut std::io::stderr(), "WARNING: SKIPPED: {test} - {why}");
@@ -52,6 +55,7 @@ fn is_codec_refusal(e: &CodecError, codec: Codec, engine: Engine) -> bool {
 
 #[test]
 fn video_capabilities_are_the_platform_engine() {
+    let _sessions = sessions::take(1);
     let caps = capabilities();
     let video: Vec<_> = caps.iter().filter(|c| c.codec.is_video()).collect();
     for c in &video {
@@ -88,6 +92,7 @@ fn video_capabilities_are_the_platform_engine() {
 
 #[test]
 fn still_image_capabilities_end_with_the_cpu_decoder() {
+    let _sessions = sessions::take(1);
     let caps = capabilities();
     let jpeg: Vec<_> = caps
         .iter()
@@ -100,6 +105,7 @@ fn still_image_capabilities_end_with_the_cpu_decoder() {
 
 #[test]
 fn engines_that_cannot_run_a_video_codec_are_refused() {
+    let _sessions = sessions::take(1);
     let encoder = |engine, codec| {
         VideoEncoder::new(
             EncoderConfig::new(codec, 640, 480, PixelFormat::Nv12, 30.0).with_engine(engine),
@@ -139,6 +145,7 @@ fn engines_that_cannot_run_a_video_codec_are_refused() {
 
 #[test]
 fn an_encoder_reports_its_engine_and_how_sources_reach_it() {
+    let _sessions = sessions::take(1);
     const TEST: &str = "an_encoder_reports_its_engine_and_how_sources_reach_it";
     if !edgefirst_tensor::is_gpu_buffer_available() {
         return skip(TEST, "no GPU buffers");
@@ -187,6 +194,7 @@ fn an_encoder_reports_its_engine_and_how_sources_reach_it() {
 
 #[test]
 fn an_image_decoder_on_an_explicit_engine_decodes_or_refuses() {
+    let _sessions = sessions::take(1);
     let jpeg = testdata("zidane.jpg");
     let mut dst = TensorDyn::image(
         1280,

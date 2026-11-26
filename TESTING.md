@@ -4,7 +4,7 @@
 target hardware.
 
 This guide is the **cross-crate** testing reference. It covers the rules
-and patterns that apply across the whole workspace — single-threaded
+and patterns that apply across the whole workspace — parallel
 execution, on-target hardware gating, cross-compilation, optimization
 validation, coverage, and the CI matrix. Crate-specific testing detail
 lives in each sub-crate's `TESTING.md`:
@@ -24,11 +24,7 @@ lives in each sub-crate's `TESTING.md`:
 
 ## Quick Reference
 
-> **Every test run is single-threaded.** `--test-threads=1` with `cargo test`, `-j 1`
-> with `cargo nextest`. This is a hard invariant, not a tuning knob — GPU driver
-> concurrency bugs, G2D per-process state, and CMA pool exhaustion each require it
-> independently. The Makefile targets already do it. See
-> [Single-Threaded Execution](#single-threaded-execution).
+> **Tests run in parallel.** nextest runs one process per test at its default thread count, and `cargo test` runs a binary's tests on libtest's default threads. A test that fails in parallel is a bug in the test or the code. See [Parallel Execution](#parallel-execution).
 
 | Makefile target | What it does |
 |-----------------|--------------|
@@ -143,15 +139,14 @@ benchmarks.
 
 ```bash
 scripts/test-macos.sh                       # full suite
-scripts/test-macos.sh -p edgefirst-image    # one crate
+scripts/test-macos.sh -E 'package(edgefirst-image)'   # one crate
 scripts/test-macos.sh test_yuyv_to_rgba_opengl_macos   # one test
 PROFILE=release scripts/test-macos.sh       # release tests
 ```
 
-The helper builds with `--tests`, signs every binary in
-`target/<profile>/deps/` with the workspace `entitlements.plist`, then
-forwards remaining arguments to `cargo nextest run`. Re-running it is
-idempotent (signing the same binary twice is a no-op).
+The helper builds the test binaries once, signs every binary nextest lists with the workspace `entitlements.plist`, then runs `cargo nextest run` over that build (`--binaries-metadata`) with the remaining arguments, so nothing is rebuilt after signing. Because the build is already recorded, pick tests with filters (`-E 'package(edgefirst-image)'`, a test-name pattern) rather than cargo options such as `-p`. Re-running it is idempotent (signing the same binary twice is a no-op).
+
+`COVERAGE=1` runs the same build, sign and run instrumented under `cargo llvm-cov show-env`, in `target/llvm-cov-target`, then writes `target/coverage_rust.lcov` (`COV_LCOV` overrides the path). Every test runs once, with the ANGLE dlopen gate open.
 
 #### The manual way
 
@@ -191,9 +186,7 @@ developer machines, but it means a broken CI GL stack (the ANGLE re-sign step
 regressing, say) would ship an untested GL backend behind a green lane.
 `gl_backend_available_canary` (crates/image lib tests) fails the run if
 `HAL_TEST_REQUIRE_GL=1` is set and `GLProcessorThreaded::new` errors. The macOS
-CI job sets it; local runs without the variable skip the canary trivially. On
-macOS the canary additionally requires `HAL_TEST_ALLOW_DLOPEN_ANGLE`, so that
-coverage pass 1 (unsigned binaries) skips and pass 2 (signed) enforces.
+CI job sets it; local runs without the variable skip the canary trivially. On macOS the canary also requires `HAL_TEST_ALLOW_DLOPEN_ANGLE`, which `scripts/test-macos.sh` sets once it has signed the test binaries.
 
 ---
 
@@ -237,7 +230,7 @@ From a **Developer PowerShell for VS** (cargo must find MSVC `link.exe`;
 Git Bash's `/usr/bin/link.exe` shadows it):
 
 ```powershell
-pwsh scripts/test-windows.ps1 -RequireGl                       # real GPU: all crates, -j 1
+pwsh scripts/test-windows.ps1 -RequireGl                       # real GPU: all crates
 pwsh scripts/test-windows.ps1 -RequireGl -p edgefirst-image    # image crate only
 pwsh scripts/test-windows.ps1 -Warp -RequireGl -p edgefirst-image   # no GPU: D3D11 WARP
 pwsh scripts/test-windows.ps1 -RequireGl -RequireCuda -p edgefirst-tensor   # real GPU + CUDA
@@ -246,8 +239,7 @@ pwsh scripts/test-windows.ps1 -RequireGl -RequireCuda -p edgefirst-tensor   # re
 The script defaults `EDGEFIRST_ANGLE_PATH` to the fetched directory, `-Warp`
 sets `EDGEFIRST_ANGLE_ADAPTER=warp` + `EDGEFIRST_ALLOW_SOFTWARE_GL=1`, and
 `-RequireGl` sets `HAL_TEST_REQUIRE_GL=1`; everything after the switches is
-passed to `cargo nextest run`. `-j 1` is forced: ANGLE takes the Full GL
-serialization policy.
+passed to `cargo nextest run`.
 
 `-RequireCuda` sets `HAL_TEST_REQUIRE_CUDA=1`, turning a silent
 `WARNING: SKIPPED: <test> - no CUDA runtime …` in
@@ -297,21 +289,14 @@ pwsh crates/gpu-probe/windows/build.ps1 -Run -Warp    # WARP
 
 Both runs must report 0 FAIL.
 
-`-Coverage` runs the same command under `cargo llvm-cov nextest --no-report`
-(needs `rustup component add llvm-tools-preview` and
-`cargo install cargo-llvm-cov --locked`). Passes accumulate until the report
-is generated:
+`-Coverage` runs the same command under `cargo llvm-cov nextest --no-report` (needs `rustup component add llvm-tools-preview` and `cargo install cargo-llvm-cov --locked`). The CI lane runs the whole workspace once, on WARP, then writes the report:
 
 ```powershell
-pwsh scripts/test-windows.ps1 -Coverage                                   # pass 1: whole workspace
-pwsh scripts/test-windows.ps1 -Coverage -Warp -RequireGl -p edgefirst-image --profile ci   # pass 2: GL on WARP
+cargo llvm-cov clean --workspace
+pwsh scripts/test-windows.ps1 -Coverage -Warp -RequireGl --features edgefirst-decoder/model-files --profile ci
 cargo llvm-cov report --lcov --output-path target/coverage_rust.lcov
 pwsh scripts/normalize-lcov-paths.ps1 target/coverage_rust.lcov          # repo-relative SF: paths for SonarCloud
 ```
-
-This is the CI lane's shape (its pass 1 runs with `EDGEFIRST_ANGLE_PATH`
-empty so the GL tests self-skip); `--profile ci` keeps the second pass's
-junit in its own nextest store instead of overwriting the first.
 
 ### 3. Verify the GPU backend is active
 
@@ -414,54 +399,27 @@ A DMA test that finds no usable heap skips and reports `ok`, so a lane that lost
 
 CI sets it through `.github/scripts/dma-heap-setup.sh`, which opens `/dev/dma_heap/system` to the job user (`sudo chmod a+rw` where it can), allocates and maps one page through the heap ioctl, and exports `HAL_TEST_REQUIRE_DMA=1` only when that probe succeeds. The step summary says which: `DMA: required (system heap, host-coherent)` or `DMA: unavailable — DMA tests skipped (<reason>)`. It runs on the Linux mutation legs and, through `.github/scripts/ci-setup.sh`, on the hosted Linux Quick/Full lanes and the board pre-command.
 
+Arming the gate from the probe means a host whose heap stops allocating, for example after a BSP update, skips its DMA tests with a warning and stays green. On boards that must have a working heap, `scripts/on-target-run.sh` takes `HAL_ONTARGET_REQUIRE_DMA=1` (`REQUIRE_DMA=1` through `scripts/on-target-test.sh`). It then sets `HAL_TEST_REQUIRE_DMA=1` for every test whatever the probe found, and fails the run up front as `NO-DMA` when the probe cannot allocate. `hardware-test.yml` sets it per board entry from its `BOARD_DMA` table. The hosted lanes, the mutation legs and the CI board lane keep the probe-armed behaviour.
+
 The V4L2 capture-import tests (`crates/tensor/tests/vivid_capture_import.rs`) need the kernel's virtual capture driver, vivid. `.github/scripts/vivid-setup.sh`, also run from `ci-setup.sh`, installs `linux-modules-extra` for the hosted runner's kernel, loads vivid, opens its nodes and exports `HAL_TEST_REQUIRE_VIVID=1` only when they appear. When the archive has no modules package for the runner's kernel the tests skip and the step summary says why. It does nothing on boards and other self-hosted machines. Locally: `sudo modprobe vivid n_devs=2 node_types=0x1,0x1 multiplanar=1,2`.
 
 A hosted-runner pass is **not** hardware validation. That heap is cached, cache-coherent system memory with no `/dev/dri` behind it, so it proves the DMA code paths run but says nothing about coherency (a missing end-of-access sync), CMA contiguity or GPU import. Only the board lanes cover those.
 
 ---
 
-## Single-Threaded Execution
+## Parallel Execution
 
-**All tests must run single-threaded.** This is a hard requirement, not a
-recommendation.
+Tests run in parallel. `cargo nextest` runs each test in its own process, as many at once as the host has CPUs, and `cargo test` uses libtest's default thread count. CI and the Makefile pass no `-j 1` to nextest. The nextest profiles in `.config/nextest.toml` do not retry a failed test, so each test runs once and a flaky test fails the lane.
 
-Use `--test-threads=1` with `cargo test` and `-j 1` with `cargo nextest`.
-The [`Makefile`](https://github.com/EdgeFirstAI/hal/blob/main/Makefile)
-enforces this automatically via `cargo llvm-cov nextest ... -j 1`.
+A test that fails only in parallel has a bug: shared global state, a fixed temporary path or port, an environment variable it sets for other tests to read, device contention, or a timing assumption. Fix the test or the code rather than serializing it. A nextest test group with `max-threads = 1` is only for an exclusive device that a test cannot share, and `.config/nextest.toml` defines none today.
 
-### Why single-threaded
+Hardware codec tests hold at most four codec sessions at once across every thread and process on the machine. Before a test opens a V4L2 or Media Foundation video codec, or a V4L2 JPEG device, it takes one slot per session it keeps open from `crates/codec/tests/common/sessions.rs`. Each slot is an exclusive `flock` on a file in the temp directory, and a test takes all its slots at once or waits. A Python test that opens a hardware codec is marked `@pytest.mark.codec_sessions(n)`, and `tests/conftest.py` takes its slots from the same files (`tests/codec_sessions.py`) for as long as it runs. A test that only needs a decoded fixture decodes it on the CPU engine: `set_engine(Engine::Cpu)` in Rust, and `EDGEFIRST_CODEC_ENGINE=cpu` for the Python image tests (`tests/image/conftest.py`), since `Engine::Auto` opens a V4L2 JPEG decoder even for a host-memory destination. The cap limits how many sessions the harness's parallelism opens on a many-core board. It is not a lock on the device: `video_concurrency.rs` opens two sessions at once on purpose, and the tests still run in parallel.
 
-Three independent constraints each require it:
+GL driver concurrency is handled by the HAL at run time, not by the test harness. The HAL picks a serialization policy per driver: `Full` on Vivante `galcore` (i.MX 8M Plus), Adreno (Linux KGSL), paravirtual GPUs and ANGLE, where every GL message in a process takes one global lock, and `LifecycleOnly` on Mali, V3D, Tegra and llvmpipe, where instances run GL concurrently. Separate test processes each open their own display. [`crates/image/ARCHITECTURE.md`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/ARCHITECTURE.md#gl-concurrency-model-serialization-policy) documents the policy.
 
-1. **GL driver concurrency bugs** — the HAL uses a process-global EGL
-   display (`SharedEglDisplay`) that is intentionally never terminated,
-   but the embedded GPU drivers it sits on top of still corrupt
-   driver-internal state under concurrent operations on that shared
-   display. Vivante `galcore` (i.MX 8M Plus) hits SIGSEGV at offset
-   `0x18` in its ioctl path and futex deadlocks when context creation,
-   DMA-BUF import, or draw commands overlap across threads; Broadcom
-   V3D 7.1.10.2 (Raspberry Pi 5) drops affected contexts into
-   `EGL(NotInitialized)` under similar pressure. At runtime the HAL
-   picks a serialization policy per driver: `Full` on Vivante,
-   Adreno (Linux KGSL) and paravirtual GPUs, where every message takes the global `GL_MUTEX`,
-   and `LifecycleOnly` on Mali, V3D, Tegra, llvmpipe, Android, and real
-   Apple GPUs, where instances run GL concurrently. `--test-threads=1`
-   extends the strict discipline to test harness processes regardless of
-   that policy, since `cargo nextest` runs each test in its own process
-   but multiple test processes still share the GPU driver state — and no
-   in-process mutex can serialize across processes.
-2. **G2D driver state** — the `galcore` kernel driver maintains
-   per-process state that is unsafe to access from concurrent threads
-   creating and destroying G2D contexts.
-3. **DMA-heap CMA pool exhaustion** — concurrent DMA-heap allocations
-   from multiple test threads can exhaust the CMA pool on
-   memory-constrained embedded targets, masking the real failures.
+`cargo test` runs a binary's tests as threads of one process, so tests must not share process state either. No test sets an environment variable another test reads. The GL processor, `ImageProcessor`, the decoder and kernels tier overrides and the D3D11 adapter read their variables through a lookup or a settings value that tests pass directly, and the V4L2 JPEG tests pick the CPU engine with `ImageDecoder::set_engine`. A test that checks a variable itself is the only test in its binary (`env_free`, `v4l2_probe_env`, `decoded_video_import`). The GL tests that drive the crate-internal `GLProcessorST` run it on a `GLProcessorThreaded` worker through a test hook, under the same per-driver lock as every other GL message. On a board, `scripts/on-target-run.sh` runs each test binary directly at libtest's default thread count; `HAL_ONTARGET_TEST_THREADS` sets another. The Full tier's board lane runs each `board-binaries` entry as one process with one test thread, through the shared `board-run` action.
 
-`cargo nextest` already provides per-test process isolation, but `-j 1`
-is still required to prevent DMA and GPU contention across test
-processes.
-
-This constraint applies to CI, the Makefile, and local development. [`crates/image/ARCHITECTURE.md`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/ARCHITECTURE.md#gl-concurrency-model-serialization-policy) documents the serialization policy behind the single-threaded rule.
+Benchmarks are not tests. They run one at a time and on demand only: `make bench` locally, and `hardware-bench.yml` on the boards through `scripts/on-target-bench.sh`. No CI tier runs them. `ci.yml` only type-checks them (`make check-benchmarks`), and pytest deselects the `benchmark` marker by default.
 
 ---
 
@@ -482,13 +440,13 @@ make test-python
 # 4. Rust tests manually with nextest
 cargo nextest run --workspace --exclude edgefirst-python-tensor \
   --exclude edgefirst-python-codec --exclude edgefirst-python-image \
-  --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-kernels -j 1
+  --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-kernels
 
 # 5. Tests for a specific crate
-cargo test -p edgefirst-image -- --test-threads=1
-cargo test -p edgefirst-codec -- --test-threads=1
-cargo test -p edgefirst-decoder -- --test-threads=1
-cargo test -p edgefirst-tensor -- --test-threads=1
+cargo test -p edgefirst-image
+cargo test -p edgefirst-codec
+cargo test -p edgefirst-decoder
+cargo test -p edgefirst-tensor
 ```
 
 ### Per-language workflows
@@ -543,9 +501,7 @@ default adapter; set `EDGEFIRST_D3D11_ADAPTER=warp` on a host without
 a GPU, as CI does, and `EDGEFIRST_ALLOW_SOFTWARE_GL=1` with it, or the
 GL engine refuses the software renderer and image-capi's
 `test_cross_library.c` converts into a host destination that hands
-back no fence. `--test-threads=1` is what CI uses to serialize the
-D3D11 tests over one WARP device; the C harness itself does not need
-it.
+back no fence.
 
 ### On-demand Ultralytics discovery test
 
@@ -614,7 +570,8 @@ Use environment variables to isolate tests to specific backends:
 | Variable | Effect |
 |----------|--------|
 | `EDGEFIRST_TENSOR_FORCE_MEM=1` | Force heap (`MemTensor`) allocation; skips DMA-heap and shared memory |
-| `HAL_TEST_REQUIRE_DMA=1` | Fail, rather than skip, any DMA test that finds no usable heap. See [CI guard against silent DMA skips](#ci-guard-against-silent-dma-skips) |
+| `HAL_TEST_REQUIRE_DMA=1` | Fail, rather than skip, any DMA test that finds no usable heap. Set by the DMA heap probe when it allocates, and on a board by `HAL_ONTARGET_REQUIRE_DMA=1`. See [CI guard against silent DMA skips](#ci-guard-against-silent-dma-skips) |
+| `HAL_ONTARGET_REQUIRE_DMA=1` | On a board, `scripts/on-target-run.sh` sets `HAL_TEST_REQUIRE_DMA=1` whatever the heap probe found, and fails the run as `NO-DMA` when the probe cannot allocate. See [CI guard against silent DMA skips](#ci-guard-against-silent-dma-skips) |
 | `HAL_TEST_REQUIRE_VIVID=1` | Fail, rather than skip, the vivid capture-import tests when no vivid node is found. See [CI guard against silent DMA skips](#ci-guard-against-silent-dma-skips) |
 | `EDGEFIRST_FORCE_BACKEND=cpu` | Force CPU-only image processing |
 | `EDGEFIRST_FORCE_BACKEND=opengl` | Force OpenGL backend |
@@ -626,13 +583,12 @@ Use environment variables to isolate tests to specific backends:
 | `EDGEFIRST_GL_SERIALIZE=full` / `=lifecycle` | Pin the GL serialization policy instead of letting the driver probe choose |
 | `EDGEFIRST_NV_CONVERT_PATH=sampler` / `=shader` / `=auto` | Force the NV12/16/24 GPU conversion path |
 | `EDGEFIRST_GL_NO_NV_HW_FILTER=1` | Resize NV12/16/24 with the shader-filtered program instead of the hardware-filtered one (diagnostic; tests reach it per processor) |
-| `EDGEFIRST_COLORIMETRY=exact` | Opt into colorimetry-exact conversion where the default trades exactness for speed |
 
 Example — run tests without any GPU backend:
 
 ```bash
 EDGEFIRST_DISABLE_GL=1 EDGEFIRST_DISABLE_G2D=1 \
-  cargo test --workspace -- --test-threads=1
+  cargo test --workspace
 ```
 
 ### Known-bug test masks
@@ -693,11 +649,11 @@ Files no leg compiles at all go in `exclude_globs` in the same file (`ahardwareb
 
 ### Running it locally
 
-cargo-mutants reads `.cargo/mutants.toml` automatically. Mutate one file in place and run its crate's tests single-threaded (the two `--` reach cargo test and then the libtest harness):
+cargo-mutants reads `.cargo/mutants.toml` automatically. Mutate one file in place and run its crate's tests:
 
 ```bash
 cargo install cargo-mutants --locked
-cargo mutants -p edgefirst-tensor --file crates/tensor/src/blob.rs --in-place -- -- --test-threads=1
+cargo mutants -p edgefirst-tensor --file crates/tensor/src/blob.rs --in-place
 # List without building:
 cargo mutants -p edgefirst-tensor --file crates/tensor/src/blob.rs --list
 ```
@@ -745,8 +701,8 @@ probes each host, cross-builds one bundle per architecture with
 `testdata/`), copies it to each host (rsync, or tar over ssh on an image
 without rsync), and runs the bundle's own
 [`scripts/on-target-run.sh`](https://github.com/EdgeFirstAI/hal/blob/main/scripts/on-target-run.sh)
-there: each binary with the mandatory `--test-threads=1`, then the C-API
-gates. It prints a pass/fail/skip matrix with each host's passed, failed and
+there: each binary at libtest's default thread count (see [Parallel Execution](#parallel-execution)), then the C-API
+gates, then the Python codec tests. Those run on the bundle's own wheels, pytest and numpy under `python3 -S`, so nothing installed on the board, in its system or user site-packages, changes what they import. The bundle carries numpy for CPython 3.11 to 3.14 and the test skips, with the reason, on a board whose python3 is older or has no matching numpy. It prints a pass/fail/skip matrix with each host's passed, failed and
 ignored test totals. Logs, `capabilities.txt` and `summary.json` land in
 `target/on-target-results/<host>/`. It exits non-zero if any host reported a test failure, and also if a host ran no tests at all — reported as `NO-TESTS` rather than `PASS`, since a run that exercised nothing is not evidence. An unreachable host is reported as `UNREACHABLE` and does not mask a real failure elsewhere. So is a host another run is already using, as `BUSY`: each run holds a lock on the host (`<REMOTE_DIR>.lock` on the board, with the holder's name) for the whole deploy, run and fetch, because two runs against one host share its remote directory and its local results directory and would read back each other's results. A run releases only a lock whose owner file still names it, so it never removes one another run took. A lock left by a killed run is removed with the command the `BUSY` line prints, or by the board's next reboot.
 
@@ -770,11 +726,14 @@ A few details worth knowing:
   `.github/scripts/dma-heap-setup.sh` allocates from the DMA heap, so a GL
   stack or heap that should work and does not fails the run instead of
   skipping. `REQUIRE_GPU=1` also fails a host with no render node at all, as
-  `NO-GPU`, where every GPU test would otherwise skip.
+  `NO-GPU`, where every GPU test would otherwise skip. `REQUIRE_DMA=1` does the
+  same for the DMA heap: it arms `HAL_TEST_REQUIRE_DMA=1` whatever the probe
+  found and fails a host whose probe cannot allocate as `NO-DMA`. Without it,
+  a host whose heap does not allocate skips its DMA tests with a warning.
 - **The DMA-BUF and G2D suites always build.** They probe for the hardware at
   run time and report `SKIPPED` without it; on a board the require gates turn
   that skip into a failure: `HAL_TEST_REQUIRE_DMA=1` when the DMA heap
-  allocates, `HAL_TEST_REQUIRE_G2D=1` when `libg2d.so.2` is installed. Both are
+  allocates or `REQUIRE_DMA=1` is set, `HAL_TEST_REQUIRE_G2D=1` when `libg2d.so.2` is installed. Both are
   armed automatically by `scripts/on-target-run.sh` and the CI board lane. On
   i.MX 95 they arm `HAL_TEST_SKIP_G2D=1` instead: its `libg2d.so.2` loads, but
   G2D is not supported there, so the G2D suites skip.
@@ -788,7 +747,7 @@ A few details worth knowing:
 Two `workflow_dispatch` workflows run on the self-hosted board fleet, one
 job per board entry:
 
-- [`hardware-test.yml`](https://github.com/EdgeFirstAI/hal/blob/main/.github/workflows/hardware-test.yml) — the whole on-target suite plus the C-API gates, with the DMA/G2D require gates armed from what each board has and `require-gpu` failing a board that has no render node.
+- [`hardware-test.yml`](https://github.com/EdgeFirstAI/hal/blob/main/.github/workflows/hardware-test.yml) — the whole on-target suite plus the C-API gates, with the G2D require gate armed from what each board has, `require-gpu` failing a board that has no render node, and the DMA gate set per board entry by the workflow's `BOARD_DMA` table: an entry marked `1` must have a heap that allocates or fails as `NO-DMA`, an entry marked `0` (orin-nano, which has no DMA heap) arms the gate only when its probe allocates. An entry missing from the table fails the plan job, so a new board entry needs a line there.
 - [`hardware-bench.yml`](https://github.com/EdgeFirstAI/hal/blob/main/.github/workflows/hardware-bench.yml) — every benchmark case of [`scripts/on-target-bench.sh`](https://github.com/EdgeFirstAI/hal/blob/main/scripts/on-target-bench.sh); see [BENCHMARKS.md § Running Benchmarks](https://github.com/EdgeFirstAI/hal/blob/main/BENCHMARKS.md#running-benchmarks).
 
 A board entry is a runner label, or labels joined by `+` that one runner must
@@ -836,10 +795,6 @@ A test that cannot exercise what it tests reports a **warning**, never a silent 
 
 The warnings are audited, not just counted. `.github/scripts/test_warnings.py` groups every `WARNING:` line from JUnit output and logs into a table in the step summary, with one annotation per distinct warning. It runs after the `hal-full` test jobs and in the hardware-test summary. `scripts/on-target-run.sh` counts skips per binary and writes the distinct warnings to `warnings.txt` in the results directory. Cross-check a skipped hardware test against the board's `capabilities.txt` before claiming a path was exercised.
 
-The `--test-threads=1` flag is mandatory on target for the same reasons
-as local development — CMA pool exhaustion risk is higher on embedded
-boards with limited memory.
-
 ### Manual fallback
 
 If you need to run a single binary by hand:
@@ -848,7 +803,7 @@ If you need to run a single binary by hand:
 cargo-zigbuild test --target aarch64-unknown-linux-gnu.2.35 --release --no-run \
   -p edgefirst-tensor -p edgefirst-image
 rsync -az target/aarch64-unknown-linux-gnu/release/deps/<binary> testdata imx95-frdm:/tmp/hal-tests/
-ssh imx95-frdm 'cd /tmp/hal-tests && EDGEFIRST_TESTDATA_DIR=$(pwd)/testdata ./<binary> --test-threads=1'
+ssh imx95-frdm 'cd /tmp/hal-tests && EDGEFIRST_TESTDATA_DIR=$(pwd)/testdata ./<binary>'
 ```
 
 The `python-*` crates are excluded from cross-builds — PyO3 requires a
@@ -881,8 +836,7 @@ CI automates this flow in the Full tier (`ci.yml` + shared `rust-full.yml`)
 when the PR carries `ci:full` or `ci:hardware`.
 The aarch64 host archives instrumented `edgefirst-image` (opengl, G2D and DMA
 test formats) and `edgefirst-tensor` as `nextest-archive-aarch64`, plus
-`rust-llvm-cov-aarch64` objects. The board downloads `ci-testdata` and runs
-`cargo nextest run --archive-file … -j 1`. Coverage profraw is merged into
+`rust-llvm-cov-aarch64` objects. The board downloads `ci-testdata` and runs each `board-binaries` entry from the archive as one process with one test thread. Coverage profraw is merged into
 `coverage-hardware.lcov`.
 
 ### iOS (build + lint the native Rust API only)
@@ -926,7 +880,7 @@ shutdown. Run any test or benchmark with
 
 ```bash
 RUST_LOG=edgefirst_image=debug \
-  cargo test -p edgefirst-image --test ... -- --test-threads=1 2>&1 | tee cache.log
+  cargo test -p edgefirst-image --test ... 2>&1 | tee cache.log
 ```
 
 Look for the final line:
@@ -1217,7 +1171,7 @@ records calls to `register`, `map`, `unmap`, and `unregister` in-process:
 Run these on any host (no CUDA hardware required):
 
 ```bash
-cargo test -p edgefirst-tensor -- --test-threads=1
+cargo test -p edgefirst-tensor
 ```
 
 ### Device-pointer correctness tests (CUDA host — incl. dev PC)
@@ -1274,7 +1228,7 @@ scp target/aarch64-unknown-linux-gnu/release/deps/edgefirst_tensor-* \
   jetson-orin-nano:/tmp/hal-tests/
 ssh jetson-orin-nano \
   'EDGEFIRST_TESTDATA_DIR=/tmp/hal-tests/testdata \
-   /tmp/hal-tests/edgefirst_tensor-<hash> --test-threads=1'
+   /tmp/hal-tests/edgefirst_tensor-<hash>'
 ```
 
 CI does not run a CUDA-capable hardware runner today; the on-target results
@@ -1364,7 +1318,7 @@ explicit probe, not a `#[ignore]` attribute.
 
 The `software-gl-coverage` lane exists because no hosted runner has a
 GPU. Mesa llvmpipe runs the same GL paths with
-`EDGEFIRST_ALLOW_SOFTWARE_GL=1`.
+`EDGEFIRST_ALLOW_SOFTWARE_GL=1`, and sets `HAL_TEST_REQUIRE_GL=1`, so the lane fails when GL cannot initialise. On x86_64 Linux it is the one lane that runs `edgefirst-image`: the `ci` nextest profile leaves the crate out of the Full linux lane there.
 
 ## Android On-Device Validation (Device Farm)
 
@@ -1431,8 +1385,8 @@ devices where the optimization silently can't engage.
 
 | Symptom | Likely cause | Remedy |
 |---------|--------------|--------|
-| Intermittent EGL segfault | Tests running in parallel | Ensure `--test-threads=1` / `-j 1` |
-| `DMA-heap allocation failed` on target | CMA pool exhaustion from parallel tests | Reduce parallelism; use `-j 1` |
+| Test fails only in parallel | Shared state between tests: a fixed path, a port, an environment variable set by a test | Fix the test; see [Parallel Execution](#parallel-execution) |
+| `DMA-heap allocation failed` on target | CMA pool exhausted | Lower `HAL_ONTARGET_TEST_THREADS` to confirm, then find the test holding the memory |
 | `cargo-nextest not found` | Tool not installed | `cargo install cargo-nextest` |
 | `cargo-llvm-cov not found` | Tool not installed | `cargo install cargo-llvm-cov --locked` |
 | Python tests fail with `ModuleNotFoundError` | Bindings not built | `maturin develop -m crates/python-tensor/Cargo.toml` |

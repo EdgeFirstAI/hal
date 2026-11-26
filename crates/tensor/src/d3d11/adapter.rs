@@ -183,12 +183,20 @@ pub fn resolve_adapter(sel: AdapterSelection, adapters: &[DxgiAdapter]) -> Adapt
 /// Reads [`ADAPTER_ENV`] and [`ADAPTER_ENV_ALIAS`]. When both are set and
 /// differ, [`ADAPTER_ENV`] wins and the disagreement is logged.
 pub(crate) fn read_adapter_env() -> Option<String> {
-    let primary = std::env::var(ADAPTER_ENV)
-        .ok()
-        .filter(|s| !s.trim().is_empty());
-    let alias = std::env::var(ADAPTER_ENV_ALIAS)
-        .ok()
-        .filter(|s| !s.trim().is_empty());
+    adapter_env_from_lookup(|name| std::env::var(name).ok())
+}
+
+/// [`read_adapter_env`] with the variables read through `lookup`, which
+/// returns a variable's value or `None` when it is unset.
+fn adapter_env_from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Option<String> {
+    resolve_adapter_env(lookup(ADAPTER_ENV), lookup(ADAPTER_ENV_ALIAS))
+}
+
+/// Picks the adapter name from the [`ADAPTER_ENV`] value `primary` and the
+/// [`ADAPTER_ENV_ALIAS`] value `alias`. Blank values count as unset.
+fn resolve_adapter_env(primary: Option<String>, alias: Option<String>) -> Option<String> {
+    let primary = primary.filter(|s| !s.trim().is_empty());
+    let alias = alias.filter(|s| !s.trim().is_empty());
     match (primary, alias) {
         (Some(p), Some(a)) if p.trim() != a.trim() => {
             log::warn!(
@@ -375,17 +383,37 @@ mod tests {
         }
     }
 
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
-    fn both_adapter_env_names_are_read_and_the_d3d11_name_wins() {
-        let _g = ENV_LOCK.lock().unwrap();
-        std::env::remove_var(ADAPTER_ENV);
-        std::env::set_var(ADAPTER_ENV_ALIAS, "warp");
-        assert_eq!(read_adapter_env().as_deref(), Some("warp"));
-        std::env::set_var(ADAPTER_ENV, "discrete");
-        assert_eq!(read_adapter_env().as_deref(), Some("discrete"));
-        std::env::remove_var(ADAPTER_ENV);
-        std::env::remove_var(ADAPTER_ENV_ALIAS);
+    fn the_d3d11_adapter_name_wins_over_its_alias() {
+        let s = |v: &str| Some(v.to_string());
+        assert_eq!(
+            resolve_adapter_env(None, s("warp")).as_deref(),
+            Some("warp")
+        );
+        assert_eq!(
+            resolve_adapter_env(s("discrete"), s("warp")).as_deref(),
+            Some("discrete")
+        );
+        assert_eq!(
+            resolve_adapter_env(s(" "), s("warp")).as_deref(),
+            Some("warp")
+        );
+        assert_eq!(resolve_adapter_env(None, None), None);
+    }
+
+    /// Both documented names are read, `EDGEFIRST_D3D11_ADAPTER` first.
+    #[test]
+    fn adapter_env_reads_both_documented_names() {
+        assert_eq!(ADAPTER_ENV, "EDGEFIRST_D3D11_ADAPTER");
+        assert_eq!(ADAPTER_ENV_ALIAS, "EDGEFIRST_ANGLE_ADAPTER");
+        let alias_only = |name: &str| (name == ADAPTER_ENV_ALIAS).then(|| "warp".to_string());
+        assert_eq!(adapter_env_from_lookup(alias_only).as_deref(), Some("warp"));
+        let both = |name: &str| match name {
+            ADAPTER_ENV => Some("discrete".to_string()),
+            ADAPTER_ENV_ALIAS => Some("warp".to_string()),
+            _ => None,
+        };
+        assert_eq!(adapter_env_from_lookup(both).as_deref(), Some("discrete"));
+        assert_eq!(adapter_env_from_lookup(|_| None), None);
     }
 }

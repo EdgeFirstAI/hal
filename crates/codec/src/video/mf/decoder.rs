@@ -50,12 +50,12 @@ use windows::Win32::System::Variant::VARIANT;
 use windows::Win32::Graphics::Direct3D11::{ID3D11DeviceContext, ID3D11Texture2D, D3D11_BOX};
 use windows::Win32::Media::MediaFoundation::IMFDXGIDeviceManager;
 
-use super::copy::{self, Plane};
 use super::{
     com, error, hal_device, is_native_nv12, pair, sample_texture, set_pair, tensor_texture, Output,
     Platform, Transform,
 };
 use crate::engine::unsupported;
+use crate::video::copy::{self, Plane};
 use crate::video::{
     DecodeEvent, DecodedFrame, DecoderBackend, DecoderConfig, OutputMemory, OutputPool, Returns,
     StreamInfo,

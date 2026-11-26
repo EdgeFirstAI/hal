@@ -761,11 +761,16 @@ class ImageProcessor:
         ``letterbox`` arguments as :meth:`convert`.
 
         Returns:
-            A sync-file descriptor on Linux and Android, an event handle
+            A sync-file descriptor on Linux and Android (where the EGL display has
+            ``EGL_ANDROID_native_fence_sync``), an event handle
             (as an integer) on Windows, or ``None`` when the convert
             completed synchronously (no native fence on this display). The
             caller owns the handle and closes it (``os.close`` for the fd,
             ``ctypes.windll.kernel32.CloseHandle`` for the Windows handle).
+
+        The handle also covers the GPU's reads of ``src``: keep the source
+        unmodified, and do not hand its buffer back to its producer (a V4L2
+        capture queue, for example), until it signals.
 
         On Windows the destination's ``gpu_completion()`` reflects this
         convert afterwards.
@@ -846,6 +851,42 @@ class ImageProcessor:
             PermissionError: As :meth:`convert`.
         """
 
+    def tile_into_with_fence(
+        self,
+        src: EdgeFirstTensorExportable,
+        dst_batched: EdgeFirstTensorExportable,
+        cfg: TilingConfig,
+    ) -> tuple[list[TilePlacement], int | None]:
+        """Render every tile of ``src`` into a tall packed parent without
+        blocking on the GPU; returns the placements and a completion handle.
+
+        Platforms:
+            Linux, macOS, iOS, Android (sync-file descriptor) and Windows
+            (event handle). Declared and callable on every platform.
+
+        Takes the same arguments as :meth:`tile_into`.
+
+        Returns:
+            A ``(placements, fence)`` tuple. ``placements`` is the per-tile
+            :class:`TilePlacement` list in tile-index order. ``fence`` is a
+            sync-file descriptor on Linux and Android (where the EGL display has
+            ``EGL_ANDROID_native_fence_sync``), an event handle (as
+            an integer) on Windows, or ``None`` when the tiles completed
+            synchronously (no native fence on this display). The caller
+            owns the handle and closes it (``os.close`` for the fd,
+            ``ctypes.windll.kernel32.CloseHandle`` for the Windows handle).
+
+        The handle also covers the GPU's reads of ``src``: keep the source
+        unmodified, and do not hand its buffer back to its producer (a V4L2
+        capture queue, for example), until it signals.
+
+        On Windows the destination's ``gpu_completion()`` reflects the
+        tiles afterwards.
+
+        Raises:
+            PermissionError: As :meth:`convert`.
+        """
+
     def tile_one(
         self,
         src: EdgeFirstTensorExportable,
@@ -911,7 +952,9 @@ class ImageProcessor:
                     and range (default: ``None`` = resolved by heuristic).
 
             Returns:
-                A new image ``Tensor`` backed by the external DMA-BUF(s).
+                A new image ``Tensor`` backed by the external DMA-BUF(s). With
+                ``chroma_fd`` its chroma plane is a separate tensor, and it
+                cannot be passed to another edgefirst package.
 
             Raises:
                 RuntimeError: If a file descriptor is invalid, dimensions are zero,

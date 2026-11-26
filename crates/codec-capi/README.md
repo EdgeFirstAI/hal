@@ -77,7 +77,7 @@ ef_video_encoder_flush(enc);
 ef_video_encoder_free(enc);
 ```
 
-Sources are read in place where the engine can (DMA-BUF on Linux, D3D11 textures on Windows); `ef_video_encoder_get_info` says which engine and device encode and how sources reach them. A packet stays valid until the next `ef_video_encoder_next_packet` call.
+Sources are read in place where the engine can (DMA-BUF on Linux, D3D11 textures on Windows); `ef_video_encoder_get_info` says which engine and device encode and how sources reach them. A V4L2 device reads only the layout it asks for, so other sources are copied into that layout first; `ef_video_encoder_create_source` allocates an image in it, which the encoder reads without a copy, and the caller frees it with `ef_tensor_free`. A packet stays valid until the next `ef_video_encoder_next_packet` call.
 
 ## Decoding video
 

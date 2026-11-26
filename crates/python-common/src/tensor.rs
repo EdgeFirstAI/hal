@@ -1768,6 +1768,9 @@ impl PyTensor {
     ///
     /// Raises:
     ///     ValueError: if ``access`` is not one of the values above.
+    ///     NotImplementedError: if the tensor's chroma plane is a separate
+    ///         tensor (two-buffer NV12, chroma at an offset, a decoded video
+    ///         frame), which cannot be passed to another edgefirst package.
     #[pyo3(signature = (access=None))]
     fn __edgefirst_tensor__<'py>(
         &self,
@@ -1775,6 +1778,8 @@ impl PyTensor {
         access: Option<&str>,
     ) -> PyResult<Bound<'py, pyo3::types::PyCapsule>> {
         use edgefirst_tensor::CpuAccess;
+
+        crate::interop::exportable(&self.0)?;
 
         // Pin only for the access the caller asked for.
         let pin = match access.map(|s| (s, CpuAccess::from_str_code(s))) {
@@ -2108,6 +2113,7 @@ impl PyTensor {
             // A PBO-backed tensor is decoded in place with the GIL held.
             return decode_image_into(&mut self_.0, &data);
         }
+        crate::interop::refuse_two_plane_decode(&self_.0).map_err(Error::Py)?;
         // Decode into a `TensorDyn` reconstructed over the same backing memory,
         // with the GIL released.
         let (mut tensor, _pin) =
@@ -2143,6 +2149,7 @@ impl PyTensor {
             let data = std::fs::read(&filename).map_err(Error::Io)?;
             return decode_image_into(&mut self_.0, &data);
         }
+        crate::interop::refuse_two_plane_decode(&self_.0).map_err(Error::Py)?;
         // Decode into a `TensorDyn` reconstructed over the same backing memory,
         // with the GIL released.
         let (mut tensor, _pin) =

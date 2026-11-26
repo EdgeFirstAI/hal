@@ -20,6 +20,8 @@
 #   crates/*-capi/        src/ and include/, which check-single-home.sh reads
 #   python/, tests/codec  with PYTHON_WHEELS: the unpacked wheels and the
 #                         Python codec tests
+#   python-cpXY/          with PYTHON_WHEELS: the unpacked wheels built for
+#                         one CPython version only, such as numpy
 #   scripts/              on-target-run.sh, check-single-home.sh,
 #                         dma-heap-setup.sh
 #   testdata/             testdata/ merged with every crates/*/testdata
@@ -40,9 +42,9 @@
 #   TESTDATA      1 to include testdata/ (default: 1). scripts/on-target-test.sh
 #                 passes its SYNC_TESTDATA here.
 #   PYTHON_WHEELS tests: a directory of aarch64 wheels (edgefirst-tensor,
-#                 edgefirst-codec, pytest and its dependencies) to bundle with
-#                 the Python codec tests (default: none, and the board skips
-#                 them)
+#                 edgefirst-codec, pytest and its dependencies, and numpy for
+#                 each CPython version the boards run) to bundle with the
+#                 Python codec tests (default: none, and the board skips them)
 
 set -euo pipefail
 
@@ -196,18 +198,26 @@ build_libs() {
   return 0
 }
 
-# Unpacks the wheels into python/ and copies the Python codec tests into
-# tests/.
+# Unpacks the wheels into python/, and the wheels tagged for one CPython
+# version (cp311-cp311) into python-cp311/, and copies the Python codec tests
+# and the helpers they import into tests/.
 bundle_python() {
-  local wheels="$1" w
+  local wheels="$1" w dest tag
   echo "==> unpacking the Python wheels from ${wheels}"
   mkdir -p "${OUT}/python" "${OUT}/tests"
   for w in "${wheels}"/*.whl; do
     [[ -e "${w}" ]] || { echo "no wheels in ${wheels}" >&2; return 1; }
-    python3 -m zipfile -e "${w}" "${OUT}/python"
+    dest="${OUT}/python"
+    if [[ "$(basename "${w}")" =~ -(cp3[0-9]+)-(cp3[0-9]+)-[^-]+\.whl$ ]] \
+        && [[ "${BASH_REMATCH[1]}" == "${BASH_REMATCH[2]}" ]]; then
+      tag="${BASH_REMATCH[1]}"
+      dest="${OUT}/python-${tag}"
+    fi
+    mkdir -p "${dest}"
+    python3 -m zipfile -e "${w}" "${dest}"
     echo "    $(basename "${w}")"
   done
-  cp tests/__init__.py tests/conftest.py "${OUT}/tests/"
+  cp tests/__init__.py tests/conftest.py tests/codec_sessions.py "${OUT}/tests/"
   cp -a tests/codec "${OUT}/tests/"
   return 0
 }

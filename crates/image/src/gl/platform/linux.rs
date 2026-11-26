@@ -59,8 +59,10 @@ impl GlPlatform for LinuxEgl {
     type Import = EglImage;
     type ImportHandle = egl::Image;
 
-    // EGLImage targets persist on the texture object.
-    const PERSISTENT_TEX_BINDINGS: bool = true;
+    fn tex_binding_epoch(_display: &GlContext) -> Option<u64> {
+        // EGLImage targets persist on the texture object.
+        Some(0)
+    }
 
     /// The planar F16 zero-copy render only.
     const ZERO_COPY_FLOAT: super::super::float_dispatch::ZeroCopyFloatSet =
@@ -141,15 +143,18 @@ impl GlPlatform for LinuxEgl {
         // Nothing to release.
     }
 
-    fn native_fence_sync(_display: &GlContext) -> bool {
-        false
+    fn native_fence_sync(display: &GlContext) -> bool {
+        display.native_fence
     }
 
     fn export_completion_fence(
-        _display: &GlContext,
+        display: &GlContext,
         _recorded: Option<u64>,
     ) -> crate::Result<Option<super::super::CompletionFence>> {
-        Ok(None)
+        if !display.native_fence {
+            return Ok(None);
+        }
+        super::super::native_fence::export_native_fence_fd(&display.egl, display.display).map(Some)
     }
 
     fn record_completion(_display: &GlContext, _dst: &mut TensorDyn, _submit: bool) -> Option<u64> {
@@ -157,7 +162,7 @@ impl GlPlatform for LinuxEgl {
     }
 
     fn submit_recorded(_display: &GlContext) {
-        // No device fence: nothing to submit.
+        // Nothing to submit.
     }
 
     fn import_buffer_packed<T>(

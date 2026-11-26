@@ -121,10 +121,11 @@ impl TensorDyn {
     /// Derive this handle's [`BufferIdentity`].
     ///
     /// On Windows a texture-backed handle is keyed on the `ID3D11Texture2D*`
-    /// returned by `ef_tensor_d3d11_texture`. On Unix a DMA-BUF-backed handle
-    /// is keyed on the `(st_dev, st_ino)` of its plane 0 fd. Every other
-    /// storage kind, and an fd that cannot be `fstat`-ed, is keyed on the
-    /// handle's own address as `HostPtr`.
+    /// returned by `ef_tensor_d3d11_texture`. On macOS and iOS an
+    /// IOSurface-backed handle is keyed on its `IOSurfaceGetID`. On Unix a
+    /// DMA-BUF-backed handle is keyed on the `(st_dev, st_ino)` of its plane 0
+    /// fd. Every other storage kind, and an fd that cannot be `fstat`-ed, is
+    /// keyed on the handle's own address as `HostPtr`.
     fn derive_identity(handle: NonNull<EfTensor>) -> BufferIdentity {
         #[cfg(target_os = "windows")]
         {
@@ -139,6 +140,24 @@ impl TensorDyn {
                         IdentityKind::D3d11Texture,
                         tex as usize as u64,
                     );
+                }
+            }
+        }
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        {
+            // SAFETY: `handle` is live for the duration of this call.
+            let code = unsafe { edgefirst_tensor_ffi::ef_tensor_storage_kind(handle.as_ptr()) };
+            if TensorMemory::from_code(code) == Some(TensorMemory::DmaBuf) {
+                // SAFETY: `handle` is live for the duration of this call; the
+                // surface is borrowed and stays live while the handle does.
+                let surface =
+                    unsafe { edgefirst_tensor_ffi::ef_tensor_iosurface_ref(handle.as_ptr()) };
+                if !surface.is_null() {
+                    // SAFETY: `surface` is a live IOSurfaceRef.
+                    let id = unsafe { IOSurfaceGetID(surface) };
+                    if id != 0 {
+                        return BufferIdentity::derived(IdentityKind::IoSurface, id as u64);
+                    }
                 }
             }
         }

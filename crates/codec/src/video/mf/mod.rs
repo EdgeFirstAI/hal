@@ -20,7 +20,6 @@
 //! run time. On a system without Media Foundation (Windows N without the
 //! Media Feature Pack) the codecs report [`CodecError::NoDevice`].
 
-pub(crate) mod copy;
 pub(crate) mod decoder;
 pub(crate) mod encoder;
 mod transform;
