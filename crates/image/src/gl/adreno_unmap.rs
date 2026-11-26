@@ -334,7 +334,7 @@ unsafe fn write_slot(slot: usize, target: usize, relro: Option<(usize, usize)>) 
 
 #[cfg(test)]
 mod tests {
-    use super::{gbm_mmap, gbm_munmap, patch_decision, subdriver_munmap};
+    use super::{gbm_mmap, gbm_munmap, patch_decision, subdriver_munmap, with_maps};
     use std::ffi::c_void;
 
     const LEN: usize = 16384;
@@ -366,10 +366,17 @@ mod tests {
     #[test]
     fn gbm_unmap_after_a_subdriver_unmap_leaves_a_new_mapping_alone() {
         let p = gbm_map();
+        let range = (p as usize, LEN);
+        // SAFETY: `gettid` has no preconditions.
+        let tid = unsafe { libc::gettid() };
         // SAFETY: `p` is the mapping made above.
         assert_eq!(unsafe { subdriver_munmap(p, LEN) }, 0);
-        assert!(!mapped(p), "the subdriver unmap goes through");
-        // SAFETY: a fixed anonymous mapping over the range just unmapped.
+        assert!(
+            with_maps(|maps| maps.released.contains(&(range, tid))),
+            "the subdriver unmap marks the range released"
+        );
+        // SAFETY: a fixed anonymous mapping over the range just unmapped, made
+        // only where nothing else has been mapped there since.
         let q = unsafe {
             libc::mmap(
                 p,
@@ -380,16 +387,21 @@ mod tests {
                 0,
             )
         };
-        let occupied = mapped(p);
         // SAFETY: the range gbm mapped.
         assert_eq!(unsafe { gbm_munmap(p, LEN) }, 0);
-        assert_eq!(
-            mapped(p),
-            occupied,
-            "gbm's second unmap leaves whatever was mapped there since in place"
+        assert!(
+            !with_maps(|maps| maps.released.contains(&(range, tid))),
+            "gbm's second unmap consumes the mark"
         );
         if q == p {
+            assert!(
+                mapped(p),
+                "gbm's second unmap leaves the new mapping in place"
+            );
             // SAFETY: `q` is the mapping made above.
+            unsafe { libc::munmap(q, LEN) };
+        } else if q != libc::MAP_FAILED {
+            // SAFETY: `q` is a mapping made above at another address.
             unsafe { libc::munmap(q, LEN) };
         }
     }
@@ -398,9 +410,14 @@ mod tests {
     #[test]
     fn gbm_unmaps_its_own_mapping() {
         let p = gbm_map();
+        let range = (p as usize, LEN);
+        // SAFETY: `gettid` has no preconditions.
+        let tid = unsafe { libc::gettid() };
+        assert!(with_maps(
+            |maps| maps.held.contains(&range) && !maps.released.contains(&(range, tid))
+        ));
         // SAFETY: `p` is the mapping made above.
         assert_eq!(unsafe { gbm_munmap(p, LEN) }, 0);
-        assert!(!mapped(p));
     }
 
     /// A subdriver unmap of a range gbm did not map goes through and leaves
@@ -419,14 +436,13 @@ mod tests {
             )
         };
         assert_ne!(p, libc::MAP_FAILED);
+        let range = (p as usize, LEN);
+        assert!(!with_maps(|maps| maps.held.contains(&range)));
         // SAFETY: `p` is the mapping made above.
         assert_eq!(unsafe { subdriver_munmap(p, LEN) }, 0);
-        assert!(!mapped(p));
         // SAFETY: `gettid` has no preconditions.
         let tid = unsafe { libc::gettid() };
-        assert!(super::with_maps(|maps| !maps
-            .released
-            .contains(&((p as usize, LEN), tid))));
+        assert!(!with_maps(|maps| maps.released.contains(&(range, tid))));
     }
 
     /// A released mark belongs to the releasing thread, and gbm's unmap on
