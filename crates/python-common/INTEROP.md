@@ -102,6 +102,10 @@ extractor (`crates/python-common/src/interop.rs`). This document describes
 the Python-visible half of the contract — the shape a third-party producer
 or consumer needs to match.
 
+### Multi-plane tensors are refused
+
+The payload describes one plane. A tensor whose chroma plane is a separate tensor (`is_multiplane()`: a two-buffer NV12 such as an `import_image(..., chroma_fd=...)`, chroma at an offset in the same buffer, a decoded video frame, a `VideoEncoder.create_source()` image) cannot be described by it, so `__edgefirst_tensor__` raises `NotImplementedError` ("a tensor whose chroma plane is a separate tensor cannot be passed to another edgefirst package") instead of exporting the luma plane alone. The proto data capsules of `edgefirst.decoder` refuse the same way. Such a tensor works only with the package that made it, where calls use it directly.
+
 ## `typing.Protocol` definitions
 
 These are published as real, importable classes (`edgefirst.tensor.EdgeFirstTensorExportable`,

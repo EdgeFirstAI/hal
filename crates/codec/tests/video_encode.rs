@@ -13,10 +13,18 @@
 use std::time::{Duration, Instant};
 
 use edgefirst_codec::video::{
-    EncodedFrame, EncoderConfig, FrameOptions, H264Level, H264Profile, VideoEncoder,
+    DecodeEvent, DecoderConfig, EncodedFrame, EncoderConfig, FrameOptions, H264Level, H264Profile,
+    VideoDecoder, VideoEncoder,
 };
-use edgefirst_codec::CodecError;
+use edgefirst_codec::{CodecError, Engine, Transfer};
 use edgefirst_tensor::{CpuAccess, DType, PixelFormat, Region, TensorDyn, TensorMemory};
+
+#[path = "common/pictures.rs"]
+mod pictures;
+#[path = "common/sessions.rs"]
+mod sessions;
+
+use pictures::{nv12, nv12_region, paint, psnr};
 
 fn skip(test: &str, why: &str) {
     use std::io::Write;
@@ -43,52 +51,30 @@ fn open(test: &str, config: EncoderConfig) -> Option<VideoEncoder> {
     }
 }
 
-/// A DMA-BUF NV12 image holding a gradient that moves with `frame`.
-fn nv12(width: usize, height: usize) -> TensorDyn {
-    TensorDyn::image(
-        width,
-        height,
-        PixelFormat::Nv12,
-        DType::U8,
-        Some(TensorMemory::DmaBuf),
-        CpuAccess::ReadWrite,
-    )
-    .expect("DMA-BUF NV12 image")
-}
-
-fn paint(img: &TensorDyn, frame: usize) {
-    let w = img.width().unwrap();
-    let h = img.height().unwrap();
-    let stride = img.effective_row_stride().unwrap();
-    let mut px = img.map_bytes(CpuAccess::Write).unwrap();
-    for y in 0..h {
-        for x in 0..w {
-            px[y * stride + x] = ((x / 4 + y / 4 + 2 * frame) & 0xff) as u8;
+/// Decodes `stream` and returns the dense NV12 bytes of its first picture,
+/// or `None` (after printing why) when there is no decoder.
+fn decode_first(test: &str, stream: &[EncodedFrame]) -> Option<Vec<u8>> {
+    let mut decoder = match VideoDecoder::new(DecoderConfig::h264()) {
+        Ok(d) => d,
+        Err(CodecError::NoDevice(why)) => {
+            skip(test, &why);
+            return None;
         }
+        Err(e) => panic!("decoder open failed: {e}"),
+    };
+    let mut events = Vec::new();
+    for f in stream {
+        events.extend(decoder.decode(&f.data, f.pts).expect("decode"));
     }
-    let chroma = stride * h;
-    for y in 0..h / 2 {
-        for x in (0..w).step_by(2) {
-            px[chroma + y * stride + x] = (64 + (x / 16 + frame) % 128) as u8;
-            px[chroma + y * stride + x + 1] = (64 + (y / 8) % 128) as u8;
+    events.extend(decoder.flush().expect("flush"));
+    events.into_iter().find_map(|e| match e {
+        DecodeEvent::Frame(f) => {
+            let t = f.tensor();
+            let r = Region::new(0, 0, t.width().unwrap(), t.height().unwrap());
+            Some(nv12_region(t, r))
         }
-    }
-}
-
-/// The dense NV12 bytes of `region` of `img`.
-fn nv12_region(img: &TensorDyn, r: Region) -> Vec<u8> {
-    let stride = img.effective_row_stride().unwrap();
-    let h = img.height().unwrap();
-    let px = img.map_bytes(CpuAccess::Read).unwrap();
-    let mut out = Vec::with_capacity(r.width * r.height * 3 / 2);
-    for y in r.y..r.y + r.height {
-        out.extend_from_slice(&px[y * stride + r.x..y * stride + r.x + r.width]);
-    }
-    for y in r.y / 2..(r.y + r.height) / 2 {
-        let row = stride * h + y * stride;
-        out.extend_from_slice(&px[row + r.x..row + r.x + r.width]);
-    }
-    out
+        DecodeEvent::Reconfigured(_) => None,
+    })
 }
 
 fn save(name: &str, frames: &[EncodedFrame], first: &[u8]) {
@@ -121,6 +107,7 @@ fn sps_profile_and_level(au: &[u8]) -> Option<(u8, u8)> {
 
 #[test]
 fn the_stream_carries_the_requested_profile_and_level() {
+    let _sessions = sessions::take(1);
     const TEST: &str = "the_stream_carries_the_requested_profile_and_level";
     if !dma_require::available_or_skip(edgefirst_tensor::is_gpu_buffer_available(), TEST) {
         return;
@@ -161,6 +148,7 @@ fn the_stream_carries_the_requested_profile_and_level() {
 
 #[test]
 fn encodes_1080p_nv12_at_30_fps_with_forced_keyframe_and_drain() {
+    let _sessions = sessions::take(1);
     const FRAMES: usize = 60;
     const FORCED: usize = 37;
     let Some(mut enc) = open(
@@ -224,6 +212,7 @@ fn encodes_1080p_nv12_at_30_fps_with_forced_keyframe_and_drain() {
 
 #[test]
 fn encodes_a_crop_of_a_larger_source() {
+    let _sessions = sessions::take(1);
     let crop = Region::new(320, 180, 1280, 720);
     let Some(mut enc) = open(
         "encodes_a_crop_of_a_larger_source",
@@ -252,9 +241,90 @@ fn encodes_a_crop_of_a_larger_source() {
     assert!(out[0].keyframe);
 }
 
-/// A host-memory source is encoded by Media Foundation and refused by V4L2.
+#[test]
+fn a_copied_crop_decodes_to_the_source_region() {
+    let _sessions = sessions::take(2);
+    const TEST: &str = "a_copied_crop_decodes_to_the_source_region";
+    // A host-memory source, which V4L2 copies into a buffer it reads.
+    let crop = Region::new(64, 32, 640, 480);
+    let Some(mut enc) = open(TEST, EncoderConfig::h264(640, 480, PixelFormat::Nv12, 30.0)) else {
+        return;
+    };
+    let src = TensorDyn::image(
+        1000,
+        600,
+        PixelFormat::Nv12,
+        DType::U8,
+        Some(TensorMemory::Mem),
+        CpuAccess::ReadWrite,
+    )
+    .unwrap();
+    paint(&src, 0);
+    let want = nv12_region(&src, crop);
+    let mut out = Vec::new();
+    for i in 0..5 {
+        let opts = FrameOptions {
+            pts: i,
+            crop: Some(crop),
+            ..FrameOptions::default()
+        };
+        out.extend(enc.encode(&src, &opts).unwrap());
+    }
+    out.extend(enc.flush().unwrap());
+    assert_eq!(out.len(), 5);
+    if enc.info().engine == Engine::V4l2 {
+        assert_eq!(enc.info().transfer, Transfer::CpuCopy);
+    }
+    let Some(got) = decode_first(TEST, &out) else {
+        return;
+    };
+    let db = psnr(&want, &got);
+    assert!(db > 30.0, "the decoded crop is {db:.1} dB from the source");
+}
+
+#[test]
+fn a_source_from_create_source_is_read_in_place() {
+    let _sessions = sessions::take(2);
+    const TEST: &str = "a_source_from_create_source_is_read_in_place";
+    let Some(mut enc) = open(
+        TEST,
+        EncoderConfig::h264(1920, 1080, PixelFormat::Nv12, 30.0),
+    ) else {
+        return;
+    };
+    let src = enc.create_source().unwrap();
+    assert_eq!((src.width(), src.height()), (Some(1920), Some(1080)));
+    assert_eq!(src.format(), Some(PixelFormat::Nv12));
+    paint(&src, 0);
+    let want = nv12_region(&src, Region::new(0, 0, 1920, 1080));
+    let mut out = Vec::new();
+    for i in 0..5 {
+        paint(&src, i as usize);
+        let opts = FrameOptions {
+            pts: i,
+            ..FrameOptions::default()
+        };
+        out.extend(enc.encode(&src, &opts).unwrap());
+        if enc.info().engine == Engine::V4l2 {
+            assert_eq!(enc.info().transfer, Transfer::ZeroCopy, "frame {i}");
+        }
+    }
+    out.extend(enc.flush().unwrap());
+    assert_eq!(out.len(), 5);
+    let Some(got) = decode_first(TEST, &out) else {
+        return;
+    };
+    let db = psnr(&want, &got);
+    assert!(
+        db > 30.0,
+        "the decoded picture is {db:.1} dB from the source"
+    );
+}
+
+/// A host-memory source is copied into a buffer the device reads.
 #[test]
 fn encodes_a_host_memory_source_where_the_encoder_copies() {
+    let _sessions = sessions::take(1);
     let Some(mut enc) = open(
         "encodes_a_host_memory_source_where_the_encoder_copies",
         EncoderConfig::h264(640, 480, PixelFormat::Nv12, 30.0),
@@ -277,16 +347,7 @@ fn encodes_a_host_memory_source_where_the_encoder_copies() {
             pts: i as u64,
             ..FrameOptions::default()
         };
-        match enc.encode(&src, &opts) {
-            Ok(au) => out.extend(au),
-            Err(CodecError::InvalidInput(why)) if !cfg!(windows) => {
-                return skip(
-                    "encodes_a_host_memory_source_where_the_encoder_copies",
-                    &format!("{} imports DMA-BUFs only: {why}", enc.device()),
-                );
-            }
-            Err(e) => panic!("encode: {e}"),
-        }
+        out.extend(enc.encode(&src, &opts).unwrap());
     }
     out.extend(enc.flush().unwrap());
     assert_eq!(out.len(), 10);
@@ -295,8 +356,49 @@ fn encodes_a_host_memory_source_where_the_encoder_copies() {
     assert_eq!(pts, (0..10).collect::<Vec<_>>());
 }
 
+/// More encoders than a device has sessions open one after another, each
+/// dropped after a frame, half of them before their stream is drained.
+#[test]
+fn a_dropped_encoder_frees_its_session() {
+    let _sessions = sessions::take(1);
+    const ROUNDS: usize = 40;
+    let src = match TensorDyn::image(
+        320,
+        240,
+        PixelFormat::Nv12,
+        DType::U8,
+        Some(TensorMemory::DmaBuf),
+        CpuAccess::ReadWrite,
+    ) {
+        Ok(src) => src,
+        Err(e) => {
+            return skip(
+                "a_dropped_encoder_frees_its_session",
+                &format!("no DMA-BUF image: {e}"),
+            )
+        }
+    };
+    for round in 0..ROUNDS {
+        let Some(mut enc) = open(
+            "a_dropped_encoder_frees_its_session",
+            EncoderConfig::h264(320, 240, PixelFormat::Nv12, 30.0),
+        ) else {
+            assert_eq!(round, 0, "the encoder went away after {round} sessions");
+            return;
+        };
+        paint(&src, round);
+        enc.encode(&src, &FrameOptions::default())
+            .unwrap_or_else(|e| panic!("session {round}: {e}"));
+        if round % 2 == 0 {
+            enc.flush()
+                .unwrap_or_else(|e| panic!("session {round}: {e}"));
+        }
+    }
+}
+
 #[test]
 fn encoder_is_reusable_after_flush() {
+    let _sessions = sessions::take(1);
     let Some(mut enc) = open(
         "encoder_is_reusable_after_flush",
         EncoderConfig::h264(640, 480, PixelFormat::Nv12, 30.0),
@@ -324,6 +426,7 @@ fn encoder_is_reusable_after_flush() {
 
 #[test]
 fn rejects_a_source_of_the_wrong_size() {
+    let _sessions = sessions::take(1);
     let Some(mut enc) = open(
         "rejects_a_source_of_the_wrong_size",
         EncoderConfig::h264(640, 480, PixelFormat::Nv12, 30.0),
@@ -337,6 +440,7 @@ fn rejects_a_source_of_the_wrong_size() {
 
 #[test]
 fn rejects_a_16_bit_source() {
+    let _sessions = sessions::take(1);
     let Some(mut enc) = open(
         "rejects_a_16_bit_source",
         EncoderConfig::h264(640, 480, PixelFormat::Nv12, 30.0),

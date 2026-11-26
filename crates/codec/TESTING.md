@@ -39,6 +39,7 @@ Located in `crates/codec/tests/`:
 | `v4l2_jpeg.rs`          | Device-gated hardware decode: NV12 parity vs CPU, persistent streaming loop, geometry change, DMA-BUF zero-copy (skips cleanly when no V4L2 JPEG device / dma_heap) |
 | `video_encode.rs`       | Device-gated H.264 encoding (see [Video Encoder Verification](#video-encoder-verification)) |
 | `video_decode.rs`       | Device-gated H.264 decoding (see [Video Decoder Verification](#video-decoder-verification)) |
+| `video_concurrency.rs`  | Device-gated sessions at once: two encoders on two threads, each stream decoded and compared with its own source; an encoder and a decoder on two threads; two processes encoding at once (the test runs itself again as the two children, told apart by `EDGEFIRST_CODEC_TEST_CHILD`) |
 
 ### Test Images
 
@@ -57,21 +58,20 @@ Tests use images from the workspace `testdata/` directory:
 ## Running Tests
 
 ```bash
-# All codec tests (single-threaded — required for GPU resource safety)
-cargo test -p edgefirst-codec -- --test-threads=1
+# All codec tests
+cargo test -p edgefirst-codec
 
 # Or with nextest (process-isolated; preferred in CI)
-cargo nextest run -p edgefirst-codec -j 1
+cargo nextest run -p edgefirst-codec
 
 # Unit tests only
-cargo test -p edgefirst-codec --lib -- --test-threads=1
+cargo test -p edgefirst-codec --lib
 
 # Specific test
-cargo test -p edgefirst-codec decode_zidane_nv12 -- --test-threads=1
+cargo test -p edgefirst-codec decode_zidane_nv12
 ```
 
-**Important:** Always use `--test-threads=1` (or `nextest -j 1`). See the root
-[TESTING.md](../../TESTING.md) for the rationale (GPU resource contention).
+Tests run in parallel; see the root [TESTING.md § Parallel Execution](../../TESTING.md#parallel-execution). A test that opens a hardware codec first takes a slot per session from `tests/common/sessions.rs` (`sessions::take(n)`), which keeps at most four hardware sessions open at once across every test thread and process.
 
 The `v4l2_jpeg.rs` tests are device-gated: they skip cleanly unless a V4L2 JPEG
 M2M device is present, so they pass on any host and exercise hardware only on a
@@ -236,7 +236,7 @@ cargo zigbuild --test v4l2_jpeg --target aarch64-unknown-linux-gnu
 # On the target (e.g. imx95-frdm), run under strace and confirm the real
 # lifecycle: S_FMT(JPEG) … REQBUFS … STREAMON … QBUF … DQEVENT … G_FMT …
 # CAPTURE QBUF … DQBUF=0 (decode complete).
-strace -f -e trace=ioctl ./v4l2_jpeg-* --test-threads=1
+strace -f -e trace=ioctl ./v4l2_jpeg-*
 ```
 
 Persistence is proven by a single CAPTURE `REQBUFS` versus N `DQBUF`s across a
@@ -250,7 +250,15 @@ prints `SKIPPED` and passes without them (every x86 CI host). On a board it
 encodes 60 frames of moving 1080p NV12 with a forced key frame, checks that
 every frame comes back once with its PTS, that the first and the forced frame
 are IDRs with SPS/PPS, and that `encode()` keeps up with 30 fps; it also checks
-a 720p crop of a 1080p source, reuse after `flush()` and a size mismatch.
+a 720p crop of a 1080p source, reuse after `flush()` and a size mismatch, and
+that 40 encoders opened and dropped one after another (half before their drain)
+all open, more than `msm_vidc`'s 32 sessions. `video_decode.rs` does the same
+for decoders. Two
+tests decode what they encode with the hardware decoder and compare it with the
+source (above 30 dB PSNR): a crop of a host-memory source, which every encoder
+copies, and a `create_source()` image, which V4L2 must read in place
+(`EncoderInfo::transfer` is `ZeroCopy`). On a device whose layout differs from
+`TensorDyn::image` (`msm_vidc` on the IQ-9075), the other tests take the copy.
 
 ```bash
 # Cross-compile (release, so the 30 fps check measures the encoder)
@@ -258,7 +266,7 @@ cargo zigbuild --release -p edgefirst-codec --test video_encode \
     --example video-encode --target aarch64-unknown-linux-gnu.2.35
 
 # On the target, with its CI runner taken offline first:
-EDGEFIRST_VIDEO_OUT=$HOME/video-out ./video_encode-* --test-threads=1 --nocapture
+EDGEFIRST_VIDEO_OUT=$HOME/video-out ./video_encode-* --nocapture
 ```
 
 `EDGEFIRST_VIDEO_OUT` keeps each stream (`<test>.h264`) and the first source
@@ -299,7 +307,7 @@ cargo zigbuild --release -p edgefirst-codec --test video_decode \
     --target aarch64-unknown-linux-gnu.2.35
 
 # On the target, with its CI runner taken offline first:
-EDGEFIRST_TESTDATA_DIR=$HOME/testdata ./video_decode-* --test-threads=1
+EDGEFIRST_TESTDATA_DIR=$HOME/testdata ./video_decode-*
 ```
 
 ## Windows (Media Foundation)
@@ -314,11 +322,11 @@ NV12 images of the stream's size, and
 since such a pool cannot follow a size change.
 
 ```powershell
-cargo test --release -p edgefirst-codec --test video_encode --test video_decode -- --test-threads=1 --nocapture
+cargo test --release -p edgefirst-codec --test video_encode --test video_decode -- --nocapture
 
 # Microsoft's software encoder on the WARP adapter, as on a runner without a GPU
 $env:EDGEFIRST_CODEC_MF_ENCODER = "software"; $env:EDGEFIRST_D3D11_ADAPTER = "warp"
-cargo test -p edgefirst-codec --test video_encode --test video_decode -- --test-threads=1
+cargo test -p edgefirst-codec --test video_encode --test video_decode
 ```
 
 | Machine | Encoder | Source | 1080p NV12 per `encode()` |
@@ -384,5 +392,5 @@ does not exist):
 # On target device
 export EDGEFIRST_TESTDATA_DIR=/tmp/testdata
 scp -r testdata/ root@target:/tmp/testdata
-./decode_jpeg-* --test-threads=1
+./decode_jpeg-*
 ```

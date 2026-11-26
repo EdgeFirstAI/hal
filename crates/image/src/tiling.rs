@@ -13,7 +13,9 @@
 //! [`TilePlacement`] is produced here and consumed there.
 
 use crate::Error;
-use crate::{ConvertOptions, Flip, ImageProcessor, ImageProcessorTrait, Result, Rotation};
+use crate::{
+    CompletionFence, ConvertOptions, Flip, ImageProcessor, ImageProcessorTrait, Result, Rotation,
+};
 use edgefirst_tensor::{CpuAccess, DType, PixelFormat, Region, TensorDyn, TensorMemory};
 
 pub use edgefirst_decoder_abi::TilePlacement;
@@ -278,6 +280,15 @@ impl ImageProcessor {
     /// GL declines and each tile is converted on the CPU. `Rgba`, `Bgra`, and
     /// `Grey` batches stay on the batched GPU path.
     ///
+    /// # Concurrency
+    ///
+    /// On the GL backend the whole batch, every tile and the final sync, runs
+    /// as one GL worker message. Where the driver's GL calls are serialized
+    /// across processors (Vivante, Adreno on Linux, ANGLE and virtualized
+    /// GPUs), the batch holds the process-wide GL lock from its first tile to
+    /// its final sync, and another processor's GL work waits until the batch
+    /// completes.
+    ///
     /// # Errors
     /// Returns an error if `cfg` is invalid, if `src`/`dst_batched` are not
     /// images, if `dst_batched` is shorter than `count * tile_h`, or if a tile
@@ -290,6 +301,95 @@ impl ImageProcessor {
     ) -> Result<Vec<TilePlacement>> {
         let span = tracing::trace_span!("image.tile_into", tiles = tracing::field::Empty);
         let _s = span.enter();
+        let (placements, mut items) = self.tile_items(src, dst_batched, cfg, &span)?;
+        self.convert_batch(src, &mut items, false)?;
+        Ok(placements)
+    }
+
+    /// Render every tile of `src` into `dst_batched` as [`Self::tile_into`]
+    /// does, returning a native fence for the whole batch in place of the CPU
+    /// wait for the GPU.
+    ///
+    /// # Returns
+    ///
+    /// The per-tile [`TilePlacement`] in tile-index order, and:
+    ///
+    /// - `Some(fence)`: the tiles may still be in flight on the GPU. The fence
+    ///   signals when every tile is complete: a sync-file fd on Linux and
+    ///   Android where the EGL display has `EGL_ANDROID_native_fence_sync`
+    ///   (wait on it with `poll`), a manual-reset event handle on Windows
+    ///   (wait on it with `WaitForSingleObject`). The caller owns it; wait on it, or hand it to
+    ///   the consumer, before reading `dst_batched`.
+    /// - `None`: every tile is complete and `dst_batched` is safe to read.
+    ///   This is the result where there is no native fence (macOS, iOS, and
+    ///   an EGL display without `EGL_ANDROID_native_fence_sync`), where the
+    ///   fence export fails, when a backend other than
+    ///   OpenGL converted any tile, and on the G2D and CPU backends.
+    ///
+    /// The fence also covers the GPU's reads of the source: keep `src`
+    /// unmodified, and do not hand its buffer back to its producer (a V4L2
+    /// capture queue, for example), until the fence signals.
+    ///
+    /// On Windows, for a texture destination, the event and `dst_batched`'s
+    /// own `Tensor::gpu_completion` name the same fence value.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # use edgefirst_image::{ImageProcessor, TilingConfig};
+    /// # use edgefirst_tensor::{CpuAccess, DType, PixelFormat, TensorDyn};
+    /// # fn run(src: &TensorDyn) -> Result<(), edgefirst_image::Error> {
+    /// let mut processor = ImageProcessor::new()?;
+    /// let cfg = TilingConfig::new(640, 640).with_overlap(0.2);
+    /// let planned = processor.plan_tiles(3840, 2160, &cfg)?;
+    /// let mut batch = processor.alloc_tile_batch(
+    ///     planned.len(), &cfg, PixelFormat::Rgba, DType::U8, None, CpuAccess::None,
+    /// )?;
+    ///
+    /// // `Some(fence)`: the consumer of `batch` waits on it. `None`: `batch` is complete.
+    /// let (placements, fence) = processor.tile_into_with_fence(src, &mut batch, &cfg)?;
+    /// assert_eq!(placements.len(), planned.len());
+    /// # drop(fence);
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Concurrency
+    ///
+    /// On the GL backend the whole batch, every tile and the fence, runs as
+    /// one GL worker message. Where the driver's GL calls are serialized
+    /// across processors (Vivante, Adreno on Linux, ANGLE and virtualized
+    /// GPUs), the batch holds the process-wide GL lock from its first tile
+    /// until every tile's GPU work is submitted, or completed when it returns
+    /// no fence, and another processor's GL work waits until then.
+    ///
+    /// # Errors
+    /// As for [`Self::tile_into`].
+    pub fn tile_into_with_fence(
+        &mut self,
+        src: &TensorDyn,
+        dst_batched: &mut TensorDyn,
+        cfg: &TilingConfig,
+    ) -> Result<(Vec<TilePlacement>, Option<CompletionFence>)> {
+        let span =
+            tracing::trace_span!("image.tile_into_with_fence", tiles = tracing::field::Empty);
+        let _s = span.enter();
+        let (placements, mut items) = self.tile_items(src, dst_batched, cfg, &span)?;
+        let fence = self.convert_batch(src, &mut items, true)?;
+        Ok((placements, fence))
+    }
+
+    /// The placements of `src`'s tiles under `cfg` and, for each, its
+    /// `dst_batched` row band with the options that sample its crop. Records
+    /// the tile count on `span`.
+    #[allow(clippy::type_complexity)]
+    fn tile_items(
+        &self,
+        src: &TensorDyn,
+        dst_batched: &TensorDyn,
+        cfg: &TilingConfig,
+        span: &tracing::Span,
+    ) -> Result<(Vec<TilePlacement>, Vec<(TensorDyn, ConvertOptions)>)> {
         cfg.validate()?;
         let (src_w, src_h) = (
             src.width().ok_or(Error::NotAnImage)?,
@@ -307,11 +407,20 @@ impl ImageProcessor {
             )));
         }
 
-        for p in &placements {
-            self.render_tile(src, dst_batched, p, cfg)?;
-        }
-        self.flush()?;
-        Ok(placements)
+        let items = placements
+            .iter()
+            .map(|p| {
+                let options = cfg.options.source(Some(placement_to_source_region(p)?));
+                let band = dst_batched.view(Region::new(
+                    0,
+                    p.index * cfg.tile_h,
+                    cfg.tile_w,
+                    cfg.tile_h,
+                ))?;
+                Ok((band, options))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok((placements, items))
     }
 
     /// Render exactly one tile of `src` into `dst_slot` (a single model-input
@@ -320,6 +429,11 @@ impl ImageProcessor {
     /// [`Self::plan_tiles`]).
     ///
     /// A deferred tile is not CPU/CUDA-readable until [`ImageProcessorTrait::flush`].
+    ///
+    /// Where the driver's GL calls are serialized across processors (see
+    /// [`Self::tile_into`]), each call takes its own turn on the GL lock and
+    /// completes its GPU work before it returns, so the tile is ready without
+    /// a flush.
     ///
     /// # Errors
     /// Returns an error if `cfg` is invalid or the tile convert fails.

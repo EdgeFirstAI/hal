@@ -15,7 +15,8 @@
 //   - `platform/` — cross-platform display/EGL-loader seam (all OSes)
 //   - Linux-only:   `context`, `dma_import`, `fourcc`
 //   - macOS/iOS:    `iosurface_import`
-//   - Android-only: `ahardwarebuffer_import`, `native_fence`
+//   - Android-only: `ahardwarebuffer_import`
+//   - Linux and Android: `native_fence`
 //   - Windows:      `d3d11_import`, `platform/windows.rs` (ANGLE/D3D11)
 // The engine (`processor`, `threaded`, `cache`, `resources`, `shaders`)
 // reaches platform buffers only through the `GlPlatform` trait.
@@ -56,6 +57,9 @@ mod ahardwarebuffer_import;
 // CUDA test policy.
 #[cfg(test)]
 mod cuda_policy;
+// Adreno `msm_gbm.so` mapping bookkeeping.
+#[cfg(target_os = "linux")]
+mod adreno_unmap;
 // `EGL_ANGLE_image_d3d11_texture` attribute assembly.
 #[cfg(target_os = "windows")]
 pub(super) mod d3d11_import;
@@ -63,7 +67,7 @@ pub(super) mod d3d11_import;
 mod fourcc;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 mod iosurface_import;
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 mod native_fence;
 mod platform;
 mod processor;
@@ -89,7 +93,7 @@ pub(super) type Egl = edgefirst_egl::Instance<
 >;
 
 /// Handle returned by `GlPlatform::export_completion_fence` (and surfaced
-/// by `convert_with_fence`): a sync_file fd on Unix
+/// by `convert_with_fence`): a sync_file fd on Linux and Android
 /// (`EGL_ANDROID_native_fence_sync`), an event NT handle on Windows, set
 /// when the D3D11 device fence reaches the value the convert queued.
 pub use crate::CompletionFence;

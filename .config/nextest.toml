@@ -12,22 +12,22 @@ junit.store-failure-output = true
 # Fail fast on first test failure (can be overridden with --no-fail-fast)
 fail-fast = true
 
-# Retry flaky tests once before marking as failed
-retries = 1
-
 [profile.ci]
-# CI profile with more retries and no fail-fast
+# CI profile without fail-fast
 fail-fast = false
-retries = 2
 junit.path = "test-results.xml"
 junit.store-success-output = true
 junit.store-failure-output = true
+
+# On x86_64 Linux the ci profile leaves out edgefirst-image.
+[[profile.ci.overrides]]
+platform = 'cfg(all(target_os = "linux", target_arch = "x86_64"))'
+default-filter = 'not package(edgefirst-image)'
 
 [profile.board]
 # The on-target lane. terminate-after kills a test after 3 slow-timeout
 # periods.
 fail-fast = false
-retries = 1
 slow-timeout = { period = "60s", terminate-after = 3 }
 junit.path = "test-results.xml"
 junit.store-success-output = true

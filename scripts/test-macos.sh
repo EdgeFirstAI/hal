@@ -5,8 +5,15 @@
 # Build, codesign, and run the EdgeFirst HAL test suite on macOS.
 #
 # Usage:
-#   scripts/test-macos.sh                  # build + sign + run full suite
-#   scripts/test-macos.sh -p edgefirst-image  # extra args forwarded to nextest
+#   scripts/test-macos.sh                                # build + sign + run full suite
+#   scripts/test-macos.sh -E 'package(edgefirst-image)'  # extra args forwarded to nextest run
+#   COVERAGE=1 scripts/test-macos.sh                     # the same run instrumented, then LCOV
+#
+# The test binaries are built once and every one is signed with
+# entitlements.plist. nextest then runs them from the recorded build
+# (--binaries-metadata) without invoking cargo. The forwarded arguments reach
+# `cargo nextest run` only: select tests with filters (-E, name patterns),
+# not cargo build options.
 #
 # Prerequisites:
 #   brew install startergo/angle/angle
@@ -36,6 +43,7 @@ fi
 
 COVERAGE="${COVERAGE:-0}"
 COV_LCOV="${COV_LCOV:-target/coverage_rust.lcov}"
+COV_IGNORE='(\.cargo|/rustc/|/target/)'
 
 # The workspace without the probe, bench and Python crates.
 WS_EXCLUDES=(
@@ -50,61 +58,66 @@ WS_EXCLUDES=(
     --exclude edgefirst-python-common
 )
 
-# Features for the build and every nextest invocation.
+# Features for the build.
 FEATURES=(--features edgefirst-image/opengl)
 
-sign_test_binaries() {
-    # Sign every test binary in the given deps dir with the library-
-    # validation-disabled entitlement. Skips .d manifests and dSYM bundles.
-    local deps_dir="$1"
-    find "$deps_dir" -maxdepth 1 -type f -perm -u+x \
-        \( -name "edgefirst*-*" -o -name "hal*-*" \) \
-        ! -name "*.d" ! -name "*.dSYM" \
-        -exec codesign --force --sign - --entitlements "$ENTITLEMENTS" {} \; \
-        > /dev/null 2>&1
+# Builds the test binaries, signs each one nextest lists, and runs nextest
+# over that build with the forwarded arguments.
+build_sign_run() {
+    local meta_dir="${CARGO_TARGET_DIR:-target}/nextest-reuse"
+    local binaries="$meta_dir/binaries.json"
+    local metadata="$meta_dir/cargo-metadata.json"
+    mkdir -p "$meta_dir"
+
+    echo "→ Building workspace tests ($PROFILE)…"
+    cargo nextest list --list-type binaries-only --message-format json \
+        ${PROFILE_FLAG[@]+"${PROFILE_FLAG[@]}"} "${WS_EXCLUDES[@]}" "${FEATURES[@]}" \
+        > "$binaries" || return
+    cargo metadata --format-version 1 > "$metadata" || return
+
+    echo "→ Codesigning every test binary with library-validation disabled…"
+    local count=0 bin
+    while IFS= read -r bin; do
+        codesign --force --sign - --entitlements "$ENTITLEMENTS" "$bin" > /dev/null 2>&1 || return
+        count=$((count + 1))
+    done < <(grep -o '"binary-path":"[^"]*"' "$binaries" | sed 's/^"binary-path":"//; s/"$//')
+    if [[ "$count" -eq 0 ]]; then
+        echo "error: $binaries lists no test binaries" >&2
+        return 1
+    fi
+    echo "  signed $count test binaries"
+
+    echo "→ Running nextest…"
+    HAL_TEST_ALLOW_DLOPEN_ANGLE=1 cargo nextest run \
+        --binaries-metadata "$binaries" --cargo-metadata "$metadata" "$@"
 }
 
 if [[ "$COVERAGE" != "1" ]]; then
-    # ----- Normal path: build → sign → run -----
-    DEPS_DIR="target/$PROFILE/deps"
-    echo "→ Building workspace tests ($PROFILE)…"
-    cargo build --tests ${PROFILE_FLAG[@]+"${PROFILE_FLAG[@]}"} "${WS_EXCLUDES[@]}" "${FEATURES[@]}"
-    echo "→ Codesigning test binaries with library-validation disabled…"
-    sign_test_binaries "$DEPS_DIR"
-    echo "→ Running nextest…"
-    export HAL_TEST_ALLOW_DLOPEN_ANGLE=1
-    exec cargo nextest run ${PROFILE_FLAG[@]+"${PROFILE_FLAG[@]}"} "${WS_EXCLUDES[@]}" "${FEATURES[@]}" "$@"
+    build_sign_run "$@"
+    exit 0
 fi
 
-# ----- Coverage path: two passes with the sign step between them -----
-#
-#   Pass 1  build (instrumented) + run; the GL/ANGLE-dlopen tests self-skip
-#           while HAL_TEST_ALLOW_DLOPEN_ANGLE is unset.
-#   sign    the instrumented binaries cargo-llvm-cov built.
-#   Pass 2  re-run with HAL_TEST_ALLOW_DLOPEN_ANGLE=1.
-#   report  merge all accumulated profraw into LCOV.
 echo "→ Coverage: cleaning previous profraw…"
 cargo llvm-cov clean --workspace
 
-# cargo-llvm-cov's target dir, holding the instrumented test binaries to sign.
-COV_DEPS_DIR="target/llvm-cov-target/$PROFILE/deps"
+# The instrumented build, its profraw and the report share cargo-llvm-cov's
+# target/llvm-cov-target directory. The report is written whether or not the
+# tests pass, and the script exits with the test run's status.
+rc=0
+(
+    env_sh="$(cargo llvm-cov show-env --export-prefix 2> /dev/null)" || exit
+    eval "$env_sh"
+    export CARGO_TARGET_DIR="$CARGO_LLVM_COV_TARGET_DIR/llvm-cov-target"
+    export LLVM_PROFILE_FILE="$CARGO_TARGET_DIR/hal-%p-%12m.profraw"
+    build_sign_run "$@"
+) || rc=$?
 
-echo "→ Coverage pass 1/2: build + run (GL dlopen tests self-skip)…"
-cargo llvm-cov nextest --no-report ${PROFILE_FLAG[@]+"${PROFILE_FLAG[@]}"} \
-    "${WS_EXCLUDES[@]}" "${FEATURES[@]}" "$@"
+echo "→ Generating LCOV report → ${COV_LCOV}"
+cargo llvm-cov report ${PROFILE_FLAG[@]+"${PROFILE_FLAG[@]}"} --lcov \
+    --output-path "${COV_LCOV}" --ignore-filename-regex "$COV_IGNORE"
+echo "→ Coverage report written to ${COV_LCOV}"
 
-echo "→ Codesigning instrumented test binaries…"
-sign_test_binaries "$COV_DEPS_DIR"
-
-echo "→ Coverage pass 2/2: re-run with ANGLE dlopen enabled…"
-HAL_TEST_ALLOW_DLOPEN_ANGLE=1 cargo llvm-cov nextest --no-report \
-    ${PROFILE_FLAG[@]+"${PROFILE_FLAG[@]}"} "${WS_EXCLUDES[@]}" "${FEATURES[@]}" "$@"
-
-echo "-> Generating LCOV report -> ${COV_LCOV}"
-cargo llvm-cov report --lcov --output-path "${COV_LCOV}" \
-    --ignore-filename-regex '(\.cargo|/rustc/|/target/)'
-echo "-> Coverage report written to ${COV_LCOV}"
-
-echo "-> Overall coverage summary (per-file detail is in ${COV_LCOV})"
-cargo llvm-cov report --summary-only \
-    --ignore-filename-regex '(\.cargo|/rustc/|/target/)'
+echo "→ Overall coverage summary (per-file detail is in ${COV_LCOV})"
+cargo llvm-cov report ${PROFILE_FLAG[@]+"${PROFILE_FLAG[@]}"} --summary-only \
+    --ignore-filename-regex "$COV_IGNORE"
+exit "$rc"

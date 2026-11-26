@@ -40,11 +40,11 @@ use windows::Win32::Media::MediaFoundation::{
 };
 use windows::Win32::System::Variant::VARIANT;
 
-use super::copy::{self, Plane};
 use super::{
     com, error, frame_duration, frame_rate_ratio, hal_device, is_native_nv12, set_pair,
     tensor_texture, Output, Platform, Transform,
 };
+use crate::video::copy::{self, Plane};
 use crate::video::h264::{self, AccessUnit};
 use crate::video::{
     chroma_subsampling, EncodedFrame, EncoderBackend, EncoderConfig, EncoderInfo, FrameOptions,
@@ -472,7 +472,7 @@ impl MfEncoder {
             .map_err(|e| error(e, "IMFMediaBuffer::Lock"))?;
         // SAFETY: the buffer is locked and was created `frame_bytes` long.
         let dst = unsafe { std::slice::from_raw_parts_mut(ptr, self.frame_bytes) };
-        let copied = copy_source(format, size, src, origin, stride, dst, &self.planes);
+        let copied = copy::copy_source(format, size, src, origin, stride, dst, &self.planes);
         // SAFETY: locked above.
         let unlocked = unsafe { buffer.Unlock() };
         copied?;
@@ -574,7 +574,7 @@ impl MfEncoder {
                 })
                 .collect();
             let mut map = scratch.map_bytes(CpuAccess::Write)?;
-            copy_source(format, size, src, origin, stride, &mut map, &to)?;
+            copy::copy_source(format, size, src, origin, stride, &mut map, &to)?;
         }
         textures.ring[slot].1 = Some(time);
         // SAFETY: a live context.
@@ -838,6 +838,18 @@ impl EncoderBackend for MfEncoder {
         self.device.clone()
     }
 
+    fn create_source(&self) -> Result<TensorDyn> {
+        let (w, h) = (self.config.width as usize, self.config.height as usize);
+        Ok(TensorDyn::image(
+            w,
+            h,
+            self.config.input_format,
+            DType::U8,
+            Some(TensorMemory::DmaBuf),
+            CpuAccess::ReadWrite,
+        )?)
+    }
+
     fn info(&self) -> EncoderInfo {
         let transfer = match &self.textures {
             None => Transfer::CpuCopy,
@@ -851,68 +863,6 @@ impl EncoderBackend for MfEncoder {
             transfer,
         }
     }
-}
-
-/// Copies the `size` region of `src` at `origin`, whose rows are `stride`
-/// bytes apart, into the planes `to` of `dst`.
-fn copy_source(
-    format: PixelFormat,
-    size: (usize, usize),
-    src: &TensorDyn,
-    origin: (usize, usize),
-    stride: usize,
-    dst: &mut [u8],
-    to: &[Plane],
-) -> Result<()> {
-    let read_error = |e: edgefirst_tensor::Error| {
-        CodecError::InvalidInput(format!("the source cannot be read: {e}"))
-    };
-    let shapes =
-        copy::plane_shapes(format, size.0, size.1).ok_or(CodecError::UnsupportedFormat(format))?;
-    let luma = src.map_bytes(CpuAccess::Read).map_err(read_error)?;
-    let copied = if src.is_multiplane() {
-        let chroma = src.chroma_dyn().ok_or_else(|| {
-            CodecError::InvalidInput("multi-plane source has no chroma plane".into())
-        })?;
-        let cstride = chroma.effective_row_stride().unwrap_or(stride);
-        let cmap = chroma.map_bytes(CpuAccess::Read).map_err(read_error)?;
-        let planes = copy::offset(
-            format,
-            &[
-                Plane {
-                    offset: 0,
-                    pitch: stride,
-                },
-                Plane {
-                    offset: 0,
-                    pitch: cstride,
-                },
-            ],
-            origin,
-        );
-        copy::copy_plane(&luma, planes[0], dst, to[0], shapes[0])
-            .and_then(|()| copy::copy_plane(&cmap, planes[1], dst, to[1], shapes[1]))
-    } else {
-        let table = format
-            .plane_table(src.width().unwrap_or(0), src.height().unwrap_or(0), stride)
-            .ok_or(CodecError::UnsupportedFormat(format))?;
-        let planes: Vec<Plane> = table
-            .iter()
-            .map(|p| Plane {
-                offset: p.offset as usize,
-                pitch: p.stride as usize,
-            })
-            .collect();
-        copy::copy(
-            format,
-            size,
-            &luma,
-            &copy::offset(format, &planes, origin),
-            dst,
-            to,
-        )
-    };
-    copied.map_err(CodecError::InvalidInput)
 }
 
 /// Sets the rate control, GOP, B-frame and latency properties `config`

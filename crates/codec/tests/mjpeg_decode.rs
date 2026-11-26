@@ -9,6 +9,9 @@ use edgefirst_codec::video::{DecodeEvent, DecodedFrame, DecoderConfig, VideoDeco
 use edgefirst_codec::{peek_info, Codec, CodecError, Engine, ImageDecoder};
 use edgefirst_tensor::{CpuAccess, DType, PixelFormat, TensorDyn, TensorMemory};
 
+#[path = "common/sessions.rs"]
+mod sessions;
+
 fn skip(test: &str, why: &str) {
     use std::io::Write;
     let _ = writeln!(&mut std::io::stderr(), "WARNING: SKIPPED: {test} - {why}");
@@ -84,6 +87,7 @@ fn frames(events: Vec<DecodeEvent>) -> Vec<DecodedFrame> {
 
 #[test]
 fn each_mjpeg_picture_matches_the_cpu_decoder() {
+    let _sessions = sessions::take(2);
     const TEST: &str = "each_mjpeg_picture_matches_the_cpu_decoder";
     let Some(mut decoder) = open(TEST) else {
         return;
@@ -128,6 +132,7 @@ fn each_mjpeg_picture_matches_the_cpu_decoder() {
 /// A 4:2:2 MJPEG picture decodes to NV12 or is refused.
 #[test]
 fn a_4_2_2_mjpeg_picture_decodes_to_nv12_or_is_refused() {
+    let _sessions = sessions::take(2);
     const TEST: &str = "a_4_2_2_mjpeg_picture_decodes_to_nv12_or_is_refused";
     let Some(mut decoder) = open(TEST) else {
         return;

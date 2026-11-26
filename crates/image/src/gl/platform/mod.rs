@@ -172,13 +172,14 @@ pub(super) trait GlPlatform {
     /// `egl::Surface` (the pbuffer) on macOS.
     type ImportHandle: Copy;
 
-    /// Whether [`Self::attach_tex_image_2d`] bindings persist on the GL
-    /// texture object across GPU passes. `true` on Linux and Android, where
-    /// EGLImage targets persist. `false` on macOS, where `eglBindTexImage`
-    /// bindings are released at the end of each synced pass
-    /// ([`Self::end_gpu_pass`]), and on Windows, where the engine re-attaches
-    /// on every use.
-    const PERSISTENT_TEX_BINDINGS: bool;
+    /// How long an [`Self::attach_tex_image_2d`] or
+    /// [`Self::attach_tex_image_external`] binding stays on its GL texture
+    /// object: while this value is unchanged, or `None` when the engine
+    /// re-attaches on every use. Constant on Linux and Android, where
+    /// EGLImage targets persist. On macOS it changes when
+    /// [`Self::end_gpu_pass`] releases the pass's `eglBindTexImage`
+    /// bindings. `None` on Windows.
+    fn tex_binding_epoch(display: &Self::Display) -> Option<u64>;
 
     /// Which zero-copy float render paths this platform serves, as read by
     /// [`super::float_dispatch::classify_float_render`]. The Linux, macOS

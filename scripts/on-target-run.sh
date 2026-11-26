@@ -18,6 +18,18 @@
 #                               summary.json for the fleet roll-up
 #   HAL_ONTARGET_REQUIRE_GPU    1 to fail, as NO-GPU, on a board without a
 #                               DRM render node
+#   HAL_ONTARGET_TEST_THREADS   test threads per binary; unset uses libtest's
+#                               default, one per CPU
+#   HAL_ONTARGET_GDB            1 to run each test binary under `gdb -batch`,
+#                               which prints every thread's backtrace and the
+#                               loaded shared libraries with their addresses
+#                               into the binary's log if the binary is killed
+#                               by a signal or hangs
+#   HAL_ONTARGET_GDB_TIMEOUT    seconds a binary may run under gdb before it
+#                               counts as hung (default: 900). A hung binary
+#                               gets SIGINT, which stops it in gdb for the
+#                               backtraces, and SIGKILL 120 s later if gdb is
+#                               still running
 #
 # Sets the test gates from what the board has: HAL_TEST_REQUIRE_GL with a
 # render node, HAL_TEST_REQUIRE_G2D with libg2d.so.2 (HAL_TEST_SKIP_G2D
@@ -27,11 +39,16 @@
 #
 # Writes one log per binary, check-single-home.log,
 # test_two_library_user.log, test_codec_api.log, python-codec.log,
-# capabilities.txt, summary.txt (`RESULT|detail`, one line) and summary.json
-# into <results-dir>. Exits 0 on PASS, 1 on FAIL, NO-TESTS or NO-GPU.
+# capabilities.txt, diagnostics.txt (core pattern, core size limit, gdb,
+# coredumpctl), summary.txt (`RESULT|detail`, one line) and summary.json into
+# <results-dir>. A test binary killed by a signal also gets
+# <binary>.crash.txt, with the signal and whatever backtrace coredumpctl or a
+# core file and gdb can give. A binary that hangs under gdb gets
+# <binary>.crash.txt with each thread's name, wait channel and kernel stack and
+# the last kernel messages. Exits 0 on PASS, 1 on FAIL, NO-TESTS or NO-GPU.
 #
 # Needs bash and the POSIX tools (awk, grep, sed, sort). python3 is used for
-# the Python codec tests only.
+# the Python codec tests only, and only its standard library.
 
 set -uo pipefail
 
@@ -39,6 +56,8 @@ BUNDLE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RESULTS="${1:?usage: $0 <results-dir>}"
 FILTER="${FILTER:-}"
 REQUIRE_GPU="${HAL_ONTARGET_REQUIRE_GPU:-0}"
+THREADS_ARG=()
+[[ -n "${HAL_ONTARGET_TEST_THREADS:-}" ]] && THREADS_ARG=(--test-threads="${HAL_ONTARGET_TEST_THREADS}")
 
 rm -rf "${RESULTS}"
 mkdir -p "${RESULTS}"
@@ -53,6 +72,90 @@ neutron="$([[ -e /dev/neutron0 ]] && echo yes || echo no)"
 caps="dma_heap=${heaps:-none} render=${render} galcore=${galcore} neutron=${neutron}"
 echo "${caps}" > "${RESULTS}/capabilities.txt"
 echo "    ${caps}"
+
+# Lets test binaries dump core, and records what the board offers for crash
+# backtraces.
+ulimit -c unlimited 2>/dev/null || true
+have_gdb="$(command -v gdb >/dev/null 2>&1 && echo yes || echo no)"
+have_coredumpctl="$(command -v coredumpctl >/dev/null 2>&1 && echo yes || echo no)"
+diag="core_pattern=$(cat /proc/sys/kernel/core_pattern 2>/dev/null || echo unknown) core_limit=$(ulimit -c) gdb=${have_gdb} coredumpctl=${have_coredumpctl}"
+echo "${diag}" > "${RESULTS}/diagnostics.txt"
+echo "    ${diag}"
+DEBUGGER=()
+if [[ "${HAL_ONTARGET_GDB:-0}" == "1" ]]; then
+  if [[ "${have_gdb}" == yes ]]; then
+    DEBUGGER=(gdb -q -batch -return-child-result -ex run -ex "thread apply all bt" \
+      -ex "info sharedlibrary" --args)
+  else
+    echo "    HAL_ONTARGET_GDB=1 but the board has no gdb"
+  fi
+fi
+
+# Writes <results>/<name>.crash.txt for a test binary `bin` (pid `pid`) that
+# exited with status `rc` > 128.
+collect_crash() {
+  local bin="$1" pid="$2" rc="$3"
+  local name out core
+  name="$(basename "${bin}")"
+  out="${RESULTS}/${name}.crash.txt"
+  echo "${name} (pid ${pid}) was killed by signal $((rc - 128))" > "${out}"
+  if [[ "${have_coredumpctl}" == yes ]]; then
+    # Retries for up to 10 s while systemd-coredump records the dump.
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+      if coredumpctl --no-pager info "${pid}" >> "${out}" 2>&1; then
+        break
+      fi
+      sleep 1
+    done
+  fi
+  for core in "core.${pid}" core; do
+    [[ -f "${core}" ]] || continue
+    if [[ "${have_gdb}" == yes ]]; then
+      gdb -q -batch -ex "thread apply all bt" -ex "info sharedlibrary" "${bin}" "${core}" \
+        >> "${out}" 2>&1
+    else
+      echo "core file ${core} left on the board; no gdb to read it" >> "${out}"
+    fi
+    rm -f "${core}"
+    break
+  done
+}
+
+GDB_TIMEOUT="${HAL_ONTARGET_GDB_TIMEOUT:-900}"
+
+# Prints the pids of the processes whose parent is `parent`.
+children_of() {
+  local parent="$1" stat ppid
+  for stat in /proc/[0-9]*/stat; do
+    read -r _ ppid _ < <(sed 's/.*) //' "${stat}" 2>/dev/null) || continue
+    [[ "${ppid}" == "${parent}" ]] && basename "$(dirname "${stat}")"
+  done
+  return 0
+}
+
+# Handles test binary `name` still running under gdb (pid `gdb_pid`) after
+# GDB_TIMEOUT seconds: writes <results>/<name>.crash.txt, sends the binary
+# SIGINT, and sends SIGKILL if it is still running 120 s later.
+on_hang() {
+  local name="$1" gdb_pid="$2" out="${RESULTS}/$1.crash.txt" child task
+  for child in $(children_of "${gdb_pid}"); do
+    {
+      echo "${name} (pid ${child}) hung: still running after ${GDB_TIMEOUT} s"
+      for task in /proc/"${child}"/task/*; do
+        echo "--- thread ${task##*/} $(cat "${task}/comm" 2>/dev/null) wchan=$(cat "${task}/wchan" 2>/dev/null)"
+        cat "${task}/stack" 2>/dev/null
+      done
+      echo "--- dmesg"
+      dmesg 2>/dev/null | tail -n 100
+    } > "${out}"
+    kill -INT "${child}" 2>/dev/null
+  done
+  sleep 120 & nap=$!
+  wait "${nap}"
+  for child in $(children_of "${gdb_pid}"); do
+    kill -KILL "${child}" 2>/dev/null
+  done
+}
 
 extra_env=()
 [[ "${galcore}" == yes ]] && extra_env+=(EDGEFIRST_SKIP_VIVANTE_KNOWN_BUGS=1)
@@ -151,8 +254,30 @@ for bin in "${bins[@]}"; do
   echo "  -- ${name}"
   log="${RESULTS}/${name}.log"
   # shellcheck disable=SC2086
-  if env EDGEFIRST_TESTDATA_DIR="${BUNDLE}/testdata" ${extra_env[@]+"${extra_env[@]}"} \
-      "./${bin}" --test-threads=1 ${FILTER} > "${log}" 2>&1; then
+  env EDGEFIRST_TESTDATA_DIR="${BUNDLE}/testdata" ${extra_env[@]+"${extra_env[@]}"} \
+    ${DEBUGGER[@]+"${DEBUGGER[@]}"} "./${bin}" ${THREADS_ARG[@]+"${THREADS_ARG[@]}"} ${FILTER} \
+    > "${log}" 2>&1 &
+  pid=$!
+  watchdog=""
+  if [[ ${#DEBUGGER[@]} -gt 0 ]]; then
+    (
+      nap=""
+      trap 'kill "${nap}" 2>/dev/null; exit 0' TERM
+      sleep "${GDB_TIMEOUT}" & nap=$!
+      wait "${nap}"
+      on_hang "${name}" "${pid}"
+    ) &
+    watchdog=$!
+  fi
+  wait "${pid}"
+  rc=$?
+  if [[ -n "${watchdog}" ]]; then
+    kill "${watchdog}" 2>/dev/null
+    wait "${watchdog}" 2>/dev/null
+  fi
+  hung=no
+  [[ -n "${watchdog}" && -f "${RESULTS}/${name}.crash.txt" ]] && hung=yes
+  if [[ ${rc} -eq 0 && "${hung}" == no ]]; then
     pass=$((pass + 1))
     # Reports the skips of a binary that passed.
     if grep -q "SKIPPED" "${log}"; then
@@ -164,9 +289,16 @@ for bin in "${bins[@]}"; do
       echo "     ok, but ran 0 tests${FILTER:+ (FILTER=\"${FILTER}\" matched no test name)}"
     fi
   else
-    fail=$((fail + 1)); failed_bins+=("${name}")
+    fail=$((fail + 1))
+    if [[ "${hung}" == yes ]]; then failed_bins+=("${name} (hung)"); else failed_bins+=("${name}"); fi
     echo "     FAILED (see ${log})"
     grep -E "^(test .* FAILED|failures:|error)" "${log}" | head -8 | sed 's/^/     /'
+    if [[ "${hung}" == yes ]]; then
+      echo "     hung after ${GDB_TIMEOUT} s; see ${RESULTS}/${name}.crash.txt"
+    elif [[ ${rc} -gt 128 ]]; then
+      collect_crash "${bin}" "${pid}" "${rc}"
+      echo "     killed by signal $((rc - 128)); see ${RESULTS}/${name}.crash.txt"
+    fi
   fi
 done
 
@@ -208,24 +340,30 @@ else
   sed 's/^/     /' "${codeclog}"
 fi
 
-# Runs the Python codec tests with the bundle's wheels and pytest on
-# PYTHONPATH. Skips them, with the reason, on a board without a python3 of
-# 3.11 or newer with numpy and in a bundle built without wheels. Writes
-# each of pytest's `SKIPPED [N]` lines N times as `WARNING: SKIPPED:` lines.
+# Runs the Python codec tests on the bundle's wheels alone: python3 -S skips
+# site-packages, the user site and .pth files, so sys.path holds the standard
+# library, the bundle's python/ and the bundle's python-cpXY/ for the
+# interpreter's version. Skips them, with the reason, on a board without a
+# python3 of 3.11 or newer, in a bundle built without wheels and in a bundle
+# without wheels for the board's CPython. Writes each of pytest's
+# `SKIPPED [N]` lines N times as `WARNING: SKIPPED:` lines.
 echo "  -- Python codec tests"
 pylog="${RESULTS}/python-codec.log"
 py_skip=""
+py_tag="$(python3 -S -c 'import sys; v = sys.version_info; print("cp%d%d" % v[:2]) if v >= (3, 11) else None' 2>/dev/null || true)"
 if [[ ! -d python ]]; then
   py_skip="the bundle has no wheels (built without PYTHON_WHEELS)"
-elif ! python3 -c 'import sys, numpy; sys.exit(sys.version_info < (3, 11))' > /dev/null 2>&1; then
-  py_skip="no python3 3.11+ with numpy on this board"
+elif [[ -z "${py_tag}" ]]; then
+  py_skip="no python3 3.11+ on this board"
+elif [[ ! -d "python-${py_tag}" ]]; then
+  py_skip="the bundle has no wheels for ${py_tag}"
 fi
 if [[ -n "${py_skip}" ]]; then
   echo "WARNING: SKIPPED: Python codec tests - ${py_skip}" > "${pylog}"
   echo "     skipped: ${py_skip}"
 else
-  env PYTHONPATH="${BUNDLE}/python" ${extra_env[@]+"${extra_env[@]}"} \
-    python3 -m pytest tests/codec -q -rs -p no:cacheprovider 2>&1 \
+  env PYTHONPATH="${BUNDLE}/python:${BUNDLE}/python-${py_tag}" ${extra_env[@]+"${extra_env[@]}"} \
+    python3 -S -m pytest tests/codec -q -rs -p no:cacheprovider 2>&1 \
     | awk '
         match($0, /^SKIPPED \[[0-9]+\] /) {
           n = substr($0, 10, RLENGTH - 11) + 0

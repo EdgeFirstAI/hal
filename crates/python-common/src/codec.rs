@@ -671,8 +671,8 @@ impl PyEncoderInfo {
 /// Encodes image tensors into an H.264 or MJPEG stream on hardware.
 ///
 /// Platforms:
-///     Linux: V4L2 memory-to-memory encoders; DMA-BUF sources are read in
-///     place.
+///     Linux: V4L2 memory-to-memory encoders; DMA-BUF sources laid out as
+///     the device reads them are read in place, others are copied first.
 ///     Windows: Media Foundation; D3D11 sources are read in place.
 ///     Elsewhere opening fails with ``NoDeviceError``.
 #[pyclass(name = "VideoEncoder", module = "edgefirst.codec")]
@@ -751,6 +751,11 @@ impl PyVideoEncoder {
     /// Returns the next access unit, or ``None`` while the encoder holds
     /// pictures back; :meth:`flush` returns the rest at the end.
     ///
+    /// A source the device can read in place is read there;
+    /// :meth:`create_source` allocates one. Any other source, of any row
+    /// stride and in any memory the CPU can read, is copied into a buffer
+    /// the device can read first.
+    ///
     /// Args:
     ///     src: An image tensor from any ``edgefirst`` package, of the
     ///         configured format and size (or larger, with ``crop``).
@@ -784,6 +789,29 @@ impl PyVideoEncoder {
             .into_iter()
             .map(|f| PyEncodedFrame::new(py, f))
             .collect())
+    }
+
+    /// Allocates a source image of the configured size and format that the
+    /// encoder reads in place, without a copy.
+    ///
+    /// On Linux the image is laid out as the V4L2 device reads it: its row
+    /// stride and, for NV12, the offset of its chroma plane can be larger
+    /// than the picture needs, and the chroma plane can be a buffer of its
+    /// own. On Windows it is a GPU image of the configured size.
+    ///
+    /// Such an image is a ``edgefirst.codec`` tensor; one whose chroma plane
+    /// is a separate tensor cannot be passed to another edgefirst package.
+    ///
+    /// Raises:
+    ///     NoDeviceError: there is no GPU buffer allocator.
+    ///     CodecError: the image cannot be allocated, or the device does not
+    ///         report its layout.
+    fn create_source(&self, py: Python<'_>) -> PyResult<PyTensor> {
+        let inner = &self.inner;
+        let t = py
+            .detach(|| locked(inner).create_source())
+            .map_err(to_pyerr)?;
+        Ok(PyTensor(t))
     }
 
     /// The engine, device and transfer of this encoder.

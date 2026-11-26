@@ -1768,6 +1768,9 @@ impl PyTensor {
     ///
     /// Raises:
     ///     ValueError: if ``access`` is not one of the values above.
+    ///     NotImplementedError: if the tensor's chroma plane is a separate
+    ///         tensor (two-buffer NV12, chroma at an offset, a decoded video
+    ///         frame), which cannot be passed to another edgefirst package.
     #[pyo3(signature = (access=None))]
     fn __edgefirst_tensor__<'py>(
         &self,
@@ -1775,6 +1778,8 @@ impl PyTensor {
         access: Option<&str>,
     ) -> PyResult<Bound<'py, pyo3::types::PyCapsule>> {
         use edgefirst_tensor::CpuAccess;
+
+        crate::interop::exportable(&self.0)?;
 
         // Pin only for the access the caller asked for.
         let pin = match access.map(|s| (s, CpuAccess::from_str_code(s))) {

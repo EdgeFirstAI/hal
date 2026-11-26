@@ -207,8 +207,7 @@ jobs:
           set -euo pipefail
           # .cargo/mutants.toml, read from the workspace root, carries the file
           # exclusions and the exclude_re list. --sharding slice keeps a
-          # shard's mutants contiguous in the corpus. The first `--` passes
-          # arguments to `cargo test`, the second to the libtest harness.
+          # shard's mutants contiguous in the corpus.
           args=(
             --no-shuffle
             --in-place
@@ -220,7 +219,7 @@ jobs:
           echo "DMA require gate: HAL_TEST_REQUIRE_DMA=${HAL_TEST_REQUIRE_DMA:-unset}"
           rc=0
           # shellcheck disable=SC2086
-          cargo mutants "${args[@]}" $PACKAGES -- -- --test-threads=1 || rc=$?
+          cargo mutants "${args[@]}" $PACKAGES || rc=$?
           echo "cargo-mutants exit ${rc}"
           # 0 all caught, 2 some survived, 3 some timed out: the step passes.
           # 1 usage, 4 baseline failing, 5/6 bad --in-diff, 70 internal: the

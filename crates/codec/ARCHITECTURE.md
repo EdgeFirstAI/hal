@@ -110,7 +110,7 @@ V4L2 access goes through the [`edgefirst-v4l2`](https://github.com/EdgeFirstAI/v
 
 ### Still-Image Encoder (`encoder.rs`)
 
-`ImageEncoder` encodes JPEG. The CPU path feeds `jpeg-encoder` through its `ImageBuffer` trait straight from the mapped tensor: each row is handed over as full-resolution Y, Cb and Cr, chroma repeated across its subsampled block, and the encoder's sampling factor (2x2 for NV12, 2x1 for NV16 and YUYV) averages it back, so the file keeps the source's chroma without an intermediate image. Limited-range sources go through two 256-entry tables to full range. On Linux the V4L2 path opens an MJPEG `VideoEncoder` on the V4L2 engine for the source's geometry and quality and keeps it until they change; under `Auto` any failure there (a host-memory source, a format the device does not take) passes the image to the CPU.
+`ImageEncoder` encodes JPEG. The CPU path feeds `jpeg-encoder` through its `ImageBuffer` trait straight from the mapped tensor: each row is handed over as full-resolution Y, Cb and Cr, chroma repeated across its subsampled block, and the encoder's sampling factor (2x2 for NV12, 2x1 for NV16 and YUYV) averages it back, so the file keeps the source's chroma without an intermediate image. Limited-range sources go through two 256-entry tables to full range. On Linux the V4L2 path opens an MJPEG `VideoEncoder` on the V4L2 engine for the source's geometry and quality and keeps it until they change; under `Auto` a host-memory source goes straight to the CPU, and any failure there (a format the device does not take) passes the image to the CPU.
 
 ### Video Module Map (`video/`)
 
@@ -118,14 +118,15 @@ V4L2 access goes through the [`edgefirst-v4l2`](https://github.com/EdgeFirstAI/v
 |-----------------|------------------------------------------------------|
 | `mod.rs`        | `VideoEncoder`, `EncoderConfig` and its H.264 profile, level and bitrate types, `FrameOptions`, `EncodedFrame`, the `EncoderBackend` seam; `VideoDecoder`, `DecoderConfig`, `OutputPool`, `StreamInfo`, `DecodeEvent`, `DecodedFrame` (returns its buffer on drop), the `DecoderBackend` seam |
 | `h264.rs`       | Annex B framing: NAL unit types, SPS/PPS extraction, `AccessUnit` classification (IDR, parameter sets, trailing NAL units that belong to the previous access unit), `access_units()` splitting |
-| `v4l2/mod.rs`   | Capability-based discovery of stateful M2M nodes (env override, then `/dev/video*`), `M2mDevice` |
-| `v4l2/encoder.rs` | `V4l2Encoder` (Linux + `v4l2` feature): format and control setup, DMA-BUF import of the source planes and crops, PTS mapping, header caching, `ENCODER_CMD` drain and stream reset |
+| `copy.rs`       | Plane geometry and strided copies of NV12 and packed pictures, shared by the V4L2 and Media Foundation encoders and the Media Foundation decoder |
+| `v4l2/mod.rs`   | Capability-based discovery of stateful M2M nodes (env override, then `/dev/video*`), `M2mDevice`, busy codec nodes reported as errors |
+| `v4l2/media.rs` | Whether a video node is a codec, from the media controller graph of its device (`MEDIA_IOC_G_TOPOLOGY`) |
+| `v4l2/encoder.rs` | `V4l2Encoder` (Linux + `v4l2` feature): format and control setup, DMA-BUF import of the source planes and crops, copy of other sources into a staging buffer of the device's layout, `create_source`, PTS mapping, header caching, `ENCODER_CMD` drain and stream reset |
 | `v4l2/decoder.rs` | `V4l2Decoder` (Linux + `v4l2` feature): bitstream queue, `SOURCE_CHANGE` handling, CAPTURE pool by DMA-BUF import or export, NV12 frame tensors over the padded buffers, one access unit in flight, `DECODER_CMD` drain and queue restart, reopen on reset |
 | `mf/mod.rs`     | Media Foundation platform (Windows + `media-foundation` feature): `mfplat.dll` resolved at run time, COM apartment per thread, `MFStartup` hold, transform enumeration with the environment filter, media type helpers |
 | `mf/transform.rs` | `Transform`: one synchronous or asynchronous MFT driven from the caller's thread (event polling, input credits, output sample allocation, stream-change renegotiation, drain and restart) |
 | `mf/encoder.rs` | `MfEncoder`: output and input types with the profile and level fallbacks, `ICodecAPI` rate control, tight copy of the source into a sample, forced key frames, PTS by sample time, header caching |
 | `mf/decoder.rs` | `MfDecoder`: NV12 output, layout from the output type (aperture, stride, colorimetry), pictures waiting in Media Foundation memory, copy into the D3D11 or host pool, pool growth for drain bursts |
-| `mf/copy.rs`    | Plane geometry and strided copies of NV12 and YUYV pictures |
 
 ## Key Design Decisions
 
@@ -656,14 +657,41 @@ with a V4L2 backend on Linux and a Media Foundation backend on Windows (see
   lists H.264 and whose OUTPUT queue lists the input format qualifies. Names are
   never used: `vsi_v4l2` on the i.MX 8M Plus leaves its sysfs name empty.
 - **Configuration happens at `new()`** (coded format, size check by `TRY_FMT`,
-  frame interval, controls); **buffers wait for the first frame**, because the
-  OUTPUT `bytesperline` must equal the source's row stride for a zero-copy
-  import. A source with another stride is rejected rather than copied.
+  frame interval, controls); **buffers wait for the first frame**, whose row
+  stride is asked for as the OUTPUT `bytesperline`. The format the device sets
+  in reply (`bytesperline` per plane, the format height and `sizeimage`) is the
+  layout it reads every source of the stream in.
 - **NV12 uses `NV12M` (two V4L2 planes) where offered.** Each plane is a
   DMA-BUF with its own `data_offset`, so a crop moves the luma and chroma start
   independently, and a chroma plane in its own allocation works. The one-plane
-  `NV12` layout cannot crop: the driver places chroma at
-  `bytesperline × height` after the luma start.
+  `NV12` layout places chroma `bytesperline × height` after the luma start,
+  with the height of the format the device set, so it takes a crop in place
+  only when the source's planes happen to be that far apart.
+- **A source the device cannot read in place is copied.** The source is
+  imported when it is a DMA-BUF whose row strides, plane gap and buffer sizes
+  match the device's layout. Anything else (another stride, a tight NV12 image
+  on a device that pads its rows, a crop the layout cannot express, host
+  memory) is copied on the CPU into a staging DMA-BUF of the device's layout,
+  allocated on first use and reused. The last row of each plane is repeated
+  down to the format height. The copy is logged at info the first time for a
+  source shape and at debug after that, and `EncoderInfo::transfer` reports
+  `CpuCopy` while sources are copied. `VideoEncoder::create_source` allocates
+  a source in the device's layout, which is always imported. `msm_vidc` on the
+  IQ-9075 needs this: it sets `bytesperline` to the width rounded up to 128
+  bytes and the format height to the height rounded up to 32 rows, whatever
+  the source has. The codec crate cannot use `edgefirst-image` for the copy
+  (that crate depends on this one), so it runs on the CPU.
+- **Busy codec nodes are errors.** A node that fails to open with `ENOMEM`,
+  `EBUSY` or `EAGAIN` (`msm_vidc` refuses a session past its limit with
+  `ENOMEM`) is kept as a candidate when the media controller of its device
+  names it a codec: its interface links to an entity, or one data-linked to
+  it, of function `MEDIA_ENT_F_PROC_VIDEO_ENCODER` or `_DECODER`, as
+  `v4l2_m2m_register_media_controller` builds the graph. The graph is read
+  from `/dev/mediaN` without opening the node. When no other node opens,
+  `VideoEncoder::new` and `VideoDecoder::new` return that
+  `CodecError::Device` rather than `NoDevice`. A busy node on a device
+  without a media controller (a camera, `vsi_v4l2`, Wave6) is skipped, so a
+  board without a free codec still reports `NoDevice`.
 - **`encode()` waits until the device has read the source** (its OUTPUT buffer
   is dequeued), because it only borrows the tensor; then it waits briefly for
   the access unit so latency stays at one frame.
@@ -684,6 +712,17 @@ with a V4L2 backend on Linux and a Media Foundation backend on Windows (see
   a drained encoder resumes (Wave6 ignores `V4L2_ENC_CMD_START`), so the
   backend tears the queues down and the next frame starts a new stream, which
   also opens it with an IDR.
+- **Teardown frees the buffers.** A reset, a drop and a failed start stop both
+  queues and free their buffers with `VIDIOC_REQBUFS(0)` before the device is
+  closed. `msm_vidc` on the IQ-9075 keeps an encoder session whose file is
+  closed with buffers still allocated, and refuses new sessions past 32.
+
+## Video Decoder
+
+`video::VideoDecoder` fronts an internal `DecoderBackend` trait in the same way. The V4L2 backend (`video/v4l2/decoder.rs`) drives a stateful decoder (`dev-decoder.rst`).
+
+- **Resolution changes.** The driver reports `V4L2_EVENT_SOURCE_CHANGE` and flags the last CAPTURE buffer of the old format with `V4L2_BUF_FLAG_LAST`. Drivers deliver the two in either order, or in the same wake-up (`msm_vidc` on the IQ-9075), so the backend reads pending events before it dequeues pictures and again when it dequeues the last buffer. A change that arrives after the last buffer is applied at once. Only then is the CAPTURE queue freed and set up for the new format.
+- **Held frames.** A frame of the old format keeps its buffer. A provided buffer that a held frame still shows is left out of the new queue until that frame drops.
 
 ## MJPEG
 

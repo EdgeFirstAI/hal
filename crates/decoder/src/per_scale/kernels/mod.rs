@@ -11,11 +11,15 @@ pub(crate) fn decoder_cpu_features() -> Result<CpuFeatures, crate::DecoderError>
     if let Some(tier) = forced_for_test::get() {
         return decoder_cpu_features_from(Some(tier));
     }
-    decoder_cpu_features_from(
-        std::env::var("EDGEFIRST_DECODER_FORCE_KERNEL")
-            .ok()
-            .as_deref(),
-    )
+    decoder_cpu_features_lookup(|name| std::env::var(name).ok())
+}
+
+/// [`decoder_cpu_features`] with `EDGEFIRST_DECODER_FORCE_KERNEL` read
+/// through `lookup`.
+fn decoder_cpu_features_lookup(
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<CpuFeatures, crate::DecoderError> {
+    decoder_cpu_features_from(lookup("EDGEFIRST_DECODER_FORCE_KERNEL").as_deref())
 }
 
 /// A forced tier for the calling thread only.
@@ -82,7 +86,6 @@ mod box_tier_tests;
 mod cpu_tests {
     use super::*;
     use crate::DecoderError;
-    use std::sync::{Mutex, MutexGuard};
 
     #[test]
     fn unknown_forced_tier_maps_to_forced_kernel_unavailable() {
@@ -107,42 +110,19 @@ mod cpu_tests {
         );
     }
 
-    /// Serializes tests that override an env var.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    /// Overrides an env var while holding `ENV_LOCK`, restoring it on drop (even on panic).
-    struct EnvGuard {
-        key: &'static str,
-        prev: Option<String>,
-        _lock: MutexGuard<'static, ()>,
-    }
-
-    impl EnvGuard {
-        fn set(key: &'static str, value: &str) -> Self {
-            let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            let prev = std::env::var(key).ok();
-            std::env::set_var(key, value);
-            Self {
-                key,
-                prev,
-                _lock: lock,
-            }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            match self.prev.take() {
-                Some(v) => std::env::set_var(self.key, v),
-                None => std::env::remove_var(self.key),
-            }
-        }
-    }
-
-    /// `EDGEFIRST_DECODER_FORCE_KERNEL=scalar` in the environment gives the scalar tier.
+    /// `EDGEFIRST_DECODER_FORCE_KERNEL=scalar` gives the scalar tier; other names are ignored.
     #[test]
     fn decoder_cpu_features_reads_the_documented_variable() {
-        let _g = EnvGuard::set("EDGEFIRST_DECODER_FORCE_KERNEL", "scalar");
-        assert_eq!(decoder_cpu_features().unwrap(), CpuFeatures::default());
+        let forced =
+            |name: &str| (name == "EDGEFIRST_DECODER_FORCE_KERNEL").then(|| "scalar".into());
+        assert_eq!(
+            decoder_cpu_features_lookup(forced).unwrap(),
+            CpuFeatures::default()
+        );
+        let other = |name: &str| (name == "EDGEFIRST_KERNELS_FORCE_TIER").then(|| "scalar".into());
+        assert_eq!(
+            decoder_cpu_features_lookup(other).unwrap(),
+            CpuFeatures::probe()
+        );
     }
 }

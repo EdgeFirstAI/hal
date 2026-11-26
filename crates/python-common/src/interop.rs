@@ -30,6 +30,21 @@ use pyo3::types::PyCapsule;
 
 /// Attach `quant` to `tensor`, if there is any. Returns an error when the
 /// quantization does not validate against the tensor.
+/// The message of the error that refuses to export a multi-plane tensor.
+pub(crate) const MULTIPLANE_EXPORT: &str =
+    "a tensor whose chroma plane is a separate tensor cannot be passed to another edgefirst package";
+
+/// Refuses, with `NotImplementedError`, a tensor whose chroma plane is a
+/// tensor of its own, which the `edgefirst_tensor_v2` capsule cannot carry.
+pub(crate) fn exportable(tensor: &TensorDyn) -> PyResult<()> {
+    if tensor.is_multiplane() {
+        return Err(pyo3::exceptions::PyNotImplementedError::new_err(
+            MULTIPLANE_EXPORT,
+        ));
+    }
+    Ok(())
+}
+
 fn apply_quantization(tensor: &mut TensorDyn, quant: Option<Quantization>) -> PyResult<()> {
     if let Some(q) = quant {
         tensor.set_quantization(q).map_err(|e| {
@@ -190,9 +205,9 @@ impl<'py> TensorArg<'py> {
     /// Whether [`Self::into_raw_access`] can succeed for `self`.
     ///
     /// `Foreign` is always detachable. `NativeRef`/`NativeMut` are detachable
-    /// when `reconstructible` holds for their backing memory, which excludes
-    /// `Cuda`. A caller whose argument fails this check keeps the GIL held for
-    /// the whole operation.
+    /// when `reconstructible` holds, which excludes `Cuda` memory and a tensor
+    /// whose chroma plane is a tensor of its own. A caller whose argument fails
+    /// this check keeps the GIL held for the whole operation.
     pub fn can_detach(&self) -> bool {
         match self {
             Self::Foreign { .. } => true,
@@ -394,10 +409,18 @@ pub(crate) fn write_pin_access(tensor: &TensorDyn) -> edgefirst_tensor::CpuAcces
 /// Build an independent `TensorDyn` aliasing the same backing memory as
 /// `tensor`. Requests no pin unless the descriptor comes back host-kind with a
 /// null `ptr`, in which case it pins with `access` and returns the pin.
+///
+/// Fails with `RuntimeError` for a tensor whose chroma plane is a tensor of
+/// its own, which a descriptor cannot describe.
 pub(crate) fn reconstruct(
     tensor: &TensorDyn,
     access: edgefirst_tensor::CpuAccess,
 ) -> PyResult<(TensorDyn, Option<HostPin<'static>>)> {
+    if tensor.is_multiplane() {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "this call cannot take a tensor whose chroma plane is a separate tensor",
+        ));
+    }
     let desc = tensor.descriptor_pinned(None);
     let (desc, pin) = if desc.is_host() && desc.ptr.is_null() {
         let pin = tensor.pin_host(access).map_err(|e| {
@@ -498,10 +521,10 @@ pub(crate) fn publish_colorimetry(
     }
 }
 
-/// Whether [`reconstruct`] can succeed for `tensor`'s backing memory. Only
-/// `Cuda` is excluded.
+/// Whether [`reconstruct`] can succeed for `tensor`: any tensor but a `Cuda`
+/// one and one whose chroma plane is a tensor of its own.
 pub(crate) fn reconstructible(tensor: &TensorDyn) -> bool {
-    !matches!(tensor.memory(), edgefirst_tensor::TensorMemory::Cuda)
+    !matches!(tensor.memory(), edgefirst_tensor::TensorMemory::Cuda) && !tensor.is_multiplane()
 }
 
 /// What keeps a tensor taken out of a [`RawTensorAccess`] valid: the host

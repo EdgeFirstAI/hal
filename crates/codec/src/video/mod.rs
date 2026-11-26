@@ -61,6 +61,11 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
+#[cfg(any(
+    all(target_os = "linux", feature = "v4l2"),
+    all(windows, feature = "media-foundation")
+))]
+pub(crate) mod copy;
 #[cfg_attr(
     not(any(
         all(target_os = "linux", feature = "v4l2"),
@@ -502,7 +507,11 @@ pub struct EncoderInfo {
     /// Crops and host-memory sources may take a copy where this says none.
     /// A Media Foundation hardware encoder decides on its first frame
     /// whether it can read sources in place, and reports
-    /// [`Transfer::GpuCopy`] until then.
+    /// [`Transfer::GpuCopy`] until then. A V4L2 encoder reports how the
+    /// latest source reached the device: [`Transfer::CpuCopy`] when it was
+    /// copied into the device's layout, [`Transfer::ZeroCopy`] before the
+    /// first frame and when the device read it in place, as it reads a
+    /// source from [`VideoEncoder::create_source`].
     pub transfer: Transfer,
 }
 
@@ -512,6 +521,7 @@ pub(crate) trait EncoderBackend: Send {
     fn flush(&mut self) -> Result<Vec<EncodedFrame>>;
     fn device(&self) -> String;
     fn info(&self) -> EncoderInfo;
+    fn create_source(&self) -> Result<TensorDyn>;
 }
 
 /// A hardware video encoder.
@@ -550,8 +560,10 @@ impl VideoEncoder {
     /// [`CodecError::InvalidConfig`] when `config` is invalid or the device
     /// rejects it, [`CodecError::UnsupportedFormat`] when no device accepts
     /// the input format, [`CodecError::Unsupported`] when the engine (or, for
-    /// [`Engine::Auto`], every engine here) does not encode the codec, and
-    /// [`CodecError::NoDevice`] when there is no encoder.
+    /// [`Engine::Auto`], every engine here) does not encode the codec,
+    /// [`CodecError::Device`] when no V4L2 encoder opens and a node is busy
+    /// or out of resources, and [`CodecError::NoDevice`] when there is no
+    /// encoder.
     pub fn new(config: EncoderConfig) -> Result<Self> {
         config.validate()?;
         let engine = pick(config.engine, config.codec, Direction::Encode)?;
@@ -563,10 +575,12 @@ impl VideoEncoder {
     /// Encodes `src`.
     ///
     /// `src` must have the configured input format and, without a crop, the
-    /// configured size. DMA-BUF sources are read in place: the call returns
-    /// once the device has finished reading `src`, so the caller may reuse
-    /// it afterwards. Every source of one stream must have the same row
-    /// stride.
+    /// configured size. A source the device can read in place is read
+    /// there; [`create_source`](Self::create_source) allocates one. Any
+    /// other source, of any row stride and in any memory the CPU can read,
+    /// is copied into a buffer the device can read first. Either way the
+    /// call returns once `src` has been read, so the caller may reuse it
+    /// afterwards.
     ///
     /// Returns the next finished access unit, which may belong to an earlier
     /// frame, or `None` when none is ready yet.
@@ -588,6 +602,23 @@ impl VideoEncoder {
     /// The engine and device that encode, and how sources reach them.
     pub fn info(&self) -> EncoderInfo {
         self.backend.info()
+    }
+
+    /// Allocates a source image of the configured size and input format
+    /// that the encoder reads in place, without a copy.
+    ///
+    /// On V4L2 the image is laid out as the device reads it: its row stride
+    /// and, for NV12, the offset of its chroma plane can be larger than the
+    /// picture needs, and the chroma plane can be a buffer of its own. On
+    /// Windows it is a GPU image of the configured size.
+    ///
+    /// # Errors
+    ///
+    /// [`CodecError::Tensor`] when the image cannot be allocated,
+    /// [`CodecError::NoDevice`] when there is no GPU buffer allocator, and
+    /// [`CodecError::Device`] when the device does not report its layout.
+    pub fn create_source(&self) -> Result<TensorDyn> {
+        self.backend.create_source()
     }
 }
 
@@ -870,8 +901,9 @@ impl VideoDecoder {
     /// [`CodecError::InvalidConfig`] when a provided pool is empty, holds one
     /// buffer twice or is not in DMA-BUF memory, [`CodecError::Unsupported`]
     /// when the engine (or, for [`Engine::Auto`], every engine here) does not
-    /// decode the codec, and [`CodecError::NoDevice`] when there is no
-    /// decoder.
+    /// decode the codec, [`CodecError::Device`] when no V4L2 decoder opens
+    /// and a node is busy or out of resources, and [`CodecError::NoDevice`]
+    /// when there is no decoder.
     pub fn new(config: DecoderConfig) -> Result<Self> {
         if let OutputPool::Provided(pool) = &config.output {
             if pool.is_empty() {

@@ -899,7 +899,12 @@ pub unsafe extern "C" fn ef_image_processor_flush(p: *mut EfImageProcessor) -> c
 ///
 /// `*fence_fd` receives a descriptor the caller owns and must close, or `-1`
 /// when the platform has no native fence and the convert completed
-/// synchronously.
+/// synchronously. Linux and Android return a descriptor where the EGL
+/// display has `EGL_ANDROID_native_fence_sync`; macOS and iOS return `-1`.
+///
+/// The fence also covers the GPU's reads of `src`: keep the source
+/// unmodified, and do not hand its buffer back to its producer (a V4L2
+/// capture queue, for example), until the fence signals.
 ///
 /// `options` as for [`ef_image_processor_convert`].
 ///
@@ -957,6 +962,10 @@ pub unsafe extern "C" fn ef_image_processor_convert_fence(
 /// event is set when the destination is complete; the caller owns it and
 /// closes it with `CloseHandle`. `*fence` is `NULL` when the convert
 /// completed synchronously (no fence on this display).
+///
+/// The fence also covers the GPU's reads of `src`: keep the source
+/// unmodified, and do not hand its buffer back to its producer (a V4L2
+/// capture queue, for example), until the fence signals.
 ///
 /// `options` as for [`ef_image_processor_convert`].
 ///

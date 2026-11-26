@@ -8,6 +8,7 @@ elsewhere.
 """
 
 import gc
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -217,6 +218,108 @@ def nv12(width, height, luma):
         a[:height] = luma
         a[height:] = 128
     return t
+
+
+def test_a_source_from_the_encoder_is_read_in_place():
+    w, h, count = 320, 240, 4
+    encoder = open_or_skip(
+        lambda: VideoEncoder(Codec.H264, w, h, PixelFormat.Nv12, 30.0, gop=count)
+    )
+    if not encoder.info.hardware:
+        pytest.skip(f"no hardware H.264 encoder here: {encoder.info.device}")
+    src = encoder.create_source()
+    assert (src.width, src.height, src.format) == (w, h, PixelFormat.Nv12)
+    packets = []
+    for pts in range(count):
+        with src.map("write") as m:
+            np.asarray(m)[:h, :w] = 16 + pts * 48
+        p = encoder.encode(src, pts, keyframe=pts == 0)
+        if encoder.info.engine == Engine.V4l2:
+            assert encoder.info.transfer == codec.Transfer.ZeroCopy
+        if p is not None:
+            packets.append(p)
+    packets += encoder.flush()
+    assert [p.pts for p in packets] == list(range(count))
+
+    decoder = open_or_skip(lambda: VideoDecoder(Codec.H264, pool=count + 2))
+    events = []
+    for p in packets:
+        events += decoder.decode(p.data, p.pts)
+    events += decoder.flush()
+    frames = [e for e in events if isinstance(e, Frame)]
+    assert [f.pts for f in frames] == list(range(count))
+    for f in frames:
+        with f.map("read") as m:
+            mean = float(np.asarray(m)[:h, :w].mean())
+        assert abs(mean - (16 + f.pts * 48)) < 4, f.pts
+
+
+def test_a_decoded_frame_encodes_in_the_same_package():
+    decoder = open_or_skip(lambda: VideoDecoder(Codec.H264))
+    stream = (TESTDATA / "h264_resolution_change.h264").read_bytes()
+    frame = None
+    for pts, unit in enumerate(codec.access_units(stream)):
+        frames = [e for e in decoder.decode(unit, pts) if isinstance(e, Frame)]
+        if frames:
+            frame = frames[0]
+            break
+    if frame is None:
+        frame = next(e for e in decoder.flush() if isinstance(e, Frame))
+    w, h = frame.width, frame.height
+    encoder = open_or_skip(
+        lambda: VideoEncoder(Codec.H264, w, h, PixelFormat.Nv12, 30.0)
+    )
+    packets = [p for p in [encoder.encode(frame, 0, keyframe=True)] if p is not None]
+    packets += encoder.flush()
+    assert [p.pts for p in packets] == [0]
+    assert packets[0].keyframe
+
+
+def test_two_threads_encode_at_once():
+    w, h, count = 320, 240, 6
+    encoders = [
+        open_or_skip(
+            lambda: VideoEncoder(Codec.H264, w, h, PixelFormat.Nv12, 30.0, gop=count)
+        )
+        for _ in range(2)
+    ]
+    if not encoders[0].info.hardware:
+        pytest.skip(f"no hardware H.264 encoder here: {encoders[0].info.device}")
+    start = threading.Barrier(2)
+    packets = [[], []]
+    errors = []
+
+    def run(i):
+        try:
+            start.wait()
+            for pts in range(count):
+                p = encoders[i].encode(nv12(w, h, 16 + i * 120 + pts * 8), pts)
+                if p is not None:
+                    packets[i].append(p)
+            packets[i] += encoders[i].flush()
+        except Exception as e:  # noqa: BLE001
+            errors.append(e)
+
+    threads = [threading.Thread(target=run, args=(i,)) for i in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors, errors
+
+    for i in range(2):
+        assert [p.pts for p in packets[i]] == list(range(count))
+        decoder = open_or_skip(lambda: VideoDecoder(Codec.H264, pool=count + 2))
+        events = []
+        for p in packets[i]:
+            events += decoder.decode(p.data, p.pts)
+        events += decoder.flush()
+        frames = [e for e in events if isinstance(e, Frame)]
+        assert [f.pts for f in frames] == list(range(count))
+        for f in frames:
+            with f.map("read") as m:
+                mean = float(np.asarray(m)[:h, :w].mean())
+            assert abs(mean - (16 + i * 120 + f.pts * 8)) < 4, (i, f.pts)
 
 
 def test_an_h264_stream_round_trips_through_the_hardware():

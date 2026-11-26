@@ -4,7 +4,8 @@
    The codec C API end to end: the capability list, a JPEG encoded from a
    tensor and decoded back, the refusal of a codec no engine runs, and, where
    this machine has an H.264 encoder and decoder, a stream encoded from
-   tensors and decoded into frames.
+   tensors and decoded into frames. The second half of the stream comes
+   from a source the encoder allocated, which it reads in place.
 
    A part this machine cannot run prints "SKIP: <reason>" and passes. */
 #include <edgefirst/codec.h>
@@ -140,7 +141,17 @@ static int h264_round_trip(void) {
     ef_tensor *src = ef_tensor_image_alloc(W, H, "NV12", EF_DTYPE_U8, 0, 0,
                                            EF_CPU_ACCESS_READ_WRITE);
     if (!src) FAIL("allocating the source: %s", ef_tensor_last_error_message());
+    if (ef_video_encoder_create_source(NULL) != NULL || errno != EINVAL)
+        FAIL("a NULL encoder made a source");
+    ef_tensor *own = ef_video_encoder_create_source(enc);
+    if (!own) FAIL("ef_video_encoder_create_source");
+    if (strcmp(ef_tensor_format(own), "NV12") != 0)
+        FAIL("the encoder's source is %s, not NV12", ef_tensor_format(own));
     for (unsigned i = 0; i <= FRAMES; i++) {
+        if (i == FRAMES / 2) {
+            ef_tensor_free(src);
+            src = own;
+        }
         if (i < FRAMES) {
             if (!fill(src, i * 3)) FAIL("mapping the source");
             /* One frame names its window explicitly: the whole picture. */
@@ -148,6 +159,10 @@ static int h264_round_trip(void) {
             if (ef_video_encoder_encode(enc, src, i, i == 0 ? EF_VIDEO_ENCODE_KEYFRAME : 0,
                                         i == 1 ? &whole : NULL) != 0)
                 FAIL("encoding frame %u", i);
+            info = ef_video_encoder_get_info(enc);
+            if (src == own && info->engine == EF_CODEC_ENGINE_V4L2 &&
+                info->transfer != EF_CODEC_TRANSFER_ZERO_COPY)
+                FAIL("frame %u from the encoder's source took transfer %u", i, info->transfer);
         } else if (ef_video_encoder_flush(enc) != 0) {
             FAIL("flushing the encoder");
         }

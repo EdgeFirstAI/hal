@@ -427,6 +427,8 @@ mod tests {
             "ef_image_processor_materialize_masks",
             "ef_image_processor_plan_tiles",
             "ef_image_processor_tile_into",
+            "ef_image_processor_tile_into_fence",
+            "ef_image_processor_tile_into_fence_handle",
             "ef_image_processor_tile_one",
             "ef_image_processor_alloc_tile_batch",
             "ef_align_width_for_gpu_pitch",

@@ -506,6 +506,90 @@ mod gl_tests {
         Ok(())
     }
 
+    /// Releasing EGLImages leaves the anonymous mappings other threads hold in place.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn egl_image_releases_leave_other_threads_mappings_mapped() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+        if !is_gpu_image_buffer_available() {
+            crate::test_support::report_skip(&format!(
+                "{} - no zero-copy GPU buffers",
+                function!()
+            ));
+            return;
+        }
+        let mut gl = match GLProcessorThreaded::with_cache_capacity(None, Some(1)) {
+            Ok(gl) => gl,
+            Err(e) => {
+                crate::test_support::report_skip(&format!(
+                    "{} - GL not available: {e}",
+                    function!()
+                ));
+                return;
+            }
+        };
+        let image = || {
+            TensorDyn::image(
+                64,
+                64,
+                PixelFormat::Rgba,
+                DType::U8,
+                Some(TensorMemory::DmaBuf),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .unwrap()
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let lost = Arc::new(AtomicUsize::new(0));
+        let mappers: Vec<_> = (0..3)
+            .map(|_| {
+                let (stop, lost) = (stop.clone(), lost.clone());
+                std::thread::spawn(move || {
+                    const LEN: usize = 16384;
+                    while !stop.load(Ordering::Relaxed) {
+                        // SAFETY: an anonymous private mapping, checked and
+                        // unmapped by this thread only.
+                        unsafe {
+                            let p = libc::mmap(
+                                std::ptr::null_mut(),
+                                LEN,
+                                libc::PROT_READ | libc::PROT_WRITE,
+                                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                                -1,
+                                0,
+                            );
+                            if p == libc::MAP_FAILED {
+                                continue;
+                            }
+                            for _ in 0..200 {
+                                std::hint::spin_loop();
+                            }
+                            let mut pages = [0u8; LEN / 4096];
+                            if libc::mincore(p, LEN, pages.as_mut_ptr()) != 0 {
+                                lost.fetch_add(1, Ordering::Relaxed);
+                            }
+                            libc::munmap(p, LEN);
+                        }
+                    }
+                })
+            })
+            .collect();
+        let mut dst = image();
+        for _ in 0..2000 {
+            gl.convert(&image(), &mut dst, None).unwrap();
+        }
+        stop.store(true, Ordering::Relaxed);
+        for m in mappers {
+            m.join().unwrap();
+        }
+        assert_eq!(
+            lost.load(Ordering::Relaxed),
+            0,
+            "mappings other threads held were unmapped while the GL backend released EGLImages"
+        );
+    }
+
     /// A convert loop over a fixed pool of DMA sources makes no new EGLImage imports after warmup.
     #[test]
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
@@ -746,11 +830,11 @@ mod gl_tests {
         let fence = gl
             .convert_with_fence(&src, &mut dst_fenced, None)
             .expect("convert_with_fence");
-        if cfg!(not(any(target_os = "android", target_os = "windows"))) {
-            assert!(
-                fence.is_none(),
-                "no platform in this test tier has native fence sync"
-            );
+        if !gl.exports_native_fence() {
+            assert!(fence.is_none(), "this display exports no native fence");
+        }
+        if let Some(fence) = fence {
+            crate::test_support::wait_completion_fence(fence);
         }
         gl.convert(&src, &mut dst_blocking, None).expect("convert");
         let (ma, mb) = (
@@ -758,6 +842,631 @@ mod gl_tests {
             dst_blocking.as_u8().unwrap().map().unwrap(),
         );
         assert_eq!(ma.as_slice(), mb.as_slice(), "fenced vs blocking output");
+    }
+
+    /// A deferred convert on each render plan leaves its terminal GPU wait to the flush and
+    /// renders the bytes the blocking convert renders.
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    fn deferred_converts_wait_only_at_the_flush() {
+        use crate::opengl_headless::render::ConvertPlan;
+        if !is_opengl_available() {
+            crate::test_support::report_skip(&format!("{} - GL not available", function!()));
+            return;
+        }
+        let worker = match GLProcessorThreaded::new(None) {
+            Ok(w) => w,
+            Err(e) => {
+                crate::test_support::report_skip(&format!(
+                    "{} - GL not available: {e}",
+                    function!()
+                ));
+                return;
+            }
+        };
+        let (sw, sh, dw, dh) = (96usize, 72usize, 64usize, 48usize);
+        let bytes = rgba_gradient(sw, sh, 5);
+        let host_src = load_raw_image(sw, sh, PixelFormat::Rgba, Some(TensorMemory::Mem), &bytes)
+            .expect("host source");
+        let gpu_src = crate::test_support::gpu_buffer_allocated(
+            load_raw_image(
+                sw,
+                sh,
+                PixelFormat::Rgba,
+                Some(TensorMemory::DmaBuf),
+                &bytes,
+            ),
+            "GPU buffer source",
+        );
+        let image = |fmt: PixelFormat, memory: TensorMemory| -> Option<TensorDyn> {
+            if memory == TensorMemory::Pbo {
+                return worker
+                    .create_pbo_image(dw, dh, fmt)
+                    .ok()
+                    .map(TensorDyn::from);
+            }
+            TensorDyn::image(
+                dw,
+                dh,
+                fmt,
+                DType::U8,
+                Some(memory),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .ok()
+        };
+        let mut cases = vec![
+            (
+                ConvertPlan::SinglePass,
+                &host_src,
+                PixelFormat::Rgba,
+                TensorMemory::Mem,
+            ),
+            (
+                ConvertPlan::TwoPassNvPlanar,
+                &host_src,
+                PixelFormat::PlanarRgb,
+                TensorMemory::Mem,
+            ),
+            (
+                ConvertPlan::TwoPassGrey,
+                &host_src,
+                PixelFormat::Grey,
+                TensorMemory::Mem,
+            ),
+        ];
+        if cfg!(any(target_os = "linux", target_os = "windows")) {
+            cases.extend([
+                (
+                    ConvertPlan::SinglePass,
+                    &host_src,
+                    PixelFormat::Rgba,
+                    TensorMemory::Pbo,
+                ),
+                (
+                    ConvertPlan::TwoPassNvPlanar,
+                    &host_src,
+                    PixelFormat::PlanarRgb,
+                    TensorMemory::Pbo,
+                ),
+            ]);
+        }
+        if let Some(src) = gpu_src.as_ref() {
+            cases.extend([
+                (
+                    ConvertPlan::SinglePass,
+                    src,
+                    PixelFormat::Rgba,
+                    TensorMemory::DmaBuf,
+                ),
+                (
+                    ConvertPlan::SinglePass,
+                    src,
+                    PixelFormat::PlanarRgb,
+                    TensorMemory::DmaBuf,
+                ),
+                (
+                    ConvertPlan::TwoPassPackedRgb,
+                    src,
+                    PixelFormat::Rgb,
+                    TensorMemory::DmaBuf,
+                ),
+                (
+                    ConvertPlan::TwoPassGrey,
+                    src,
+                    PixelFormat::Grey,
+                    TensorMemory::DmaBuf,
+                ),
+                (
+                    ConvertPlan::ThreePassNv12,
+                    src,
+                    PixelFormat::Nv12,
+                    TensorMemory::DmaBuf,
+                ),
+            ]);
+        }
+        let mut covered = Vec::new();
+        for (want_plan, src, fmt, memory) in cases {
+            let case = format!("{:?} {fmt:?} {memory:?}", src.memory());
+            let (Some(mut blocking), Some(mut deferred)) = (image(fmt, memory), image(fmt, memory))
+            else {
+                crate::test_support::report_skip(&format!(
+                    "{} - {case}: destination not allocated",
+                    function!()
+                ));
+                continue;
+            };
+            let blocking_run = worker.with_st(|gl| {
+                gl.terminal_waits = 0;
+                gl.last_plan = None;
+                gl.convert(src, &mut blocking, None)
+                    .map(|()| (gl.last_plan, gl.terminal_waits))
+            });
+            let (plan, blocking_waits) = match blocking_run {
+                Ok(run) => run,
+                Err(e) => {
+                    crate::test_support::report_skip(&format!(
+                        "{} - {case}: GL declines it ({e})",
+                        function!()
+                    ));
+                    continue;
+                }
+            };
+            let (deferred_waits, pending) = worker.with_st(|gl| {
+                gl.terminal_waits = 0;
+                gl.convert_deferred(src, &mut deferred, None)
+                    .unwrap_or_else(|e| panic!("{case}: the deferred convert fails: {e}"));
+                let run = (gl.terminal_waits, gl.pending_flush);
+                gl.flush().expect("flush");
+                run
+            });
+            assert!(
+                blocking_waits >= 1,
+                "{case} ({plan:?}): the blocking convert waits"
+            );
+            assert_eq!(
+                deferred_waits, 0,
+                "{case} ({plan:?}): the deferred convert waits"
+            );
+            assert!(
+                pending,
+                "{case} ({plan:?}): the deferred convert owes a flush"
+            );
+            let (b, d) = (
+                blocking.as_u8().unwrap().map().unwrap(),
+                deferred.as_u8().unwrap().map().unwrap(),
+            );
+            assert_eq!(
+                b.as_slice(),
+                d.as_slice(),
+                "{case} ({plan:?}): deferred vs blocking"
+            );
+            if plan == Some(want_plan) {
+                covered.push(want_plan);
+            } else {
+                crate::test_support::report_skip(&format!(
+                    "{} - {case}: rendered by {plan:?}, not {want_plan:?}",
+                    function!()
+                ));
+            }
+        }
+        assert!(
+            covered.contains(&ConvertPlan::TwoPassNvPlanar)
+                && covered.contains(&ConvertPlan::TwoPassGrey),
+            "the host-source multi-pass plans render on every GL platform, covered {covered:?}"
+        );
+    }
+
+    /// The rows of `t` (a whole image or a band view), each `row_bytes` long, packed tight.
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    fn tight_rows(t: &TensorDyn, row_bytes: usize, rows: usize) -> Vec<u8> {
+        let t = t.as_u8().unwrap();
+        let stride = t.effective_row_stride().unwrap_or(row_bytes);
+        let map = t.map().unwrap();
+        (0..rows)
+            .flat_map(|r| map.as_slice()[r * stride..][..row_bytes].to_vec())
+            .collect()
+    }
+
+    /// Back-to-back deferred converts on the multi-pass plans, in one message with no CPU wait
+    /// between them, overwrite their shared intermediate texture while the previous convert's
+    /// second pass may still be reading it, and render what one blocking convert each renders.
+    /// The destinations are ones whose readback does not wait for the GPU: zero-copy GPU buffers,
+    /// PBOs, and band views of a tall GPU-buffer parent.
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    fn back_to_back_deferred_multi_pass_converts_match_blocking() {
+        use crate::opengl_headless::render::ConvertPlan;
+        if !is_opengl_available() {
+            crate::test_support::report_skip(&format!("{} - GL not available", function!()));
+            return;
+        }
+        let worker = match GLProcessorThreaded::new(None) {
+            Ok(w) => w,
+            Err(e) => {
+                crate::test_support::report_skip(&format!(
+                    "{} - GL not available: {e}",
+                    function!()
+                ));
+                return;
+            }
+        };
+        let (sw, sh, tile, count) = (96usize, 64usize, 32usize, 3usize);
+        let bytes = rgba_gradient(sw, sh, 11);
+        let src = load_raw_image(sw, sh, PixelFormat::Rgba, Some(TensorMemory::Mem), &bytes)
+            .expect("source");
+        let options = |i: usize| {
+            crate::ConvertOptions::new().source(Some(edgefirst_tensor::Region::new(
+                i * 24,
+                i * 8,
+                tile + 8 * i,
+                tile,
+            )))
+        };
+        // Destinations of `fmt` in `memory`: separate images, or bands of one tall parent.
+        let dsts =
+            |fmt: PixelFormat, memory: TensorMemory, banded: bool| -> Option<Vec<TensorDyn>> {
+                let image = |h: usize| -> Option<TensorDyn> {
+                    if memory == TensorMemory::Pbo {
+                        return worker
+                            .create_pbo_image(tile, h, fmt)
+                            .ok()
+                            .map(TensorDyn::from);
+                    }
+                    TensorDyn::image(
+                        tile,
+                        h,
+                        fmt,
+                        DType::U8,
+                        Some(memory),
+                        edgefirst_tensor::CpuAccess::ReadWrite,
+                    )
+                    .ok()
+                };
+                if banded {
+                    let parent = image(count * tile)?;
+                    (0..count)
+                        .map(|i| {
+                            parent
+                                .view(edgefirst_tensor::Region::new(0, i * tile, tile, tile))
+                                .ok()
+                        })
+                        .collect()
+                } else {
+                    (0..count).map(|_| image(tile)).collect()
+                }
+            };
+        let mut cases = vec![
+            (
+                ConvertPlan::TwoPassGrey,
+                PixelFormat::Grey,
+                TensorMemory::DmaBuf,
+                false,
+            ),
+            (
+                ConvertPlan::TwoPassNvPlanar,
+                PixelFormat::PlanarRgb,
+                TensorMemory::DmaBuf,
+                false,
+            ),
+            (
+                ConvertPlan::TwoPassGrey,
+                PixelFormat::Grey,
+                TensorMemory::DmaBuf,
+                true,
+            ),
+        ];
+        if cfg!(any(target_os = "linux", target_os = "windows")) {
+            cases.extend([
+                (
+                    ConvertPlan::TwoPassGrey,
+                    PixelFormat::Grey,
+                    TensorMemory::Pbo,
+                    false,
+                ),
+                (
+                    ConvertPlan::TwoPassNvPlanar,
+                    PixelFormat::PlanarRgb,
+                    TensorMemory::Pbo,
+                    false,
+                ),
+            ]);
+        }
+        let mut ran = 0;
+        for (want_plan, fmt, memory, banded) in cases {
+            let case = format!("{fmt:?} {memory:?}{}", if banded { " bands" } else { "" });
+            let (Some(mut blocking), Some(mut deferred)) =
+                (dsts(fmt, memory, banded), dsts(fmt, memory, banded))
+            else {
+                crate::test_support::report_skip(&format!(
+                    "{} - {case}: destination not allocated",
+                    function!()
+                ));
+                continue;
+            };
+            let blocked: Result<(), crate::Error> =
+                blocking.iter_mut().enumerate().try_for_each(|(i, dst)| {
+                    worker.with_st(|gl| gl.convert(&src, dst, Some(options(i))))
+                });
+            if let Err(e) = blocked {
+                crate::test_support::report_skip(&format!(
+                    "{} - {case}: GL declines it ({e})",
+                    function!()
+                ));
+                continue;
+            }
+            let (plans, waits) = worker.with_st(|gl| {
+                gl.terminal_waits = 0;
+                let plans: Vec<_> = deferred
+                    .iter_mut()
+                    .enumerate()
+                    .map(|(i, dst)| {
+                        gl.last_plan = None;
+                        gl.convert_deferred(&src, dst, Some(options(i)))
+                            .unwrap_or_else(|e| panic!("{case} convert {i}: deferred: {e}"));
+                        gl.last_plan
+                    })
+                    .collect();
+                let waits = gl.terminal_waits;
+                gl.flush().expect("flush");
+                (plans, waits)
+            });
+            if plans.iter().any(|p| *p != Some(want_plan)) {
+                crate::test_support::report_skip(&format!(
+                    "{} - {case}: rendered by {plans:?}, not {want_plan:?}",
+                    function!()
+                ));
+                continue;
+            }
+            assert_eq!(
+                waits, 0,
+                "{case}: the deferred converts waited between them"
+            );
+            let rows = tile * fmt.channels();
+            for (i, (b, d)) in blocking.iter().zip(&deferred).enumerate() {
+                assert_eq!(
+                    tight_rows(b, tile, rows),
+                    tight_rows(d, tile, rows),
+                    "{case} convert {i}: deferred vs blocking"
+                );
+            }
+            ran += 1;
+        }
+        if ran == 0 {
+            crate::test_support::report_skip(&format!(
+                "{} - no multi-pass destination on this host reads back without a CPU wait",
+                function!()
+            ));
+        }
+    }
+
+    /// RGBA images of `w`x`h` in host memory, one per entry of `crops`, with the options that
+    /// sample each crop.
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    fn mem_items(
+        w: usize,
+        h: usize,
+        crops: &[edgefirst_tensor::Region],
+    ) -> Vec<(TensorDyn, crate::ConvertOptions)> {
+        crops
+            .iter()
+            .map(|&crop| {
+                let dst = TensorDyn::image(
+                    w,
+                    h,
+                    PixelFormat::Rgba,
+                    DType::U8,
+                    Some(TensorMemory::Mem),
+                    edgefirst_tensor::CpuAccess::ReadWrite,
+                )
+                .expect("destination");
+                (dst, crate::ConvertOptions::new().source(Some(crop)))
+            })
+            .collect()
+    }
+
+    /// Work a deferred convert left owed stays owed across a fenced batch, in one message and
+    /// across messages, so a later flush still waits for it.
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    fn a_fenced_batch_keeps_earlier_deferred_work_owed() {
+        if !is_opengl_available() {
+            crate::test_support::report_skip(&format!("{} - GL not available", function!()));
+            return;
+        }
+        let mut worker = match GLProcessorThreaded::new(None) {
+            Ok(w) => w,
+            Err(e) => {
+                crate::test_support::report_skip(&format!(
+                    "{} - GL not available: {e}",
+                    function!()
+                ));
+                return;
+            }
+        };
+        let (sw, sh, tile) = (96usize, 64usize, 32usize);
+        let bytes = rgba_gradient(sw, sh, 13);
+        let src = load_raw_image(sw, sh, PixelFormat::Rgba, Some(TensorMemory::Mem), &bytes)
+            .expect("source");
+        let crops: Vec<_> = (0..3)
+            .map(|i| edgefirst_tensor::Region::new(i * tile, 0, tile, tile))
+            .collect();
+        let serializes = worker.with_st(|gl| gl.platform_caps().serialize_gl);
+
+        let mut earlier = mem_items(tile, tile, &crops[..1]);
+        let mut batch = mem_items(tile, tile, &crops);
+        let fence = worker.with_st(|gl| {
+            let (dst, options) = &mut earlier[0];
+            gl.convert_deferred(&src, dst, Some(*options))
+                .expect("earlier deferred convert");
+            let owed = gl.pending_flush;
+            assert!(owed, "the earlier deferred convert owes a flush");
+            for (dst, options) in &mut batch {
+                gl.convert_deferred(&src, dst, Some(*options))
+                    .expect("deferred tile");
+            }
+            let fence = gl.flush_pending_fenced(owed);
+            assert_eq!(
+                gl.pending_flush,
+                fence.is_some(),
+                "after an exported fence the earlier work is still owed; after a blocking sync nothing is"
+            );
+            gl.flush().expect("flush");
+            assert!(!gl.pending_flush, "the flush cleared the owed work");
+            fence
+        });
+        if let Some(fence) = fence {
+            crate::test_support::wait_completion_fence(fence);
+        }
+
+        let mut earlier = mem_items(tile, tile, &crops[..1]);
+        let mut batch = mem_items(tile, tile, &crops);
+        let (dst, options) = &mut earlier[0];
+        worker
+            .convert_deferred(&src, dst, Some(*options))
+            .expect("earlier deferred convert");
+        let (results, fence) = worker
+            .convert_batch(&src, &mut batch, true)
+            .expect("fenced batch");
+        assert!(results.iter().all(Result::is_ok), "every tile renders");
+        let pending = worker.with_st(|gl| gl.pending_flush);
+        assert_eq!(
+            pending,
+            !serializes && fence.is_some(),
+            "the earlier convert stays owed after a fenced batch on a worker that does not sync \
+             every message"
+        );
+        if let Some(fence) = fence {
+            crate::test_support::wait_completion_fence(fence);
+        }
+        worker.flush().expect("flush");
+        assert!(
+            !worker.with_st(|gl| gl.pending_flush),
+            "the flush cleared it"
+        );
+    }
+
+    /// A convert that fails after a draw that skipped its GPU wait leaves that draw owed, deferred
+    /// or fenced, and a worker that syncs every message leaves nothing pending after it.
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    fn a_convert_failing_after_its_draw_leaves_the_draw_owed() {
+        if !is_opengl_available() {
+            crate::test_support::report_skip(&format!("{} - GL not available", function!()));
+            return;
+        }
+        let mut worker = match GLProcessorThreaded::new(None) {
+            Ok(w) => w,
+            Err(e) => {
+                crate::test_support::report_skip(&format!(
+                    "{} - GL not available: {e}",
+                    function!()
+                ));
+                return;
+            }
+        };
+        let (sw, sh, tile) = (96usize, 64usize, 32usize);
+        let bytes = rgba_gradient(sw, sh, 17);
+        let src = load_raw_image(sw, sh, PixelFormat::Rgba, Some(TensorMemory::Mem), &bytes)
+            .expect("source");
+        let crop = [edgefirst_tensor::Region::new(0, 0, tile, tile)];
+        let serializes = worker.with_st(|gl| gl.platform_caps().serialize_gl);
+
+        let mut items = mem_items(tile, tile, &crop);
+        worker.with_st(|gl| {
+            gl.fail_readback = true;
+            let (dst, options) = &mut items[0];
+            assert!(gl.convert_deferred(&src, dst, Some(*options)).is_err());
+            assert!(
+                gl.pending_flush,
+                "a failed deferred convert leaves its draw owed"
+            );
+            gl.flush().expect("flush");
+            assert!(gl.convert_fenced(&src, dst, *options).is_err());
+            assert!(
+                gl.pending_flush,
+                "a failed fenced convert leaves its draw owed"
+            );
+            gl.flush().expect("flush");
+            assert!(!gl.pending_flush);
+        });
+
+        let (dst, options) = &mut items[0];
+        assert!(worker.convert_deferred(&src, dst, Some(*options)).is_err());
+        let pending = worker.with_st(|gl| {
+            let pending = gl.pending_flush;
+            gl.fail_readback = false;
+            pending
+        });
+        assert_eq!(
+            pending, !serializes,
+            "a worker that syncs every message completes the failed convert's draw before it \
+             releases the lock; any other keeps it owed"
+        );
+        worker.flush().expect("flush");
+    }
+
+    /// A fenced flush of a deferred batch leaves nothing pending, returns a fence only where the
+    /// platform exports one, and completes the converts the blocking flush completes.
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    fn a_fenced_batch_flush_leaves_nothing_pending() {
+        if !is_opengl_available() {
+            crate::test_support::report_skip(&format!("{} - GL not available", function!()));
+            return;
+        }
+        let worker = match GLProcessorThreaded::new(None) {
+            Ok(w) => w,
+            Err(e) => {
+                crate::test_support::report_skip(&format!(
+                    "{} - GL not available: {e}",
+                    function!()
+                ));
+                return;
+            }
+        };
+        let (sw, sh, tile) = (96usize, 64usize, 32usize);
+        let bytes = rgba_gradient(sw, sh, 9);
+        let src = load_raw_image(sw, sh, PixelFormat::Rgba, Some(TensorMemory::Mem), &bytes)
+            .expect("source");
+        let items = || -> Vec<(TensorDyn, crate::ConvertOptions)> {
+            (0..3)
+                .map(|i| {
+                    let dst = TensorDyn::image(
+                        tile,
+                        tile,
+                        PixelFormat::Rgba,
+                        DType::U8,
+                        Some(TensorMemory::Mem),
+                        edgefirst_tensor::CpuAccess::ReadWrite,
+                    )
+                    .expect("tile");
+                    let options = crate::ConvertOptions::new()
+                        .source(Some(edgefirst_tensor::Region::new(i * tile, 0, tile, tile)));
+                    (dst, options)
+                })
+                .collect()
+        };
+        let (mut blocking_items, mut fenced_items) = (items(), items());
+        let native_fence = worker.with_st(|gl| gl.platform_caps().native_fence_sync);
+
+        let (fence, idle_fence, state) = worker.with_st(|gl| {
+            for (dst, options) in &mut blocking_items {
+                gl.convert_deferred(&src, dst, Some(*options))
+                    .expect("deferred tile");
+            }
+            gl.flush().expect("flush");
+            for (dst, options) in &mut fenced_items {
+                gl.convert_deferred(&src, dst, Some(*options))
+                    .expect("deferred tile");
+            }
+            assert!(gl.pending_flush, "the deferred tiles owe a flush");
+            let fence = gl.flush_pending_fenced(false);
+            let state = (gl.pending_flush, gl.pending_submit, gl.pending_recorded);
+            (fence, gl.flush_pending_fenced(false), state)
+        });
+        assert_eq!(
+            state,
+            (false, false, None),
+            "the fenced flush left work pending"
+        );
+        assert!(
+            idle_fence.is_none(),
+            "a flush with nothing pending returns no fence"
+        );
+        if !native_fence {
+            assert!(fence.is_none(), "this platform exports no native fence");
+        }
+        if let Some(fence) = fence {
+            crate::test_support::wait_completion_fence(fence);
+        }
+        for (i, ((b, _), (f, _))) in blocking_items.iter().zip(&fenced_items).enumerate() {
+            assert_eq!(
+                b.as_u8().unwrap().map().unwrap().as_slice(),
+                f.as_u8().unwrap().map().unwrap().as_slice(),
+                "tile {i}: fenced vs blocking"
+            );
+        }
     }
 
     /// A float zero-copy source import matches the CPU-upload feed bit for bit, source untouched.
@@ -2958,28 +3667,24 @@ mod gl_tests {
         }
     }
 
-    /// The lock every GL-environment guard below holds while its variable is set.
-    fn lock_gl_env() -> std::sync::MutexGuard<'static, ()> {
-        static GL_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        GL_ENV.lock().unwrap_or_else(|e| e.into_inner())
+    /// The process's GL environment settings with `edit` applied.
+    fn gl_env(
+        edit: impl FnOnce(&mut crate::opengl_headless::processor::GlEnv),
+    ) -> crate::opengl_headless::processor::GlEnv {
+        let mut env = crate::opengl_headless::processor::GlEnv::from_process();
+        edit(&mut env);
+        env
     }
 
-    /// Sets `EDGEFIRST_GL_SERIALIZE` until dropped, holding [`lock_gl_env`].
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
-    struct SerializeEnvGuard(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
-    impl SerializeEnvGuard {
-        fn set(v: &str) -> Self {
-            let held = lock_gl_env();
-            std::env::set_var("EDGEFIRST_GL_SERIALIZE", v);
-            SerializeEnvGuard(held)
-        }
-    }
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
-    impl Drop for SerializeEnvGuard {
-        fn drop(&mut self) {
-            std::env::remove_var("EDGEFIRST_GL_SERIALIZE");
-        }
+    /// A worker whose processor setup fails hands the error back from the constructor.
+    #[test]
+    fn a_failed_worker_setup_returns_its_error() {
+        let err = GLProcessorThreaded::with_env(None, None, gl_env(|e| e.fail_setup = true))
+            .expect_err("setup refused");
+        assert!(
+            matches!(&err, crate::Error::NotSupported(m) if m.contains("test hook")),
+            "{err:?}"
+        );
     }
 
     /// A PBO source owned by another processor's context is refused under the `Full` policy.
@@ -2991,9 +3696,18 @@ mod gl_tests {
             return;
         }
 
-        let _serialize = SerializeEnvGuard::set("full");
-        let mut gl_a = GLProcessorThreaded::new(None).unwrap();
-        let gl_b = GLProcessorThreaded::new(None).unwrap();
+        let mut gl_a = GLProcessorThreaded::with_env(
+            None,
+            None,
+            gl_env(|e| e.serialize = Some("full".into())),
+        )
+        .unwrap();
+        let gl_b = GLProcessorThreaded::with_env(
+            None,
+            None,
+            gl_env(|e| e.serialize = Some("full".into())),
+        )
+        .unwrap();
 
         let pbo_src = gl_b
             .create_pbo_image(64, 64, PixelFormat::Rgba)
@@ -3020,6 +3734,22 @@ mod gl_tests {
         );
     }
 
+    /// Whether this driver's own policy is `LifecycleOnly` and the process does not force `Full`
+    /// through `EDGEFIRST_GL_SERIALIZE`.
+    #[cfg(target_os = "linux")]
+    fn driver_allows_lifecycle() -> bool {
+        if crate::opengl_headless::processor::GlEnv::from_process()
+            .serialize
+            .as_deref()
+            == Some("full")
+        {
+            return false;
+        }
+        GLProcessorThreaded::new(None)
+            .map(|p| !p.with_st(|gl| gl.platform_caps().serialize_gl))
+            .unwrap_or(false)
+    }
+
     /// A PBO source owned by another processor's context converts through its owner's map.
     #[test]
     #[cfg(target_os = "linux")]
@@ -3028,9 +3758,25 @@ mod gl_tests {
             crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
             return;
         }
-        let _serialize = SerializeEnvGuard::set("lifecycle");
-        let mut gl_a = GLProcessorThreaded::new(None).unwrap();
-        let gl_b = GLProcessorThreaded::new(None).unwrap();
+        if !driver_allows_lifecycle() {
+            crate::test_support::report_skip(&format!(
+                "{} - this driver serializes every GL message (Full policy)",
+                function!()
+            ));
+            return;
+        }
+        let mut gl_a = GLProcessorThreaded::with_env(
+            None,
+            None,
+            gl_env(|e| e.serialize = Some("lifecycle".into())),
+        )
+        .unwrap();
+        let gl_b = GLProcessorThreaded::with_env(
+            None,
+            None,
+            gl_env(|e| e.serialize = Some("lifecycle".into())),
+        )
+        .unwrap();
         let (w, h) = (320usize, 240usize);
         let foreign = rgba8_pbo(&gl_b, w, h);
         stamp_rgba8_positionally(&foreign, w, h);
@@ -3074,9 +3820,25 @@ mod gl_tests {
             crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
             return;
         }
-        let _serialize = SerializeEnvGuard::set("lifecycle");
-        let mut gl_a = GLProcessorThreaded::new(None).unwrap();
-        let gl_b = GLProcessorThreaded::new(None).unwrap();
+        if !driver_allows_lifecycle() {
+            crate::test_support::report_skip(&format!(
+                "{} - this driver serializes every GL message (Full policy)",
+                function!()
+            ));
+            return;
+        }
+        let mut gl_a = GLProcessorThreaded::with_env(
+            None,
+            None,
+            gl_env(|e| e.serialize = Some("lifecycle".into())),
+        )
+        .unwrap();
+        let gl_b = GLProcessorThreaded::with_env(
+            None,
+            None,
+            gl_env(|e| e.serialize = Some("lifecycle".into())),
+        )
+        .unwrap();
         let (w, h) = (320usize, 240usize);
         let access = edgefirst_tensor::CpuAccess::ReadWrite;
         let cm = edgefirst_tensor::Colorimetry::default()
@@ -3130,6 +3892,20 @@ mod gl_tests {
             }
             _ => false,
         }
+    }
+
+    /// On Vivante, asserts that `result` is the GL backend's decline of a multiplane NV source
+    /// and returns `true`; elsewhere returns `false`.
+    #[cfg(target_os = "linux")]
+    fn vivante_declined_multiplane(gl: &GLProcessorThreaded, result: &crate::Result<()>) -> bool {
+        if !gl.with_st(|st| st.is_vivante) {
+            return false;
+        }
+        assert!(
+            matches!(result, Err(crate::Error::NotSupported(m)) if m.contains("Vivante external sampler")),
+            "Vivante must decline a multiplane NV12 source, got {result:?}"
+        );
+        true
     }
 
     /// Load NV12 raw bytes into separate DMA-backed luma and chroma tensors and return a
@@ -3186,10 +3962,14 @@ mod gl_tests {
         let src_multiplane = load_multiplane_nv12_dma(1280, 720, nv12_bytes);
         assert!(src_multiplane.as_u8().unwrap().is_multiplane());
 
-        // Both sources are pinned to `ExternalSampler`.
-        let _nv_path = NvPathEnvGuard::set("sampler");
+        // Requests `ExternalSampler` for both sources.
 
-        let mut gl = GLProcessorThreaded::new(None).unwrap();
+        let mut gl = GLProcessorThreaded::with_env(
+            None,
+            None,
+            gl_env(|e| e.nv_convert_path = Some("sampler".into())),
+        )
+        .unwrap();
 
         // Convert contiguous
         let dst_contig = TensorDyn::image(
@@ -3219,6 +3999,9 @@ mod gl_tests {
         let src_multiplane_dyn = src_multiplane;
         let mut dst_multi_dyn = dst_multi;
         let result = gl.convert(&src_multiplane_dyn, &mut dst_multi_dyn, None);
+        if vivante_declined_multiplane(&gl, &result) {
+            return;
+        }
         if declined_separate_chroma(&result, function!()) {
             return;
         }
@@ -3279,8 +4062,7 @@ mod gl_tests {
             .with_stride(stride)
             .with_offset(y_size);
 
-        // Both sources are pinned to `ExternalSampler`.
-        let _nv_path = NvPathEnvGuard::set("sampler");
+        // Requests `ExternalSampler` for both sources.
 
         let proc = crate::ImageProcessor::new().unwrap();
         let src = proc
@@ -3306,7 +4088,12 @@ mod gl_tests {
         )
         .unwrap();
 
-        let mut gl = GLProcessorThreaded::new(None).unwrap();
+        let mut gl = GLProcessorThreaded::with_env(
+            None,
+            None,
+            gl_env(|e| e.nv_convert_path = Some("sampler".into())),
+        )
+        .unwrap();
 
         // Render the same-fd two-plane source.
         let mut dst_same_fd = TensorDyn::image(
@@ -3318,7 +4105,11 @@ mod gl_tests {
             edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
-        gl.convert(&src, &mut dst_same_fd, None).unwrap();
+        let result = gl.convert(&src, &mut dst_same_fd, None);
+        if vivante_declined_multiplane(&gl, &result) {
+            return;
+        }
+        result.unwrap();
 
         // Render contiguous reference
         let mut dst_contig = TensorDyn::image(
@@ -3351,8 +4142,7 @@ mod gl_tests {
             return;
         }
 
-        // Both sources are pinned to `ExternalSampler`.
-        let _nv_path = NvPathEnvGuard::set("sampler");
+        // Requests `ExternalSampler` for both sources.
 
         let nv12_bytes: &[u8] = &edgefirst_bench::testdata::read("camera720p.nv12");
 
@@ -3367,7 +4157,12 @@ mod gl_tests {
         let src_multiplane = load_multiplane_nv12_dma(1280, 720, nv12_bytes);
 
         let crop = letterbox_crop(1280, 720, 640, 640);
-        let mut gl = GLProcessorThreaded::new(None).unwrap();
+        let mut gl = GLProcessorThreaded::with_env(
+            None,
+            None,
+            gl_env(|e| e.nv_convert_path = Some("sampler".into())),
+        )
+        .unwrap();
 
         // Contiguous → packed PixelFormat::Rgb with letterbox
         let dst_contig = TensorDyn::image(
@@ -3405,6 +4200,9 @@ mod gl_tests {
             &mut dst_multi_dyn,
             Some(crate::ConvertOptions::new().crop(crop)),
         );
+        if vivante_declined_multiplane(&gl, &result) {
+            return;
+        }
         if declined_separate_chroma(&result, function!()) {
             return;
         }
@@ -3428,8 +4226,7 @@ mod gl_tests {
             return;
         }
 
-        // Both sources are pinned to `ExternalSampler`.
-        let _nv_path = NvPathEnvGuard::set("sampler");
+        // Requests `ExternalSampler` for both sources.
 
         let nv12_bytes: &[u8] = &edgefirst_bench::testdata::read("camera720p.nv12");
 
@@ -3444,7 +4241,12 @@ mod gl_tests {
         let src_multiplane = load_multiplane_nv12_dma(1280, 720, nv12_bytes);
 
         let crop = letterbox_crop(1280, 720, 640, 640);
-        let mut gl = GLProcessorThreaded::new(None).unwrap();
+        let mut gl = GLProcessorThreaded::with_env(
+            None,
+            None,
+            gl_env(|e| e.nv_convert_path = Some("sampler".into())),
+        )
+        .unwrap();
 
         // Contiguous → packed PixelFormat::Rgb int8 with letterbox
         let dst_contig = TensorDyn::image(
@@ -3482,6 +4284,9 @@ mod gl_tests {
             &mut dst_multi_dyn,
             Some(crate::ConvertOptions::new().crop(crop)),
         );
+        if vivante_declined_multiplane(&gl, &result) {
+            return;
+        }
         if declined_separate_chroma(&result, function!()) {
             return;
         }
@@ -4292,36 +5097,6 @@ mod gl_tests {
         dst
     }
 
-    /// Forces `has_float_linear` off for processors created in scope.
-    struct FloatLinearEnvGuard(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
-    impl FloatLinearEnvGuard {
-        fn set() -> Self {
-            let held = lock_gl_env();
-            std::env::set_var("EDGEFIRST_GL_NO_FLOAT_LINEAR", "1");
-            FloatLinearEnvGuard(held)
-        }
-    }
-    impl Drop for FloatLinearEnvGuard {
-        fn drop(&mut self) {
-            std::env::remove_var("EDGEFIRST_GL_NO_FLOAT_LINEAR");
-        }
-    }
-
-    /// Opts processors created in scope into the GLES 3.1 compute-shader proto repack.
-    struct ProtoComputeEnvGuard(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
-    impl ProtoComputeEnvGuard {
-        fn set() -> Self {
-            let held = lock_gl_env();
-            std::env::set_var("EDGEFIRST_PROTO_COMPUTE", "1");
-            ProtoComputeEnvGuard(held)
-        }
-    }
-    impl Drop for ProtoComputeEnvGuard {
-        fn drop(&mut self) {
-            std::env::remove_var("EDGEFIRST_PROTO_COMPUTE");
-        }
-    }
-
     /// The F32 and F16 proto renders agree with the int8 fused reference.
     #[test]
     fn proto_float_dtypes_match_int8_reference() {
@@ -4356,8 +5131,9 @@ mod gl_tests {
             render_proto_to_rgba(&mut gl, &boxes, &proto_f32)
         };
         let dst_fallback = {
-            let _guard = FloatLinearEnvGuard::set();
-            let mut gl = GLProcessorThreaded::new(None).unwrap();
+            let mut gl =
+                GLProcessorThreaded::with_env(None, None, gl_env(|e| e.no_float_linear = true))
+                    .unwrap();
             render_proto_to_rgba(&mut gl, &boxes, &proto_f32)
         };
 
@@ -4378,8 +5154,9 @@ mod gl_tests {
             render_proto_to_rgba(&mut gl, &boxes, &proto_i8)
         };
         let dst_compute = {
-            let _guard = ProtoComputeEnvGuard::set();
-            let mut gl = GLProcessorThreaded::new(None).unwrap();
+            let mut gl =
+                GLProcessorThreaded::with_env(None, None, gl_env(|e| e.proto_compute = true))
+                    .unwrap();
             render_proto_to_rgba(&mut gl, &boxes, &proto_i8)
         };
 
@@ -5262,8 +6039,7 @@ mod gl_tests {
             return;
         }
 
-        // Both sources are pinned to `ExternalSampler`.
-        let _nv_path = NvPathEnvGuard::set("sampler");
+        // Requests `ExternalSampler` for both sources.
 
         let nv12_bytes: &[u8] = &edgefirst_bench::testdata::read("camera720p.nv12");
         let width: usize = 1280;
@@ -5324,7 +6100,12 @@ mod gl_tests {
         )
         .unwrap();
 
-        let mut gl = GLProcessorThreaded::new(None).unwrap();
+        let mut gl = GLProcessorThreaded::with_env(
+            None,
+            None,
+            gl_env(|e| e.nv_convert_path = Some("sampler".into())),
+        )
+        .unwrap();
 
         // Render the two-plane source.
         let mut dst_multi = TensorDyn::image(
@@ -5337,6 +6118,9 @@ mod gl_tests {
         )
         .unwrap();
         let result = gl.convert(&src, &mut dst_multi, None);
+        if vivante_declined_multiplane(&gl, &result) {
+            return;
+        }
         if declined_separate_chroma(&result, function!()) {
             // On a decline, `ImageProcessor` converts on the CPU and matches the CPU's convert of
             // the contiguous bytes.
@@ -7223,7 +8007,7 @@ mod gl_tests {
     #[test]
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn test_gpu_nv16_to_rgba_shader_r8() {
-        use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
+        use crate::opengl_headless::processor::NvConvertPath;
         if !is_gpu_image_buffer_available() {
             crate::test_support::report_skip(&format!(
                 "{} - no zero-copy GPU buffers",
@@ -7260,7 +8044,7 @@ mod gl_tests {
         )
         .unwrap();
 
-        let mut gl = match GLProcessorST::new(None, None) {
+        let worker = match GLProcessorThreaded::new(None) {
             Ok(g) => g,
             Err(e) => {
                 crate::test_support::report_skip(&format!(
@@ -7270,6 +8054,7 @@ mod gl_tests {
                 return;
             }
         };
+        worker.with_st(|gl| {
 
         gl.convert(&src, &mut dst, None).unwrap();
 
@@ -7295,58 +8080,26 @@ mod gl_tests {
                 expected[0], expected[1], expected[2]
             );
         }
+        });
     }
 
-    /// Sets `EDGEFIRST_NV_CONVERT_PATH` and removes it on drop.
-    #[cfg(target_os = "linux")]
-    struct NvPathEnvGuard;
-    #[cfg(target_os = "linux")]
-    impl NvPathEnvGuard {
-        fn set(v: &str) -> Self {
-            std::env::set_var("EDGEFIRST_NV_CONVERT_PATH", v);
-            NvPathEnvGuard
-        }
-    }
-    #[cfg(target_os = "linux")]
-    impl Drop for NvPathEnvGuard {
-        fn drop(&mut self) {
-            std::env::remove_var("EDGEFIRST_NV_CONVERT_PATH");
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    struct ColorimetryEnvGuard;
-    #[cfg(target_os = "linux")]
-    impl ColorimetryEnvGuard {
-        fn set(v: &str) -> Self {
-            std::env::set_var("EDGEFIRST_COLORIMETRY", v);
-            ColorimetryEnvGuard
-        }
-    }
-    #[cfg(target_os = "linux")]
-    impl Drop for ColorimetryEnvGuard {
-        fn drop(&mut self) {
-            std::env::remove_var("EDGEFIRST_COLORIMETRY");
-        }
-    }
-
-    /// Colorimetry mode, source colorimetry and `EDGEFIRST_COLORIMETRY` pick the `auto` NV12 path.
+    /// `auto` takes `ShaderR8` for single-plane NV12, for BT.709 and BT.601 sources, into RGBA
+    /// and Grey.
     #[test]
     #[cfg(target_os = "linux")]
-    fn colorimetry_mode_policy_nv12_auto() {
+    fn nv12_auto_path_is_shader_r8_for_every_source_coding() {
         if !is_opengl_available() {
             crate::test_support::report_skip(&format!("{} - GL not available", function!()));
             return;
         }
         use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
-        use crate::ColorimetryMode;
         use edgefirst_tensor::{ColorEncoding, ColorRange, Colorimetry};
 
         if !is_dma_available() {
             crate::test_support::report_skip(&format!("{} - DMA not available", function!()));
             return;
         }
-        let mut gl = match GLProcessorST::new(None, None) {
+        let worker = match GLProcessorThreaded::new(None) {
             Ok(g) => g,
             Err(e) => {
                 crate::test_support::report_skip(&format!(
@@ -7356,7 +8109,6 @@ mod gl_tests {
                 return;
             }
         };
-
         let (w, h) = (64usize, 64usize);
         let mut nv12 = vec![128u8; w * h * 3 / 2];
         nv12[..w * h].fill(100);
@@ -7379,81 +8131,48 @@ mod gl_tests {
             edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
-        let mut path_for = |gl: &mut GLProcessorST, src: &TensorDyn| {
-            gl.convert(src, &mut dst, None).unwrap();
+        let path_for = |gl: &mut GLProcessorST, src: &TensorDyn, dst: &mut TensorDyn| {
+            gl.convert(src, dst, None).unwrap();
             gl.last_nv_convert_path
         };
+        worker.with_st(|gl| {
+            for (name, src) in [("BT.709-full", &src_709), ("BT.601-limited", &src_601)] {
+                assert_eq!(
+                    path_for(gl, src, &mut dst),
+                    NvConvertPath::ShaderR8,
+                    "{name} NV12"
+                );
+            }
 
-        // Fast (default): the sampler on Vivante, the in-shader matrix everywhere else.
-        let expect_fast = if gl.is_vivante {
-            NvConvertPath::ExternalSampler
-        } else {
-            NvConvertPath::ShaderR8
-        };
-        assert_eq!(
-            path_for(&mut gl, &src_709),
-            expect_fast,
-            "Fast mode, BT.709-full NV12"
-        );
-
-        // Exact: the in-shader matrix everywhere for a BT.709 source.
-        gl.set_colorimetry_mode(ColorimetryMode::Exact);
-        assert_eq!(
-            path_for(&mut gl, &src_709),
-            NvConvertPath::ShaderR8,
-            "Exact mode, BT.709-full NV12"
-        );
-        // Exact with a BT.601-limited source: the sampler on Vivante.
-        assert_eq!(
-            path_for(&mut gl, &src_601),
-            expect_fast,
-            "Exact mode, BT.601-limited NV12"
-        );
-
-        // A Grey destination takes `ShaderR8` in either mode.
-        let mut grey_dst = TensorDyn::image(
-            w,
-            h,
-            PixelFormat::Grey,
-            DType::U8,
-            Some(TensorMemory::DmaBuf),
-            edgefirst_tensor::CpuAccess::ReadWrite,
-        )
-        .unwrap();
-        let mut grey_path = |gl: &mut GLProcessorST, src: &TensorDyn| {
-            gl.convert(src, &mut grey_dst, None).unwrap();
-            gl.last_nv_convert_path
-        };
-        gl.set_colorimetry_mode(ColorimetryMode::Fast);
-        assert_eq!(
-            grey_path(&mut gl, &src_709),
-            NvConvertPath::ShaderR8,
-            "Fast mode, BT.709 NV12 → Grey must avoid the sampler (R8 target)"
-        );
-        gl.set_colorimetry_mode(ColorimetryMode::Exact);
-        assert_eq!(
-            grey_path(&mut gl, &src_601),
-            NvConvertPath::ShaderR8,
-            "Exact mode, BT.601-limited NV12 → Grey must avoid the sampler (R8 target)"
-        );
-
-        // `EDGEFIRST_COLORIMETRY=exact` keeps a Fast request at Exact.
-        drop(gl);
-        let _env = ColorimetryEnvGuard::set("exact");
-        let mut gl = GLProcessorST::new(None, None).unwrap();
-        gl.set_colorimetry_mode(ColorimetryMode::Fast);
-        assert_eq!(
-            path_for(&mut gl, &src_709),
-            NvConvertPath::ShaderR8,
-            "env-pinned Exact must override set_colorimetry_mode(Fast)"
-        );
+            // A Grey destination takes `ShaderR8`.
+            let mut grey_dst = TensorDyn::image(
+                w,
+                h,
+                PixelFormat::Grey,
+                DType::U8,
+                Some(TensorMemory::DmaBuf),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .unwrap();
+            let mut grey_path = |gl: &mut GLProcessorST, src: &TensorDyn| {
+                gl.convert(src, &mut grey_dst, None).unwrap();
+                gl.last_nv_convert_path
+            };
+            for (name, src) in [("BT.709-full", &src_709), ("BT.601-limited", &src_601)] {
+                assert_eq!(
+                    grey_path(gl, src),
+                    NvConvertPath::ShaderR8,
+                    "{name} NV12 → Grey must avoid the sampler (R8 target)"
+                );
+            }
+        });
     }
 
     /// `EDGEFIRST_NV_CONVERT_PATH` selects the NV12 GPU conversion path.
     #[test]
     #[cfg(target_os = "linux")]
     fn test_nv12_path_env_override() {
-        use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
+        use crate::opengl_headless::processor::NvConvertPath;
         if !is_dma_available() {
             crate::test_support::report_skip(&format!("{} - DMA not available", function!()));
             return;
@@ -7466,13 +8185,12 @@ mod gl_tests {
         }
 
         let run = |env: Option<&str>| -> Option<(NvConvertPath, bool)> {
-            // The variable is set for this construction only.
-            let gl = {
-                std::env::remove_var("EDGEFIRST_NV_CONVERT_PATH");
-                let _guard = env.map(NvPathEnvGuard::set);
-                GLProcessorST::new(None, None)
-            };
-            let mut gl = match gl {
+            let worker = GLProcessorThreaded::with_env(
+                None,
+                None,
+                gl_env(|e| e.nv_convert_path = env.map(str::to_string)),
+            );
+            let worker = match worker {
                 Ok(g) => g,
                 Err(e) => {
                     crate::test_support::report_skip(&format!(
@@ -7499,19 +8217,17 @@ mod gl_tests {
                 edgefirst_tensor::CpuAccess::ReadWrite,
             )
             .unwrap();
-            gl.convert(&src, &mut dst, None).unwrap();
-            Some((gl.last_nv_convert_path, gl.is_vivante))
+            Some(worker.with_st(|gl| {
+                gl.convert(&src, &mut dst, None).unwrap();
+                (gl.last_nv_convert_path, gl.is_vivante)
+            }))
         };
 
-        if let Some((p, is_vivante)) = run(None) {
-            let expect = if is_vivante {
-                NvConvertPath::ExternalSampler
-            } else {
-                NvConvertPath::ShaderR8
-            };
+        if let Some((p, _)) = run(None) {
             assert_eq!(
-                p, expect,
-                "auto default: single-plane full-range NV12 policy pick"
+                p,
+                NvConvertPath::ShaderR8,
+                "auto default: single-plane full-range NV12 takes ShaderR8"
             );
         }
         if let Some((p, _)) = run(Some("shader")) {
@@ -7521,12 +8237,20 @@ mod gl_tests {
                 "forced shader must use ShaderR8"
             );
         }
-        if let Some((p, _)) = run(Some("sampler")) {
-            assert_ne!(
-                p,
-                NvConvertPath::ShaderR8,
-                "forced sampler must NOT use ShaderR8 (got ExternalSampler or Cpu)"
-            );
+        if let Some((p, is_vivante)) = run(Some("sampler")) {
+            if is_vivante {
+                assert_eq!(
+                    p,
+                    NvConvertPath::ShaderR8,
+                    "Vivante must refuse a forced sampler and use ShaderR8"
+                );
+            } else {
+                assert_ne!(
+                    p,
+                    NvConvertPath::ShaderR8,
+                    "forced sampler must NOT use ShaderR8 (got ExternalSampler or Cpu)"
+                );
+            }
         }
     }
 
@@ -7534,7 +8258,7 @@ mod gl_tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn test_nv12_nondma_upload_uses_shader() {
-        use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
+        use crate::opengl_headless::processor::NvConvertPath;
         if !is_opengl_available() {
             crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
             return;
@@ -7549,7 +8273,7 @@ mod gl_tests {
         }
         bytes.extend(std::iter::repeat_n(128u8, w * h / 2)); // neutral chroma
 
-        let mut gl = match GLProcessorST::new(None, None) {
+        let worker = match GLProcessorThreaded::new(None) {
             Ok(g) => g,
             Err(e) => {
                 crate::test_support::report_skip(&format!(
@@ -7559,52 +8283,53 @@ mod gl_tests {
                 return;
             }
         };
-
-        let mem_src =
-            load_raw_image(w, h, PixelFormat::Nv12, Some(TensorMemory::Mem), &bytes).unwrap();
-        let mut gpu_dst = TensorDyn::image(
-            w,
-            h,
-            PixelFormat::Rgba,
-            DType::U8,
-            None,
-            edgefirst_tensor::CpuAccess::ReadWrite,
-        )
-        .unwrap();
-        gl.convert(&mem_src, &mut gpu_dst, None).unwrap();
-        assert_eq!(
-            gl.last_nv_convert_path,
-            NvConvertPath::ShaderR8,
-            "non-DMA NV12 must use the R8-upload ShaderR8 path, not CPU (got {:?})",
-            gl.last_nv_convert_path
-        );
-
-        // CPU reference.
-        let cpu_src =
-            load_raw_image(w, h, PixelFormat::Nv12, Some(TensorMemory::Mem), &bytes).unwrap();
-        let mut cpu_dst = TensorDyn::image(
-            w,
-            h,
-            PixelFormat::Rgba,
-            DType::U8,
-            None,
-            edgefirst_tensor::CpuAccess::ReadWrite,
-        )
-        .unwrap();
-        crate::cpu::CPUProcessor::new()
-            .convert(&cpu_src, &mut cpu_dst, None)
+        worker.with_st(|gl| {
+            let mem_src =
+                load_raw_image(w, h, PixelFormat::Nv12, Some(TensorMemory::Mem), &bytes).unwrap();
+            let mut gpu_dst = TensorDyn::image(
+                w,
+                h,
+                PixelFormat::Rgba,
+                DType::U8,
+                None,
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
             .unwrap();
+            gl.convert(&mem_src, &mut gpu_dst, None).unwrap();
+            assert_eq!(
+                gl.last_nv_convert_path,
+                NvConvertPath::ShaderR8,
+                "non-DMA NV12 must use the R8-upload ShaderR8 path, not CPU (got {:?})",
+                gl.last_nv_convert_path
+            );
 
-        let gpu_map = gpu_dst.as_u8().unwrap().map().unwrap();
-        let cpu_map = cpu_dst.as_u8().unwrap().map().unwrap();
-        assert_pixels_match(cpu_map.as_slice(), gpu_map.as_slice(), 2);
+            // CPU reference.
+            let cpu_src =
+                load_raw_image(w, h, PixelFormat::Nv12, Some(TensorMemory::Mem), &bytes).unwrap();
+            let mut cpu_dst = TensorDyn::image(
+                w,
+                h,
+                PixelFormat::Rgba,
+                DType::U8,
+                None,
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .unwrap();
+            crate::cpu::CPUProcessor::new()
+                .convert(&cpu_src, &mut cpu_dst, None)
+                .unwrap();
+
+            let gpu_map = gpu_dst.as_u8().unwrap().map().unwrap();
+            let cpu_map = cpu_dst.as_u8().unwrap().map().unwrap();
+            assert_pixels_match(cpu_map.as_slice(), gpu_map.as_slice(), 2);
+        });
     }
 
     /// NV12 (DMA) to PlanarRgb routes through the `ShaderR8` two-pass and matches the CPU.
     #[test]
     #[cfg(target_os = "linux")]
     fn test_nv12_to_planar_rgb_uses_shader_path() {
-        use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
+        use crate::opengl_headless::processor::NvConvertPath;
         if !is_dma_available() {
             crate::test_support::report_skip(&format!("{} - DMA not available", function!()));
             return;
@@ -7632,7 +8357,7 @@ mod gl_tests {
             ));
         }
 
-        let mut gl = match GLProcessorST::new(None, None) {
+        let worker = match GLProcessorThreaded::new(None) {
             Ok(g) => g,
             Err(e) => {
                 crate::test_support::report_skip(&format!(
@@ -7642,43 +8367,45 @@ mod gl_tests {
                 return;
             }
         };
-        gl.set_colorimetry_mode(crate::ColorimetryMode::Exact);
-        let mut src =
-            load_raw_image(w, h, PixelFormat::Nv12, Some(TensorMemory::DmaBuf), &bytes).unwrap();
-        tag(&mut src);
-        let mut dst = TensorDyn::image(
-            w,
-            h,
-            PixelFormat::PlanarRgb,
-            DType::U8,
-            Some(TensorMemory::DmaBuf),
-            edgefirst_tensor::CpuAccess::ReadWrite,
-        )
-        .unwrap();
-        gl.convert(&src, &mut dst, None).unwrap();
-        assert_eq!(
-            gl.last_nv_convert_path,
-            NvConvertPath::ShaderR8,
-            "NV12→PlanarRgb in Exact mode must use the ShaderR8 two-pass, not the driver sampler"
-        );
-
-        // CPU planar reference.
-        let mut cpu_src =
-            load_raw_image(w, h, PixelFormat::Nv12, Some(TensorMemory::Mem), &bytes).unwrap();
-        tag(&mut cpu_src);
-        let mut cpu_dst = TensorDyn::image(
-            w,
-            h,
-            PixelFormat::PlanarRgb,
-            DType::U8,
-            None,
-            edgefirst_tensor::CpuAccess::ReadWrite,
-        )
-        .unwrap();
-        crate::cpu::CPUProcessor::new()
-            .convert(&cpu_src, &mut cpu_dst, None)
+        worker.with_st(|gl| {
+            let mut src =
+                load_raw_image(w, h, PixelFormat::Nv12, Some(TensorMemory::DmaBuf), &bytes)
+                    .unwrap();
+            tag(&mut src);
+            let mut dst = TensorDyn::image(
+                w,
+                h,
+                PixelFormat::PlanarRgb,
+                DType::U8,
+                Some(TensorMemory::DmaBuf),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
             .unwrap();
-        compare_images(&cpu_dst, &dst, 0.95, "nv12_to_planar_rgb_shader");
+            gl.convert(&src, &mut dst, None).unwrap();
+            assert_eq!(
+                gl.last_nv_convert_path,
+                NvConvertPath::ShaderR8,
+                "NV12→PlanarRgb must use the ShaderR8 two-pass, not the driver sampler"
+            );
+
+            // CPU planar reference.
+            let mut cpu_src =
+                load_raw_image(w, h, PixelFormat::Nv12, Some(TensorMemory::Mem), &bytes).unwrap();
+            tag(&mut cpu_src);
+            let mut cpu_dst = TensorDyn::image(
+                w,
+                h,
+                PixelFormat::PlanarRgb,
+                DType::U8,
+                None,
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .unwrap();
+            crate::cpu::CPUProcessor::new()
+                .convert(&cpu_src, &mut cpu_dst, None)
+                .unwrap();
+            compare_images(&cpu_dst, &dst, 0.95, "nv12_to_planar_rgb_shader");
+        });
     }
 
     /// A 1280x720 NV12 frame whose luma and chroma vary over a few pixels.
@@ -7838,14 +8565,11 @@ mod gl_tests {
     }
 
     #[cfg(target_os = "linux")]
-    fn nv_test_processor() -> Option<crate::opengl_headless::processor::GLProcessorST> {
+    fn nv_test_processor() -> Option<GLProcessorThreaded> {
         if !is_opengl_available() {
             return None;
         }
-        let mut gl = crate::opengl_headless::processor::GLProcessorST::new(None, None).ok()?;
-        // Exact keeps Vivante on the NV shader programs.
-        gl.set_colorimetry_mode(crate::ColorimetryMode::Exact);
-        Some(gl)
+        GLProcessorThreaded::new(None).ok()
     }
 
     /// A resizing NV12 convert matches the reference for its sampling, `Hardware` or `Shader`.
@@ -7854,10 +8578,11 @@ mod gl_tests {
     fn test_nv12_resize_matches_its_sampling() {
         use crate::opengl_headless::processor::NvSampling;
         const MAX_MEAN_ERROR: f64 = 3.0;
-        let Some(mut gl) = nv_test_processor() else {
+        let Some(worker) = nv_test_processor() else {
             crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
             return;
         };
+        worker.with_st(|gl| {
         let (sw, sh, nv12) = detailed_nv12();
         let mut memories = vec![TensorMemory::Mem];
         if is_dma_available() {
@@ -7929,6 +8654,7 @@ mod gl_tests {
                 }
             }
         }
+        });
     }
 
     /// A source crop drawn 1:1 reproduces the bytes the whole frame converts to there.
@@ -7936,47 +8662,49 @@ mod gl_tests {
     #[cfg(target_os = "linux")]
     fn test_nv12_crop_1to1_matches_whole_frame() {
         use crate::opengl_headless::processor::NvSampling;
-        let Some(mut gl) = nv_test_processor() else {
+        let Some(worker) = nv_test_processor() else {
             crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
             return;
         };
-        let (sw, sh, nv12) = detailed_nv12();
-        let src =
-            load_raw_image(sw, sh, PixelFormat::Nv12, Some(TensorMemory::Mem), &nv12).unwrap();
-        let image = |w, h| {
-            TensorDyn::image(
-                w,
-                h,
-                PixelFormat::PlanarRgb,
-                DType::U8,
-                Some(TensorMemory::Mem),
-                edgefirst_tensor::CpuAccess::ReadWrite,
-            )
-            .unwrap()
-        };
-        let mut whole = image(sw, sh);
-        gl.convert(&src, &mut whole, None).unwrap();
-        let whole = planar_bytes(&whole);
-        for (cx, cy) in [(101usize, 53usize), (100, 52)] {
-            let (cw, ch) = (320usize, 180usize);
-            let mut tile = image(cw, ch);
-            let crop = Crop::new().with_source(Some(crate::Region::new(cx, cy, cw, ch)));
-            gl.convert(
-                &src,
-                &mut tile,
-                Some(crate::ConvertOptions::new().crop(crop)),
-            )
-            .unwrap();
-            assert_eq!(gl.last_nv_sampling, Some(NvSampling::Single));
-            let tile = planar_bytes(&tile);
-            for c in 0..3 {
-                for y in 0..ch {
-                    let got = &tile[c * cw * ch + y * cw..][..cw];
-                    let want = &whole[c * sw * sh + (cy + y) * sw + cx..][..cw];
-                    assert_eq!(got, want, "crop ({cx}, {cy}) channel {c} row {y} differs");
+        worker.with_st(|gl| {
+            let (sw, sh, nv12) = detailed_nv12();
+            let src =
+                load_raw_image(sw, sh, PixelFormat::Nv12, Some(TensorMemory::Mem), &nv12).unwrap();
+            let image = |w, h| {
+                TensorDyn::image(
+                    w,
+                    h,
+                    PixelFormat::PlanarRgb,
+                    DType::U8,
+                    Some(TensorMemory::Mem),
+                    edgefirst_tensor::CpuAccess::ReadWrite,
+                )
+                .unwrap()
+            };
+            let mut whole = image(sw, sh);
+            gl.convert(&src, &mut whole, None).unwrap();
+            let whole = planar_bytes(&whole);
+            for (cx, cy) in [(101usize, 53usize), (100, 52)] {
+                let (cw, ch) = (320usize, 180usize);
+                let mut tile = image(cw, ch);
+                let crop = Crop::new().with_source(Some(crate::Region::new(cx, cy, cw, ch)));
+                gl.convert(
+                    &src,
+                    &mut tile,
+                    Some(crate::ConvertOptions::new().crop(crop)),
+                )
+                .unwrap();
+                assert_eq!(gl.last_nv_sampling, Some(NvSampling::Single));
+                let tile = planar_bytes(&tile);
+                for c in 0..3 {
+                    for y in 0..ch {
+                        let got = &tile[c * cw * ch + y * cw..][..cw];
+                        let want = &whole[c * sw * sh + (cy + y) * sw + cx..][..cw];
+                        assert_eq!(got, want, "crop ({cx}, {cy}) channel {c} row {y} differs");
+                    }
                 }
             }
-        }
+        });
     }
 
     /// `Interpolation::Nearest` resizes NV12 by copying the source pixel under each output centre.
@@ -7984,161 +8712,166 @@ mod gl_tests {
     #[cfg(target_os = "linux")]
     fn test_nv12_nearest_interpolation() {
         use crate::opengl_headless::processor::NvSampling;
-        let Some(mut gl) = nv_test_processor() else {
+        let Some(worker) = nv_test_processor() else {
             crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
             return;
         };
-        gl.set_interpolation(crate::Interpolation::Nearest);
-        let (sw, sh, nv12) = detailed_nv12();
-        let src =
-            load_raw_image(sw, sh, PixelFormat::Nv12, Some(TensorMemory::Mem), &nv12).unwrap();
-        let oracle = NvOracle::new(&nv12, sw, sh, &src);
-        for (dw, dh) in [(1792usize, 1008usize), (768, 432)] {
-            let mut gpu = TensorDyn::image(
-                dw,
-                dh,
-                PixelFormat::PlanarRgb,
-                DType::U8,
-                Some(TensorMemory::Mem),
-                edgefirst_tensor::CpuAccess::ReadWrite,
-            )
-            .unwrap();
-            gl.convert(&src, &mut gpu, None).unwrap();
-            assert_eq!(gl.last_nv_sampling, Some(NvSampling::Single));
-            let mad = mean_abs_diff(
-                &planar_bytes(&gpu),
-                &oracle.render((0, 0, sw, sh), dw, dh, "nearest"),
-            );
-            assert!(
-                mad < 3.0,
-                "{dw}x{dh}: nearest GL is {mad:.3} grey levels from the reference"
-            );
-        }
+        worker.with_st(|gl| {
+            gl.set_interpolation(crate::Interpolation::Nearest);
+            let (sw, sh, nv12) = detailed_nv12();
+            let src =
+                load_raw_image(sw, sh, PixelFormat::Nv12, Some(TensorMemory::Mem), &nv12).unwrap();
+            let oracle = NvOracle::new(&nv12, sw, sh, &src);
+            for (dw, dh) in [(1792usize, 1008usize), (768, 432)] {
+                let mut gpu = TensorDyn::image(
+                    dw,
+                    dh,
+                    PixelFormat::PlanarRgb,
+                    DType::U8,
+                    Some(TensorMemory::Mem),
+                    edgefirst_tensor::CpuAccess::ReadWrite,
+                )
+                .unwrap();
+                gl.convert(&src, &mut gpu, None).unwrap();
+                assert_eq!(gl.last_nv_sampling, Some(NvSampling::Single));
+                let mad = mean_abs_diff(
+                    &planar_bytes(&gpu),
+                    &oracle.render((0, 0, sw, sh), dw, dh, "nearest"),
+                );
+                assert!(
+                    mad < 3.0,
+                    "{dw}x{dh}: nearest GL is {mad:.3} grey levels from the reference"
+                );
+            }
+        });
     }
 
     /// The GL bilinear letterbox of natural content stays close to the CPU backend's.
     #[test]
     #[cfg(target_os = "linux")]
     fn test_nv12_letterbox_close_to_cpu_on_camera_frame() {
-        let Some(mut gl) = nv_test_processor() else {
+        let Some(worker) = nv_test_processor() else {
             crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
             return;
         };
-        let nv12: &[u8] = &edgefirst_bench::testdata::read("camera720p.nv12");
-        let src =
-            load_raw_image(1280, 720, PixelFormat::Nv12, Some(TensorMemory::Mem), nv12).unwrap();
-        let crop = letterbox_crop(1280, 720, 1792, 1024);
-        let image = |m| {
-            TensorDyn::image(
-                1792,
-                1024,
-                PixelFormat::PlanarRgb,
-                DType::U8,
-                m,
-                edgefirst_tensor::CpuAccess::ReadWrite,
-            )
-            .unwrap()
-        };
-        let mut gpu = image(Some(TensorMemory::Mem));
-        gl.convert(
-            &src,
-            &mut gpu,
-            Some(crate::ConvertOptions::new().crop(crop)),
-        )
-        .unwrap();
-        let mut cpu = image(None);
-        crate::cpu::CPUProcessor::new()
-            .convert(
+        worker.with_st(|gl| {
+            let nv12: &[u8] = &edgefirst_bench::testdata::read("camera720p.nv12");
+            let src = load_raw_image(1280, 720, PixelFormat::Nv12, Some(TensorMemory::Mem), nv12)
+                .unwrap();
+            let crop = letterbox_crop(1280, 720, 1792, 1024);
+            let image = |m| {
+                TensorDyn::image(
+                    1792,
+                    1024,
+                    PixelFormat::PlanarRgb,
+                    DType::U8,
+                    m,
+                    edgefirst_tensor::CpuAccess::ReadWrite,
+                )
+                .unwrap()
+            };
+            let mut gpu = image(Some(TensorMemory::Mem));
+            gl.convert(
                 &src,
-                &mut cpu,
+                &mut gpu,
                 Some(crate::ConvertOptions::new().crop(crop)),
             )
             .unwrap();
-        let mad = mean_abs_diff(&planar_bytes(&gpu), &planar_bytes(&cpu));
-        assert!(
-            mad < 1.5,
-            "letterbox upscale: GL is {mad:.3} grey levels from the CPU backend"
-        );
+            let mut cpu = image(None);
+            crate::cpu::CPUProcessor::new()
+                .convert(
+                    &src,
+                    &mut cpu,
+                    Some(crate::ConvertOptions::new().crop(crop)),
+                )
+                .unwrap();
+            let mad = mean_abs_diff(&planar_bytes(&gpu), &planar_bytes(&cpu));
+            assert!(
+                mad < 1.5,
+                "letterbox upscale: GL is {mad:.3} grey levels from the CPU backend"
+            );
+        });
     }
 
     /// `Interpolation::Nearest` resizes a packed source with `GL_NEAREST`, where `Bilinear` blends.
     #[test]
     #[cfg(target_os = "linux")]
     fn test_gl_texture_nearest_interpolation() {
-        let Some(mut gl) = nv_test_processor() else {
+        let Some(worker) = nv_test_processor() else {
             crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
             return;
         };
-        let (sw, sh, dw, dh) = (40usize, 30usize, 56usize, 42usize);
-        let pixel = |x: usize, y: usize| if (x + y).is_multiple_of(2) { 16u8 } else { 235 };
-        let mut rgba = Vec::with_capacity(sw * sh * 4);
-        for y in 0..sh {
-            for x in 0..sw {
-                rgba.extend_from_slice(&[pixel(x, y), 128, 255 - pixel(x, y), 255]);
+        worker.with_st(|gl| {
+            let (sw, sh, dw, dh) = (40usize, 30usize, 56usize, 42usize);
+            let pixel = |x: usize, y: usize| if (x + y).is_multiple_of(2) { 16u8 } else { 235 };
+            let mut rgba = Vec::with_capacity(sw * sh * 4);
+            for y in 0..sh {
+                for x in 0..sw {
+                    rgba.extend_from_slice(&[pixel(x, y), 128, 255 - pixel(x, y), 255]);
+                }
             }
-        }
-        let src =
-            load_raw_image(sw, sh, PixelFormat::Rgba, Some(TensorMemory::Mem), &rgba).unwrap();
-        let mut want = Vec::with_capacity(dw * dh * 4);
-        for dy in 0..dh {
-            for dx in 0..dw {
-                let x = (dx * 2 + 1) * sw / (dw * 2);
-                let y = (dy * 2 + 1) * sh / (dh * 2);
-                want.extend_from_slice(&rgba[(y * sw + x) * 4..][..4]);
+            let src =
+                load_raw_image(sw, sh, PixelFormat::Rgba, Some(TensorMemory::Mem), &rgba).unwrap();
+            let mut want = Vec::with_capacity(dw * dh * 4);
+            for dy in 0..dh {
+                for dx in 0..dw {
+                    let x = (dx * 2 + 1) * sw / (dw * 2);
+                    let y = (dy * 2 + 1) * sh / (dh * 2);
+                    want.extend_from_slice(&rgba[(y * sw + x) * 4..][..4]);
+                }
             }
-        }
-        for (mode, exact) in [
-            (crate::Interpolation::Nearest, true),
-            (crate::Interpolation::Bilinear, false),
-        ] {
-            gl.set_interpolation(mode);
-            let mut dst = TensorDyn::image(
-                dw,
-                dh,
-                PixelFormat::Rgba,
-                DType::U8,
-                Some(TensorMemory::Mem),
-                edgefirst_tensor::CpuAccess::ReadWrite,
-            )
-            .unwrap();
-            gl.convert(&src, &mut dst, None).unwrap();
-            let got = dst.as_u8().unwrap().map().unwrap().as_slice().to_vec();
-            assert_eq!(
-                got == want,
-                exact,
-                "{mode:?}: nearest copy expected = {exact}"
-            );
-        }
+            for (mode, exact) in [
+                (crate::Interpolation::Nearest, true),
+                (crate::Interpolation::Bilinear, false),
+            ] {
+                gl.set_interpolation(mode);
+                let mut dst = TensorDyn::image(
+                    dw,
+                    dh,
+                    PixelFormat::Rgba,
+                    DType::U8,
+                    Some(TensorMemory::Mem),
+                    edgefirst_tensor::CpuAccess::ReadWrite,
+                )
+                .unwrap();
+                gl.convert(&src, &mut dst, None).unwrap();
+                let got = dst.as_u8().unwrap().map().unwrap().as_slice().to_vec();
+                assert_eq!(
+                    got == want,
+                    exact,
+                    "{mode:?}: nearest copy expected = {exact}"
+                );
+            }
 
-        // A per-convert interpolation overrides the processor's for that convert only.
-        let mut convert = |options: Option<crate::ConvertOptions>| {
-            let mut dst = TensorDyn::image(
-                dw,
-                dh,
-                PixelFormat::Rgba,
-                DType::U8,
-                Some(TensorMemory::Mem),
-                edgefirst_tensor::CpuAccess::ReadWrite,
-            )
-            .unwrap();
-            gl.convert(&src, &mut dst, options).unwrap();
-            dst.as_u8().unwrap().map().unwrap().as_slice().to_vec()
-        };
-        let nearest = crate::ConvertOptions::new().interpolation(crate::Interpolation::Nearest);
-        assert_eq!(convert(Some(nearest)), want, "per-convert Nearest");
-        assert_ne!(convert(None), want, "the processor's Bilinear is restored");
+            // A per-convert interpolation overrides the processor's for that convert only.
+            let mut convert = |options: Option<crate::ConvertOptions>| {
+                let mut dst = TensorDyn::image(
+                    dw,
+                    dh,
+                    PixelFormat::Rgba,
+                    DType::U8,
+                    Some(TensorMemory::Mem),
+                    edgefirst_tensor::CpuAccess::ReadWrite,
+                )
+                .unwrap();
+                gl.convert(&src, &mut dst, options).unwrap();
+                dst.as_u8().unwrap().map().unwrap().as_slice().to_vec()
+            };
+            let nearest = crate::ConvertOptions::new().interpolation(crate::Interpolation::Nearest);
+            assert_eq!(convert(Some(nearest)), want, "per-convert Nearest");
+            assert_ne!(convert(None), want, "the processor's Bilinear is restored");
+        });
     }
 
     /// A source crop drawn 1:1 reads each crop pixel unblended on the filtered (`LINEAR`) paths.
     #[test]
     #[cfg(target_os = "linux")]
     fn test_gl_crop_1to1_is_exact() {
-        use crate::opengl_headless::processor::GLProcessorST;
         if !is_opengl_available() {
             crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
             return;
         }
-        let mut gl = match GLProcessorST::new(None, None) {
+        let worker = match GLProcessorThreaded::new(None) {
             Ok(g) => g,
             Err(e) => {
                 crate::test_support::report_skip(&format!(
@@ -8148,87 +8881,89 @@ mod gl_tests {
                 return;
             }
         };
-        let (sw, sh) = (640usize, 360usize);
-        let checker = |x: usize, y: usize| if (x + y).is_multiple_of(2) { 16u8 } else { 235 };
-        let mut rgba = Vec::with_capacity(sw * sh * 4);
-        let mut nv12 = Vec::with_capacity(sw * sh * 3 / 2);
-        for y in 0..sh {
-            for x in 0..sw {
-                let v = checker(x, y);
-                rgba.extend_from_slice(&[v, 255 - v, v, 255]);
-                nv12.push(v);
-            }
-        }
-        nv12.resize(sw * sh * 3 / 2, 128);
-        let crop = Crop::new().with_source(Some(crate::Region::new(101, 53, 64, 48)));
-
-        let mut memories = vec![TensorMemory::Mem];
-        if is_dma_available() {
-            memories.push(TensorMemory::DmaBuf);
-        }
-        for mem in memories {
-            for (src_fmt, bytes) in [(PixelFormat::Rgba, &rgba), (PixelFormat::Nv12, &nv12)] {
-                if src_fmt == PixelFormat::Nv12 && mem != TensorMemory::DmaBuf {
-                    continue;
+        worker.with_st(|gl| {
+            let (sw, sh) = (640usize, 360usize);
+            let checker = |x: usize, y: usize| if (x + y).is_multiple_of(2) { 16u8 } else { 235 };
+            let mut rgba = Vec::with_capacity(sw * sh * 4);
+            let mut nv12 = Vec::with_capacity(sw * sh * 3 / 2);
+            for y in 0..sh {
+                for x in 0..sw {
+                    let v = checker(x, y);
+                    rgba.extend_from_slice(&[v, 255 - v, v, 255]);
+                    nv12.push(v);
                 }
-                let mut src = load_raw_image(sw, sh, src_fmt, Some(mem), bytes).unwrap();
-                src.set_colorimetry(Some(
-                    edgefirst_tensor::Colorimetry::default()
-                        .with_encoding(edgefirst_tensor::ColorEncoding::Bt601)
-                        .with_range(edgefirst_tensor::ColorRange::Limited),
-                ));
-                for dst_fmt in [PixelFormat::Rgba, PixelFormat::PlanarRgb] {
-                    let image = |m| {
-                        TensorDyn::image(
-                            64,
-                            48,
-                            dst_fmt,
-                            DType::U8,
-                            m,
-                            edgefirst_tensor::CpuAccess::ReadWrite,
-                        )
-                        .unwrap()
-                    };
-                    let mut gpu = image(Some(mem));
-                    gl.convert(
-                        &src,
-                        &mut gpu,
-                        Some(crate::ConvertOptions::new().crop(crop)),
-                    )
-                    .unwrap();
-                    let mut cpu = image(None);
-                    crate::cpu::CPUProcessor::new()
-                        .convert(
+            }
+            nv12.resize(sw * sh * 3 / 2, 128);
+            let crop = Crop::new().with_source(Some(crate::Region::new(101, 53, 64, 48)));
+
+            let mut memories = vec![TensorMemory::Mem];
+            if is_dma_available() {
+                memories.push(TensorMemory::DmaBuf);
+            }
+            for mem in memories {
+                for (src_fmt, bytes) in [(PixelFormat::Rgba, &rgba), (PixelFormat::Nv12, &nv12)] {
+                    if src_fmt == PixelFormat::Nv12 && mem != TensorMemory::DmaBuf {
+                        continue;
+                    }
+                    let mut src = load_raw_image(sw, sh, src_fmt, Some(mem), bytes).unwrap();
+                    src.set_colorimetry(Some(
+                        edgefirst_tensor::Colorimetry::default()
+                            .with_encoding(edgefirst_tensor::ColorEncoding::Bt601)
+                            .with_range(edgefirst_tensor::ColorRange::Limited),
+                    ));
+                    for dst_fmt in [PixelFormat::Rgba, PixelFormat::PlanarRgb] {
+                        let image = |m| {
+                            TensorDyn::image(
+                                64,
+                                48,
+                                dst_fmt,
+                                DType::U8,
+                                m,
+                                edgefirst_tensor::CpuAccess::ReadWrite,
+                            )
+                            .unwrap()
+                        };
+                        let mut gpu = image(Some(mem));
+                        gl.convert(
                             &src,
-                            &mut cpu,
+                            &mut gpu,
                             Some(crate::ConvertOptions::new().crop(crop)),
                         )
                         .unwrap();
-                    let g = gpu.as_u8().unwrap().map().unwrap().as_slice().to_vec();
-                    let c = cpu.as_u8().unwrap().map().unwrap().as_slice().to_vec();
-                    let max = g.iter().zip(&c).map(|(&a, &b)| a.abs_diff(b)).max();
-                    assert!(
-                        max <= Some(16),
-                        "{mem:?} {src_fmt:?}->{dst_fmt:?} 1:1 crop: max deviation {max:?} \
+                        let mut cpu = image(None);
+                        crate::cpu::CPUProcessor::new()
+                            .convert(
+                                &src,
+                                &mut cpu,
+                                Some(crate::ConvertOptions::new().crop(crop)),
+                            )
+                            .unwrap();
+                        let g = gpu.as_u8().unwrap().map().unwrap().as_slice().to_vec();
+                        let c = cpu.as_u8().unwrap().map().unwrap().as_slice().to_vec();
+                        let max = g.iter().zip(&c).map(|(&a, &b)| a.abs_diff(b)).max();
+                        assert!(
+                            max <= Some(16),
+                            "{mem:?} {src_fmt:?}->{dst_fmt:?} 1:1 crop: max deviation {max:?} \
                          (path {:?})",
-                        gl.last_nv_convert_path
-                    );
+                            gl.last_nv_convert_path
+                        );
+                    }
                 }
             }
-        }
+        });
     }
 
     /// NV16 and NV24 heap sources convert on the GPU through `ShaderR8` and match the CPU within 2.
     #[test]
     #[cfg(target_os = "linux")]
     fn test_nv16_nv24_nondma_upload_uses_shader() {
-        use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
+        use crate::opengl_headless::processor::NvConvertPath;
         if !is_opengl_available() {
             crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
             return;
         }
         let (w, h) = (64usize, 64usize);
-        let mut gl = match GLProcessorST::new(None, None) {
+        let worker = match GLProcessorThreaded::new(None) {
             Ok(g) => g,
             Err(e) => {
                 crate::test_support::report_skip(&format!(
@@ -8238,53 +8973,55 @@ mod gl_tests {
                 return;
             }
         };
-        // (format, chroma byte count).
-        for (fmt, uv) in [(PixelFormat::Nv16, w * h), (PixelFormat::Nv24, 2 * w * h)] {
-            let mut bytes = vec![0u8; w * h];
-            for r in 0..h {
-                for c in 0..w {
-                    bytes[r * w + c] = ((r + c) * 255 / (w + h)) as u8; // Y gradient
+        worker.with_st(|gl| {
+            // (format, chroma byte count).
+            for (fmt, uv) in [(PixelFormat::Nv16, w * h), (PixelFormat::Nv24, 2 * w * h)] {
+                let mut bytes = vec![0u8; w * h];
+                for r in 0..h {
+                    for c in 0..w {
+                        bytes[r * w + c] = ((r + c) * 255 / (w + h)) as u8; // Y gradient
+                    }
                 }
-            }
-            bytes.extend(std::iter::repeat_n(128u8, uv)); // neutral chroma
+                bytes.extend(std::iter::repeat_n(128u8, uv)); // neutral chroma
 
-            let mem_src = load_raw_image(w, h, fmt, Some(TensorMemory::Mem), &bytes).unwrap();
-            let mut gpu = TensorDyn::image(
-                w,
-                h,
-                PixelFormat::Rgba,
-                DType::U8,
-                None,
-                edgefirst_tensor::CpuAccess::ReadWrite,
-            )
-            .unwrap();
-            gl.convert(&mem_src, &mut gpu, None).unwrap();
-            assert_eq!(
-                gl.last_nv_convert_path,
-                NvConvertPath::ShaderR8,
-                "non-DMA {fmt:?} must use the R8-upload ShaderR8 path (got {:?})",
-                gl.last_nv_convert_path
-            );
-
-            let cpu_src = load_raw_image(w, h, fmt, Some(TensorMemory::Mem), &bytes).unwrap();
-            let mut cpu = TensorDyn::image(
-                w,
-                h,
-                PixelFormat::Rgba,
-                DType::U8,
-                None,
-                edgefirst_tensor::CpuAccess::ReadWrite,
-            )
-            .unwrap();
-            crate::cpu::CPUProcessor::new()
-                .convert(&cpu_src, &mut cpu, None)
+                let mem_src = load_raw_image(w, h, fmt, Some(TensorMemory::Mem), &bytes).unwrap();
+                let mut gpu = TensorDyn::image(
+                    w,
+                    h,
+                    PixelFormat::Rgba,
+                    DType::U8,
+                    None,
+                    edgefirst_tensor::CpuAccess::ReadWrite,
+                )
                 .unwrap();
-            assert_pixels_match(
-                cpu.as_u8().unwrap().map().unwrap().as_slice(),
-                gpu.as_u8().unwrap().map().unwrap().as_slice(),
-                2,
-            );
-        }
+                gl.convert(&mem_src, &mut gpu, None).unwrap();
+                assert_eq!(
+                    gl.last_nv_convert_path,
+                    NvConvertPath::ShaderR8,
+                    "non-DMA {fmt:?} must use the R8-upload ShaderR8 path (got {:?})",
+                    gl.last_nv_convert_path
+                );
+
+                let cpu_src = load_raw_image(w, h, fmt, Some(TensorMemory::Mem), &bytes).unwrap();
+                let mut cpu = TensorDyn::image(
+                    w,
+                    h,
+                    PixelFormat::Rgba,
+                    DType::U8,
+                    None,
+                    edgefirst_tensor::CpuAccess::ReadWrite,
+                )
+                .unwrap();
+                crate::cpu::CPUProcessor::new()
+                    .convert(&cpu_src, &mut cpu, None)
+                    .unwrap();
+                assert_pixels_match(
+                    cpu.as_u8().unwrap().map().unwrap().as_slice(),
+                    gpu.as_u8().unwrap().map().unwrap().as_slice(),
+                    2,
+                );
+            }
+        });
     }
 
     /// Prints per-path NV12 deltas against the CPU; asserts only `ShaderR8` on a solid frame.
@@ -8292,7 +9029,7 @@ mod gl_tests {
     #[ignore = "diagnostic probe — run manually on-target with --nocapture --ignored"]
     #[cfg(target_os = "linux")]
     fn probe_nv12_sampler_vs_shader_divergence() {
-        use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
+        use crate::opengl_headless::processor::NvConvertPath;
         if !is_dma_available() {
             crate::test_support::report_skip(&format!("{} - DMA not available", function!()));
             return;
@@ -8315,12 +9052,14 @@ mod gl_tests {
         let solid = build(120, &|_| (90, 160));
         let edge = build(120, &|col| if col < w / 2 { (90, 160) } else { (200, 40) });
 
-        // Force a path via the env var (read at construction), then clear it.
+        // Force a path through the processor's NV path setting.
         let convert_dma = |env: &str, bytes: &[u8]| -> Option<(NvConvertPath, Vec<u8>)> {
-            std::env::set_var("EDGEFIRST_NV_CONVERT_PATH", env);
-            let gl = GLProcessorST::new(None, None);
-            std::env::remove_var("EDGEFIRST_NV_CONVERT_PATH");
-            let mut gl = match gl {
+            let gl = GLProcessorThreaded::with_env(
+                None,
+                None,
+                gl_env(|e| e.nv_convert_path = Some(env.to_string())),
+            );
+            let gl = match gl {
                 Ok(g) => g,
                 Err(e) => {
                     crate::test_support::report_skip(&format!(
@@ -8341,9 +9080,12 @@ mod gl_tests {
                 edgefirst_tensor::CpuAccess::ReadWrite,
             )
             .unwrap();
-            gl.convert(&src, &mut dst, None).unwrap();
+            let path = gl.with_st(|gl| {
+                gl.convert(&src, &mut dst, None).unwrap();
+                gl.last_nv_convert_path
+            });
             let out = dst.as_u8().unwrap().map().unwrap().to_vec();
-            Some((gl.last_nv_convert_path, out))
+            Some((path, out))
         };
         let cpu_ref = |bytes: &[u8]| -> Vec<u8> {
             let src =
@@ -8413,7 +9155,6 @@ mod gl_tests {
     #[ignore = "diagnostic probe — run manually on-target with --nocapture --ignored"]
     #[cfg(target_os = "linux")]
     fn probe_nv12_packed_letterbox_divergence() {
-        use crate::opengl_headless::processor::GLProcessorST;
         use crate::{Fit, Region};
         if !is_dma_available() {
             crate::test_support::report_skip(&format!("{} - DMA not available", function!()));
@@ -8453,10 +9194,12 @@ mod gl_tests {
         };
 
         let gl_packed = |env: &str, crop: Crop, dw: usize, dh: usize| -> Option<(usize, Vec<u8>)> {
-            std::env::set_var("EDGEFIRST_NV_CONVERT_PATH", env);
-            let g = GLProcessorST::new(None, None);
-            std::env::remove_var("EDGEFIRST_NV_CONVERT_PATH");
-            let mut g = match g {
+            let g = GLProcessorThreaded::with_env(
+                None,
+                None,
+                gl_env(|e| e.nv_convert_path = Some(env.to_string())),
+            );
+            let g = match g {
                 Ok(x) => x,
                 Err(e) => {
                     crate::test_support::report_skip(&format!("{} - GL: {e}", function!()));
@@ -8480,11 +9223,13 @@ mod gl_tests {
                 edgefirst_tensor::CpuAccess::ReadWrite,
             )
             .unwrap();
-            if let Err(e) = g.convert(
-                &src,
-                &mut dst,
-                Some(crate::ConvertOptions::new().crop(crop)),
-            ) {
+            if let Err(e) = g.with_st(|g| {
+                g.convert(
+                    &src,
+                    &mut dst,
+                    Some(crate::ConvertOptions::new().crop(crop)),
+                )
+            }) {
                 crate::test_support::report_skip(&format!(
                     "{} - {env} convert declined: {e}",
                     function!()
@@ -8589,7 +9334,7 @@ mod gl_tests {
     #[test]
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn test_gpu_nv24_to_rgba_shader_r8() {
-        use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
+        use crate::opengl_headless::processor::NvConvertPath;
         if !is_gpu_image_buffer_available() {
             crate::test_support::report_skip(&format!(
                 "{} - no zero-copy GPU buffers",
@@ -8626,7 +9371,7 @@ mod gl_tests {
         )
         .unwrap();
 
-        let mut gl = match GLProcessorST::new(None, None) {
+        let worker = match GLProcessorThreaded::new(None) {
             Ok(g) => g,
             Err(e) => {
                 crate::test_support::report_skip(&format!(
@@ -8636,6 +9381,7 @@ mod gl_tests {
                 return;
             }
         };
+        worker.with_st(|gl| {
 
         gl.convert(&src, &mut dst, None).unwrap();
 
@@ -8661,13 +9407,14 @@ mod gl_tests {
                 expected[0], expected[1], expected[2]
             );
         }
+        });
     }
 
     /// NV16 to RGBA through `ShaderR8` matches the CPU converter within ±2.
     #[test]
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn test_gpu_nv16_matches_cpu_reference() {
-        use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
+        use crate::opengl_headless::processor::NvConvertPath;
         if !is_gpu_image_buffer_available() {
             crate::test_support::report_skip(&format!(
                 "{} - no zero-copy GPU buffers",
@@ -8716,7 +9463,7 @@ mod gl_tests {
             edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
-        let mut gl = match GLProcessorST::new(None, None) {
+        let worker = match GLProcessorThreaded::new(None) {
             Ok(g) => g,
             Err(e) => {
                 crate::test_support::report_skip(&format!(
@@ -8726,35 +9473,37 @@ mod gl_tests {
                 return;
             }
         };
-        gl.convert(&src_dma, &mut gpu_dst, None).unwrap();
+        worker.with_st(|gl| {
+            gl.convert(&src_dma, &mut gpu_dst, None).unwrap();
 
-        assert_eq!(
-            gl.last_nv_convert_path,
-            NvConvertPath::ShaderR8,
-            "NV16 DMA convert must use ShaderR8"
-        );
+            assert_eq!(
+                gl.last_nv_convert_path,
+                NvConvertPath::ShaderR8,
+                "NV16 DMA convert must use ShaderR8"
+            );
 
-        let cpu_map = cpu_dst.as_u8().unwrap().map().unwrap();
-        let gpu_map = gpu_dst.as_u8().unwrap().map().unwrap();
-        let cpu_pixels = cpu_map.as_slice();
-        let gpu_pixels = gpu_map.as_slice();
+            let cpu_map = cpu_dst.as_u8().unwrap().map().unwrap();
+            let gpu_map = gpu_dst.as_u8().unwrap().map().unwrap();
+            let cpu_pixels = cpu_map.as_slice();
+            let gpu_pixels = gpu_map.as_slice();
 
-        let mut max_diff = 0u32;
-        for i in 0..(w * h * 4) {
-            let d = (gpu_pixels[i] as i32 - cpu_pixels[i] as i32).unsigned_abs();
-            max_diff = max_diff.max(d);
-        }
-        assert!(
-            max_diff <= 2,
-            "NV16 GPU ShaderR8 vs CPU reference: max_diff={max_diff} (tolerance 2)"
-        );
+            let mut max_diff = 0u32;
+            for i in 0..(w * h * 4) {
+                let d = (gpu_pixels[i] as i32 - cpu_pixels[i] as i32).unsigned_abs();
+                max_diff = max_diff.max(d);
+            }
+            assert!(
+                max_diff <= 2,
+                "NV16 GPU ShaderR8 vs CPU reference: max_diff={max_diff} (tolerance 2)"
+            );
+        });
     }
 
     /// NV24 to RGBA through `ShaderR8` matches the CPU converter within ±2.
     #[test]
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn test_gpu_nv24_matches_cpu_reference() {
-        use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
+        use crate::opengl_headless::processor::NvConvertPath;
         if !is_gpu_image_buffer_available() {
             crate::test_support::report_skip(&format!(
                 "{} - no zero-copy GPU buffers",
@@ -8803,7 +9552,7 @@ mod gl_tests {
             edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
-        let mut gl = match GLProcessorST::new(None, None) {
+        let worker = match GLProcessorThreaded::new(None) {
             Ok(g) => g,
             Err(e) => {
                 crate::test_support::report_skip(&format!(
@@ -8813,28 +9562,30 @@ mod gl_tests {
                 return;
             }
         };
-        gl.convert(&src_dma, &mut gpu_dst, None).unwrap();
+        worker.with_st(|gl| {
+            gl.convert(&src_dma, &mut gpu_dst, None).unwrap();
 
-        assert_eq!(
-            gl.last_nv_convert_path,
-            NvConvertPath::ShaderR8,
-            "NV24 DMA convert must use ShaderR8"
-        );
+            assert_eq!(
+                gl.last_nv_convert_path,
+                NvConvertPath::ShaderR8,
+                "NV24 DMA convert must use ShaderR8"
+            );
 
-        let cpu_map = cpu_dst.as_u8().unwrap().map().unwrap();
-        let gpu_map = gpu_dst.as_u8().unwrap().map().unwrap();
-        let cpu_pixels = cpu_map.as_slice();
-        let gpu_pixels = gpu_map.as_slice();
+            let cpu_map = cpu_dst.as_u8().unwrap().map().unwrap();
+            let gpu_map = gpu_dst.as_u8().unwrap().map().unwrap();
+            let cpu_pixels = cpu_map.as_slice();
+            let gpu_pixels = gpu_map.as_slice();
 
-        let mut max_diff = 0u32;
-        for i in 0..(w * h * 4) {
-            let d = (gpu_pixels[i] as i32 - cpu_pixels[i] as i32).unsigned_abs();
-            max_diff = max_diff.max(d);
-        }
-        assert!(
-            max_diff <= 2,
-            "NV24 GPU ShaderR8 vs CPU reference: max_diff={max_diff} (tolerance 2)"
-        );
+            let mut max_diff = 0u32;
+            for i in 0..(w * h * 4) {
+                let d = (gpu_pixels[i] as i32 - cpu_pixels[i] as i32).unsigned_abs();
+                max_diff = max_diff.max(d);
+            }
+            assert!(
+                max_diff <= 2,
+                "NV24 GPU ShaderR8 vs CPU reference: max_diff={max_diff} (tolerance 2)"
+            );
+        });
     }
 
     /// CoreVideo IOSurface sources wrapped by `TensorDyn::from_planar_iosurface`.
@@ -8846,12 +9597,12 @@ mod gl_tests {
         use crate::{CPUProcessor, ConvertOptions, Flip};
 
         /// A GL processor, or `None` after reporting why the test skips.
-        fn gl_processor(test: &str) -> Option<GLProcessorST> {
+        fn gl_processor(test: &str) -> Option<GLProcessorThreaded> {
             if !is_gpu_image_buffer_available() {
                 report_skip(&format!("{test} - no zero-copy GPU buffers"));
                 return None;
             }
-            match GLProcessorST::new(None, None) {
+            match GLProcessorThreaded::new(None) {
                 Ok(gl) => Some(gl),
                 Err(e) => {
                     report_skip(&format!("{test} - GL not available: {e}"));
@@ -8973,169 +9724,178 @@ mod gl_tests {
         /// `420v` and `420f` CoreVideo sources convert to RGBA on GL by plane, within 3 of the CPU.
         #[test]
         fn test_planar_nv12_to_rgba_opengl_macos() {
-            let Some(mut gl) = gl_processor(function!()) else {
+            let Some(worker) = gl_processor(function!()) else {
                 return;
             };
-            for (w, h, fourcc) in [
-                (1920usize, 1080usize, b"420v"),
-                (1000, 562, b"420v"),
-                (640, 480, b"420f"),
-            ] {
-                let what = format!("{} {w}x{h}", String::from_utf8_lossy(fourcc));
-                let buf = corevideo_buffer(w, h, fourcc);
-                fill_nv12(&buf, w, 0);
-                let src = wrap(&buf);
-                assert!(src.is_multiplane(), "{what}: wrap is multiplane");
-                let (gpu, cpu) = convert_both(&mut gl, &src, w, h, ConvertOptions::default());
-                let (max, _) = rgb_diff(&gpu, &cpu);
-                assert!(max <= 3, "{what}: GL vs CPU max channel diff {max} > 3");
-                assert_sampled_by_plane(&gl, &what);
-            }
+            worker.with_st(|gl| {
+                for (w, h, fourcc) in [
+                    (1920usize, 1080usize, b"420v"),
+                    (1000, 562, b"420v"),
+                    (640, 480, b"420f"),
+                ] {
+                    let what = format!("{} {w}x{h}", String::from_utf8_lossy(fourcc));
+                    let buf = corevideo_buffer(w, h, fourcc);
+                    fill_nv12(&buf, w, 0);
+                    let src = wrap(&buf);
+                    assert!(src.is_multiplane(), "{what}: wrap is multiplane");
+                    let (gpu, cpu) = convert_both(gl, &src, w, h, ConvertOptions::default());
+                    let (max, _) = rgb_diff(&gpu, &cpu);
+                    assert!(max <= 3, "{what}: GL vs CPU max channel diff {max} > 3");
+                    assert_sampled_by_plane(gl, &what);
+                }
+            });
         }
 
         /// A planar NV12 source resized to 640x360 and flipped horizontally matches the CPU within a mean of 2.
         #[test]
         fn test_planar_nv12_resized_and_flipped_opengl_macos() {
-            let Some(mut gl) = gl_processor(function!()) else {
+            let Some(worker) = gl_processor(function!()) else {
                 return;
             };
-            for (w, h) in [(1920usize, 1080usize), (1000, 562)] {
-                let what = format!("420v {w}x{h} -> 640x360");
-                let buf = corevideo_buffer(w, h, b"420v");
-                fill_smooth_nv12(&buf, w, h);
-                let src = wrap(&buf);
-                let options = ConvertOptions::default().flip(Flip::Horizontal);
-                let (gpu, cpu) = convert_both(&mut gl, &src, 640, 360, options);
-                let (_, mean) = rgb_diff(&gpu, &cpu);
-                assert!(
-                    mean <= 2.0,
-                    "{what}: GL vs CPU mean channel diff {mean:.3} > 2"
-                );
-                assert_sampled_by_plane(&gl, &what);
-            }
+            worker.with_st(|gl| {
+                for (w, h) in [(1920usize, 1080usize), (1000, 562)] {
+                    let what = format!("420v {w}x{h} -> 640x360");
+                    let buf = corevideo_buffer(w, h, b"420v");
+                    fill_smooth_nv12(&buf, w, h);
+                    let src = wrap(&buf);
+                    let options = ConvertOptions::default().flip(Flip::Horizontal);
+                    let (gpu, cpu) = convert_both(gl, &src, 640, 360, options);
+                    let (_, mean) = rgb_diff(&gpu, &cpu);
+                    assert!(
+                        mean <= 2.0,
+                        "{what}: GL vs CPU mean channel diff {mean:.3} > 2"
+                    );
+                    assert_sampled_by_plane(gl, &what);
+                }
+            });
         }
 
         /// A planar surface refilled and wrapped again between two conversions is read again by the second.
         #[test]
         fn test_a_recycled_planar_surface_is_read_again_opengl_macos() {
-            let Some(mut gl) = gl_processor(function!()) else {
+            let Some(worker) = gl_processor(function!()) else {
                 return;
             };
-            let (w, h) = (1000usize, 562usize);
-            let buf = corevideo_buffer(w, h, b"420v");
-            fill_nv12(&buf, w, 0);
-            let src = wrap(&buf);
-            let (first, _) = convert_both(&mut gl, &src, w, h, ConvertOptions::default());
-            let before = gl.egl_cache_stats();
-            drop(src);
+            worker.with_st(|gl| {
+                let (w, h) = (1000usize, 562usize);
+                let buf = corevideo_buffer(w, h, b"420v");
+                fill_nv12(&buf, w, 0);
+                let src = wrap(&buf);
+                let (first, _) = convert_both(gl, &src, w, h, ConvertOptions::default());
+                let before = gl.egl_cache_stats();
+                drop(src);
 
-            fill_nv12(&buf, w, 97);
-            let src = wrap(&buf);
-            let (second, expected) = convert_both(&mut gl, &src, w, h, ConvertOptions::default());
-            assert_sampled_by_plane(&gl, "refilled surface");
-            let after = gl.egl_cache_stats();
-            assert_eq!(
-                after.nv_r8.misses, before.nv_r8.misses,
-                "luma plane re-imported"
-            );
-            assert_eq!(
-                after.nv_uv.misses, before.nv_uv.misses,
-                "chroma plane re-imported"
-            );
-            assert!(
-                after.nv_r8.hits > before.nv_r8.hits,
-                "luma import not reused"
-            );
-            assert!(
-                after.nv_uv.hits > before.nv_uv.hits,
-                "chroma import not reused"
-            );
-            let (max, _) = rgb_diff(&second, &expected);
-            assert!(
-                max <= 3,
-                "refilled surface: GL vs CPU max channel diff {max} > 3"
-            );
-            assert_ne!(
-                first, second,
-                "the second conversion read the first pattern"
-            );
+                fill_nv12(&buf, w, 97);
+                let src = wrap(&buf);
+                let (second, expected) = convert_both(gl, &src, w, h, ConvertOptions::default());
+                assert_sampled_by_plane(gl, "refilled surface");
+                let after = gl.egl_cache_stats();
+                assert_eq!(
+                    after.nv_r8.misses, before.nv_r8.misses,
+                    "luma plane re-imported"
+                );
+                assert_eq!(
+                    after.nv_uv.misses, before.nv_uv.misses,
+                    "chroma plane re-imported"
+                );
+                assert!(
+                    after.nv_r8.hits > before.nv_r8.hits,
+                    "luma import not reused"
+                );
+                assert!(
+                    after.nv_uv.hits > before.nv_uv.hits,
+                    "chroma import not reused"
+                );
+                let (max, _) = rgb_diff(&second, &expected);
+                assert!(
+                    max <= 3,
+                    "refilled surface: GL vs CPU max channel diff {max} > 3"
+                );
+                assert_ne!(
+                    first, second,
+                    "the second conversion read the first pattern"
+                );
+            });
         }
 
         /// A `yuvs` CoreVideo source converts to RGBA on GL within 3 of the CPU, and a `BGRA` one
         /// converts to BGRA through the image processor unchanged.
         #[test]
         fn test_yuvs_on_gl_and_bgra_through_the_processor_macos() {
-            let Some(mut gl) = gl_processor(function!()) else {
+            let Some(worker) = gl_processor(function!()) else {
                 return;
             };
             let (w, h) = (640usize, 480usize);
+            worker.with_st(|gl| {
+                let yuvs = corevideo_buffer(w, h, b"yuvs");
+                let luma = |x: usize, row: usize| (16 + x * 200 / w + row * 20 / h) as u8;
+                yuvs.fill_rows(|_, row, bytes| {
+                    for (cx, quad) in bytes[..w * 2].chunks_exact_mut(4).enumerate() {
+                        quad[0] = luma(cx * 2, row);
+                        quad[1] = (40 + cx * 300 / w) as u8;
+                        quad[2] = luma(cx * 2 + 1, row);
+                        quad[3] = (200 - row * 150 / h) as u8;
+                    }
+                });
 
-            let yuvs = corevideo_buffer(w, h, b"yuvs");
-            let luma = |x: usize, row: usize| (16 + x * 200 / w + row * 20 / h) as u8;
-            yuvs.fill_rows(|_, row, bytes| {
-                for (cx, quad) in bytes[..w * 2].chunks_exact_mut(4).enumerate() {
-                    quad[0] = luma(cx * 2, row);
-                    quad[1] = (40 + cx * 300 / w) as u8;
-                    quad[2] = luma(cx * 2 + 1, row);
-                    quad[3] = (200 - row * 150 / h) as u8;
-                }
+                let src = wrap(&yuvs);
+                assert_eq!(
+                    src.format(),
+                    Some(PixelFormat::Yuyv),
+                    "yuvs: wrapped format"
+                );
+                let imports = gl.convert_stats().src_imports;
+                let (gpu, cpu) = convert_both(gl, &src, w, h, ConvertOptions::default());
+                assert!(
+                    gl.convert_stats().src_imports > imports,
+                    "yuvs: GL did not import the surface"
+                );
+                let (max, _) = rgb_diff(&gpu, &cpu);
+                assert!(max <= 3, "yuvs: GL vs CPU max channel diff {max} > 3");
             });
 
-            let src = wrap(&yuvs);
-            assert_eq!(
-                src.format(),
-                Some(PixelFormat::Yuyv),
-                "yuvs: wrapped format"
-            );
-            let imports = gl.convert_stats().src_imports;
-            let (gpu, cpu) = convert_both(&mut gl, &src, w, h, ConvertOptions::default());
-            assert!(
-                gl.convert_stats().src_imports > imports,
-                "yuvs: GL did not import the surface"
-            );
-            let (max, _) = rgb_diff(&gpu, &cpu);
-            assert!(max <= 3, "yuvs: GL vs CPU max channel diff {max} > 3");
-
-            let bgra = corevideo_buffer(w, h, b"BGRA");
-            let pixel = |x: usize, row: usize| {
-                [
-                    ((x * 3) & 0xff) as u8,
-                    ((row * 5) & 0xff) as u8,
-                    ((x + row) & 0xff) as u8,
-                    255,
-                ]
-            };
-            bgra.fill_rows(|_, row, bytes| {
-                for (x, px) in bytes[..w * 4].chunks_exact_mut(4).enumerate() {
-                    px.copy_from_slice(&pixel(x, row));
-                }
-            });
-            let src = wrap(&bgra);
-            assert_eq!(
-                src.format(),
-                Some(PixelFormat::Bgra),
-                "BGRA: wrapped format"
-            );
-            let mut dst = TensorDyn::image(
-                w,
-                h,
-                PixelFormat::Bgra,
-                DType::U8,
-                Some(TensorMemory::Mem),
-                edgefirst_tensor::CpuAccess::ReadWrite,
-            )
-            .unwrap();
-            crate::ImageProcessor::new()
-                .expect("image processor")
-                .convert(&src, &mut dst, None)
-                .expect("BGRA to BGRA");
-            let expected: Vec<u8> = (0..h)
-                .flat_map(|row| (0..w).flat_map(move |x| pixel(x, row)))
-                .collect();
-            assert!(
-                tight_rgba(&dst) == expected,
-                "BGRA: the converted pixels differ from the source"
-            );
+            {
+                let bgra = corevideo_buffer(w, h, b"BGRA");
+                let pixel = |x: usize, row: usize| {
+                    [
+                        ((x * 3) & 0xff) as u8,
+                        ((row * 5) & 0xff) as u8,
+                        ((x + row) & 0xff) as u8,
+                        255,
+                    ]
+                };
+                bgra.fill_rows(|_, row, bytes| {
+                    for (x, px) in bytes[..w * 4].chunks_exact_mut(4).enumerate() {
+                        px.copy_from_slice(&pixel(x, row));
+                    }
+                });
+                let src = wrap(&bgra);
+                assert_eq!(
+                    src.format(),
+                    Some(PixelFormat::Bgra),
+                    "BGRA: wrapped format"
+                );
+                let mut dst = TensorDyn::image(
+                    w,
+                    h,
+                    PixelFormat::Bgra,
+                    DType::U8,
+                    Some(TensorMemory::Mem),
+                    edgefirst_tensor::CpuAccess::ReadWrite,
+                )
+                .unwrap();
+                crate::ImageProcessor::new()
+                    .expect("image processor")
+                    .convert(&src, &mut dst, None)
+                    .expect("BGRA to BGRA");
+                let expected: Vec<u8> = (0..h)
+                    .flat_map(|row| (0..w).flat_map(move |x| pixel(x, row)))
+                    .collect();
+                assert!(
+                    tight_rgba(&dst) == expected,
+                    "BGRA: the converted pixels differ from the source"
+                );
+            }
         }
     }
 
@@ -9143,7 +9903,7 @@ mod gl_tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn test_nv12_dma_gpu_path_no_cpu_fallback() {
-        use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
+        use crate::opengl_headless::processor::NvConvertPath;
         if !is_dma_available() {
             crate::test_support::report_skip(&format!("{} - DMA not available", function!()));
             return;
@@ -9166,7 +9926,7 @@ mod gl_tests {
         )
         .unwrap();
 
-        let mut gl = match GLProcessorST::new(None, None) {
+        let worker = match GLProcessorThreaded::new(None) {
             Ok(g) => g,
             Err(e) => {
                 crate::test_support::report_skip(&format!(
@@ -9176,24 +9936,25 @@ mod gl_tests {
                 return;
             }
         };
+        worker.with_st(|gl| {
+            gl.convert(&src, &mut dst, None).unwrap();
 
-        gl.convert(&src, &mut dst, None).unwrap();
-
-        assert!(
-            matches!(
-                gl.last_nv_convert_path,
-                NvConvertPath::ExternalSampler | NvConvertPath::ShaderR8
-            ),
-            "NV12 DMA convert must use a GPU path (ExternalSampler/ShaderR8), got {:?}",
-            gl.last_nv_convert_path
-        );
+            assert!(
+                matches!(
+                    gl.last_nv_convert_path,
+                    NvConvertPath::ExternalSampler | NvConvertPath::ShaderR8
+                ),
+                "NV12 DMA convert must use a GPU path (ExternalSampler/ShaderR8), got {:?}",
+                gl.last_nv_convert_path
+            );
+        });
     }
 
     /// NV16 to RGB int8 through `ShaderR8` matches the CPU i8 reference within 2.
     #[test]
     #[cfg(target_os = "linux")]
     fn test_gpu_nv16_shader_r8_int8_output() {
-        use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
+        use crate::opengl_headless::processor::NvConvertPath;
         if !is_dma_available() {
             crate::test_support::report_skip(&format!("{} - DMA not available", function!()));
             return;
@@ -9245,7 +10006,7 @@ mod gl_tests {
             edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
-        let mut gl = match GLProcessorST::new(None, None) {
+        let worker = match GLProcessorThreaded::new(None) {
             Ok(g) => g,
             Err(e) => {
                 crate::test_support::report_skip(&format!(
@@ -9255,27 +10016,30 @@ mod gl_tests {
                 return;
             }
         };
-        gl.convert(&src_dma, &mut gpu_dst, None).unwrap();
+        worker.with_st(|gl| {
+            gl.convert(&src_dma, &mut gpu_dst, None).unwrap();
 
-        assert_eq!(
-            gl.last_nv_convert_path,
-            NvConvertPath::ShaderR8,
-            "NV16 int8 DMA convert must use ShaderR8"
-        );
+            assert_eq!(
+                gl.last_nv_convert_path,
+                NvConvertPath::ShaderR8,
+                "NV16 int8 DMA convert must use ShaderR8"
+            );
 
-        // Compare raw i8 bytes.
-        let cpu_map = cpu_dst.as_i8().unwrap().map().unwrap();
-        let gpu_map = gpu_dst.as_i8().unwrap().map().unwrap();
-        let n = w * h * 3;
-        let mut max_diff = 0u32;
-        for i in 0..n {
-            let d = (gpu_map.as_slice()[i] as i32 - cpu_map.as_slice()[i] as i32).unsigned_abs();
-            max_diff = max_diff.max(d);
-        }
-        assert!(
-            max_diff <= 2,
-            "NV16 int8 GPU ShaderR8 vs CPU reference: max_diff={max_diff} (tolerance 2)"
-        );
+            // Compare raw i8 bytes.
+            let cpu_map = cpu_dst.as_i8().unwrap().map().unwrap();
+            let gpu_map = gpu_dst.as_i8().unwrap().map().unwrap();
+            let n = w * h * 3;
+            let mut max_diff = 0u32;
+            for i in 0..n {
+                let d =
+                    (gpu_map.as_slice()[i] as i32 - cpu_map.as_slice()[i] as i32).unsigned_abs();
+                max_diff = max_diff.max(d);
+            }
+            assert!(
+                max_diff <= 2,
+                "NV16 int8 GPU ShaderR8 vs CPU reference: max_diff={max_diff} (tolerance 2)"
+            );
+        });
     }
 
     // =========================================================================
@@ -9447,7 +10211,7 @@ mod gl_tests {
     #[test]
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn nv16_odd_w_vs_cpu() {
-        use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
+        use crate::opengl_headless::processor::NvConvertPath;
         if !is_gpu_image_buffer_available() {
             crate::test_support::report_skip(&format!(
                 "{} - no zero-copy GPU buffers",
@@ -9480,7 +10244,7 @@ mod gl_tests {
             edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
-        let mut gl = match GLProcessorST::new(None, None) {
+        let worker = match GLProcessorThreaded::new(None) {
             Ok(g) => g,
             Err(e) => {
                 crate::test_support::report_skip(&format!(
@@ -9490,21 +10254,23 @@ mod gl_tests {
                 return;
             }
         };
-        gl.convert(&src_dma, &mut gpu_dst, None).unwrap();
+        worker.with_st(|gl| {
+            gl.convert(&src_dma, &mut gpu_dst, None).unwrap();
 
-        assert_eq!(
-            gl.last_nv_convert_path,
-            NvConvertPath::ShaderR8,
-            "NV16 odd-W must use ShaderR8, got {:?}",
-            gl.last_nv_convert_path
-        );
+            assert_eq!(
+                gl.last_nv_convert_path,
+                NvConvertPath::ShaderR8,
+                "NV16 odd-W must use ShaderR8, got {:?}",
+                gl.last_nv_convert_path
+            );
 
-        let (max_diff, first_fail) = compare_gpu_vs_cpu_u8(&gpu_dst, &cpu_dst, w, h);
-        eprintln!("NV16 odd-W: GPU vs CPU max_diff={max_diff}");
-        assert!(
-            max_diff <= 4,
-            "NV16 odd-W GPU vs CPU max_diff={max_diff} > 4; first bad at {first_fail:?}"
-        );
+            let (max_diff, first_fail) = compare_gpu_vs_cpu_u8(&gpu_dst, &cpu_dst, w, h);
+            eprintln!("NV16 odd-W: GPU vs CPU max_diff={max_diff}");
+            assert!(
+                max_diff <= 4,
+                "NV16 odd-W GPU vs CPU max_diff={max_diff} > 4; first bad at {first_fail:?}"
+            );
+        });
     }
 
     // -------------------------------------------------------------------------
@@ -9515,7 +10281,7 @@ mod gl_tests {
     #[test]
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn nv24_odd_w_vs_cpu() {
-        use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
+        use crate::opengl_headless::processor::NvConvertPath;
         if !is_gpu_image_buffer_available() {
             crate::test_support::report_skip(&format!(
                 "{} - no zero-copy GPU buffers",
@@ -9548,7 +10314,7 @@ mod gl_tests {
             edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
-        let mut gl = match GLProcessorST::new(None, None) {
+        let worker = match GLProcessorThreaded::new(None) {
             Ok(g) => g,
             Err(e) => {
                 crate::test_support::report_skip(&format!(
@@ -9558,21 +10324,23 @@ mod gl_tests {
                 return;
             }
         };
-        gl.convert(&src_dma, &mut gpu_dst, None).unwrap();
+        worker.with_st(|gl| {
+            gl.convert(&src_dma, &mut gpu_dst, None).unwrap();
 
-        assert_eq!(
-            gl.last_nv_convert_path,
-            NvConvertPath::ShaderR8,
-            "NV24 odd-W must use ShaderR8, got {:?}",
-            gl.last_nv_convert_path
-        );
+            assert_eq!(
+                gl.last_nv_convert_path,
+                NvConvertPath::ShaderR8,
+                "NV24 odd-W must use ShaderR8, got {:?}",
+                gl.last_nv_convert_path
+            );
 
-        let (max_diff, first_fail) = compare_gpu_vs_cpu_u8(&gpu_dst, &cpu_dst, w, h);
-        eprintln!("NV24 odd-W: GPU vs CPU max_diff={max_diff}");
-        assert!(
-            max_diff <= 4,
-            "NV24 odd-W GPU vs CPU max_diff={max_diff} > 4; first bad at {first_fail:?}"
-        );
+            let (max_diff, first_fail) = compare_gpu_vs_cpu_u8(&gpu_dst, &cpu_dst, w, h);
+            eprintln!("NV24 odd-W: GPU vs CPU max_diff={max_diff}");
+            assert!(
+                max_diff <= 4,
+                "NV24 odd-W GPU vs CPU max_diff={max_diff} > 4; first bad at {first_fail:?}"
+            );
+        });
     }
 
     // -------------------------------------------------------------------------
@@ -9583,7 +10351,7 @@ mod gl_tests {
     #[test]
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn nv16_odd_both_vs_cpu() {
-        use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
+        use crate::opengl_headless::processor::NvConvertPath;
         if !is_gpu_image_buffer_available() {
             crate::test_support::report_skip(&format!(
                 "{} - no zero-copy GPU buffers",
@@ -9616,7 +10384,7 @@ mod gl_tests {
             edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
-        let mut gl = match GLProcessorST::new(None, None) {
+        let worker = match GLProcessorThreaded::new(None) {
             Ok(g) => g,
             Err(e) => {
                 crate::test_support::report_skip(&format!(
@@ -9626,21 +10394,23 @@ mod gl_tests {
                 return;
             }
         };
-        gl.convert(&src_dma, &mut gpu_dst, None).unwrap();
+        worker.with_st(|gl| {
+            gl.convert(&src_dma, &mut gpu_dst, None).unwrap();
 
-        assert_eq!(
-            gl.last_nv_convert_path,
-            NvConvertPath::ShaderR8,
-            "NV16 odd-both must use ShaderR8, got {:?}",
-            gl.last_nv_convert_path
-        );
+            assert_eq!(
+                gl.last_nv_convert_path,
+                NvConvertPath::ShaderR8,
+                "NV16 odd-both must use ShaderR8, got {:?}",
+                gl.last_nv_convert_path
+            );
 
-        let (max_diff, first_fail) = compare_gpu_vs_cpu_u8(&gpu_dst, &cpu_dst, w, h);
-        eprintln!("NV16 odd-both (65×63): GPU vs CPU max_diff={max_diff}");
-        assert!(
-            max_diff <= 4,
-            "NV16 odd-both GPU vs CPU max_diff={max_diff} > 4; first bad at {first_fail:?}"
-        );
+            let (max_diff, first_fail) = compare_gpu_vs_cpu_u8(&gpu_dst, &cpu_dst, w, h);
+            eprintln!("NV16 odd-both (65×63): GPU vs CPU max_diff={max_diff}");
+            assert!(
+                max_diff <= 4,
+                "NV16 odd-both GPU vs CPU max_diff={max_diff} > 4; first bad at {first_fail:?}"
+            );
+        });
     }
 
     // -------------------------------------------------------------------------
@@ -9651,7 +10421,7 @@ mod gl_tests {
     #[test]
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn nv24_odd_both_vs_cpu() {
-        use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
+        use crate::opengl_headless::processor::NvConvertPath;
         if !is_gpu_image_buffer_available() {
             crate::test_support::report_skip(&format!(
                 "{} - no zero-copy GPU buffers",
@@ -9684,7 +10454,7 @@ mod gl_tests {
             edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
-        let mut gl = match GLProcessorST::new(None, None) {
+        let worker = match GLProcessorThreaded::new(None) {
             Ok(g) => g,
             Err(e) => {
                 crate::test_support::report_skip(&format!(
@@ -9694,21 +10464,23 @@ mod gl_tests {
                 return;
             }
         };
-        gl.convert(&src_dma, &mut gpu_dst, None).unwrap();
+        worker.with_st(|gl| {
+            gl.convert(&src_dma, &mut gpu_dst, None).unwrap();
 
-        assert_eq!(
-            gl.last_nv_convert_path,
-            NvConvertPath::ShaderR8,
-            "NV24 odd-both must use ShaderR8, got {:?}",
-            gl.last_nv_convert_path
-        );
+            assert_eq!(
+                gl.last_nv_convert_path,
+                NvConvertPath::ShaderR8,
+                "NV24 odd-both must use ShaderR8, got {:?}",
+                gl.last_nv_convert_path
+            );
 
-        let (max_diff, first_fail) = compare_gpu_vs_cpu_u8(&gpu_dst, &cpu_dst, w, h);
-        eprintln!("NV24 odd-both (65×63): GPU vs CPU max_diff={max_diff}");
-        assert!(
-            max_diff <= 4,
-            "NV24 odd-both GPU vs CPU max_diff={max_diff} > 4; first bad at {first_fail:?}"
-        );
+            let (max_diff, first_fail) = compare_gpu_vs_cpu_u8(&gpu_dst, &cpu_dst, w, h);
+            eprintln!("NV24 odd-both (65×63): GPU vs CPU max_diff={max_diff}");
+            assert!(
+                max_diff <= 4,
+                "NV24 odd-both GPU vs CPU max_diff={max_diff} > 4; first bad at {first_fail:?}"
+            );
+        });
     }
 
     // -------------------------------------------------------------------------
@@ -9719,7 +10491,6 @@ mod gl_tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn odd_dst_unaligned_stride_guarded() {
-        use crate::opengl_headless::processor::GLProcessorST;
         if !is_dma_available() {
             crate::test_support::report_skip(&format!("{} - DMA not available", function!()));
             return;
@@ -9745,7 +10516,7 @@ mod gl_tests {
         )
         .unwrap();
 
-        let mut gl = match GLProcessorST::new(None, None) {
+        let worker = match GLProcessorThreaded::new(None) {
             Ok(g) => g,
             Err(e) => {
                 crate::test_support::report_skip(&format!(
@@ -9755,7 +10526,7 @@ mod gl_tests {
                 return;
             }
         };
-        match gl.convert(&src_dma, &mut gpu_dst, None) {
+        worker.with_st(|gl| match gl.convert(&src_dma, &mut gpu_dst, None) {
             Ok(()) => eprintln!("platform accepts non-aligned odd dst (OK)"),
             Err(crate::Error::NotSupported(msg)) => {
                 assert!(
@@ -9767,7 +10538,7 @@ mod gl_tests {
             Err(other) => {
                 panic!("odd-dst failure must be wrapped as NotSupported, not leaked raw: {other:?}")
             }
-        }
+        });
     }
 
     // -------------------------------------------------------------------------
@@ -9778,7 +10549,7 @@ mod gl_tests {
     #[test]
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn nv12_odd_w_shader_r8_vs_cpu() {
-        use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
+        use crate::opengl_headless::processor::NvConvertPath;
         if !is_gpu_image_buffer_available() {
             crate::test_support::report_skip(&format!(
                 "{} - no zero-copy GPU buffers",
@@ -9811,7 +10582,7 @@ mod gl_tests {
             edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
-        let mut gl = match GLProcessorST::new(None, None) {
+        let worker = match GLProcessorThreaded::new(None) {
             Ok(g) => g,
             Err(e) => {
                 crate::test_support::report_skip(&format!(
@@ -9821,21 +10592,23 @@ mod gl_tests {
                 return;
             }
         };
-        gl.convert(&src_dma, &mut gpu_dst, None).unwrap();
+        worker.with_st(|gl| {
+            gl.convert(&src_dma, &mut gpu_dst, None).unwrap();
 
-        assert_eq!(
-            gl.last_nv_convert_path,
-            NvConvertPath::ShaderR8,
-            "non-mult-4 NV12 must route to ShaderR8, got {:?}",
-            gl.last_nv_convert_path
-        );
+            assert_eq!(
+                gl.last_nv_convert_path,
+                NvConvertPath::ShaderR8,
+                "non-mult-4 NV12 must route to ShaderR8, got {:?}",
+                gl.last_nv_convert_path
+            );
 
-        let (max_diff, first_fail) = compare_gpu_vs_cpu_u8(&gpu_dst, &cpu_dst, w, h);
-        eprintln!("NV12 odd-W: GPU vs CPU max_diff={max_diff}");
-        assert!(
-            max_diff <= 4,
-            "NV12 odd-W GPU vs CPU max_diff={max_diff} > 4; first bad at {first_fail:?}"
-        );
+            let (max_diff, first_fail) = compare_gpu_vs_cpu_u8(&gpu_dst, &cpu_dst, w, h);
+            eprintln!("NV12 odd-W: GPU vs CPU max_diff={max_diff}");
+            assert!(
+                max_diff <= 4,
+                "NV12 odd-W GPU vs CPU max_diff={max_diff} > 4; first bad at {first_fail:?}"
+            );
+        });
     }
 
     // -------------------------------------------------------------------------
@@ -9846,7 +10619,7 @@ mod gl_tests {
     #[test]
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn nv12_odd_h_shader_r8_vs_cpu() {
-        use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
+        use crate::opengl_headless::processor::NvConvertPath;
         if !is_gpu_image_buffer_available() {
             crate::test_support::report_skip(&format!(
                 "{} - no zero-copy GPU buffers",
@@ -9879,7 +10652,7 @@ mod gl_tests {
             edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
-        let mut gl = match GLProcessorST::new(None, None) {
+        let worker = match GLProcessorThreaded::new(None) {
             Ok(g) => g,
             Err(e) => {
                 crate::test_support::report_skip(&format!(
@@ -9889,6 +10662,7 @@ mod gl_tests {
                 return;
             }
         };
+        worker.with_st(|gl| {
         gl.convert(&src_dma, &mut gpu_dst, None).unwrap();
 
         assert!(
@@ -9912,6 +10686,7 @@ mod gl_tests {
             max_diff <= 35,
             "gross NV12 odd-H GPU vs CPU mismatch max_diff={max_diff} (>35); first bad at {first_fail:?}"
         );
+        });
     }
 
     // -------------------------------------------------------------------------
@@ -9922,7 +10697,6 @@ mod gl_tests {
     #[test]
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn g_grey_odd_w_vs_cpu() {
-        use crate::opengl_headless::processor::GLProcessorST;
         use edgefirst_codec::{ImageDecoder, ImageLoad};
         if !is_gpu_image_buffer_available() {
             crate::test_support::report_skip(&format!(
@@ -9990,7 +10764,7 @@ mod gl_tests {
             edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
-        let mut gl = match GLProcessorST::new(None, None) {
+        let worker = match GLProcessorThreaded::new(None) {
             Ok(g) => g,
             Err(e) => {
                 crate::test_support::report_skip(&format!(
@@ -10000,6 +10774,7 @@ mod gl_tests {
                 return;
             }
         };
+        worker.with_st(|gl| {
         gl.convert(&src_dma, &mut gpu_dst, None).unwrap();
 
         let (max_diff, first_fail) = compare_gpu_vs_cpu_u8(&gpu_dst, &cpu_dst, w, h);
@@ -10008,6 +10783,7 @@ mod gl_tests {
             max_diff <= 4,
             "g_grey_odd_w: Grey odd-W GPU vs CPU max_diff={max_diff} > 4; first bad at {first_fail:?}"
         );
+        });
     }
 
     // -------------------------------------------------------------------------
@@ -10019,7 +10795,7 @@ mod gl_tests {
     #[ignore = "odd-width 3-channel RGB DMA output needs width*3 % 4 == 0 (pack-as-RGBA8 architecture in convert_to_packed_rgb, NOT the stride bug); use RGBA or even/mult-4 RGB dst"]
     #[cfg(target_os = "linux")]
     fn nv12_odd_w_i8_vs_cpu() {
-        use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
+        use crate::opengl_headless::processor::NvConvertPath;
         if !is_dma_available() {
             crate::test_support::report_skip(&format!("{} - DMA not available", function!()));
             return;
@@ -10049,7 +10825,7 @@ mod gl_tests {
             edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
-        let mut gl = match GLProcessorST::new(None, None) {
+        let worker = match GLProcessorThreaded::new(None) {
             Ok(g) => g,
             Err(e) => {
                 crate::test_support::report_skip(&format!(
@@ -10059,21 +10835,23 @@ mod gl_tests {
                 return;
             }
         };
-        gl.convert(&src_dma, &mut gpu_dst, None).unwrap();
+        worker.with_st(|gl| {
+            gl.convert(&src_dma, &mut gpu_dst, None).unwrap();
 
-        assert_eq!(
-            gl.last_nv_convert_path,
-            NvConvertPath::ShaderR8,
-            "odd-W single-plane NV12 must use ShaderR8, got {:?}",
-            gl.last_nv_convert_path
-        );
+            assert_eq!(
+                gl.last_nv_convert_path,
+                NvConvertPath::ShaderR8,
+                "odd-W single-plane NV12 must use ShaderR8, got {:?}",
+                gl.last_nv_convert_path
+            );
 
-        let max_diff = compare_gpu_vs_cpu_i8(&gpu_dst, &cpu_dst, w, h);
-        eprintln!("NV12 odd-W i8: GPU vs CPU max_diff={max_diff}");
-        assert!(
-            max_diff <= 2,
-            "NV12 i8 odd-W GPU vs CPU max_diff={max_diff} > 2"
-        );
+            let max_diff = compare_gpu_vs_cpu_i8(&gpu_dst, &cpu_dst, w, h);
+            eprintln!("NV12 odd-W i8: GPU vs CPU max_diff={max_diff}");
+            assert!(
+                max_diff <= 2,
+                "NV12 i8 odd-W GPU vs CPU max_diff={max_diff} > 2"
+            );
+        });
     }
 
     // -------------------------------------------------------------------------
@@ -10085,7 +10863,7 @@ mod gl_tests {
     #[ignore = "odd-width 3-channel RGB DMA output needs width*3 % 4 == 0 (pack-as-RGBA8 architecture in convert_to_packed_rgb, NOT the stride bug); use RGBA or even/mult-4 RGB dst"]
     #[cfg(target_os = "linux")]
     fn nv16_odd_both_i8_vs_cpu() {
-        use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
+        use crate::opengl_headless::processor::NvConvertPath;
         if !is_dma_available() {
             crate::test_support::report_skip(&format!("{} - DMA not available", function!()));
             return;
@@ -10115,7 +10893,7 @@ mod gl_tests {
             edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
-        let mut gl = match GLProcessorST::new(None, None) {
+        let worker = match GLProcessorThreaded::new(None) {
             Ok(g) => g,
             Err(e) => {
                 crate::test_support::report_skip(&format!(
@@ -10125,21 +10903,23 @@ mod gl_tests {
                 return;
             }
         };
-        gl.convert(&src_dma, &mut gpu_dst, None).unwrap();
+        worker.with_st(|gl| {
+            gl.convert(&src_dma, &mut gpu_dst, None).unwrap();
 
-        assert_eq!(
-            gl.last_nv_convert_path,
-            NvConvertPath::ShaderR8,
-            "NV16 i8 odd-both must use ShaderR8, got {:?}",
-            gl.last_nv_convert_path
-        );
+            assert_eq!(
+                gl.last_nv_convert_path,
+                NvConvertPath::ShaderR8,
+                "NV16 i8 odd-both must use ShaderR8, got {:?}",
+                gl.last_nv_convert_path
+            );
 
-        let max_diff = compare_gpu_vs_cpu_i8(&gpu_dst, &cpu_dst, w, h);
-        eprintln!("NV16 odd-both i8: GPU vs CPU max_diff={max_diff}");
-        assert!(
-            max_diff <= 2,
-            "NV16 i8 odd-both GPU vs CPU max_diff={max_diff} > 2"
-        );
+            let max_diff = compare_gpu_vs_cpu_i8(&gpu_dst, &cpu_dst, w, h);
+            eprintln!("NV16 odd-both i8: GPU vs CPU max_diff={max_diff}");
+            assert!(
+                max_diff <= 2,
+                "NV16 i8 odd-both GPU vs CPU max_diff={max_diff} > 2"
+            );
+        });
     }
 
     // -------------------------------------------------------------------------
@@ -10150,7 +10930,7 @@ mod gl_tests {
     #[test]
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn even_nv16_64x64_regression() {
-        use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
+        use crate::opengl_headless::processor::NvConvertPath;
         if !is_gpu_image_buffer_available() {
             crate::test_support::report_skip(&format!(
                 "{} - no zero-copy GPU buffers",
@@ -10183,7 +10963,7 @@ mod gl_tests {
             edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
-        let mut gl = match GLProcessorST::new(None, None) {
+        let worker = match GLProcessorThreaded::new(None) {
             Ok(g) => g,
             Err(e) => {
                 crate::test_support::report_skip(&format!(
@@ -10193,26 +10973,28 @@ mod gl_tests {
                 return;
             }
         };
-        gl.convert(&src_dma, &mut gpu_dst, None).unwrap();
+        worker.with_st(|gl| {
+            gl.convert(&src_dma, &mut gpu_dst, None).unwrap();
 
-        assert_eq!(
-            gl.last_nv_convert_path,
-            NvConvertPath::ShaderR8,
-            "even NV16 regression: must use ShaderR8"
-        );
-        let (max_diff, first_fail) = compare_gpu_vs_cpu_u8(&gpu_dst, &cpu_dst, w, h);
-        eprintln!("even NV16 64×64 regression: GPU vs CPU max_diff={max_diff}");
-        assert!(
-            max_diff <= 4,
-            "even NV16 64×64 regression: max_diff={max_diff} > 4; first bad at {first_fail:?}"
-        );
+            assert_eq!(
+                gl.last_nv_convert_path,
+                NvConvertPath::ShaderR8,
+                "even NV16 regression: must use ShaderR8"
+            );
+            let (max_diff, first_fail) = compare_gpu_vs_cpu_u8(&gpu_dst, &cpu_dst, w, h);
+            eprintln!("even NV16 64×64 regression: GPU vs CPU max_diff={max_diff}");
+            assert!(
+                max_diff <= 4,
+                "even NV16 64×64 regression: max_diff={max_diff} > 4; first bad at {first_fail:?}"
+            );
+        });
     }
 
     /// NV24 64×64 → RGBA on the GPU matches the CPU within ±4.
     #[test]
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn even_nv24_64x64_regression() {
-        use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
+        use crate::opengl_headless::processor::NvConvertPath;
         if !is_gpu_image_buffer_available() {
             crate::test_support::report_skip(&format!(
                 "{} - no zero-copy GPU buffers",
@@ -10245,7 +11027,7 @@ mod gl_tests {
             edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
-        let mut gl = match GLProcessorST::new(None, None) {
+        let worker = match GLProcessorThreaded::new(None) {
             Ok(g) => g,
             Err(e) => {
                 crate::test_support::report_skip(&format!(
@@ -10255,19 +11037,21 @@ mod gl_tests {
                 return;
             }
         };
-        gl.convert(&src_dma, &mut gpu_dst, None).unwrap();
+        worker.with_st(|gl| {
+            gl.convert(&src_dma, &mut gpu_dst, None).unwrap();
 
-        assert_eq!(
-            gl.last_nv_convert_path,
-            NvConvertPath::ShaderR8,
-            "even NV24 regression: must use ShaderR8"
-        );
-        let (max_diff, first_fail) = compare_gpu_vs_cpu_u8(&gpu_dst, &cpu_dst, w, h);
-        eprintln!("even NV24 64×64 regression: GPU vs CPU max_diff={max_diff}");
-        assert!(
-            max_diff <= 4,
-            "even NV24 64×64 regression: max_diff={max_diff} > 4; first bad at {first_fail:?}"
-        );
+            assert_eq!(
+                gl.last_nv_convert_path,
+                NvConvertPath::ShaderR8,
+                "even NV24 regression: must use ShaderR8"
+            );
+            let (max_diff, first_fail) = compare_gpu_vs_cpu_u8(&gpu_dst, &cpu_dst, w, h);
+            eprintln!("even NV24 64×64 regression: GPU vs CPU max_diff={max_diff}");
+            assert!(
+                max_diff <= 4,
+                "even NV24 64×64 regression: max_diff={max_diff} > 4; first bad at {first_fail:?}"
+            );
+        });
     }
 
     /// Fill a YUYV tensor at its real row stride: two bytes per pixel, Y in
@@ -11911,15 +12695,17 @@ mod gl_tests {
             .to_vec();
 
         // Tolerance by renderer, read while a probe processor's context is current.
-        let tolerance: u8 = crate::opengl_headless::processor::GLProcessorST::new(None, None)
-            .map(|g| {
-                let v3d = edgefirst_gl::get_string(edgefirst_gl::gl::RENDERER)
-                    .is_ok_and(|r| r.contains("V3D"));
-                if g.is_adreno || v3d {
-                    4
-                } else {
-                    0
-                }
+        let tolerance: u8 = GLProcessorThreaded::new(None)
+            .map(|worker| {
+                worker.with_st(|g| {
+                    let v3d = edgefirst_gl::get_string(edgefirst_gl::gl::RENDERER)
+                        .is_ok_and(|r| r.contains("V3D"));
+                    if g.is_adreno || v3d {
+                        4
+                    } else {
+                        0
+                    }
+                })
             })
             .unwrap_or(0);
         let mut gl = GLProcessorThreaded::new(None).expect("GL processor");
@@ -12359,13 +13145,13 @@ mod gl_tests {
     /// A GL processor for the packed-Rgb tests, with zero-copy DMA-BUF
     /// import, or `None` (with the skip reported) where there is none.
     #[cfg(target_os = "linux")]
-    fn rgb_test_processor(test: &str) -> Option<crate::opengl_headless::processor::GLProcessorST> {
+    fn rgb_test_processor(test: &str) -> Option<GLProcessorThreaded> {
         if !is_opengl_available() || !is_dma_available() {
             crate::test_support::report_skip(&format!("{test} - OpenGL or DMA-BUF not available"));
             return None;
         }
-        let gl = crate::opengl_headless::processor::GLProcessorST::new(None, None).ok()?;
-        if !gl.gl_context.transfer_backend.is_zero_copy() {
+        let gl = GLProcessorThreaded::new(None).ok()?;
+        if !gl.with_st(|st| st.gl_context.transfer_backend.is_zero_copy()) {
             crate::test_support::report_skip(&format!("{test} - no zero-copy DMA-BUF import"));
             return None;
         }
@@ -12409,8 +13195,9 @@ mod gl_tests {
         let Some(probe) = rgb_test_processor(function!()) else {
             return;
         };
-        for (route, native, r8) in rgb_test_routes(&probe) {
-            let mut gl = crate::opengl_headless::processor::GLProcessorST::new(None, None).unwrap();
+        for (route, native, r8) in probe.with_st(|p| rgb_test_routes(p)) {
+            let worker = GLProcessorThreaded::new(None).unwrap();
+            worker.with_st(|gl| {
             gl.restrict_rgb_source_routes(native, r8);
             for (w, h) in [
                 (320usize, 240usize),
@@ -12473,6 +13260,7 @@ mod gl_tests {
                     worst.1
                 );
             }
+            });
         }
     }
 
@@ -12480,25 +13268,27 @@ mod gl_tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn test_rgb_dma_source_without_an_import_declines() {
-        let Some(mut gl) = rgb_test_processor(function!()) else {
+        let Some(worker) = rgb_test_processor(function!()) else {
             return;
         };
-        gl.restrict_rgb_source_routes(false, false);
-        let src = rgb_test_source(640, 480, PixelFormat::Rgb);
-        let mut dst = TensorDyn::image(
-            320,
-            240,
-            PixelFormat::Rgba,
-            DType::U8,
-            Some(TensorMemory::Mem),
-            edgefirst_tensor::CpuAccess::ReadWrite,
-        )
-        .unwrap();
-        let err = gl
-            .convert(&src, &mut dst, None)
-            .expect_err("no import route: the GL convert must decline");
-        assert!(matches!(err, crate::Error::NotSupported(_)), "{err:?}");
-        assert_eq!(gl.last_rgb_source_path, None);
+        worker.with_st(|gl| {
+            gl.restrict_rgb_source_routes(false, false);
+            let src = rgb_test_source(640, 480, PixelFormat::Rgb);
+            let mut dst = TensorDyn::image(
+                320,
+                240,
+                PixelFormat::Rgba,
+                DType::U8,
+                Some(TensorMemory::Mem),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .unwrap();
+            let err = gl
+                .convert(&src, &mut dst, None)
+                .expect_err("no import route: the GL convert must decline");
+            assert!(matches!(err, crate::Error::NotSupported(_)), "{err:?}");
+            assert_eq!(gl.last_rgb_source_path, None);
+        });
     }
 
     /// Every route of a packed Rgb DMA-BUF source renders what an Rgba DMA-BUF source renders.
@@ -12602,72 +13392,73 @@ mod gl_tests {
             });
         }
         let mut failures = Vec::new();
-        for (route, native, r8) in rgb_test_routes(&probe) {
+        for (route, native, r8) in probe.with_st(|p| rgb_test_routes(p)) {
             let hw_modes: &[bool] = if route == "native" {
                 &[true]
             } else {
                 &[true, false]
             };
             for &hw in hw_modes {
-                let mut gl =
-                    crate::opengl_headless::processor::GLProcessorST::new(None, None).unwrap();
-                gl.restrict_rgb_source_routes(native, r8);
-                gl.set_nv_hw_filter(hw);
-                for case in &cases {
-                    let ((sw, sh), (dw, dh)) = (case.src, case.dst);
-                    let src = rgb_test_source(sw, sh, PixelFormat::Rgb);
-                    let reference_src = rgb_test_source(sw, sh, PixelFormat::Rgba);
-                    let image = || {
-                        TensorDyn::image(
-                            dw,
-                            dh,
-                            case.fmt,
-                            case.dtype,
-                            Some(case.mem),
-                            edgefirst_tensor::CpuAccess::ReadWrite,
-                        )
-                        .unwrap()
-                    };
-                    let (mut got, mut want) = (image(), image());
-                    gl.convert(&src, &mut got, Some(case.options)).unwrap();
-                    let path = gl.last_rgb_source_path;
-                    gl.convert(&reference_src, &mut want, Some(case.options))
-                        .unwrap();
-                    let label = format!("{route} hw={hw} {}", case.name);
-                    if !rgb_route_matches(route, path) {
-                        failures.push(format!("{label}: took {path:?}"));
-                        continue;
-                    }
-                    let (got, want) = if case.dtype == DType::F16 {
-                        let bytes = |t: &TensorDyn| -> Vec<u8> {
-                            let t = t.as_f16().unwrap();
-                            let m = t.map().unwrap();
-                            m.as_slice()
-                                .iter()
-                                .map(|v| (v.to_f32() * 255.0).round().clamp(0.0, 255.0) as u8)
-                                .collect()
+                let worker = GLProcessorThreaded::new(None).unwrap();
+                worker.with_st(|gl| {
+                    gl.restrict_rgb_source_routes(native, r8);
+                    gl.set_nv_hw_filter(hw);
+                    for case in &cases {
+                        let ((sw, sh), (dw, dh)) = (case.src, case.dst);
+                        let src = rgb_test_source(sw, sh, PixelFormat::Rgb);
+                        let reference_src = rgb_test_source(sw, sh, PixelFormat::Rgba);
+                        let image = || {
+                            TensorDyn::image(
+                                dw,
+                                dh,
+                                case.fmt,
+                                case.dtype,
+                                Some(case.mem),
+                                edgefirst_tensor::CpuAccess::ReadWrite,
+                            )
+                            .unwrap()
                         };
-                        (bytes(&got), bytes(&want))
-                    } else {
-                        (rgb_test_tight_bytes(&got), rgb_test_tight_bytes(&want))
-                    };
-                    assert_eq!(got.len(), want.len());
-                    let max = got
-                        .iter()
-                        .zip(&want)
-                        .map(|(a, b)| a.abs_diff(*b))
-                        .max()
-                        .unwrap_or(0);
-                    let mean = got
-                        .iter()
-                        .zip(&want)
-                        .map(|(a, b)| a.abs_diff(*b) as f64)
-                        .sum::<f64>()
-                        / got.len().max(1) as f64;
-                    if max > MAX_DIFF || mean > MAX_MEAN {
-                        failures.push(format!("{label} ({path:?}): max {max}, mean {mean:.3}"));
+                        let (mut got, mut want) = (image(), image());
+                        gl.convert(&src, &mut got, Some(case.options)).unwrap();
+                        let path = gl.last_rgb_source_path;
+                        gl.convert(&reference_src, &mut want, Some(case.options))
+                            .unwrap();
+                        let label = format!("{route} hw={hw} {}", case.name);
+                        if !rgb_route_matches(route, path) {
+                            failures.push(format!("{label}: took {path:?}"));
+                            continue;
+                        }
+                        let (got, want) = if case.dtype == DType::F16 {
+                            let bytes = |t: &TensorDyn| -> Vec<u8> {
+                                let t = t.as_f16().unwrap();
+                                let m = t.map().unwrap();
+                                m.as_slice()
+                                    .iter()
+                                    .map(|v| (v.to_f32() * 255.0).round().clamp(0.0, 255.0) as u8)
+                                    .collect()
+                            };
+                            (bytes(&got), bytes(&want))
+                        } else {
+                            (rgb_test_tight_bytes(&got), rgb_test_tight_bytes(&want))
+                        };
+                        assert_eq!(got.len(), want.len());
+                        let max = got
+                            .iter()
+                            .zip(&want)
+                            .map(|(a, b)| a.abs_diff(*b))
+                            .max()
+                            .unwrap_or(0);
+                        let mean = got
+                            .iter()
+                            .zip(&want)
+                            .map(|(a, b)| a.abs_diff(*b) as f64)
+                            .sum::<f64>()
+                            / got.len().max(1) as f64;
+                        if max > MAX_DIFF || mean > MAX_MEAN {
+                            failures.push(format!("{label} ({path:?}): max {max}, mean {mean:.3}"));
+                        }
                     }
-                }
+                });
             }
         }
         assert!(failures.is_empty(), "{}", failures.join("\n"));
@@ -12732,119 +13523,122 @@ mod gl_tests {
             crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
             return;
         }
-        let mut gl = crate::opengl_headless::processor::GLProcessorST::new(None, None).unwrap();
-        let zero_copy = gl.gl_context.transfer_backend.is_zero_copy() && is_dma_available();
-        let mut mems = vec![TensorMemory::Mem];
-        if zero_copy {
-            mems.push(TensorMemory::DmaBuf);
-        }
-        let full = edgefirst_tensor::Colorimetry::default()
-            .with_encoding(edgefirst_tensor::ColorEncoding::Bt601)
-            .with_range(edgefirst_tensor::ColorRange::Full);
-        let mut failures = Vec::new();
-        let (w, h) = (322usize, 242usize);
-        for fmt in [
-            PixelFormat::Rgb,
-            PixelFormat::Rgba,
-            PixelFormat::Grey,
-            PixelFormat::Nv12,
-            PixelFormat::Nv16,
-            PixelFormat::Nv24,
-            PixelFormat::Yuyv,
-        ] {
-            let ranges: &[Option<edgefirst_tensor::Colorimetry>] = if fmt.is_yuv() {
-                &[None, Some(full)]
-            } else {
-                &[None]
-            };
-            for &mem in &mems {
-                if fmt == PixelFormat::Yuyv && mem == TensorMemory::Mem && zero_copy {
-                    continue;
-                }
-                for &cm in ranges {
-                    let mut src =
-                        load_raw_image(w, h, fmt, Some(mem), &grey_test_bytes(w, h, fmt)).unwrap();
-                    src.set_colorimetry(cm);
-                    // The CPU reference for an NV16 source is NV12 with the same luma plane.
-                    let ref_fmt = if fmt == PixelFormat::Nv16 {
-                        PixelFormat::Nv12
-                    } else {
-                        fmt
-                    };
-                    let mut reference = load_raw_image(
-                        w,
-                        h,
-                        ref_fmt,
-                        Some(TensorMemory::Mem),
-                        &grey_test_bytes(w, h, ref_fmt),
-                    )
-                    .unwrap();
-                    reference.set_colorimetry(cm);
-                    for (opts_name, (dw, dh), options) in [
-                        ("1:1", (w, h), ConvertOptions::new()),
-                        (
-                            "letterbox",
-                            (480, 480),
-                            ConvertOptions::new().letterbox([200, 30, 90, 255]),
-                        ),
-                        (
-                            "pad-output",
-                            (480, 480),
-                            ConvertOptions::new()
-                                .letterbox([200, 30, 90, 255])
-                                .pad_output([1.0; 4]),
-                        ),
-                    ] {
-                        for dtype in [DType::U8, DType::I8] {
-                            let label = format!(
-                                "{fmt:?}@{mem:?} {} {opts_name} {dtype:?}",
-                                if cm.is_some() { "full" } else { "default" }
-                            );
-                            let image = |m| {
-                                TensorDyn::image(
-                                    dw,
-                                    dh,
-                                    PixelFormat::Grey,
-                                    dtype,
-                                    Some(m),
-                                    edgefirst_tensor::CpuAccess::ReadWrite,
-                                )
-                                .unwrap()
-                            };
-                            let mut got = image(mem);
-                            if let Err(e) = gl.convert(&src, &mut got, Some(options)) {
-                                failures.push(format!("{label}: GL declined: {e}"));
-                                continue;
-                            }
-                            let mut want = image(TensorMemory::Mem);
-                            crate::CPUProcessor::new()
-                                .convert(&reference, &mut want, Some(options))
+        let worker = GLProcessorThreaded::new(None).unwrap();
+        worker.with_st(|gl| {
+            let zero_copy = gl.gl_context.transfer_backend.is_zero_copy() && is_dma_available();
+            let mut mems = vec![TensorMemory::Mem];
+            if zero_copy {
+                mems.push(TensorMemory::DmaBuf);
+            }
+            let full = edgefirst_tensor::Colorimetry::default()
+                .with_encoding(edgefirst_tensor::ColorEncoding::Bt601)
+                .with_range(edgefirst_tensor::ColorRange::Full);
+            let mut failures = Vec::new();
+            let (w, h) = (322usize, 242usize);
+            for fmt in [
+                PixelFormat::Rgb,
+                PixelFormat::Rgba,
+                PixelFormat::Grey,
+                PixelFormat::Nv12,
+                PixelFormat::Nv16,
+                PixelFormat::Nv24,
+                PixelFormat::Yuyv,
+            ] {
+                let ranges: &[Option<edgefirst_tensor::Colorimetry>] = if fmt.is_yuv() {
+                    &[None, Some(full)]
+                } else {
+                    &[None]
+                };
+                for &mem in &mems {
+                    if fmt == PixelFormat::Yuyv && mem == TensorMemory::Mem && zero_copy {
+                        continue;
+                    }
+                    for &cm in ranges {
+                        let mut src =
+                            load_raw_image(w, h, fmt, Some(mem), &grey_test_bytes(w, h, fmt))
                                 .unwrap();
-                            let (got, want) =
-                                (rgb_test_tight_bytes(&got), rgb_test_tight_bytes(&want));
-                            let diffs: Vec<u8> =
-                                got.iter().zip(&want).map(|(a, b)| a.abs_diff(*b)).collect();
-                            let max = diffs.iter().copied().max().unwrap_or(0);
-                            let mean =
-                                diffs.iter().map(|&d| d as f64).sum::<f64>() / diffs.len() as f64;
-                            let ok = if opts_name == "1:1" {
-                                max <= 1
-                            } else {
-                                // Row 0 lies in the pad band and is exact.
-                                got[0] == want[0] && mean <= 2.0
-                            };
-                            if !ok {
-                                failures.push(format!(
-                                    "{label}: max {max}, mean {mean:.3}, pad {} vs {}",
-                                    got[0], want[0]
-                                ));
+                        src.set_colorimetry(cm);
+                        // The CPU reference for an NV16 source is NV12 with the same luma plane.
+                        let ref_fmt = if fmt == PixelFormat::Nv16 {
+                            PixelFormat::Nv12
+                        } else {
+                            fmt
+                        };
+                        let mut reference = load_raw_image(
+                            w,
+                            h,
+                            ref_fmt,
+                            Some(TensorMemory::Mem),
+                            &grey_test_bytes(w, h, ref_fmt),
+                        )
+                        .unwrap();
+                        reference.set_colorimetry(cm);
+                        for (opts_name, (dw, dh), options) in [
+                            ("1:1", (w, h), ConvertOptions::new()),
+                            (
+                                "letterbox",
+                                (480, 480),
+                                ConvertOptions::new().letterbox([200, 30, 90, 255]),
+                            ),
+                            (
+                                "pad-output",
+                                (480, 480),
+                                ConvertOptions::new()
+                                    .letterbox([200, 30, 90, 255])
+                                    .pad_output([1.0; 4]),
+                            ),
+                        ] {
+                            for dtype in [DType::U8, DType::I8] {
+                                let label = format!(
+                                    "{fmt:?}@{mem:?} {} {opts_name} {dtype:?}",
+                                    if cm.is_some() { "full" } else { "default" }
+                                );
+                                let image = |m| {
+                                    TensorDyn::image(
+                                        dw,
+                                        dh,
+                                        PixelFormat::Grey,
+                                        dtype,
+                                        Some(m),
+                                        edgefirst_tensor::CpuAccess::ReadWrite,
+                                    )
+                                    .unwrap()
+                                };
+                                let mut got = image(mem);
+                                if let Err(e) = gl.convert(&src, &mut got, Some(options)) {
+                                    failures.push(format!("{label}: GL declined: {e}"));
+                                    continue;
+                                }
+                                let mut want = image(TensorMemory::Mem);
+                                crate::CPUProcessor::new()
+                                    .convert(&reference, &mut want, Some(options))
+                                    .unwrap();
+                                let (got, want) =
+                                    (rgb_test_tight_bytes(&got), rgb_test_tight_bytes(&want));
+                                let diffs: Vec<u8> =
+                                    got.iter().zip(&want).map(|(a, b)| a.abs_diff(*b)).collect();
+                                let max = diffs.iter().copied().max().unwrap_or(0);
+                                let mean = diffs.iter().map(|&d| d as f64).sum::<f64>()
+                                    / diffs.len() as f64;
+                                let ok = if opts_name == "1:1" {
+                                    max <= 1
+                                } else {
+                                    // Row 0 lies in the pad band and is exact.
+                                    got[0] == want[0] && mean <= 2.0
+                                };
+                                if !ok {
+                                    failures.push(format!(
+                                        "{label}: max {max}, mean {mean:.3}, pad {} vs {}",
+                                        got[0], want[0]
+                                    ));
+                                }
                             }
                         }
                     }
                 }
             }
-        }
-        assert!(failures.is_empty(), "{}", failures.join("\n"));
+            assert!(failures.is_empty(), "{}", failures.join("\n"));
+        });
     }
 
     /// A colour convert after a Grey one through the same NV program restores the chroma terms.
@@ -12856,38 +13650,40 @@ mod gl_tests {
             crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
             return;
         }
-        let mut gl = crate::opengl_headless::processor::GLProcessorST::new(None, None).unwrap();
-        let (w, h) = (322usize, 242usize);
-        let src = load_raw_image(
-            w,
-            h,
-            PixelFormat::Nv12,
-            Some(TensorMemory::Mem),
-            &grey_test_bytes(w, h, PixelFormat::Nv12),
-        )
-        .unwrap();
-        let image = |fmt| {
-            TensorDyn::image(
+        let worker = GLProcessorThreaded::new(None).unwrap();
+        worker.with_st(|gl| {
+            let (w, h) = (322usize, 242usize);
+            let src = load_raw_image(
                 w,
                 h,
-                fmt,
-                DType::U8,
+                PixelFormat::Nv12,
                 Some(TensorMemory::Mem),
-                edgefirst_tensor::CpuAccess::ReadWrite,
+                &grey_test_bytes(w, h, PixelFormat::Nv12),
             )
-            .unwrap()
-        };
-        let mut before = image(PixelFormat::Rgba);
-        gl.convert(&src, &mut before, None).unwrap();
-        let mut grey = image(PixelFormat::Grey);
-        gl.convert(&src, &mut grey, None).unwrap();
-        let mut after = image(PixelFormat::Rgba);
-        gl.convert(&src, &mut after, None).unwrap();
-        assert_eq!(
-            rgb_test_tight_bytes(&before),
-            rgb_test_tight_bytes(&after),
-            "an NV -> Rgba convert after an NV -> Grey one lost its chroma"
-        );
+            .unwrap();
+            let image = |fmt| {
+                TensorDyn::image(
+                    w,
+                    h,
+                    fmt,
+                    DType::U8,
+                    Some(TensorMemory::Mem),
+                    edgefirst_tensor::CpuAccess::ReadWrite,
+                )
+                .unwrap()
+            };
+            let mut before = image(PixelFormat::Rgba);
+            gl.convert(&src, &mut before, None).unwrap();
+            let mut grey = image(PixelFormat::Grey);
+            gl.convert(&src, &mut grey, None).unwrap();
+            let mut after = image(PixelFormat::Rgba);
+            gl.convert(&src, &mut after, None).unwrap();
+            assert_eq!(
+                rgb_test_tight_bytes(&before),
+                rgb_test_tight_bytes(&after),
+                "an NV -> Rgba convert after an NV -> Grey one lost its chroma"
+            );
+        });
     }
 
     /// A limited-range luma resize clamps each sample's footroom to black before blending.
@@ -12899,63 +13695,65 @@ mod gl_tests {
             crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
             return;
         }
-        let mut gl = crate::opengl_headless::processor::GLProcessorST::new(None, None).unwrap();
-        gl.set_nv_hw_filter(true);
-        let zero_copy = gl.gl_context.transfer_backend.is_zero_copy()
-            && edgefirst_tensor::is_gpu_buffer_available();
-        let (w, h) = (320usize, 240usize);
-        let row = |y: usize| if y.is_multiple_of(2) { 0u8 } else { 32 };
-        let mut sources = vec![(PixelFormat::Nv12, TensorMemory::Mem)];
-        if zero_copy {
-            sources.push((PixelFormat::Nv12, TensorMemory::DmaBuf));
-            if cfg!(target_os = "linux") {
-                sources.push((PixelFormat::Yuyv, TensorMemory::DmaBuf));
+        let worker = GLProcessorThreaded::new(None).unwrap();
+        worker.with_st(|gl| {
+            gl.set_nv_hw_filter(true);
+            let zero_copy = gl.gl_context.transfer_backend.is_zero_copy()
+                && edgefirst_tensor::is_gpu_buffer_available();
+            let (w, h) = (320usize, 240usize);
+            let row = |y: usize| if y.is_multiple_of(2) { 0u8 } else { 32 };
+            let mut sources = vec![(PixelFormat::Nv12, TensorMemory::Mem)];
+            if zero_copy {
+                sources.push((PixelFormat::Nv12, TensorMemory::DmaBuf));
+                if cfg!(target_os = "linux") {
+                    sources.push((PixelFormat::Yuyv, TensorMemory::DmaBuf));
+                }
             }
-        }
-        let mut failures = Vec::new();
-        for (fmt, mem) in sources {
-            let bytes: Vec<u8> = if fmt == PixelFormat::Yuyv {
-                (0..h)
-                    .flat_map(|y| (0..w).flat_map(move |_| [row(y), 128]))
-                    .collect()
-            } else {
-                let luma = (0..h).flat_map(|y| std::iter::repeat_n(row(y), w));
-                luma.chain(std::iter::repeat_n(128, w * h / 2)).collect()
-            };
-            let src = load_raw_image(w, h, fmt, Some(mem), &bytes).unwrap();
-            let image = |m| {
-                TensorDyn::image(
-                    w,
-                    h / 2,
-                    PixelFormat::Grey,
-                    DType::U8,
-                    Some(m),
-                    edgefirst_tensor::CpuAccess::ReadWrite,
-                )
-                .unwrap()
-            };
-            let mut got = image(mem);
-            gl.convert(&src, &mut got, None).unwrap();
-            let mut want = image(TensorMemory::Mem);
-            crate::CPUProcessor::new()
-                .convert(&src, &mut want, None)
-                .unwrap();
-            let (got, want) = (rgb_test_tight_bytes(&got), rgb_test_tight_bytes(&want));
-            let max = got
-                .iter()
-                .zip(&want)
-                .map(|(a, b)| a.abs_diff(*b))
-                .max()
-                .unwrap_or(0);
-            if max > 2 {
-                failures.push(format!(
-                    "{fmt:?}@{mem:?}: max {max} (gl {}, cpu {})",
-                    got[w * 10],
-                    want[w * 10]
-                ));
+            let mut failures = Vec::new();
+            for (fmt, mem) in sources {
+                let bytes: Vec<u8> = if fmt == PixelFormat::Yuyv {
+                    (0..h)
+                        .flat_map(|y| (0..w).flat_map(move |_| [row(y), 128]))
+                        .collect()
+                } else {
+                    let luma = (0..h).flat_map(|y| std::iter::repeat_n(row(y), w));
+                    luma.chain(std::iter::repeat_n(128, w * h / 2)).collect()
+                };
+                let src = load_raw_image(w, h, fmt, Some(mem), &bytes).unwrap();
+                let image = |m| {
+                    TensorDyn::image(
+                        w,
+                        h / 2,
+                        PixelFormat::Grey,
+                        DType::U8,
+                        Some(m),
+                        edgefirst_tensor::CpuAccess::ReadWrite,
+                    )
+                    .unwrap()
+                };
+                let mut got = image(mem);
+                gl.convert(&src, &mut got, None).unwrap();
+                let mut want = image(TensorMemory::Mem);
+                crate::CPUProcessor::new()
+                    .convert(&src, &mut want, None)
+                    .unwrap();
+                let (got, want) = (rgb_test_tight_bytes(&got), rgb_test_tight_bytes(&want));
+                let max = got
+                    .iter()
+                    .zip(&want)
+                    .map(|(a, b)| a.abs_diff(*b))
+                    .max()
+                    .unwrap_or(0);
+                if max > 2 {
+                    failures.push(format!(
+                        "{fmt:?}@{mem:?}: max {max} (gl {}, cpu {})",
+                        got[w * 10],
+                        want[w * 10]
+                    ));
+                }
             }
-        }
-        assert!(failures.is_empty(), "{}", failures.join("\n"));
+            assert!(failures.is_empty(), "{}", failures.join("\n"));
+        });
     }
 
     // -------------------------------------------------------------------------
@@ -13077,7 +13875,7 @@ mod gl_tests {
     /// A GL processor for an NV12 destination test, or `None` after reporting a skip when
     /// OpenGL or zero-copy GPU buffers are unavailable.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    fn nv12_gl_or_skip(name: &str) -> Option<crate::opengl_headless::processor::GLProcessorST> {
+    fn nv12_gl_or_skip(name: &str) -> Option<GLProcessorThreaded> {
         if !is_opengl_available() {
             crate::test_support::report_skip(&format!("{name} - OpenGL not available"));
             return None;
@@ -13086,8 +13884,8 @@ mod gl_tests {
             crate::test_support::report_skip(&format!("{name} - no zero-copy GPU buffers"));
             return None;
         }
-        let gl = crate::opengl_headless::processor::GLProcessorST::new(None, None).unwrap();
-        if !gl.gl_context.transfer_backend.is_zero_copy() {
+        let gl = GLProcessorThreaded::new(None).unwrap();
+        if !gl.with_st(|st| st.gl_context.transfer_backend.is_zero_copy()) {
             crate::test_support::report_skip(&format!("{name} - no zero-copy destination import"));
             return None;
         }
@@ -13173,11 +13971,11 @@ mod gl_tests {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn test_gpu_nv12_dst_matches_cpu_reference() {
         use crate::{ConvertOptions, ImageProcessorTrait};
-        let Some(mut gl) = nv12_gl_or_skip(function!()) else {
+        let Some(worker) = nv12_gl_or_skip(function!()) else {
             return;
         };
+        worker.with_st(|gl| {
         let backend = gl.gl_context.transfer_backend;
-        gl.set_colorimetry_mode(crate::ColorimetryMode::Exact);
         let full = edgefirst_tensor::Colorimetry::default()
             .with_encoding(edgefirst_tensor::ColorEncoding::Bt709)
             .with_range(edgefirst_tensor::ColorRange::Full);
@@ -13306,6 +14104,7 @@ mod gl_tests {
         if gl.renders_nv12_dst() {
             assert!(rendered > 0, "no conversion rendered on GL");
         }
+        });
     }
 
     /// With the default soft declines, RGBA and YUYV zero-copy sources of a small and a 1080p
@@ -13315,110 +14114,113 @@ mod gl_tests {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn test_gpu_nv12_dst_matches_cpu_at_small_and_1080p_sizes() {
         use crate::{ConvertOptions, ImageProcessorTrait};
-        let Some(mut gl) = nv12_gl_or_skip(function!()) else {
+        let Some(worker) = nv12_gl_or_skip(function!()) else {
             return;
         };
-        gl.soft_declines = true;
-        let backend = gl.gl_context.transfer_backend;
-        let bars = ConvertOptions::new().letterbox([200, 30, 90, 255]);
-        let mut failures = Vec::new();
-        let mut rendered = 0usize;
-        for (w, h) in [(64usize, 32usize), (1920, 1080)] {
-            let mut cases = Vec::new();
-            for fmt in [PixelFormat::Rgba, PixelFormat::Yuyv] {
-                let src = nv12_dst_test_source(w, h, fmt, TensorMemory::DmaBuf, None);
-                cases.push(("1:1", src, (w, h), ConvertOptions::new()));
-                let src = nv12_dst_test_source(w, h, fmt, TensorMemory::DmaBuf, None);
-                cases.push(("resize", src, (w / 2, h / 2), ConvertOptions::new()));
-            }
-            let square = nv12_dst_test_source(h, h, PixelFormat::Rgba, TensorMemory::DmaBuf, None);
-            cases.push(("letterbox", square, (w, h), bars));
-            let narrow =
-                nv12_dst_test_source(h - 2, h, PixelFormat::Rgba, TensorMemory::DmaBuf, None);
-            cases.push(("pillarbox-odd", narrow, (w, h), bars));
-            for (name, src, (dw, dh), options) in cases {
-                let fmt = src.format().unwrap();
-                let label = format!(
-                    "{fmt:?} {}x{} -> {dw}x{dh} {name}",
-                    src.width().unwrap(),
-                    src.height().unwrap()
-                );
-                let same_size = name == "1:1";
-                let decline = gl.nv12_policy_decline(
-                    fmt,
-                    same_size,
-                    same_size && fmt != PixelFormat::Rgba,
-                    (dw, dh),
-                );
-                let takes_src =
+        worker.with_st(|gl| {
+            gl.soft_declines = true;
+            let backend = gl.gl_context.transfer_backend;
+            let bars = ConvertOptions::new().letterbox([200, 30, 90, 255]);
+            let mut failures = Vec::new();
+            let mut rendered = 0usize;
+            for (w, h) in [(64usize, 32usize), (1920, 1080)] {
+                let mut cases = Vec::new();
+                for fmt in [PixelFormat::Rgba, PixelFormat::Yuyv] {
+                    let src = nv12_dst_test_source(w, h, fmt, TensorMemory::DmaBuf, None);
+                    cases.push(("1:1", src, (w, h), ConvertOptions::new()));
+                    let src = nv12_dst_test_source(w, h, fmt, TensorMemory::DmaBuf, None);
+                    cases.push(("resize", src, (w / 2, h / 2), ConvertOptions::new()));
+                }
+                let square =
+                    nv12_dst_test_source(h, h, PixelFormat::Rgba, TensorMemory::DmaBuf, None);
+                cases.push(("letterbox", square, (w, h), bars));
+                let narrow =
+                    nv12_dst_test_source(h - 2, h, PixelFormat::Rgba, TensorMemory::DmaBuf, None);
+                cases.push(("pillarbox-odd", narrow, (w, h), bars));
+                for (name, src, (dw, dh), options) in cases {
+                    let fmt = src.format().unwrap();
+                    let label = format!(
+                        "{fmt:?} {}x{} -> {dw}x{dh} {name}",
+                        src.width().unwrap(),
+                        src.height().unwrap()
+                    );
+                    let same_size = name == "1:1";
+                    let decline = gl.nv12_policy_decline(
+                        fmt,
+                        same_size,
+                        same_size && fmt != PixelFormat::Rgba,
+                        (dw, dh),
+                    );
+                    let takes_src =
                     crate::opengl_headless::processor::GLProcessorST::check_src_format_supported(
                         backend,
                         src.as_u8().unwrap(),
                         fmt,
                     );
-                let mut got = nv12_image(dw, dh, TensorMemory::DmaBuf, None);
-                let fallbacks_before = gl.convert_stats().dst_import_fallbacks;
-                gl.begin_gpu_pass();
-                let result = gl.convert(&src, &mut got, Some(options));
-                gl.end_gpu_pass_if_synced();
-                if decline.is_some() || !takes_src {
-                    if !matches!(result, Err(crate::Error::NotSupported(_))) {
-                        failures.push(format!("{label}: expected a decline, got {result:?}"));
+                    let mut got = nv12_image(dw, dh, TensorMemory::DmaBuf, None);
+                    let fallbacks_before = gl.convert_stats().dst_import_fallbacks;
+                    gl.begin_gpu_pass();
+                    let result = gl.convert(&src, &mut got, Some(options));
+                    gl.end_gpu_pass_if_synced();
+                    if decline.is_some() || !takes_src {
+                        if !matches!(result, Err(crate::Error::NotSupported(_))) {
+                            failures.push(format!("{label}: expected a decline, got {result:?}"));
+                        }
+                        continue;
                     }
-                    continue;
-                }
-                if let Err(e) = result {
-                    failures.push(format!("{label}: GL declined: {e}"));
-                    continue;
-                }
-                if gl.convert_stats().dst_import_fallbacks != fallbacks_before {
-                    failures.push(format!("{label}: the destination import was refused"));
-                    continue;
-                }
-                rendered += 1;
-                let mut want = nv12_image(dw, dh, TensorMemory::Mem, got.colorimetry());
-                crate::CPUProcessor::new()
-                    .convert(&src, &mut want, Some(options))
-                    .unwrap();
-                let (got_y, got_uv) = nv12_tight_planes(&got);
-                let (want_y, want_uv) = nv12_tight_planes(&want);
-                let (y_max, y_mean) = nv12_plane_diff(&got_y, &want_y);
-                let (uv_max, uv_mean) = nv12_plane_diff(&got_uv, &want_uv);
-                let ok = if same_size {
-                    y_max <= 2 && uv_max <= 2
-                } else {
-                    y_mean <= 2.0 && uv_mean <= 2.0
-                };
-                if !ok {
-                    failures.push(format!(
+                    if let Err(e) = result {
+                        failures.push(format!("{label}: GL declined: {e}"));
+                        continue;
+                    }
+                    if gl.convert_stats().dst_import_fallbacks != fallbacks_before {
+                        failures.push(format!("{label}: the destination import was refused"));
+                        continue;
+                    }
+                    rendered += 1;
+                    let mut want = nv12_image(dw, dh, TensorMemory::Mem, got.colorimetry());
+                    crate::CPUProcessor::new()
+                        .convert(&src, &mut want, Some(options))
+                        .unwrap();
+                    let (got_y, got_uv) = nv12_tight_planes(&got);
+                    let (want_y, want_uv) = nv12_tight_planes(&want);
+                    let (y_max, y_mean) = nv12_plane_diff(&got_y, &want_y);
+                    let (uv_max, uv_mean) = nv12_plane_diff(&got_uv, &want_uv);
+                    let ok = if same_size {
+                        y_max <= 2 && uv_max <= 2
+                    } else {
+                        y_mean <= 2.0 && uv_mean <= 2.0
+                    };
+                    if !ok {
+                        failures.push(format!(
                         "{label}: Y max {y_max} mean {y_mean:.3}, UV max {uv_max} mean {uv_mean:.3}"
                     ));
-                }
-                if name == "pillarbox-odd" {
-                    let left = (dw - (dh - 2)) / 2;
-                    let right = left + dh - 2;
-                    assert!(
-                        left % 2 == 1 && right % 2 == 1,
-                        "{label}: edges {left}, {right}"
-                    );
-                    let mut edge_max = 0;
-                    for (g, w) in got_uv.chunks_exact(dw).zip(want_uv.chunks_exact(dw)) {
-                        for x in [left - 1, left, right - 1, right] {
-                            edge_max = edge_max.max(g[x].abs_diff(w[x]));
-                        }
                     }
-                    if edge_max > 4 {
-                        failures.push(format!(
-                            "{label}: chroma pair straddling an odd edge differs by {edge_max}"
-                        ));
+                    if name == "pillarbox-odd" {
+                        let left = (dw - (dh - 2)) / 2;
+                        let right = left + dh - 2;
+                        assert!(
+                            left % 2 == 1 && right % 2 == 1,
+                            "{label}: edges {left}, {right}"
+                        );
+                        let mut edge_max = 0;
+                        for (g, w) in got_uv.chunks_exact(dw).zip(want_uv.chunks_exact(dw)) {
+                            for x in [left - 1, left, right - 1, right] {
+                                edge_max = edge_max.max(g[x].abs_diff(w[x]));
+                            }
+                        }
+                        if edge_max > 4 {
+                            failures.push(format!(
+                                "{label}: chroma pair straddling an odd edge differs by {edge_max}"
+                            ));
+                        }
                     }
                 }
             }
-        }
-        assert!(failures.is_empty(), "{}", failures.join("\n"));
-        if gl.renders_nv12_dst() {
-            assert!(rendered > 0, "no conversion rendered on GL");
-        }
+            assert!(failures.is_empty(), "{}", failures.join("\n"));
+            if gl.renders_nv12_dst() {
+                assert!(rendered > 0, "no conversion rendered on GL");
+            }
+        });
     }
 
     /// An NV12 destination whose luma and chroma are separate DMA-BUFs is written as the CPU
@@ -13427,9 +14229,10 @@ mod gl_tests {
     #[cfg(target_os = "linux")]
     fn test_gpu_nv12_dst_writes_a_multiplane_dma_destination() {
         use crate::ImageProcessorTrait;
-        let Some(mut gl) = nv12_gl_or_skip(function!()) else {
+        let Some(worker) = nv12_gl_or_skip(function!()) else {
             return;
         };
+        worker.with_st(|gl| {
         if !gl.renders_nv12_dst() {
             crate::test_support::report_skip(&format!(
                 "{} - this GPU leaves NV12 destinations to the CPU",
@@ -13455,6 +14258,7 @@ mod gl_tests {
             y_mean <= 2.0 && uv_mean <= 2.0,
             "multiplane NV12 destination differs from the CPU: Y mean {y_mean:.3}, UV mean {uv_mean:.3}"
         );
+        });
     }
 
     /// GL declines a heap NV12 destination, and the processor converts it on the CPU.
@@ -13466,7 +14270,7 @@ mod gl_tests {
             crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
             return;
         }
-        let mut gl = crate::opengl_headless::processor::GLProcessorST::new(None, None).unwrap();
+        let worker = GLProcessorThreaded::new(None).unwrap();
         let (w, h) = (320usize, 240usize);
         let src = load_raw_image(
             w,
@@ -13488,8 +14292,8 @@ mod gl_tests {
             .unwrap()
         };
         let mut dst = image();
-        let err = gl
-            .convert(&src, &mut dst, None)
+        let err = worker
+            .with_st(|gl| gl.convert(&src, &mut dst, None))
             .expect_err("GL renders no heap NV12 destination");
         assert!(matches!(err, crate::Error::NotSupported(_)), "{err:?}");
 
@@ -13528,10 +14332,11 @@ mod gl_tests {
         let other_cm = edgefirst_tensor::Colorimetry::default()
             .with_encoding(edgefirst_tensor::ColorEncoding::Bt709)
             .with_range(edgefirst_tensor::ColorRange::Full);
-        let mut gl = crate::opengl_headless::processor::GLProcessorST::new(None, None).unwrap();
-        let gl_renders = memory == TensorMemory::DmaBuf
-            && gl.gl_context.transfer_backend.is_zero_copy()
-            && gl.renders_nv12_dst();
+        let worker = GLProcessorThreaded::new(None).unwrap();
+        let (transfer_backend, renders_nv12_dst) =
+            worker.with_st(|gl| (gl.gl_context.transfer_backend, gl.renders_nv12_dst()));
+        let gl_renders =
+            memory == TensorMemory::DmaBuf && transfer_backend.is_zero_copy() && renders_nv12_dst;
         if !gl_renders {
             crate::test_support::report_skip(&format!(
                 "{} - GL renders no NV12 destination here; checking the CPU only",
@@ -13545,7 +14350,7 @@ mod gl_tests {
             let src = nv12_dst_test_source(w, h, fmt, memory, Some(src_cm));
             let takes_src =
                 crate::opengl_headless::processor::GLProcessorST::check_src_format_supported(
-                    gl.gl_context.transfer_backend,
+                    transfer_backend,
                     src.as_u8().unwrap(),
                     fmt,
                 );
@@ -13587,8 +14392,13 @@ mod gl_tests {
                 };
                 if gl_renders && takes_src {
                     let mut rendered = image(memory);
-                    let declines = gl.nv12_policy_decline(fmt, true, copy, (w, h));
-                    match (declines, gl.convert(&src, &mut rendered, None)) {
+                    let (declines, result) = worker.with_st(|gl| {
+                        (
+                            gl.nv12_policy_decline(fmt, true, copy, (w, h)),
+                            gl.convert(&src, &mut rendered, None),
+                        )
+                    });
+                    match (declines, result) {
                         (Some(why), Err(crate::Error::NotSupported(m))) if m == why => {}
                         (None, Ok(())) => failures.extend(check("gl", &rendered, false)),
                         (want, r) => failures.push(format!(
@@ -13602,7 +14412,9 @@ mod gl_tests {
                     .unwrap_or_else(|e| panic!("{fmt:?}: {e}"));
                 let cpu_copies = copy
                     && (!(gl_renders && takes_src)
-                        || gl.nv12_policy_decline(fmt, true, true, (w, h)).is_some());
+                        || worker
+                            .with_st(|gl| gl.nv12_policy_decline(fmt, true, true, (w, h)))
+                            .is_some());
                 failures.extend(check("processor", &got, cpu_copies));
             }
         }
@@ -13663,27 +14475,33 @@ mod gl_tests {
     #[cfg(target_os = "linux")]
     fn test_gpu_nv12_dst_refused_import_declines_to_the_cpu() {
         use crate::ImageProcessorTrait;
-        let Some(mut gl) = nv12_gl_or_skip(function!()) else {
+        let Some(worker) = nv12_gl_or_skip(function!()) else {
             return;
         };
-        if !gl.renders_nv12_dst() {
-            crate::test_support::report_skip(&format!(
-                "{} - this GPU leaves NV12 destinations to the CPU",
-                function!()
-            ));
-            return;
-        }
         let (w, h) = (640usize, 480usize);
         let src = nv12_dst_test_source(w * 2, h * 2, PixelFormat::Rgba, TensorMemory::DmaBuf, None);
         let mut dst = nv12_image(w, h, TensorMemory::DmaBuf, None);
-        let before = gl.convert_stats().dst_import_fallbacks;
-        gl.fail_dst_import = true;
-        let err = gl
-            .convert(&src, &mut dst, None)
-            .expect_err("a refused NV12 destination import declines");
-        gl.fail_dst_import = false;
-        assert!(matches!(err, crate::Error::NotSupported(_)), "{err:?}");
-        assert_eq!(gl.convert_stats().dst_import_fallbacks, before + 1);
+        let rendered = worker.with_st(|gl| {
+            if !gl.renders_nv12_dst() {
+                crate::test_support::report_skip(&format!(
+                    "{} - this GPU leaves NV12 destinations to the CPU",
+                    function!()
+                ));
+                return false;
+            }
+            let before = gl.convert_stats().dst_import_fallbacks;
+            gl.fail_dst_import = true;
+            let err = gl
+                .convert(&src, &mut dst, None)
+                .expect_err("a refused NV12 destination import declines");
+            gl.fail_dst_import = false;
+            assert!(matches!(err, crate::Error::NotSupported(_)), "{err:?}");
+            assert_eq!(gl.convert_stats().dst_import_fallbacks, before + 1);
+            true
+        });
+        if !rendered {
+            return;
+        }
 
         crate::ImageProcessor::new()
             .unwrap()
@@ -13702,33 +14520,39 @@ mod gl_tests {
     #[cfg(target_os = "linux")]
     fn test_gpu_nv12_dst_declines_a_same_size_rgba_conversion() {
         use crate::ImageProcessorTrait;
-        let Some(mut gl) = nv12_gl_or_skip(function!()) else {
+        let Some(worker) = nv12_gl_or_skip(function!()) else {
             return;
         };
-        if !gl.renders_nv12_dst() {
-            crate::test_support::report_skip(&format!(
-                "{} - this GPU leaves NV12 destinations to the CPU",
-                function!()
-            ));
-            return;
-        }
         let (w, h) = (640usize, 480usize);
-        if gl
-            .nv12_policy_decline(PixelFormat::Rgba, true, false, (w, h))
-            .is_none()
-        {
-            crate::test_support::report_skip(&format!(
-                "{} - this GPU renders a same-size {w}x{h} NV12 conversion",
-                function!()
-            ));
-            return;
-        }
         let src = nv12_dst_test_source(w, h, PixelFormat::Rgba, TensorMemory::DmaBuf, None);
         let mut dst = nv12_image(w, h, TensorMemory::DmaBuf, None);
-        let err = gl
-            .convert(&src, &mut dst, None)
-            .expect_err("GL declines a same-size NV12 conversion");
-        assert!(matches!(&err, crate::Error::NotSupported(_)), "{err:?}");
+        let declined = worker.with_st(|gl| {
+            if !gl.renders_nv12_dst() {
+                crate::test_support::report_skip(&format!(
+                    "{} - this GPU leaves NV12 destinations to the CPU",
+                    function!()
+                ));
+                return false;
+            }
+            if gl
+                .nv12_policy_decline(PixelFormat::Rgba, true, false, (w, h))
+                .is_none()
+            {
+                crate::test_support::report_skip(&format!(
+                    "{} - this GPU renders a same-size {w}x{h} NV12 conversion",
+                    function!()
+                ));
+                return false;
+            }
+            let err = gl
+                .convert(&src, &mut dst, None)
+                .expect_err("GL declines a same-size NV12 conversion");
+            assert!(matches!(&err, crate::Error::NotSupported(_)), "{err:?}");
+            true
+        });
+        if !declined {
+            return;
+        }
 
         crate::ImageProcessor::new()
             .unwrap()
@@ -13747,9 +14571,10 @@ mod gl_tests {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn test_gpu_nv12_program_build_failure_declines_nv12_only() {
         use crate::ImageProcessorTrait;
-        let Some(mut gl) = nv12_gl_or_skip(function!()) else {
+        let Some(worker) = nv12_gl_or_skip(function!()) else {
             return;
         };
+        worker.with_st(|gl| {
         if !gl.renders_nv12_dst() {
             crate::test_support::report_skip(&format!(
                 "{} - GL renders no NV12 destination here",
@@ -13816,6 +14641,7 @@ mod gl_tests {
             .convert(&src, &mut want, None)
             .unwrap();
         assert_eq!(nv12_tight_planes(&dst), nv12_tight_planes(&want));
+        });
     }
 
     /// A YUYV 1920x1080 source resizes into a 640x360 NV12 destination on GL as the CPU does.
@@ -13823,22 +14649,25 @@ mod gl_tests {
     #[cfg(target_os = "linux")]
     fn test_gpu_nv12_dst_renders_a_resized_yuyv_conversion() {
         use crate::ImageProcessorTrait;
-        let Some(mut gl) = nv12_gl_or_skip(function!()) else {
+        let Some(worker) = nv12_gl_or_skip(function!()) else {
             return;
         };
-        if let Some(why) = gl.nv12_policy_decline(PixelFormat::Yuyv, false, false, (640, 360)) {
-            crate::test_support::report_skip(&format!("{} - {why}", function!()));
-            return;
-        }
-        let src = nv12_dst_test_source(1920, 1080, PixelFormat::Yuyv, TensorMemory::DmaBuf, None);
-        let mut got = nv12_image(640, 360, TensorMemory::DmaBuf, None);
-        gl.convert(&src, &mut got, None)
-            .expect("GL renders a resized YUYV to NV12 conversion");
-        let (y_mean, uv_mean) = nv12_mean_diff_vs_cpu(&src, &got, None);
-        assert!(
-            y_mean <= 2.0 && uv_mean <= 2.0,
-            "Y mean {y_mean:.3}, UV mean {uv_mean:.3}"
-        );
+        worker.with_st(|gl| {
+            if let Some(why) = gl.nv12_policy_decline(PixelFormat::Yuyv, false, false, (640, 360)) {
+                crate::test_support::report_skip(&format!("{} - {why}", function!()));
+                return;
+            }
+            let src =
+                nv12_dst_test_source(1920, 1080, PixelFormat::Yuyv, TensorMemory::DmaBuf, None);
+            let mut got = nv12_image(640, 360, TensorMemory::DmaBuf, None);
+            gl.convert(&src, &mut got, None)
+                .expect("GL renders a resized YUYV to NV12 conversion");
+            let (y_mean, uv_mean) = nv12_mean_diff_vs_cpu(&src, &got, None);
+            assert!(
+                y_mean <= 2.0 && uv_mean <= 2.0,
+                "Y mean {y_mean:.3}, UV mean {uv_mean:.3}"
+            );
+        });
     }
 
     /// Converting twice into one NV12 destination imports it once and counts both lookups in

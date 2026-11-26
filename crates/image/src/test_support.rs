@@ -416,3 +416,30 @@ mod corevideo {
         }
     }
 }
+
+/// Block until `fence` signals; panics when it has not signalled within five seconds.
+pub(crate) fn wait_completion_fence(fence: crate::CompletionFence) {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        let mut pfd = libc::pollfd {
+            fd: fence.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `pfd` names a descriptor `fence` keeps open for the call.
+        let ready = unsafe { libc::poll(&mut pfd, 1, 5000) };
+        assert_eq!(ready, 1, "the fence did not signal within 5 seconds");
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn WaitForSingleObject(handle: *mut std::ffi::c_void, milliseconds: u32) -> u32;
+        }
+        // SAFETY: `fence` owns a live Win32 event handle for the call.
+        let waited = unsafe { WaitForSingleObject(fence.as_raw_handle() as _, 5000) };
+        assert_eq!(waited, 0, "the fence was not set within 5 seconds");
+    }
+}

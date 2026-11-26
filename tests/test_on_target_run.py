@@ -58,7 +58,11 @@ NO_PYTHON = "exit 127\n"
 # Stands in for a board whose pytest run skipped five tests, four of them
 # sharing a location and reason, which pytest reports on one line.
 PYTEST_WITH_GROUPED_SKIPS = """\
-[[ "$1" == -c ]] && exit 0
+[[ "$1" == -S ]] && shift
+if [[ "$1" == -c ]]; then
+  echo cp311
+  exit 0
+fi
 if [[ "$1" == -m && "$2" == pytest ]]; then
   echo 'ssss.s                                                         [100%]'
   echo '==================== short test summary info ===================='
@@ -92,6 +96,7 @@ def _run(tmp_path, python3, env=None, with_wheels=True):
     _stub(bundle / "target" / "debug" / "test_codec_api", CODEC_C_PROGRAM)
     if with_wheels:
         (bundle / "python").mkdir()
+        (bundle / "python-cp311").mkdir()
     (bundle / "MANIFEST").write_text(
         "".join(f"{k}={v}\n" for k, v in MANIFEST.items()), newline="\n"
     )

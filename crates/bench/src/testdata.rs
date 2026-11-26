@@ -43,7 +43,13 @@ pub const ENV_VAR: &str = "EDGEFIRST_TESTDATA_DIR";
 /// Panics if neither `EDGEFIRST_TESTDATA_DIR` is set nor the
 /// workspace-relative `testdata/` directory exists.
 pub fn root() -> PathBuf {
-    if let Ok(dir) = std::env::var(ENV_VAR) {
+    root_from(std::env::var(ENV_VAR).ok())
+}
+
+/// Resolves the testdata root from the `ENV_VAR` value `dir`, falling back to
+/// the workspace `testdata/` directory.
+fn root_from(dir: Option<String>) -> PathBuf {
+    if let Some(dir) = dir {
         return PathBuf::from(dir);
     }
     // `CARGO_MANIFEST_DIR` is `<workspace>/crates/bench`; `testdata/` is two
@@ -66,7 +72,12 @@ pub fn root() -> PathBuf {
 ///
 /// `rel` is joined onto [`root`] verbatim and is not checked for existence.
 pub fn path(rel: impl AsRef<Path>) -> PathBuf {
-    root().join(rel)
+    path_from(std::env::var(ENV_VAR).ok(), rel.as_ref())
+}
+
+/// [`path`] with the `ENV_VAR` value `dir`.
+fn path_from(dir: Option<String>, rel: &Path) -> PathBuf {
+    root_from(dir).join(rel)
 }
 
 /// Reads the testdata file at `rel` as raw bytes.
@@ -94,67 +105,25 @@ pub fn read_to_string(rel: impl AsRef<Path>) -> String {
 mod tests {
     use super::*;
 
-    /// `root()` resolves to a real directory under default workspace layout.
+    /// Without an override the root is the workspace `testdata/` directory.
     #[test]
     fn root_resolves_to_workspace_testdata() {
-        // Unset any override.
-        let saved = std::env::var(ENV_VAR).ok();
-        // SAFETY: tests in this module run single-threaded.
-        unsafe {
-            std::env::remove_var(ENV_VAR);
-        }
-
-        let r = root();
+        let r = root_from(None);
         assert!(r.is_dir(), "expected testdata dir at {}", r.display());
-
-        // Restore.
-        if let Some(v) = saved {
-            // SAFETY: tests in this module run single-threaded.
-            unsafe {
-                std::env::set_var(ENV_VAR, v);
-            }
-        }
     }
 
-    /// `EDGEFIRST_TESTDATA_DIR` override is honored.
+    /// An `EDGEFIRST_TESTDATA_DIR` value is used verbatim.
     #[test]
     fn env_var_override_is_respected() {
         let tmp = std::env::temp_dir();
-        let saved = std::env::var(ENV_VAR).ok();
-        // SAFETY: tests in this module run single-threaded.
-        unsafe {
-            std::env::set_var(ENV_VAR, &tmp);
-        }
-
-        let r = root();
+        let r = root_from(Some(tmp.to_string_lossy().into_owned()));
         assert_eq!(r, tmp);
-
-        // Restore.
-        unsafe {
-            match saved {
-                Some(v) => std::env::set_var(ENV_VAR, v),
-                None => std::env::remove_var(ENV_VAR),
-            }
-        }
     }
 
     /// `path()` joins relative segments onto the root.
     #[test]
     fn path_joins_relative_segments() {
-        let saved = std::env::var(ENV_VAR).ok();
-        // SAFETY: tests in this module run single-threaded.
-        unsafe {
-            std::env::set_var(ENV_VAR, "/fake/root");
-        }
-
-        let p = path("per_scale/foo.json");
+        let p = path_from(Some("/fake/root".into()), Path::new("per_scale/foo.json"));
         assert_eq!(p, PathBuf::from("/fake/root/per_scale/foo.json"));
-
-        unsafe {
-            match saved {
-                Some(v) => std::env::set_var(ENV_VAR, v),
-                None => std::env::remove_var(ENV_VAR),
-            }
-        }
     }
 }

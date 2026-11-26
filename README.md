@@ -265,6 +265,9 @@ let mut batch = processor.alloc_tile_batch(
     placements.len(), &cfg, PixelFormat::Rgb, DType::U8, None, CpuAccess::None)?;
 
 // Render every tile: deferred convert per tile, one flush at the end.
+// `tile_into_with_fence` renders the same tiles and returns a native fence
+// in place of that flush where the platform has one (Linux and Android with
+// EGL_ANDROID_native_fence_sync, Windows).
 let placements = processor.tile_into(&src, &mut batch, &cfg)?;
 
 // Per-tile decoding is deliberately permissive. A fragment clipped at a seam
@@ -338,7 +341,7 @@ joined.
 
 The C API mirrors the same split (`ef_image_processor_plan_tiles` /
 `ef_image_processor_tile_into` / `ef_image_processor_tile_one` on the input side, `ef_tiled_frame_accumulator_*`
-on the output side). Full per-language detail lives in
+on the output side). `ef_image_processor_tile_into_fence` and, on Windows, `ef_image_processor_tile_into_fence_handle` return a fence for the tile batch, as `ef_image_processor_convert_fence` does for one convert. Full per-language detail lives in
 [image/README.md § Tiled Preprocessing](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/README.md#tiled-preprocessing-sahi)
 and
 [decoder/README.md § Tiled Inference](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/README.md#tiled-inference-sahi).
@@ -1082,7 +1085,7 @@ On this driver a GPU operation's completion reaches the application through a ch
 
 ### How the HAL handles it
 
-While a GL operation is in flight (`convert`, `convert_with_fence`, `flush` and the mask draws), the HAL holds a CPU wake-latency request through the kernel's PM QoS device, `/dev/cpu_dma_latency`, and releases it as soon as the operation returns. Concurrent processors share one request. Between frames the cores reach their deep idle states as usual.
+While a GL operation is in flight (`convert`, `convert_with_fence`, `tile_into`, `tile_into_with_fence`, `flush` and the mask draws), the HAL holds a CPU wake-latency request through the kernel's PM QoS device, `/dev/cpu_dma_latency`, and releases it as soon as the operation returns. Concurrent processors share one request. Between frames the cores reach their deep idle states as usual.
 
 Measured on the IQ-9075, forced GL, DMA-BUF buffers:
 
@@ -1348,7 +1351,7 @@ For a pipelined handoff that skips the blocking GPU sync entirely, use
 `ef_image_processor_convert_fence()`: it returns a sync-fence fd
 (`EGL_ANDROID_native_fence_sync`) the NPU runtime waits on instead
 (`ANeuralNetworksExecution_startComputeWithDependencies`), or `-1` with
-the work already synced on drivers without fence support.
+the work already synced on drivers without fence support. `ef_image_processor_tile_into_fence()` does the same for a whole tile batch.
 
 **Flatness**: gralloc chooses the row pitch and may pad it (observed on
 the S26 Ultra: 640-px planar F16 → 1536-byte rows, natural 1280). Check
@@ -1437,8 +1440,7 @@ and the sibling `*-capi` READMEs.
 | `EDGEFIRST_DISABLE_CPU` | Disable CPU backend |
 | `EDGEFIRST_FORCE_BACKEND` | Force one backend: `cpu`, `g2d`, or `opengl` (disables fallback) |
 | `EDGEFIRST_FORCE_TRANSFER` | Force GL transfer: `pbo`, `dmabuf`, or `sync` |
-| `EDGEFIRST_NV_CONVERT_PATH` | NV12/16/24 GPU conversion path: `sampler`, `shader`, or `auto` (default). `auto` prefers the portable, colorimetry-exact in-shader `ShaderR8`, except BT.601-limited single-plane NV12 on Vivante (hardware sampler is ~12× faster and correct). `sampler`/`shader` force a path for benchmarking/bring-up |
-| `EDGEFIRST_COLORIMETRY` | `fast` (default) or `exact`. High-performance colour conversion is the default; `exact` opts into the colorimetry-exact path where it costs more. Takes precedence over the per-processor setting |
+| `EDGEFIRST_NV_CONVERT_PATH` | NV12/16/24 GPU conversion path: `sampler`, `shader`, or `auto` (default). `auto` takes the portable, colorimetry-exact in-shader `ShaderR8` wherever it can read the source. `sampler`/`shader` force a path for benchmarking/bring-up; Vivante refuses `sampler` for NV sources, and its GL backend declines multiplane NV12/NV16 sources to the next backend in every mode |
 | `EDGEFIRST_INTERPOLATION` | `nearest` or `bilinear` (default). How `convert()` resamples when it resizes, on every backend. Bilinear uses half-pixel centres and two taps per axis on the CPU and GL backends, matching OpenCV `INTER_LINEAR`; G2D scales with its fixed hardware filter and declines resizing converts under `nearest`. Nearest is faster and less accurate on resized inputs. Takes precedence over `ImageProcessorConfig::interpolation` |
 | `EDGEFIRST_GL_SERIALIZE` | `full` or `lifecycle` — pin the GL command serialization policy instead of using the per-driver default (see [Rule 5](#rule-5--one-imageprocessor-per-pipeline)) |
 | `EDGEFIRST_GL_CPU_LATENCY` | `on` or `off` — whether GL operations hold a CPU wake-latency request on `/dev/cpu_dma_latency` (Linux) while they run; on by default for Adreno. The process needs write access to the device (see [Qualcomm Adreno on Linux](#qualcomm-adreno-on-linux)) |
@@ -1462,7 +1464,7 @@ Per-crate variables and additional detail live in each crate's README.
 ## Testing
 
 See [TESTING.md](https://github.com/EdgeFirstAI/hal/blob/main/TESTING.md)
-for the cross-cutting testing guide (single-threaded rule, on-target
+for the cross-cutting testing guide (parallel execution, on-target
 gating, cross-compilation, CI matrix, optimization validation). Per-crate
 testing detail lives in each crate's `TESTING.md` — links in the
 [Core Components](#core-components) table.

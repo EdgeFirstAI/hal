@@ -20,6 +20,9 @@ use edgefirst_codec::CodecError;
 use edgefirst_image::{GLProcessorThreaded, ImageProcessorTrait};
 use edgefirst_tensor::{CpuAccess, DType, PixelFormat, TensorDyn, TensorMemory};
 
+#[path = "../../codec/tests/common/sessions.rs"]
+mod sessions;
+
 #[path = "../../tensor/tests/support/dma_require.rs"]
 mod dma_require;
 
@@ -102,6 +105,8 @@ struct Check {
     reimports: u64,
     first_gl: Option<Vec<u8>>,
     first_copy: Option<Vec<u8>>,
+    /// The GL backend's decline of the decoded frames, when it declines them.
+    declined: Option<String>,
 }
 
 impl Check {
@@ -117,10 +122,20 @@ impl Check {
     fn frame(&mut self, frame: &DecodedFrame) {
         let src = frame.tensor();
         assert_eq!(src.memory(), TensorMemory::DmaBuf);
+        if self.declined.is_some() {
+            return;
+        }
         let before = self.gl.egl_cache_stats().unwrap().src.misses;
-        self.gl
-            .convert(src, &mut self.dst, None)
-            .expect("GL converts a decoded frame");
+        match self.gl.convert(src, &mut self.dst, None) {
+            Ok(()) => {}
+            Err(edgefirst_image::Error::NotSupported(m))
+                if src.is_multiplane() && m.contains("Vivante external sampler") =>
+            {
+                self.declined = Some(m);
+                return;
+            }
+            Err(e) => panic!("GL converts a decoded frame: {e}"),
+        }
         let imports = self.gl.egl_cache_stats().unwrap().src.misses - before;
         if !self.seen.insert(src as *const TensorDyn as usize) {
             self.repeats += 1;
@@ -140,6 +155,7 @@ impl Check {
 
 #[test]
 fn decoded_frames_convert_on_the_gpu_without_new_imports() {
+    let _sessions = sessions::take(1);
     if !dma_require::available_or_skip(edgefirst_tensor::is_dma_available(), TEST) {
         return;
     }
@@ -148,7 +164,7 @@ fn decoded_frames_convert_on_the_gpu_without_new_imports() {
         Err(CodecError::NoDevice(why)) => return skip(&why),
         Err(e) => panic!("decoder open failed: {e}"),
     };
-    // Both sources take the external-sampler path.
+    // Requests the external-sampler path for both sources.
     std::env::set_var("EDGEFIRST_NV_CONVERT_PATH", "sampler");
     let gl = match GLProcessorThreaded::new(None) {
         Ok(gl) => gl,
@@ -167,11 +183,17 @@ fn decoded_frames_convert_on_the_gpu_without_new_imports() {
         reimports: 0,
         first_gl: None,
         first_copy: None,
+        declined: None,
     };
     for (i, au) in access_units(&stream).enumerate() {
         check.events(decoder.decode(au, i as u64).unwrap());
     }
     check.events(decoder.flush().unwrap());
+    if let Some(why) = check.declined {
+        return skip(&format!(
+            "the GL backend declines the decoded frames: {why}"
+        ));
+    }
     let buffers = check.buffers;
     assert_eq!(check.frames, 30);
     assert!(

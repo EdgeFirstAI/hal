@@ -248,6 +248,8 @@ pub(in crate::opengl_headless) struct AngleDisplay {
     /// Texture attachments made via `eglBindTexImage` since the last
     /// `GlPlatform::end_gpu_pass`, which releases them.
     active_binds: std::cell::RefCell<Vec<egl::Surface>>,
+    /// The number of `GlPlatform::end_gpu_pass` calls so far.
+    bind_epoch: std::cell::Cell<u64>,
 }
 
 impl AngleDisplay {
@@ -315,8 +317,10 @@ impl GlPlatform for AngleClientBuffer {
         super::unplaced_destination(img).is_none() || planar_nv12_extent(img).is_some()
     }
 
-    // eglBindTexImage attachments are released at end_gpu_pass.
-    const PERSISTENT_TEX_BINDINGS: bool = false;
+    fn tex_binding_epoch(display: &AngleDisplay) -> Option<u64> {
+        // eglBindTexImage attachments last until end_gpu_pass releases them.
+        Some(display.bind_epoch.get())
+    }
 
     /// The planar F16 zero-copy render only.
     const ZERO_COPY_FLOAT: super::super::float_dispatch::ZeroCopyFloatSet =
@@ -405,6 +409,7 @@ impl GlPlatform for AngleClientBuffer {
                 EGL_BACK_BUFFER,
             );
         }
+        display.bind_epoch.set(display.bind_epoch.get() + 1);
     }
 
     fn import_buffer_packed<T>(
@@ -502,6 +507,7 @@ impl GlPlatform for AngleClientBuffer {
             transfer_backend: super::super::TransferBackend::IOSurface,
             has_compute: false,
             active_binds: std::cell::RefCell::new(Vec::new()),
+            bind_epoch: std::cell::Cell::new(0),
         })
     }
 

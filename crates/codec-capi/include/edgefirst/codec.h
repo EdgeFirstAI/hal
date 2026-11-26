@@ -440,7 +440,12 @@ typedef struct ef_video_encoder_info {
    * an `ef_codec_transfer`. Crops and host-memory sources may take a
    * copy where this says none. A Media Foundation hardware encoder
    * decides on its first frame whether it reads sources in place, and
-   * reports `EF_CODEC_TRANSFER_GPU_COPY` until then.
+   * reports `EF_CODEC_TRANSFER_GPU_COPY` until then. A V4L2 encoder
+   * reports how the latest source reached the device:
+   * `EF_CODEC_TRANSFER_CPU_COPY` when it was copied into the device's
+   * layout, `EF_CODEC_TRANSFER_ZERO_COPY` before the first frame and when
+   * the device read it in place, as it reads a source from
+   * [`ef_video_encoder_create_source`].
    */
   uint32_t transfer;
   /**
@@ -918,11 +923,13 @@ void ef_video_encoder_free(struct ef_video_encoder *e);
  *
  * `src` must have the configured pixel format and, without `crop`, the
  * configured size. `crop`, when not `NULL`, is the part of `src` to
- * encode, exactly the configured size. DMA-BUF and D3D11 sources are read
- * in place: the call returns once the device has finished reading `src`,
- * so the caller may reuse it afterwards. Every source of one stream must
- * have the same row stride. `pts` is returned unchanged on the access
- * unit; `flags` is 0 or `EF_VIDEO_ENCODE_KEYFRAME`.
+ * encode, exactly the configured size. A source the device can read in
+ * place is read there; [`ef_video_encoder_create_source`] allocates one.
+ * Any other source, of any row stride and in any memory the CPU can read,
+ * is copied into a buffer the device can read first. Either way the call
+ * returns once `src` has been read, so the caller may reuse it
+ * afterwards. `pts` is returned unchanged on the access unit; `flags` is 0
+ * or `EF_VIDEO_ENCODE_KEYFRAME`.
  *
  * Platforms: Linux, Windows.
  *
@@ -939,6 +946,27 @@ int ef_video_encoder_encode(struct ef_video_encoder *e,
                             uint64_t pts,
                             uint32_t flags,
                             const struct ef_codec_region *crop);
+
+/**
+ * Allocates a source image of the configured size and pixel format that
+ * the encoder reads in place, without a copy.
+ *
+ * On Linux the image is laid out as the V4L2 device reads it: its row
+ * stride and, for NV12, the offset of its chroma plane can be larger than
+ * the picture needs, and the chroma plane can be a buffer of its own. On
+ * Windows it is a GPU image of the configured size.
+ *
+ * Platforms: Linux, Windows.
+ *
+ * @return a tensor the caller owns, freed with `ef_tensor_free`; `NULL`
+ *         with `errno` `EINVAL` for a `NULL` encoder, `ENODEV` when there
+ *         is no GPU buffer allocator, or `EIO` when the image cannot be
+ *         allocated or the device does not report its layout.
+ *
+ * # Safety
+ * `e` must be `NULL` or a live encoder.
+ */
+ef_tensor *ef_video_encoder_create_source(const struct ef_video_encoder *e);
 
 /**
  * Drains the encoder, queueing every access unit not yet queued. The

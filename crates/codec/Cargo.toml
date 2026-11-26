@@ -18,7 +18,7 @@ documentation = "https://docs.rs/edgefirst-codec"
 # Windows. nvjpeg loads libnvjpeg.so.12 and media-foundation loads mfplat.dll
 # at runtime.
 default = ["v4l2", "nvjpeg", "png", "media-foundation"]
-v4l2 = ["dep:edgefirst-v4l2"]
+v4l2 = ["dep:edgefirst-v4l2", "dep:libc"]
 media-foundation = ["dep:windows", "dep:libloading"]
 png = ["dep:zune-png"]
 nvjpeg = ["dep:libloading"]
@@ -37,10 +37,11 @@ tracing = { workspace = true }
 turbojpeg = { version = "1.4", optional = true }
 zune-png = { workspace = true, optional = true }
 
-# Hardware JPEG decode (v4l2 feature), Linux only: device discovery, the
-# buffer queues and events.
+# Hardware JPEG decode and video (v4l2 feature), Linux only: device
+# discovery, the buffer queues and events, and the media controller graph.
 [target.'cfg(target_os = "linux")'.dependencies]
 edgefirst-v4l2 = { workspace = true, optional = true }
+libc = { workspace = true, optional = true }
 
 # H.264 encode and decode through the Media Foundation transforms
 # (media-foundation feature).

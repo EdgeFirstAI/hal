@@ -4,7 +4,7 @@ Process, CI tiers, release chain, and runner policy live in the canonical
 [EdgeFirstAI/.github copilot-instructions](https://github.com/EdgeFirstAI/.github/blob/main/.github/copilot-instructions.md).
 This file keeps only HAL-specific workspace, testing, and platform notes.
 
-**Version:** 1.9
+**Version:** 1.10
 **Last Updated:** November 2026
 
 ---
@@ -145,7 +145,7 @@ cargo-zigbuild test --target aarch64-unknown-linux-gnu --release --no-run \
     --exclude edgefirst-python-tracker --exclude edgefirst-python-kernels
 
 # Run tests on target hardware (after scp to the device)
-ssh <target> 'cd /tmp/hal-tests && ./edgefirst_image-<hash> --test-threads=1'
+ssh <target> 'cd /tmp/hal-tests && ./edgefirst_image-<hash>'
 ```
 
 The Python crates (`edgefirst-python-*`) must be excluded from zigbuild cross-compilation
@@ -352,15 +352,7 @@ Rust objects; actual GPU resources are freed by explicit cleanup calls).
 
 ### Testing with GPU Resources
 
-**All tests must run single-threaded.** Use `--test-threads=1` for `cargo test`
-and `-j 1` for `cargo nextest`. This prevents:
-- EGL display races (concurrent `eglTerminate` tearing down shared state)
-- G2D driver contention (galcore is not thread-safe for context creation)
-- DMA-heap CMA pool exhaustion on memory-constrained embedded targets
-
-This applies to CI, the Makefile, and local development. See
-[`TESTING.md`](../TESTING.md) and [`ARCHITECTURE.md`](../ARCHITECTURE.md)
-for details.
+**Tests run in parallel.** Do not add `-j 1` to a nextest run in CI, the Makefile or scripts. A test that fails in parallel has shared state (a fixed path, a port, an environment variable it sets, a device it assumes it owns) and gets fixed in the test or the code. A nextest test group with `max-threads = 1` is only for an exclusive device a test cannot share. Tests never set an environment variable another test reads; build the processor from a settings value instead (`GLProcessorThreaded::with_env`, `ImageProcessor::with_config_env`), and put a test that must set one alone in its own integration-test binary. Tests that need `GLProcessorST` run it through `GLProcessorThreaded::with_st`. Benchmarks run one at a time, on demand only. See [`TESTING.md` § Parallel Execution](../TESTING.md#parallel-execution).
 
 ### Common Pitfalls
 
@@ -371,7 +363,7 @@ for details.
 5. **Don't skip tests** - Add both Rust and Python tests for new features
 6. **Don't forget documentation** - Public APIs need doc comments
 7. **Don't nest `with_quantized!` macros** - Each nesting level multiplies monomorphized paths by 6 (6^N explosion). Dequantize tensors sequentially with `dequant_3d!`/`dequant_4d!` helpers, or split into independent phases that each nest at most 2 levels
-8. **Don't run tests in parallel** - Always use `--test-threads=1` or `-j 1` (see above)
+8. **Don't serialize a failing test** - Fix the shared state that makes it fail in parallel (see above)
 9. **Don't skip `eglTerminate`** - Omitting it leaks EGL display connections
 10. **Don't `dlclose` GPU libraries** - Use `Box::leak` to keep driver code mapped
 11. **Declare the CPU access you use** - every CPU map, including the HAL's own, must be covered by the tensor's `CpuAccess`; `ReadWrite` (the default) covers everything, while `None` (GPU/NPU-only, required for tile compression), `Write` (decode targets) and `Read` (readback paths) are specialised modes
@@ -445,7 +437,7 @@ MUST update the affected documents to stay in sync with the implementation.
 
 | Document | Scope |
 |----------|-------|
-| [`TESTING.md`](../TESTING.md) | **Cross-crate** testing: single-threaded execution rules, on-target gating, cross-compilation, coverage, CI matrix, Android on-device validation (Device Farm) |
+| [`TESTING.md`](../TESTING.md) | **Cross-crate** testing: parallel execution, on-target gating, cross-compilation, coverage, CI matrix, Android on-device validation (Device Farm) |
 | [`crates/tensor/TESTING.md`](../crates/tensor/TESTING.md) | Per-backend unit tests, DMA/SHM/IOSurface gating, host-tested Android layout + intern-policy tables, allocation benchmarks |
 | [`crates/codec/TESTING.md`](../crates/codec/TESTING.md) | JPEG/PNG decode tests, strided output validation, hot-loop reuse pattern, allocation profiling, benchmark methodology |
 | [`crates/image/TESTING.md`](../crates/image/TESTING.md) | GL gating via OnceLock probe, G2D gating on `/dev/galcore`, fp16 benchmarks |
@@ -465,7 +457,7 @@ You must read and consult the relevant architecture and testing documents when:
 4. **Changing decoder logic or model support** — consult `crates/decoder/ARCHITECTURE.md` for the `dshape` physical-memory-order contract, per-scale framework, and NMS pipeline
 5. **Changing image decode or codec APIs** — consult `crates/codec/ARCHITECTURE.md` for the strided decode pipeline, `ImageLoad` trait, and allocation discipline
 6. **Updating the C ABI** — consult `crates/tensor-capi/ARCHITECTURE.md` for the opaque-handle contract; each sibling leaf has its own header under `include/edgefirst/`
-7. **Adding or changing tests** — consult the relevant crate's TESTING.md for test gating patterns, fixture conventions, and the single-threaded execution rule
+7. **Adding or changing tests** — consult the relevant crate's TESTING.md for test gating patterns, fixture conventions, and the parallel execution rule
 8. **Cross-crate refactoring** — consult both the root `ARCHITECTURE.md` and all affected crate-level documents
 
 ### When You MUST Update These Documents

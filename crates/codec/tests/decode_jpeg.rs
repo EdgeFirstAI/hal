@@ -832,20 +832,19 @@ fn fast_dct_mode_close_to_accurate_and_off_by_default() {
         dec.set_dct_method(DctMethod::Accurate);
         let info_a = t_acc.load_image(&mut dec, &jpeg).unwrap();
 
-        // A fresh decoder with no setter and no environment override.
-        std::env::remove_var("EDGEFIRST_CODEC_DCT");
-        let mut t_def = Tensor::<u8>::image(
-            4096,
-            4096,
-            PixelFormat::Nv24,
-            Some(TensorMemory::Mem),
-            edgefirst_tensor::CpuAccess::ReadWrite,
-        )
-        .unwrap();
-        let mut dec_default = ImageDecoder::new();
-        let info_d = t_def.load_image(&mut dec_default, &jpeg).unwrap();
-        assert_eq!(info_a.format, info_d.format);
-        {
+        // A fresh decoder with no setter, compared while `EDGEFIRST_CODEC_DCT` is unset.
+        if std::env::var_os("EDGEFIRST_CODEC_DCT").is_none() {
+            let mut t_def = Tensor::<u8>::image(
+                4096,
+                4096,
+                PixelFormat::Nv24,
+                Some(TensorMemory::Mem),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .unwrap();
+            let mut dec_default = ImageDecoder::new();
+            let info_d = t_def.load_image(&mut dec_default, &jpeg).unwrap();
+            assert_eq!(info_a.format, info_d.format);
             let a = t_acc.map().unwrap();
             let d = t_def.map().unwrap();
             assert_eq!(
@@ -853,6 +852,10 @@ fn fast_dct_mode_close_to_accurate_and_off_by_default() {
                 &d[..],
                 "{name}: default decode != explicit Accurate"
             );
+        } else {
+            outcome::report_skip(&format!(
+                "{name}: default-DCT comparison - EDGEFIRST_CODEC_DCT is set"
+            ));
         }
 
         dec.set_dct_method(DctMethod::Fast);
@@ -884,8 +887,7 @@ fn fast_dct_mode_close_to_accurate_and_off_by_default() {
     }
 }
 
-/// Allocation policy: a failure the D3D11 probe did not predict fails the test.
-#[cfg(windows)]
+/// Allocation policy and skip reporting.
 #[path = "../../tensor/tests/support/outcome.rs"]
 #[allow(dead_code)]
 mod outcome;

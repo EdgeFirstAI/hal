@@ -1085,11 +1085,16 @@ impl PyImageProcessor {
     /// ``letterbox`` arguments as :meth:`convert`.
     ///
     /// Returns:
-    ///     A sync-file descriptor on Linux and Android, an event handle
+    ///     A sync-file descriptor on Linux and Android (where the EGL display has
+    ///     ``EGL_ANDROID_native_fence_sync``), an event handle
     ///     (as an integer) on Windows, or ``None`` when the convert
     ///     completed synchronously (no native fence on this display). The
     ///     caller owns the handle and closes it (``os.close`` for the fd,
     ///     ``ctypes.windll.kernel32.CloseHandle`` for the Windows handle).
+    ///
+    /// The handle also covers the GPU's reads of ``src``: keep the source
+    /// unmodified, and do not hand its buffer back to its producer (a V4L2
+    /// capture queue, for example), until it signals.
     ///
     /// On Windows the destination's ``gpu_completion()`` reflects this
     /// convert afterwards.
@@ -1618,6 +1623,93 @@ impl PyImageProcessor {
             .into_iter()
             .map(crate::tiling::PyTilePlacement)
             .collect())
+    }
+
+    /// Render every tile of ``src`` into ``dst_batched`` as :meth:`tile_into`
+    /// does, without blocking on the GPU; returns the placements and a
+    /// completion handle.
+    ///
+    /// Returns:
+    ///     A ``(placements, fence)`` tuple. ``placements`` is the per-tile
+    ///     :class:`TilePlacement` list in tile-index order. ``fence`` is a
+    ///     sync-file descriptor on Linux and Android (where the EGL display has
+    ///     ``EGL_ANDROID_native_fence_sync``), an event handle (as an
+    ///     integer) on Windows, or ``None`` when the tiles completed
+    ///     synchronously (no native fence on this display). The caller owns
+    ///     the handle and closes it (``os.close`` for the fd,
+    ///     ``ctypes.windll.kernel32.CloseHandle`` for the Windows handle).
+    ///
+    /// The handle also covers the GPU's reads of ``src``: keep the source
+    /// unmodified, and do not hand its buffer back to its producer (a V4L2
+    /// capture queue, for example), until it signals.
+    ///
+    /// On Windows the destination's ``gpu_completion()`` reflects the tiles
+    /// afterwards.
+    #[pyo3(signature = (src, dst_batched, cfg))]
+    pub fn tile_into_with_fence<'py>(
+        &self,
+        py: Python<'py>,
+        src: &Bound<'py, PyAny>,
+        dst_batched: &Bound<'py, PyAny>,
+        cfg: &crate::tiling::PyTilingConfig,
+    ) -> Result<(Vec<crate::tiling::PyTilePlacement>, Option<usize>)> {
+        let _span = tracing::trace_span!("python.tile_into_with_fence").entered();
+        // `access=None`: no host pin is requested.
+        let src = crate::interop::TensorArg::extract(src, None)?;
+        let dst_arg = crate::interop::TensorArg::extract_mut(dst_batched, None)?;
+        let cfg = cfg.0;
+        let (placements, fence);
+        if src.can_detach() && dst_arg.can_detach() {
+            // Run the tiles with the GIL released.
+            let src = src.into_raw_access()?;
+            let mut rendered = dst_arg.into_raw_access()?;
+            let target = &mut rendered;
+            (placements, fence) = py.detach(
+                move || -> Result<(Vec<image::TilePlacement>, Option<image::CompletionFence>)> {
+                    let mut l = self.0.lock().map_err(|_| {
+                        Error::InvalidArg("ImageProcessor lock poisoned".to_string())
+                    })?;
+                    Ok(l.tile_into_with_fence(src.as_ref(), target.as_mut(), &cfg)?)
+                },
+            )?;
+            let recorded = crate::interop::recorded_gpu_write(rendered.as_ref());
+            drop(rendered);
+            crate::interop::publish_gpu_write(dst_batched, recorded);
+        } else {
+            // A PBO-backed argument: render with the GIL held.
+            let mut dst_arg = dst_arg;
+            {
+                let mut l = self
+                    .0
+                    .lock()
+                    .map_err(|_| Error::InvalidArg("ImageProcessor lock poisoned".to_string()))?;
+                (placements, fence) =
+                    l.tile_into_with_fence(src.as_ref(), dst_arg.as_mut(), &cfg)?;
+            }
+            let recorded = crate::interop::recorded_gpu_write(dst_arg.as_ref());
+            drop(dst_arg);
+            crate::interop::publish_gpu_write(dst_batched, recorded);
+        }
+        let placements = placements
+            .into_iter()
+            .map(crate::tiling::PyTilePlacement)
+            .collect();
+        // Ownership of the handle passes to the caller as a Python int.
+        Ok((
+            placements,
+            fence.map(|f| {
+                #[cfg(unix)]
+                {
+                    use std::os::fd::IntoRawFd;
+                    f.into_raw_fd() as usize
+                }
+                #[cfg(windows)]
+                {
+                    use std::os::windows::io::IntoRawHandle;
+                    f.into_raw_handle() as usize
+                }
+            }),
+        ))
     }
 
     /// Render exactly one tile of ``src`` into ``dst_slot`` (a single

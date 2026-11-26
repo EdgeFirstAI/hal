@@ -80,6 +80,19 @@ fn two_wraps_of_one_iosurface_share_an_identity() {
 }
 
 #[test]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn an_iosurface_tensor_is_keyed_on_its_surface() {
+    let Some(t) = iosurface_tensor_or_skip() else {
+        return;
+    };
+    assert_eq!(
+        t.buffer_identity().kind(),
+        IdentityKind::IoSurface,
+        "an IOSurface tensor is keyed on IOSurfaceGetID"
+    );
+}
+
+#[test]
 fn the_same_system_key_yields_the_same_identity() {
     let a = BufferIdentity::derived(IdentityKind::DmaBuf, 4242);
     let b = BufferIdentity::derived(IdentityKind::DmaBuf, 4242);

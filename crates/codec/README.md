@@ -187,7 +187,7 @@ encoder.encode_into(&image, &mut jpeg)?;
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-- **Engines:** under `Engine::Auto` a V4L2 JPEG encoder takes DMA-BUF sources it can read, kept open for the last geometry, and the CPU takes the rest. `set_engine(Engine::Cpu)` or `Engine::V4l2` uses one alone.
+- **Engines:** under `Engine::Auto` a V4L2 JPEG encoder takes DMA-BUF sources in a format it lists, kept open for the last geometry, and the CPU takes the rest, including every host-memory source. `set_engine(Engine::Cpu)` or `Engine::V4l2` uses one alone.
 - **CPU sources:** `u8` NV12 (written 4:2:0), NV16 and YUYV (4:2:2), Grey, RGB and RGBA, at any row stride. Limited-range YUV is stretched to the full range JPEG readers expect; the matrix is kept, so BT.709 sources decode with BT.601 colours.
 - **Quality** is 1 to 100, 85 by default.
 
@@ -244,14 +244,14 @@ let rest = encoder.flush()?; // every access unit still in the encoder
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-- **Sources** must be DMA-BUF tensors in the configured format. They are imported without a copy, and `encode()` returns once the device has read them, so the caller can reuse the buffer straight away. Every source of a stream must have the same row stride.
-- **Crops:** `FrameOptions::crop` encodes a region of a larger source. The region must be the configured size and start on a chroma sample. NV12 crops need a device that takes the two-plane `NV12M` layout (both i.MX encoders do).
+- **Sources** are tensors in the configured format, at any row stride and in any memory the CPU can read. A DMA-BUF source laid out as the device reads it is imported without a copy; `VideoEncoder::create_source()` allocates one. Any other source is copied on the CPU into a buffer of the device's layout first, logged at info the first time for each source shape. Either way `encode()` returns once the device has read the source, so the caller can reuse the buffer straight away. Devices differ: both i.MX encoders read a `TensorDyn::image` source in place, while `msm_vidc` on the IQ-9075 pads rows to 128 bytes and the height to 32 rows, so only a `create_source()` image avoids the copy there.
+- **Crops:** `FrameOptions::crop` encodes a region of a larger source. The region must be the configured size and start on a chroma sample. NV12 crops are read in place on a device that takes the two-plane `NV12M` layout (both i.MX encoders do) and copied elsewhere.
 - **Headers:** with `EncoderConfig::repeat_headers` (the default), every IDR, forced or not, starts with the SPS and PPS, so a receiver can join at any key frame.
 - **PTS:** `FrameOptions::pts` comes back unchanged on the matching `EncodedFrame`, in any unit.
 - **Input formats** are whatever the device lists for HAL's V4L2 code of the format (`PixelFormat::to_fourcc`); NV12 and YUYV on both i.MX encoders.
 - **Windows:** sources are NV12 or YUYV tensors in any memory. On a hardware encoder a native NV12 texture of the configured size is read in place, without a copy; crops, host tensors, and sources for an encoder that holds frames are copied into a texture of the encoder's own, on the GPU where the source is a texture. Either way the caller can reuse the source as soon as `encode()` returns. B-frames are off and the transform runs in low-latency mode, so `encode()` normally returns the access unit of the frame it was given. Microsoft's software encoder, used where there is no hardware encoder, reads system memory.
 - **MJPEG:** `EncoderConfig::new(Codec::Mjpeg, ..)` encodes each frame as a JPEG picture, every one a key frame, at `EncoderConfig::quality` (85 by default). Only V4L2 JPEG encoders run it; elsewhere it is `CodecError::Unsupported`.
-- **`info()`** names the engine and device and says how sources reach the encoder (`EncoderInfo::transfer`): zero-copy on V4L2; on Media Foundation zero-copy for an encoder that reads textures in place, a GPU copy for one that holds frames (decided on the first frame), and a CPU copy for the software encoder.
+- **`info()`** names the engine and device and says how sources reach the encoder (`EncoderInfo::transfer`): on V4L2 zero-copy, or a CPU copy while sources are copied into the device's layout; on Media Foundation zero-copy for an encoder that reads textures in place, a GPU copy for one that holds frames (decided on the first frame), and a CPU copy for the software encoder.
 
 | Environment variable           | Effect                                     |
 |--------------------------------|--------------------------------------------|

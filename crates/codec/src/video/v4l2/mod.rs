@@ -7,6 +7,7 @@
 
 pub(crate) mod decoder;
 pub(crate) mod encoder;
+mod media;
 pub(crate) mod mjpeg;
 
 use std::path::PathBuf;
@@ -85,7 +86,29 @@ pub(crate) struct M2mDevice {
 impl M2mDevice {
     /// Opens `path` if it is a streaming memory-to-memory device.
     pub fn open(path: &std::path::Path) -> Option<Self> {
-        let dev = Device::open(path).ok()?;
+        Self::try_open(path).ok().flatten()
+    }
+
+    /// Opens `path` if it is a streaming memory-to-memory device: `Ok(None)`
+    /// when it is not one or cannot be opened, and
+    /// [`CodecError::Device`] when its media controller describes it as a
+    /// codec but it is busy or out of resources for another user.
+    pub fn try_open(path: &std::path::Path) -> Result<Option<Self>, CodecError> {
+        let dev = match Device::open(path) {
+            Ok(dev) => dev,
+            Err(e) if is_busy(&e) && media::is_codec_node(path) => {
+                let errno = e.errno().map_or(0, |n| n as i32);
+                return Err(CodecError::Device {
+                    op: format!("open {}", path.display()),
+                    source: std::io::Error::from_raw_os_error(errno),
+                });
+            }
+            Err(_) => return Ok(None),
+        };
+        Ok(Self::from_device(dev))
+    }
+
+    fn from_device(dev: Device) -> Option<Self> {
         let caps = dev.capabilities();
         if !caps.is_m2m() || !caps.has_streaming() {
             return None;
@@ -113,7 +136,8 @@ impl M2mDevice {
 }
 
 /// The device nodes to try: the node in `env` when set, otherwise every
-/// streaming memory-to-memory node, in numeric order.
+/// streaming memory-to-memory node, and every codec node that is busy or
+/// out of resources, in numeric order.
 pub(crate) fn candidates(env: &str) -> Vec<PathBuf> {
     if let Some(path) = std::env::var_os(env) {
         return vec![PathBuf::from(path)];
@@ -121,11 +145,22 @@ pub(crate) fn candidates(env: &str) -> Vec<PathBuf> {
     device::enumerate()
         .unwrap_or_default()
         .into_iter()
-        .filter(|node| {
-            node.capabilities
-                .as_ref()
-                .is_ok_and(|c| c.is_m2m() && c.has_streaming())
+        .filter(|node| match &node.capabilities {
+            Ok(c) => c.is_m2m() && c.has_streaming(),
+            Err(e) => is_busy(e) && media::is_codec_node(&node.path),
         })
         .map(|node| node.path)
         .collect()
+}
+
+/// Whether a failed open means the node is busy or out of resources.
+fn is_busy(e: &edgefirst_v4l2::Error) -> bool {
+    e.errno().is_some_and(|errno| {
+        matches!(
+            std::io::Error::from_raw_os_error(errno as i32).kind(),
+            std::io::ErrorKind::OutOfMemory
+                | std::io::ErrorKind::ResourceBusy
+                | std::io::ErrorKind::WouldBlock
+        )
+    })
 }

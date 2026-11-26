@@ -99,6 +99,8 @@ if (o) {
 
 `ef_tiling_config` holds the tile geometry. How each tile is converted is the `const ef_convert_options *` that `ef_image_processor_plan_tiles`, `_tile_into` and `_tile_one` take beside it (`NULL` stretches each tile); pass the same options to the plan and the render. With a letterbox, every `ef_tile_placement` carries its `content_region`. Options that rotate or flip are `EINVAL`.
 
+`ef_image_processor_tile_into_fence` renders the tiles as `ef_image_processor_tile_into` does and returns a sync-fence fd in `*fence_fd` instead of blocking. On Windows, `ef_image_processor_tile_into_fence_handle` returns an event handle in `*fence`. The caller owns the fence and closes it. `-1` (or `NULL`) means the tiles already completed, and is not an error. Each entry point returns `NULL` with `errno` `ENOTSUP` off its platform.
+
 ## What actually needs a processor
 
 Only PBO allocation, because a PBO is a GL object and only the context owner can
@@ -119,6 +121,6 @@ same object to all of them, not a compatible copy that has to be translated.
 `ef_image_processor_convert_fence` returns a sync-fence fd instead of blocking,
 for the GL to NPU handoff. The caller owns the descriptor and must close it.
 `-1` means the platform has no native fence and the convert already completed —
-not an error.
+not an error. Linux and Android return a descriptor where the EGL display has `EGL_ANDROID_native_fence_sync`; macOS and iOS return `-1`. The fence also covers the GPU's reads of the source, so keep the source unmodified, and do not hand its buffer back to its producer (a V4L2 capture queue, for example), until it signals. `ef_image_processor_tile_into_fence` does the same for a tile batch (see [Tiling](#tiling)).
 
 <img referrerpolicy="no-referrer" src="https://px.edgefirst.ai/a.png?x-pxid=37aa7de2-6935-484e-b31d-9fd9a57fcd63" alt="" width="1" height="1" style="position:absolute; width:1px; height:1px; opacity:0; pointer-events:none;" />

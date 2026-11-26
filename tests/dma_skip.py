@@ -51,8 +51,8 @@ def image_or_skip_dma(*args, **kwargs):
         return Tensor.image(*args, **kwargs)
     except Exception as exc:
         mem = kwargs.get("mem")
-        if mem is TensorMemory.DMABUF or (
-            len(args) >= 4 and args[3] is TensorMemory.DMABUF
+        if mem == TensorMemory.DMABUF or (
+            len(args) >= 4 and args[3] == TensorMemory.DMABUF
         ):
             skip_if_dma_unavailable(exc)
         raise
@@ -64,6 +64,6 @@ def tensor_or_skip_dma(*args, **kwargs):
         return Tensor(*args, **kwargs)
     except Exception as exc:
         mem = kwargs.get("mem")
-        if mem is TensorMemory.DMABUF:
+        if mem == TensorMemory.DMABUF:
             skip_if_dma_unavailable(exc)
         raise

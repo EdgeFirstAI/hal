@@ -86,9 +86,15 @@ pub(crate) fn guard(body: impl FnOnce() -> c_int) -> c_int {
 /// Runs an entry point that returns a new object: `NULL` on failure, with
 /// `errno` (the last-error code on Windows) and the last error set.
 pub(crate) fn guard_new<T>(body: impl FnOnce() -> Result<T, c_int>) -> *mut T {
+    guard_ptr(|| body().map(|v| Box::into_raw(Box::new(v))))
+}
+
+/// Runs an entry point that returns a new pointer: `NULL` on failure, with
+/// `errno` (the last-error code on Windows) and the last error set.
+pub(crate) fn guard_ptr<T>(body: impl FnOnce() -> Result<*mut T, c_int>) -> *mut T {
     clear_last();
     let rc = match catch_unwind(AssertUnwindSafe(body)) {
-        Ok(Ok(v)) => return Box::into_raw(Box::new(v)),
+        Ok(Ok(p)) => return p,
         Ok(Err(rc)) => rc,
         Err(_) => {
             set_last("internal error");

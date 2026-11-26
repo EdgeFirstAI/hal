@@ -55,8 +55,7 @@ def _image_size(path):
         return im.size  # (width, height)
 
 
-def test_flip(monkeypatch):
-    monkeypatch.setenv("EDGEFIRST_COLORIMETRY", "exact")
+def test_flip():
     w, h = _image_size("testdata/zidane.jpg")
     src = Tensor.image(w, h, format=PixelFormat.Nv12, access="readwrite")
     decode_file_into(src, "testdata/zidane.jpg")
@@ -190,8 +189,7 @@ def test_box_colour_alpha():
     assert img[16, 16].tolist() == [10, 20, 30, 200]
 
 
-def test_rgb_resize(monkeypatch):
-    monkeypatch.setenv("EDGEFIRST_COLORIMETRY", "exact")
+def test_rgb_resize():
     w, h = _image_size("testdata/zidane.jpg")
     src = Tensor.image(w, h, format=PixelFormat.Nv12, access="readwrite")
     decode_file_into(src, "testdata/zidane.jpg")
@@ -235,8 +233,7 @@ def test_interpolation(monkeypatch):
     assert blended(resize(ImageProcessor(interpolation="bilinear"))) == 0
 
 
-def test_rgba_to_rgb(monkeypatch):
-    monkeypatch.setenv("EDGEFIRST_COLORIMETRY", "exact")
+def test_rgba_to_rgb():
     w, h = _image_size("testdata/zidane.jpg")
     src = Tensor.image(w, h, format=PixelFormat.Nv12, access="readwrite")
     decode_file_into(src, "testdata/zidane.jpg")
@@ -629,8 +626,11 @@ def test_gpu_declined_convert_raises_permission_error():
     assert "opengl" in str(info.value)
 
 
-def test_decode_image_method_on_read_dma_tensor_raises_permission_error():
-    """``Tensor.decode_image`` into a read-only DMA tensor raises PermissionError."""
+def test_decode_image_method_that_needs_a_cpu_write_raises_on_a_read_tensor():
+    """``Tensor.decode_image`` into a read-only tensor raises PermissionError
+    whenever the decode writes it on the CPU: always into host memory, and
+    into a DMA tensor for an image whose size no hardware decoder writes in
+    place (500x375, not on a 16-pixel macroblock grid)."""
     from edgefirst.codec import Tensor as CodecTensor
 
     with open("testdata/zidane.jpg", "rb") as fh:
@@ -641,9 +641,33 @@ def test_decode_image_method_on_read_dma_tensor_raises_permission_error():
     )
     with pytest.raises(PermissionError, match="CPU access denied"):
         host.decode_image(data)
+    with open("testdata/coco_420_odd.jpg", "rb") as fh:
+        odd = fh.read()
+    w, h = _image_size("testdata/coco_420_odd.jpg")
     dma = _dma_or_skip(CodecTensor, w, h, PixelFormat.Nv12, access="read")
     with pytest.raises(PermissionError, match="CPU access denied"):
-        dma.decode_image(data)
+        dma.decode_image(odd)
+
+
+def test_a_hardware_jpeg_decoder_writes_a_read_dma_tensor_in_place():
+    """Under ``Engine.Auto`` a V4L2 JPEG decoder writes a read-only DMA tensor
+    by DMA: an aligned image decodes without a CPU access."""
+    from edgefirst import codec
+    from edgefirst.codec import Tensor as CodecTensor
+
+    if not codec.is_v4l2_available():
+        reason = "no V4L2 JPEG decoder here"
+        print(f"WARNING: SKIPPED: {reason}", file=sys.stderr)
+        pytest.skip(reason)
+    with open("testdata/zidane.jpg", "rb") as fh:
+        data = fh.read()
+    w, h = _image_size("testdata/zidane.jpg")
+    dma = _dma_or_skip(CodecTensor, w, h, PixelFormat.Nv12, access="read")
+    info = dma.decode_image(data)
+    assert (info.width, info.height) == (w, h)
+    with dma.map("read") as m:
+        spread = float(np.asarray(m).reshape(-1)[: w * h].std())
+    assert spread > 10, "the decoded picture is flat"
 
 
 @pytest.mark.parametrize("mem", ["mem", "dma"])
@@ -1187,9 +1211,8 @@ def test_from_numpy_grey_unaligned_width(width, height):
         )
 
 
-def test_convert_honors_tagged_colorimetry(monkeypatch):
+def test_convert_honors_tagged_colorimetry():
     """convert() honors the source tensor's tagged colorimetry."""
-    monkeypatch.setenv("EDGEFIRST_COLORIMETRY", "exact")
     w, h = 1280, 720
     nv12 = np.fromfile("testdata/zidane.nv12", dtype=np.uint8).reshape(h * 3 // 2, w)
     converter = ImageProcessor()

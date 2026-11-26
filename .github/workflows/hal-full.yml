@@ -3,7 +3,7 @@
 # runner-class: larger
 # Shared workflows: EdgeFirstAI/.github, pinned in the `uses:` lines below.
 # Generic Linux/arm/hardware/scancode live in rust-full.yml.
-# The macOS (codesign + ANGLE) and Windows (gating pass + WARP) lanes are here.
+# The macOS (codesign + ANGLE) and Windows (ANGLE on WARP) lanes are here.
 
 name: HAL Full extras
 
@@ -105,17 +105,6 @@ jobs:
           done
           venv/bin/pip install --no-deps --force-reinstall target/wheels/*.whl
 
-      - name: Run Rust tests with coverage
-        run: |
-          cargo llvm-cov nextest --cargo-profile profiling --features default,edgefirst-decoder/model-files --workspace \
-            --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-kernels --exclude edgefirst-python-common \
-            --no-report -j 1 \
-            2>&1 | tee target/test-metrics-rust-x86_64.txt
-      - name: Audit test warnings
-        if: always()
-        shell: bash
-        run: python3 .github/scripts/test_warnings.py target/llvm-cov-target/nextest target/nextest
-
       - name: Run Python tests with coverage
         run: |
           source /tmp/coverage-env.sh
@@ -123,7 +112,7 @@ jobs:
             -m pytest tests/ -v --tb=short --junitxml=target/pytest_results.xml \
             2>&1 | tee target/test-metrics-python-x86_64.txt
 
-      - name: Generate combined Rust coverage report
+      - name: Generate the Rust coverage report of the Python tests
         run: |
           cargo llvm-cov report --profile profiling \
             --ignore-filename-regex '(\.cargo|/rustc/|/target/)' \
@@ -143,7 +132,6 @@ jobs:
             target/coverage_python.xml
             target/pytest_results.xml
             target/coverage_rust.lcov
-            target/test-metrics-rust-x86_64.txt
             target/test-metrics-python-x86_64.txt
           retention-days: 7
 
@@ -185,14 +173,14 @@ jobs:
         run: |
           eglinfo -B 2>&1 | head -50 || true
           cargo run -p gpu-probe -- --probe-only 2>&1 | head -60 || true
-      - name: Run image GL tests under coverage
+      - name: Run the edgefirst-image tests under coverage
         run: |
           cargo llvm-cov nextest -p edgefirst-image --features default \
-            --no-fail-fast -j 1 \
+            --no-fail-fast \
             -E 'not test(~no_bleed_gl)' \
             --lcov --output-path target/coverage_rust.lcov \
             --ignore-filename-regex '(\.cargo|/rustc/|/target/)' \
-            2>&1 | tee target/test-metrics-software-gl.txt || true
+            2>&1 | tee target/test-metrics-software-gl.txt
       - name: Audit test warnings
         if: always()
         shell: bash
@@ -249,7 +237,7 @@ jobs:
           COVERAGE: "1"
           COV_LCOV: target/coverage_rust.lcov
           HAL_TEST_REQUIRE_GL: "1"
-        run: ./scripts/test-macos.sh -j 1
+        run: ./scripts/test-macos.sh --profile ci
       - name: Audit test warnings
         if: always()
         shell: bash
@@ -257,6 +245,7 @@ jobs:
       - run: make test-capi-modular
       - run: make test-capi-link
       - run: make test-two-library-user
+      - run: make test-tensor-dynamic
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         if: always()
         with:
@@ -265,7 +254,7 @@ jobs:
           retention-days: 7
 
   test-windows:
-    name: Build & Test (Windows, ANGLE off)
+    name: Build & Test (Windows, ANGLE D3D11 WARP)
     runs-on: windows-latest
     timeout-minutes: 60
     needs: checkout-lfs
@@ -273,6 +262,7 @@ jobs:
       contents: read
     env:
       GH_TOKEN: ${{ github.token }}
+      EDGEFIRST_ANGLE_PATH: ${{ github.workspace }}\target\angle\windows-x64\bin
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -299,20 +289,23 @@ jobs:
         run: |
           cargo clippy --workspace --all-targets --exclude gpu-probe --exclude edgefirst-bench --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-kernels --exclude edgefirst-python-common -- -D warnings
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Rust tests (no ANGLE on PATH)
+      - name: Fetch ANGLE
+        shell: bash
+        run: bash scripts/fetch-angle.sh --windows
+      - name: Reset coverage counters
         shell: pwsh
-        env:
-          EDGEFIRST_ANGLE_PATH: ''
         run: |
           cargo llvm-cov clean --workspace
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo llvm-cov nextest --no-report --features edgefirst-decoder/model-files --workspace --exclude gpu-probe --exclude edgefirst-bench --exclude edgefirst-python-tensor --exclude edgefirst-python-codec --exclude edgefirst-python-image --exclude edgefirst-python-decoder --exclude edgefirst-python-tracker --exclude edgefirst-python-kernels --exclude edgefirst-python-common -j 1
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Rust tests on WARP
+        shell: pwsh
+        run: pwsh -NoProfile -File scripts/test-windows.ps1 -Coverage -Warp -RequireGl --features edgefirst-decoder/model-files --profile ci
       - name: Audit test warnings
         if: always()
         shell: bash
         run: python .github/scripts/test_warnings.py target/llvm-cov-target/nextest target/nextest
       - name: Generate LCOV
+        if: always()
         shell: pwsh
         run: |
           cargo llvm-cov report --lcov --output-path target/coverage_rust.lcov --ignore-filename-regex '(\.cargo|[\\/]rustc[\\/]|[\\/]target[\\/])'
@@ -393,67 +386,6 @@ jobs:
         run: |
           cargo ndk -t arm64-v8a -t x86_64 -P 26 build --profile profiling \
             -p edgefirst-tensor -p edgefirst-image -p edgefirst-codec -p edgefirst-decoder -p edgefirst-tracker
-
-  test-windows-warp:
-    name: GL Tests (Windows, ANGLE D3D11 WARP)
-    runs-on: windows-latest
-    timeout-minutes: 45
-    needs: checkout-lfs
-    permissions:
-      contents: read
-    env:
-      GH_TOKEN: ${{ github.token }}
-      EDGEFIRST_ANGLE_PATH: ${{ github.workspace }}\target\angle\windows-x64\bin
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-        with:
-          lfs: false
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
-        with:
-          name: testdata-lfs
-          path: testdata/
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8  # v1
-        with:
-          toolchain: ${{ env.RUST_STABLE_VERSION }}
-          components: clippy, rustfmt, llvm-tools-preview
-      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756  # v1.13.0
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
-        with:
-          shared-key: rust-windows-warp
-          cache-on-failure: true
-          cache-bin: false
-      - uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68  # v2.88.1
-        with:
-          tool: cargo-nextest,cargo-llvm-cov@0.6.16
-      - name: Fetch ANGLE
-        shell: bash
-        run: bash scripts/fetch-angle.sh --windows
-      - name: Reset coverage counters
-        shell: pwsh
-        run: |
-          cargo llvm-cov clean --workspace
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Run GL tests on WARP
-        shell: pwsh
-        run: pwsh -NoProfile -File scripts/test-windows.ps1 -Coverage -Warp -RequireGl -p edgefirst-image --profile ci
-      - name: Audit test warnings
-        if: always()
-        shell: bash
-        run: python .github/scripts/test_warnings.py target/llvm-cov-target/nextest target/nextest
-      - name: Generate LCOV
-        if: always()
-        shell: pwsh
-        run: |
-          cargo llvm-cov report --lcov --output-path target/coverage_rust_warp.lcov --ignore-filename-regex '(\.cargo|[\\/]rustc[\\/]|[\\/]target[\\/])'
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          pwsh -NoProfile -File scripts/normalize-lcov-paths.ps1 target/coverage_rust_warp.lcov
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
-        if: always()
-        with:
-          name: coverage-windows-warp
-          path: target/coverage_rust_warp.lcov
-          retention-days: 7
 
   package-windows-capi:
     name: Package C Archive (Windows)

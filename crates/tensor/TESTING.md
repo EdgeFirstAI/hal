@@ -40,22 +40,20 @@ Per-backend unit tests live in the source files alongside the implementation. `t
 
 ## Running Tests
 
-All `cargo test` invocations below pass `-- --test-threads=1` per the
-workspace single-threaded rule
-([root TESTING.md § Single-threaded execution](https://github.com/EdgeFirstAI/hal/blob/main/TESTING.md#single-threaded-execution)).
+Tests run in parallel, at the default thread count ([root TESTING.md § Parallel Execution](https://github.com/EdgeFirstAI/hal/blob/main/TESTING.md#parallel-execution)).
 
 ```bash
 # All tensor tests on the host
-cargo test -p edgefirst-tensor -- --test-threads=1
+cargo test -p edgefirst-tensor
 
 # Heap-only (skips DMA tests when DMA-heap permissions are missing)
-EDGEFIRST_TENSOR_FORCE_MEM=1 cargo test -p edgefirst-tensor -- --test-threads=1
+EDGEFIRST_TENSOR_FORCE_MEM=1 cargo test -p edgefirst-tensor
 
 # Doc-tests only
-cargo test -p edgefirst-tensor --doc -- --test-threads=1
+cargo test -p edgefirst-tensor --doc
 
 # With ndarray feature exercised explicitly
-cargo test -p edgefirst-tensor --features ndarray -- --test-threads=1
+cargo test -p edgefirst-tensor --features ndarray
 ```
 
 ## Special Requirements
@@ -71,7 +69,7 @@ cargo test -p edgefirst-tensor --features ndarray -- --test-threads=1
 
   ```bash
   cargo test -p edgefirst-tensor --lib --no-run     # build as your user
-  sudo ./target/debug/deps/edgefirst_tensor-<hash> --test-threads=1
+  sudo ./target/debug/deps/edgefirst_tensor-<hash>
   ```
 
   Or set `HAL_TEST_REQUIRE_DMA=1`, which turns every such skip into a failure; see [DMA require gate](#dma-require-gate) below.
@@ -136,7 +134,7 @@ To confirm the gate fails loudly on a workstation that does have a heap, hide th
 
 ```bash
 unshare -rm sh -c 'mount --bind /dev/null /dev/dma_heap/system &&
-  HAL_TEST_REQUIRE_DMA=1 cargo test -p edgefirst-tensor -- --test-threads=1'
+  HAL_TEST_REQUIRE_DMA=1 cargo test -p edgefirst-tensor'
 ```
 
 `EDGEFIRST_TENSOR_FORCE_MEM=1` also makes every DMA test skip, so do not combine it with the gate.
@@ -146,7 +144,7 @@ unshare -rm sh -c 'mount --bind /dev/null /dev/dma_heap/system &&
 The nightly mutation lane runs this crate on all four legs (Linux x86_64 and arm64, macOS, Windows); see root [TESTING.md § Mutation Testing](https://github.com/EdgeFirstAI/hal/blob/main/TESTING.md#mutation-testing) for the legs, how survivors are judged and how to mark an equivalent mutant. To mutate one file locally:
 
 ```bash
-cargo mutants -p edgefirst-tensor --file crates/tensor/src/<file>.rs --in-place -- -- --test-threads=1
+cargo mutants -p edgefirst-tensor --file crates/tensor/src/<file>.rs --in-place
 ```
 
 A survivor in a DMA path only counts as a test gap if the tests actually ran against a heap, so run it with `HAL_TEST_REQUIRE_DMA=1` on a host that has one. `ahardwarebuffer.rs` is excluded from the corpus in `.cargo/mutants.toml` (no Android runner); its pure logic is in `ahardwarebuffer_layout.rs`, which is mutated everywhere.
@@ -203,13 +201,13 @@ The CUDA zero-copy surface (`cuda_map()`, `is_cuda_available()`, `CudaMap`,
 Run all CUDA tests on the host (no hardware required):
 
 ```bash
-cargo test -p edgefirst-tensor -- --test-threads=1
+cargo test -p edgefirst-tensor
 ```
 
 To exercise just the CUDA tests by name:
 
 ```bash
-cargo test -p edgefirst-tensor cuda -- --test-threads=1
+cargo test -p edgefirst-tensor cuda
 ```
 
 ### Windows D3D11 CUDA interop tests
@@ -239,7 +237,7 @@ cargo-zigbuild test --target aarch64-unknown-linux-gnu --release --no-run \
 
 scp target/aarch64-unknown-linux-gnu/release/deps/edgefirst_tensor-* \
   jetson-orin-nano:/tmp/hal-tests/
-ssh jetson-orin-nano '/tmp/hal-tests/edgefirst_tensor-<hash> --test-threads=1'
+ssh jetson-orin-nano '/tmp/hal-tests/edgefirst_tensor-<hash>'
 ```
 
 The on-target suite includes an end-to-end test that:

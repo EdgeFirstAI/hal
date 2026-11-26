@@ -35,20 +35,20 @@ Outside the crate: `crates/kernels-capi/src/tests.rs` and `crates/kernels-capi/t
 
 ## Running Tests
 
-All `cargo test` invocations pass `-- --test-threads=1` per the workspace single-threaded rule ([root TESTING.md § Single-threaded execution](https://github.com/EdgeFirstAI/hal/blob/main/TESTING.md#single-threaded-execution)). The kernels are CPU-only, but the rule applies workspace-wide.
+Tests run in parallel, at the default thread count ([root TESTING.md § Parallel Execution](https://github.com/EdgeFirstAI/hal/blob/main/TESTING.md#parallel-execution)).
 
 ```bash
 # All kernels tests (unit, integration, doc)
-cargo test -p edgefirst-kernels -- --test-threads=1
+cargo test -p edgefirst-kernels
 
 # One integration suite
-cargo test -p edgefirst-kernels --test softmax -- --test-threads=1
+cargo test -p edgefirst-kernels --test softmax
 
 # A forced tier for every plan built with ::new (the tests also build each tier explicitly)
-EDGEFIRST_KERNELS_FORCE_TIER=scalar cargo test -p edgefirst-kernels -- --test-threads=1
+EDGEFIRST_KERNELS_FORCE_TIER=scalar cargo test -p edgefirst-kernels
 
 # The C boundary (workspace-excluded leaf)
-(cd crates/kernels-capi && EF_REQUIRE_FRESH_ARTIFACTS=1 cargo test --target-dir ../../target -- --test-threads=1)
+(cd crates/kernels-capi && EF_REQUIRE_FRESH_ARTIFACTS=1 cargo test --target-dir ../../target)
 
 # The Python bindings, from the repo venv
 make install-python PYTHON_PACKAGES=kernels

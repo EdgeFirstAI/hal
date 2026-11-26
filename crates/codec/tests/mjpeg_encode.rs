@@ -10,6 +10,9 @@ use edgefirst_codec::video::{EncoderConfig, FrameOptions, VideoEncoder};
 use edgefirst_codec::{Codec, CodecError, Engine, ImageDecoder, ImageEncoder};
 use edgefirst_tensor::{CpuAccess, DType, PixelFormat, TensorDyn, TensorMemory};
 
+#[path = "common/sessions.rs"]
+mod sessions;
+
 fn skip(test: &str, why: &str) {
     use std::io::Write;
     let _ = writeln!(&mut std::io::stderr(), "WARNING: SKIPPED: {test} - {why}");
@@ -78,6 +81,7 @@ fn luma_difference(jpeg: &[u8], src: &TensorDyn) -> f64 {
 
 #[test]
 fn mjpeg_pictures_decode_to_their_sources() {
+    let _sessions = sessions::take(2);
     const TEST: &str = "mjpeg_pictures_decode_to_their_sources";
     let (w, h) = (640usize, 480usize);
     let mut config = EncoderConfig::new(Codec::Mjpeg, w as u32, h as u32, PixelFormat::Nv12, 30.0);
@@ -112,6 +116,7 @@ fn mjpeg_pictures_decode_to_their_sources() {
 
 #[test]
 fn a_hardware_image_encoder_writes_the_source() {
+    let _sessions = sessions::take(2);
     const TEST: &str = "a_hardware_image_encoder_writes_the_source";
     let Some(src) = source(640, 480, 0) else {
         return skip(TEST, "no DMA-BUF images");

@@ -709,6 +709,7 @@ fn tensor_capsule<'py>(
     tensor: &edgefirst_tensor::TensorDyn,
 ) -> PyResult<Bound<'py, pyo3::types::PyCapsule>> {
     use edgefirst_tensor::CpuAccess;
+    crate::interop::exportable(tensor)?;
     let pin = tensor.pin_host(CpuAccess::Read).map_err(decode_err)?;
     let desc = tensor.descriptor_pinned(Some(&pin));
     // The payload owns an `Arc` of the quantization, whose arrays `quant`

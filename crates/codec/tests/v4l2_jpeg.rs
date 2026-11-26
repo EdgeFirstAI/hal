@@ -11,8 +11,8 @@
 //! `Grey` for greyscale), so the comparison is over the full native buffer
 //! (Y + CbCr for NV12).
 //!
-//! The tests set process-global environment variables to select the backend
-//! and must run single-threaded.
+//! The CPU references decode with [`Engine::Cpu`]; the hardware decodes use
+//! [`Engine::Auto`].
 #![cfg(all(target_os = "linux", feature = "v4l2"))]
 
 #[path = "../../tensor/tests/support/dma_require.rs"]
@@ -23,8 +23,11 @@ mod dma_require;
 #[allow(dead_code)]
 mod outcome;
 
-use edgefirst_codec::{peek_info, ImageDecoder, ImageLoad};
+use edgefirst_codec::{peek_info, Engine, ImageDecoder, ImageLoad};
 use edgefirst_tensor::{PixelFormat, Tensor, TensorMemory, TensorTrait};
+
+#[path = "common/sessions.rs"]
+mod sessions;
 
 fn testdata(name: &str) -> Vec<u8> {
     let root = std::env::var("EDGEFIRST_TESTDATA_DIR")
@@ -55,14 +58,10 @@ fn has_video_device() -> bool {
         .unwrap_or(false)
 }
 
-/// Decode `jpeg` into a tensor of `fmt` with the backend selected by
-/// `disable_v4l2`, returning the full native buffer (Y + CbCr for NV12).
-fn decode(jpeg: &[u8], w: usize, h: usize, fmt: PixelFormat, disable_v4l2: bool) -> Vec<u8> {
-    if disable_v4l2 {
-        std::env::set_var("EDGEFIRST_DISABLE_V4L2", "1");
-    } else {
-        std::env::remove_var("EDGEFIRST_DISABLE_V4L2");
-    }
+/// Decode `jpeg` into a tensor of `fmt` on the CPU when `cpu` is set and on
+/// [`Engine::Auto`] otherwise, returning the full native buffer (Y + CbCr for
+/// NV12).
+fn decode(jpeg: &[u8], w: usize, h: usize, fmt: PixelFormat, cpu: bool) -> Vec<u8> {
     let mut tensor = Tensor::<u8>::image(
         w,
         h,
@@ -72,6 +71,9 @@ fn decode(jpeg: &[u8], w: usize, h: usize, fmt: PixelFormat, disable_v4l2: bool)
     )
     .unwrap();
     let mut decoder = ImageDecoder::new();
+    if cpu {
+        decoder.set_engine(Engine::Cpu);
+    }
     let info = tensor.load_image(&mut decoder, jpeg).unwrap();
     let map = tensor.map().unwrap();
     let pixels: &[u8] = &map;
@@ -103,6 +105,7 @@ fn assert_close(cpu: &[u8], hw: &[u8], label: &str) {
 
 #[test]
 fn v4l2_parity_nv12() {
+    let _sessions = sessions::take(1);
     eprintln!(
         "v4l2_parity_nv12: video device present = {}",
         has_video_device()
@@ -116,6 +119,7 @@ fn v4l2_parity_nv12() {
 
 #[test]
 fn v4l2_parity_grey() {
+    let _sessions = sessions::take(1);
     // grey.jpg is a greyscale JPEG.
     let jpeg = testdata("grey.jpg");
     let info = peek_info(&jpeg).unwrap();
@@ -126,12 +130,12 @@ fn v4l2_parity_grey() {
 
 #[test]
 fn v4l2_persistent_loop() {
+    let _sessions = sessions::take(1);
     // One decoder reused across frames; every frame matches the CPU reference.
     let jpeg = testdata("zidane.jpg");
     let cpu = decode(&jpeg, 1280, 720, PixelFormat::Nv12, true);
     let nv12_len = 1280 * 720 * 3 / 2;
 
-    std::env::remove_var("EDGEFIRST_DISABLE_V4L2");
     let mut decoder = ImageDecoder::new();
     let mut tensor = Tensor::<u8>::image(
         1280,
@@ -153,10 +157,10 @@ fn v4l2_persistent_loop() {
 
 #[test]
 fn v4l2_geometry_change_rebuilds() {
+    let _sessions = sessions::take(1);
     // Alternating geometries rebuild the stream on each call.
     let z = testdata("zidane.jpg");
     let g = testdata("giraffe.jpg");
-    std::env::remove_var("EDGEFIRST_DISABLE_V4L2");
     let mut decoder = ImageDecoder::new();
 
     for data in [&z, &g, &z, &g] {
@@ -190,12 +194,7 @@ fn v4l2_geometry_change_rebuilds() {
 /// Decode `jpeg` into a `fmt` tensor and extract the tight native buffer,
 /// honouring the tensor's row stride. Handles widths that are not
 /// stride-aligned and `Nv24`.
-fn decode_tight(jpeg: &[u8], w: usize, h: usize, fmt: PixelFormat, disable_v4l2: bool) -> Vec<u8> {
-    if disable_v4l2 {
-        std::env::set_var("EDGEFIRST_DISABLE_V4L2", "1");
-    } else {
-        std::env::remove_var("EDGEFIRST_DISABLE_V4L2");
-    }
+fn decode_tight(jpeg: &[u8], w: usize, h: usize, fmt: PixelFormat, cpu: bool) -> Vec<u8> {
     let mut tensor = Tensor::<u8>::image(
         w,
         h,
@@ -205,6 +204,9 @@ fn decode_tight(jpeg: &[u8], w: usize, h: usize, fmt: PixelFormat, disable_v4l2:
     )
     .unwrap();
     let mut decoder = ImageDecoder::new();
+    if cpu {
+        decoder.set_engine(Engine::Cpu);
+    }
     let info = tensor.load_image(&mut decoder, jpeg).unwrap();
     assert_eq!((info.width, info.height), (w, h));
     let stride = info.row_stride;
@@ -241,6 +243,7 @@ fn decode_tight(jpeg: &[u8], w: usize, h: usize, fmt: PixelFormat, disable_v4l2:
 
 #[test]
 fn v4l2_geometry_change_reconfigures() {
+    let _sessions = sessions::take(1);
     // Alternating geometries through one decoder; each frame is compared
     // against the CPU reference.
     let z = testdata("zidane.jpg");
@@ -248,7 +251,6 @@ fn v4l2_geometry_change_reconfigures() {
     let cpu_z = decode_tight(&z, 1280, 720, PixelFormat::Nv12, true);
     let cpu_g = decode_tight(&g, 640, 640, PixelFormat::Nv12, true);
 
-    std::env::remove_var("EDGEFIRST_DISABLE_V4L2");
     let mut decoder = ImageDecoder::new();
     // 3 rounds: initial configure, geometry-change reconfigure, stable reuse.
     for i in 0..3 {
@@ -284,6 +286,7 @@ fn v4l2_geometry_change_reconfigures() {
 
 #[test]
 fn v4l2_yuv444_nv24() {
+    let _sessions = sessions::take(1);
     // 4:4:4 JPEG: matches the CPU decoder's native NV24.
     let jpeg = testdata("zidane_444.jpg");
     let cpu = decode_tight(&jpeg, 1280, 720, PixelFormat::Nv24, true);
@@ -293,6 +296,7 @@ fn v4l2_yuv444_nv24() {
 
 #[test]
 fn v4l2_non_mcu_dims() {
+    let _sessions = sessions::take(1);
     // Non-MCU-aligned (odd) dimensions decode through the copy paths.
     for (name, w, h, fmt) in [
         ("coco_420_odd.jpg", 500usize, 375usize, PixelFormat::Nv12),
@@ -308,6 +312,7 @@ fn v4l2_non_mcu_dims() {
 
 #[test]
 fn v4l2_reconfigure_loop_stable() {
+    let _sessions = sessions::take(1);
     // Geometry and subsampling changes through one decoder, without leaking fds.
     let images: Vec<(Vec<u8>, usize, usize, PixelFormat)> = vec![
         (testdata("zidane.jpg"), 1280, 720, PixelFormat::Nv12),
@@ -318,7 +323,6 @@ fn v4l2_reconfigure_loop_stable() {
     ];
     let fd_count = || std::fs::read_dir("/proc/self/fd").unwrap().count();
 
-    std::env::remove_var("EDGEFIRST_DISABLE_V4L2");
     let mut decoder = ImageDecoder::new();
     // Warm-up pass establishes the device fd and the persistent allocations.
     for (jpeg, w, h, fmt) in &images {
@@ -360,10 +364,10 @@ fn v4l2_reconfigure_loop_stable() {
 
 #[test]
 fn v4l2_zero_copy_dma_nv12() {
+    let _sessions = sessions::take(1);
     // Zero-copy: decode into a DMA-backed NV12 tensor (1280×720, MCU-aligned)
     // and compare with the scratch copy-out path.
     let jpeg = testdata("zidane.jpg");
-    std::env::remove_var("EDGEFIRST_DISABLE_V4L2");
     let result = Tensor::<u8>::image(
         1280,
         720,
@@ -408,14 +412,4 @@ fn v4l2_zero_copy_dma_nv12() {
     // Reference: the scratch copy-out path through the same backend.
     let reference = decode(&jpeg, w, h, PixelFormat::Nv12, false);
     assert_close(&reference, &zc, "zero-copy-dma");
-}
-
-/// `v4l2_available` answers with or without a decoder device, and
-/// `EDGEFIRST_DISABLE_V4L2` forces `false`.
-#[test]
-fn v4l2_available_probe_honours_disable_env() {
-    std::env::set_var("EDGEFIRST_DISABLE_V4L2", "1");
-    assert!(!edgefirst_codec::v4l2_available());
-    std::env::remove_var("EDGEFIRST_DISABLE_V4L2");
-    let _present: bool = edgefirst_codec::v4l2_available();
 }

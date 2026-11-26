@@ -34,12 +34,15 @@ header = """
  * header, `edgefirst/tensor.h`. Detection primitives used when drawing
  * masks live in header-only `edgefirst/detect.h`.
  *
- * Platform-specific entry points. Both are declared on every platform and
+ * Platform-specific entry points. Each is declared on every platform and
  * refuse at run time off their platform. Each function states its
  * platforms on a "Platforms:" line:
- *   - Linux, macOS, iOS, Android: ef_image_processor_convert_fence
- *     (sync-fence fd)
- *   - Windows: ef_image_processor_convert_fence_handle (event handle)
+ *   - Linux, macOS, iOS, Android: ef_image_processor_convert_fence and
+ *     ef_image_processor_tile_into_fence (sync-fence fd; a fence is
+ *     returned on Linux and Android where the EGL display has
+ *     EGL_ANDROID_native_fence_sync)
+ *   - Windows: ef_image_processor_convert_fence_handle and
+ *     ef_image_processor_tile_into_fence_handle (event handle)
  */
 
 #include <stdarg.h>

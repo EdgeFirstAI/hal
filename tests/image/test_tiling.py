@@ -7,6 +7,10 @@ The grid geometry and config validation are pure (no GPU). The
 ``tile_into`` round-trip is GPU-gated and skips when no backend can render.
 """
 
+import os
+import select
+import sys
+
 import numpy as np
 import pytest
 from edgefirst.image import (
@@ -162,3 +166,70 @@ def test_tile_into_round_trip():
     # The packed parent stacks n tiles of tile_h vertically.
     assert dst.width == 64
     assert dst.height == n * 64
+
+
+def _wait_and_close(fence):
+    """Wait up to five seconds for a completion handle to signal, then close it."""
+    if fence is None:
+        return
+    if sys.platform == "win32":
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        try:
+            waited = kernel32.WaitForSingleObject(ctypes.c_void_p(fence), 5000)
+        finally:
+            kernel32.CloseHandle(ctypes.c_void_p(fence))
+        assert waited == 0, "the fence was not set within 5 seconds"
+    else:
+        try:
+            ready, _, _ = select.select([fence], [], [], 5.0)
+        finally:
+            os.close(fence)
+        assert ready, "the fence did not signal within 5 seconds"
+
+
+def test_tile_into_with_fence_matches_tile_into():
+    """tile_into_with_fence returns tile_into's placements and pixels, with a
+    fence or None."""
+    proc = ImageProcessor()
+    cfg = TilingConfig(64, 64, overlap=0.0)
+    try:
+        src = proc.create_image(128, 64, PixelFormat.Rgba, access="readwrite")
+        n = len(proc.plan_tiles(128, 64, cfg))
+        plain = proc.alloc_tile_batch(n, cfg, PixelFormat.Rgba, access="readwrite")
+        fenced = proc.alloc_tile_batch(n, cfg, PixelFormat.Rgba, access="readwrite")
+    except (RuntimeError, AttributeError) as e:
+        pytest.skip(f"GPU/image backend unavailable: {e}")
+
+    try:
+        with src.map() as m:
+            buf = np.asarray(m.numpy())
+            buf[...] = (np.arange(buf.size) % 251).astype(np.uint8).reshape(buf.shape)
+    except (RuntimeError, NotImplementedError) as e:
+        pytest.skip(f"source not CPU-mappable: {e}")
+
+    try:
+        want = proc.tile_into(src, plain, cfg)
+    except RuntimeError as e:
+        pytest.skip(f"tile_into render unavailable: {e}")
+    got, fence = proc.tile_into_with_fence(src, fenced, cfg)
+    assert fence is None or isinstance(fence, int)
+    _wait_and_close(fence)
+
+    assert [(p.index, p.origin) for p in got] == [(p.index, p.origin) for p in want]
+    with plain.map() as a, fenced.map() as b:
+        assert np.array_equal(np.asarray(a.numpy()), np.asarray(b.numpy()))
+
+
+def test_tile_into_with_fence_rejects_an_undersized_destination():
+    """tile_into_with_fence refuses a destination too short for every tile."""
+    proc = ImageProcessor()
+    cfg = TilingConfig(64, 64, overlap=0.0)
+    try:
+        src = proc.create_image(128, 64, PixelFormat.Rgba, access="readwrite")
+        small = proc.alloc_tile_batch(1, cfg, PixelFormat.Rgba, access="readwrite")
+    except (RuntimeError, AttributeError) as e:
+        pytest.skip(f"GPU/image backend unavailable: {e}")
+    with pytest.raises(RuntimeError, match="count\\*tile_h"):
+        proc.tile_into_with_fence(src, small, cfg)

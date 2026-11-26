@@ -45,6 +45,10 @@ on:
         description: Fail a board without a DRM render node instead of skipping its GPU tests
         type: boolean
         default: true
+      gdb:
+        description: Run each test binary under gdb, which logs every thread's backtrace if it crashes
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -66,7 +70,8 @@ jobs:
           token: ${{ secrets.FLEET_RUNNERS_TOKEN }}
 
   # Builds the edgefirst-tensor and edgefirst-codec wheels natively on aarch64
-  # with abi3-py311, and downloads pytest with its pure-Python dependencies.
+  # with abi3-py311, and downloads pytest with its pure-Python dependencies and
+  # numpy for each CPython version the boards run.
   wheels:
     name: Build Python wheels (aarch64)
     needs: plan
@@ -104,9 +109,14 @@ jobs:
           verify-version: "false"
           attest: false
 
-      - name: Download pytest
+      - name: Download pytest and numpy
         run: |
           pip download --only-binary=:all: -d wheels pytest==9.1.1
+          for v in 3.11 3.12 3.13 3.14; do
+            pip download --only-binary=:all: --no-deps -d wheels \
+              --platform manylinux_2_28_aarch64 --platform manylinux2014_aarch64 \
+              --python-version "${v}" numpy==2.4.6
+          done
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
@@ -220,6 +230,7 @@ jobs:
         env:
           FILTER: ${{ inputs.filter }}
           HAL_ONTARGET_REQUIRE_GPU: ${{ inputs.require-gpu && '1' || '0' }}
+          HAL_ONTARGET_GDB: ${{ inputs.gdb && '1' || '0' }}
           HAL_BOARD_ENTRY: ${{ matrix.runner }}
         run: hal-bundle/scripts/on-target-run.sh "$GITHUB_WORKSPACE/hal-results"
 

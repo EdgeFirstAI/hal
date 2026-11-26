@@ -47,6 +47,9 @@ struct SharedEglDisplay {
     display: egl::Display,
     kind: EglDisplayKind,
     transfer_backend: TransferBackend,
+    /// `EGL_ANDROID_native_fence_sync` and `EGL_KHR_fence_sync` are in the
+    /// display's extension string.
+    native_fence: bool,
     /// Kept alive — dropping the GBM device closes the DRM fd and
     /// invalidates the EGL display.
     _resources: SharedDisplayResources,
@@ -146,6 +149,9 @@ fn init_shared_display(
             continue;
         }
 
+        let native_fence = super::native_fence::display_supports_native_fence(&exts);
+        log::debug!("Shared display: {kind} EGL_ANDROID_native_fence_sync={native_fence}");
+
         // Check DMA-BUF support through the display extension string.
         let transfer_backend = if GlContext::egl_check_support_dma(egl, display).is_ok() {
             TransferBackend::DmaBuf
@@ -165,6 +171,7 @@ fn init_shared_display(
             display,
             kind,
             transfer_backend,
+            native_fence,
             _resources: resources,
         });
     }
@@ -250,6 +257,9 @@ pub(super) struct GlContext {
     pub(super) ctx: egl::Context,
     /// Whether the context is GLES 3.1+ (compute shaders available).
     pub(super) has_compute: bool,
+    /// Whether the display exports native sync-fence fds
+    /// (`EGL_ANDROID_native_fence_sync` with `EGL_KHR_fence_sync`).
+    pub(super) native_fence: bool,
     /// Wrapped in `ManuallyDrop` and never dropped.
     pub(super) egl: ManuallyDrop<Rc<Egl>>,
 }
@@ -295,6 +305,7 @@ impl GlContext {
 
         let display = shared.display;
         let transfer_backend = shared.transfer_backend;
+        let native_fence = shared.native_fence;
 
         // Bind the API for this thread.
         egl.bind_api(egl::OPENGL_ES_API)?;
@@ -329,6 +340,7 @@ impl GlContext {
             display,
             ctx,
             has_compute,
+            native_fence,
             egl: ManuallyDrop::new(egl),
             transfer_backend,
         })

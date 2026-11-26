@@ -7,7 +7,7 @@
 //! * Import: the AHardwareBuffer becomes an `EGLImage`
 //!   (`ahardwarebuffer_import.rs`) bound to a `GL_TEXTURE_2D` via
 //!   `glEGLImageTargetTexture2DOES`. The binding persists on the texture
-//!   object across GPU passes (`PERSISTENT_TEX_BINDINGS = true`), and
+//!   object across GPU passes (a constant `tex_binding_epoch`), and
 //!   `end_gpu_pass` is a no-op.
 //! * Dispatch: imports bind as `TEXTURE_2D`; `EXTERNAL_OES = false`.
 //! * Display bring-up: `eglGetDisplay(EGL_DEFAULT_DISPLAY)` on the native
@@ -134,12 +134,7 @@ fn init_shared_display() -> Result<SharedAndroidDisplay> {
         .query_string(Some(display), egl::EXTENSIONS)
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let supports_native_fence = egl_extensions
-        .split_ascii_whitespace()
-        .any(|e| e == "EGL_ANDROID_native_fence_sync")
-        && egl_extensions
-            .split_ascii_whitespace()
-            .any(|e| e == "EGL_KHR_fence_sync");
+    let supports_native_fence = native_fence::display_supports_native_fence(&egl_extensions);
     debug!("Android EGL: EGL_ANDROID_native_fence_sync={supports_native_fence}");
 
     egl.bind_api(egl::OPENGL_ES_API)
@@ -332,8 +327,10 @@ impl GlPlatform for AndroidEgl {
     type Import = AndroidEglImage;
     type ImportHandle = egl::Image;
 
-    // EGLImage targets persist on the texture object.
-    const PERSISTENT_TEX_BINDINGS: bool = true;
+    fn tex_binding_epoch(_display: &AndroidGlContext) -> Option<u64> {
+        // EGLImage targets persist on the texture object.
+        Some(0)
+    }
 
     /// The planar F16 zero-copy render only. Every other float tuple falls
     /// through to the CPU converter.

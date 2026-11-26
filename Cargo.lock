@@ -498,6 +498,7 @@ dependencies = [
  "image",
  "jpeg-encoder",
  "kamadak-exif",
+ "libc",
  "libloading",
  "log",
  "num-traits",
