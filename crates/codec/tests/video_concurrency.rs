@@ -15,9 +15,11 @@ use edgefirst_codec::video::{
     access_units, DecodeEvent, DecoderConfig, EncodedFrame, EncoderConfig, FrameOptions,
     VideoDecoder, VideoEncoder,
 };
-use edgefirst_codec::{capabilities, Codec, CodecError, Direction};
+use edgefirst_codec::{capabilities, Codec, CodecError, Direction, Engine};
 use edgefirst_tensor::Region;
 
+#[path = "support/encode_retry.rs"]
+mod encode_retry;
 #[path = "common/pictures.rs"]
 mod pictures;
 #[path = "common/sessions.rs"]
@@ -82,7 +84,8 @@ fn open_encoder() -> Option<VideoEncoder> {
 }
 
 /// Encodes `FRAMES` frames of the gradient at `frame`, and returns the
-/// stream and the dense NV12 bytes of the source.
+/// stream and the dense NV12 bytes of the source. On VideoToolbox, a frame
+/// the encoder refuses with [`CodecError::Timeout`] is submitted again.
 fn encode(encoder: &mut VideoEncoder, frame: usize) -> (Vec<EncodedFrame>, Vec<u8>) {
     let src = nv12(W, H);
     paint(&src, frame);
@@ -94,7 +97,12 @@ fn encode(encoder: &mut VideoEncoder, frame: usize) -> (Vec<EncodedFrame>, Vec<u
             keyframe: i == 0,
             ..FrameOptions::default()
         };
-        out.extend(encoder.encode(&src, &opts).expect("encode"));
+        let vt = encoder.info().engine == Engine::VideoToolbox;
+        let au = encode_retry::retry(
+            || encoder.encode(&src, &opts),
+            |e| vt && matches!(e, CodecError::Timeout(_)),
+        );
+        out.extend(au.expect("encode"));
     }
     out.extend(encoder.flush().expect("flush"));
     (out, want)
