@@ -563,7 +563,7 @@ fn a_full_in_flight_window_refuses_the_next_frame_at_once() {
 
 #[test]
 fn sustains_4k_at_30_fps_zero_copy() {
-    let _sessions = sessions::take(1);
+    let _sessions = sessions::take(sessions::SLOTS);
     let test = "sustains_4k_at_30_fps_zero_copy";
     let Some(mut enc) = open_zero_copy(test, config(3840, 2160, PixelFormat::Nv12)) else {
         return;

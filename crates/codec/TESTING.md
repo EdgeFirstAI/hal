@@ -347,7 +347,7 @@ scripts/test-macos.sh -p edgefirst-codec
 scripts/test-macos.sh -p edgefirst-codec -E 'test(video::vt::tests)'
 ```
 
-These tests run in parallel with the rest of the suite. Each takes a slot per VideoToolbox session it holds at once (`sessions::take(n)`), the same four slots the V4L2 and Media Foundation tests share.
+These tests run in parallel with the rest of the suite. Each takes a slot per VideoToolbox session it holds at once (`sessions::take(n)`), the same four slots the V4L2 and Media Foundation tests share. `sustains_4k_at_30_fps_zero_copy` takes all four, so no other session shares the encoder while it runs.
 
 Each encoder test logs the encoder it opened and whether it is hardware (`Apple H.264 (HW) hardware true`). The `test-macos` lane of `hal-full.yml` may have only Apple's software encoder. That encoder does not bound its frame delay, so it copies every source:
 
