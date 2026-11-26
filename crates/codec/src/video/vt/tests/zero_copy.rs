@@ -373,6 +373,7 @@ fn pool_run(
 
 #[test]
 fn zero_copy_and_copy_sources_decode_to_the_same_pictures() {
+    let _sessions = sessions::take(2);
     let test = "zero_copy_and_copy_sources_decode_to_the_same_pictures";
     let (w, h) = (1280, 720);
     let Some(mut enc) = open_zero_copy(test, config(w, h, PixelFormat::Nv12)) else {
@@ -412,6 +413,7 @@ fn zero_copy_and_copy_sources_decode_to_the_same_pictures() {
 
 #[test]
 fn a_pool_never_hands_out_a_surface_the_encoder_is_reading() {
+    let _sessions = sessions::take(2);
     let test = "a_pool_never_hands_out_a_surface_the_encoder_is_reading";
     let Some(mut enc) = open_zero_copy(test, config(1920, 1080, PixelFormat::Nv12)) else {
         return;
@@ -436,6 +438,7 @@ fn a_pool_never_hands_out_a_surface_the_encoder_is_reading() {
 
 #[test]
 fn a_zero_copy_source_is_in_use_until_its_access_unit_is_out() {
+    let _sessions = sessions::take(1);
     let test = "a_zero_copy_source_is_in_use_until_its_access_unit_is_out";
     let Some(mut enc) = open_zero_copy(test, config(1920, 1080, PixelFormat::Nv12)) else {
         return;
@@ -510,6 +513,7 @@ fn check_call_times(test: &str, paced: bool) {
 
 #[test]
 fn encode_returns_within_a_frame_interval_at_1080p_and_4k() {
+    let _sessions = sessions::take(1);
     check_call_times(
         "encode_returns_within_a_frame_interval_at_1080p_and_4k",
         true,
@@ -518,6 +522,7 @@ fn encode_returns_within_a_frame_interval_at_1080p_and_4k() {
 
 #[test]
 fn encode_returns_at_once_when_frames_come_faster_than_they_encode() {
+    let _sessions = sessions::take(1);
     check_call_times(
         "encode_returns_at_once_when_frames_come_faster_than_they_encode",
         false,
@@ -526,6 +531,7 @@ fn encode_returns_at_once_when_frames_come_faster_than_they_encode() {
 
 #[test]
 fn a_full_in_flight_window_refuses_the_next_frame_at_once() {
+    let _sessions = sessions::take(1);
     let test = "a_full_in_flight_window_refuses_the_next_frame_at_once";
     let (w, h) = (3840, 2160);
     let Some(mut enc) = open_zero_copy(test, config(w, h, PixelFormat::Nv12)) else {
@@ -557,6 +563,7 @@ fn a_full_in_flight_window_refuses_the_next_frame_at_once() {
 
 #[test]
 fn sustains_4k_at_30_fps_zero_copy() {
+    let _sessions = sessions::take(1);
     let test = "sustains_4k_at_30_fps_zero_copy";
     let Some(mut enc) = open_zero_copy(test, config(3840, 2160, PixelFormat::Nv12)) else {
         return;
@@ -585,6 +592,7 @@ fn sustains_4k_at_30_fps_zero_copy() {
 
 #[test]
 fn yuyv_from_a_yuvs_surface_is_read_in_place() {
+    let _sessions = sessions::take(2);
     let test = "yuyv_from_a_yuvs_surface_is_read_in_place";
     let Some(mut enc) = open_zero_copy(test, config(640, 480, PixelFormat::Yuyv)) else {
         return;
@@ -627,6 +635,7 @@ fn pool_colour(
 
 #[test]
 fn a_video_range_surface_is_described_as_video_range() {
+    let _sessions = sessions::take(1);
     let test = "a_video_range_surface_is_described_as_video_range";
     let bt709 = Colorimetry {
         space: Some(ColorSpace::Bt709),
@@ -643,6 +652,7 @@ fn a_video_range_surface_is_described_as_video_range() {
 
 #[test]
 fn a_full_range_surface_is_described_as_full_range() {
+    let _sessions = sessions::take(1);
     let test = "a_full_range_surface_is_described_as_full_range";
     let pool = Pool::new(640, 480, FOURCC_420F);
     let Some(got) = pool_colour(test, &pool, 640, 480, None) else {
@@ -653,6 +663,7 @@ fn a_full_range_surface_is_described_as_full_range() {
 
 #[test]
 fn a_tagged_range_that_disagrees_with_the_surface_is_refused() {
+    let _sessions = sessions::take(1);
     let test = "a_tagged_range_that_disagrees_with_the_surface_is_refused";
     let Some(mut enc) = open_encoder(test, config(640, 480, PixelFormat::Nv12)) else {
         return;
@@ -670,6 +681,7 @@ fn a_tagged_range_that_disagrees_with_the_surface_is_refused() {
 
 #[test]
 fn surface_colour_attachments_describe_an_untagged_source() {
+    let _sessions = sessions::take(1);
     let test = "surface_colour_attachments_describe_an_untagged_source";
     let pool = Pool::new(1920, 1080, FOURCC_420V);
     let tagged = pool.buffer();
@@ -713,6 +725,7 @@ fn one_frame_colour(enc: &mut encoder::VtEncoder, src: &TensorDyn) -> (VuiColour
 
 #[test]
 fn surface_colour_attachments_describe_the_stream_on_either_route() {
+    let _sessions = sessions::take(2);
     let test = "surface_colour_attachments_describe_the_stream_on_either_route";
     let (w, h) = (1920, 1080);
     let src = smpte_c_surface(&Pool::new(w, h, FOURCC_420V));
@@ -741,6 +754,7 @@ fn surface_colour_attachments_describe_the_stream_on_either_route() {
 
 #[test]
 fn a_cropped_frame_from_a_tagged_surface_keeps_the_stream_colour() {
+    let _sessions = sessions::take(2);
     let test = "a_cropped_frame_from_a_tagged_surface_keeps_the_stream_colour";
     let (w, h) = (1920, 1080);
     let Some(mut enc) = open_encoder(test, config(w, h, PixelFormat::Nv12)) else {
@@ -778,6 +792,7 @@ fn a_cropped_frame_from_a_tagged_surface_keeps_the_stream_colour() {
 
 #[test]
 fn yuyv_from_a_yuvf_surface_is_read_in_place_as_full_range() {
+    let _sessions = sessions::take(2);
     let test = "yuyv_from_a_yuvf_surface_is_read_in_place_as_full_range";
     let Some(mut enc) = open_encoder(test, config(640, 480, PixelFormat::Yuyv)) else {
         return;
@@ -805,6 +820,7 @@ fn yuyv_from_a_yuvf_surface_is_read_in_place_as_full_range() {
 
 #[test]
 fn a_yuvs_surface_tagged_full_range_is_refused() {
+    let _sessions = sessions::take(1);
     let test = "a_yuvs_surface_tagged_full_range_is_refused";
     let Some(mut enc) = open_encoder(test, config(640, 480, PixelFormat::Yuyv)) else {
         return;
@@ -822,6 +838,7 @@ fn a_yuvs_surface_tagged_full_range_is_refused() {
 
 #[test]
 fn a_yuvf_surface_tagged_limited_range_is_refused() {
+    let _sessions = sessions::take(1);
     let test = "a_yuvf_surface_tagged_limited_range_is_refused";
     let Some(mut enc) = open_encoder(test, config(640, 480, PixelFormat::Yuyv)) else {
         return;
@@ -879,6 +896,7 @@ fn wrap_tight_yuyv(buffer: &CfOwned) -> TensorDyn {
 
 #[test]
 fn a_source_whose_row_stride_is_not_the_surface_pitch_is_copied() {
+    let _sessions = sessions::take(3);
     let test = "a_source_whose_row_stride_is_not_the_surface_pitch_is_copied";
     let (w, h) = (600, 480);
     let buffer = aligned_buffer(w, h, FOURCC_YUVS, 256);
@@ -919,6 +937,7 @@ fn a_source_whose_row_stride_is_not_the_surface_pitch_is_copied() {
 
 #[test]
 fn one_stream_takes_sources_at_different_row_strides() {
+    let _sessions = sessions::take(2);
     let test = "one_stream_takes_sources_at_different_row_strides";
     let (w, h) = (600, 480);
     let tight = wrap_tight_yuyv(&aligned_buffer(w, h, FOURCC_YUVS, 256));
@@ -950,6 +969,7 @@ fn one_stream_takes_sources_at_different_row_strides() {
 
 #[test]
 fn a_refused_first_frame_leaves_the_stream_unset() {
+    let _sessions = sessions::take(2);
     let test = "a_refused_first_frame_leaves_the_stream_unset";
     let (w, h) = (600, 480);
     let Some(mut enc) = open_encoder(test, config(w, h, PixelFormat::Yuyv)) else {
@@ -982,6 +1002,7 @@ fn a_refused_first_frame_leaves_the_stream_unset() {
 
 #[test]
 fn a_cropped_planar_source_is_copied() {
+    let _sessions = sessions::take(1);
     let test = "a_cropped_planar_source_is_copied";
     let Some(mut enc) = open_encoder(test, config(1280, 720, PixelFormat::Nv12)) else {
         return;
@@ -1015,6 +1036,7 @@ fn four_held(enc: &mut encoder::VtEncoder) -> Vec<TensorDyn> {
 
 #[test]
 fn dropping_the_encoder_releases_every_source() {
+    let _sessions = sessions::take(1);
     let test = "dropping_the_encoder_releases_every_source";
     let Some(mut enc) = open_zero_copy(test, config(1280, 720, PixelFormat::Nv12)) else {
         return;
@@ -1029,6 +1051,7 @@ fn dropping_the_encoder_releases_every_source() {
 
 #[test]
 fn a_session_error_releases_every_source() {
+    let _sessions = sessions::take(1);
     let test = "a_session_error_releases_every_source";
     let Some(mut enc) = open_zero_copy(test, config(1280, 720, PixelFormat::Nv12)) else {
         return;
@@ -1065,6 +1088,7 @@ fn a_session_error_releases_every_source() {
 
 #[test]
 fn a_full_copy_queue_refuses_the_next_frame_without_taking_a_pool_buffer() {
+    let _sessions = sessions::take(2);
     let test = "a_full_copy_queue_refuses_the_next_frame_without_taking_a_pool_buffer";
     let Some(mut enc) = open_encoder(test, config(1920, 1080, PixelFormat::Nv12)) else {
         return;
@@ -1103,6 +1127,7 @@ fn a_full_copy_queue_refuses_the_next_frame_without_taking_a_pool_buffer() {
 
 #[test]
 fn a_session_holds_at_most_max_frame_delay_frames() {
+    let _sessions = sessions::take(1);
     let test = "a_session_holds_at_most_max_frame_delay_frames";
     let (w, h) = (1280, 720);
     let Some(mut enc) = open_zero_copy(test, config(w, h, PixelFormat::Nv12)) else {
@@ -1136,6 +1161,7 @@ fn a_session_holds_at_most_max_frame_delay_frames() {
 
 #[test]
 fn a_session_without_a_bounded_frame_delay_copies_corevideo_sources() {
+    let _sessions = sessions::take(2);
     let test = "a_session_without_a_bounded_frame_delay_copies_corevideo_sources";
     let (w, h) = (1280, 720);
     encoder::VtEncoder::refuse_frame_delay_for_test(true);
@@ -1161,6 +1187,7 @@ fn a_session_without_a_bounded_frame_delay_copies_corevideo_sources() {
 
 #[test]
 fn corevideo_sources_take_the_route_the_session_allows() {
+    let _sessions = sessions::take(2);
     let test = "corevideo_sources_take_the_route_the_session_allows";
     let (w, h) = (1280, 720);
     let Some(mut enc) = open_encoder(test, config(w, h, PixelFormat::Nv12)) else {

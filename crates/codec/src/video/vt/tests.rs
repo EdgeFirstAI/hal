@@ -10,7 +10,7 @@ use edgefirst_tensor::{
 
 use super::ffi::*;
 use super::*;
-use crate::test_support::{dma_require, report_skip};
+use crate::test_support::{dma_require, report_skip, sessions};
 use crate::video::h264;
 use crate::video::h264_syntax::{ParameterSets, SliceHeader, Sps};
 use crate::video::{
@@ -154,6 +154,7 @@ impl Run {
 
 #[test]
 fn allocate_lends_multiplane_iosurface_frames_with_colorimetry() {
+    let _sessions = sessions::take(1);
     let test = "allocate_lends_multiplane_iosurface_frames_with_colorimetry";
     let Some(mut decoder) = open(test, OutputPool::Allocate { count: 4 }) else {
         return;
@@ -205,6 +206,7 @@ fn allocate_lends_multiplane_iosurface_frames_with_colorimetry() {
 
 #[test]
 fn holding_count_plus_one_frames_exhausts_the_pool_until_one_drops() {
+    let _sessions = sessions::take(1);
     let test = "holding_count_plus_one_frames_exhausts_the_pool_until_one_drops";
     let Some(mut decoder) = open(test, OutputPool::Allocate { count: 3 }) else {
         return;
@@ -262,6 +264,7 @@ fn holding_count_plus_one_frames_exhausts_the_pool_until_one_drops() {
 
 #[test]
 fn a_lent_frame_keeps_its_pixel_buffer_from_reuse() {
+    let _sessions = sessions::take(1);
     let test = "a_lent_frame_keeps_its_pixel_buffer_from_reuse";
     let Some(mut decoder) = open(test, OutputPool::Allocate { count: 2 }) else {
         return;
@@ -299,6 +302,7 @@ fn a_lent_frame_keeps_its_pixel_buffer_from_reuse() {
 
 #[test]
 fn repeated_parameter_sets_do_not_reconfigure() {
+    let _sessions = sessions::take(1);
     let test = "repeated_parameter_sets_do_not_reconfigure";
     let Some(mut decoder) = open(test, OutputPool::default()) else {
         return;
@@ -322,6 +326,7 @@ fn repeated_parameter_sets_do_not_reconfigure() {
 
 #[test]
 fn access_units_before_the_parameter_sets_are_refused() {
+    let _sessions = sessions::take(1);
     let test = "access_units_before_the_parameter_sets_are_refused";
     let Some(mut decoder) = open(test, OutputPool::default()) else {
         return;
@@ -411,6 +416,7 @@ fn check_provided_run(run: &Run, colours: &[Option<Colorimetry>]) {
 
 #[test]
 fn a_provided_multiplane_pool_receives_the_pictures() {
+    let _sessions = sessions::take(1);
     let test = "a_provided_multiplane_pool_receives_the_pictures";
     let Some((run, colours)) = decode_into(test, multiplane_pool(6)) else {
         return;
@@ -420,6 +426,7 @@ fn a_provided_multiplane_pool_receives_the_pictures() {
 
 #[test]
 fn a_provided_single_buffer_pool_receives_the_pictures() {
+    let _sessions = sessions::take(1);
     let test = "a_provided_single_buffer_pool_receives_the_pictures";
     let pool = (0..6)
         .map(|_| {
@@ -488,6 +495,7 @@ fn decode_keeping(
 
 #[test]
 fn a_flush_that_needs_more_tensors_than_the_provided_pool_holds_is_refused() {
+    let _sessions = sessions::take(1);
     let test = "a_flush_that_needs_more_tensors_than_the_provided_pool_holds_is_refused";
     let Some(drain) = drain_size(test) else {
         return;
@@ -515,6 +523,7 @@ fn a_flush_that_needs_more_tensors_than_the_provided_pool_holds_is_refused() {
 
 #[test]
 fn a_flush_while_the_caller_holds_provided_tensors_lends_nothing_until_they_drop() {
+    let _sessions = sessions::take(1);
     let test = "a_flush_while_the_caller_holds_provided_tensors_lends_nothing_until_they_drop";
     let Some(drain) = drain_size(test) else {
         return;
@@ -557,6 +566,7 @@ fn open_backend(test: &str, output: OutputPool) -> Option<decoder::VtDecoder> {
 
 #[test]
 fn a_flush_after_a_session_failure_returns_the_decoded_pictures() {
+    let _sessions = sessions::take(1);
     let test = "a_flush_after_a_session_failure_returns_the_decoded_pictures";
     let Some(mut decoder) = open_backend(test, OutputPool::Allocate { count: 4 }) else {
         return;
@@ -585,6 +595,7 @@ fn a_flush_after_a_session_failure_returns_the_decoded_pictures() {
 
 #[test]
 fn a_picture_decoded_before_a_decode_error_is_returned_corrupted() {
+    let _sessions = sessions::take(1);
     let test = "a_picture_decoded_before_a_decode_error_is_returned_corrupted";
     let bad_data: OSStatus = -12909;
     let Some(mut decoder) = open_backend(test, OutputPool::Allocate { count: 4 }) else {
@@ -887,6 +898,7 @@ fn mean_luma(t: &TensorDyn) -> f64 {
 
 #[test]
 fn without_repeated_headers_only_the_first_idr_carries_parameter_sets() {
+    let _sessions = sessions::take(1);
     let test = "without_repeated_headers_only_the_first_idr_carries_parameter_sets";
     let mut config = EncoderConfig::h264(640, 480, PixelFormat::Nv12, 30.0);
     config.gop = Some(10);
@@ -913,6 +925,7 @@ fn without_repeated_headers_only_the_first_idr_carries_parameter_sets() {
 
 #[test]
 fn the_encoder_emits_no_b_frames() {
+    let _sessions = sessions::take(1);
     let test = "the_encoder_emits_no_b_frames";
     let Some(mut enc) = open_encoder(test, EncoderConfig::h264(640, 480, PixelFormat::Nv12, 30.0))
     else {
@@ -944,6 +957,7 @@ fn the_encoder_emits_no_b_frames() {
 
 #[test]
 fn the_frame_after_a_session_error_is_an_idr() {
+    let _sessions = sessions::take(1);
     let test = "the_frame_after_a_session_error_is_an_idr";
     let Some(mut enc) = open_encoder(test, EncoderConfig::h264(640, 480, PixelFormat::Nv12, 30.0))
     else {
@@ -991,6 +1005,7 @@ fn untagged_sources_follow_the_height_rule() {
 
 #[test]
 fn a_full_range_source_is_described_as_full_range() {
+    let _sessions = sessions::take(1);
     let test = "a_full_range_source_is_described_as_full_range";
     let src = image(640, 480, PixelFormat::Nv12).with_colorimetry(full_range_smpte170m());
     let Some(got) = stream_colour(test, &src) else {
@@ -1020,6 +1035,7 @@ fn a_full_range_source_is_described_as_full_range() {
 
 #[test]
 fn a_source_with_other_colorimetry_than_the_stream_is_refused() {
+    let _sessions = sessions::take(1);
     let test = "a_source_with_other_colorimetry_than_the_stream_is_refused";
     let Some(mut enc) = open_encoder(
         test,
@@ -1048,6 +1064,7 @@ fn a_source_with_other_colorimetry_than_the_stream_is_refused() {
 
 #[test]
 fn decoded_frames_carry_the_stream_colorimetry() {
+    let _sessions = sessions::take(2);
     let test = "decoded_frames_carry_the_stream_colorimetry";
     let Some(mut enc) = open_encoder(test, EncoderConfig::h264(640, 480, PixelFormat::Nv12, 30.0))
     else {
@@ -1073,6 +1090,7 @@ fn decoded_frames_carry_the_stream_colorimetry() {
 
 #[test]
 fn yuyv_from_a_hal_tensor_is_copied() {
+    let _sessions = sessions::take(2);
     let test = "yuyv_from_a_hal_tensor_is_copied";
     let Some(mut enc) = open_encoder(test, EncoderConfig::h264(640, 480, PixelFormat::Yuyv, 30.0))
     else {
@@ -1141,6 +1159,7 @@ fn capabilities_list_the_h264_encoders() {
 
 #[test]
 fn ten_seconds_at_1080p30_keep_near_the_target_bit_rate() {
+    let _sessions = sessions::take(1);
     let test = "ten_seconds_at_1080p30_keep_near_the_target_bit_rate";
     let config = EncoderConfig::h264(1920, 1080, PixelFormat::Nv12, 30.0);
     let target = config.target_bitrate();
@@ -1237,6 +1256,7 @@ fn encode_planes(
 
 #[test]
 fn constrained_baseline_streams_say_so_in_the_sps() {
+    let _sessions = sessions::take(2);
     let test = "constrained_baseline_streams_say_so_in_the_sps";
     for profile in [H264Profile::ConstrainedBaseline, H264Profile::Baseline] {
         let mut config = EncoderConfig::h264(640, 480, PixelFormat::Nv12, 30.0);
@@ -1266,6 +1286,7 @@ fn constrained_baseline_streams_say_so_in_the_sps() {
 
 #[test]
 fn an_untagged_420f_surface_is_encoded_as_full_range() {
+    let _sessions = sessions::take(2);
     let test = "an_untagged_420f_surface_is_encoded_as_full_range";
     let Some(mut enc) = open_encoder(test, EncoderConfig::h264(640, 480, PixelFormat::Nv12, 30.0))
     else {
@@ -1286,6 +1307,7 @@ fn an_untagged_420f_surface_is_encoded_as_full_range() {
 
 #[test]
 fn a_420f_surface_tagged_limited_is_refused() {
+    let _sessions = sessions::take(1);
     let test = "a_420f_surface_tagged_limited_is_refused";
     let Some(mut enc) = open_encoder(test, EncoderConfig::h264(640, 480, PixelFormat::Nv12, 30.0))
     else {
@@ -1301,6 +1323,7 @@ fn a_420f_surface_tagged_limited_is_refused() {
 
 #[test]
 fn a_stream_after_a_flush_may_change_colorimetry() {
+    let _sessions = sessions::take(1);
     let test = "a_stream_after_a_flush_may_change_colorimetry";
     let Some(mut enc) = open_encoder(test, EncoderConfig::h264(640, 480, PixelFormat::Nv12, 30.0))
     else {

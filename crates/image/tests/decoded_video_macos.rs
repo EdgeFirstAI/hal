@@ -16,6 +16,9 @@ use edgefirst_codec::{CodecError, Engine};
 use edgefirst_image::{CPUProcessor, GLProcessorThreaded, ImageProcessorTrait};
 use edgefirst_tensor::{CpuAccess, DType, PixelFormat, TensorDyn, TensorMemory};
 
+#[path = "../../codec/tests/common/sessions.rs"]
+mod sessions;
+
 #[path = "../../tensor/tests/support/dma_require.rs"]
 #[allow(dead_code)]
 mod dma_require;
@@ -82,6 +85,7 @@ fn first_frame(decoder: &mut VideoDecoder, stream: &[u8]) -> DecodedFrame {
 
 #[test]
 fn a_videotoolbox_frame_converts_to_rgba_on_angle() {
+    let _sessions = sessions::take(1);
     if !dma_require::available_or_skip(edgefirst_tensor::is_gpu_buffer_available(), TEST) {
         return;
     }
