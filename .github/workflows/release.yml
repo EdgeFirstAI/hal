@@ -184,7 +184,7 @@ jobs:
       # Two passes over the same distributions, abi3-py311 and abi3-py38.
       # --sdist is passed for tracker and kernels only.
       - name: Build wheels (Python 3.11+ — zero-copy buffer protocol)
-        uses: EdgeFirstAI/.github/.github/actions/maturin-build@c7876194b9fe9f7f72daf0efadaf32d7dff1b257
+        uses: EdgeFirstAI/.github/.github/actions/maturin-build@966df5c40680f6946896cb5e51542d5dde1bfa1a
         env:
           EDGEFIRST_ANGLE_PATH: ${{ matrix.name == 'windows' && format('{0}\target\angle\windows-x64\bin', github.workspace) || '' }}
         with:
@@ -200,7 +200,7 @@ jobs:
           attest: false
 
       - name: Build wheels (Python 3.8+ — compatible fallback)
-        uses: EdgeFirstAI/.github/.github/actions/maturin-build@c7876194b9fe9f7f72daf0efadaf32d7dff1b257
+        uses: EdgeFirstAI/.github/.github/actions/maturin-build@966df5c40680f6946896cb5e51542d5dde1bfa1a
         env:
           EDGEFIRST_ANGLE_PATH: ${{ matrix.name == 'windows' && format('{0}\target\angle\windows-x64\bin', github.workspace) || '' }}
         with:
