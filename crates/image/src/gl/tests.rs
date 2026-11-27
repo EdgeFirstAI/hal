@@ -1395,11 +1395,12 @@ mod gl_tests {
         worker.flush().expect("flush");
     }
 
-    /// A convert that fails after a draw that skipped its GPU wait leaves that draw owed, deferred
-    /// or fenced, and a worker that syncs every message leaves nothing pending after it.
+    /// A deferred convert that fails after a draw that skipped its GPU wait leaves that draw owed,
+    /// and a worker that syncs every message leaves nothing pending after it. A fenced convert
+    /// that fails the same way completes the draw before it returns.
     #[test]
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-    fn a_convert_failing_after_its_draw_leaves_the_draw_owed() {
+    fn a_convert_failing_after_its_draw_owes_the_draw_only_when_deferred() {
         if !is_opengl_available() {
             crate::test_support::report_skip(&format!("{} - GL not available", function!()));
             return;
@@ -1433,11 +1434,9 @@ mod gl_tests {
             gl.flush().expect("flush");
             assert!(gl.convert_fenced(&src, dst, *options).is_err());
             assert!(
-                gl.pending_flush,
-                "a failed fenced convert leaves its draw owed"
+                !gl.pending_flush,
+                "a failed fenced convert completes its draw"
             );
-            gl.flush().expect("flush");
-            assert!(!gl.pending_flush);
         });
 
         let (dst, options) = &mut items[0];
@@ -14815,7 +14814,7 @@ mod gl_tests {
     }
 
     /// A program that fails to build declines every conversion that draws with it, without a
-    /// rebuild, and leaves the other conversions on GL.
+    /// rebuild and with no GL work left owed, and leaves the other conversions on GL.
     #[test]
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn a_program_that_fails_to_build_declines_only_its_conversions() {
@@ -14849,6 +14848,10 @@ mod gl_tests {
                     matches!(&err, crate::Error::NotSupported(m) if m.contains("failed to build")),
                     "attempt {attempt}: {err:?}"
                 );
+                assert!(
+                    !gl.pending_flush,
+                    "attempt {attempt}: the declined conversion completed its first pass"
+                );
             }
             let mut rgba = lazy_program_test_destination(w, h, PixelFormat::Rgba);
             gl.convert(&src, &mut rgba, None)
@@ -14860,6 +14863,53 @@ mod gl_tests {
             let (got, want) = (lazy_program_test_rows(&rgba), lazy_program_test_rows(&want));
             let max = got.iter().zip(&want).map(|(a, b)| a.abs_diff(*b)).max();
             assert!(max <= Some(1), "RGBA differs from the CPU by up to {max:?}");
+        });
+    }
+
+    /// A box draw leaves blending off when it renders and when its program fails to build.
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    fn a_box_draw_leaves_blending_off_whether_it_renders_or_fails() {
+        use crate::ImageProcessorTrait;
+        if !is_opengl_available() {
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
+            return;
+        }
+        let (w, h) = (64, 48);
+        let detect = [DetectBox {
+            bbox: [0.25, 0.25, 0.75, 0.75].into(),
+            score: 0.9,
+            label: 0,
+        }];
+        let blending = || unsafe {
+            edgefirst_gl::gl::IsEnabled(edgefirst_gl::gl::BLEND) == edgefirst_gl::gl::TRUE
+        };
+        let drawn = GLProcessorThreaded::new(None).unwrap().with_st(|gl| {
+            let mut dst = lazy_program_test_destination(w, h, PixelFormat::Rgba);
+            let drawn = gl.draw_decoded_masks(&mut dst, &detect, &[], Default::default());
+            drawn.map(|()| blending())
+        });
+        match drawn {
+            Ok(on) => assert!(!on, "blending is off after a box draw"),
+            Err(e) => {
+                crate::test_support::report_skip(&format!(
+                    "{} - GL declines a box draw here: {e}",
+                    function!()
+                ));
+                return;
+            }
+        }
+        GLProcessorThreaded::new(None).unwrap().with_st(|gl| {
+            gl.fail_color_program();
+            let mut dst = lazy_program_test_destination(w, h, PixelFormat::Rgba);
+            let err = gl
+                .draw_decoded_masks(&mut dst, &detect, &[], Default::default())
+                .expect_err("a box draw declines without its program");
+            assert!(
+                matches!(&err, crate::Error::NotSupported(m) if m.contains("failed to build")),
+                "{err:?}"
+            );
+            assert!(!blending(), "blending is off after the declined box draw");
         });
     }
 

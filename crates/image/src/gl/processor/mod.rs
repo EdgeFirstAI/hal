@@ -1036,10 +1036,10 @@ pub struct GLProcessorST {
     /// reset on every exit; `false` between calls.
     pub(super) defer_finish: bool,
     /// `true` when GL work was issued without its terminal GPU wait and a
-    /// [`flush`](Self::flush) is owed: a deferred convert, or a convert that
+    /// [`flush`](Self::flush) is owed: a deferred convert, successful or
     /// failed after a draw that skipped its wait. Cleared by the flush (see
-    /// [`flush_pending`](Self::flush_pending)) and by any terminal wait that
-    /// runs.
+    /// [`flush_pending`](Self::flush_pending)), by any terminal wait that
+    /// runs and by a convert that is not deferred failing.
     pub(super) pending_flush: bool,
     /// `true` when a `record_completion` inside a batch queued a device fence
     /// signal without submitting the command buffer. Cleared by
@@ -1187,7 +1187,13 @@ impl ImageProcessorTrait for GLProcessorST {
         dst: &mut TensorDyn,
         options: Option<crate::ConvertOptions>,
     ) -> crate::Result<()> {
-        self.convert_inner(src, dst, &options.unwrap_or_default())?;
+        if let Err(e) = self.convert_inner(src, dst, &options.unwrap_or_default()) {
+            // Completes the GL work a failed convert left without its wait.
+            if !self.defer_finish {
+                self.flush_pending();
+            }
+            return Err(e);
+        }
         crate::colorimetry::tag_yuv_destination(dst);
         // Records completion after every convert; inside a batch the device
         // submission is left to `flush_pending`.
@@ -3109,7 +3115,11 @@ impl GLProcessorST {
         self.defer_finish = true;
         let result = self.convert_inner(src, dst, &options);
         self.defer_finish = false;
-        result?;
+        if let Err(e) = result {
+            // Completes the GL work a failed convert left without its wait.
+            self.flush_pending();
+            return Err(e);
+        }
         // Records completion on the destination and exports the fence for the
         // same sync point.
         let recorded = Platform::record_completion(&self.gl_context, dst, true);
@@ -3502,45 +3512,15 @@ impl GLProcessorST {
             }
         };
 
-        // Write the base layer of the framebuffer before running mask passes:
-        //
-        // - background + zero-copy destination: draw bg into the destination
-        //   framebuffer (see `draw_background_into_bound_fbo`).
-        // - background + non-DMA destination: upload bg pixels into the
-        //   render_texture that backs the FBO.
-        // - no background: glClear(0x00000000) on the framebuffer.
-        if let Some((bg, bg_fmt)) = background {
-            if bg.width() != Some(dst_w) || bg.height() != Some(dst_h) {
-                return Err(crate::Error::InvalidShape(
-                    "background dimensions do not match dst".into(),
-                ));
-            }
-            if is_dma {
-                self.draw_background_into_bound_fbo(bg, bg_fmt)?;
-            } else {
-                // Non-DMA destination: upload bg pixels into the render_texture
-                // attached to the FBO.
-                self.upload_pixels_to_render_texture(bg, bg_fmt, dst_w, dst_h)?;
-            }
-        } else {
-            // No background: clear the framebuffer.
-            unsafe {
-                edgefirst_gl::gl::ClearColor(0.0, 0.0, 0.0, 0.0);
-                edgefirst_gl::gl::Clear(edgefirst_gl::gl::COLOR_BUFFER_BIT);
-            }
-        }
-
-        edgefirst_gl::enable(edgefirst_gl::gl::BLEND);
-        edgefirst_gl::blend_func_separate(
-            edgefirst_gl::gl::SRC_ALPHA,
-            edgefirst_gl::gl::ONE_MINUS_SRC_ALPHA,
-            edgefirst_gl::gl::ZERO,
-            edgefirst_gl::gl::ONE,
-        );
-
-        self.set_opacity_uniform(opacity)?;
-        self.render_box(dst_w, dst_h, detect, color_mode)?;
-        self.render_segmentation(detect, segmentation, color_mode)?;
+        self.draw_overlay_layers(
+            (dst_w, dst_h),
+            is_dma,
+            background,
+            opacity,
+            detect,
+            color_mode,
+            |gl| gl.render_segmentation(detect, segmentation, color_mode),
+        )?;
 
         edgefirst_gl::finish();
         if !is_dma {
@@ -3648,37 +3628,15 @@ impl GLProcessorST {
             }
         };
 
-        // Write the base layer of the framebuffer before running mask passes.
-        if let Some((bg, bg_fmt)) = background {
-            if bg.width() != Some(dst_w) || bg.height() != Some(dst_h) {
-                return Err(crate::Error::InvalidShape(
-                    "background dimensions do not match dst".into(),
-                ));
-            }
-            if is_dma {
-                self.draw_background_into_bound_fbo(bg, bg_fmt)?;
-            } else {
-                self.upload_pixels_to_render_texture(bg, bg_fmt, dst_w, dst_h)?;
-            }
-        } else {
-            unsafe {
-                edgefirst_gl::gl::ClearColor(0.0, 0.0, 0.0, 0.0);
-                edgefirst_gl::gl::Clear(edgefirst_gl::gl::COLOR_BUFFER_BIT);
-            }
-        }
-
-        edgefirst_gl::enable(edgefirst_gl::gl::BLEND);
-        edgefirst_gl::blend_func_separate(
-            edgefirst_gl::gl::SRC_ALPHA,
-            edgefirst_gl::gl::ONE_MINUS_SRC_ALPHA,
-            edgefirst_gl::gl::ZERO,
-            edgefirst_gl::gl::ONE,
-        );
-
-        self.set_opacity_uniform(opacity)?;
-        self.render_box(dst_w, dst_h, detect, color_mode)?;
-        self.render_proto_segmentation(detect, proto_data, color_mode)?;
-        edgefirst_gl::disable(edgefirst_gl::gl::BLEND);
+        self.draw_overlay_layers(
+            (dst_w, dst_h),
+            is_dma,
+            background,
+            opacity,
+            detect,
+            color_mode,
+            |gl| gl.render_proto_segmentation(detect, proto_data, color_mode),
+        )?;
 
         edgefirst_gl::finish();
         if !is_dma {
@@ -3708,6 +3666,63 @@ impl GLProcessorST {
         }
 
         Ok(())
+    }
+
+    /// Write the base layer into the bound framebuffer, then draw the boxes
+    /// and `masks` over it with blending.
+    ///
+    /// - background + zero-copy destination: draw bg into the destination
+    ///   framebuffer (see `draw_background_into_bound_fbo`).
+    /// - background + non-DMA destination: upload bg pixels into the
+    ///   render_texture that backs the FBO.
+    /// - no background: glClear(0x00000000) on the framebuffer.
+    ///
+    /// Blending is off on return. On an error the GL work issued has
+    /// completed.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_overlay_layers(
+        &mut self,
+        (dst_w, dst_h): (usize, usize),
+        is_dma: bool,
+        background: Option<(&Tensor<u8>, PixelFormat)>,
+        opacity: f32,
+        detect: &[DetectBox],
+        color_mode: crate::ColorMode,
+        masks: impl FnOnce(&mut Self) -> crate::Result<()>,
+    ) -> crate::Result<()> {
+        if background.is_some_and(|(bg, _)| bg.width() != Some(dst_w) || bg.height() != Some(dst_h))
+        {
+            return Err(crate::Error::InvalidShape(
+                "background dimensions do not match dst".into(),
+            ));
+        }
+        let drawn = (|| -> crate::Result<()> {
+            match background {
+                Some((bg, bg_fmt)) if is_dma => self.draw_background_into_bound_fbo(bg, bg_fmt)?,
+                Some((bg, bg_fmt)) => {
+                    self.upload_pixels_to_render_texture(bg, bg_fmt, dst_w, dst_h)?
+                }
+                None => unsafe {
+                    edgefirst_gl::gl::ClearColor(0.0, 0.0, 0.0, 0.0);
+                    edgefirst_gl::gl::Clear(edgefirst_gl::gl::COLOR_BUFFER_BIT);
+                },
+            }
+            edgefirst_gl::enable(edgefirst_gl::gl::BLEND);
+            edgefirst_gl::blend_func_separate(
+                edgefirst_gl::gl::SRC_ALPHA,
+                edgefirst_gl::gl::ONE_MINUS_SRC_ALPHA,
+                edgefirst_gl::gl::ZERO,
+                edgefirst_gl::gl::ONE,
+            );
+            self.set_opacity_uniform(opacity)?;
+            self.render_box(dst_w, dst_h, detect, color_mode)?;
+            masks(self)
+        })();
+        edgefirst_gl::disable(edgefirst_gl::gl::BLEND);
+        if drawn.is_err() {
+            edgefirst_gl::finish();
+        }
+        drawn
     }
 
     pub(super) fn check_src_format_supported(
@@ -6188,6 +6203,12 @@ impl GLProcessorST {
         self.luma_2d_program.fail_build("refused by the test hook");
     }
 
+    /// Records a failed build in the box program, for a test.
+    #[cfg(test)]
+    pub(super) fn fail_color_program(&self) {
+        self.color_program.fail_build("refused by the test hook");
+    }
+
     /// The NV12 programs [`Self::ensure_nv12_programs`] built.
     fn nv12_programs(&self) -> crate::Result<&Nv12Programs> {
         match &self.nv12_programs {
@@ -6602,6 +6623,18 @@ impl GLProcessorST {
             Error::NotSupported("external-OES planar program unavailable on this platform".into())
         })?
         .id()?;
+        // The u8 program that draws an integer alpha plane, and its extent
+        // location.
+        let alpha_program = if int8 && alpha {
+            Some((
+                self.texture_program_planar
+                    .as_ref()
+                    .map_or(Ok(0), LazyProgram::id)?,
+                self.external_src_extent_loc(false, true)?,
+            ))
+        } else {
+            None
+        };
         unsafe {
             edgefirst_gl::gl::UseProgram(program_id);
             let [e0, e1, e2, e3] = src_extent;
@@ -6720,22 +6753,12 @@ impl GLProcessorST {
                     edgefirst_gl::gl::TEXTURE_SWIZZLE_R,
                     swizzles[i] as i32,
                 );
-                if int8 && i == 3 {
+                if let (3, Some((alpha_id, extent_loc))) = (i, alpha_program) {
                     // Integer alpha is drawn by the u8 program.
                     self.set_plane_quant(program_id, None);
-                    edgefirst_gl::gl::UseProgram(
-                        self.texture_program_planar
-                            .as_ref()
-                            .map_or(Ok(0), LazyProgram::id)?,
-                    );
+                    edgefirst_gl::gl::UseProgram(alpha_id);
                     let [e0, e1, e2, e3] = src_extent;
-                    edgefirst_gl::gl::Uniform4f(
-                        self.external_src_extent_loc(false, true)?,
-                        e0,
-                        e1,
-                        e2,
-                        e3,
-                    );
+                    edgefirst_gl::gl::Uniform4f(extent_loc, e0, e1, e2, e3);
                 } else {
                     self.set_plane_quant(program_id, Some(i));
                 }
@@ -6772,6 +6795,12 @@ impl GLProcessorST {
         int8: bool,
     ) -> Result<(), Error> {
         let texture_target = edgefirst_gl::gl::TEXTURE_2D;
+        // The u8 program that draws an integer alpha plane.
+        let alpha_program = if int8 && alpha {
+            Some(self.texture_program_planar_2d.id()?)
+        } else {
+            None
+        };
         unsafe {
             let program = if int8 {
                 &self.texture_program_planar_int8_2d
@@ -6862,10 +6891,10 @@ impl GLProcessorST {
                     edgefirst_gl::gl::TEXTURE_SWIZZLE_R,
                     swizzles[i] as i32,
                 );
-                if int8 && i == 3 {
+                if let (3, Some(alpha_id)) = (i, alpha_program) {
                     // Integer alpha is drawn by the u8 program.
                     self.set_plane_quant(program.id, None);
-                    edgefirst_gl::gl::UseProgram(self.texture_program_planar_2d.id()?);
+                    edgefirst_gl::gl::UseProgram(alpha_id);
                 } else {
                     self.set_plane_quant(program.id, Some(i));
                 }
@@ -9544,7 +9573,6 @@ impl GLProcessorST {
             }
         }
 
-        edgefirst_gl::disable(edgefirst_gl::gl::BLEND);
         Ok(())
     }
 
