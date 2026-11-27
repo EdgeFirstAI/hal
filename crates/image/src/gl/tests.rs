@@ -1395,11 +1395,12 @@ mod gl_tests {
         worker.flush().expect("flush");
     }
 
-    /// A convert that fails after a draw that skipped its GPU wait leaves that draw owed, deferred
-    /// or fenced, and a worker that syncs every message leaves nothing pending after it.
+    /// A deferred convert that fails after a draw that skipped its GPU wait leaves that draw owed,
+    /// and a worker that syncs every message leaves nothing pending after it. A fenced convert
+    /// that fails the same way completes the draw before it returns.
     #[test]
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-    fn a_convert_failing_after_its_draw_leaves_the_draw_owed() {
+    fn a_convert_failing_after_its_draw_owes_the_draw_only_when_deferred() {
         if !is_opengl_available() {
             crate::test_support::report_skip(&format!("{} - GL not available", function!()));
             return;
@@ -1433,11 +1434,9 @@ mod gl_tests {
             gl.flush().expect("flush");
             assert!(gl.convert_fenced(&src, dst, *options).is_err());
             assert!(
-                gl.pending_flush,
-                "a failed fenced convert leaves its draw owed"
+                !gl.pending_flush,
+                "a failed fenced convert completes its draw"
             );
-            gl.flush().expect("flush");
-            assert!(!gl.pending_flush);
         });
 
         let (dst, options) = &mut items[0];
@@ -14713,6 +14712,204 @@ mod gl_tests {
             .convert(&src, &mut want, None)
             .unwrap();
         assert_eq!(nv12_tight_planes(&dst), nv12_tight_planes(&want));
+        });
+    }
+
+    /// A `w`x`h` host-memory RGBA image whose channels differ.
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    fn lazy_program_test_source(w: usize, h: usize) -> TensorDyn {
+        let bytes: Vec<u8> = (0..h)
+            .flat_map(|y| {
+                (0..w).flat_map(move |x| {
+                    [
+                        (x * 255 / w) as u8,
+                        (y * 255 / h) as u8,
+                        ((x + y) * 127 / (w + h)) as u8,
+                        255,
+                    ]
+                })
+            })
+            .collect();
+        load_raw_image(w, h, PixelFormat::Rgba, Some(TensorMemory::Mem), &bytes).unwrap()
+    }
+
+    /// A `w`x`h` host-memory `fmt` destination.
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    fn lazy_program_test_destination(w: usize, h: usize, fmt: PixelFormat) -> TensorDyn {
+        TensorDyn::image(
+            w,
+            h,
+            fmt,
+            DType::U8,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap()
+    }
+
+    /// The rows of a u8 image with any row padding removed.
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    fn lazy_program_test_rows(t: &TensorDyn) -> Vec<u8> {
+        let (w, h) = (t.width().unwrap(), t.height().unwrap());
+        let row = w * t.format().unwrap().channels();
+        let t = t.as_u8().unwrap();
+        let stride = t.effective_row_stride().unwrap_or(row);
+        let map = t.map().unwrap();
+        (0..h)
+            .flat_map(|r| map.as_slice()[r * stride..][..row].to_vec())
+            .collect()
+    }
+
+    /// A new processor has built only the Y2Y programs and the programs its zero-copy
+    /// self-check draws with; a conversion then builds the programs it draws with and no others.
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    fn programs_build_on_the_first_conversion_that_draws_with_them() {
+        use crate::ImageProcessorTrait;
+        if !is_opengl_available() {
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
+            return;
+        }
+        let worker = GLProcessorThreaded::new(None).unwrap();
+        worker.with_st(|gl| {
+            let at_creation = gl.built_programs();
+            assert!(
+                at_creation
+                    .iter()
+                    .all(|name| ["nv_y2y", "texture", "texture_yuv"].contains(name)),
+                "built at creation: {at_creation:?}"
+            );
+            let (w, h) = (64, 48);
+            let src = lazy_program_test_source(w, h);
+            let mut grey = lazy_program_test_destination(w, h, PixelFormat::Grey);
+            if let Err(e) = gl.convert(&src, &mut grey, None) {
+                crate::test_support::report_skip(&format!(
+                    "{} - GL declines an RGBA to Grey conversion here: {e}",
+                    function!()
+                ));
+                return;
+            }
+            let after = gl.built_programs();
+            assert!(
+                after.contains(&"luma_2d"),
+                "built after a Grey conversion: {after:?}"
+            );
+            let unused = [
+                "texture_int8",
+                "luma_2d_int8",
+                "yuyv_2d",
+                "nv_r8",
+                "rgb_r8",
+                "yuyv_luma_r8",
+                "float_rgba",
+                "segmentation",
+                "proto_f16",
+                "color",
+            ];
+            assert!(
+                after.iter().all(|name| !unused.contains(name)),
+                "built after a Grey conversion: {after:?}"
+            );
+        });
+    }
+
+    /// A program that fails to build declines every conversion that draws with it, without a
+    /// rebuild and with no GL work left owed, and leaves the other conversions on GL.
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    fn a_program_that_fails_to_build_declines_only_its_conversions() {
+        use crate::ImageProcessorTrait;
+        if !is_opengl_available() {
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
+            return;
+        }
+        let (w, h) = (64, 48);
+        let src = lazy_program_test_source(w, h);
+        let grey_on_gl = GLProcessorThreaded::new(None).unwrap().with_st(|gl| {
+            let mut grey = lazy_program_test_destination(w, h, PixelFormat::Grey);
+            gl.convert(&src, &mut grey, None).err()
+        });
+        if let Some(e) = grey_on_gl {
+            crate::test_support::report_skip(&format!(
+                "{} - GL declines an RGBA to Grey conversion here: {e}",
+                function!()
+            ));
+            return;
+        }
+        let worker = GLProcessorThreaded::new(None).unwrap();
+        worker.with_st(|gl| {
+            gl.fail_luma_2d_program();
+            for attempt in 0..2 {
+                let mut grey = lazy_program_test_destination(w, h, PixelFormat::Grey);
+                let err = gl
+                    .convert(&src, &mut grey, None)
+                    .expect_err("a Grey conversion declines without its luma program");
+                assert!(
+                    matches!(&err, crate::Error::NotSupported(m) if m.contains("failed to build")),
+                    "attempt {attempt}: {err:?}"
+                );
+                assert!(
+                    !gl.pending_flush,
+                    "attempt {attempt}: the declined conversion completed its first pass"
+                );
+            }
+            let mut rgba = lazy_program_test_destination(w, h, PixelFormat::Rgba);
+            gl.convert(&src, &mut rgba, None)
+                .expect("an RGBA conversion still renders on GL");
+            let mut want = lazy_program_test_destination(w, h, PixelFormat::Rgba);
+            crate::CPUProcessor::new()
+                .convert(&src, &mut want, None)
+                .unwrap();
+            let (got, want) = (lazy_program_test_rows(&rgba), lazy_program_test_rows(&want));
+            let max = got.iter().zip(&want).map(|(a, b)| a.abs_diff(*b)).max();
+            assert!(max <= Some(1), "RGBA differs from the CPU by up to {max:?}");
+        });
+    }
+
+    /// A box draw leaves blending off when it renders and when its program fails to build.
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    fn a_box_draw_leaves_blending_off_whether_it_renders_or_fails() {
+        use crate::ImageProcessorTrait;
+        if !is_opengl_available() {
+            crate::test_support::report_skip(&format!("{} - OpenGL not available", function!()));
+            return;
+        }
+        let (w, h) = (64, 48);
+        let detect = [DetectBox {
+            bbox: [0.25, 0.25, 0.75, 0.75].into(),
+            score: 0.9,
+            label: 0,
+        }];
+        let blending = || unsafe {
+            edgefirst_gl::gl::IsEnabled(edgefirst_gl::gl::BLEND) == edgefirst_gl::gl::TRUE
+        };
+        let drawn = GLProcessorThreaded::new(None).unwrap().with_st(|gl| {
+            let mut dst = lazy_program_test_destination(w, h, PixelFormat::Rgba);
+            let drawn = gl.draw_decoded_masks(&mut dst, &detect, &[], Default::default());
+            drawn.map(|()| blending())
+        });
+        match drawn {
+            Ok(on) => assert!(!on, "blending is off after a box draw"),
+            Err(e) => {
+                crate::test_support::report_skip(&format!(
+                    "{} - GL declines a box draw here: {e}",
+                    function!()
+                ));
+                return;
+            }
+        }
+        GLProcessorThreaded::new(None).unwrap().with_st(|gl| {
+            gl.fail_color_program();
+            let mut dst = lazy_program_test_destination(w, h, PixelFormat::Rgba);
+            let err = gl
+                .draw_decoded_masks(&mut dst, &detect, &[], Default::default())
+                .expect_err("a box draw declines without its program");
+            assert!(
+                matches!(&err, crate::Error::NotSupported(m) if m.contains("failed to build")),
+                "{err:?}"
+            );
+            assert!(!blending(), "blending is off after the declined box draw");
         });
     }
 

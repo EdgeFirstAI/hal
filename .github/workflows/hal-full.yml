@@ -176,6 +176,7 @@ jobs:
           cargo run -p gpu-probe -- --probe-only 2>&1 | head -60 || true
       - name: Run the edgefirst-image tests under coverage
         run: |
+          mkdir -p target
           cargo llvm-cov nextest -p edgefirst-image --features default \
             --no-fail-fast \
             -E 'not test(~no_bleed_gl)' \

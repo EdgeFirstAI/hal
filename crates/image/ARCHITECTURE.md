@@ -743,6 +743,19 @@ backend has no `PboTensor<T>` to lend once the buffer lives in the library,
 and a borrow that exists on only one backend cannot be the signature this
 crate compiles against on both.
 
+### GL programs
+
+`GLProcessorST` compiles and links each GL program the first time a draw needs it, not when the processor is created. Each program is a `LazyProgram` (`gl/resources.rs`) holding its fragment source, a setup function that loads its constant uniforms and resolves the uniform locations its draws read, and a cell for the linked program or the failure. Linking leaves the previously bound program bound. A link runs inside the message that needs it: under the per-message lock with the `Full` policy, and in parallel across processors with `LifecycleOnly`.
+
+A program that fails to build logs a warning once and is never rebuilt. Every conversion that draws with it returns `Error::NotSupported`, which `ImageProcessor` treats like any other GL decline, and conversions that draw with other programs stay on GL.
+
+Two kinds of uniform state outlive a draw, and a program takes the current values as it links:
+
+- the `colors` and `opacity` of the segmentation and colour programs (`DrawUniforms`), which `set_class_colors` and the draw calls upload to the linked programs and hold for the rest;
+- the `quantize()` coefficients of the mapped int8 programs (`QuantPrograms`), where each mapped program registers as it links.
+
+Some programs build earlier. The Y2Y NV programs link at creation where `GL_EXT_YUV_target` is present, since whether they build decides `NvSampling::HardwareYuv`. The proto repack compute program builds at creation with `EDGEFIRST_PROTO_COMPUTE=1`. The NV12 destination programs build together on the first NV12 destination.
+
 ### GLES 3.1 context and the optional compute path
 
 At context creation time, the GL thread attempts a GLES 3.1 context first;
@@ -1537,7 +1550,7 @@ no userspace lock can order. That known bug keeps the
 ### What stays globally serialized everywhere
 
 1. **Initialization** — `GLProcessorST::new()` (display probe/creation,
-   context setup, shader compilation, DMA-BUF roundtrip verification).
+   context setup, the Y2Y NV program build, DMA-BUF roundtrip verification).
    Also makes the once-per-process GL function-pointer load race-free.
 2. **Teardown** — `GLProcessorST::drop()` → `GlContext::drop()`
    (`eglDestroyContext` serialization; V3D breaks display

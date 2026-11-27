@@ -683,11 +683,11 @@ impl GLProcessorST {
             float_crop_uniforms(&crop, src_w, src_h, dst_w, dst_h)?;
 
         let program_id = match path {
-            FloatRenderPath::PboF32Nhwc => self.float_f32_nhwc_program.id,
+            FloatRenderPath::PboF32Nhwc => self.float_f32_nhwc_program.id()?,
             FloatRenderPath::PboF16Nchw | FloatRenderPath::PboF32Nchw => {
-                self.float_f16_nchw_program.id
+                self.float_f16_nchw_program.id()?
             }
-            FloatRenderPath::PboF16Nhwc => self.float_nhwc_pack_program.id,
+            FloatRenderPath::PboF16Nhwc => self.float_nhwc_pack_program.id()?,
             _ => unreachable!(),
         };
         // The R32F shader samples `u_tex`; the packed shaders sample `src`.
@@ -920,17 +920,17 @@ impl GLProcessorST {
                 DType::F32,
             ) => (
                 packed_planar_layout(dst_w as u32, dst_h as u32, dst_fmt.channels() as u32),
-                self.float_f16_nchw_program.id,
+                self.float_f16_nchw_program.id()?,
                 Some((dst_w as f32, dst_h as f32)),
             ),
             (FloatRenderPath::ZeroCopyFloatNhwc, PixelFormat::Rgb, DType::F16 | DType::F32) => (
                 packed_interleaved_layout(dst_w as u32, dst_h as u32),
-                self.float_nhwc_pack_program.id,
+                self.float_nhwc_pack_program.id()?,
                 None,
             ),
             (FloatRenderPath::ZeroCopyFloatRgba, PixelFormat::Rgba, DType::F16 | DType::F32) => (
                 Some((dst_w as u32, dst_h as u32)),
-                self.float_rgba_program.id,
+                self.float_rgba_program.id()?,
                 None,
             ),
             _ => {
